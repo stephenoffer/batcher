@@ -23,7 +23,7 @@ distinct, a window. Breakers are where data materializes, where the engine spill
 under memory pressure, where a distributed query shuffles, and where the adaptive
 layer re-plans.
 
-![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](../_static/diagrams/pipeline_breakers.png)
+![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](../_static/diagrams/pipeline_breakers.svg)
 
 The unit of work inside a pipeline is the morsel — a `RecordBatch` of 16,384 rows
 by default (`execution.morsel_rows`). Morsels keep scheduling granular and the

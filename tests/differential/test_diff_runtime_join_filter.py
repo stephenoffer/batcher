@@ -12,6 +12,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -24,8 +25,6 @@ def _tables(duck):
 
 
 def test_range_filtered_probe_matches_unfiltered(duck):
-    from conftest import assert_same
-
     fact, dim = _tables(duck)
     expected = duck.sql("SELECT * FROM fact JOIN dim USING (k)")
     # dim.k spans [12, 18]; pre-filtering the fact to that range is what the rule does.
@@ -37,8 +36,6 @@ def test_range_filtered_probe_matches_unfiltered(duck):
 def test_multi_key_range_filter_matches_unfiltered(duck):
     """Composite-key join: pruning the probe by the build's range on *every* key
     (`k1 BETWEEN .. AND k2 BETWEEN ..`) is still a pure superset — identical result."""
-    from conftest import assert_same
-
     fact = pa.table(
         {
             "k1": [1, 5, 12, 12, 18, 50, 12, 15],
@@ -63,8 +60,6 @@ def test_multi_key_range_filter_matches_unfiltered(duck):
 
 
 def test_semi_join_range_filter_safe(duck):
-    from conftest import assert_same
-
     fact, dim = _tables(duck)
     expected = duck.sql("SELECT fact.* FROM fact SEMI JOIN dim USING (k)")
     narrowed = fact.filter((col("k") >= 12) & (col("k") <= 18))
@@ -75,8 +70,6 @@ def test_semi_join_range_filter_safe(duck):
 def test_left_join_filters_right_side_safely(duck):
     """For a left join only the right (non-preserved) side may be pruned; pruning the
     right by the left's key range keeps every preserved left row."""
-    from conftest import assert_same
-
     fact, dim = _tables(duck)
     expected = duck.sql("SELECT * FROM fact LEFT JOIN dim USING (k)")
     pruned = fact.join(dim.filter((col("k") >= 1) & (col("k") <= 99)), on="k", how="left").collect()

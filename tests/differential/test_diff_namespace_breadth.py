@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -18,8 +19,6 @@ pytestmark = pytest.mark.differential
 
 # --- string ---------------------------------------------------------------
 def test_str_trim_with_chars(duck):
-    from conftest import assert_same
-
     t = pa.table({"s": ["xxhixx", "--a--", "  pad  ", None]})
     duck.register("t", t)
     out = bt.from_arrow(t).select(
@@ -35,8 +34,6 @@ def test_str_trim_with_chars(duck):
 
 
 def test_str_split_part(duck):
-    from conftest import assert_same
-
     t = pa.table({"s": ["a,b,c", "x", "", None]})
     duck.register("t", t)
     out = bt.from_arrow(t).select(
@@ -54,8 +51,6 @@ def test_str_split_part(duck):
 
 
 def test_str_regexp_replace_all(duck):
-    from conftest import assert_same
-
     t = pa.table({"s": ["a1b2c3", "no digits", None]})
     duck.register("t", t)
     out = bt.from_arrow(t).select(g=col("s").str.regexp_replace_all("[0-9]", "#"))
@@ -69,8 +64,6 @@ def _dates():
 
 
 def test_dt_leap_days_isoyear(duck):
-    from conftest import assert_same
-
     t = _dates()
     duck.register("t", t)
     out = bt.from_arrow(t).select(

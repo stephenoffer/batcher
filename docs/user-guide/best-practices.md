@@ -19,7 +19,7 @@ ds = bt.from_pydict(
 ## Build one lazy chain, collect once
 
 A Dataset is lazy and immutable. Each operation returns a new Dataset and runs no
-work; the plan executes only at a terminal operation such as `collect`,
+work. The plan executes only at a terminal operation such as `collect`,
 `to_pydict`, or a write. Chain the whole transformation, then collect once. The
 optimizer sees the entire pipeline and can reorder and fuse it.
 
@@ -51,7 +51,7 @@ print(out.to_pydict()["total"])
 # [10.0, 40.0, 90.0, 160.0, 250.0]
 ```
 
-Do not pull data into Python to compute a column. If you reach for `to_pylist`
+Don't pull data into Python to compute a column. If you reach for `to_pylist`
 inside a loop to build a new field, rewrite it as an expression instead. When a
 computation genuinely needs Python, use `map_batches`, which hands you a whole
 Arrow batch rather than one row at a time.
@@ -80,23 +80,35 @@ filter landed near the scan or that a projection trimmed the columns.
 ```python
 plan = ds.filter(bt.col("price") > 20).select("category").explain()
 print(plan)
-# Project  (≈... rows, default)
-#   Filter  (≈... rows, default)
-#     Scan  (≈5 rows, exact)
 ```
+
+The filter sits directly above the scan, and the projection is above it. That is the shape
+you wanted. Each line carries the row estimate and its provenance: `exact` from the source,
+`default` from a heuristic, `learned` from a previous run.
+
+```text
+project                         est≈4 (default)
+  filter                        est≈4 (default)
+    scan                        est≈5 (exact)
+
+decisions:
+  - [core/io] source read at 6 MB/s (learned)
+```
+
+The read throughput under `decisions:` is measured, so expect a different figure.
 
 ## Use distributed and spill deliberately
 
 `collect` runs single-node and in-memory by default, which is the fastest path for
 data that fits. Reach for the flags when the workload calls for them:
 
-- `distributed=True` (with `num_workers=`) spreads execution across Ray workers.
-  Use it when one machine cannot hold or process the data in reasonable time. The
-  result is identical to single-node execution because the same mergeable operators
-  run in both modes.
-- `spill=True` lets stateful operators (aggregation, join, sort) spill to disk
-  under memory pressure instead of failing. Use it when an in-memory run risks
-  running out of memory.
+- `distributed=True` (with `num_workers=`) spreads execution across Ray workers. Use
+  it when one machine cannot hold the data, or cannot process it in reasonable time.
+  The result is identical to single-node execution, because the same mergeable
+  operators run in both modes.
+- `spill=True` lets stateful operators (aggregation, join, sort) spill to disk under
+  memory pressure instead of failing. Reach for it when an in-memory run risks running
+  out of memory.
 
 ```python
 # docs: skip
@@ -107,9 +119,9 @@ out = (
 )
 ```
 
-Do not turn these on by default. Distribution adds scheduling and shuffle overhead
+Don't turn these on by default. Distribution adds scheduling and shuffle overhead
 that hurts small queries, and spill trades memory for disk I/O. Both earn their cost
-only at scale.
+only on a big job.
 
 ## See also
 

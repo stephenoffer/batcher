@@ -16,8 +16,14 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pyarrow as pa
 
+from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.sql._common import require_module
+from batcher.io.formats.sql._common import (
+    probe_is_typed,
+    push_down,
+    require_module,
+    schema_probe,
+)
 
 if TYPE_CHECKING:
     from batcher.io.splits import Split
@@ -29,8 +35,17 @@ _MODULE = "clickhouse_connect"
 
 
 def _client(params: dict[str, Any]) -> Any:
-    """Open a fresh clickhouse-connect client (rebuilt per worker)."""
+    """Open a fresh clickhouse-connect client (rebuilt per worker).
+
+    The password is resolved *here*, not when the source was built: `params` is carried on
+    a pickled split, so an `env:`/`file:` reference must still be a reference at that point
+    and only becomes the secret on the machine that dials the server."""
     ch = require_module(_MODULE, extra=_EXTRA)
+    if params.get("password"):
+        params = {
+            **params,
+            "password": resolve_secret(params["password"], what="ClickHouse password"),
+        }
     return ch.get_client(**params)
 
 
@@ -49,7 +64,21 @@ class _ClickHouseSplit:
             client.close()
 
     def schema(self) -> pa.Schema:
-        return self._table().schema
+        """The query's column types, taken off the stream without draining it.
+
+        `query_arrow` downloads the entire result to read a schema the Arrow IPC stream
+        already carries in its header. That is normally hidden because `ClickHouseSource.schema`
+        asks a ``WHERE 1 = 0`` probe, which returns nothing — but the fallback for a driver
+        whose probe comes back untyped runs the *real* query, and there materializing a whole
+        relation to learn its column names is the difference between a metadata lookup and
+        an OOM.
+        """
+        client = _client(self.params)
+        try:
+            with client.query_arrow_stream(self.query) as reader:
+                return reader.schema
+        finally:
+            client.close()
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         table = self._table()
@@ -100,9 +129,10 @@ class ClickHouseSource:
     host: str
     port: int | None = None
     username: str = "default"
-    password: str = ""
+    password: str = field(default="", repr=False)
     database: str | None = None
-    client_kwargs: dict[str, Any] = field(default_factory=dict)
+    # `client_kwargs` can carry auth material too (e.g. a password or TLS settings).
+    client_kwargs: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _params(self) -> dict[str, Any]:
         params: dict[str, Any] = {"host": self.host, "username": self.username}
@@ -115,36 +145,29 @@ class ClickHouseSource:
         params.update(self.client_kwargs)
         return params
 
-    def _split(self) -> _ClickHouseSplit:
-        return _ClickHouseSplit(self._params(), self.query)
+    def _split(
+        self, predicate: dict | None = None, projection: list[str] | None = None
+    ) -> _ClickHouseSplit:
+        """The split, with the pushdown already folded into its SQL (see `push_down`)."""
+        return _ClickHouseSplit(self._params(), push_down(self.query, predicate, projection))
 
     def schema(self) -> pa.Schema:
-        return self._split().schema()
+        """The relation's columns, from a zero-row probe rather than the whole query.
+
+        See `schema_probe`: this used to execute the full query and discard every row.
+        """
+        probed = _ClickHouseSplit(self._params(), schema_probe(self.query)).schema()
+        return probed if probe_is_typed(probed) else self._split().schema()
 
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                sql = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                return _ClickHouseSplit(self._params(), sql).read(projection)
-        return self._split().read(projection)
+        return self._split(predicate, projection).read(projection)
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                sql = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                yield from _ClickHouseSplit(self._params(), sql).iter_batches(projection)
-                return
-        yield from self._split().iter_batches(projection)
+        yield from self._split(predicate, projection).iter_batches(projection)
 
     def row_count(self) -> int | None:
         return None
@@ -152,5 +175,15 @@ class ClickHouseSource:
     def identity(self) -> str:
         return f"clickhouse:{self.host}:{self.query}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        return [self._split()]
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
+        """One split, whose SQL already carries the pushdown — so the worker's query is filtered.
+
+        Without this, the worker rebuilt an *unfiltered* query from the split and ClickHouse
+        streamed the whole table for the engine's `Filter` to discard.
+        """
+        return [self._split(predicate, projection)]

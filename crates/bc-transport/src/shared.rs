@@ -100,9 +100,14 @@ pub fn publish_shared(addr: &str, ticket: &str, batches: &[RecordBatch]) -> std:
 }
 
 /// Read the batches a same-node peer published under `(addr, ticket)`, or `None` if no
-/// file exists (an empty bucket, an un-shm'd peer, or shm disabled — fall back to
-/// Flight). The file is memory-mapped, so the read is served from the page cache with
-/// no socket or gRPC decode.
+/// usable file exists (an empty bucket, an un-shm'd peer, shm disabled, or a
+/// corrupt/truncated file — every case falls back to Flight). The file is memory-mapped,
+/// so the read is served from the page cache with no socket or gRPC decode.
+///
+/// This is **best-effort**: a decode failure on the world-writable shm path (a corrupt,
+/// truncated, or hostile file) resolves to `None` — a miss the caller answers over Flight
+/// — never an error or a panic, so a bad file can never fail or crash a healthy reducer.
+/// Only a genuine I/O fault (a read error on the mapping) surfaces as `Err`.
 pub fn fetch_shared(addr: &str, ticket: &str) -> std::io::Result<Option<Vec<RecordBatch>>> {
     let Some(path) = shm_path(addr, ticket) else {
         return Ok(None);
@@ -118,9 +123,9 @@ pub fn fetch_shared(addr: &str, ticket: &str) -> std::io::Result<Option<Vec<Reco
     if mmap.len() < 10 {
         return Ok(None); // too short to hold an IPC-file trailer — treat as a miss
     }
-    read_mmap_zero_copy(mmap)
-        .map(Some)
-        .map_err(std::io::Error::other)
+    // A malformed/corrupt file is a miss (⇒ fall back to Flight), not an error: the shm
+    // dir is world-writable, so a bad file is expected and must be transparently ignored.
+    Ok(read_mmap_zero_copy(mmap).ok())
 }
 
 /// Decode the IPC-file `mmap` into batches whose buffers point INTO the mmap (zero-copy).
@@ -139,29 +144,86 @@ fn read_mmap_zero_copy(mmap: Mmap) -> Result<Vec<RecordBatch>, arrow::error::Arr
     // memory outlives every decoded batch. `Arc::new(mmap)` coerces to `Arc<dyn Allocation>`.
     let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, Arc::new(mmap)) };
 
+    // A truncated / corrupt / hostile file (the shm dir is world-writable) must NOT panic the
+    // reducer — this same-node fast path is best-effort. Every malformed shape returns an
+    // `ArrowError` the caller turns into a miss (falling back to Flight), never an `unwrap` panic.
+    if len < 10 {
+        return Err(arrow::error::ArrowError::IpcError(
+            "shm file shorter than the 10-byte IPC trailer".into(),
+        ));
+    }
     let trailer_start = len - 10;
-    let footer_len = read_footer_length(buffer[trailer_start..].try_into().unwrap())?;
+    let trailer: [u8; 10] = buffer[trailer_start..]
+        .try_into()
+        .map_err(|_| arrow::error::ArrowError::IpcError("bad shm trailer".into()))?;
+    let footer_len = read_footer_length(trailer)?;
+    if footer_len > trailer_start {
+        return Err(arrow::error::ArrowError::IpcError(
+            "shm footer length exceeds file size".into(),
+        ));
+    }
     let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start])
         .map_err(|e| arrow::error::ArrowError::IpcError(format!("bad shm footer: {e}")))?;
-    let schema = Arc::new(fb_to_schema(footer.schema().unwrap()));
+    let footer_schema = footer
+        .schema()
+        .ok_or_else(|| arrow::error::ArrowError::IpcError("shm footer has no schema".into()))?;
+    let schema = Arc::new(fb_to_schema(footer_schema));
     let mut decoder = FileDecoder::new(schema, footer.version());
     for block in footer.dictionaries().iter().flatten() {
-        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-        let data = buffer.slice_with_length(block.offset() as usize, block_len);
+        let data = block_slice(&buffer, block)?;
         decoder.read_dictionary(block, &data)?;
     }
     let mut out = Vec::with_capacity(footer.recordBatches().map_or(0, |r| r.len()));
     if let Some(rbs) = footer.recordBatches() {
         for i in 0..rbs.len() {
             let block = rbs.get(i);
-            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-            let data = buffer.slice_with_length(block.offset() as usize, block_len);
+            let data = block_slice(&buffer, block)?;
             if let Some(b) = decoder.read_record_batch(block, &data)? {
                 out.push(b);
             }
         }
     }
     Ok(out)
+}
+
+/// Slice a footer `block`'s `[offset, offset+meta+body)` region out of `buffer`, after
+/// validating it lies fully within the buffer.
+///
+/// The block coordinates come from the file's footer, which on the world-writable shm
+/// path is untrusted: a corrupt, truncated, or hostile file can carry a *valid*
+/// flatbuffer footer whose block offset/length point past the (short) file, or even a
+/// negative `i64`/`i32` that wraps huge under `as usize`. Passing those straight to
+/// [`Buffer::slice_with_length`] panics (`offset + length > len`), crashing the reducer —
+/// exactly what `read_mmap_zero_copy` promises never to do. Validate here and return an
+/// `ArrowError` (⇒ a miss ⇒ fall back to Flight) instead.
+fn block_slice(
+    buffer: &Buffer,
+    block: &arrow::ipc::Block,
+) -> Result<Buffer, arrow::error::ArrowError> {
+    let bad = |what: &str| {
+        arrow::error::ArrowError::IpcError(format!(
+            "shm block out of range: {what} (offset={}, meta={}, body={}, file_len={})",
+            block.offset(),
+            block.metaDataLength(),
+            block.bodyLength(),
+            buffer.len()
+        ))
+    };
+    // Reject negative coordinates before the sign-flipping `as usize` cast.
+    if block.offset() < 0 || block.metaDataLength() < 0 || block.bodyLength() < 0 {
+        return Err(bad("negative coordinate"));
+    }
+    let offset = block.offset() as usize;
+    let block_len = (block.metaDataLength() as usize)
+        .checked_add(block.bodyLength() as usize)
+        .ok_or_else(|| bad("length overflow"))?;
+    let end = offset
+        .checked_add(block_len)
+        .ok_or_else(|| bad("end overflow"))?;
+    if end > buffer.len() {
+        return Err(bad("exceeds file"));
+    }
+    Ok(buffer.slice_with_length(offset, block_len))
 }
 
 fn null_io() -> std::io::Error {
@@ -247,6 +309,42 @@ mod tests {
         publish_shared(addr, ticket, std::slice::from_ref(&want)).unwrap();
         let got = fetch_shared(addr, ticket).unwrap().expect("published");
         assert_eq!(got, vec![want]);
+        clear_shared(addr);
+    }
+
+    /// A corrupt / hostile file whose footer is a *valid* flatbuffer but whose block
+    /// offsets/lengths point past the (truncated) file must resolve to a miss, never a
+    /// panic — the shm dir is world-writable, so a co-tenant or a half-written file from
+    /// a crashed non-batcher writer must not crash the reducer. We reproduce it by
+    /// publishing a valid file, then rewriting the same path with only its footer+trailer
+    /// (body dropped): the footer's blocks now reference offsets far beyond the tiny file.
+    #[test]
+    fn corrupt_footer_with_out_of_range_blocks_is_a_miss_not_a_panic() {
+        let addr = "host_6:55506";
+        let ticket = "9/0/3/3/0";
+        // A valid multi-batch file so the footer references non-trivial block offsets.
+        publish_shared(addr, ticket, &[batch(&[1, 2, 3]), batch(&[4, 5, 6])]).unwrap();
+        let path = shm_path(addr, ticket).unwrap();
+        let v = fs::read(&path).unwrap();
+        let len = v.len();
+        // IPC-file trailer: <i32 footer_len LE><"ARROW1"> = 10 bytes at end.
+        let footer_len = i32::from_le_bytes(v[len - 10..len - 6].try_into().unwrap()) as usize;
+        let footer_start = len - 10 - footer_len;
+        // Keep the valid footer + trailer, drop the schema + all batch bodies. The footer's
+        // block offsets (absolute, into the original body region) now exceed this file.
+        let mut corrupt = Vec::new();
+        corrupt.extend_from_slice(&v[footer_start..len - 10]); // footer
+        corrupt.extend_from_slice(&v[len - 10..]); // trailer
+        fs::write(&path, &corrupt).unwrap();
+
+        // Must not panic: a corrupt file resolves to a best-effort miss (`Ok(None)` ⇒ the
+        // caller falls back to Flight), never a process-killing index-out-of-bounds in
+        // `Buffer::slice_with_length`.
+        let got = fetch_shared(addr, ticket);
+        assert!(
+            matches!(got, Ok(None)),
+            "corrupt shm file must be a miss, got {got:?}"
+        );
         clear_shared(addr);
     }
 

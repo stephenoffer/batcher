@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -40,8 +41,6 @@ def sales(duck):
     ],
 )
 def test_shorthand_equals_method_and_duckdb(duck, sales, shorthand, method, sql):
-    from conftest import assert_same
-
     ds = bt.from_arrow(sales)
     short = ds.group_by("dept").agg(shorthand("amount")).sort("dept")
     method_form = ds.group_by("dept").agg(getattr(bt.col("amount"), method)()).sort("dept")
@@ -56,10 +55,14 @@ def test_shorthand_equals_method_and_duckdb(duck, sales, shorthand, method, sql)
 def test_shorthand_accepts_expression_and_names_output(sales):
     ds = bt.from_arrow(sales)
     # A str is a column; an Expr passes through; a keyword renames.
-    out = ds.group_by("dept").agg(
-        bt.sum("amount"),
-        avg_score=bt.mean(bt.col("score")),
-    ).sort("dept")
+    out = (
+        ds.group_by("dept")
+        .agg(
+            bt.sum("amount"),
+            avg_score=bt.mean(bt.col("score")),
+        )
+        .sort("dept")
+    )
     assert out.columns == ["dept", "amount", "avg_score"]
 
 

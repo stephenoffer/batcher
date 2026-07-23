@@ -1,8 +1,9 @@
 # Core concepts
 
-Batcher splits cleanly into a Python control plane and a Rust data plane: Python
-builds and optimizes a query plan, Rust runs it over Apache Arrow record batches.
-Four ideas follow from that split and explain how the rest of the API behaves.
+Batcher has two halves. Python is the control plane: it builds a query plan and
+optimizes it. Rust is the data plane: it runs that plan over Apache Arrow record
+batches. Almost everything surprising about the API follows from that split, by way
+of the four ideas below.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -16,7 +17,7 @@ A `Dataset` is a handle to a plan; nothing runs until a terminal operation.
 :::{grid-item-card} {octicon}`code;1.1em` Expressions run in Rust
 :link: expressions
 :link-type: doc
-Column work is described, not looped — evaluated over Arrow batches in Rust.
+You describe column work; Rust evaluates it over whole Arrow batches.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` One core to a cluster
@@ -34,11 +35,20 @@ The optimizer re-plans mid-query on measured row counts, not static guesses.
 
 ## Where to go next
 
-- [Reading data](../../user-guide/reading-data.md): every way to build a dataset.
+- [Reading data](../../user-guide/reading-data.md): every way to get a dataset.
 - [Transformations](../../user-guide/transformations.md),
   [Aggregations](../../user-guide/aggregations.md),
   [Joins](../../user-guide/joins.md),
   [Window functions](../../user-guide/window-functions.md).
+
+## See also
+
+:::{seealso}
+- {doc}`../../architecture/index`: the same split, at the level of the whole system.
+- {doc}`../../deep-dives/query-lifecycle`: what actually happens between `collect()` and
+  the Arrow batches coming back.
+- {doc}`../../user-guide/explain-plans`: reading the plan these concepts describe.
+:::
 
 ```{toctree}
 :hidden:

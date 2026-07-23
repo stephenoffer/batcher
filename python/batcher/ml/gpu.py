@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.hardware import available_cpu_count
+from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher.config import active_config
 
 if TYPE_CHECKING:
@@ -38,6 +38,7 @@ __all__ = [
     "gpu_aware_pool_default",
     "gpu_feedback_key",
     "gpu_vram_gb",
+    "inference_vram_multiplier",
     "load_gpu_peak_vram",
     "load_gpu_utilization",
     "max_actors_per_gpu",
@@ -73,28 +74,76 @@ def resolve_num_workers(num_workers: int | str, num_gpus: float) -> int:
     return available_cpu_count()  # usable local cores (cgroup/affinity aware), not host count
 
 
+def _accelerator_pool_size(resources: dict[str, float] | None, num_partitions: int) -> int | None:
+    """Actor-pool size that fills a cluster's *custom* accelerators (TPU / Trainium / Gaudi).
+
+    The GPU foot-gun the pool default avoids — one actor idling a whole cluster — is identical
+    for a non-GPU accelerator, which Ray reports as a named resource rather than as `GPU`. A
+    stage asking `{"TPU": 4}` should spawn ``cluster_TPU / 4`` replicas so every chip runs one.
+    Bounded by the *most* constraining requested resource (a stage needing both `TPU` and a
+    scarce custom resource fills the scarcer), and by the partition count. Returns `None` — so
+    the caller keeps its worker-count fallback — when no accelerator is requested, the cluster
+    advertises none of a requested one (nothing to fill), or Ray is unreadable.
+    """
+    if not resources:
+        return None
+    try:
+        import ray
+
+        avail = ray.cluster_resources()
+    except Exception:
+        return None
+    replicas: int | None = None
+    for name, per in resources.items():
+        if per <= 0:
+            continue
+        total = float(avail.get(name, 0.0))
+        if total <= 0:  # a requested accelerator the cluster doesn't have → don't guess
+            return None
+        fit = int(total / per)
+        replicas = fit if replicas is None else min(replicas, fit)
+    if not replicas or replicas <= 0:
+        return None
+    return max(1, min(num_partitions, replicas))
+
+
 def gpu_aware_pool_default(
     num_gpus: float,
     fallback: int,
     num_partitions: int,
     accelerator_type: str | None = None,
+    *,
+    tensor_parallel_size: int = 1,
+    resources: dict[str, float] | None = None,
 ) -> int:
     """Default distributed actor-pool size when `concurrency` is unset.
 
     For a GPU stage, size the pool to the cluster's GPUs so *every* GPU gets an actor
     (replicas = total_GPUs / per-actor `num_gpus`) — never one engine idling a multi-GPU
-    cluster (the Ray Data ``concurrency=1`` foot-gun). For a CPU stage, keep the cluster
-    worker count (`fallback`). Clamped to the partition count (no idle actors); falls back
-    when Ray reports no GPUs.
+    cluster (the Ray Data ``concurrency=1`` foot-gun). A stage on a **custom** accelerator
+    (TPU / Trainium / Inferentia / Gaudi, which carries `num_gpus == 0` plus a named
+    `resources` request) is sized the same way against that resource's cluster total, so a
+    TPU pod fills its chips rather than running one actor. For a plain CPU stage, keep the
+    cluster worker count (`fallback`). Clamped to the partition count (no idle actors); falls
+    back when Ray reports no matching accelerator.
 
     When the stage is pinned to an `accelerator_type` on a **heterogeneous** cluster
     (mixed GPU classes), size against *that class's* GPUs — Ray tags them as the
     ``accelerator_type:<NAME>`` resource — so a stage pinned to the 4 A100s never spawns
     actors for the 8 T4s it can't run on. Taken as a `min` with the total GPU count, so
     an absent or sentinel typed resource only ever sizes *down* (never over-subscribes).
+
+    A **tensor-parallel** engine (vLLM ``tensor_parallel_size=N``) spawns N GPU workers per
+    replica, so one actor consumes ``num_gpus * N`` GPUs even though it declares `num_gpus`.
+    Sizing on `num_gpus` alone therefore spawns N times too many replicas and the pool never
+    schedules. Pass `tensor_parallel_size` and the replica count becomes Ray's documented
+    ``available_GPUs / tensor_parallel_size``. The default of 1 leaves every existing caller
+    unchanged.
     """
     if num_gpus <= 0:
-        return fallback
+        pool = _accelerator_pool_size(resources, num_partitions)
+        return pool if pool is not None else fallback
+    per_replica = num_gpus * max(1, tensor_parallel_size)
     try:
         import ray
 
@@ -108,7 +157,7 @@ def gpu_aware_pool_default(
         return fallback
     if total <= 0:
         return fallback
-    return max(1, min(num_partitions, int(total / num_gpus)))
+    return max(1, min(num_partitions, int(total / per_replica)))
 
 
 _NAMESPACE = "ml.gpu"
@@ -117,11 +166,22 @@ _NAMESPACE = "ml.gpu"
 _PACK_BELOW = 0.5
 _SATURATED_ABOVE = 0.9
 # Don't fragment a GPU finer than this (avoids requesting unschedulable slivers).
-_MIN_FRACTION = 0.25
+# Raised back from 0.25: the old value silently CAPPED packing at 4 actors/GPU, so a
+# 0.1 GB embedding model that VRAM-fits 36 actors on an 80 GB card still got 4 and
+# stranded ~90% of the device. `max_actors_per_gpu` has already proven the slice fits in
+# VRAM, so the only job left for a floor is keeping the request schedulable; 0.05 (20
+# actors/GPU) is the density past which per-actor CUDA contexts and SM time-slicing stop
+# paying, and Ray schedules fractions this small without trouble.
+_MIN_FRACTION = 0.05
+# `_PACK_BELOW`/`recommend_num_gpus` keeps the coarser 0.25 floor: that path packs from
+# *utilization*, which says nothing about whether the model's weights fit in the slice.
+_UTIL_MIN_FRACTION = 0.25
 # Bounds on the adaptive per-actor submit-ahead depth (how many partitions an inference
 # actor keeps in flight). A starved GPU (low measured utilization) submits deeper to
-# overlap the dispatch/gather round-trip; a saturated one keeps the shallow default.
-_INFLIGHT_DEPTH_MAX = 16
+# overlap the dispatch/gather round-trip; a saturated one keeps the shallow default. The
+# ceiling is shared with the distributed actor pool via the neutral `_internal.hardware`
+# so the two paths cannot drift (the alias keeps the short local name at the call sites).
+_INFLIGHT_DEPTH_MAX = INFERENCE_INFLIGHT_DEPTH_MAX
 # Above this measured peak-VRAM fraction the device has too little headroom to hold several
 # partitions in flight, so the submit-ahead depth stays shallow regardless of utilization.
 _VRAM_TIGHT = 0.8
@@ -134,70 +194,119 @@ _CONTEXT_OVERHEAD_GB = {
     "xpu": 0.3,
     "mps": 0.0,
     "tpu": 0.0,
+    # Neuron (Trainium/Inferentia) and Gaudi manage device memory through their own runtimes
+    # rather than a CUDA-style context reserve, so no separate host-side overhead is budgeted.
+    "neuron": 0.0,
+    "hpu": 0.0,
     "cpu": 0.0,
 }
-# Budget peak inference VRAM at ~1.5x model size (activations + batch tensors).
+# Budget peak inference VRAM at ~1.5x model size (activations + batch tensors). This is
+# the multiplier at the REFERENCE workload below; `inference_vram_multiplier` scales it
+# with the three things that actually drive peak activation memory.
 _INFERENCE_VRAM_MULTIPLIER = 1.5
+# The workload the flat 1.5x was implicitly calibrated for: 32 rows of 512-token sequences
+# in fp16. At exactly this point the scaled multiplier still returns 1.5, so every caller
+# that passes no workload information is unchanged.
+_REF_BATCH_ROWS = 32
+_REF_SEQ_LEN = 512
+_REF_DTYPE_BYTES = 2
+# Activations are the part of the 1.5x that scales; the remaining 1.0x is the weights,
+# which do not depend on the batch at all.
+_ACTIVATION_SHARE = _INFERENCE_VRAM_MULTIPLIER - 1.0
+# Clamp the scaled multiplier. The low bound keeps a tiny batch from budgeting below the
+# weights plus a working slice; the high bound stops a huge declared sequence length from
+# collapsing packing to 1 actor on a model whose activations are checkpointed or paged.
+_MIN_VRAM_MULTIPLIER = 1.1
+_MAX_VRAM_MULTIPLIER = 4.0
+
+
+def inference_vram_multiplier(
+    *,
+    batch_rows: int | None = None,
+    seq_len: int | None = None,
+    activation_dtype_bytes: int | None = None,
+) -> float:
+    """Peak-inference VRAM as a multiple of model size, scaled by the workload.
+
+    Peak VRAM during inference is the weights plus the activation working set, and the
+    activations scale with the batch size, the sequence length, and the width of the
+    activation dtype — none of which a flat multiplier can see. A fixed 1.5x therefore
+    over-packs a long-context fp32 job into an OOM and under-packs a short fp16 one.
+
+    The scaling is anchored so that the reference workload (32 rows, 512 tokens, fp16)
+    returns exactly 1.5, the value this was before. Omit an argument and that dimension
+    contributes its reference value, so passing nothing is the old behavior.
+
+    Args:
+        batch_rows: rows per forward pass; activations scale linearly with it.
+        seq_len: tokens per row for a sequence model; 1 for a fixed-shape vision model.
+        activation_dtype_bytes: 2 for fp16/bf16, 4 for fp32.
+
+    Returns:
+        The multiplier, clamped to ``[1.1, 4.0]``.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.gpu import inference_vram_multiplier
+            >>> inference_vram_multiplier()
+            1.5
+            >>> inference_vram_multiplier(batch_rows=32, seq_len=512)
+            1.5
+            >>> inference_vram_multiplier(batch_rows=128, seq_len=2048) > 1.5
+            True
+    """
+    rows = _REF_BATCH_ROWS if batch_rows is None or batch_rows <= 0 else batch_rows
+    tokens = _REF_SEQ_LEN if seq_len is None or seq_len <= 0 else seq_len
+    width = (
+        _REF_DTYPE_BYTES
+        if activation_dtype_bytes is None or activation_dtype_bytes <= 0
+        else activation_dtype_bytes
+    )
+    scale = (rows / _REF_BATCH_ROWS) * (tokens / _REF_SEQ_LEN) * (width / _REF_DTYPE_BYTES)
+    return min(_MAX_VRAM_MULTIPLIER, max(_MIN_VRAM_MULTIPLIER, 1.0 + _ACTIVATION_SHARE * scale))
 
 
 def detect_backend() -> str:
-    """The accelerator backend: ``cuda`` / ``rocm`` / ``xpu`` / ``mps`` / ``tpu`` / ``cpu``.
+    """The accelerator backend, one of ``cuda`` / ``rocm`` / ``xpu`` / ``mps`` / ``tpu`` /
+    ``neuron`` / ``hpu`` / ``cpu``.
 
-    Detected via torch (the most portable probe): ROCm reports through the CUDA API
-    with ``torch.version.hip`` set; Intel GPUs via ``torch.xpu``; Apple via MPS; Cloud
-    TPUs via ``torch_xla``. Falls back to ``cpu`` when torch is absent or no accelerator
-    is present.
+    Thin re-export of `_internal.hardware.accelerator_backend`. The detection itself is a
+    hardware fact and lives in the neutral layer so `core` can use it to place the
+    relational GPU kernels without importing this user-facing package; keeping one
+    implementation is what stops the executor and the ML layer from disagreeing about
+    which device is present.
     """
-    try:
-        import torch
-    except ImportError:
-        return "cpu"
-    if torch.cuda.is_available():
-        return "rocm" if getattr(torch.version, "hip", None) else "cuda"
-    xpu = getattr(torch, "xpu", None)
-    if xpu is not None and xpu.is_available():
-        return "xpu"
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return "mps"
-    if _tpu_available():
-        return "tpu"
-    return "cpu"
+    from batcher._internal.hardware import accelerator_backend
 
-
-def _tpu_available() -> bool:
-    """Whether a Cloud TPU is present, via `torch_xla` — import-gated and side-effect-free.
-
-    `find_spec` avoids importing (and so initializing) the XLA runtime on the common
-    no-TPU host; only when `torch_xla` is actually installed do we ask its runtime for
-    the device type. Any failure (older API, no device) reads as "no TPU"."""
-    import importlib.util
-
-    if importlib.util.find_spec("torch_xla") is None:
-        return False
-    try:
-        import torch_xla.runtime as xr  # type: ignore[import-not-found]
-
-        return xr.device_type() == "TPU"
-    except Exception:
-        return False
+    return accelerator_backend()
 
 
 def torch_device(backend: str | None = None) -> str:
     """The torch device string for `backend` (default: detected) — what ``.to(...)`` wants.
 
     ROCm uses the ``cuda`` device string (HIP shims the CUDA API); Intel is ``xpu``,
-    Apple ``mps``, a TPU is ``xla`` (torch_xla), and CPU ``cpu``.
+    Apple ``mps``, a TPU and AWS Neuron (Trainium/Inferentia) are ``xla`` (both run through
+    torch_xla), Intel Gaudi is ``hpu`` (habana_frameworks), and CPU ``cpu``.
+
+    An unrecognized backend degrades to ``cpu`` rather than raising. This is a mapping of
+    *names*, and the names come from places this function does not control — a caller
+    naming an accelerator we have not taught it about, or a newer `detect_backend`. A
+    `KeyError` from a device-string lookup would abort a job that could have run correctly,
+    if slower, on the CPU; the whole point of the accelerator layer is that it is an
+    optimization.
     """
-    b = backend or detect_backend()
+    b = detect_backend() if backend in (None, "auto") else backend
     return {
         "cuda": "cuda",
         "rocm": "cuda",
         "xpu": "xpu",
         "mps": "mps",
         "tpu": "xla",
+        "neuron": "xla",  # torch-neuronx runs through XLA, same as Cloud TPU
+        "hpu": "hpu",  # Intel Gaudi via habana_frameworks
         "cpu": "cpu",
-    }[b]
+    }.get(b, "cpu")
 
 
 def vram_context_overhead(backend: str | None = None) -> float:
@@ -311,15 +420,75 @@ def gpu_vram_gb() -> float | None:
     return None
 
 
+def _own_budget_fraction(used_by_pid: float, total: float, n_processes: int) -> float | None:
+    """This process's VRAM use as a fraction of its **fair share** of a shared device.
+
+    The number an actor must react to when several inference actors are packed onto one
+    GPU. Reading the device-wide ``used`` instead makes every co-tenant observe the
+    *aggregate*, so a single actor growing its batch pushes all of them over the cap and
+    they all shrink together — a synchronized oscillation down to the minimum batch size
+    that no actor caused and none can escape. Dividing the device between its `n_processes`
+    tenants gives each actor a private budget, so it responds only to its own allocations.
+
+    Degenerates exactly to ``used / total`` for a sole tenant, so the single-actor path is
+    unchanged.
+
+    Args:
+        used_by_pid: bytes this process has allocated on the device.
+        total: the device's total VRAM in bytes.
+        n_processes: compute processes resident on the device (clamped to >= 1).
+
+    Returns:
+        The fraction of this process's budget in use, or `None` when `total` is zero.
+    """
+    if total <= 0:
+        return None
+    budget = total / max(1, n_processes)
+    return used_by_pid / budget if budget else None
+
+
+def _nvml_own_vram_fraction(handle: Any) -> float | None:
+    """`_own_budget_fraction` from NVML's per-process accounting, or `None` if unavailable.
+
+    `None` (rather than a guess) whenever NVML cannot attribute memory per process — an
+    older driver with no ``nvmlDeviceGetComputeRunningProcesses``, or a container without
+    the PID namespace visibility it needs — so the caller falls back to the device-wide
+    reading instead of silently reporting zero usage."""
+    nvml = _nvml()
+    query = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses", None)
+    if query is None:
+        return None
+    try:
+        import os
+
+        procs = query(handle)
+        total = nvml.nvmlDeviceGetMemoryInfo(handle).total
+        pid = os.getpid()
+        # `usedGpuMemory` is None when the driver won't attribute it (permission, MIG).
+        # Such an entry still proves a tenant exists, so it counts toward the divisor.
+        accounted = [p for p in procs if getattr(p, "usedGpuMemory", None) is not None]
+        if not accounted:
+            return None
+        used = sum(float(p.usedGpuMemory) for p in accounted if getattr(p, "pid", None) == pid)
+        return _own_budget_fraction(used, float(total), len(procs))
+    except Exception:
+        return None
+
+
 def sample_gpu_vram_fraction() -> float | None:
-    """Fraction (0..1) of accelerator-0 VRAM in use, or `None` without a GPU.
+    """Fraction (0..1) of this process's VRAM budget in use, or `None` without a GPU.
 
     Feeds the throughput autobatcher's VRAM cap so it shrinks (or refuses to grow) the
-    batch *before* an out-of-memory rather than catching one after the fact. Tries the
-    vendor SMI (NVML — counts every process on the device) then torch's reserved
-    memory; returns `None` on a GPU-less host, where the guard is simply inert."""
+    batch *before* an out-of-memory rather than catching one after the fact. Prefers NVML's
+    **per-process** accounting scaled to this process's share of the device
+    (`_own_budget_fraction`), so packed inference actors don't all react to each other's
+    allocations; falls back to the device-wide reading, then to torch's reserved memory.
+    Returns `None` on a GPU-less host, where the guard is simply inert."""
     handle = _vram_handle()
     if handle is not None:
+        own = _nvml_own_vram_fraction(handle)
+        if own is not None:
+            return own
         try:
             info = _nvml().nvmlDeviceGetMemoryInfo(handle)
             return info.used / info.total if info.total else None
@@ -330,6 +499,8 @@ def sample_gpu_vram_fraction() -> float | None:
 
         if torch.cuda.is_available():
             total = torch.cuda.get_device_properties(0).total_memory
+            # torch's reserved bytes are already this process's own allocator, so this
+            # path needs no per-process attribution.
             return torch.cuda.memory_reserved(0) / total if total else None
         # MPS unified memory: current allocation against the recommended budget.
         mps = getattr(torch.backends, "mps", None)
@@ -347,7 +518,10 @@ def max_actors_per_gpu(
     *,
     headroom: float = 0.2,
     context_overhead_gb: float | None = None,
-    inference_multiplier: float = _INFERENCE_VRAM_MULTIPLIER,
+    inference_multiplier: float | None = None,
+    batch_rows: int | None = None,
+    seq_len: int | None = None,
+    activation_dtype_bytes: int | None = None,
 ) -> int:
     """How many inference actors fit on one GPU, VRAM-budgeted.
 
@@ -357,27 +531,38 @@ def max_actors_per_gpu(
     `context_overhead_gb` defaults to the detected vendor's process-context overhead
     (NVIDIA 0.4, AMD 0.5, Intel 0.3, Apple 0.0). This packs a small model and refuses
     to over-subscribe a large one into an OOM.
+
+    `inference_multiplier` defaults to `inference_vram_multiplier` evaluated on
+    `batch_rows` / `seq_len` / `activation_dtype_bytes` — the three drivers of peak
+    activation memory. Passing none of them reproduces the flat 1.5x this used before.
+    An explicit `inference_multiplier` overrides the workload scaling entirely.
     """
     if model_vram_gb <= 0 or gpu_vram_gb <= 0:
         return 1
+    if inference_multiplier is None:
+        inference_multiplier = inference_vram_multiplier(
+            batch_rows=batch_rows, seq_len=seq_len, activation_dtype_bytes=activation_dtype_bytes
+        )
     overhead = vram_context_overhead() if context_overhead_gb is None else context_overhead_gb
     usable = gpu_vram_gb * (1.0 - headroom)
     per_actor = model_vram_gb * inference_multiplier + overhead
     return max(1, int(usable // per_actor))
 
 
-def recommend_gpu_fraction(model_vram_gb: float, gpu_vram_gb: float, **kwargs: float) -> float:
+def recommend_gpu_fraction(model_vram_gb: float, gpu_vram_gb: float, **kwargs: Any) -> float:
     """The per-actor ``num_gpus`` fraction so several actors share a GPU when the
     model is small, floored at `_MIN_FRACTION` to avoid unschedulable slivers; 1.0
     when only one actor fits. The static counterpart to the measured-utilization
     `recommend_num_gpus` (use this to size a cold start, that to adapt across runs).
 
-    Use *this* for the scheduler's ``num_gpus``, not `max_actors_per_gpu` directly:
-    the actors Ray actually packs onto one GPU is ``floor(1 / fraction)``, which is
-    ``min(max_actors_per_gpu(...), 4)`` — the 0.25 floor caps packing density at 4/GPU
-    even when more would fit by VRAM. So this is always schedule-safe (never over-
-    subscribes a GPU), at the cost of leaving VRAM unused for very small models."""
-    n = max_actors_per_gpu(model_vram_gb, gpu_vram_gb, **kwargs)  # type: ignore[arg-type]
+    Use *this* for the scheduler's ``num_gpus``, not `max_actors_per_gpu` directly: the
+    actors Ray actually packs onto one GPU is ``floor(1 / fraction)``, so the fraction has
+    to be the reciprocal of the VRAM-derived count rather than the count itself. The floor
+    only guards schedulability — `max_actors_per_gpu` has already proven the slice holds
+    the model — so it no longer caps density at 4 actors/GPU and a small model can now use
+    the whole device. `kwargs` forward to `max_actors_per_gpu` (including the
+    `batch_rows` / `seq_len` / `activation_dtype_bytes` workload scaling)."""
+    n = max_actors_per_gpu(model_vram_gb, gpu_vram_gb, **kwargs)
     if n <= 1:
         return 1.0
     return max(_MIN_FRACTION, round(1.0 / n, 2))
@@ -506,6 +691,14 @@ def recommend_inference_dtype(backend: str | None = None) -> str | None:
     ``"float16"`` on Turing/Volta and Apple MPS (fast FP16, no native BF16), and `None`
     (keep FP32) on older/CPU/probe-failure so the model never silently loses precision
     where half gives no speedup. The per-GPU default Ray Data users otherwise set by hand.
+
+    TPU and Intel XPU deliberately still return `None`, even though both have native BF16
+    and a TPU's MXU multiplies in it. Returning ``"bfloat16"`` there would set the model's
+    *storage* dtype, which is a stronger change than the FP32→BF16 rewrite XLA already
+    applies to matmuls on its own — so it is a numerics change, not just a speed one, and
+    nobody has measured it on the hardware. Characterize it on a real device before
+    changing this; an unvalidated half-precision default is exactly the "fast wrong
+    answer" this function exists to avoid.
     """
     b = backend or detect_backend()
     try:
@@ -539,7 +732,7 @@ def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:
     if util_fraction is None or requested <= 0.0:
         return requested
     if requested >= 1.0 and util_fraction < _PACK_BELOW:
-        frac = max(_MIN_FRACTION, round(util_fraction, 2))
+        frac = max(_UTIL_MIN_FRACTION, round(util_fraction, 2))
         return min(1.0, frac)
     if requested < 1.0 and util_fraction > _SATURATED_ABOVE:
         return 1.0
@@ -686,6 +879,12 @@ _AUTOCAST_VERDICT: dict[str, bool] = {}
 # is not bit-identical, so it is only worth applying when it is a real tensor-core win.
 _AUTOCAST_PROBE_ROWS = 64
 _AUTOCAST_MIN_SPEEDUP = 1.15
+# A UDF sets this attribute (on the function, or on a class UDF's instance/class) to False
+# to decline the probe outright. The probe re-executes the model, which is free for a local
+# tensor forward but is a *duplicated billed request* for a UDF that calls a hosted LLM, and
+# is not idempotent for one that writes anything. Neither is detectable from the callable,
+# so an author who knows their UDF has side effects opts out here.
+_AUTOCAST_OPT_OUT_ATTR = "batcher_autocast"
 
 
 def autocast_call(call: Callable) -> Callable:
@@ -705,11 +904,23 @@ def autocast_call(call: Callable) -> Callable:
     verdict is cached per model. This keeps "correctness before speed": FP16 is used only when it
     is a genuine speedup, never as a silent output change with no benefit.
 
+    The probe re-executes the model, which costs nothing for a local tensor forward but
+    duplicates a *billed request* for a UDF that calls a hosted model, and is not idempotent
+    for a UDF that writes anything. Two guards keep that from happening. A UDF may set
+    ``batcher_autocast = False`` on itself (or on a class UDF's class) to decline outright,
+    in which case `call` is returned untouched and never runs twice. Otherwise the probe
+    stops after its FIRST execution unless that execution actually allocated accelerator
+    memory, so an opaque UDF that never touches the local GPU costs one extra slice-sized
+    run rather than the full timing sweep.
+
     Returns `call` unchanged when it can't apply — `distributed.autocast_inference` off, a CPU
-    host, a GPU with no fast half type, or torch absent. Config is read each call so a job can
-    pin FP32 (bit-exact repro); the device/dtype probe is cached (stable per worker).
+    host, a GPU with no fast half type, torch absent, or the opt-out above. Config is read each
+    call so a job can pin FP32 (bit-exact repro); the device/dtype probe is cached (stable per
+    worker).
     """
     if not active_config().distributed.autocast_inference:
+        return call
+    if not _autocast_probe_allowed(call):
         return call
     ctx = _autocast_device_dtype()
     if ctx is None:
@@ -734,6 +945,38 @@ def autocast_call(call: Callable) -> Callable:
     return _cast
 
 
+def _autocast_probe_allowed(call: Callable) -> bool:
+    """Whether `call` permits the re-executing autocast probe (``batcher_autocast`` opt-out)."""
+    obj = getattr(call, "__self__", call)  # bound method -> its instance; else the callable
+    for target in (call, obj, type(obj)):
+        if getattr(target, _AUTOCAST_OPT_OUT_ATTR, True) is False:
+            return False
+    return True
+
+
+def _allocated_accelerator_bytes(call: Callable, probe: Any, device_type: str) -> int | None:
+    """Peak accelerator bytes `call(probe)` allocated, or `None` when it can't be measured.
+
+    Runs `call` exactly once. This is the cheap half of the autocast probe: a UDF that
+    allocates nothing on the local device is not a tensor forward autocast could speed up
+    (it is a hosted-API call, a CPU transform, or a no-op), so the verdict is settled after
+    one execution instead of the eight the full timing sweep costs."""
+    try:
+        import torch
+
+        stats = getattr(torch, device_type, None)
+        reset = getattr(stats, "reset_peak_memory_stats", None)
+        peak = getattr(stats, "max_memory_allocated", None)
+        if reset is None or peak is None:
+            return None  # backend has no allocator stats (mps/xla) — fall through to timing
+        reset()
+        base = int(peak())
+        call(probe)
+        return max(0, int(peak()) - base)
+    except Exception:
+        return None
+
+
 def _autocast_key(call: Callable) -> str | None:
     """A stable cache key for a model call's autocast verdict (function or callable instance)."""
     obj = getattr(call, "__self__", call)  # bound method -> its instance; else the callable
@@ -746,6 +989,10 @@ def _autocast_key(call: Callable) -> str | None:
 def _autocast_speeds_up(call: Callable, batch, device_type: str, dtype: Any) -> bool:
     """Time `call` FP32 vs autocast on a slice; True if autocast is >= the required speedup.
 
+    Cheap-exits after ONE execution when that execution allocated no accelerator memory —
+    the call is then not a local tensor forward, so autocast cannot help it and the
+    remaining seven runs would be pure duplicated side effects (see `autocast_call`).
+
     On any failure (a model that errors under autocast, an odd batch type) returns False — the
     safe, output-preserving FP32 path. The probe's outputs are discarded (timing only)."""
     try:
@@ -754,6 +1001,10 @@ def _autocast_speeds_up(call: Callable, batch, device_type: str, dtype: Any) -> 
         rows = getattr(batch, "num_rows", 0)
         probe = batch.slice(0, min(rows, _AUTOCAST_PROBE_ROWS)) if rows else batch
 
+        allocated = _allocated_accelerator_bytes(call, probe, device_type)
+        if allocated is not None and allocated <= 0:
+            return False
+
         def _fp32() -> None:
             call(probe)
 
@@ -761,7 +1012,9 @@ def _autocast_speeds_up(call: Callable, batch, device_type: str, dtype: Any) -> 
             with torch.autocast(device_type=device_type, dtype=dtype):
                 call(probe)
 
-        _fp32()  # warm (weights resident, cudnn/cublas kernels selected)
+        if allocated is None:
+            _fp32()  # warm (weights resident, cudnn/cublas kernels selected)
+        # else: the allocation probe above already ran `call` once, which is the warm-up.
         _fp16()
         if device_type == "cuda":
             torch.cuda.synchronize()

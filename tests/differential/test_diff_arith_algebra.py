@@ -16,8 +16,8 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.arith_algebra  # registers the rules into DEFAULT_REGISTRY
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 _INT64_MAX = 2**63 - 1
 

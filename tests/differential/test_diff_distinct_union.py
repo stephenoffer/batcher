@@ -5,11 +5,10 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def test_distinct_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table({"a": [1, 1, 2, 2, 3, 1], "b": ["x", "x", "y", "z", "z", "x"]})
     duck.register("t", t)
     out = bt.from_arrow(t).distinct().collect()
@@ -17,8 +16,6 @@ def test_distinct_vs_duckdb(duck):
 
 
 def test_distinct_after_projection_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table({"a": [1, 2, 3, 4], "b": [10, 10, 20, 20]})
     duck.register("t", t)
     out = bt.from_arrow(t).select("b").distinct().collect()
@@ -26,8 +23,6 @@ def test_distinct_after_projection_vs_duckdb(duck):
 
 
 def test_union_all_vs_duckdb(duck):
-    from conftest import assert_same
-
     a = pa.table({"x": [1, 2, 3]})
     b = pa.table({"x": [3, 4, 5]})
     duck.register("a", a)
@@ -37,8 +32,6 @@ def test_union_all_vs_duckdb(duck):
 
 
 def test_union_distinct_vs_duckdb(duck):
-    from conftest import assert_same
-
     a = pa.table({"x": [1, 2, 2, 3]})
     b = pa.table({"x": [3, 4, 5]})
     duck.register("a", a)

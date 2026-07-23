@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -36,8 +37,6 @@ def _quotes():
 
 
 def test_asof_backward_by_symbol(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_trades()).join_asof(bt.from_arrow(_quotes()), on="ts", by="sym").collect()
     duck.register("trades", _trades())
     duck.register("quotes", _quotes())
@@ -51,8 +50,6 @@ def test_asof_backward_by_symbol(duck):
 
 
 def test_asof_forward_by_symbol(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_trades())
         .join_asof(bt.from_arrow(_quotes()), on="ts", by="sym", direction="forward")
@@ -70,8 +67,6 @@ def test_asof_forward_by_symbol(duck):
 
 
 def test_asof_no_by(duck):
-    from conftest import assert_same
-
     left = pa.table({"ts": pa.array([1, 5, 10, 30], type=pa.int64())})
     right = pa.table(
         {"ts": pa.array([2, 6, 20], type=pa.int64()), "v": pa.array([20, 60, 200], type=pa.int64())}

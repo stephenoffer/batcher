@@ -33,7 +33,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from functools import reduce
 
-from batcher._internal.errors import AccessDeniedError
+from batcher._internal.errors import AccessDeniedError, PlanError
+from batcher.governance._validate import reject_bare_string
 from batcher.governance.audit import GovernanceEvent
 from batcher.governance.catalog import SecurityCatalog
 from batcher.governance.principal import Principal
@@ -56,6 +57,23 @@ def enforce(
     is by construction what was enforced. A denial raises before any event is returned;
     the exception carries the same facts.
 
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.governance import Principal, Redact, SecurityCatalog, enforce
+            >>> from batcher.plan.logical import Scan
+            >>> from batcher.plan.schema import SchemaRef
+            >>> schema = SchemaRef.from_arrow(pa.schema([("id", pa.int64()), ("ssn", pa.string())]))
+            >>> catalog = SecurityCatalog().grant("analyst", on="people", select=["id", "ssn"])
+            >>> catalog = catalog.mask_column("people", "ssn", Redact(show_last=4))
+            >>> analyst = Principal("ana", roles={"analyst"})
+            >>> governed, events = enforce(Scan(0, schema), ["people"], analyst, catalog)
+            >>> events[0].masked
+            ('ssn',)
+            >>> governed.items[1].expr  # `ssn` is read through the mask, at the scan
+            col('ssn').cast('string').str.mask('X', 0, 4)
+
     Args:
         plan: The plan to govern.
         tables: The table name of each source, indexed by a `Scan`'s ``source_id``.
@@ -69,13 +87,41 @@ def enforce(
 
     Raises:
         AccessDeniedError: If the principal may select no column of a governed table.
+        PlanError: If `tables` is a bare string, `principal` is not a `Principal`, or a
+            `Scan`'s ``source_id`` has no entry in `tables` while the catalog governs
+            anything. That last one used to be ignored — the scan was left ungoverned —
+            which turns a caller's off-by-one into a policy that silently does not
+            apply. On an authorization boundary the only safe direction is to fail.
     """
+    reject_bare_string(
+        tables, what="enforce(tables=...)", param="tables", reads_as="one table per character"
+    )
+    if not isinstance(principal, Principal):
+        raise PlanError(
+            f"enforce needs a Principal, but got {type(principal).__name__} {principal!r}.",
+            hint='Build one with bt.Principal("name", roles=[...]).',
+        )
     events: list[GovernanceEvent] = []
+    # An unnamed source is only safe to leave alone when *nothing* is governed; once a
+    # catalog declares a policy, a source it cannot name is a policy that might not have
+    # been applied, and that must not pass silently.
+    governing = catalog._any_policy()
 
     def govern(node: LogicalPlan) -> LogicalPlan:
         if not isinstance(node, Scan):
             return node
-        table = tables[node.source_id] if node.source_id < len(tables) else ""
+        if node.source_id >= len(tables):
+            if governing:
+                raise PlanError(
+                    f"Cannot enforce policy: the plan scans source {node.source_id}, but "
+                    f"only {len(tables)} table name(s) were given.",
+                    hint=(
+                        "enforce() indexes `tables` by a Scan's source_id, so it needs "
+                        "one entry per bound source."
+                    ),
+                )
+            return node
+        table = tables[node.source_id]
         if not table or not catalog.governs(table):
             return node
         governed, event = _govern_scan(node, table, principal, catalog)
@@ -111,11 +157,17 @@ def _govern_scan(
     columns = scan.available_columns()
     visible = catalog.visible_columns(table, columns, principal)
     if not visible:
+        held = sorted(principal.roles)
         raise AccessDeniedError(
-            f"principal {principal.name!r} may not read table {table!r}: "
-            f"no column is granted to roles {sorted(principal.roles)}",
+            f"Principal {principal.name!r} may not read table {table!r}: no column is "
+            f"granted to {'its roles ' + str(held) if held else 'a principal with no roles'}.",
             table=table,
             columns=tuple(columns),
+            hint=(
+                "Grant it access with "
+                f"catalog.grant(<role>, on={table!r}, select=[...]), or give the "
+                "principal a role that already has one."
+            ),
         )
 
     governed: LogicalPlan = scan

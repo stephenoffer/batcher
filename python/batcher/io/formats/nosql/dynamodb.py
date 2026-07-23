@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import pyarrow as pa
@@ -56,7 +57,7 @@ class DynamoDBSource(ScanSource):
     # keeps a partial or skipped push correct.
     supports_predicate = True
 
-    __slots__ = ("_pushed_filter",)
+    __slots__ = ()
 
     def __init__(
         self,
@@ -76,21 +77,6 @@ class DynamoDBSource(ScanSource):
             aws_secret_access_key=aws_secret_access_key,
             endpoint_url=endpoint_url,
         )
-        # The translated ``Scan`` filter for the active read, or None. Set per-read
-        # by `read`/`iter_batches`; consumed in `_read_partition`.
-        self._pushed_filter: _DynamoFilter | None = None
-
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection, predicate))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        self._pushed_filter = _to_dynamo_filter(predicate) if predicate is not None else None
-        for partition in self._enumerate_partitions():
-            yield from self._read_partition(partition, projection)
 
     def _client(self) -> Any:
         boto3 = require_driver("boto3", "dynamodb")
@@ -99,13 +85,31 @@ class DynamoDBSource(ScanSource):
             "dynamodb",
             region_name=kw["region_name"],
             aws_access_key_id=kw["aws_access_key_id"],
-            aws_secret_access_key=kw["aws_secret_access_key"],
+            aws_secret_access_key=self._secret("aws_secret_access_key"),
             endpoint_url=kw["endpoint_url"],
         )
 
     def _identity_suffix(self) -> str:
         region = self._conn_kwargs["region_name"] or "default"
         return f"{region}/{self._conn_kwargs['table']}"
+
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """`_conn_kwargs` with the AWS keys dropped before the connection is fingerprinted.
+
+        `connection_fingerprint` drops credentials by exact key name — ``password``,
+        ``secret``, ``token``, ``api_key`` — and AWS spells its own with a prefix.
+        ``aws_secret_access_key`` is not the string ``secret``, so it matched nothing and
+        the live secret key was digested straight into `identity()`, the **persisted**
+        learned-statistics key.
+
+        One-way, so not a plaintext leak, but every key rotation re-keys the relation and
+        silently orphans everything Kyber has learned about the table. What is left is the
+        genuinely identifying part: `endpoint_url` is what separates DynamoDB Local (and one
+        account's table) from the real service at the same region and name, so a laptop's
+        ten-item fixture no longer teaches the optimizer a cardinality it applies to
+        production.
+        """
+        return {k: v for k, v in self._conn_kwargs.items() if not k.startswith("aws_")}
 
     def _infer_schema(self) -> pa.Schema:
         client = self._client()
@@ -120,7 +124,10 @@ class DynamoDBSource(ScanSource):
         return [(i, total) for i in range(total)]
 
     def _read_partition(
-        self, partition: _Segment, projection: list[str] | None
+        self,
+        partition: _Segment,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
         segment, total = partition
         client = self._client()
@@ -132,7 +139,7 @@ class DynamoDBSource(ScanSource):
         if projection:
             names = {f"#c{i}": col for i, col in enumerate(projection)}
             kwargs["ProjectionExpression"] = ", ".join(names)
-        pushed = self._pushed_filter
+        pushed = _to_dynamo_filter(predicate) if predicate is not None else None
         if pushed is not None:
             kwargs["FilterExpression"] = pushed.expression
             names.update(pushed.names)
@@ -242,22 +249,38 @@ def _serialize(value: Any) -> dict[str, Any]:
 
 
 def _scan_items(client: Any, kwargs: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    """Paginate a `Scan`, following `LastEvaluatedKey`, yielding decoded items."""
+    """Paginate a `Scan`, following `LastEvaluatedKey`, yielding decoded items.
+
+    Genuinely incremental: one page is held at a time and `LastEvaluatedKey` drives the
+    next request, so a scan of a table larger than memory streams rather than accumulating.
+    """
+    deserializer = _type_deserializer()
     while True:
         resp = client.scan(**kwargs)
         for item in resp.get("Items", []):
-            yield _deserialize(item)
+            yield _deserialize(item, deserializer)
         last = resp.get("LastEvaluatedKey")
         if not last:
             return
         kwargs["ExclusiveStartKey"] = last
 
 
-def _deserialize(item: dict[str, Any]) -> dict[str, Any]:
-    """Decode a DynamoDB low-level item ``{attr: {type: value}}`` to plain Python."""
+@lru_cache(maxsize=1)
+def _type_deserializer() -> Any:
+    """The one `TypeDeserializer` every decode shares.
+
+    It is stateless, so the per-item construction it replaces bought nothing — but it was
+    paid for on **every row of every scan**, along with an `import boto3.dynamodb.types`
+    lookup, in the one loop the whole connector's throughput runs through.
+    """
     from boto3.dynamodb.types import TypeDeserializer
 
-    deserializer = TypeDeserializer()
+    return TypeDeserializer()
+
+
+def _deserialize(item: dict[str, Any], deserializer: Any = None) -> dict[str, Any]:
+    """Decode a DynamoDB low-level item ``{attr: {type: value}}`` to plain Python."""
+    deserializer = deserializer if deserializer is not None else _type_deserializer()
     return {k: _to_py(deserializer.deserialize(v)) for k, v in item.items()}
 
 

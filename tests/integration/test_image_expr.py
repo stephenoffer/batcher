@@ -48,6 +48,73 @@ def test_image_to_tensor_shape():
     assert tensor[:3] == [255, 0, 0]  # solid red survives the resize
 
 
+def test_image_to_tensor_f32_scales_and_normalizes():
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
+    # Bare: scale to [0, 1]. Solid red → first pixel (1.0, 0.0, 0.0) in HWC.
+    out = ds.select(t=bt.col("img").image.to_tensor_f32(2, 2)).collect()
+    tensor = out.column("t")[0].as_py()
+    assert len(tensor) == 2 * 2 * 3
+    assert tensor[:3] == pytest.approx([1.0, 0.0, 0.0])
+
+    # Normalized + channels-first → the CHW red plane is (1 - 0.5)/0.25 = 2.0.
+    t = bt.col("img").image.to_tensor_f32(
+        2, 2, mean=[0.5, 0.5, 0.5], std=[0.25, 0.25, 0.25], channels_first=True
+    )
+    out = ds.select(t=t).collect()
+    tensor = out.column("t")[0].as_py()
+    assert tensor[0] == pytest.approx(2.0)  # red plane
+    assert tensor[4] == pytest.approx(-2.0)  # green plane starts at index hw=4
+
+
+def test_image_to_tensor_f32_is_a_shaped_float_tensor():
+    # The output round-trips as a fixed-shape-tensor column (element type float32),
+    # so it feeds a model with no per-batch Python re-type.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
+    out = ds.select(t=bt.col("img").image.to_tensor_f32(2, 2, channels_first=True)).collect()
+    ttype = str(out.schema.field("t").type)
+    assert ttype.startswith("extension<arrow.fixed_shape_tensor")
+    assert "float" in ttype and "double" not in ttype
+    # CHW shape travels in the metadata.
+    assert "shape=[3,2,2]" in ttype
+
+
+def test_image_center_crop_takes_the_middle():
+    # A solid image crops to a solid tensor of the requested shape; the Rust unit test
+    # (center_crop_takes_the_middle_and_pads_when_smaller) pins the actual pixel placement.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(8, 8), None], type=pa.binary())}))
+    out = ds.select(t=bt.col("img").image.center_crop(4, 4)).collect()
+    tensor = out.column("t")[0].as_py()
+    assert len(tensor) == 4 * 4 * 3
+    assert tensor[:3] == [255, 0, 0]  # solid red survives the crop
+    assert out.column("t")[1].as_py() is None  # undecodable → null
+    # The output is a shaped fixed-shape-tensor column.
+    ttype = str(out.schema.field("t").type)
+    assert ttype.startswith("extension<arrow.fixed_shape_tensor")
+    assert "shape=[4,4,3]" in ttype
+
+
+def test_image_center_crop_pads_when_smaller():
+    # Cropping a 2x2 image to 4x4 zero-pads the border (torchvision CenterCrop).
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(2, 2)], type=pa.binary())}))
+    tensor = ds.select(t=bt.col("img").image.center_crop(4, 4)).collect().column("t")[0].as_py()
+    assert len(tensor) == 4 * 4 * 3
+    assert tensor[:3] == [0, 0, 0]  # top-left corner is padding
+
+
+def test_image_to_grayscale_single_channel():
+    # Solid red → luma = round(0.299 * 255) = 76; output is one byte per pixel.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(8, 8), None], type=pa.binary())}))
+    out = ds.select(g=bt.col("img").image.to_grayscale(4, 4)).collect()
+    gray = out.column("g")[0].as_py()
+    assert len(gray) == 4 * 4  # not *3
+    assert all(v == 76 for v in gray)
+    assert out.column("g")[1].as_py() is None
+    # Shaped as a single-channel fixed-shape tensor.
+    ttype = str(out.schema.field("g").type)
+    assert ttype.startswith("extension<arrow.fixed_shape_tensor")
+    assert "shape=[4,4,1]" in ttype
+
+
 def test_image_decode_over_multicolumn_source(tmp_path):
     """Decoding a column of a multi-column source: projection pushdown must keep the
     decoded input column (regression — `referenced_columns` must traverse ImageFunc).

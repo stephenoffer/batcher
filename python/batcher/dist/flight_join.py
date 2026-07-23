@@ -15,18 +15,20 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
-    release_placement,
     shuffle_partitions,
 )
-from batcher.dist.fleet import acquire_fleet
+from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
+from batcher.dist.flight_worker import current_plan_id
 from batcher.io.source import Source
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 
 __all__ = ["execute_join_flight"]
@@ -41,9 +43,17 @@ def execute_join_flight(
     *,
     fused_agg: Aggregate | None = None,
     combine_partials: bool = False,
+    materialize: bool = True,
     _fault_inject_map: set[int] | None = None,
-) -> pa.Table:
+):
     """Co-partition both join sides over a Flight shuffle and join per bucket.
+
+    `materialize=False` (an *intermediate* stage of a multi-join query, with nothing
+    fused above) leaves each reducer's joined bucket published on its host actor and
+    returns a `FlightMaterializedSource` over the handles, so the next stage's mappers
+    fetch it shared-nothing. Otherwise the reducers' batches are collected into a
+    `pa.Table` (the returned type is therefore one or the other — the caller handles
+    both, exactly as for the aggregate).
 
     `fused_agg` is folded INTO the reduce so only small aggregated/partial buckets reach
     the driver — the full join never materializes on the head (exchange elimination). When
@@ -64,8 +74,7 @@ def execute_join_flight(
     barrier."""
     import ray
 
-    import batcher._native as nat
-
+    nat = engine()
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
 
@@ -97,8 +106,7 @@ def execute_join_flight(
     # each reducer to fold its joined bucket down before it leaves the worker.
     gk = aj = None
     if fused_agg is not None:
-        gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in fused_agg.group_keys])
-        aj = json.dumps([s.agg.to_ir(s.alias) for s in fused_agg.aggregates])
+        gk, aj = agg_spec_json(fused_agg)
 
     # 0-row schema probes so reducers can type the null-extended side of an outer join.
     def probe(sub_ir, source):
@@ -113,11 +121,22 @@ def execute_join_flight(
     # placement group would contend with the fleet's held bundles and deadlock.
     actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
+    # Keep the join's output ON the workers only when it is a plain intermediate: nothing
+    # to apply above it, and no fused aggregate (which already shrinks the bucket to a
+    # partial before it leaves — a far smaller thing to hand back than the join itself).
+    publish = materialize is False and not above and fused_agg is None
+    keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
     try:
         # Each side reads only the columns/rows its map prefix needs (join keys + carried
         # output), not the whole wide table — the biggest scan win on a star-schema join.
-        lproj, lpred = source_pushdown(left_plan, lsid)
-        rproj, rpred = source_pushdown(right_plan, rsid)
+        # `_relabel_single_source` rewrote each side's scan to source **0**, so the analysis
+        # must be keyed on 0 — not on the side's original id in `sources`. Keyed on `rsid`
+        # (always 1 for the right operand) the lookup missed every time and returned "no
+        # pushdown", so the build side read EVERY column of its table from storage and the
+        # map prefix then threw the surplus away. The left side (`lsid == 0`) coincidentally
+        # agreed with the relabeled id, which is why only the right side paid for it.
+        lproj, lpred = source_pushdown(left_plan, 0)
+        rproj, rpred = source_pushdown(right_plan, 0)
         lparts = partition_descriptors(sources[lsid], workers, projection=lproj, predicate=lpred)
         rparts = partition_descriptors(sources[rsid], workers, projection=rproj, predicate=rpred)
 
@@ -128,16 +147,21 @@ def execute_join_flight(
 
         # MAP barrier under worker-loss recovery: a worker preempted while mapping has
         # BOTH its sides republished on one survivor under the same `src`, so the single
-        # `mapper_addrs[src]` the reducers dial still resolves. Both sides are issued to
-        # the same actor and only the second is awaited — actor calls run in order, so
-        # the addr coming back means both landed (the same contract `recompute` below
-        # relies on). Without this a bare `ray.get` failed the whole join on one loss.
-        def _launch(host: int, src: int):
-            actors[host].map_publish_raw.remote(
-                left_ir, list(join.left_keys), lparts[src], n_buckets, 0, src
+        # `mapper_addrs[src]` the reducers dial still resolves. Both sides go out as ONE
+        # actor call (`map_publish_join`), so the barrier awaits a single ref that fails if
+        # *either* side fails — issuing two calls and awaiting only the second hid a
+        # left-side error behind a healthy-looking address and mislabelled it, three
+        # retries later, as an unreachable worker.
+        def _sides(src: int):
+            return (
+                (left_ir, list(join.left_keys), lparts[src]),
+                (right_ir, list(join.right_keys), rparts[src]),
             )
-            return actors[host].map_publish_raw.remote(
-                right_ir, list(join.right_keys), rparts[src], n_buckets, 1, src
+
+        def _launch(host: int, src: int):
+            left, right = _sides(src)
+            return actors[host].map_publish_join.remote(
+                left, right, n_buckets, src, 0, current_plan_id()
             )
 
         mapper_addrs, mapper_dead = map_barrier(workers, _launch)
@@ -149,7 +173,7 @@ def execute_join_flight(
 
         lschema = probe(left_ir, sources[lsid])
         rschema = probe(right_ir, sources[rsid])
-        batches = _join_reduce_with_recovery(
+        out = _join_reduce_with_recovery(
             actors,
             mapper_addrs,
             (lparts, rparts),
@@ -163,13 +187,26 @@ def execute_join_flight(
             aj,
             finalize=not combine_partials,
             dead=mapper_dead,
+            publish=publish,
         )
+        if publish:
+            from batcher.dist.fleet import FlightMaterializedSource
+
+            # `out` is the reducers' `(addr, ticket, rows, schema)` handles; an empty
+            # bucket publishes nothing and is simply absent.
+            handles = [(a, t, n) for a, t, n, _s in out]
+            schema = out[0][3] if out else _join_output_schema(join, lschema, rschema)
+            keep_actors = True  # the source holds the buckets; the fleet must outlive us
+            # A borrowed fleet is the query's (freed once by the adaptive loop), so the
+            # source must not own it; only a self-spawned fleet is handed over to tear down.
+            src_actors, src_pg = (actors, pg) if owns else (None, None)
+            return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+        batches = out
     finally:
-        if owns:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        # A published result leaves its buckets ON the actors, so a fleet we own is handed
+        # to the source rather than torn down here.
+        if not keep_actors:
+            release_fleet(actors, pg, owns)
 
     # Non-fusable fused aggregate: reducers shipped PARTIAL state (one per bucket); the
     # group spans buckets, so do the cross-bucket combine+finalize here on the small
@@ -210,6 +247,22 @@ def _project_join_side(side: LogicalPlan, needed: set[str]) -> LogicalPlan:
     return Project(side, tuple(Projection(alias=c, expr=Col(c)) for c in keep))
 
 
+def _join_output_schema(join: Join, lschema: pa.RecordBatch, rschema: pa.RecordBatch) -> pa.Schema:
+    """The join's output schema, for a result whose every bucket came back empty.
+
+    Built from `join.output` against the two sides' probe schemas, so a
+    `FlightMaterializedSource` over zero buckets still advertises the columns the next
+    stage's plan is typed against (an empty relation must still have a schema).
+    """
+    sides = {"left": lschema.schema, "right": rschema.schema}
+    fields = []
+    for o in join.output:
+        side = sides[o.side]
+        field = side.field(side.get_field_index(o.name))
+        fields.append(field.with_name(o.alias))
+    return pa.schema(fields)
+
+
 def _join_reduce_with_recovery(
     actors,
     addrs,
@@ -224,13 +277,15 @@ def _join_reduce_with_recovery(
     aj=None,
     finalize=True,
     dead=None,
+    publish=False,
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
     Each reducer is hosted on a live worker; one that reports an unreachable mapper
     (or whose host died) drives a recompute of that worker's *both* sides (the join
     co-partitions left and right) from their on-disk source partitions onto a
-    survivor, then a retry. Returns the joined batches.
+    survivor, then a retry. Returns the joined batches — or, with `publish`, the
+    `(addr, ticket, rows, schema)` handles of the buckets left ON the workers.
 
     `dead` seeds the workers the map barrier already lost, so no reducer is hosted on
     an actor that is gone.
@@ -279,9 +334,27 @@ def _join_reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            ref = actors[host].reduce_join.remote(
-                join_ir, addrs, r, lschema, rschema, gk, aj, finalize
-            )
+            # `publish`: leave the joined bucket on the worker and return a handle, so an
+            # intermediate join never round-trips through the driver (see
+            # `reduce_join_publish`). Otherwise the reducer ships its batches back.
+            if publish:
+                ref = actors[host].reduce_join_publish.remote(
+                    join_ir, addrs, r, lschema, rschema, None, None, current_plan_id()
+                )
+            else:
+                ref = actors[host].reduce_join.remote(
+                    join_ir,
+                    addrs,
+                    r,
+                    lschema,
+                    rschema,
+                    gk,
+                    aj,
+                    finalize,
+                    None,
+                    None,
+                    current_plan_id(),
+                )
             ref_host[ref] = host
             return ref
 
@@ -313,12 +386,16 @@ def _join_reduce_with_recovery(
         for src in failed:
             dead.add(src)  # an unreachable mapper means that worker is gone
             target = _pick_live({src})
-            actors[target].map_publish_raw.remote(
-                left_ir, left_keys, lparts[src], n_buckets, 0, src
-            )
+            # One call for both sides, as in the map barrier: awaiting only the right side
+            # would let a left-side failure pass for a successful republish.
             addrs[src] = ray.get(
-                actors[target].map_publish_raw.remote(
-                    right_ir, right_keys, rparts[src], n_buckets, 1, src
+                actors[target].map_publish_join.remote(
+                    (left_ir, left_keys, lparts[src]),
+                    (right_ir, right_keys, rparts[src]),
+                    n_buckets,
+                    src,
+                    0,
+                    current_plan_id(),
                 )
             )
 
@@ -331,6 +408,9 @@ def _join_reduce_with_recovery(
             recompute(proactive)
 
     finals = ShuffleRecovery(recovery_policy()).run(attempt, recompute)
+    if publish:
+        # One `(addr, ticket, rows, schema)` handle per non-empty bucket, still on its worker.
+        return list(finals)
     out = []
     for res in finals:
         out.extend(b for b in res if b.num_rows > 0)

@@ -16,6 +16,7 @@ simply not verified without it). A missing-but-required dependency raises
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 from typing import IO, Any
 
 import pyarrow as pa
@@ -96,6 +97,31 @@ class TFRecordSource(FileSource):
         if records or not out:
             out.append(self._to_batch(records, projection))
         return out
+
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream a TFRecord file's batches instead of collecting them all first.
+
+        `_read_file` already batches at the morsel size, but accumulates every batch into
+        one list before returning — so the whole file's decoded records are resident, and
+        a TFRecord shard of images is exactly where that is expensive. The record framing
+        is a forward-only length-prefixed scan and the schema is fixed, so yielding as we
+        go changes nothing about what is produced.
+        """
+        crc = _crc32c()
+        batch_rows = active_config().execution.morsel_rows
+        records: list[bytes] = []
+        emitted = False
+        with self._fs.open(path) as fh:
+            for payload in _iter_records(fh, crc):
+                records.append(payload)
+                if len(records) >= batch_rows:
+                    yield self._to_batch(records, projection)
+                    emitted = True
+                    records = []
+        if records or not emitted:
+            # An empty file still yields one empty batch, so the schema is observable —
+            # matching `_read_file`.
+            yield self._to_batch(records, projection)
 
     @staticmethod
     def _to_batch(records: list[bytes], projection: list[str] | None) -> pa.RecordBatch:

@@ -71,27 +71,40 @@ def test_connectors_registered() -> None:
 
 
 def test_identity_does_not_require_backend_or_leak_creds() -> None:
+    """Each identity opens with its store's human locator and carries no credential.
+
+    These were exact-equality assertions, which pinned an identity built from the locator
+    *alone*. That is the bug they were hiding: the locator is a partial view of the
+    connection, so ``elasticsearch:idx`` named the index ``idx`` on every cluster in the
+    company at once, and Kyber treated them as one relation. `ScanSource.identity` now
+    appends a `connection_fingerprint`, so the assertions check the stable, meaningful
+    part — the prefix and the absence of secrets — rather than freezing the whole string.
+    Discrimination between connections is pinned in `test_nosql_audit_b.py`.
+    """
     mongo = MongoSource(uri="mongodb://secret@h/db", database="d", collection="c")
-    assert mongo.identity() == "mongo:d.c"
+    assert mongo.identity().startswith("mongo:d.c")
     assert "secret" not in mongo.identity()
 
     cass = CassandraSource(contact_points=["h"], keyspace="ks", table="t", partition_key="id")
-    assert cass.identity() == "cassandra:ks.t"
+    assert cass.identity().startswith("cassandra:ks.t")
     assert (
-        ScyllaSource(contact_points=["h"], keyspace="ks", table="t", partition_key="id").identity()
-        == "scylla:ks.t"
+        ScyllaSource(contact_points=["h"], keyspace="ks", table="t", partition_key="id")
+        .identity()
+        .startswith("scylla:ks.t")
     )
 
     dynamo = DynamoDBSource(table="t", region_name="us-east-1", aws_secret_access_key="zzz")
-    assert dynamo.identity() == "dynamodb:us-east-1/t"
+    assert dynamo.identity().startswith("dynamodb:us-east-1/t")
     assert "zzz" not in dynamo.identity()
 
     redis = RedisSource(host="h", port=6379, db=2, password="pw")
-    assert redis.identity() == "redis:h:6379/2"
+    assert redis.identity().startswith("redis:h:6379/2")
     assert "pw" not in redis.identity()
 
-    assert ElasticsearchSource(hosts="h", index="idx", api_key="k").identity() == (
-        "elasticsearch:idx"
+    assert (
+        ElasticsearchSource(hosts="h", index="idx", api_key="k")
+        .identity()
+        .startswith("elasticsearch:idx")
     )
     cb = CouchbaseSource(
         connstr="couchbases://h",
@@ -101,12 +114,12 @@ def test_identity_does_not_require_backend_or_leak_creds() -> None:
         scope="s",
         collection="c",
     )
-    assert cb.identity() == "couchbase:d.s.c"
+    assert cb.identity().startswith("couchbase:d.s.c")
     assert "p" not in cb.identity()
 
     neo = Neo4jSource(uri="bolt://h", username="u", password="p", cypher="MATCH (n) RETURN n")
-    assert neo.identity() == "neo4j:bolt://h/default"
-    assert HBaseSource(host="h", table="t").identity() == "hbase:h:9090/t"
+    assert neo.identity().startswith("neo4j:bolt://h/default")
+    assert HBaseSource(host="h", table="t").identity().startswith("hbase:h:9090/t")
 
 
 # --- missing-driver errors are typed + actionable ----------------------------

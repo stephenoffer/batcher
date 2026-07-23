@@ -31,15 +31,12 @@ from batcher.plan.logical import (
     Limit,
     LogicalPlan,
     Project,
-    Sort,
     Union,
 )
 
 __all__ = [
     "dedup_distinct_union_branches",
     "drop_distinct_in_distinct_union",
-    "eliminate_sort_before_distinct",
-    "eliminate_sort_in_distinct_union_branch",
     "flatten_nested_union",
     "fold_distinct_union_all",
     "prune_distinct_of_empty",
@@ -188,31 +185,15 @@ def drop_distinct_in_distinct_union(node: Union, _ctx: OptimizerContext) -> Logi
     return Union(tuple(new_inputs), True)
 
 
-@rule(name="eliminate_sort_in_distinct_union_branch", phase=Phase.REWRITE, matches=(Union,))
-def eliminate_sort_in_distinct_union_branch(
-    node: Union, _ctx: OptimizerContext
-) -> LogicalPlan | None:
-    """Drop an order-only `Sort` inside a branch of a DISTINCT union.
-
-    A distinct union produces a set, so its rows carry no meaningful order — a `Sort`
-    (without a top-N `limit`) feeding a branch is wasted work whose ordering the dedup
-    discards. Skipped for `UNION ALL` (whose branch order is observable) and for a sort
-    carrying a `limit` (a top-N selects *which* rows). Stacked sorts collapse at once.
-    """
-    if not node.distinct:
-        return None
-    new_inputs: list[LogicalPlan] = []
-    changed = False
-    for branch in node.inputs:
-        stripped = branch
-        while isinstance(stripped, Sort) and stripped.limit is None:
-            stripped = stripped.input
-        if stripped is not branch:
-            changed = True
-        new_inputs.append(stripped)
-    if not changed:
-        return None
-    return Union(tuple(new_inputs), True)
+# `eliminate_sort_in_distinct_union_branch` and `eliminate_sort_before_distinct` used to
+# live here. Both dropped an order-only `Sort` feeding a dedup, reasoning that "a distinct
+# produces a set, so its rows carry no meaningful order". The output *multiset* is indeed
+# order-independent; the output *row order* is not, and Batcher's `Distinct` preserves its
+# input's order. So the rewrite changed observable results — `sort("k").distinct().limit(3)`
+# returned `[5, 3, 1]` with the optimizer on and `[1, 2, 3]` with it off — which breaks the
+# rule contract that a pass is semantics-preserving (the plan changes, the result does not).
+# Removed rather than narrowed: soundness needs to know whether anything downstream observes
+# the order, and a local `Distinct`/`Union` rewrite has no view of its parent.
 
 
 @rule(name="push_project_through_union", phase=Phase.PUSHDOWN, matches=(Project,))
@@ -261,19 +242,6 @@ def push_filter_through_distinct(node: Filter, _ctx: OptimizerContext) -> Logica
     if isinstance(inner, Distinct):
         return Distinct(Filter(inner.input, node.predicate))
     return None
-
-
-@rule(name="eliminate_sort_before_distinct", phase=Phase.REWRITE, matches=(Distinct,))
-def eliminate_sort_before_distinct(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`Distinct(Sort(x))` → `Distinct(x)`. Dedup is order-independent, so an order-only
-    sort feeding it is wasted work. Skipped when the sort carries a `limit` (a top-N
-    changes *which* rows reach the dedup). Stacked limitless sorts collapse at once."""
-    inner = node.input
-    if not (isinstance(inner, Sort) and inner.limit is None):
-        return None
-    while isinstance(inner, Sort) and inner.limit is None:
-        inner = inner.input
-    return Distinct(inner)
 
 
 @rule(name="prune_distinct_of_empty", phase=Phase.REWRITE, matches=(Distinct,))

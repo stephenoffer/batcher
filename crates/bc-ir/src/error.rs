@@ -1,3 +1,5 @@
+//! The crate's error type: how a malformed plan IR is rejected at the wire boundary.
+
 use thiserror::Error;
 
 /// Errors raised while parsing or validating the plan IR.

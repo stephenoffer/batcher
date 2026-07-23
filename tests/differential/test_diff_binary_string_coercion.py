@@ -12,6 +12,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -28,22 +29,16 @@ def _t(duck):
 
 
 def test_binary_neq_empty_string(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(col("s") != "")
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE s <> ''"))
 
 
 def test_binary_eq_literal(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(col("s") == "apple")
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE s = 'apple'"))
 
 
 def test_binary_group_by_and_count(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(col("s") != "").group_by("s").agg(c=col("n").count())
     assert_same(
         ds.collect(),

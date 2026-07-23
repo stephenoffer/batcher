@@ -42,10 +42,11 @@ _TABLE = pa.table(
     }
 )
 
-# Types the engine's MIN/MAX aggregate can execute (so the in-memory fallback runs);
-# Date32/Boolean min/max are executed only via the footer shortcut (see the dedicated
-# metadata-only test below), matching the engine's supported aggregate surface.
-_ORDERABLE = ["i", "f", "s", "k"]
+# Types the engine's MIN/MAX aggregate can execute (so the in-memory fallback runs). The
+# engine now reduces temporal (Date32) and Boolean columns too — previously it could only
+# answer those from the Parquet footer, a metadata-vs-engine disagreement — so `d`/`b` are
+# exercised through real execution here, not only the footer shortcut below.
+_ORDERABLE = ["i", "f", "s", "d", "b", "k"]
 _FOOTER_ORDERABLE = ["i", "f", "d", "b", "k"]
 _ALL_COLS = ["i", "f", "s", "d", "b", "allnull", "k"]
 
@@ -80,15 +81,31 @@ def test_min_max_match_duckdb(pq_path, duck, col):
 @pytest.mark.differential
 @pytest.mark.parametrize("col", _FOOTER_ORDERABLE)
 def test_min_max_from_footer_match_duckdb(pq_path, duck, col):
-    # Date/bool min/max are answered straight from the EXACT footer bound with no scan
-    # — proven by asserting the metadata shortcut fires (non-None) and equals DuckDB.
+    """min/max match DuckDB — and the footer shortcut fires wherever it is *sound*.
+
+    `min` is answered straight from the EXACT footer bound for every orderable type, with no
+    scan. `max` is too — **except on a float column**, where the bound cannot represent the
+    answer: Parquet omits NaN from its statistics (as does our KLL sketch), but SQL's total
+    order makes NaN the *greatest* value, so `max(f)` over a column containing NaN is NaN. The
+    shortcut used to return the largest non-NaN value and silently disagree with executing the
+    same query. It now declines, and the engine runs it. See `kyber/stats/columns.py`.
+
+    Both answers must still equal DuckDB — the last two assertions — whichever path produced
+    them. That is the property; the shortcut is only an optimization.
+    """
     from batcher.api.terminal.metadata_answer import metadata_max, metadata_min
 
     _duck(duck)
     dmin, dmax = duck.execute(f"select min({col}), max({col}) from t").fetchone()
     ds = bt.read.parquet(pq_path)
     assert metadata_min(ds._plan, ds._sources, col) == dmin  # fired, no execution
-    assert metadata_max(ds._plan, ds._sources, col) == dmax
+
+    if col == "f":  # float: `max` cannot be answered from a NaN-blind bound
+        assert metadata_max(ds._plan, ds._sources, col) is None
+    else:
+        assert metadata_max(ds._plan, ds._sources, col) == dmax  # fired, no execution
+
+    # Whichever path answers, the answer is the same one DuckDB gives.
     assert ds.min(col) == dmin
     assert ds.max(col) == dmax
 
@@ -174,7 +191,6 @@ def test_approx_terminals_answer(pq_path):
     ds = bt.from_arrow(_TABLE)
     streamed = _stream_q(ds.select("f").iter_batches(), "f", 0.5)
     assert streamed is not None and 1.5 <= streamed <= 4.0
-
 
 
 @pytest.mark.differential

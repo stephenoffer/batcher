@@ -5,6 +5,18 @@ module stays focused on the dataclasses and the active-config plumbing. `Config`
 calls `validate_config(self)` at every entry point (`set_config`, `config_context`,
 `from_env`, `from_file`) so an out-of-range or inconsistent tunable raises
 `ConfigError` early and clearly instead of surfacing as a confusing runtime failure.
+
+**Each distinct `Config` object is validated at most once.** `config_context` is one of
+those entry points, and the conductor enters it *twice per query* — once for the sensed
+memory envelope, once for Carbonite's adapted morsel target. So the ~60 range checks ran
+twice on every `collect()`, ~24 µs a time: about 6% of a small query's entire control
+plane, spent re-deriving that a config which passed a moment ago still passes.
+
+A `Config` is a frozen dataclass, and validation is a pure function of its value, so
+"this exact object already passed" is a sound answer — memoized on object identity, with
+the config held as the memo's value so its `id()` cannot be recycled underneath the entry.
+A config built by `dataclasses.replace` is a *new* object and is validated normally; the
+hit comes from the conductor handing the same resolved object back each query.
 """
 
 from __future__ import annotations
@@ -12,12 +24,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import ConfigError
+from batcher.config.config import VERBOSITY_LEVELS
 from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, RESILIENCE_PROFILES
 
 if TYPE_CHECKING:
     from batcher.config.config import Config
 
 __all__ = ["validate_config"]
+
+# id(config) -> the config itself. The value is the keep-alive: holding a strong reference
+# makes it impossible for the id to be reused by a different object while the entry lives.
+_VALIDATED: dict[int, Config] = {}
+# Bound on the memo. A process activates a handful of distinct configs; anything that
+# churns past this is building configs per query, where re-validating is the lesser cost.
+_VALIDATED_MAX = 64
 
 
 def _check(cond: bool, msg: str) -> None:
@@ -28,9 +48,23 @@ def _check(cond: bool, msg: str) -> None:
 def validate_config(cfg: Config) -> None:
     """Raise `ConfigError` if any tunable is out of range or inconsistent.
 
-    Pure (no side effects); covers the memory envelope, execution sizing, the
-    distributed fault-tolerance budgets/timeouts, and flow-control credits.
+    Covers the memory envelope, execution sizing, the distributed fault-tolerance
+    budgets/timeouts, and flow-control credits. A `Config` object that has already passed
+    is not re-checked (see the module docstring); the checks themselves are pure.
+
+    Args:
+        cfg: The configuration to validate.
     """
+    if id(cfg) in _VALIDATED:
+        return
+    _run_checks(cfg)
+    if len(_VALIDATED) >= _VALIDATED_MAX:
+        _VALIDATED.clear()
+    _VALIDATED[id(cfg)] = cfg
+
+
+def _run_checks(cfg: Config) -> None:
+    """The range/consistency checks themselves. Pure; raises `ConfigError` on a bad value."""
     m, e, d, fc = cfg.memory, cfg.execution, cfg.distributed, cfg.flow_control
     o, card, pid, md, ob = (
         cfg.optimizer,
@@ -116,6 +150,11 @@ def validate_config(cfg: Config) -> None:
     _check(
         d.speculation_max_backups >= 0,
         f"distributed.speculation_max_backups must be >= 0, got {d.speculation_max_backups}",
+    )
+    _check(
+        d.shuffle_replication >= 1,
+        f"distributed.shuffle_replication must be >= 1 (1 = no replica), "
+        f"got {d.shuffle_replication}",
     )
     _check(
         d.resilience in RESILIENCE_PROFILES,
@@ -233,8 +272,8 @@ def validate_config(cfg: Config) -> None:
         f"memory.spill_bucket_max_bytes must be positive, got {m.spill_bucket_max_bytes}",
     )
     _check(
-        m.spill_local_budget_bytes is None or m.spill_local_budget_bytes > 0,
-        f"memory.spill_local_budget_bytes must be positive or None, "
+        m.spill_local_budget_bytes is None or m.spill_local_budget_bytes >= 0,
+        f"memory.spill_local_budget_bytes must be non-negative or None, "
         f"got {m.spill_local_budget_bytes}",
     )
 
@@ -376,11 +415,23 @@ def validate_config(cfg: Config) -> None:
         f"metadata.decay_per_day must be in [0, 1], got {md.decay_per_day}",
     )
 
-    # Observability — log-level / format enums and positive file-rotation sizing.
+    # Observability — verbosity/log-level/progress enums and positive file-rotation sizing.
+    # `None` is valid for `log_level` and `progress`: it means "derive from verbosity", and
+    # is their default. Only an explicitly-set value is enum-checked.
     _check(
-        ob.log_level in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"},
-        "observability.log_level must be one of CRITICAL/ERROR/WARNING/INFO/DEBUG, "
+        ob.log_level is None or ob.log_level in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"},
+        "observability.log_level must be None or one of CRITICAL/ERROR/WARNING/INFO/DEBUG, "
         f"got {ob.log_level!r}",
+    )
+    _check(
+        ob.progress is None or ob.progress in {"auto", "on", "off"},
+        f"observability.progress must be None or 'auto'/'on'/'off', got {ob.progress!r}",
+    )
+    _check(
+        _valid_verbosity(ob.verbosity),
+        "observability.verbosity must be one of "
+        f"{'/'.join(level.name for level in VERBOSITY_LEVELS)} or 0-{len(VERBOSITY_LEVELS) - 1}, "
+        f"got {ob.verbosity!r}",
     )
     _check(
         ob.log_format in {"human", "json"},
@@ -391,3 +442,21 @@ def validate_config(cfg: Config) -> None:
         "observability log-file rotation must satisfy log_file_max_bytes > 0 and "
         f"log_file_backups >= 0, got {ob.log_file_max_bytes}, {ob.log_file_backups}",
     )
+
+
+def _valid_verbosity(value: object) -> bool:
+    """Whether `value` names a verbosity rung, by name or by index.
+
+    `bool` is rejected explicitly: it is an `int` in Python, so `verbosity=True` would
+    otherwise silently validate as rung 1 ("quiet") — a confusing way to spell something the
+    user almost certainly did not mean.
+    """
+    if isinstance(value, bool):
+        return False
+    names = {level.name for level in VERBOSITY_LEVELS}
+    if isinstance(value, int):
+        return 0 <= value < len(VERBOSITY_LEVELS)
+    text = str(value).strip().lower()
+    if text.isdigit():
+        return 0 <= int(text) < len(VERBOSITY_LEVELS)
+    return text in names

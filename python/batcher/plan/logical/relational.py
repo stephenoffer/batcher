@@ -1,8 +1,8 @@
 """Row-wise and set relational logical nodes.
 
-`Scan`, `Filter`, `Projection`/`Project`, `Limit`, `Distinct`, `Union`, and the
-opaque `MapBatches`. These are the non-grouping operators; grouping/ordering and
-windowing live in sibling modules.
+`Scan`, `Filter`, `Projection`/`Project`, `Limit`, `Distinct`, `Sample`, `Union`, and
+the opaque `MapBatches`. These are the non-grouping operators; grouping/ordering,
+windowing, and the row-reshaping nodes live in sibling modules.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import Op
-from batcher.plan.logical.base import LogicalPlan, _validate_refs
+from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases, _validate_refs
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, promote, widen
 
@@ -29,8 +29,6 @@ __all__ = [
     "Sample",
     "Scan",
     "Union",
-    "Unnest",
-    "Unpivot",
     "WatermarkDedup",
 ]
 
@@ -99,6 +97,7 @@ class Project(LogicalPlan):
         available = set(self.input.available_columns())
         for item in self.items:
             _validate_refs(item.expr, available, what=f"projection {item.alias!r}")
+        _reject_duplicate_aliases([item.alias for item in self.items], what="select/with_columns")
 
     def to_ir(self) -> dict[str, Any]:
         return {
@@ -154,6 +153,30 @@ class Distinct(LogicalPlan):
 
     def to_ir(self) -> dict[str, Any]:
         return {"op": Op.DISTINCT, "input": self.input.to_ir()}
+
+    def as_aggregate(self):
+        """This `Distinct` as the equivalent `Aggregate` — group by every column.
+
+        DISTINCT is a group-by over all columns with no aggregate functions, which is
+        what lets it reuse the mergeable aggregate wholesale: identical rows fold into
+        the same group, so the same `partial → combine → finalize` serves the streaming
+        fold, the distributed shuffle, and the single-node path with no distinct-specific
+        state anywhere.
+
+        The derivation lives on the node because all three callers need it and they sit
+        in mutually-independent subsystems (`core` twice, `dist` once). Those subsystems
+        may not import one another, so a shared helper in any of them would have to be
+        copy-pasted — which is exactly what had happened. `plan` is neutral, so this is
+        the one place all three can reach.
+
+        Returns:
+            An `Aggregate` over the same input, grouping by every available column.
+        """
+        from batcher.plan.expr_ir import Col
+        from batcher.plan.logical.aggregate import Aggregate
+
+        keys = tuple(Projection(c, Col(c)) for c in self.input.available_columns())
+        return Aggregate(self.input, keys, ())
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
@@ -233,144 +256,6 @@ class Union(LogicalPlan):
 
 
 @dataclass(frozen=True, slots=True)
-class Unnest(LogicalPlan):
-    """Explode a list/array column into one row per element (SQL ``UNNEST`` /
-    DataFrame ``explode``).
-
-    The named `column` is replaced in place by its element values bound to `alias`;
-    every other column repeats once per element. Null and empty lists produce no
-    output rows (DuckDB ``UNNEST`` semantics). Streaming and stateless.
-    """
-
-    input: LogicalPlan
-    column: str
-    alias: str
-
-    def __post_init__(self) -> None:
-        available = self.input.available_columns()
-        if self.column not in available:
-            raise PlanError(
-                f"unnest column {self.column!r} not found in input columns: {available}"
-            )
-
-    def to_ir(self) -> dict[str, Any]:
-        return {
-            "op": Op.UNNEST,
-            "input": self.input.to_ir(),
-            "column": self.column,
-            "alias": self.alias,
-        }
-
-    def available_columns(self) -> list[str]:
-        return [self.alias if c == self.column else c for c in self.input.available_columns()]
-
-    def available_schema(self) -> SchemaRef | None:
-        inp = self.input.available_schema()
-        if inp is None:
-            return None
-        list_t = inp.field(self.column).type
-        if not (
-            pa.types.is_list(list_t)
-            or pa.types.is_large_list(list_t)
-            or pa.types.is_fixed_size_list(list_t)
-        ):
-            return None  # unnest of a non-list: leave it to the engine
-        fields = [
-            pa.field(self.alias, list_t.value_type) if f.name == self.column else f
-            for f in inp.arrow
-        ]
-        return SchemaRef.from_arrow(pa.schema(fields))
-
-
-@dataclass(frozen=True, slots=True)
-class RowId(LogicalPlan):
-    """Append a 0-based (plus `offset`) sequential row-index column (Polars
-    ``with_row_index``).
-
-    The index numbers rows in arrival order across the whole input via one sequential
-    counter, so it is identical on the single-node and parallel paths for an
-    order-preserving pipeline. Streaming.
-    """
-
-    input: LogicalPlan
-    alias: str
-    offset: int = 0
-
-    def __post_init__(self) -> None:
-        if self.alias in self.input.available_columns():
-            raise PlanError(f"with_row_index name {self.alias!r} collides with an existing column")
-
-    def to_ir(self) -> dict[str, Any]:
-        return {
-            "op": Op.ROW_ID,
-            "input": self.input.to_ir(),
-            "alias": self.alias,
-            "offset": self.offset,
-        }
-
-    def available_columns(self) -> list[str]:
-        return [self.alias, *self.input.available_columns()]
-
-    def available_schema(self) -> SchemaRef | None:
-        inp = self.input.available_schema()
-        if inp is None:
-            return None
-        fields = [pa.field(self.alias, pa.int64()), *inp.arrow]
-        return SchemaRef.from_arrow(pa.schema(fields))
-
-
-@dataclass(frozen=True, slots=True)
-class Unpivot(LogicalPlan):
-    """Reshape wide → long (SQL ``UNPIVOT`` / pandas ``melt`` / Polars ``unpivot``).
-
-    Each input row becomes one row per `on` column: the `index` columns repeat, the
-    `variable_name` column holds the melted column's name, and `value_name` holds its
-    value. The `on` columns must share a type. Streaming and stateless.
-    """
-
-    input: LogicalPlan
-    index: tuple[str, ...]
-    on: tuple[str, ...]
-    variable_name: str
-    value_name: str
-
-    def __post_init__(self) -> None:
-        available = self.input.available_columns()
-        missing = [c for c in (*self.index, *self.on) if c not in available]
-        if missing:
-            raise PlanError(f"unpivot columns {missing} not found in input columns: {available}")
-        if not self.on:
-            raise PlanError("unpivot requires at least one column in `on`")
-
-    def to_ir(self) -> dict[str, Any]:
-        return {
-            "op": Op.UNPIVOT,
-            "input": self.input.to_ir(),
-            "index": list(self.index),
-            "on": list(self.on),
-            "variable_name": self.variable_name,
-            "value_name": self.value_name,
-        }
-
-    def available_columns(self) -> list[str]:
-        return [*self.index, self.variable_name, self.value_name]
-
-    def available_schema(self) -> SchemaRef | None:
-        inp = self.input.available_schema()
-        if inp is None:
-            return None
-        value_t = inp.field(self.on[0]).type
-        for c in self.on[1:]:  # the melted columns share a (promotable) type
-            value_t = promote(value_t, inp.field(c).type)
-            if value_t is None:
-                return None
-        fields = [inp.field(c) for c in self.index]
-        fields.append(pa.field(self.variable_name, pa.string()))
-        fields.append(pa.field(self.value_name, value_t))
-        return SchemaRef.from_arrow(pa.schema(fields))
-
-
-@dataclass(frozen=True, slots=True)
 class Sample(LogicalPlan):
     """Randomly keep a `fraction` of rows (DataFrame ``sample``).
 
@@ -419,6 +304,15 @@ class MapBatches(LogicalPlan):
     compiled relational operators and black-box ML compose in one pipeline. The
     optional `output_columns` declares the result schema for downstream
     validation; if omitted, the input columns are assumed to pass through.
+
+    `input_columns` is the other half of that contract, and it is what lets the optimizer
+    see *into* the black box far enough to be useful. Without it the plan must assume the
+    `fn` may read any column of its input, so projection pushdown gives up and the scan
+    reads the whole table: an embedding stage over one column of a 41-column Parquet file
+    read all 41. Declaring the columns the `fn` actually reads turns that into a one-column
+    scan, and lets column lineage narrow to the truth instead of "everything derives from
+    everything". It is opt-in precisely because getting it wrong is a wrong answer, not a
+    slow one — an undeclared column the `fn` secretly reads would be pruned away beneath it.
     """
 
     input: LogicalPlan
@@ -428,6 +322,24 @@ class MapBatches(LogicalPlan):
     fn: object
     batch_size: int | None = None
     output_columns: tuple[str, ...] | None = None
+    # The columns `fn` reads. None = unknown, so the optimizer must keep every column alive
+    # (the safe default). When declared, projection pushdown prunes the scan to these columns
+    # (plus whatever the operators *above* still need), and lineage attributes the outputs to
+    # these inputs only. Declaring a column the `fn` does not read is merely wasteful;
+    # OMITTING one it does read is a correctness bug — the column gets pruned out from under it.
+    input_columns: tuple[str, ...] | None = None
+    # The columns `fn` passes through UNCHANGED — same name, same value, in every output row.
+    # None = unknown, so the optimizer must assume `fn` may rewrite any column and no predicate
+    # can ever move below the UDF (the safe default). When a column is declared here, a `Filter`
+    # whose predicate reads only preserved columns is pushed *below* the UDF, so the model runs
+    # on the rows that survive the filter instead of every row — filtering 60% of the rows
+    # before GPU inference saves 60% of the GPU work. This is the mirror of `input_columns`:
+    # that field says only what `fn` READS, which cannot justify the pushdown (a column the fn
+    # reads it may still overwrite). Preservation is the stronger claim, and it is opt-in for
+    # the same reason `input_columns` is — declaring a column the `fn` actually rewrites is a
+    # WRONG ANSWER, not a slow one: rows the predicate would drop on the *rewritten* value are
+    # dropped on the *input* value instead, silently changing the result.
+    preserves_columns: tuple[str, ...] | None = None
     # Concurrent workers for the per-batch call (>1 overlaps GIL-releasing model
     # inference across cores; the GIL serializes pure-Python `fn`s).
     num_workers: int = 1
@@ -445,6 +357,11 @@ class MapBatches(LogicalPlan):
     # Optional GPU model to pin GPU actors/tasks to (a `ray.util.accelerators` name
     # like "NVIDIA_A100"); None lets Ray pick any GPU.
     accelerator_type: str | None = None
+    # Custom Ray resources per worker, as `((name, amount), ...)`. `num_gpus` only covers
+    # what Ray calls the `GPU` resource (NVIDIA/AMD/Intel/MetaX); a TPU, Trainium
+    # (`neuron_cores`), Gaudi (`HPU`), or an operator's own on-prem resource is named
+    # instead. A tuple so the node stays hashable/frozen like every other field here.
+    resources: tuple[tuple[str, float], ...] = ()
     # Optional estimate of the model's memory footprint in GB. Lets the resource layer
     # budget host RAM per worker (so loading the model into many workers can't OOM the
     # node) and VRAM-pack the GPU fraction; lets Kyber's cost model scale the

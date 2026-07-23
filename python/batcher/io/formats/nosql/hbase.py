@@ -14,6 +14,7 @@ never logged.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 from typing import Any
 
@@ -107,20 +108,31 @@ class HBaseSource(ScanSource):
         return [(seen[i], seen[i + 1]) for i in range(len(seen) - 1)]
 
     def _read_partition(
-        self, partition: _KeyRange, projection: list[str] | None
+        self,
+        partition: _KeyRange,
+        projection: list[str] | None,
+        predicate: dict | None = None,  # noqa: ARG002 (no server-side filter; the engine's Filter re-checks)
     ) -> Iterator[pa.RecordBatch]:
         start_hex, stop_hex = partition
-        conn = self._connection()
+        # Resolved *before* the scan connection is opened. `self.schema()` opens a
+        # connection of its own, so calling it here held two at once — and a raise from it
+        # landed between `_connection()` and the `try`, stranding the outer one with
+        # nothing left holding a reference to close it.
         schema = self.schema() if not projection else None
+        conn = self._connection()
         try:
             table = conn.table(self._conn_kwargs["table"])
             scan = table.scan(
                 row_start=_from_hex(start_hex) or None,
                 row_stop=_from_hex(stop_hex) or None,
             )
-            rows = (_decode_row(key, data) for key, data in scan)
-            for batch in rows_to_batches(rows, schema=schema):
-                yield batch.select(projection) if projection else batch
+            # `closing` on the scanner, not just on the connection: a consumer that stops
+            # early (a LIMIT downstream) abandons this generator, and the server-side
+            # scanner would otherwise stay open until the collector happened to run.
+            with contextlib.closing(scan):
+                rows = (_decode_row(key, data) for key, data in scan)
+                for batch in rows_to_batches(rows, schema=schema):
+                    yield batch.select(projection) if projection else batch
         finally:
             conn.close()
 

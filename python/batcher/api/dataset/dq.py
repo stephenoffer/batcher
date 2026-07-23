@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import DataQualityError
+from batcher._internal.errors import DataQualityError, PlanError
 from batcher.plan.expr_ir import Col, Expr, count, lit, when
 
 if TYPE_CHECKING:
@@ -43,6 +43,16 @@ class RowConstraint:
 
     name: str
     valid: Expr
+    # Whether `valid` is *total* — TRUE or FALSE for every row, and never NULL.
+    #
+    # Every built-in constraint is (`in_range` and friends are `col IS NULL OR <test>`, which
+    # is TRUE when the column is null; `not_null` is a plain `IS NOT NULL`). That matters for
+    # one thing only: it is what lets the contract be discharged from metadata, by asking
+    # whether the filter `NOT valid` keeps any row (`meta.prove`). With a NULL-valued validity
+    # that probe would be wrong — a NULL validity counts as a *violation*, but `NOT NULL` is
+    # NULL, so the filter would not see it. A user's `check()` predicate is not assumed total,
+    # so it takes the executing path, which treats NULL as a violation exactly as before.
+    total: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +191,7 @@ class DatasetDQ:
                 {'id': [1, 3]}
         """
         if not cols:
-            raise ValueError("not_null() requires at least one column")
+            raise PlanError("not_null() requires at least one column, e.g. not_null('id')")
         valid = reduce(lambda a, b: a & b, (Col(c).is_not_null() for c in cols))
         return self._add(RowConstraint(f"not_null({', '.join(cols)})", valid))
 
@@ -204,7 +214,7 @@ class DatasetDQ:
         """
         key_list = [keys] if isinstance(keys, str) else list(keys)
         if not key_list:
-            raise ValueError("unique() requires at least one key column")
+            raise PlanError("unique() requires at least one key column, e.g. unique('id')")
         return self._add(UniqueConstraint(f"unique({', '.join(key_list)})", tuple(key_list)))
 
     def in_range(self, column: str, low: Any, high: Any) -> DatasetDQ:
@@ -226,6 +236,10 @@ class DatasetDQ:
                 >>> ds.dq.in_range("x", 0, 10).drop().to_pydict()
                 {'x': [1, 2]}
         """
+        if low > high:
+            raise PlanError(
+                f"in_range({column!r}): low ({low!r}) > high ({high!r}) — swap the arguments?"
+            )
         c = Col(column)
         return self._add(
             RowConstraint(f"in_range({column}, {low}, {high})", c.is_null() | c.between(low, high))
@@ -297,7 +311,12 @@ class DatasetDQ:
                 >>> ds.dq.check(bt.col("x") > 0, name="positive").drop().to_pydict()
                 {'x': [1, 2]}
         """
-        return self._add(RowConstraint(name, predicate))
+        # `total=False`: a user predicate may be NULL for a row (a comparison against a null
+        # column), and a NULL validity is a violation. That is handled correctly by executing
+        # (`when(valid).then(0).otherwise(1)` catches it) but *not* by the metadata probe, so
+        # this constraint opts out of the shortcut rather than risk discharging a contract it
+        # has not proved. See `api.dataset.meta.prove`.
+        return self._add(RowConstraint(name, predicate, total=False))
 
     def foreign_key(
         self,
@@ -339,7 +358,6 @@ class DatasetDQ:
         ref = references.select(*ref_cols).distinct()
         return self._ds.join(ref, left_on=cols, right_on=ref_cols, how="anti")
 
-    # --- terminals ---------------------------------------------------------
     def validate(self) -> ValidationReport:
         """Execute the checks and return per-constraint violation counts (no raise).
 
@@ -354,6 +372,8 @@ class DatasetDQ:
                 >>> str(ds.dq.in_range("x", 0, 10).validate())
                 'ValidationReport(violations: in_range(x, 0, 10)=1)'
         """
+        if self._provably_clean():
+            return ValidationReport({c.name: 0 for c in self._constraints})
         violations: dict[str, int] = {}
         rows = [c for c in self._constraints if isinstance(c, RowConstraint)]
         if rows:
@@ -394,7 +414,9 @@ class DatasetDQ:
         report = self.validate()
         if not report.ok:
             raise DataQualityError(
-                f"data-quality check failed: {report}", violations=report.violations
+                f"data-quality check failed: {report}. Use .drop() to keep only valid rows, "
+                "or .quarantine() to route violating rows aside.",
+                violations=report.violations,
             )
         return self._ds
 
@@ -412,6 +434,8 @@ class DatasetDQ:
                 >>> ds.dq.in_range("x", 0, 10).drop().to_pydict()
                 {'x': [1, 2]}
         """
+        if self._provably_clean():
+            return self._ds  # every row passes — the filter is the identity, so don't build one
         prepared, valid, helpers = self._prepared()
         kept = prepared.filter(when(valid).then(lit(True)).otherwise(lit(False)))
         return kept.drop(*helpers) if helpers else kept
@@ -433,6 +457,11 @@ class DatasetDQ:
                 >>> clean.to_pydict(), rejected.to_pydict()
                 ({'x': [1, 2]}, {'x': [-3]})
         """
+        if self._provably_clean():
+            # Nothing violates the contract, so the split is the whole relation and nothing.
+            # `limit(0)` is the canonical empty marker — it carries the right schema and the
+            # optimizer prunes its input, so the dead-letter side costs nothing to produce.
+            return self._ds, self._ds.limit(0)
         prepared, valid, helpers = self._prepared()
         keep = when(valid).then(lit(True)).otherwise(lit(False))
         reject = when(valid).then(lit(False)).otherwise(lit(True))
@@ -441,6 +470,12 @@ class DatasetDQ:
         if helpers:
             clean, bad = clean.drop(*helpers), bad.drop(*helpers)
         return clean, bad
+
+    def _provably_clean(self) -> bool:
+        """Whether metadata proves every constraint holds — see `api.dataset.meta.prove`."""
+        from batcher.api.dataset.meta.prove import constraints_provably_hold
+
+        return constraints_provably_hold(self._ds, self._constraints)
 
     def _prepared(self) -> tuple[Dataset, Expr, list[str]]:
         """Add window-count helpers for uniqueness and return ``(dataset, validity,

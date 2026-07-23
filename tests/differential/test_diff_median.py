@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -25,15 +26,11 @@ def t(duck):
 
 
 def test_median_grouped(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).group_by("k").agg(m=col("v").median(), mf=col("f").median()).collect()
     assert_same(out, duck.sql("SELECT k, median(v) m, median(f) mf FROM t GROUP BY k"))
 
 
 def test_median_global(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).group_by().agg(m=col("v").median()).collect()
     assert_same(out, duck.sql("SELECT median(v) m FROM t"))
 
@@ -42,8 +39,6 @@ def test_mixed_value_list_and_constant_state_aggregates(duck, t):
     # A value-list aggregate (median) mixed with constant-state aggregates
     # (sum/count) and another value-list (n_unique) — the shape that falls to the
     # grace path. Must match DuckDB across columns.
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .group_by("k")
@@ -65,7 +60,6 @@ def test_mixed_aggregates_under_forced_spill(duck, t):
     import dataclasses
 
     from batcher.config import active_config, config_context
-    from conftest import assert_same
 
     cfg = active_config()
     spill_cfg = cfg.replace(memory=dataclasses.replace(cfg.memory, max_memory_bytes=4096))
@@ -75,8 +69,6 @@ def test_mixed_aggregates_under_forced_spill(duck, t):
 
 
 def test_median_even_and_odd_counts(duck):
-    from conftest import assert_same
-
     tbl = pa.table({"k": [1, 1, 1, 1, 2, 2, 2], "v": [4, 2, 3, 1, 3, 1, 2]})
     duck.register("e", tbl)
     out = bt.from_arrow(tbl).group_by("k").agg(m=col("v").median()).collect()
@@ -84,8 +76,6 @@ def test_median_even_and_odd_counts(duck):
 
 
 def test_median_via_sql(duck, t):
-    from conftest import assert_same
-
     q = "SELECT k, median(v) AS m FROM t GROUP BY k"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
@@ -114,7 +104,6 @@ def _tight_cap():
 
 def test_median_grouped_spilled(duck):
     from batcher.config import config_context
-    from conftest import assert_same
 
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)
@@ -126,7 +115,6 @@ def test_median_grouped_spilled(duck):
 @pytest.mark.parametrize("p", [0.1, 0.25, 0.5, 0.9])
 def test_quantile_grouped_spilled(duck, p):
     from batcher.config import config_context
-    from conftest import assert_same
 
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)
@@ -137,7 +125,6 @@ def test_quantile_grouped_spilled(duck, p):
 
 def test_median_global_spilled(duck):
     from batcher.config import config_context
-    from conftest import assert_same
 
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)

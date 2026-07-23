@@ -14,33 +14,58 @@ produces an unstable one (the pre-contract prototype had a 15% task-failure rate
 - **Rust is the data plane.** All per-row and per-batch computation lives in the
   `bc-*` crates and runs over Arrow `RecordBatch`es.
 - The boundary is a **JSON plan IR** plus zero-copy Arrow batches. Python lowers a
-  plan to JSON (`plan/logical.py::to_ir`), hands it to `bc_py::execute_plan`, and
+  plan to JSON (`plan/logical/::to_ir`), hands it to `bc_py::execute_plan`, and
   gets Arrow batches back. Nothing else crosses.
 
-## The three subsystems (independence is enforced)
+## The import matrix (every package has a layer — check yours before you import)
 
-`python/batcher/` is split into three subsystems that MUST stay independent:
+This table is the whole answer to "what am I allowed to import?". **Every** package under
+`python/batcher/` is listed. If a package is not in this table, the table is wrong — fix it
+in the same commit, don't guess.
 
-| Subsystem    | Responsibility                                            | May import |
-|--------------|-----------------------------------------------------------|------------|
-| `kyber`      | **Optimizer.** Plan → plan passes; cardinality/cost; learned stats. Decides, never executes. | `plan`, `metadata`, `config`, `_internal` |
-| `carbonite`  | **Resource manager.** Buffer pool, spill, credit-based flow control, memory envelopes. | `plan`, `metadata`, `config`, `_internal`, `batcher._native` (governs the data plane: the `bc-resource` pool / `bc-transport` shuffle) |
-| `core`       | **Executor.** Drives the engine via `bc_py`, runs the adaptive re-optimization loop, **measures** runtime metadata. | `plan`, `metadata`, `config`, `_internal`, `batcher._native` |
+Read it bottom-up: a package may import anything **below** its line, never above or sideways
+(except where the row says so).
 
-Rules:
+| Layer | Package | Responsibility | May import |
+|---|---|---|---|
+| 6 · front-ends | `ml`, `_sql` | User-facing feature surfaces built *on* the public API: ML/inference/loaders; the SQL parser+translator. They lower to the same `Dataset`/`LogicalPlan` everything else uses — they never build a second plan or a second executor. | `api` + everything below |
+| 5 · conductor | `api` | **The only conductor.** The single place allowed to import all subsystems; it sequences them on a terminal op: Kyber optimizes → Carbonite checks feasibility → Core executes → metadata flows back. | everything below |
+| 4 · backend | `dist` | Distributed **scheduling** of the same operators (Ray tasks, Arrow Flight shuffle, out-of-core spill). A *scheduling* concern, not a second semantics — it composes the same mergeable primitives. | `kyber`, `carbonite`, `core` + everything below. **MUST NOT import `api`** (that is the conductor calling *into* its own backend — a cycle). |
+| 3 · subsystems | `kyber` | **Optimizer.** Plan → plan passes; cardinality/cost; learned stats. Decides, never executes. | layers 0–2 |
+| 3 · subsystems | `carbonite` | **Resource manager.** Buffer pool, spill, credit-based flow control, memory envelopes. Also drives the data plane it governs (`bc-resource` pool, `bc-transport` shuffle). | layers 0–2, `_internal.native` |
+| 3 · subsystems | `core` | **Executor.** Drives the engine, runs the adaptive re-optimization loop, **measures** runtime metadata. | layers 0–2, `_internal.native` |
+| 3 · subsystems | `governance` | **Policy.** Row filters / column masks as a pure plan rewrite; lineage. | layers 0–2 |
+| 2 · neutral IO | `io` | Sources, sinks, formats, filesystem, schema evolution. **Neutral**: it imports no subsystem, so anyone may depend on it. | layers 0–1, `_internal.native` |
+| 2 · neutral sinks | `observe` | **Observability sinks**: the terminal progress reporter, the bounded activity store, and the web dashboard (`bt.start_ui()`). Consumes the event bus (`_internal.events`) that every subsystem publishes to; it reads events, never the engine. **Neutral** — it imports no subsystem (not even `io`), which is what keeps observability decoupled from the thing it observes. | layers 0–1 |
+| 1 · contracts | `plan` | `LogicalPlan`/`PhysicalPlan`, `expr_ir`, schema, the JSON IR (`to_ir`), IR tags. | layer 0 |
+| 1 · contracts | `metadata` | Learned stats (`MetadataHub`) — Core measures, Kyber consumes. | `plan`, layer 0 |
+| 0 · utilities | `config`, `_internal` | Config/profiles; errors, registry, logging, hardware, and `_internal.native` — **the one accessor for the compiled engine**. | each other only |
 
-- **`kyber`, `carbonite`, `core` MUST NOT import one another.** (import-linter
-  `independence` contract.)
-- **`plan` is the neutral contract layer.** It MUST NOT import `kyber`,
-  `carbonite`, `core`, or `api`. Everything depends on `plan`; `plan` depends on
-  no subsystem. (import-linter `forbidden` contract.)
-- **`api` is the only conductor.** It is the single place allowed to import all
-  three subsystems; it sequences them on a terminal operation: Kyber optimizes →
-  Carbonite checks feasibility / allocates → Core executes → metadata flows back.
-- `metadata`, `config`, `_internal` are shared neutral utilities.
+The four subsystems on layer 3 are **mutually independent** — `kyber`, `carbonite`, `core`,
+and `governance` MUST NOT import one another (import-linter `independence` contract). That is
+deliberate, and it has a consequence you must respect: **copy-paste is the only *wrong* way to
+share between them.** If two subsystems need the same helper, lift it into a neutral layer
+(`plan`, `metadata`, `config`, `_internal`) — never paste it twice. (This has already happened:
+`_median` was pasted into `kyber` twice and `carbonite` once.)
 
-Run `just lint-layers` after any change to Python imports. A red contract is a
-blocking failure, not a warning.
+### Never import the compiled engine directly
+
+Use `from batcher._internal.native import engine` — **never** `import batcher._native`. The
+static import graph cannot see into a compiled extension, so a direct import gets attributed to
+the *root* `batcher` package, which re-exports `api`, which imports every subsystem — forging a
+phantom `core -> batcher -> api -> kyber` cycle that silently breaks the independence contract.
+This is not theoretical: it is what broke all six independence directions, and the
+`ignore_imports` allowlist that used to paper over it is gone precisely so it cannot come back.
+
+Run `just lint-layers` after any change to Python imports. A red contract is a blocking
+failure, not a warning.
+
+### Known debt (visible on purpose)
+
+- `core/udf` imports `ml.gpu` / `ml.inference` / `ml.batch_format` — an *upward* edge (layer 3
+  reaching into layer 6). Those are execution concerns (autocast, the inference pool, batch-format
+  conversion) that grew inside the user-facing `ml` package instead of the executor. They belong in
+  `core` or a neutral layer. Don't add more upward edges; move these down when you touch them.
 
 ## The contract loop (why the split exists)
 

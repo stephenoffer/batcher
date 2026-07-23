@@ -125,8 +125,23 @@ def _is_false(expr: Expr) -> bool:
 
 def _rewrite_node(node: LogicalPlan, leaf) -> LogicalPlan | None:
     """Apply a leaf `Expr → Expr` rewrite to every expression in `node`, returning the
-    rebuilt node, or `None` when nothing changed (so the driver reaches a fixpoint)."""
+    rebuilt node, or `None` when nothing changed (so the driver reaches a fixpoint).
+
+    **Identity first.** `map_node_expressions` and `transform_expr_up` share structure: when
+    a rule touches nothing — the overwhelming case, since each of the hundred-odd expression
+    rules matches a handful of shapes and passes over the rest — the *same* node object comes
+    back. That is an O(1) "no change", and it is the answer almost every time this is called.
+
+    Falling straight through to `to_ir() != to_ir()` instead meant serializing the node's
+    whole expression tree to JSON **twice, per rule, per node, per fixpoint iteration** just
+    to conclude nothing had happened. That serialization — not the rewriting — was what made
+    the rule set expensive to plan with: it is quadratic in (rules x expression size), and it
+    is pure waste. The IR comparison is still needed on the path where the object *did*
+    change, because a rule may rebuild an equal-but-new tree (`Lit(False)` over an already
+    `Lit(False)`), and treating that as a change would spin the fixpoint forever."""
     new = map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
+    if new is node:
+        return None  # structural sharing proved the rewrite was a no-op
     return new if new.to_ir() != node.to_ir() else None
 
 
@@ -142,7 +157,12 @@ def _and_false(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="and_false_annihilator", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="and_false_annihilator",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_and_false,
+)
 def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND FALSE → FALSE`. Under the engine's Kleene AND, `NULL AND FALSE` and
     `TRUE AND FALSE` are both FALSE, so a `FALSE` operand forces the whole conjunction
@@ -161,7 +181,12 @@ def _or_true(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="or_true_annihilator", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="or_true_annihilator",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_or_true,
+)
 def or_true_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR TRUE → TRUE`. Under the engine's Kleene OR, `NULL OR TRUE` and
     `FALSE OR TRUE` are both TRUE, so a `TRUE` operand forces the disjunction to TRUE.
@@ -183,7 +208,12 @@ def _and_idem(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="and_idempotent", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="and_idempotent",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_and_idem,
+)
 def and_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND x → x`. In Kleene logic `v AND v = v` for every value (`T,F,N`), so a
     self-conjunction is redundant. Restricted to a `_safe` `x` so collapsing two
@@ -202,7 +232,12 @@ def _or_idem(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="or_idempotent", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="or_idempotent",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_or_idem,
+)
 def or_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR x → x`. In Kleene logic `v OR v = v` for every value, so a
     self-disjunction is redundant. Restricted to a `_safe` `x`."""
@@ -234,7 +269,12 @@ def _and_absorb(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="and_absorption", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="and_absorption",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_and_absorb,
+)
 def and_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND (x OR y) → x`. The Kleene absorption law holds for all three values
     (`x=T`: `T`; `x=F`: `F`; `x=N`: `N`), so the disjunction is redundant. Both
@@ -252,7 +292,12 @@ def _or_absorb(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="or_absorption", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="or_absorption",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_or_absorb,
+)
 def or_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR (x AND y) → x`. The dual Kleene absorption law, valid for all three
     values. Both operands must be `_safe`."""
@@ -277,7 +322,12 @@ def _complement(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="complement_total_bool", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="complement_total_bool",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_complement,
+)
 def complement_total_bool(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND NOT x → FALSE` and `x OR NOT x → TRUE`, but **only** when `x` never
     yields null (`is_null`/`is_not_null`). For a nullable `x`, `x AND NOT x` is NULL
@@ -300,7 +350,12 @@ def _fold_not_comparison(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="fold_not_comparison", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_not_comparison",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_fold_not_comparison,
+)
 def fold_not_comparison(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (a = b) → a <> b`, `NOT (a < b) → a >= b`, … — push `NOT` into a
     comparison. Exact under three-valued logic: a comparison and its complement are
@@ -333,7 +388,12 @@ def _bool_eq_literal(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="bool_eq_literal", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="bool_eq_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_bool_eq_literal,
+)
 def bool_eq_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x = TRUE → x`, `x = FALSE → NOT x` (and the `<>` duals) for a boolean `x`.
     Comparing a boolean to a boolean literal is the identity or the negation in all
@@ -352,7 +412,12 @@ def _single_in_list(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="single_in_list", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="single_in_list",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_single_in_list,
+)
 def single_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x IN (v) → x = v`. A one-element membership test is exactly an equality, with
     identical null behavior (`NULL IN (v)` and `NULL = v` are both null). Turns the
@@ -369,7 +434,12 @@ def _dedup_in_list(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="dedup_in_list", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="dedup_in_list",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_dedup_in_list,
+)
 def dedup_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x IN (a, b, a) → x IN (a, b)`. Set membership is unchanged by duplicate values,
     so de-duplicating (first occurrence kept) shrinks the probe set with no change to
@@ -396,13 +466,14 @@ def _coalesce_simplify(expr: Expr) -> Expr:
                 continue  # an earlier identical (deterministic) arg already covers it
             seen.add(k)
         out.append(arg)
-    # A non-null literal makes every later argument unreachable — drop them when the
-    # dropped tail cannot error (so removing it changes neither value nor errors).
-    for i, arg in enumerate(out):
-        if isinstance(arg, Lit):
-            if all(_safe(rest) for rest in out[i + 1 :]):
-                out = out[: i + 1]
-            break
+    # NB: truncating the tail after the first non-null *literal* is deliberately NOT done
+    # here. It is sound only when the dropped tail's type is already carried by a kept arm
+    # — otherwise it narrows the result type (a `COALESCE`'s type is the *join* of its
+    # arms', so dropping `CAST(-1 AS DOUBLE)` from `coalesce(5, CAST(-1 AS DOUBLE))` turns
+    # a DOUBLE `5.0` into an INT `5`). That type-guarded truncation lives in
+    # `coalesce_drop_nulls_after_first_non_null` (`_droppable`); doing an unguarded version
+    # here silently changed the output dtype and value. Flatten + dedup below only ever
+    # drop an arm structurally identical to a kept one, so they cannot move the type.
     if len(out) == 1:
         return out[0]
     if _keys(out) == _keys(expr.inputs):
@@ -410,12 +481,19 @@ def _coalesce_simplify(expr: Expr) -> Expr:
     return Coalesce(out)
 
 
-@rule(name="coalesce_simplify", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="coalesce_simplify",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_coalesce_simplify,
+)
 def coalesce_simplify(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Flatten and shrink a `COALESCE`: inline a nested `COALESCE`, drop a later
-    duplicate of an earlier `_safe` argument, truncate everything after the first
-    non-null literal (when the dropped tail cannot error), and unwrap `COALESCE(x)` to
-    `x`. Each step preserves "first non-null argument" exactly — a repeated or
-    post-literal argument is only ever reached when it is null (or never), so removing
-    it is sound."""
+    duplicate of an earlier `_safe` argument, and unwrap `COALESCE(x)` to `x`. Each step
+    preserves "first non-null argument" *and* the result type: a repeated argument is only
+    ever reached when it is null and is structurally identical to a kept one, so removing
+    it moves neither the value nor the type. Truncating the tail after the first non-null
+    *literal* is left to `coalesce_drop_nulls_after_first_non_null`, which guards it with a
+    type check (`_droppable`) — dropping a differently-typed tail here would narrow the
+    `COALESCE`'s join type (turning DOUBLE `5.0` into INT `5`)."""
     return _rewrite_node(node, _coalesce_simplify)

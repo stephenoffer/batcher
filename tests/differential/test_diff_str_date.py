@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -45,15 +46,11 @@ def t(duck):
     ],
 )
 def test_str_date_fn_vs_duckdb(duck, t, expr, sql):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r=expr).collect()
     assert_same(out, duck.sql(f"SELECT {sql} AS r FROM t"))
 
 
 def test_str_in_filter_and_projection(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .filter(col("s").str.contains("o"))

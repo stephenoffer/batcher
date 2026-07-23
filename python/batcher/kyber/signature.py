@@ -32,10 +32,28 @@ from batcher.plan.logical import (
 __all__ = ["plan_signature"]
 
 
+# Instance-`__dict__` cache slot, matching the `_memoize_noarg` convention plan nodes
+# already use for `to_ir` / `available_schema` (see `plan/logical/base.py`).
+_SIG_SLOT = "_c_plan_signature"
+
+
 def plan_signature(node: LogicalPlan) -> str:
-    """A stable short hash of a node's structure (literal values normalized)."""
+    """A stable short hash of a node's structure (literal values normalized).
+
+    Memoized on the node. Plan nodes are immutable, so the signature is a pure function
+    of the node — but it JSON-encodes and hashes the *whole subtree*, and the conductor
+    asks for it several times per query (result-cache key, learned-stats lookup, feedback
+    recording). Measured on a small query that was ~4 encodes per query, making
+    `json.iterencode` as expensive as the entire native execution. The write goes through
+    `__dict__` to bypass the frozen `__setattr__`, exactly as `_memoize_noarg` does.
+    """
+    cached = node.__dict__.get(_SIG_SLOT)
+    if cached is not None:
+        return cached
     payload = json.dumps(_struct(node), sort_keys=True, default=str)
-    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+    sig = hashlib.sha1(payload.encode()).hexdigest()[:16]
+    node.__dict__[_SIG_SLOT] = sig
+    return sig
 
 
 def _struct(node: LogicalPlan):
@@ -81,7 +99,14 @@ def _struct(node: LogicalPlan):
     if isinstance(node, Union):
         return ["union", [_struct(i) for i in node.inputs]]
     if isinstance(node, MapBatches):
-        return ["map_batches", _struct(node.input)]
+        # The UDF's identity is part of the shape: without it every `map_batches` over the
+        # same input signature collapses to one learned entry, so a filtering UDF (0.1x) and
+        # an exploding one (20x) — the two ends of an AI pipeline — would share, and
+        # whichever ran last would answer for the other. Exactly the scan-collision defect,
+        # and the reason `MapBatches` can only be a learnable (`_CORRECTABLE`) fan-out once
+        # its signature tells the UDFs apart. Best-effort by qualified name (stable across
+        # runs for a named function/class); anonymous lambdas still collide, the floor.
+        return ["map_batches", _udf_identity(node.fn), _struct(node.input)]
     if isinstance(node, Unnest):
         return ["unnest", node.column, node.alias, _struct(node.input)]
     if isinstance(node, Unpivot):
@@ -96,6 +121,26 @@ def _struct(node: LogicalPlan):
     if isinstance(node, Sample):
         return ["sample", node.fraction, node.seed, _struct(node.input)]
     return [type(node).__name__]
+
+
+def _udf_identity(fn: object) -> str:
+    """A best-effort, run-stable identity for a `map_batches` UDF.
+
+    A named function or factory class is identified by ``module.qualname`` — stable across
+    processes, so a correction learned on one run applies to the next. A callable *instance*
+    (the "build the model once" factory pattern) is identified by its class, since that is
+    what determines its behaviour. An anonymous lambda degrades to ``<lambda>`` and may
+    collide with another lambda over the same input — the unavoidable floor for a UDF with
+    no name — which is still strictly better than every `map_batches` sharing one key.
+    """
+    qual = getattr(fn, "__qualname__", None)
+    if qual is not None:
+        module = getattr(fn, "__module__", "") or ""
+    else:  # a callable instance: identify it by its type
+        cls = type(fn)
+        qual = getattr(cls, "__qualname__", cls.__name__)
+        module = getattr(cls, "__module__", "") or ""
+    return f"{module}.{qual}"
 
 
 def _norm(ir):

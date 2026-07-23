@@ -12,6 +12,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.adaptive_meta  # registers the rules into DEFAULT_REGISTRY
+from _harness import assert_same
 from batcher import col
 
 
@@ -24,8 +25,6 @@ def _reg(duck, name, table):
 
 
 def test_inert_limit_returns_all_rows(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3, None, 5], "y": [10, 20, 30, 40, 50]})
     ds = _reg(duck, "t", t)
     # LIMIT 100 over 5 exact rows → the cap is inert; every row (incl. the null) stays.
@@ -34,8 +33,6 @@ def test_inert_limit_returns_all_rows(duck):
 
 
 def test_inert_limit_at_exact_row_count(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
     ds = _reg(duck, "t2", t)
     out = ds.limit(3).collect()  # cap == row count → still all rows
@@ -43,8 +40,6 @@ def test_inert_limit_at_exact_row_count(duck):
 
 
 def test_inert_limit_over_global_aggregate(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3, 4]})
     ds = _reg(duck, "t3", t)
     # A global aggregate is EXACTLY one row, so LIMIT 5 over it is inert.
@@ -56,8 +51,6 @@ def test_inert_limit_over_global_aggregate(duck):
 
 
 def test_offset_past_end_is_empty(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3], "y": [10, 20, 30]})
     ds = _reg(duck, "t4", t)
     # OFFSET 3 over 3 rows → window opens past the last row → empty.
@@ -66,8 +59,6 @@ def test_offset_past_end_is_empty(duck):
 
 
 def test_offset_well_past_end_is_empty(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2], "y": ["a", "b"]})
     ds = _reg(duck, "t5", t)
     out = ds.limit(5, offset=100).collect()
@@ -78,8 +69,6 @@ def test_offset_well_past_end_is_empty(duck):
 
 
 def test_filter_sort_over_empty_source(duck):
-    from conftest import assert_same
-
     empty = pa.table({"x": pa.array([], pa.int64()), "y": pa.array([], pa.int64())})
     ds = _reg(duck, "e1", empty)
     out = ds.filter(col("x") > 1).sort("x").collect()
@@ -87,8 +76,6 @@ def test_filter_sort_over_empty_source(duck):
 
 
 def test_distinct_over_empty_source(duck):
-    from conftest import assert_same
-
     empty = pa.table({"x": pa.array([], pa.int64()), "y": pa.array([], pa.string())})
     ds = _reg(duck, "e2", empty)
     out = ds.filter(col("x") > 1).distinct().collect()

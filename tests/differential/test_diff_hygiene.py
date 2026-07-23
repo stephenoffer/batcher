@@ -9,14 +9,13 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 def test_eq_missing_is_not_distinct_from(duck):
     """`eq_missing` matches SQL ``IS NOT DISTINCT FROM`` (two nulls equal, null vs
     value is false)."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "a": pa.array([1, 2, None, None, 5], pa.int64()),
@@ -30,8 +29,6 @@ def test_eq_missing_is_not_distinct_from(duck):
 
 def test_replace_maps_values(duck):
     """`replace({old: new})` remaps listed values, keeping the rest unchanged."""
-    from conftest import assert_same
-
     t = pa.table({"c": ["US", "UK", "FR", "US", None]})
     duck.register("rp", t)
     out = bt.from_arrow(t).select(c=col("c").replace({"US": "USA", "UK": "GBR"})).collect()
@@ -45,8 +42,6 @@ def test_replace_maps_values(duck):
 
 def test_replace_with_default(duck):
     """A `default` replaces every unmapped (incl. unmatched) value."""
-    from conftest import assert_same
-
     t = pa.table({"c": ["a", "b", "z", None]})
     duck.register("rpd", t)
     out = bt.from_arrow(t).select(c=col("c").replace({"a": "1", "b": "2"}, default="?")).collect()
@@ -58,8 +53,6 @@ def test_replace_with_default(duck):
 
 def test_fill_null_strategy_mean(duck):
     """`fill_null(strategy="mean")` fills nulls with the column mean (whole relation)."""
-    from conftest import assert_same
-
     t = pa.table({"v": pa.array([1.0, 3.0, None, 5.0, None], pa.float64())})
     duck.register("fm", t)
     out = bt.from_arrow(t).fill_null(strategy="mean").collect()
@@ -68,8 +61,6 @@ def test_fill_null_strategy_mean(duck):
 
 def test_normalize_whitespace(duck):
     """`str.normalize_whitespace` collapses whitespace runs and trims (vs DuckDB)."""
-    from conftest import assert_same
-
     t = pa.table({"s": ["  hello   world ", "a  b", "no-change", None]})
     duck.register("nw", t)
     out = bt.from_arrow(t).select(s=col("s").str.normalize_whitespace()).collect()
@@ -78,8 +69,6 @@ def test_normalize_whitespace(duck):
 
 def test_fill_null_strategy_max_subset(duck):
     """A strategy fill restricted to `subset`."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "a": pa.array([1, None, 3], pa.int64()),

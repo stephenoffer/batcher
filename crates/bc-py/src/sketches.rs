@@ -12,7 +12,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_pyarrow::PyArrowType;
-use bc_sketches::Mergeable;
+use bc_sketches::{FrequentItems, Mergeable};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -376,11 +376,85 @@ pub(crate) fn tdigest_quantile(sketches: Vec<Vec<u8>>, q: f64) -> PyResult<Optio
     Ok(merged.and_then(|mut m| m.quantile(q)))
 }
 
+/// The non-null values of an integer column, widened to `i64` — `None` for any other type.
+///
+/// Restricted to the plain integer types **on purpose**. Their `Utf8` rendering is the
+/// decimal of the integer, so a survivor widened to `i64` and cast back renders exactly as
+/// the original column would have. `Date32`/`Timestamp` are *also* integers underneath but
+/// render as dates and times, and `Boolean` renders as `true`/`false`; widening those would
+/// silently change the key the optimizer matches on, so they stay on the string path.
+fn int_values(col: &ArrayRef) -> Option<Vec<i64>> {
+    use arrow::array::*;
+
+    macro_rules! widen {
+        ($ty:ty) => {{
+            let a = col.as_any().downcast_ref::<$ty>().expect("dtype matched");
+            Some(
+                a.iter()
+                    .flatten()
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MIN))
+                    .collect(),
+            )
+        }};
+    }
+    match col.data_type() {
+        DataType::Int8 => widen!(Int8Array),
+        DataType::Int16 => widen!(Int16Array),
+        DataType::Int32 => widen!(Int32Array),
+        DataType::Int64 => widen!(Int64Array),
+        DataType::UInt8 => widen!(UInt8Array),
+        DataType::UInt16 => widen!(UInt16Array),
+        DataType::UInt32 => widen!(UInt32Array),
+        DataType::UInt64 => widen!(UInt64Array),
+        _ => None,
+    }
+}
+
+/// Render integer heavy hitters to the strings the `Utf8` cast of `dtype` would have given.
+///
+/// The survivors go back through `cast` — the *same* conversion the string path applies to
+/// the whole column — via a tiny array of the column's original type. That is what makes the
+/// native-integer summary safe: the labels the optimizer and the shuffle's salting path key
+/// on cannot drift from what casting the column produced, because they are produced by
+/// casting.
+fn render_int_hits(hits: &[(i64, u64)], dtype: &DataType) -> Vec<(String, u64)> {
+    use arrow::array::{Array, Int64Array, StringArray};
+
+    let keys: ArrayRef = std::sync::Arc::new(Int64Array::from(
+        hits.iter().map(|(v, _)| *v).collect::<Vec<i64>>(),
+    ));
+    // Back to the column's own type, then to text — exactly the string path's conversion.
+    let Ok(native) = cast(&keys, dtype) else {
+        return Vec::new();
+    };
+    let Ok(text) = cast(&native, &DataType::Utf8) else {
+        return Vec::new();
+    };
+    let Some(arr) = text.as_any().downcast_ref::<StringArray>() else {
+        return Vec::new();
+    };
+    hits.iter()
+        .enumerate()
+        .filter(|(i, _)| arr.is_valid(*i))
+        .map(|(i, (_, n))| (arr.value(i).to_string(), *n))
+        .collect()
+}
+
 /// Heavy hitters (the Misra-Gries `FrequentItems` sketch) per column: the values
 /// whose frequency exceeds `fraction` of the rows, with their estimated counts.
 /// Kyber consumes this for skew detection (a hot join key → salting). Values are
 /// rendered to strings (cast to Utf8) so any column type can be labelled; columns
 /// that cannot cast are skipped. Mergeable in spirit — built across all batches.
+///
+/// **An integer column is summarized over its native values, not its rendering.** The
+/// obvious implementation casts the whole column to `Utf8` and feeds one `String` per row
+/// into the summary — for a 1M-row join key that is a million integers formatted into a
+/// million heap strings, each hashed and then thrown away, since the summary only ever
+/// monitors ~`capacity` (≈20) of them. Measured at **90 ns/value**, it made skew detection
+/// cost more than the join it was protecting. Integers are hashed as `i64` instead, and only
+/// the surviving handful are rendered — through the *same* `cast`, applied to a tiny array
+/// of the survivors' original type, so the strings the optimizer and the shuffle's salting
+/// path match on are byte-identical to what this always produced.
 #[pyfunction]
 pub(crate) fn heavy_hitters(
     columns: Vec<String>,
@@ -389,32 +463,50 @@ pub(crate) fn heavy_hitters(
 ) -> PyResult<std::collections::HashMap<String, Vec<(String, u64)>>> {
     // Misra-Gries capacity: 1/fraction guarantees all keys above `fraction` survive.
     let capacity = ((1.0 / fraction).ceil() as usize).max(1);
-    let mut items: std::collections::HashMap<String, bc_sketches::FrequentItems<String>> =
+    let mut ints: std::collections::HashMap<String, (DataType, bc_sketches::FrequentItems<i64>)> =
+        std::collections::HashMap::new();
+    let mut strs: std::collections::HashMap<String, bc_sketches::FrequentItems<String>> =
         std::collections::HashMap::new();
     for batch in &batches {
         let b = &batch.0;
         for name in &columns {
-            if let Some(col) = b.column_by_name(name) {
-                let Ok(s) = cast(col, &DataType::Utf8) else {
-                    continue;
-                };
-                let Some(arr) = s.as_any().downcast_ref::<arrow::array::StringArray>() else {
-                    continue;
-                };
-                let fi = items
+            let Some(col) = b.column_by_name(name) else {
+                continue;
+            };
+            if let Some(vals) = int_values(col) {
+                let (_, fi) = ints
                     .entry(name.clone())
-                    .or_insert_with(|| bc_sketches::FrequentItems::new(capacity));
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        fi.add(arr.value(i).to_string());
-                    }
+                    .or_insert_with(|| (col.data_type().clone(), FrequentItems::new(capacity)));
+                for v in vals {
+                    fi.add(v);
+                }
+                continue;
+            }
+            let Ok(s) = cast(col, &DataType::Utf8) else {
+                continue;
+            };
+            let Some(arr) = s.as_any().downcast_ref::<arrow::array::StringArray>() else {
+                continue;
+            };
+            let fi = strs
+                .entry(name.clone())
+                .or_insert_with(|| FrequentItems::new(capacity));
+            // `add_ref`, not `add`: only the branch that takes a free slot needs to own the
+            // key, so the row's `String` is built solely when it enters the summary.
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    fi.add_ref(arr.value(i));
                 }
             }
         }
     }
     let mut out = std::collections::HashMap::new();
-    for (name, fi) in items {
+    for (name, fi) in strs {
         out.insert(name, fi.heavy_hitters(fraction));
+    }
+    for (name, (dtype, fi)) in ints {
+        let hits = fi.heavy_hitters(fraction);
+        out.insert(name, render_int_hits(&hits, &dtype));
     }
     Ok(out)
 }

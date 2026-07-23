@@ -19,7 +19,8 @@ Read `.claude/rules/architecture.md` (Kyber's lane), `.claude/rules/maintainabil
 - **Framework:** `kyber/rule.py` (`Rule`, `Phase`, `RuleCategory`, `node_rule`,
   `plan_rule`), `kyber/registry.py` (`@rule` decorator, `DEFAULT_REGISTRY`).
 - **Rule families (add yours to the matching module):**
-  `kyber/rules/{normalize,pushdown,projections,fusion,selection,join_order,algebraic}.py`.
+  `kyber/rules/{normalize,pushdown,projections,fusion,selection,algebraic}.py` and
+  `kyber/rules/joins/`.
 - **Phases, in order:** `NORMALIZE → REWRITE → PUSHDOWN → JOIN_REORDER → FUSION →
   SELECTION → ENFORCE`. Rewrite phases run to a fixpoint; `JOIN_REORDER`/`SELECTION`/
   `ENFORCE` run once.
@@ -48,7 +49,7 @@ Read `.claude/rules/architecture.md` (Kyber's lane), `.claude/rules/maintainabil
    - **Whole-plan / cost-based transform:** write `f(plan, ctx) -> plan` and register
      it with `registry.add(plan_rule(name, phase, f, matches=(...), category=...))`
      in the module body. Use for holistic rewrites and cost-based search. Examples:
-     `kyber/rules/join_order.py` (join reordering), `kyber/rules/selection.py`
+     `kyber/rules/joins/order.py` (join reordering), `kyber/rules/selection.py`
      (build-side). Make sure the module is imported from `kyber/rules/__init__.py`.
      Do **not** hand-roll a per-node `isinstance` ladder to recurse the tree — the
      structural recursion and the identity-preserving rebuild (the fixpoint detector

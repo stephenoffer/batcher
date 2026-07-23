@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import operator
+from collections.abc import Callable
 
 from batcher.plan.expr_ir import (
     Expr,
@@ -175,3 +176,123 @@ def any_horizontal(*exprs: IntoExpr) -> Expr:
     if not exprs:
         raise ValueError("any_horizontal() requires at least one argument")
     return functools.reduce(operator.or_, [_wrap(e) for e in exprs])
+
+
+def count_horizontal(*exprs: IntoExpr) -> Expr:
+    """Row-wise count of non-null values across the given columns (Polars ``count_horizontal``).
+
+    The horizontal companion to :func:`sum_horizontal`: how many of the arguments are
+    non-null in each row. Composes as a sum of null-indicators, so an all-null row
+    counts 0 (never null).
+
+    Args:
+        exprs: The columns whose per-row non-null values are counted.
+
+    Returns:
+        An Int64 column holding the per-row count of non-null arguments.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, None], "b": [10, 20], "c": [None, 3]})
+            >>> ds.select(n=bt.count_horizontal(bt.col("a"), bt.col("b"), bt.col("c"))).to_pydict()
+            {'n': [2, 2]}
+    """
+    if not exprs:
+        raise ValueError("count_horizontal() requires at least one argument")
+    return functools.reduce(operator.add, [_wrap(e).is_not_null().cast("int64") for e in exprs])
+
+
+def product_horizontal(*exprs: IntoExpr) -> Expr:
+    """Row-wise product across the given columns, treating nulls as 1 (Polars-style).
+
+    The multiplicative counterpart to :func:`sum_horizontal`: an all-null row yields 1
+    (the empty product), and a single null factor is skipped rather than nulling the row.
+
+    Args:
+        exprs: The columns to multiply together element-wise.
+
+    Returns:
+        A column holding the per-row product across the non-null values.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [2, None], "b": [10, 20]})
+            >>> ds.select(p=bt.product_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
+            {'p': [20, 20]}
+    """
+    if not exprs:
+        raise ValueError("product_horizontal() requires at least one argument")
+    parts = [coalesce(_wrap(e), lit(1)) for e in exprs]
+    return functools.reduce(operator.mul, parts)
+
+
+def reduce_horizontal(function: Callable[[Expr, Expr], Expr], *exprs: IntoExpr) -> Expr:
+    """Reduce the given columns row-wise with a binary expression `function` (Polars ``reduce``).
+
+    Left-folds `function` across the columns with no seed: the first column is the
+    initial accumulator, then ``acc = function(acc, next)`` for each remaining column.
+    `function` runs **once at plan-build time** on `Expr` operands to assemble the
+    expression tree — it never sees a row — so any expression-valued combiner works
+    (``lambda a, b: a + b``, ``lambda a, b: bt.max_horizontal(a, b)``, …). Use it for a
+    horizontal reduction the named ``*_horizontal`` helpers don't cover.
+
+    Args:
+        function: A binary combiner mapping two `Expr` operands to one `Expr`.
+        exprs: The columns to reduce, left to right.
+
+    Returns:
+        A column holding the per-row reduction.
+
+    Raises:
+        ValueError: If no columns are given.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, 2], "b": [10, 20], "c": [100, 200]})
+            >>> cols = [bt.col("a"), bt.col("b"), bt.col("c")]
+            >>> ds.select(r=bt.reduce_horizontal(lambda x, y: x + y, *cols)).to_pydict()
+            {'r': [111, 222]}
+    """
+    if not exprs:
+        raise ValueError("reduce_horizontal() requires at least one argument")
+    return functools.reduce(function, [_wrap(e) for e in exprs])
+
+
+def fold_horizontal(
+    acc: IntoExpr, function: Callable[[Expr, Expr], Expr], *exprs: IntoExpr
+) -> Expr:
+    """Fold the given columns row-wise with `function`, seeded by `acc` (Polars ``fold``).
+
+    Like :func:`reduce_horizontal` but with an explicit initial accumulator `acc`, so a
+    fold over zero columns is still well-defined and the accumulator can seed a running
+    computation (``fold_horizontal(bt.lit(0), lambda a, b: a + b * b, *cols)`` for a sum
+    of squares). `function` is applied at plan-build time on `Expr` operands, never per
+    row.
+
+    Args:
+        acc: The initial accumulator expression.
+        function: A binary combiner mapping ``(acc, next)`` to a new `Expr`.
+        exprs: The columns to fold in, left to right.
+
+    Returns:
+        A column holding the per-row folded value.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> d = bt.from_pydict({"a": [1, 2], "b": [3, 4]})
+            >>> c = [bt.col("a"), bt.col("b")]
+            >>> d.select(r=bt.fold_horizontal(bt.lit(0), lambda s, x: s + x * x, *c)).to_pydict()
+            {'r': [10, 20]}
+    """
+    result = _wrap(acc)
+    for e in exprs:
+        result = function(result, _wrap(e))
+    return result

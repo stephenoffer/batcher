@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -18,8 +19,6 @@ def _data():
 
 
 def test_adjacent_filters_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).filter(col("x") > 1).filter(col("y") < 90).collect()
@@ -28,8 +27,6 @@ def test_adjacent_filters_vs_duckdb(duck):
 
 
 def test_double_distinct_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).select("x").distinct().distinct().collect()
@@ -38,8 +35,6 @@ def test_double_distinct_vs_duckdb(duck):
 
 
 def test_distinct_over_aggregate_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).group_by("x").agg(total=col("y").sum()).distinct().collect()
@@ -48,8 +43,6 @@ def test_distinct_over_aggregate_vs_duckdb(duck):
 
 
 def test_nested_limits_vs_duckdb(duck):
-    from conftest import assert_same
-
     # Order first so the row window is deterministic for the comparison.
     t = _data()
     duck.register("t", t)
@@ -59,8 +52,6 @@ def test_nested_limits_vs_duckdb(duck):
 
 
 def test_limit_through_project_vs_duckdb(duck):
-    from conftest import assert_same
-
     # Distinct x so ORDER BY x LIMIT 2 has no tie ambiguity.
     t = pa.table({"x": [5, 3, 1, 4, 2], "y": [50, 30, 10, 40, 20]})
     duck.register("t", t)
@@ -70,8 +61,6 @@ def test_limit_through_project_vs_duckdb(duck):
 
 
 def test_sort_before_aggregate_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     # A sort feeding a group-by is wasted; removing it must not change the result.
@@ -81,8 +70,6 @@ def test_sort_before_aggregate_vs_duckdb(duck):
 
 
 def test_filter_through_sort_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").filter(col("x") > 3).collect()
@@ -91,8 +78,6 @@ def test_filter_through_sort_vs_duckdb(duck):
 
 
 def test_filter_through_aggregate_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "dept": ["a", "a", "b", "b", "c", "c", "a"],
@@ -113,8 +98,6 @@ def test_filter_through_aggregate_vs_duckdb(duck):
 
 
 def test_merged_projections_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     # with_columns then select then with_columns -> stacked Projects collapsed.
@@ -130,8 +113,6 @@ def test_merged_projections_vs_duckdb(duck):
 
 
 def test_filter_through_projection_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     # rename x->a then filter on a: the optimizer pushes the filter below the
@@ -142,8 +123,6 @@ def test_filter_through_projection_vs_duckdb(duck):
 
 
 def test_filter_into_union_all_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _data()
     duck.register("t", t)
     out = (
@@ -158,8 +137,6 @@ def test_filter_into_union_all_vs_duckdb(duck):
 
 
 def test_limit_into_union_all_preserves_multiset_vs_duckdb(duck):
-    from conftest import assert_same
-
     # Non-truncating limit: validates the pushdown drops no rows of the UNION ALL
     # (the top-N of an *unordered* union isn't deterministic, so don't truncate).
     t = _data()

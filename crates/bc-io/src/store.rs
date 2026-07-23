@@ -95,19 +95,59 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
     let scheme = url.scheme();
 
     // Environment defaults (object_store's `parse_url_opts` does not read env itself).
-    if matches!(scheme, "s3" | "s3a") {
-        if let Ok(r) = std::env::var("AWS_REGION").or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        {
-            opts.push(("aws_region".into(), r));
+    //
+    // Instance/workload identity — IRSA, IMDS, ECS task roles, GCE and Azure metadata —
+    // is resolved inside the builder and needs nothing here. STATIC credentials in the
+    // environment are the gap: object_store's builders start from `new()`, not
+    // `from_env()`, so without this a MinIO/Ceph deployment with `AWS_ACCESS_KEY_ID` set
+    // (the on-prem norm, where there is no metadata service to fall back on) fails to
+    // authenticate. The scan then silently degrades to the slower pyarrow path — correct
+    // results, quietly worse, with no diagnostic — which is exactly the kind of failure
+    // that never gets reported as a bug.
+    let mut env_opt = |key: &str, vars: &[&str]| {
+        for var in vars {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    opts.push((key.into(), v));
+                    return;
+                }
+            }
         }
-        if let Ok(e) = std::env::var("AWS_ENDPOINT_URL").or_else(|_| std::env::var("AWS_ENDPOINT"))
-        {
-            opts.push(("aws_endpoint".into(), e));
+    };
+    match scheme {
+        "s3" | "s3a" => {
+            env_opt("aws_region", &["AWS_REGION", "AWS_DEFAULT_REGION"]);
+            env_opt("aws_endpoint", &["AWS_ENDPOINT_URL", "AWS_ENDPOINT"]);
+            env_opt("aws_access_key_id", &["AWS_ACCESS_KEY_ID"]);
+            env_opt("aws_secret_access_key", &["AWS_SECRET_ACCESS_KEY"]);
+            env_opt("aws_session_token", &["AWS_SESSION_TOKEN"]);
+            // Allow virtual-hosted-style off for path-style endpoints (MinIO/Ceph).
+            if std::env::var("AWS_ALLOW_HTTP").is_ok() {
+                opts.push(("aws_allow_http".into(), "true".into()));
+            }
         }
-        // Allow virtual-hosted-style off for path-style endpoints (MinIO/Ceph).
-        if std::env::var("AWS_ALLOW_HTTP").is_ok() {
-            opts.push(("aws_allow_http".into(), "true".into()));
+        "gs" | "gcs" => {
+            env_opt(
+                "google_service_account",
+                &["GOOGLE_SERVICE_ACCOUNT", "GOOGLE_APPLICATION_CREDENTIALS"],
+            );
+            env_opt(
+                "google_service_account_key",
+                &["GOOGLE_SERVICE_ACCOUNT_KEY"],
+            );
         }
+        "az" | "azure" | "abfs" | "abfss" | "wasb" | "wasbs" => {
+            env_opt(
+                "azure_storage_account_name",
+                &["AZURE_STORAGE_ACCOUNT_NAME"],
+            );
+            env_opt("azure_storage_account_key", &["AZURE_STORAGE_ACCOUNT_KEY"]);
+            env_opt("azure_storage_sas_key", &["AZURE_STORAGE_SAS_TOKEN"]);
+            env_opt("azure_storage_client_id", &["AZURE_CLIENT_ID"]);
+            env_opt("azure_storage_client_secret", &["AZURE_CLIENT_SECRET"]);
+            env_opt("azure_storage_tenant_id", &["AZURE_TENANT_ID"]);
+        }
+        _ => {}
     }
 
     // Query-string overrides win over env. Map the friendly names the Python façade
@@ -126,4 +166,75 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
         }
     }
     opts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_for(uri: &str) -> HashMap<String, String> {
+        store_options(&Url::parse(uri).unwrap())
+            .into_iter()
+            .collect()
+    }
+
+    /// Static credentials in the environment must reach the builder for every cloud, not
+    /// just AWS. Without this the on-prem case (MinIO/Ceph with `AWS_ACCESS_KEY_ID`, where
+    /// there is no metadata service to fall back on) fails to authenticate and the scan
+    /// silently degrades to the slower pyarrow path instead of reporting anything.
+    ///
+    /// One test rather than several: these env vars are process-global, so splitting this
+    /// across functions would race under cargo's parallel test threads.
+    #[test]
+    fn env_credentials_reach_every_scheme() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AK");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "SK");
+        std::env::set_var("AWS_ENDPOINT_URL", "http://minio.internal:9000");
+        std::env::set_var("AZURE_STORAGE_ACCOUNT_KEY", "AZKEY");
+        std::env::set_var("GOOGLE_SERVICE_ACCOUNT", "/creds/sa.json");
+
+        let s3 = opts_for("s3://bucket/key.parquet");
+        assert_eq!(s3.get("aws_access_key_id").map(String::as_str), Some("AK"));
+        assert_eq!(
+            s3.get("aws_secret_access_key").map(String::as_str),
+            Some("SK")
+        );
+        assert_eq!(
+            s3.get("aws_endpoint").map(String::as_str),
+            Some("http://minio.internal:9000")
+        );
+
+        // Each scheme gets only its own vendor's keys — an `aws_*` key on a GCS store is
+        // not merely useless, it makes the cache key differ for no reason.
+        let gs = opts_for("gs://bucket/key.parquet");
+        assert_eq!(
+            gs.get("google_service_account").map(String::as_str),
+            Some("/creds/sa.json")
+        );
+        assert!(!gs.contains_key("aws_access_key_id"));
+
+        let az = opts_for("abfs://c@a.dfs.core.windows.net/key.parquet");
+        assert_eq!(
+            az.get("azure_storage_account_key").map(String::as_str),
+            Some("AZKEY")
+        );
+        assert!(!az.contains_key("aws_access_key_id"));
+
+        // A query-string option still wins over the environment.
+        let overridden = opts_for("s3://bucket/key.parquet?region=eu-west-1");
+        assert_eq!(
+            overridden.get("aws_region").map(String::as_str),
+            Some("eu-west-1")
+        );
+
+        for v in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ENDPOINT_URL",
+            "AZURE_STORAGE_ACCOUNT_KEY",
+            "GOOGLE_SERVICE_ACCOUNT",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
 }

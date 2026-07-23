@@ -16,39 +16,66 @@ from typing import Any
 import pyarrow as pa
 
 
-def _to_table(rows: list[dict[str, Any]], template: pa.RecordBatch) -> pa.Table:
-    """Build an output table from per-row dicts, falling back to an empty slice of
-    the input schema when a batch produces no rows (so the schema is preserved)."""
+def _to_table(
+    rows: list[dict[str, Any]],
+    template: pa.RecordBatch,
+    out_columns: tuple[str, ...] | None = None,
+) -> pa.Table:
+    """Build an output table from per-row dicts, preserving the *output* schema when a
+    batch produces no rows.
+
+    An empty result carries no rows to infer types from, so the schema must be
+    synthesized. When the callback declared `output_columns` that differ from the input
+    (it renames/adds/drops columns), falling back to the input schema loses those columns
+    — an empty input batch (e.g. a filter that removed every row upstream) then makes a
+    downstream reference to a callback-added column fail, while the same query on
+    non-empty data succeeds. Emit the declared columns as 0-row null-typed arrays instead
+    (a 0-row null column satisfies a downstream projection and unifies with a real-typed
+    batch of the same stage); with no declared columns the input schema is the right
+    pass-through fallback.
+    """
     if rows:
         return pa.Table.from_pylist(rows)
+    if out_columns is not None and list(out_columns) != template.schema.names:
+        return pa.table({name: pa.array([], type=pa.null()) for name in out_columns})
     return pa.Table.from_batches([template.slice(0, 0)])
 
 
 class _RowMap:
     """Apply a per-row ``fn(row_dict) -> row_dict`` over each batch's rows."""
 
-    __slots__ = ("fn",)
+    __slots__ = ("fn", "out_columns")
 
-    def __init__(self, fn: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        fn: Callable[[dict[str, Any]], dict[str, Any]],
+        out_columns: tuple[str, ...] | None = None,
+    ) -> None:
         self.fn = fn
+        self.out_columns = out_columns
 
     def __call__(self, batch: pa.RecordBatch) -> pa.Table:
-        return _to_table([self.fn(row) for row in batch.to_pylist()], batch)
+        return _to_table([self.fn(row) for row in batch.to_pylist()], batch, self.out_columns)
 
 
 class _RowFlatMap:
     """Apply a per-row ``fn(row_dict) -> iterable[row_dict]`` and flatten the rows."""
 
-    __slots__ = ("fn",)
+    __slots__ = ("fn", "out_columns")
 
-    def __init__(self, fn: Callable[[dict[str, Any]], Iterable[dict[str, Any]]]) -> None:
+    def __init__(
+        self,
+        fn: Callable[[dict[str, Any]], Iterable[dict[str, Any]]],
+        out_columns: tuple[str, ...] | None = None,
+    ) -> None:
         self.fn = fn
+        self.out_columns = out_columns
 
     def __call__(self, batch: pa.RecordBatch) -> pa.Table:
         out: list[dict[str, Any]] = []
         for row in batch.to_pylist():
             out.extend(self.fn(row))
-        return _to_table(out, batch)
+        return _to_table(out, batch, self.out_columns)
 
 
 class Udf:

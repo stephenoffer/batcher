@@ -250,7 +250,6 @@ def _find_join(plan):
 def test_learned_join_arm_overrides_the_cost_model_choice():
     import batcher as bt
     from batcher.kyber import optimize_full
-    from batcher.kyber.signature import plan_signature
 
     left = bt.from_pydict({"k": [1, 2, 3], "v": [1, 2, 3]})
     right = bt.from_pydict({"k": [1, 2], "w": [9, 8]})
@@ -258,9 +257,15 @@ def test_learned_join_arm_overrides_the_cost_model_choice():
 
     hub = _hub()
     # Cold: the SELECTION rule picks a strategy purely from the cost model.
-    _p, logical, _d = optimize_full(q._plan, sources=q._sources, hub=hub)
+    _p, logical, decisions = optimize_full(q._plan, sources=q._sources, hub=hub)
     join = _find_join(logical)
-    sig = plan_signature(join)  # signature ignores strategy, so it is stable across runs
+    # Key the reward on the signature SELECTION *looked the arm up under*, exactly as the
+    # conductor does. It is not `plan_signature` of the finished plan: the ENFORCE phase runs
+    # after SELECTION and rewrites the join's inputs (a runtime filter lands on them), which
+    # changes the join's structural signature. Recording under the finished plan's signature
+    # would teach an arm the optimizer never consults — the loop would silently never close.
+    sig = decisions[0].signature
+    assert sig  # SELECTION stamped the key it used
     cold_strategy = join.strategy
     assert cold_strategy != "sort_merge"
 

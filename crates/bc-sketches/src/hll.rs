@@ -86,8 +86,11 @@ impl HyperLogLog {
 
     /// Hash primitive / string / binary columns directly from native values. Returns
     /// `false` for a type it does not fast-path, so the caller uses the row-format
-    /// fallback. The hash is `SEED.hash_one` of the native value (`to_bits()` for
-    /// floats so equal floats — including `-0.0`/`0.0` — bucket identically).
+    /// fallback. The hash is `SEED.hash_one` of the native value; floats are routed
+    /// through [`canon_float_bits`] so `-0.0`/`0.0` and every NaN bit pattern share
+    /// one distinct identity — the same identity the exact distinct / GROUP BY path
+    /// and the approx-aggregate HLL use (`raw to_bits()` counted `-0.0` and `0.0`, and
+    /// distinct NaN payloads, as separate distinct values, over-counting the ndv).
     fn add_array_fast(&mut self, array: &ArrayRef) -> bool {
         use arrow::array::*;
         use arrow::datatypes::DataType as DT;
@@ -121,8 +124,9 @@ impl HyperLogLog {
             DT::UInt16 => prim!(UInt16Array, |v: u16| v as u64),
             DT::UInt32 => prim!(UInt32Array, |v: u32| v as u64),
             DT::UInt64 => prim!(UInt64Array, |v: u64| v),
-            DT::Float32 => prim!(Float32Array, |v: f32| (v as f64).to_bits()),
-            DT::Float64 => prim!(Float64Array, |v: f64| v.to_bits()),
+            DT::Float16 => prim!(Float16Array, |v| canon_float_bits(f64::from(v))),
+            DT::Float32 => prim!(Float32Array, |v: f32| canon_float_bits(v as f64)),
+            DT::Float64 => prim!(Float64Array, |v: f64| canon_float_bits(v)),
             DT::Date32 => prim!(Date32Array, |v: i32| v as i64),
             DT::Date64 => prim!(Date64Array, |v: i64| v),
             DT::Utf8 => {
@@ -223,6 +227,22 @@ impl Mergeable for HyperLogLog {
                 *a = *b;
             }
         }
+    }
+}
+
+/// Canonicalize a float's bits for distinct identity, so equal-by-value floats hash
+/// identically: `-0.0`/`0.0` collapse to `+0.0` and every NaN bit pattern collapses to
+/// one canonical NaN. This matches the exact distinct / GROUP BY float identity (and the
+/// approx-aggregate HLL, fixed in B103); raw `to_bits()` would over-count the ndv because
+/// `(-0.0).to_bits() != (0.0).to_bits()` and NaN payloads differ.
+#[inline]
+fn canon_float_bits(v: f64) -> u64 {
+    if v.is_nan() {
+        f64::NAN.to_bits()
+    } else if v == 0.0 {
+        0 // folds both `+0.0` and `-0.0`
+    } else {
+        v.to_bits()
     }
 }
 
@@ -435,6 +455,50 @@ mod tests {
         right.merge(&cc);
 
         assert!((left.estimate() - right.estimate()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn add_array_folds_signed_zero_and_nan_like_exact_distinct() {
+        use arrow::array::Float64Array;
+        // Distinct identity for floats: `-0.0`≡`0.0` and every NaN bit pattern is one
+        // value — the same identity the exact distinct / GROUP BY path uses (and the
+        // approx-aggregate HLL path, fixed in B103). So the distinct set of
+        // {-0.0, 0.0, NaN, NaN', 1.5} is {0.0, NaN, 1.5} → 3, not 5.
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001), // a different NaN bit pattern
+            1.5,
+        ]));
+        let mut hll = HyperLogLog::new(14);
+        hll.add_array(&arr);
+        // Small cardinality → HLL is exact (linear counting), so this must be exactly 3.
+        let est = hll.estimate().round();
+        assert_eq!(est, 3.0, "signed-zero/NaN not folded: estimate {est}");
+    }
+
+    #[test]
+    fn add_array_folds_signed_zero_and_nan_for_float16() {
+        use arrow::array::Float64Array;
+        use arrow::compute::cast;
+        use arrow::datatypes::DataType;
+        // Float16 must fold `-0.0`≡`0.0` and every NaN to one distinct identity, the
+        // same as Float32/Float64 and the exact distinct / GROUP BY path. Before the
+        // fix Float16 fell through to the row-format fallback, which does not fold
+        // signed zero, so {-0.0, 0.0, NaN, NaN', 1.5} over-counted to 4 instead of 3.
+        let src: ArrayRef = Arc::new(Float64Array::from(vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            1.5,
+        ]));
+        let f16 = cast(&src, &DataType::Float16).expect("cast to f16");
+        let mut hll = HyperLogLog::new(14);
+        hll.add_array(&f16);
+        let est = hll.estimate().round();
+        assert_eq!(est, 3.0, "f16 signed-zero/NaN not folded: estimate {est}");
     }
 
     #[test]

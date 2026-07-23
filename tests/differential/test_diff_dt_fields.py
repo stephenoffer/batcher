@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -25,8 +26,6 @@ def t(duck):
 
 
 def test_all_dt_fields_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -52,8 +51,6 @@ def test_all_dt_fields_vs_duckdb(duck, t):
 
 
 def test_dt_fields_filter_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     # Field extractions used in a predicate (exercises them in filter position).
     out = (
         bt.from_arrow(t)

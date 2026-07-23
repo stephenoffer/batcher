@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
+from batcher._internal.hardware import cgroup_v2_dirs, read_cgroup_bytes
 from batcher.config import Config, active_config
 
 if TYPE_CHECKING:
@@ -107,53 +108,65 @@ def _cgroup_limit_bytes() -> int | None:
     the mount root — so the effective cap is the tightest `memory.max` across the whole
     ancestry (`cgroup_v2_dirs`), not just the root. v1 keeps its single well-known path.
     """
-    from batcher._internal.hardware import cgroup_v2_dirs
-
-    limits = [v for d in cgroup_v2_dirs() if (v := _read_memory_max(os.path.join(d, "memory.max")))]
+    limits = [
+        v for d in cgroup_v2_dirs() if (v := read_cgroup_bytes(os.path.join(d, "memory.max")))
+    ]
     if limits:
         return min(limits)
-    return _read_memory_max("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
+    return read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
 
 
-def _read_memory_max(path: str) -> int | None:
-    """A cgroup memory-limit file as bytes, or `None` when unlimited (`max`/sentinel)/absent."""
-    try:
-        with open(path) as f:
-            raw = f.read().strip()
-    except OSError:
-        return None
-    if raw in ("max", ""):
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    # cgroup v1 reports a sentinel near 2^63 when unlimited; treat huge/non-positive as none.
-    if value <= 0 or value >= (1 << 62):
-        return None
-    return value
+def _cgroup_file_cache_bytes() -> int:
+    """Page cache charged to this cgroup — `file` (v2) or `total_cache` (v1); 0 if unknown."""
+    for path, key in (
+        ("/sys/fs/cgroup/memory.stat", "file"),
+        ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
+    ):
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            field, _, raw = line.partition(" ")
+            if field == key:
+                try:
+                    return max(0, int(raw))
+                except ValueError:
+                    return 0
+    return 0
 
 
 def _cgroup_current_bytes() -> int | None:
-    """The container's *current* memory usage from cgroup v2 (`memory.current`) or v1
-    (`memory.usage_in_bytes`), or `None` when not in a cgroup.
+    """The cgroup's *unreclaimable* memory, or `None` when not in a cgroup.
 
-    This is the figure the kernel OOM-killer watches — it counts *all* of the
-    process's anonymous memory, including the in-memory Flight shuffle store and
-    off-pool pyarrow buffers the engine's buffer pool does not track. Reading it is
-    what lets the monitor see the real pressure instead of only the pool's reservations.
+    `memory.current` is routinely mistaken for the OOM number, and is not: it counts
+    anonymous memory **plus every clean file page the kernel happens to be caching**. Cache is
+    reclaimable — dropped long before anything is OOM-killed — so charging it as pressure
+    reads a box that has merely *read files* as one about to die. Measured on a 30 GiB host
+    after loading TPC-H: 24.3 GiB "current", of which 15.3 GiB was cache. That pinned the
+    monitor at ELEVATED, which halves every morsel (`_MORSEL_PRESSURE_FACTORS`) — a 7%
+    throughput loss for the whole run, invisible to every correctness test.
+
+    Subtracting `file` costs the guard nothing, because the two are disjoint: what it exists
+    to see (the Flight shuffle store, off-pool pyarrow buffers) is **anonymous** and stays
+    counted; what is subtracted is cache that was never the engine's. The remainder
+    (anon + slab + sock) is what the kernel cannot get back — the figure the OOM-killer acts on.
+    """
+    total = _cgroup_total_bytes()
+    if total is None:
+        return None
+    return max(0, total - _cgroup_file_cache_bytes())
+
+
+def _cgroup_total_bytes() -> int | None:
+    """The raw cgroup charge, anonymous **and** cached — `memory.current` / `usage_in_bytes`.
+
+    Not a pressure signal on its own; see `_cgroup_current_bytes`.
     """
     for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
-        try:
-            with open(path) as f:
-                raw = f.read().strip()
-        except OSError:
-            continue
-        try:
-            value = int(raw)
-        except ValueError:
-            continue
-        if value > 0:
+        value = read_cgroup_bytes(path)
+        if value is not None:
             return value
     return None
 
@@ -164,8 +177,10 @@ def _cap_to_cgroup_headroom(host_available: int) -> int:
     `psutil`/`/proc` report the *machine's* free RAM, but a cgroup-limited container (the norm
     under Kubernetes/Ray) OOMs at `memory.max`, not at host exhaustion — on a 184 GB host an
     8 GB container would otherwise read ~180 GB free and over-admit into a kill. The real
-    headroom is `limit - current`; take the smaller of that and the host figure. No cgroup cap
-    (bare metal / unlimited) leaves the reading untouched.
+    headroom is `limit - current`, where `current` excludes the reclaimable page cache (see
+    `_cgroup_current_bytes`) — cache the kernel will evict on demand is headroom, not usage.
+    Take the smaller of that and the host figure. No cgroup cap (bare metal / unlimited)
+    leaves the reading untouched.
     """
     limit = _cgroup_limit_bytes()
     if limit is None:
@@ -264,6 +279,14 @@ class PressureMonitor:
             self._alpha = self._EWMA_ALPHA
         else:
             self._alpha = min(1.0, max(1e-3, hysteresis_alpha))
+        # Flap accounting for `flap_rate` — the signal `hysteresis_alpha` is itself derived
+        # from, closing that loop. Counts direction *reversals* across sampled levels: the
+        # previous level, the direction of the last change (+1/-1/0), how many changes were
+        # reversals, and how many samples were taken.
+        self._prev_level: PressureLevel | None = None
+        self._last_dir = 0
+        self._reversals = 0
+        self._samples = 0
 
     def snapshot(self) -> MemorySnapshot:
         """Take a current reading of total/available memory and budget usage."""
@@ -316,7 +339,38 @@ class PressureMonitor:
         prev = self._ewma if self._ewma is not None else raw
         level = self._classify(max(raw, prev))
         self._ewma = self._alpha * raw + (1.0 - self._alpha) * prev
+        self._observe_flap(level)
         return level
+
+    def _observe_flap(self, level: PressureLevel) -> None:
+        """Fold one sampled level into the reversal count behind `flap_rate`.
+
+        A *reversal* is a level change whose direction opposes the previous change — the
+        SPILL->NORMAL->SPILL oscillation the hysteresis exists to damp. A monotonic climb or
+        decay is not a flap however many steps it takes, so only direction changes count.
+        """
+        self._samples += 1
+        if self._prev_level is None:
+            self._prev_level = level
+            return
+        if level == self._prev_level:
+            return
+        direction = 1 if level > self._prev_level else -1
+        if self._last_dir and direction != self._last_dir:
+            self._reversals += 1
+        self._last_dir = direction
+        self._prev_level = level
+
+    def flap_rate(self) -> float | None:
+        """Fraction of sampled levels that reversed direction, or `None` before 2 samples.
+
+        This is the measurement `hysteresis_alpha_from_flap` consumes to stiffen de-escalation
+        for a workload observed to oscillate. Nothing produced it, so `load_flap_rate` returned
+        `None` on every real run and the whole anti-oscillation mechanism was permanently
+        inert at the static default. The monitor is the natural producer — it is the component
+        that sees every level — and this only *measures*, consistent with the rest of the class.
+        """
+        return self._reversals / self._samples if self._samples >= 2 else None
 
     def classify(self) -> PressureLevel:
         """The current pressure level **without** advancing the hysteresis average.
@@ -348,12 +402,14 @@ class PressureMonitor:
         """Fraction of the memory ceiling in use, by whichever measure is highest.
 
         Takes the MAX of the engine's reserved buffer-pool envelope and the process's
-        *actual* footprint (the cgroup's current usage, else RSS). Memory the pool does
-        not track — the in-memory Flight shuffle `PartitionStore`, off-pool pyarrow
+        *actual* footprint (the cgroup's unreclaimable usage, else RSS). Memory the pool
+        does not track — the in-memory Flight shuffle `PartitionStore`, off-pool pyarrow
         buffers — therefore cannot let the monitor report NORMAL while the kernel
-        OOM-kills a shuffle-heavy worker. Over-reading only spills/throttles a little
-        early (safe); under-reading risks the OOM-kill this guards against. Falls back
-        to the machine's used fraction when neither a pool nor a live reading exists.
+        OOM-kills a shuffle-heavy worker. The footprint term deliberately excludes the
+        page cache: it is reclaimable, so counting it would report a box that has merely
+        *read files* as one under pressure — which is not a safe over-read but a silent
+        throttle (it halves every morsel). Falls back to the machine's used fraction when
+        neither a pool nor a live reading exists.
         """
         from batcher.carbonite.memory.pool import current_process_pool
 

@@ -29,13 +29,33 @@ __all__ = ["PreemptionMonitor", "cloud_preemption_probe", "preemption_monitor"]
 _PROBE_TIMEOUT_S = 0.3
 
 
+def _azure_is_draining(body: str) -> bool:
+    """Whether Azure's Scheduled Events payload announces reclamation of *this* node.
+
+    The endpoint always answers 200 with a (usually empty) ``Events`` list, so unlike the
+    AWS and GCP probes the status code says nothing — the payload has to be read. Only
+    ``Preempt`` (spot eviction) and ``Terminate`` (announced shutdown) mean the node is
+    going away; ``Reboot``/``Freeze``/``Redeploy`` are disruptions the job rides out, and
+    treating them as a drain would migrate shuffle output on every host maintenance blip.
+    """
+    import json
+
+    try:
+        events = json.loads(body).get("Events") or []
+    except (ValueError, AttributeError):
+        return False
+    return any(e.get("EventType") in ("Preempt", "Terminate") for e in events)
+
+
 def cloud_preemption_probe() -> bool:
     """Return True when the cloud metadata endpoint reports imminent reclamation.
 
     Checks the AWS spot ``instance-action`` endpoint (200 only when an action is
-    scheduled) and the GCP ``preempted`` flag. Any error or non-preempt response
-    reads as "not draining", so a transient probe failure never false-positives a
-    drain. Cheap link-local HTTP with a tight timeout, called from the poll thread.
+    scheduled), the GCP ``preempted`` flag, and Azure Scheduled Events. Any error or
+    non-preempt response reads as "not draining", so a transient probe failure never
+    false-positives a drain. Cheap link-local HTTP with a tight timeout, called from the
+    poll thread — and only ever from a spot-profile worker, so a fixed on-prem cluster
+    never pays for probes its infrastructure would not answer.
     """
     import urllib.request
 
@@ -49,6 +69,11 @@ def cloud_preemption_probe() -> bool:
             "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
             {"Metadata-Flavor": "Google"},
             lambda body: body.strip().upper() == "TRUE",
+        ),
+        (
+            "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01",
+            {"Metadata": "true"},
+            _azure_is_draining,
         ),
     )
     for url, headers, is_drain in probes:

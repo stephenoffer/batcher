@@ -33,7 +33,7 @@ from batcher.plan.logical import (
     Sort,
     Union,
 )
-from batcher.plan.stats import ColumnStat, RelStats
+from batcher.plan.stats import ColumnStat, RelStats, ambiguous_float_bound
 
 __all__ = ["propagate_empty_relation", "zonemap_prune_filter"]
 
@@ -123,13 +123,27 @@ def _predicate_status(expr: Expr, stats: RelStats) -> bool | None:
             return _comparison_status(expr, stats)
         return None
     if isinstance(expr, Not):
-        inner = _predicate_status(expr.input, stats)
-        return None if inner is None else (not inner)
+        return _not(_predicate_status(expr.input, stats))
     if isinstance(expr, IsNull):
         return _is_null_status(expr.input, stats, negate=False)
     if isinstance(expr, IsNotNull):
         return _is_null_status(expr.input, stats, negate=True)
     return None
+
+
+def _not(inner: bool | None) -> bool | None:
+    """Negate the tri-state. Sound in one direction only.
+
+    The two states are not mirror images, so `not inner` is wrong. `_TRUE` is proven
+    from bounds *and* a zero null count (see `_decide`), so every row evaluates the
+    inner predicate to TRUE and negating gives FALSE for every row → `_FALSE`.
+
+    `_FALSE` only proves no row *passes*; those rows are FALSE **or NULL**. Negating a
+    NULL yields NULL, which a filter still drops — so `NOT (always-empty)` is not
+    provably always-true, and claiming `_TRUE` would drop the filter and wrongly keep
+    the NULL rows. Decline instead: that costs a scan, never a row.
+    """
+    return _FALSE if inner is _TRUE else None
 
 
 def _and(left: bool | None, right: bool | None) -> bool | None:
@@ -223,11 +237,40 @@ def _comparison_status(expr: Binary, stats: RelStats) -> bool | None:
             return _FALSE
     if col.min is None or col.max is None:
         return None
+    if _float_order_is_ambiguous(col.min) or _float_order_is_ambiguous(col.max):
+        return None
     no_nulls = col.null_count == 0
     try:
         return _decide(op, col.min, col.max, value, no_nulls)
     except TypeError:
         return None  # incomparable literal/bound types → undecidable
+
+
+def _float_order_is_ambiguous(bound: object) -> bool:
+    """Whether reasoning about this float bound could contradict what the engine computes.
+
+    This rule is a **plan rewrite**, not a metadata answer: folding a predicate to `FALSE`
+    deletes rows from the result. So it owes a stronger guarantee than "probably right" — it
+    must agree with the engine's own comparison, whatever that is. On two kinds of float
+    bound it currently cannot:
+
+    * a **NaN** bound — the engine ranks NaN above every number (arrow-rs compares floats on
+      their total order), while Python's `>` ranks it nowhere; and
+    * a **zero** bound — the engine separates `-0.0` from `0.0` (`-0.0 < 0.0` on that same
+      total order), while Python calls them equal.
+
+    Either one lets `_decide` "prove" a predicate empty that the engine would satisfy. It is
+    not hypothetical: over a column holding `-0.0`, `WHERE f < 0` was folded to `FALSE` and
+    the query returned no rows, while executing the same filter returned the `-0.0` row. An
+    optimizer that changes a result is not an optimizer.
+
+    (The deeper problem is that the engine's float comparisons follow arrow-rs's total order
+    rather than IEEE, so they *also* disagree with DuckDB — `WHERE f = 0.0` misses `-0.0`,
+    `WHERE f > 1` matches NaN. That is a separate, engine-side bug recorded in
+    `docs/internals/bug_hunt_ledger.md`. Declining here is sound under either semantics: it
+    costs a scan, never a row.)
+    """
+    return ambiguous_float_bound(bound)
 
 
 def _decide(op: str, cmin, cmax, lit, no_nulls: bool) -> bool | None:

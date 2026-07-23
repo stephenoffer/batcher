@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -25,16 +26,12 @@ def _t():
 
 
 def test_partition_sum_over(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_t()).with_columns(gsum=col("v").sum().over(partition_by=["g"])).collect()
     duck.register("t", _t())
     assert_same(out, duck.sql("SELECT *, SUM(v) OVER (PARTITION BY g) AS gsum FROM t"))
 
 
 def test_partition_mean_min_max_over(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_t())
         .with_columns(
@@ -55,8 +52,6 @@ def test_partition_mean_min_max_over(duck):
 
 
 def test_running_sum_over_order(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_t())
         .with_columns(run=col("v").sum().over(partition_by=["g"], order_by=["v"]))
@@ -73,8 +68,6 @@ def test_running_sum_over_order(duck):
 
 
 def test_global_window_no_partition(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_t()).with_columns(total=col("v").sum().over()).collect()
     duck.register("t", _t())
     assert_same(out, duck.sql("SELECT *, SUM(v) OVER () AS total FROM t"))
@@ -92,8 +85,6 @@ def _ordered():
 
 
 def test_cum_sum_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_ordered()).with_columns(
         cs=col("v").cum_sum(order_by=["ord"]),
         cmx=col("v").cum_max(order_by=["ord"]),
@@ -112,8 +103,6 @@ def test_cum_sum_matches_duckdb(duck):
 
 
 def test_grouped_cum_sum_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_ordered()).with_columns(
         cs=col("v").cum_sum(partition_by=["g"], order_by=["ord"])
     )
@@ -127,8 +116,6 @@ def test_grouped_cum_sum_matches_duckdb(duck):
 
 
 def test_shift_matches_duckdb_lag_lead(duck):
-    from conftest import assert_same
-
     # The rows are already in `ord` order, so positional shift == LAG/LEAD over ord.
     out = bt.from_arrow(_ordered()).with_columns(
         s1=col("v").shift(1),

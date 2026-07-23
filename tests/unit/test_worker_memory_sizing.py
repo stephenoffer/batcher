@@ -2,7 +2,7 @@
 node's RAM, not the driver's.
 
 `cluster_topology()` now captures per-node memory (the hardware fact), and the distributed
-executor caps each worker's spill budget at the smallest worker node's RAM × soft_limit. A
+executor caps each worker's spill budget at the smallest worker node's RAM x soft_limit. A
 large driver (a 197 GiB head) therefore never hands a 34 GiB worker a budget it can't hold,
 and an unbounded grant becomes a machine-sized one — the "Carbonite protects" invariant made
 hardware-aware. Carbonite's tighter data-driven estimate still wins.

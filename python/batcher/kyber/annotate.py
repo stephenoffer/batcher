@@ -30,7 +30,23 @@ __all__ = ["annotate_ops"]
 # Memory-budgeting model (consumed by Carbonite admission). Materializing
 # operators ("breakers") hold ~all their rows; streaming operators hold ~one morsel.
 # The tunables (row footprint, morsel size, unknown-size threshold) live in `Config`.
-_BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join", "Window"})
+# `AsofJoin` materializes a sorted side to search; `WatermarkStreamJoin` holds a window
+# buffer and `WatermarkDedup` a seen-key set. All three hold far more than a morsel, and
+# omitting them budgeted each at ~one morsel — an *under*-estimate of peak memory, which is
+# the direction that lets Carbonite over-admit and OOM. Being listed here only ever raises
+# the envelope from a morsel to `rows x width`.
+_BREAKER_KINDS = frozenset(
+    {
+        "Aggregate",
+        "Sort",
+        "Distinct",
+        "Join",
+        "AsofJoin",
+        "Window",
+        "WatermarkStreamJoin",
+        "WatermarkDedup",
+    }
+)
 
 # CPU-light, IO/decode-bound streaming operators: one task running these waits on IO
 # more than it saturates a core, so it asks for a fractional CPU share (`cpu_share_io`)
@@ -112,14 +128,23 @@ def annotate_ops(
             # width (0 = unset). Carbonite clamps the request to the cpu budget.
             prefers_local = False
             if known and kind in _BREAKER_KINDS:
-                in_rows = sum(estimator.estimate(c).rows for c in children(node)) or rows
+                # `known` gates the *node's* estimate, but a child can still carry the
+                # placeholder (a join over an unbound source whose parent estimate a rule
+                # collapsed). Summing it blind makes `in_rows` the 1e12 magnitude, `n_par`
+                # explode, and `prefers_local` a decision about garbage. Fall back to the
+                # node's own known estimate unless every child is itself known.
+                child_rows = [estimator.estimate(c).rows for c in children(node)]
+                usable = [r for r in child_rows if 0.0 <= r < unknown_rows]
+                in_rows = sum(usable) if len(usable) == len(child_rows) else rows
+                in_rows = in_rows or rows
                 n_par = max(1, math.ceil(in_rows / target_rows))
-                # A breaker whose shuffle volume is small enough to keep node-local
-                # (≤ the broadcast threshold — the existing "small enough to not pay
-                # the network" knob) prefers PACK over SPREAD: co-locating its few
-                # workers avoids a cross-node shuffle that buys nothing. Large shuffles
-                # keep SPREAD so the network load distributes. dist makes the final call.
-                prefers_local = int(in_rows * width) <= config.optimizer.broadcast_max_bytes
+                # A breaker whose shuffle volume is small enough to keep node-local prefers
+                # PACK over SPREAD: co-locating its few workers avoids a cross-node shuffle that
+                # buys nothing. Large shuffles keep SPREAD so the network load distributes; dist
+                # makes the final call. This is a *network* threshold (`locality_max_bytes`),
+                # deliberately separate from the *cache*-sized broadcast threshold the two used
+                # to share — an L3-derived broadcast size must not drag this placement choice.
+                prefers_local = int(in_rows * width) <= config.optimizer.locality_max_bytes
             else:
                 n_par = 0
             # Desired credit window: enough in-flight batch slots to cover one task's
@@ -146,6 +171,9 @@ def annotate_ops(
                     inputs=(),
                     properties=PlanProperties(
                         est_rows=rows,
+                        # Publish the width the envelope above was sized with, so a consumer
+                        # never has to invert `m_max_bytes` by the flat default to recover it.
+                        row_size=width,
                         provenance=est.provenance,
                         signature=estimator.signature_of(node),
                         est_rows_raw=estimator.reportable_estimate(node),

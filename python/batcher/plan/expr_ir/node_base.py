@@ -30,7 +30,7 @@ from typing import Any, ClassVar, TypeVar
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 
-__all__ = ["IRNode", "child", "children", "expr_node", "literal", "scalar"]
+__all__ = ["IRNode", "child", "child_fields", "children", "expr_node", "literal", "scalar"]
 
 _T = TypeVar("_T")
 
@@ -169,6 +169,27 @@ class IRNode(Expr):
             out[spec.ir_key or f.name] = _encode(spec.kind, value)
         self.__dict__["_ir_cache"] = out
         return out
+
+
+def child_fields(node: IRNode) -> list[tuple[str, bool]]:
+    """The ``(field_name, is_list)`` of each sub-expression field of an `IRNode`.
+
+    A generic view of a node's shape drawn from the same field metadata `to_ir` uses:
+    ``CHILD`` fields yield ``(name, False)``, ``CHILDREN`` fields ``(name, True)``.
+    It lets a caller recurse into and rebuild an arbitrary node (via
+    ``dataclasses.replace``) without a hand-written per-node visitor — used by the
+    aggregate-expression splitter to swap aggregate leaves for column references.
+    """
+    out: list[tuple[str, bool]] = []
+    for f in fields(node):
+        spec = f.metadata.get(_META)
+        if spec is None:
+            continue
+        if spec.kind is _Kind.CHILD:
+            out.append((f.name, False))
+        elif spec.kind is _Kind.CHILDREN:
+            out.append((f.name, True))
+    return out
 
 
 def expr_node(cls: type[_T]) -> type[_T]:

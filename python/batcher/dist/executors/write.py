@@ -23,6 +23,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -79,6 +80,8 @@ def _distributed_write_plan(
     materializes there and no shared filesystem is required (the input partition is
     a split-manifest the worker reads from storage, or a shipped batch list).
     """
+    from batcher import core
+    from batcher.dist.executors.map import _distributed_map
     from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
     from batcher.dist.executors.plan_analysis import _relabel_single_source
     from batcher.dist.executors.ray_runtime import (
@@ -86,6 +89,24 @@ def _distributed_write_plan(
         engine_config_json,
         gather_map_results,
     )
+
+    # A plan carrying a Python UDF (`map_batches` / batch inference) cannot be shipped as JSON
+    # IR — the native engine can't run a Python callable, and `MapBatches.to_ir()` raises. Such
+    # a plan goes through the UDF-aware distributed map instead, with the sink bound into each
+    # worker so the post-inference rows are written where they were produced. Without this a
+    # billion-row embedding write collected its whole result onto the driver first.
+    if core.has_map_batches(plan):
+        return _distributed_map(
+            plan,
+            sources,
+            workers,
+            write_spec={
+                "fmt": fmt,
+                "sink_kwargs": sink_kwargs,
+                "path": path,
+                "partition_by": partition_by,
+            },
+        )
 
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to workers
@@ -116,7 +137,7 @@ def _write_plan_shard(
     idx: int,
     engine_config: str,
 ) -> list[WrittenFile]:
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.sink import SINKS
 

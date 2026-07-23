@@ -2,8 +2,8 @@
 
 Filtering keeps the rows that satisfy a predicate. A predicate is an `Expr` that
 evaluates to a boolean column, built with comparisons and combined with boolean
-operators. This page also covers null tests, set membership, ranges,
-deduplication, and limiting.
+operators. Null tests, set membership, ranges, deduplication and limiting all follow
+from the same idea.
 
 ## Setup
 
@@ -25,7 +25,7 @@ Pass a boolean expression to `filter`. Only rows where it is true are kept.
 
 ```python
 print(ds.filter(bt.col("age") > 25).to_pydict())
-# {'age': [30, 40], 'city': ['nyc', 'nyc'], 'name': ['ann', 'cy']}
+# {'name': ['ann', 'cy'], 'age': [30, 40], 'city': ['nyc', 'nyc']}
 ```
 
 ## Comparison and boolean operators
@@ -36,12 +36,12 @@ the operators bind tighter than you may expect.
 
 ```python
 print(ds.filter((bt.col("age") > 20) & (bt.col("city") == "sf")).to_pydict())
-# {'age': [25, 22], 'city': ['sf', 'sf'], 'name': ['bob', 'eve']}
+# {'name': ['bob', 'eve'], 'age': [25, 22], 'city': ['sf', 'sf']}
 ```
 
 ```python
 print(ds.filter(~(bt.col("city") == "nyc")).to_pydict())
-# {'age': [25, None, 22], 'city': ['sf', 'la', 'sf'], 'name': ['bob', 'dan', 'eve']}
+# {'name': ['bob', 'dan', 'eve'], 'age': [25, None, 22], 'city': ['sf', 'la', 'sf']}
 ```
 
 ## is_in
@@ -50,7 +50,7 @@ print(ds.filter(~(bt.col("city") == "nyc")).to_pydict())
 
 ```python
 print(ds.filter(bt.col("city").is_in(["nyc", "la"])).to_pydict())
-# {'age': [30, 40, None], 'city': ['nyc', 'nyc', 'la'], 'name': ['ann', 'cy', 'dan']}
+# {'name': ['ann', 'cy', 'dan'], 'age': [30, 40, None], 'city': ['nyc', 'nyc', 'la']}
 ```
 
 ## between
@@ -59,7 +59,7 @@ print(ds.filter(bt.col("city").is_in(["nyc", "la"])).to_pydict())
 
 ```python
 print(ds.filter(bt.col("age").between(23, 35)).to_pydict())
-# {'age': [30, 25], 'city': ['nyc', 'sf'], 'name': ['ann', 'bob']}
+# {'name': ['ann', 'bob'], 'age': [30, 25], 'city': ['nyc', 'sf']}
 ```
 
 ## Null tests
@@ -68,10 +68,10 @@ print(ds.filter(bt.col("age").between(23, 35)).to_pydict())
 
 ```python
 print(ds.filter(bt.col("age").is_null()).to_pydict())
-# {'age': [None], 'city': ['la'], 'name': ['dan']}
+# {'name': ['dan'], 'age': [None], 'city': ['la']}
 
 print(ds.filter(bt.col("age").is_not_null()).to_pydict())
-# {'age': [30, 25, 40, 22], 'city': ['nyc', 'sf', 'nyc', 'sf'], 'name': ['ann', 'bob', 'cy', 'eve']}
+# {'name': ['ann', 'bob', 'cy', 'eve'], 'age': [30, 25, 40, 22], 'city': ['nyc', 'sf', 'nyc', 'sf']}
 ```
 
 ## distinct
@@ -91,13 +91,13 @@ common case of the first `n` rows.
 
 ```python
 print(ds.sort("name").limit(2).to_pydict())
-# {'age': [30, 25], 'city': ['nyc', 'sf'], 'name': ['ann', 'bob']}
+# {'name': ['ann', 'bob'], 'age': [30, 25], 'city': ['nyc', 'sf']}
 
 print(ds.sort("name").limit(2, offset=1).to_pydict())
-# {'age': [25, 40], 'city': ['sf', 'nyc'], 'name': ['bob', 'cy']}
+# {'name': ['bob', 'cy'], 'age': [25, 40], 'city': ['sf', 'nyc']}
 
 print(ds.sort("name").head(3).to_pydict())
-# {'age': [30, 25, 40], 'city': ['nyc', 'sf', 'nyc'], 'name': ['ann', 'bob', 'cy']}
+# {'name': ['ann', 'bob', 'cy'], 'age': [30, 25, 40], 'city': ['nyc', 'sf', 'nyc']}
 ```
 
 ## Chaining
@@ -113,7 +113,7 @@ result = (
     .head(2)
 )
 print(result.to_pydict())
-# {'age': [40, 30], 'city': ['nyc', 'nyc'], 'name': ['cy', 'ann']}
+# {'name': ['cy', 'ann'], 'age': [40, 30], 'city': ['nyc', 'nyc']}
 ```
 
 ## Next steps

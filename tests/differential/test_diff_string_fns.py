@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -21,24 +22,18 @@ def _strs():
 
 
 def test_position_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _strs())
     out = bt.from_arrow(_strs()).select(r=col("s").str.position(".")).collect()
     assert_same(out, duck.sql("SELECT instr(s, '.') AS r FROM t"))
 
 
 def test_levenshtein_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _strs())
     out = bt.from_arrow(_strs()).select(r=col("s").str.levenshtein("smith")).collect()
     assert_same(out, duck.sql("SELECT levenshtein(s, 'smith') AS r FROM t"))
 
 
 def test_regexp_extract_all_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _strs())
     out = bt.from_arrow(_strs()).select(r=col("s").str.regexp_extract_all("[a-z]")).collect()
     assert_same(out, duck.sql("SELECT regexp_extract_all(s, '[a-z]') AS r FROM t"))

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, ListArray, UInt32Array};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::compute::{concat, take};
+use arrow::compute::{cast, concat, take};
 use arrow::datatypes::Field;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 
@@ -29,8 +29,12 @@ pub(crate) fn eval_list_set(
 ) -> Result<ArrayRef, ExprError> {
     let l = require_list(left, "list set op")?;
     let r = require_list(right, "list set op")?;
-    let lc = l.values();
-    let rc = r.values();
+    // Promote both children to a common numeric type when they differ (e.g.
+    // `List<Int64>` ∩ `List<Float64>`) so `concat` and the comparison see one type.
+    // Without this, mismatched-width numeric lists errored in `concat` where DuckDB
+    // coerces (`list_intersect([1,2],[2.0,3.0])` → `[2.0]`). Only numeric↔numeric is
+    // promoted; other type mismatches still surface a clean error.
+    let (lc, rc) = coerce_children(l.values(), r.values())?;
 
     // Concatenate the two children into one array so output elements can be drawn from
     // either side (union needs both); a left element keeps its index, a right element
@@ -38,8 +42,13 @@ pub(crate) fn eval_list_set(
     // element comparable regardless of which list it came from.
     let combined = concat(&[lc.as_ref(), rc.as_ref()])?;
     let roffset = lc.len();
-    let converter = RowConverter::new(vec![SortField::new(combined.data_type().clone())])?;
-    let crows = converter.convert_columns(std::slice::from_ref(&combined))?;
+    // Compare elements by a float-canonical key so `-0.0`/`0.0` (which `RowConverter`
+    // encodes to *different* bytes) and every NaN collapse the way `=`, `GROUP BY` and the
+    // join keys do — otherwise `list_intersect([0.0], [-0.0])` wrongly yielded `[]`. Output
+    // values are still `take`n from the original `combined`, so their exact bits survive.
+    let key = crate::eval::list::float_canonical_key(&combined)?;
+    let converter = RowConverter::new(vec![SortField::new(key.data_type().clone())])?;
+    let crows = converter.convert_columns(std::slice::from_ref(&key))?;
     let (lo, ro) = (l.value_offsets(), r.value_offsets());
 
     let mut keep: Vec<u32> = Vec::new(); // indices into `combined`
@@ -97,6 +106,21 @@ pub(crate) fn eval_list_set(
     )))
 }
 
+/// Cast two list children to a common numeric type when they differ, so a set op
+/// over lists of different numeric widths compares and combines instead of erroring
+/// in `concat`. Same-typed children are returned unchanged; a non-numeric mismatch is
+/// left as-is (the later `concat` surfaces the clean type error, matching prior
+/// behavior for genuinely incompatible element types).
+fn coerce_children(lc: &ArrayRef, rc: &ArrayRef) -> Result<(ArrayRef, ArrayRef), ExprError> {
+    if lc.data_type() == rc.data_type()
+        || !(lc.data_type().is_numeric() && rc.data_type().is_numeric())
+    {
+        return Ok((lc.clone(), rc.clone()));
+    }
+    let common = crate::eval::list::compare_type(lc.data_type(), rc.data_type());
+    Ok((cast(lc, &common)?, cast(rc, &common)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +169,63 @@ mod tests {
             .downcast_ref::<ListArray>()
             .unwrap()
             .is_null(2)); // null left → null
+    }
+
+    #[test]
+    fn intersect_folds_negative_zero_into_zero() {
+        use arrow::array::{Float64Array, Float64Builder};
+        fn flist(rows: &[&[f64]]) -> ArrayRef {
+            let mut b = ListBuilder::new(Float64Builder::new());
+            for r in rows {
+                for v in *r {
+                    b.values().append_value(*v);
+                }
+                b.append(true);
+            }
+            Arc::new(b.finish())
+        }
+        // `-0.0` and `0.0` are equal under `=`/`GROUP BY`, so the intersection is non-empty
+        // (DuckDB `list_intersect([0.0], [-0.0])` == `[0.0]`). Before canonicalization the
+        // `RowConverter` encoded them differently and the result was wrongly `[]`.
+        let a = flist(&[&[0.0]]);
+        let b = flist(&[&[-0.0]]);
+        let out = eval_list_set(ListSetOp::Intersect, &a, &b).unwrap();
+        let l = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let v = l.value(0);
+        let f = v.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f.value(0), 0.0);
+    }
+
+    #[test]
+    fn set_op_coerces_mismatched_numeric_children() {
+        use arrow::array::{Float64Array, Float64Builder};
+        fn flist(rows: &[&[f64]]) -> ArrayRef {
+            let mut b = ListBuilder::new(Float64Builder::new());
+            for r in rows {
+                for v in *r {
+                    b.values().append_value(*v);
+                }
+                b.append(true);
+            }
+            Arc::new(b.finish())
+        }
+        // `List<Int64>` ∩ `List<Float64>` used to error inside `concat` ("cannot
+        // concatenate arrays of different data types"). It must instead promote to the
+        // wider type and compare — DuckDB `list_intersect([1,2,3],[2.0,3.0])` == `[2.0, 3.0]`.
+        let ints = list(&[Some(&[1, 2, 3])]);
+        let floats = flist(&[&[2.0, 3.0, 4.0]]);
+        let out = eval_list_set(ListSetOp::Intersect, &ints, &floats).unwrap();
+        let l = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let v = l.value(0);
+        let f = v.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f.values().to_vec(), vec![2.0, 3.0]);
+
+        // Union likewise: left (promoted) distinct ++ right-only.
+        let uni = eval_list_set(ListSetOp::Union, &ints, &floats).unwrap();
+        let ul = uni.as_any().downcast_ref::<ListArray>().unwrap();
+        let uv = ul.value(0);
+        let uf = uv.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(uf.values().to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_same_ordered
 
 
 @pytest.fixture
@@ -22,8 +23,6 @@ def t(duck):
 
 
 def test_first_value(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(partition_by=["p"], order_by=[("v", False)], functions={"f": ("first_value", "v")})
@@ -39,7 +38,6 @@ def test_expr_value_functions_match_dict_api_and_duckdb(duck, t):
     # The Expr-level constructors (lag/lead/first_value over .over(...)) lower to the
     # same Window operator as the dict API and match DuckDB.
     from batcher import col, first_value, lag, lead
-    from conftest import assert_same
 
     out = (
         bt.from_arrow(t)
@@ -63,8 +61,6 @@ def test_expr_value_functions_match_dict_api_and_duckdb(duck, t):
 
 
 def test_last_value_whole_frame(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(partition_by=["p"], order_by=[("v", False)], functions={"l": ("last_value", "v")})
@@ -83,8 +79,6 @@ def test_last_value_whole_frame(duck, t):
 
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_lag(duck, t, n):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(partition_by=["p"], order_by=[("v", False)], functions={"lg": ("lag", "v", n)})
@@ -98,8 +92,6 @@ def test_lag(duck, t, n):
 
 @pytest.mark.parametrize("n", [1, 2])
 def test_lead(duck, t, n):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(partition_by=["p"], order_by=[("v", False)], functions={"ld": ("lead", "v", n)})
@@ -112,8 +104,6 @@ def test_lead(duck, t, n):
 
 
 def test_lag_lead_on_string_column(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(
@@ -135,7 +125,24 @@ def test_lag_lead_on_string_column(duck, t):
 
 @pytest.mark.parametrize("fn", ["first_value", "lag", "lead"])
 def test_sql_value_window(duck, t, fn):
-    from conftest import assert_same
-
     q = f"SELECT p, v, {fn}(v) OVER (PARTITION BY p ORDER BY v) r FROM t"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "lag(v, -1)",  # negative offset flips direction (== lead(v, 1))
+        "lead(v, -2)",  # == lag(v, 2)
+        "lag(v, -3)",
+        "nth_value(v, -1)",  # non-positive n → all NULL (matches DuckDB)
+        "nth_value(v, 0)",
+    ],
+)
+def test_sql_negative_offset_value_window(duck, t, expr):
+    # A negative literal offset parses in sqlglot as a `Neg` node; the translator used
+    # to read its inner Literal (`int(off.this)`) and crash with a TypeError on a valid
+    # query. The engine supports signed offsets, so the SQL path must too. Ordered
+    # compare because a window result is order-sensitive.
+    q = f"SELECT p, v, {expr} OVER (PARTITION BY p ORDER BY v) r FROM t ORDER BY p, v"
+    assert_same_ordered(bt.sql(q, t=t).collect(), duck.sql(q))

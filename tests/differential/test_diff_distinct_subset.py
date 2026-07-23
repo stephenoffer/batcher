@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _events():
@@ -18,8 +19,6 @@ def _events():
 
 
 def test_distinct_keep_first(duck):
-    from conftest import assert_same
-
     t = _events()
     duck.register("e", t)
     out = bt.from_arrow(t).distinct(["k"], keep="first", order_by="ts").collect()
@@ -33,8 +32,6 @@ def test_distinct_keep_first(duck):
 
 
 def test_distinct_keep_last(duck):
-    from conftest import assert_same
-
     t = _events()
     duck.register("e", t)
     out = bt.from_arrow(t).distinct(["k"], keep="last", order_by="ts").collect()

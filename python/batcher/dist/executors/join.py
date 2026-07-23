@@ -14,6 +14,8 @@ import os
 
 import pyarrow as pa
 
+from batcher._internal.hardware import l3_cache_bytes
+from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     _apply_above,
     _partition_source,
@@ -89,6 +91,42 @@ def _bloom_beneficial(join: Join, sources: list[Source]) -> bool:
         build > 0
         and probe >= build * _BLOOM_AUTO_PROBE_RATIO
         and probe >= _BLOOM_AUTO_MIN_PROBE_ROWS
+    )
+
+
+def salting_is_safe(join: Join, reducer_ir: str | None) -> bool:
+    """Whether skew salting may engage for this shuffle join without changing the answer.
+
+    Salting spreads a hot key's probe rows across several reducers (replicating its build
+    rows to each), so the key's work fans across the cluster instead of overloading one
+    node. That is result-preserving **only when each reducer's output is concatenated**.
+
+    It is *not* safe when the reducer FINALIZES — a fused join+aggregate
+    (`_distributed_join_aggregate`, which passes `reducer_ir`). That fusion is correct
+    precisely because co-partitioning by the join key puts every group in exactly one
+    bucket, letting a reducer finalize its bucket locally. Salting deliberately breaks
+    that precondition: each of the salted reducers would finalize a *partial* group, and
+    the union would carry several half-summed rows for the hot key instead of one correct
+    row. No error is raised — the query simply returns a wrong answer.
+
+    This guard is load-bearing rather than defensive, because salting engages on the
+    **default** path: a measured hot key turns it on even when `skew_join_salt` is 0
+    (see the `salt = DEFAULT_LEARNED_SALT` fallback in `_shuffle_join`).
+
+    Args:
+        join: The join being scheduled; salting needs a single equi-key and a left-driven
+            join type, since it replicates build rows and must not duplicate output rows.
+        reducer_ir: The per-bucket reducer override. `None` means the reducer is the plain
+            join, whose buckets are concatenated — the only shape salting is safe for.
+
+    Returns:
+        True when salting may engage.
+    """
+    return (
+        reducer_ir is None
+        and len(join.left_keys) == 1
+        and len(join.right_keys) == 1
+        and join.join_type in _BROADCAST_SAFE
     )
 
 
@@ -201,18 +239,24 @@ def _shuffle_join(
         # identically on both sides, so the joined relation is unchanged.
         salt, frac = skew_join_salt()
         hot: list[str] = []
-        salt_eligible = (
-            len(join.left_keys) == 1
-            and len(join.right_keys) == 1
-            and join.join_type in _BROADCAST_SAFE
-        )
+        salt_eligible = salting_is_safe(join, reducer_ir)
         if salt_eligible:
-            # Metadata-driven skew: reuse the hot keys learned on a prior run of this
-            # shape (free — no detection pre-pass). Only run the pre-pass when nothing
-            # has been learned yet AND the user opted in (`salt > 0`); persist its
-            # result so future runs engage salting automatically. A learned non-empty
-            # hot set engages salting even when the config left it off, since the skew
-            # is known and salting is result-preserving — never a plain-shuffle regress.
+            # Where the hot keys come from, cheapest source first. Salting is
+            # result-preserving (it only moves a key's work between reducers), so engaging
+            # it on an approximate signal can cost a little fan-out but never an answer —
+            # which is what makes an estimated hot set safe to act on.
+            #
+            #  1. The set learned for this exact join *shape* on a previous run. Free and
+            #     exact, but says nothing about a shape that has not run before.
+            #  2. **The column's measured most-common values** — what Kyber already knows.
+            #     Skew is a property of the *column*, not of the query: if `cust_id = 7` is
+            #     47% of the rows, that is true of every join on `cust_id`, including this
+            #     one's first ever run. It costs nothing (the metadata loop measured it from
+            #     the base data) and needs no opt-in.
+            #  3. The detection pre-pass — a full distributed Misra-Gries scan of *both*
+            #     sides. Correct, and the only option when nothing has been measured, but it
+            #     buys that with an extra pass over the data, so it stays opt-in (`salt > 0`)
+            #     and its result is persisted so it is paid at most once per shape.
             from batcher.dist.skew import (
                 DEFAULT_LEARNED_SALT,
                 join_skew_key,
@@ -224,14 +268,18 @@ def _shuffle_join(
             learned = load_learned_hot_keys(shape_key)
             if learned is not None:
                 hot = learned
-                if hot and salt <= 0:
-                    salt = DEFAULT_LEARNED_SALT
-            elif salt > 0:
-                lk, rk = join.left_keys[0], join.right_keys[0]
-                left_hot = _detect_hot_keys(left_parts, left_ir, lk, frac, cfg_json)
-                right_hot = _detect_hot_keys(right_parts, right_ir, rk, frac, cfg_json)
-                hot = sorted(left_hot | right_hot)
-                persist_hot_keys(shape_key, hot)
+            else:
+                hot = _hot_keys_from_column_stats(join, sources, frac)
+                if not hot and salt > 0:
+                    lk, rk = join.left_keys[0], join.right_keys[0]
+                    left_hot = _detect_hot_keys(left_parts, left_ir, lk, frac, cfg_json)
+                    right_hot = _detect_hot_keys(right_parts, right_ir, rk, frac, cfg_json)
+                    hot = sorted(left_hot | right_hot)
+                    persist_hot_keys(shape_key, hot)
+            # A known-skewed key engages salting even when the config left it off: the skew
+            # is measured, and salting cannot regress a plain shuffle.
+            if hot and salt <= 0:
+                salt = DEFAULT_LEARNED_SALT
         salt = salt if hot else 0  # no hot key → plain co-partition
 
         # Runtime bloom reduction: build a bloom over the (smaller) build/right side's
@@ -286,8 +334,7 @@ def _shuffle_join(
             )
 
         if use_bloom:
-            import batcher._native as nat
-
+            nat = engine()
             # Build side first, so its merged bloom is ready to prune the probe side.
             right_results = gather_with_backups(
                 [_right_map_for(i, build_bloom=True) for i in range(len(right_parts))],
@@ -409,7 +456,7 @@ def _broadcast_join(
     is empty, so left/anti semantics over an empty right stay correct without a
     hand-built empty schema.
     """
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.shuffle_io import read_ipc, write_ipc
     from batcher.io.source import read_source
 
@@ -434,7 +481,8 @@ def _broadcast_join(
     if (
         not right_full
         or sum(b.num_rows for b in right_full) == 0
-        or sum(b.nbytes for b in right_full) > active_config().optimizer.broadcast_max_bytes
+        or sum(b.nbytes for b in right_full)
+        > active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes())
     ):
         return _shuffle_join(above, join, sources, workers, hub=hub)
 
@@ -542,7 +590,7 @@ def _stream_broadcast_join(
     """
     import pyarrow as pa
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.ray_runtime import execute_metered
 
     sink = writer = None
@@ -584,6 +632,23 @@ def _byte_chunks(batches, target_bytes: int):
         yield chunk
 
 
+def _hot_keys_from_column_stats(join, sources, fraction: float) -> list[str]:
+    """The join key's hot values as Kyber already measured them — no pass over the data.
+
+    Kyber owns the column statistics (`Core` measures, `Kyber` decides), so the decision of
+    *which values are hot* is asked of it rather than re-derived here. Returns an empty list
+    when nothing is known, leaving the caller's existing fallbacks untouched. Best-effort: a
+    statistics failure must never fail a join.
+    """
+    try:
+        from batcher import kyber
+        from batcher.core import default_hub
+
+        return kyber.hot_join_values(join, sources, default_hub(), fraction)
+    except Exception:  # pragma: no cover - statistics must never break a join
+        return []
+
+
 def _detect_hot_keys(parts, subplan_ir, key_name, fraction, cfg_json) -> set[str]:
     """Detect the hot values of `key_name` across a side's partitions (Misra-Gries).
 
@@ -608,7 +673,7 @@ def _detect_hot_keys(parts, subplan_ir, key_name, fraction, cfg_json) -> set[str
 
 
 def _join_detect_task(subplan_ir, key_name, part_path, fraction, engine_config):
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
 
     rows = nat.execute_plan(subplan_ir, [read_partition(part_path)], engine_config)
@@ -637,7 +702,7 @@ def _join_map_task(
 ):
     import os as _os
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
     from batcher.dist.shuffle_io import write_ipc
 

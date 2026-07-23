@@ -16,10 +16,32 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr, nullif
 from batcher.plan.functions.security import aes_encrypt, hmac_sha256, mask
 
 __all__ = ["Encrypt", "Nullify", "Pseudonymize", "Redact"]
+
+
+def _check_key(kind: str, key: str) -> None:
+    """Reject a key that is missing or empty.
+
+    Only the *empty* case is handled here. An inline (non-reference) key already raises
+    a `SecurityWarning` from `hmac_sha256` / `aes_encrypt` when the mask is applied, and
+    warning a second time from the factory would double every such report — the
+    duplication the layering rules exist to prevent.
+
+    An empty key is a different failure: it reaches the data plane as a valid-looking
+    argument and is never diagnosed at all.
+
+    Raises:
+        PlanError: If `key` is not a non-empty string.
+    """
+    if not isinstance(key, str) or not key:
+        raise PlanError(
+            f"{kind} needs a key, but got {key!r}.",
+            hint="Pass a reference such as 'env:HMAC_KEY' or 'file:/run/secrets/key'.",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,11 +50,43 @@ class Redact:
 
     ``Redact(show_last=4)`` masks all but the last four characters — the "card ending
     1234" pattern. Lowers to `mask`; length-preserving, irreversible.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Redact
+            >>> Redact(show_last=4)(col("card_number"))
+            col('card_number').cast('string').str.mask('X', 0, 4)
     """
 
     show_first: int = 0
     show_last: int = 0
     char: str = "X"
+
+    def __post_init__(self) -> None:
+        """Reject parameters that would silently widen the mask.
+
+        A negative `show_last` reads as "reveal fewer characters" but is passed straight
+        through to the data plane, where its meaning is undefined — the direction of a
+        mistake that under-masks, which is the one direction a redaction policy must
+        never be wrong in. A multi-character `char` likewise does not preserve length.
+
+        Raises:
+            PlanError: If either count is negative, or `char` is not a single character.
+        """
+        for field_name in ("show_first", "show_last"):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise PlanError(
+                    f"Redact({field_name}=...) must be a non-negative integer, but got {value!r}.",
+                    hint="It is how many characters stay visible; 0 reveals none.",
+                )
+        if not isinstance(self.char, str) or len(self.char) != 1:
+            raise PlanError(
+                f"Redact(char=...) must be a single character, but got {self.char!r}.",
+                hint="Masking is length-preserving, so each character maps to one.",
+            )
 
     def __call__(self, column: Expr) -> Expr:
         return mask(column, show_first=self.show_first, show_last=self.show_last, char=self.char)
@@ -45,9 +99,21 @@ class Pseudonymize:
     Deterministic (so pseudonymized columns still join and count distinct) and
     irreversible. `key` is a key reference (``env:NAME`` / ``file:PATH``) resolved by the
     data plane, so the persisted policy carries the reference, not the secret.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Pseudonymize
+            >>> Pseudonymize("env:HMAC_KEY")(col("email"))
+            col('email').cast('string').str.hmac_sha256('env:HMAC_KEY')
     """
 
     key: str
+
+    def __post_init__(self) -> None:
+        """Reject a missing key. See `_check_key`."""
+        _check_key("Pseudonymize", self.key)
 
     def __call__(self, column: Expr) -> Expr:
         return hmac_sha256(column, self.key)
@@ -59,9 +125,21 @@ class Encrypt:
 
     `key` is a key reference (``env:NAME`` / ``file:PATH``). See `Pseudonymize` for why
     the reference, not the secret, is what the policy stores.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Encrypt
+            >>> Encrypt("env:AES_KEY")(col("email"))
+            col('email').cast('string').str.aes_encrypt('env:AES_KEY')
     """
 
     key: str
+
+    def __post_init__(self) -> None:
+        """Reject a missing key. See `_check_key`."""
+        _check_key("Encrypt", self.key)
 
     def __call__(self, column: Expr) -> Expr:
         return aes_encrypt(column, self.key)
@@ -72,6 +150,14 @@ class Nullify:
     """Replace the value with NULL — full redaction that keeps the column's type.
 
     The strongest mask: a principal sees the column exists but never any value.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Nullify
+            >>> Nullify()(col("salary"))
+            NullIf(col('salary'), col('salary'))
     """
 
     def __call__(self, column: Expr) -> Expr:

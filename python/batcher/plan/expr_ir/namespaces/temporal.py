@@ -203,6 +203,699 @@ class _DtNamespace:
         """
         return Strftime(self._e, format)
 
+    def epoch_ms(self) -> Expr:
+        """Milliseconds since the Unix epoch as an integer (DuckDB ``epoch_ms``, → Int64).
+
+        The millisecond-resolution companion to the seconds-resolution ``.dt.epoch``;
+        composed from the timestamp's underlying microseconds, so it carries no new IR.
+
+        Returns:
+            A new Int64 expression of milliseconds since 1970-01-01 UTC.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 1, 1)]})
+                >>> ds.select(r=bt.col("d").dt.epoch_ms()).to_pydict()
+                {'r': [1609459200000]}
+        """
+        return (self._e.cast("int64") // 1000).cast("int64")
+
+    def epoch_us(self) -> Expr:
+        """Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).
+
+        The microsecond-resolution epoch — the timestamp's own underlying value.
+
+        Returns:
+            A new Int64 expression of microseconds since 1970-01-01 UTC.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 1, 1)]})
+                >>> ds.select(r=bt.col("d").dt.epoch_us()).to_pydict()
+                {'r': [1609459200000000]}
+        """
+        return self._e.cast("int64")
+
+    def epoch_ns(self) -> Expr:
+        """Nanoseconds since the Unix epoch as an integer (DuckDB ``epoch_ns``, → Int64).
+
+        The nanosecond-resolution epoch; the stored microseconds scaled by 1000 (the
+        sub-microsecond digits are always zero at microsecond storage resolution).
+
+        Returns:
+            A new Int64 expression of nanoseconds since 1970-01-01 UTC.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 1, 1)]})
+                >>> ds.select(r=bt.col("d").dt.epoch_ns()).to_pydict()
+                {'r': [1609459200000000000]}
+        """
+        return self._e.cast("int64") * 1000
+
+    def millisecond(self) -> Expr:
+        """The millisecond-of-second component, 0-999 (Polars ``dt.millisecond``, → Int64).
+
+        Returns:
+            A new Int64 expression of the millisecond component.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]})
+                >>> ds.select(r=bt.col("d").dt.millisecond()).to_pydict()
+                {'r': [123]}
+        """
+        return (self._e.cast("int64") % 1_000_000 // 1000).cast("int64")
+
+    def microsecond(self) -> Expr:
+        """The microsecond-of-second component, 0-999999 (Polars ``dt.microsecond``, → Int64).
+
+        Returns:
+            A new Int64 expression of the microsecond component.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]})
+                >>> ds.select(r=bt.col("d").dt.microsecond()).to_pydict()
+                {'r': [123456]}
+        """
+        return self._e.cast("int64") % 1_000_000
+
+    def nanosecond(self) -> Expr:
+        """The nanosecond-of-second component, 0-999999000 (Polars ``dt.nanosecond``, → Int64).
+
+        Microsecond-resolution storage means the last three digits are always zero.
+
+        Returns:
+            A new Int64 expression of the nanosecond component.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]})
+                >>> ds.select(r=bt.col("d").dt.nanosecond()).to_pydict()
+                {'r': [123456000]}
+        """
+        return (self._e.cast("int64") % 1_000_000) * 1000
+
+    # --- Polars-compatible spellings (delegate to the SQL-named accessors) ----------
+
+    def weekday(self) -> Expr:
+        """ISO weekday, Monday=1 … Sunday=7 — the Polars ``weekday`` spelling of ``isodow``.
+
+        Returns:
+            A new Int64 expression of the ISO weekday.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.weekday()).to_pydict()
+                {'r': [4]}
+        """
+        return self.isodow()
+
+    def ordinal_day(self) -> Expr:
+        """Day-of-year, 1-366 — the Polars ``ordinal_day`` spelling of ``dayofyear``.
+
+        Returns:
+            A new Int64 expression of the ordinal day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.ordinal_day()).to_pydict()
+                {'r': [46]}
+        """
+        return self.dayofyear()
+
+    def to_string(self, format: str) -> Expr:
+        """Format as text — the Polars ``dt.to_string`` spelling of :meth:`strftime`.
+
+        Args:
+            format: A strftime pattern, e.g. ``"%Y-%m-%d"``.
+
+        Returns:
+            A new Utf8 expression: the formatted text.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.to_string("%Y-%m-%d")).to_pydict()
+                {'r': ['2024-02-15']}
+        """
+        return self.strftime(format)
+
+    def date(self) -> Expr:
+        """Truncate to the date (midnight) — the Polars ``dt.date`` spelling of ``truncate('day')``.
+
+        Returns:
+            A new Timestamp expression at 00:00:00 of the same day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
+                >>> ds.select(r=bt.col("d").dt.date()).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 0, 0)]}
+        """
+        return self.truncate("day")
+
+    def month_start(self) -> Expr:
+        """First day of the month at midnight — ``truncate('month')`` (Polars ``month_start``).
+
+        Returns:
+            A new Timestamp expression at the start of the month.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
+                >>> ds.select(r=bt.col("d").dt.month_start()).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 1, 0, 0)]}
+        """
+        return self.truncate("month")
+
+    def month_end(self) -> Expr:
+        """Last day of the month at midnight — the Polars ``month_end`` spelling of ``last_day``.
+
+        Returns:
+            A new Timestamp expression at the last day of the month.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.month_end()).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 29, 0, 0)]}
+        """
+        return self.last_day()
+
+    # --- time deltas between two timestamps -----------------------------------------
+
+    def _delta_units(self, other: Expr, micros_per_unit: int) -> Expr:
+        """Whole `micros_per_unit` units from `other` to this timestamp (truncated).
+
+        Both sides are read as microseconds since the epoch and subtracted, so the
+        difference is exact fixed-width arithmetic — no calendar ambiguity."""
+        delta = self._e.cast("int64") - other.cast("int64")
+        return (delta // micros_per_unit).cast("int64")
+
+    def seconds_between(self, other: Expr) -> Expr:
+        """Whole seconds from `other` to this timestamp (negative if `other` is later).
+
+        Args:
+            other: The earlier timestamp expression to measure from.
+
+        Returns:
+            An Int64 expression of the elapsed whole seconds.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(2024, 3, 1, 12)], "b": [dt.datetime(2024, 3, 1, 11)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.seconds_between(bt.col("b"))).to_pydict()
+                {'r': [3600]}
+        """
+        return self._delta_units(other, 1_000_000)
+
+    def minutes_between(self, other: Expr) -> Expr:
+        """Whole minutes from `other` to this timestamp (negative if `other` is later).
+
+        Args:
+            other: The earlier timestamp expression to measure from.
+
+        Returns:
+            An Int64 expression of the elapsed whole minutes.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(2024, 3, 1, 12)], "b": [dt.datetime(2024, 3, 1, 11)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.minutes_between(bt.col("b"))).to_pydict()
+                {'r': [60]}
+        """
+        return self._delta_units(other, 60_000_000)
+
+    def hours_between(self, other: Expr) -> Expr:
+        """Whole hours from `other` to this timestamp (negative if `other` is later).
+
+        Args:
+            other: The earlier timestamp expression to measure from.
+
+        Returns:
+            An Int64 expression of the elapsed whole hours.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(2024, 3, 1, 12)], "b": [dt.datetime(2024, 2, 28, 6)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.hours_between(bt.col("b"))).to_pydict()
+                {'r': [54]}
+        """
+        return self._delta_units(other, 3_600_000_000)
+
+    def days_between(self, other: Expr) -> Expr:
+        """Whole days from `other` to this timestamp — the elapsed-time feature.
+
+        Counts fixed 24-hour days, so it is unaffected by calendar irregularities; a
+        partial day truncates toward zero.
+
+        Args:
+            other: The earlier timestamp expression to measure from.
+
+        Returns:
+            An Int64 expression of the elapsed whole days.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(2024, 3, 1, 12)], "b": [dt.datetime(2024, 2, 28, 6)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.days_between(bt.col("b"))).to_pydict()
+                {'r': [2]}
+        """
+        return self._delta_units(other, 86_400_000_000)
+
+    def weeks_between(self, other: Expr) -> Expr:
+        """Whole 7-day weeks from `other` to this timestamp (negative if `other` is later).
+
+        Args:
+            other: The earlier timestamp expression to measure from.
+
+        Returns:
+            An Int64 expression of the elapsed whole weeks.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(2024, 3, 15)], "b": [dt.datetime(2024, 2, 1)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.weeks_between(bt.col("b"))).to_pydict()
+                {'r': [6]}
+        """
+        return self._delta_units(other, 7 * 86_400_000_000)
+
+    def quarter_end(self) -> Expr:
+        """Last day of the calendar quarter at midnight — the close of the quarter.
+
+        Returns:
+            A Timestamp expression at the quarter's final day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 5, 15)]})
+                >>> ds.select(r=bt.col("d").dt.quarter_end()).to_pydict()
+                {'r': [datetime.datetime(2024, 6, 30, 0, 0)]}
+        """
+        return self.truncate("quarter").dt.offset_by("3mo").dt.offset_by("-1d")
+
+    def year_end(self) -> Expr:
+        """December 31st of this date's year at midnight.
+
+        Returns:
+            A Timestamp expression at the year's final day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 5, 15)]})
+                >>> ds.select(r=bt.col("d").dt.year_end()).to_pydict()
+                {'r': [datetime.datetime(2024, 12, 31, 0, 0)]}
+        """
+        return self.truncate("year").dt.offset_by("1y").dt.offset_by("-1d")
+
+    # --- pandas-compatible datetime spellings ---------------------------------------
+
+    def day_name(self) -> Expr:
+        """Full weekday name, e.g. ``"Monday"`` — the pandas ``dt.day_name``.
+
+        Returns:
+            A Utf8 expression of the weekday name.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.day_name()).to_pydict()
+                {'r': ['Thursday']}
+        """
+        return self.dayname()
+
+    def month_name(self) -> Expr:
+        """Full month name, e.g. ``"February"`` — the pandas ``dt.month_name``.
+
+        Returns:
+            A Utf8 expression of the month name.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.month_name()).to_pydict()
+                {'r': ['February']}
+        """
+        return self.monthname()
+
+    def daysinmonth(self) -> Expr:
+        """Days in this date's month — the pandas ``dt.daysinmonth`` spelling.
+
+        Returns:
+            An Int64 expression of the month's length in days.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.daysinmonth()).to_pydict()
+                {'r': [29]}
+        """
+        return self.days_in_month()
+
+    def weekofyear(self) -> Expr:
+        """ISO week number, 1-53 — the pandas ``dt.weekofyear`` spelling of ``week``.
+
+        Returns:
+            An Int64 expression of the ISO week number.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds.select(r=bt.col("d").dt.weekofyear()).to_pydict()
+                {'r': [7]}
+        """
+        return self.week()
+
+    def normalize(self) -> Expr:
+        """Reset the time to midnight, keeping the date — the pandas ``dt.normalize``.
+
+        Returns:
+            A Timestamp expression at 00:00:00 of the same day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
+                >>> ds.select(r=bt.col("d").dt.normalize()).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 0, 0)]}
+        """
+        return self.truncate("day")
+
+    def floor(self, unit: str) -> Expr:
+        """Round down to the start of `unit` — the pandas ``dt.floor`` spelling of ``truncate``.
+
+        Args:
+            unit: The granularity to floor to, e.g. ``"hour"``, ``"day"``, ``"month"``.
+
+        Returns:
+            A Timestamp expression floored to `unit`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
+                >>> ds.select(r=bt.col("d").dt.floor("hour")).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 13, 0)]}
+        """
+        return self.truncate(unit)
+
+    # --- calendar feature flags (the date features a model actually consumes) -------
+
+    def is_weekend(self) -> Expr:
+        """True on Saturday or Sunday — the canonical calendar feature flag.
+
+        Returns:
+            A Boolean expression, true on weekend days.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_weekend()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.isodow() >= 6
+
+    def is_weekday(self) -> Expr:
+        """True Monday through Friday — the complement of :meth:`is_weekend`.
+
+        Returns:
+            A Boolean expression, true on weekdays.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_weekday()).to_pydict()
+                {'r': [False, True]}
+        """
+        return self.isodow() <= 5
+
+    def is_month_start(self) -> Expr:
+        """True on the first day of the month (pandas ``is_month_start``).
+
+        Returns:
+            A Boolean expression, true on the 1st.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 1), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_month_start()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.day() == 1
+
+    def is_month_end(self) -> Expr:
+        """True on the last day of the month, leap years included (pandas ``is_month_end``).
+
+        Returns:
+            A Boolean expression, true on the month's final day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 29), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_month_end()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.day() == self.days_in_month()
+
+    def is_quarter_start(self) -> Expr:
+        """True on the first day of a calendar quarter (Jan/Apr/Jul/Oct 1).
+
+        Returns:
+            A Boolean expression, true on a quarter's first day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 4, 1), dt.datetime(2024, 5, 1)]})
+                >>> ds.select(r=bt.col("d").dt.is_quarter_start()).to_pydict()
+                {'r': [True, False]}
+        """
+        return (self.month() % 3 == 1) & (self.day() == 1)
+
+    def is_quarter_end(self) -> Expr:
+        """True on the last day of a calendar quarter (Mar/Jun/Sep/Dec month-end).
+
+        Returns:
+            A Boolean expression, true on a quarter's final day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 3, 31), dt.datetime(2024, 5, 15)]})
+                >>> ds.select(r=bt.col("d").dt.is_quarter_end()).to_pydict()
+                {'r': [True, False]}
+        """
+        return (self.month() % 3 == 0) & (self.day() == self.days_in_month())
+
+    def is_year_start(self) -> Expr:
+        """True on January 1st (pandas ``is_year_start``).
+
+        Returns:
+            A Boolean expression, true on the year's first day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1), dt.datetime(2024, 2, 1)]})
+                >>> ds.select(r=bt.col("d").dt.is_year_start()).to_pydict()
+                {'r': [True, False]}
+        """
+        return (self.month() == 1) & (self.day() == 1)
+
+    def is_year_end(self) -> Expr:
+        """True on December 31st (pandas ``is_year_end``).
+
+        Returns:
+            A Boolean expression, true on the year's final day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 12, 31), dt.datetime(2024, 2, 1)]})
+                >>> ds.select(r=bt.col("d").dt.is_year_end()).to_pydict()
+                {'r': [True, False]}
+        """
+        return (self.month() == 12) & (self.day() == 31)
+
+    def quarter_start(self) -> Expr:
+        """First day of the calendar quarter at midnight — ``truncate('quarter')``.
+
+        Returns:
+            A Timestamp expression at the start of the quarter.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 5, 15)]})
+                >>> ds.select(r=bt.col("d").dt.quarter_start()).to_pydict()
+                {'r': [datetime.datetime(2024, 4, 1, 0, 0)]}
+        """
+        return self.truncate("quarter")
+
+    def year_start(self) -> Expr:
+        """First day of the year at midnight — ``truncate('year')``.
+
+        Returns:
+            A Timestamp expression at the start of the year.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 5, 15)]})
+                >>> ds.select(r=bt.col("d").dt.year_start()).to_pydict()
+                {'r': [datetime.datetime(2024, 1, 1, 0, 0)]}
+        """
+        return self.truncate("year")
+
+    def days_in_year(self) -> Expr:
+        """Days in this date's year — 366 in a leap year, else 365 (→ Int64).
+
+        Returns:
+            An Int64 expression of the year's length in days.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 5, 1), dt.datetime(2023, 5, 1)]})
+                >>> ds.select(r=bt.col("d").dt.days_in_year()).to_pydict()
+                {'r': [366, 365]}
+        """
+        from batcher.plan.expr_ir.constructors import lit, when
+
+        return when(self.is_leap_year()).then(lit(366)).otherwise(lit(365))
+
+    def week_of_month(self) -> Expr:
+        """Which week of the month the date falls in, 1-5 (→ Int64).
+
+        Counted in whole 7-day blocks from the 1st, so days 1-7 are week 1.
+
+        Returns:
+            An Int64 expression of the 1-based week of the month.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 5, 3), dt.datetime(2024, 5, 15)]})
+                >>> ds.select(r=bt.col("d").dt.week_of_month()).to_pydict()
+                {'r': [1, 3]}
+        """
+        return ((self.day() - 1) // 7 + 1).cast("int64")
+
     def offset_by(self, by: str) -> DateOffset:
         """Shift each date/time by a Polars-style offset string. Type-preserving.
 

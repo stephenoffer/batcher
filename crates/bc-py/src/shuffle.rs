@@ -24,9 +24,12 @@
 //! query fast. Ticket minting and epoch/plan fencing stay in Python: Rust only sees
 //! opaque ticket strings.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::error::ArrowError;
+use arrow::ipc::writer::StreamWriter;
 use arrow_pyarrow::PyArrowType;
 use bc_interp::InterpError;
 use bc_transport::{classify, FetchFault, ShuffleTicket, TransportError};
@@ -36,9 +39,36 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::errors::transport_to_pyerr;
+use crate::flight::{FlightShuffleServer, ShuffleClient};
 use crate::process::shared_runtime;
 use crate::{parse_aggregates, parse_group_keys, to_pyerr, unwrap_batches};
-use crate::{FlightShuffleServer, ShuffleClient};
+
+/// Validate partition-key inputs at the FFI boundary before they reach the engine.
+///
+/// An out-of-range key index or a zero partition count would otherwise index a column
+/// out of bounds / trip a `debug_assert` deep in the runtime and **panic through the
+/// FFI** — a `PanicException`, which derives from `BaseException` and so slips past a
+/// caller's `except Exception`. Reject them here with a clean, catchable `ValueError`.
+fn validate_partition_args(
+    batches: &[RecordBatch],
+    key_indices: &[usize],
+    num_partitions: usize,
+) -> PyResult<()> {
+    if num_partitions == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "num_partitions must be >= 1",
+        ));
+    }
+    for batch in batches {
+        let ncols = batch.num_columns();
+        if let Some(&bad) = key_indices.iter().find(|&&i| i >= ncols) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "key index {bad} out of range for a batch with {ncols} columns"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Hash-shuffle batches into `num_partitions` buckets by the given key columns.
 #[pyfunction]
@@ -47,9 +77,10 @@ pub(crate) fn partition_batches(
     key_indices: Vec<usize>,
     num_partitions: usize,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
-    let parts =
-        bc_interp::dist::partition_batches(&unwrap_batches(batches), &key_indices, num_partitions)
-            .map_err(to_pyerr)?;
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, &key_indices, num_partitions)?;
+    let parts = bc_interp::dist::partition_batches(&batches, &key_indices, num_partitions)
+        .map_err(to_pyerr)?;
     Ok(wrap_buckets(parts))
 }
 
@@ -67,8 +98,10 @@ pub(crate) fn range_partition_batches(
     nulls_first: bool,
     descending: bool,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, std::slice::from_ref(&key_index), n_buckets)?;
     let parts = bc_interp::dist::range_partition_batches(
-        &unwrap_batches(batches),
+        &batches,
         key_index,
         &boundaries,
         n_buckets,
@@ -95,8 +128,10 @@ pub(crate) fn salted_partition_batches(
     replicate: bool,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
     let hot: std::collections::HashSet<String> = hot_keys.into_iter().collect();
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, &key_indices, num_partitions)?;
     let parts = bc_interp::dist::salted_partition_batches(
-        &unwrap_batches(batches),
+        &batches,
         &key_indices,
         num_partitions,
         &hot,
@@ -135,24 +170,33 @@ impl GatherErr {
     }
 }
 
-/// Fetch every source concurrently, invoking `on_batches` for each non-empty result
-/// as it arrives; returns the indices of sources that hit a *retryable* fault.
-///
-/// Co-located sources (`addr == own_addr`) read the local store with no socket. Remote
-/// fetches run on the shared runtime, bounded by a `fan_in` semaphore so no more than
-/// `fan_in` are in flight at once. A fatal fault aborts; a retryable one is collected.
-#[allow(clippy::too_many_arguments)]
 /// The node identity of a shuffle address — its host, dropping the `:port`. Advertised
 /// addresses are `{node_ip}:{port}`, so equal hosts ⇒ same node (⇒ shm is reachable).
 fn host_of(addr: &str) -> &str {
     addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
 }
 
+/// Fetch every source concurrently, invoking `on_batches` for each non-empty result
+/// as it arrives; returns the indices of sources that hit a *retryable* fault.
+///
+/// Co-located sources (`addr == own_addr`) read the local store with no socket. Remote
+/// fetches run on the shared runtime, bounded by a `fan_in` semaphore so no more than
+/// `fan_in` are in flight at once. A fatal fault aborts; a retryable one is collected.
+///
+/// `replicas[i]` holds the *fallback* addresses for source `i` — peers carrying a
+/// byte-identical copy of that bucket under the same ticket (see the replication factor
+/// in `DistributedConfig`). A retryable fault against one address transparently falls
+/// over to the next, so losing a worker costs a re-fetch from a survivor rather than the
+/// lineage recompute (re-read the source, re-run the map) it would otherwise force. A
+/// source is reported unreachable only once *every* copy is gone, which is when the
+/// driver's recompute loop is genuinely the right answer. Empty (the default) ⇒ the
+/// single-address behavior, unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     own: &FlightShuffleServer,
     pool: Arc<bc_transport::ClientPool>,
     sources: &[(String, ShuffleTicket)],
+    replicas: &[Vec<String>],
     credits: u32,
     fan_in: usize,
     token: Option<String>,
@@ -189,46 +233,71 @@ async fn drive(
             .max(1)
     };
     for (idx, (addr, ticket)) in sources.iter().enumerate() {
-        if addr.as_str() == own_addr {
-            let batches = own
-                .exchange
-                .local_partition(ticket)
-                .await
-                .unwrap_or_default();
-            if !batches.is_empty() {
-                on_batches(batches).map_err(GatherErr::Combine)?;
+        // Every address carrying this bucket: the primary, then its replicas. They hold
+        // byte-identical batches under the same ticket, so which one answers is invisible
+        // to the result — only to how long it takes.
+        let mut candidates: Vec<&str> =
+            Vec::with_capacity(1 + replicas.get(idx).map_or(0, Vec::len));
+        candidates.push(addr.as_str());
+        candidates.extend(replicas.get(idx).into_iter().flatten().map(String::as_str));
+
+        // A copy on this very worker is free (local store, no socket) wherever it sits in
+        // the candidate list — so a replica that landed here also skips the network.
+        if candidates.contains(&own_addr) {
+            if let Some(batches) = own.exchange.local_partition(ticket).await {
+                if !batches.is_empty() {
+                    on_batches(batches).map_err(GatherErr::Combine)?;
+                }
+                continue;
             }
-            continue;
+            // Not actually registered here — fall through to a remote copy.
         }
-        // Same node, different process: a zero-copy shared-memory mmap read beats a
-        // loopback Flight hop by ~20x. Try it inside the concurrent set (so cross-node
-        // fetches still fan out in parallel) and fall back to Flight on a miss — the
-        // producer may not have mirrored this bucket (shm off, or skipped under memory
-        // pressure), which is a benign, result-preserving fallback.
-        let try_shm = shm && host_of(addr) == own_host;
-        let (pool, sem, addr, ticket, token) = (
-            pool.clone(),
-            sem.clone(),
-            addr.clone(),
-            *ticket,
-            token.clone(),
-        );
+        let remote: Vec<String> = candidates
+            .iter()
+            .filter(|c| **c != own_addr)
+            .map(|c| c.to_string())
+            .collect();
+        if remote.is_empty() {
+            continue; // only copy is a local one that read back empty (unchanged behavior)
+        }
+        let (pool, sem, ticket, token) = (pool.clone(), sem.clone(), *ticket, token.clone());
+        // Owned: the task outlives `own`'s borrow, so the co-location test needs its own copy.
+        let own_host = own_host.to_string();
         set.spawn(async move {
             // Hold a permit for the whole fetch so at most `fan_in` stream concurrently.
             let _permit = sem.acquire_owned().await;
-            if try_shm {
-                let (a, t) = (addr.clone(), ticket.to_string());
-                // shm read is blocking file I/O + decode → off the async reactor.
-                if let Ok(Ok(Some(batches))) =
-                    tokio::task::spawn_blocking(move || bc_transport::fetch_shared(&a, &t)).await
+            let mut last: Option<TransportError> = None;
+            // Try each copy in turn; a retryable fault (a lost/idle peer) falls over to the
+            // next replica instead of failing the source. Only when every copy is gone does
+            // this report the fault the driver recomputes from.
+            for addr in &remote {
+                // Same node, different process: a zero-copy shared-memory mmap read beats a
+                // loopback Flight hop by ~20x. Try it inside the concurrent set (so cross-node
+                // fetches still fan out in parallel) and fall back to Flight on a miss — the
+                // producer may not have mirrored this bucket (shm off, or skipped under memory
+                // pressure), which is a benign, result-preserving fallback.
+                if shm && host_of(addr) == own_host.as_str() {
+                    let (a, t) = (addr.clone(), ticket.to_string());
+                    // shm read is blocking file I/O + decode → off the async reactor.
+                    if let Ok(Ok(Some(batches))) =
+                        tokio::task::spawn_blocking(move || bc_transport::fetch_shared(&a, &t))
+                            .await
+                    {
+                        return (idx, Ok(batches));
+                    }
+                }
+                match pool
+                    .fetch_secured_striped(addr, &ticket, credits, token.as_deref(), stripe)
+                    .await
                 {
-                    return (idx, Ok(batches));
+                    Ok(batches) => return (idx, Ok(batches)),
+                    // A fatal fault (decode/protocol/auth) is not a lost peer — every replica
+                    // would fail it identically, so fail fast instead of retrying the same bug.
+                    Err(e) if matches!(classify(&e), FetchFault::Fatal) => return (idx, Err(e)),
+                    Err(e) => last = Some(e),
                 }
             }
-            let res = pool
-                .fetch_secured_striped(&addr, &ticket, credits, token.as_deref(), stripe)
-                .await;
-            (idx, res)
+            (idx, Err(last.expect("remote is non-empty")))
         });
     }
 
@@ -256,8 +325,11 @@ async fn drive(
 /// bucket was empty. This is the concurrent replacement for the serial per-mapper
 /// fetch+combine loop, with peak memory bounded by `fan_in` in-flight fetches plus the
 /// one running state.
+///
+/// `replicas[i]` lists the fallback addresses holding a copy of source `i`'s bucket, so a
+/// lost mapper is served from a survivor instead of recomputed (see `drive`).
 #[pyfunction]
-#[pyo3(signature = (server, client, group_keys_json, aggregates_json, sources, fan_in, finalize, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false))]
+#[pyo3(signature = (server, client, group_keys_json, aggregates_json, sources, fan_in, finalize, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false, replicas=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_combine(
     py: Python<'_>,
@@ -271,6 +343,7 @@ pub(crate) fn gather_combine(
     credits: u32,
     token: Option<String>,
     shm: bool,
+    replicas: Vec<Vec<String>>,
 ) -> PyResult<(Option<PyArrowType<RecordBatch>>, Vec<usize>)> {
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
@@ -288,8 +361,10 @@ pub(crate) fn gather_combine(
                 running = Some(bc_interp::dist::combine(&group_keys, &aggregates, &merged)?);
                 Ok(())
             };
-            let unreachable =
-                drive(server, pool, &sources, credits, fan_in, token, shm, fold).await?;
+            let unreachable = drive(
+                server, pool, &sources, &replicas, credits, fan_in, token, shm, fold,
+            )
+            .await?;
             if !unreachable.is_empty() {
                 return Ok((None, unreachable)); // incomplete → driver recomputes + retries
             }
@@ -312,8 +387,11 @@ pub(crate) fn gather_combine(
 /// the window/sort/join reducer pattern, which needs the whole bucket and re-orders it
 /// downstream. Returns `(batches, unreachable)`; a non-empty `unreachable` leaves the
 /// batches partial (the driver recomputes and retries), matching `gather_combine`.
+///
+/// `replicas[i]` lists the fallback addresses holding a copy of source `i`'s bucket, so a
+/// lost mapper is served from a survivor instead of recomputed (see `drive`).
 #[pyfunction]
-#[pyo3(signature = (server, client, sources, fan_in, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false))]
+#[pyo3(signature = (server, client, sources, fan_in, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false, replicas=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_concat(
     py: Python<'_>,
@@ -324,6 +402,7 @@ pub(crate) fn gather_concat(
     credits: u32,
     token: Option<String>,
     shm: bool,
+    replicas: Vec<Vec<String>>,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, Vec<usize>)> {
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
@@ -335,14 +414,129 @@ pub(crate) fn gather_concat(
                 rows.extend(batches);
                 Ok(())
             };
-            let unreachable =
-                drive(server, pool, &sources, credits, fan_in, token, shm, collect).await?;
+            let unreachable = drive(
+                server, pool, &sources, &replicas, credits, fan_in, token, shm, collect,
+            )
+            .await?;
             Ok((rows, unreachable))
         })
     });
 
     let (rows, unreachable) = out.map_err(GatherErr::into_pyerr)?;
     Ok((rows.into_iter().map(PyArrowType).collect(), unreachable))
+}
+
+/// Spilling distributed reduce: merge the partials the shuffle wrote to `input_paths`
+/// (Arrow-IPC stream files, one per mapper for this reducer) and finalize, out of core.
+///
+/// The reducer's other half from [`gather_combine`]: where that folds every mapper's partial
+/// into one running state in RAM, this reads the reducer's shuffle files one at a time and
+/// grace-partitions them to disk under `memory_budget_bytes`, so a high-cardinality
+/// `GROUP BY` / `DISTINCT` / `COUNT(DISTINCT)` whose merged group state exceeds one worker's
+/// RAM completes instead of OOMing — the distributed arm of Batcher's out-of-core guarantee.
+/// Result-identical to the in-memory reduce over the same partials (group order differs).
+/// `spill_dir` is scratch for the grace partitions (defaults to the OS temp dir);
+/// `spill_compression` selects the spill IPC codec (`"lz4"`/`"zstd"`/`"auto"`/None). The GIL
+/// is released for the fold.
+#[pyfunction]
+#[pyo3(signature = (group_keys_json, aggregates_json, input_paths, memory_budget_bytes, spill_dir=None, spill_compression=None))]
+pub(crate) fn combine_finalize_spilling(
+    py: Python<'_>,
+    group_keys_json: &str,
+    aggregates_json: &str,
+    input_paths: Vec<String>,
+    memory_budget_bytes: usize,
+    spill_dir: Option<String>,
+    spill_compression: Option<String>,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let group_keys = parse_group_keys(group_keys_json)?;
+    let aggregates = parse_aggregates(aggregates_json)?;
+    let paths: Vec<std::path::PathBuf> = input_paths.into_iter().map(Into::into).collect();
+    let dir = spill_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let out = py
+        .allow_threads(|| {
+            bc_interp::dist::combine_finalize_spilling(
+                &group_keys,
+                &aggregates,
+                &paths,
+                memory_budget_bytes,
+                &dir,
+                spill_compression.as_deref(),
+            )
+        })
+        .map_err(to_pyerr)?;
+    Ok(PyArrowType(out))
+}
+
+/// Write one source's fetched batches to a fresh Arrow-IPC stream file under `dir`.
+fn write_gather_file(
+    dir: &std::path::Path,
+    seq: usize,
+    batches: &[RecordBatch],
+) -> Result<PathBuf, InterpError> {
+    let path = dir.join(format!("gather-{seq}.arrow"));
+    let file = std::fs::File::create(&path).map_err(ArrowError::from)?;
+    let mut w = StreamWriter::try_new(file, &batches[0].schema()).map_err(InterpError::from)?;
+    for b in batches {
+        w.write(b).map_err(InterpError::from)?;
+    }
+    w.finish().map_err(InterpError::from)?;
+    Ok(path)
+}
+
+/// Concurrently gather every source's bucket and **spill each to its own Arrow-IPC file** under
+/// `dir`, returning the file paths (not the rows). The bounded-memory sibling of
+/// [`gather_concat`]: where that returns the whole assembled bucket in RAM, this holds only
+/// `fan_in` in-flight fetches at once and lands each on disk, so a reducer whose bucket exceeds
+/// RAM stages it out of core. The caller then runs the spilling reduce over these paths
+/// (`combine_finalize_spilling`), keeping the flight aggregate reduce bounded end to end.
+///
+/// Returns `(paths, unreachable)`; a non-empty `unreachable` leaves the set partial (the driver
+/// recomputes + retries), matching the other gathers. `replicas[i]` lists fallback addresses.
+#[pyfunction]
+#[pyo3(signature = (server, client, sources, dir, fan_in, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false, replicas=Vec::new()))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gather_to_files(
+    py: Python<'_>,
+    server: &FlightShuffleServer,
+    client: &ShuffleClient,
+    sources: Vec<(String, String)>,
+    dir: String,
+    fan_in: usize,
+    credits: u32,
+    token: Option<String>,
+    shm: bool,
+    replicas: Vec<Vec<String>>,
+) -> PyResult<(Vec<String>, Vec<usize>)> {
+    let sources = parse_sources(sources)?;
+    let pool = client.pool.clone();
+    let dir = PathBuf::from(dir);
+
+    let out: Result<(Vec<String>, Vec<usize>), GatherErr> = py.allow_threads(|| {
+        shared_runtime().block_on(async {
+            let mut paths: Vec<String> = Vec::new();
+            let mut seq: usize = 0;
+            let stage = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
+                if batches.is_empty() {
+                    return Ok(());
+                }
+                let path = write_gather_file(&dir, seq, &batches)?;
+                seq += 1;
+                paths.push(path.to_string_lossy().into_owned());
+                Ok(())
+            };
+            let unreachable = drive(
+                server, pool, &sources, &replicas, credits, fan_in, token, shm, stage,
+            )
+            .await?;
+            Ok((paths, unreachable))
+        })
+    });
+
+    let (paths, unreachable) = out.map_err(GatherErr::into_pyerr)?;
+    Ok((paths, unreachable))
 }
 
 /// Parse the `(addr, ticket_string)` sources into `(addr, ShuffleTicket)`.

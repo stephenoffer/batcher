@@ -25,10 +25,12 @@ is O(1), and the backend is scanned exactly once per view per process.
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
+from batcher._internal.errors import ConfigError
 from batcher._internal.logging import get_logger
-from batcher.metadata.store import MetadataBackend
+from batcher.metadata.store import MetadataBackend, check_backend
 from batcher.plan.feedback import OperatorFeedback
 
 __all__ = ["MetadataHub"]
@@ -56,6 +58,10 @@ _PER_KIND_MAX = 4096
 # costs O(cap) once every O(cap) records rather than O(cap) on every record.
 _TRIM_SLACK = 2
 
+# Sentinel for "the parsed view has no entry under this key" — distinct from a stored `None`,
+# which `_unchanged` must be able to recognize as already-written.
+_MISSING = object()
+
 
 def _trimmed(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
     """`rows` bounded to its newest `cap` entries, trimming only past the slack factor."""
@@ -75,11 +81,61 @@ def _row_of(feedback: OperatorFeedback) -> dict[str, Any]:
     return {name: getattr(feedback, name) for name in _FEEDBACK_FIELDS}
 
 
+def _check_namespace(namespace: str) -> None:
+    """Reject a namespace that cannot address a stored entry.
+
+    The store's keys are tuples the backends JSON-encode, so a non-string namespace
+    writes under one spelling and reads back under another — a silent "the learning
+    loop never persists anything", not an error.
+    """
+    if not isinstance(namespace, str) or not namespace:
+        raise ConfigError(
+            f"A learned-parameter namespace must be a non-empty string, but got "
+            f"{type(namespace).__name__} {namespace!r}.",
+            hint="Namespaces are dotted names, e.g. 'kyber.cardinality'.",
+        )
+
+
+def _encoded(where: str, value: Any) -> bytes:
+    """`value` as JSON bytes, or a typed error naming the entry that could not encode.
+
+    `json.dumps` reports only the offending *type*, which in a map of learned stats is
+    never enough to find the entry. Naming the namespace (and, for a dict, the key)
+    turns a dead end into a one-line fix.
+    """
+    try:
+        return json.dumps(value).encode()
+    except TypeError as exc:
+        culprit = ""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                try:
+                    json.dumps(item)
+                except TypeError:
+                    culprit = f" (entry {key!r} has type {type(item).__name__})"
+                    break
+        raise ConfigError(
+            f"Learned parameters for {where!r} are not JSON-serializable{culprit}: {exc}.",
+            hint="Learned stats are stored as JSON, so use only str/int/float/bool/list/dict.",
+        ) from exc
+
+
 class MetadataHub:
     """Reads learned state and absorbs execution feedback."""
 
     def __init__(self, backend: MetadataBackend) -> None:
-        self._backend = backend
+        """Wrap a persistence backend.
+
+        Args:
+            backend: Where learned state is stored. Validated here, not on first use:
+                the hub is a process singleton read from several call sites, so a
+                malformed backend would otherwise surface as an `AttributeError` inside
+                whichever query happened to read learned stats first.
+
+        Raises:
+            ConfigError: If `backend` does not implement `MetadataBackend`.
+        """
+        self._backend = check_backend(backend)
         self._seq = 0
         # Parsed-read cache for the learned-parameter tables. `_params_generation` bumps
         # only on a *whole-blob* `save_params` (which the per-key view merges underneath
@@ -89,6 +145,10 @@ class MetadataHub:
         # cache missed on every query it existed to serve.
         self._params_generation = 0
         self._keyed_cache: dict[str, tuple[int, dict[str, Any]]] = {}
+        # Per namespace, the keys known to be backed by their own `(namespace, key)` backend
+        # entry — as opposed to merged up from the legacy single-blob shape. `_unchanged`
+        # only elides a redundant write for a key in here, so a legacy entry still migrates.
+        self._keyed_stored: dict[str, set[str]] = {}
         # Bucketed-by-kind view of the feedback history: loaded from the backend once,
         # then folded forward by `record`. Consumers reduce each bucket to a median or a
         # regression, so buckets are bounded (`_PER_KIND_MAX`) — the whole point is that
@@ -102,28 +162,56 @@ class MetadataHub:
         # incremental consumer (Kyber's q-error fold) tell how many rows are new since it
         # last read, so it absorbs only those instead of re-folding the whole view.
         self._signed_appends = 0
+        # `record` is the one writer, and several queries call it at once: the hub is a
+        # process singleton (`core.default_hub`), so two concurrent pipelines both fold
+        # their measurements in here. `self._seq += 1` is a read-modify-write, and `_seq`
+        # is half the storage key — a lost update makes two rows collide and one query's
+        # feedback silently overwrite another's. Measured with preemption forced: 124 of
+        # 32,000 rows collided. Core measures and Kyber consumes, so a dropped row is not
+        # a wrong answer, it is a plan that quietly stops improving. `record` runs once per
+        # operator per query, so serializing it costs nothing on the hot path.
+        self._lock = threading.Lock()
+
+    def __repr__(self) -> str:
+        """Name the backend and how much has been learned.
+
+        "Is my learned-stats store actually being written to?" is the question a user
+        prints a hub to answer, and an address answers none of it.
+        """
+        return (
+            f"MetadataHub(backend={self._backend!r}, recorded={self._seq}, "
+            f"signed={self._signed_appends})"
+        )
 
     # --- FeedbackSink ------------------------------------------------------
     def record(self, feedback: OperatorFeedback) -> None:
-        """Persist one operator's feedback. Never raises into the caller."""
+        """Persist one operator's feedback. Never raises into the caller.
+
+        Thread-safe: concurrent pipelines share one hub (see `_lock`).
+        """
         try:
-            self._seq += 1
-            key = (int(feedback.op_id), self._seq)
-            row = _row_of(feedback)
-            self._backend.put(_OP_STATS, key, json.dumps(row).encode())
-            # Fold the row into whichever derived views have been materialized. A view
-            # still `None` has not been read yet; its lazy load will pick this row up
-            # from the backend, so there is nothing to do.
-            if self._by_kind is not None:
-                bucket = self._by_kind.setdefault(row["kind"], [])
-                bucket.append(row)
-                _trimmed(bucket, _PER_KIND_MAX)
-            if self._signed is not None and row["signature"]:
-                self._signed.append(row)  # keep the hot view current without a re-scan
-                self._signed_appends += 1
-                _trimmed(self._signed, _SIGNED_HISTORY_MAX)
+            with self._lock:
+                self._record_locked(feedback)
         except Exception:  # pragma: no cover - feedback must not break execution
             _log.warning("dropped operator feedback", exc_info=True)
+
+    def _record_locked(self, feedback: OperatorFeedback) -> None:
+        """The body of `record`, serialized against concurrent writers by `_lock`."""
+        self._seq += 1
+        key = (int(feedback.op_id), self._seq)
+        row = _row_of(feedback)
+        self._backend.put(_OP_STATS, key, json.dumps(row).encode())
+        # Fold the row into whichever derived views have been materialized. A view
+        # still `None` has not been read yet; its lazy load will pick this row up
+        # from the backend, so there is nothing to do.
+        if self._by_kind is not None:
+            bucket = self._by_kind.setdefault(row["kind"], [])
+            bucket.append(row)
+            _trimmed(bucket, _PER_KIND_MAX)
+        if self._signed is not None and row["signature"]:
+            self._signed.append(row)  # keep the hot view current without a re-scan
+            self._signed_appends += 1
+            _trimmed(self._signed, _SIGNED_HISTORY_MAX)
 
     @property
     def signed_appends(self) -> int:
@@ -147,7 +235,24 @@ class MetadataHub:
         return self._seq
 
     def operator_history(self, op_id: int) -> list[dict[str, Any]]:
-        """All recorded feedback for an operator id, oldest first."""
+        """All recorded feedback for an operator id, oldest first.
+
+        Args:
+            op_id: The operator's plan-local id.
+
+        Returns:
+            The recorded rows, oldest first. Empty when nothing was recorded.
+
+        Raises:
+            ConfigError: If `op_id` is not an integer. The store's keys are typed, so a
+                string id matches nothing and would otherwise read as "never recorded".
+        """
+        if not isinstance(op_id, int) or isinstance(op_id, bool):
+            raise ConfigError(
+                f"operator_history needs an integer op_id, but got "
+                f"{type(op_id).__name__} {op_id!r}.",
+                hint="Operator ids are the plan-local integers on a PhysicalPlan's ops.",
+            )
         out = [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
         return out
 
@@ -228,11 +333,36 @@ class MetadataHub:
 
     # --- learned parameters ------------------------------------------------
     def load_params(self, namespace: str) -> dict[str, Any]:
+        """Every learned parameter under `namespace`, or an empty dict.
+
+        Args:
+            namespace: The learning loop's name, e.g. ``"kyber.calibration"``.
+
+        Returns:
+            The stored parameters.
+
+        Raises:
+            ConfigError: If `namespace` is not a non-empty string.
+        """
+        _check_namespace(namespace)
         raw = self._backend.get(_LEARNED_PARAMS, (namespace,))
         return json.loads(raw) if raw else {}
 
     def save_params(self, namespace: str, params: dict[str, Any]) -> None:
-        self._backend.put(_LEARNED_PARAMS, (namespace,), json.dumps(params).encode())
+        """Replace every learned parameter under `namespace`.
+
+        Args:
+            namespace: The learning loop's name.
+            params: The parameters to store. Must be JSON-serializable — the store
+                holds opaque bytes so that any backend can serve it.
+
+        Raises:
+            ConfigError: If `namespace` is invalid, or `params` is not serializable.
+                The offending key is named, because a `TypeError` reading "Object of
+                type X is not JSON serializable" does not say *which* entry it was.
+        """
+        _check_namespace(namespace)
+        self._backend.put(_LEARNED_PARAMS, (namespace,), _encoded(namespace, params))
         # A whole-blob write is the one thing the per-key view cannot patch in place: it
         # is the *legacy* layer that view merges underneath its own entries.
         self._params_generation += 1
@@ -251,14 +381,17 @@ class MetadataHub:
             return cached[1]
         out: dict[str, Any] = {}
         legacy: dict[str, Any] = {}
+        stored: set[str] = set()
         for key, value in self._backend.scan(_LEARNED_PARAMS, (namespace,)):
             if len(key) >= 2:
                 out[key[1]] = json.loads(value)
+                stored.add(str(key[1]))
             elif len(key) == 1:
                 legacy = json.loads(value)
         for k, v in legacy.items():
             out.setdefault(k, v)  # per-key entries win over the legacy blob
         self._keyed_cache[namespace] = (self._params_generation, out)
+        self._keyed_stored[namespace] = stored
         return out
 
     def get_keyed_param(self, namespace: str, key: str) -> Any | None:
@@ -272,8 +405,30 @@ class MetadataHub:
         return self.load_keyed_params(namespace).get(key)
 
     def put_keyed_param(self, namespace: str, key: str, value: Any) -> None:
-        blob = json.dumps(value).encode()
+        """Store one learned entry under `(namespace, key)`.
+
+        Args:
+            namespace: The learning loop's name.
+            key: The entry's name within the namespace.
+            value: A JSON-serializable value.
+
+        Raises:
+            ConfigError: If `namespace` or `key` is not a non-empty string, or `value`
+                is not serializable. A non-string key would round-trip through JSON as
+                a string and silently stop matching the key it was written under.
+        """
+        _check_namespace(namespace)
+        if not isinstance(key, str) or not key:
+            raise ConfigError(
+                f"A learned-parameter key must be a non-empty string, but got "
+                f"{type(key).__name__} {key!r} in namespace {namespace!r}.",
+                hint="Keys round-trip through JSON, so only strings survive unchanged.",
+            )
+        if self._unchanged(namespace, key, value):
+            return
+        blob = _encoded(f"{namespace}.{key}", value)
         self._backend.put(_LEARNED_PARAMS, (namespace, key), blob)
+        self._keyed_stored.setdefault(namespace, set()).add(key)
         # Patch the parsed view rather than invalidating it: this write *is* the new value
         # of exactly one entry, and the tuning loops read the namespace back on the very
         # next query. Invalidating instead would re-scan and re-parse the namespace each
@@ -283,3 +438,36 @@ class MetadataHub:
         cached = self._keyed_cache.get(namespace)
         if cached is not None:
             cached[1][key] = json.loads(blob)
+
+    def _unchanged(self, namespace: str, key: str, value: Any) -> bool:
+        """True when `(namespace, key)` already stores exactly `value` — so writing is a no-op.
+
+        The learning loops **re-record what they already know on every query**: a query over
+        the same source re-measures the same distinct counts, and merges them into the same
+        map, and hands the same map back. Serving that write meant a `json.dumps` of the whole
+        column map, a backend `put`, and a `json.loads` of the blob back — per column-stat
+        table, per query — to arrive at the value already sitting in the parsed view. On the
+        default in-process backend (a dict in this very process) the round-trip through JSON
+        bytes was the *entire* cost. It was ~48% of a small query's control plane.
+
+        The parsed view is by construction "what a reader of the store would see", so a value
+        equal to it is a value already stored, and the write can be dropped. Two guards keep
+        that inference honest:
+
+        * the view must be current (`_params_generation`), and
+        * the key must be backed by its own per-key backend entry (`_keyed_stored`) — an entry
+          the view merged up from the *legacy* single-blob shape is readable but not yet
+          migrated, and eliding its first write would defer that migration forever.
+
+        Equality is `==` plus a top-level type check, which pins the int/float distinction
+        JSON preserves. A nested int-vs-float drift under an equal value is not distinguished
+        — it would require a deterministic producer to change a value's type while keeping it
+        numerically equal, and every consumer of these learned stats does float arithmetic.
+        """
+        cached = self._keyed_cache.get(namespace)
+        if cached is None or cached[0] != self._params_generation:
+            return False
+        if key not in self._keyed_stored.get(namespace, ()):
+            return False
+        current = cached[1].get(key, _MISSING)
+        return type(current) is type(value) and current == value

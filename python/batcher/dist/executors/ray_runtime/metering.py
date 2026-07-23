@@ -32,6 +32,8 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
+
 __all__ = ["execute_metered", "record_worker_metrics"]
 
 
@@ -55,8 +57,7 @@ def execute_metered(
     Returns:
         A pair of the result batches and the raw `ExecMetrics` JSON (`""` if unavailable).
     """
-    import batcher._native as nat
-
+    nat = engine()
     metered = getattr(nat, "execute_plan_metered", None)
     if metered is None:
         return nat.execute_plan(plan_ir, sources, engine_config), ""

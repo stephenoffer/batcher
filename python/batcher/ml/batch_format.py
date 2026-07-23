@@ -6,7 +6,7 @@ Data parity surface — by converting **only around the per-batch call**; the da
 stays Arrow. The NumPy/torch directions reuse `ml.converters` so the Arrow↔framework
 tensor logic has a single home.
 
-A non-Arrow `fn` result reduces to something `core.udf._coerce_udf_result` already
+A non-Arrow `fn` result reduces to something `core.udf.call._coerce_udf_result` already
 turns into batches (a column dict via ``from_pydict``, or a `RecordBatch`), so the
 result path stays one normalizer, not four.
 """
@@ -47,7 +47,7 @@ def to_format(batch: pa.RecordBatch, fmt: str) -> Any:
 
 
 def result_to_arrowable(result: Any, fmt: str) -> Any:
-    """Normalize a `fn` result to a value `core.udf._coerce_udf_result` accepts.
+    """Normalize a `fn` result to a value `core.udf.call._coerce_udf_result` accepts.
 
     Reduces a NumPy/torch column dict or a pandas frame to a `RecordBatch`/`Table`/
     column-dict; ``pyarrow`` results pass through untouched.

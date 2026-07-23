@@ -20,12 +20,12 @@ from __future__ import annotations
 
 from batcher.config import Config
 from batcher.kyber.learning import load_learned_stats
-from batcher.kyber.metadata_answer import _root_stats
+from batcher.kyber.metadata_answer import _root_stats, exact_null_count
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.bloom_index import BloomIndex
 from batcher.plan.expr_ir import Binary, Col, IsNotNull, IsNull, Lit, Not
-from batcher.plan.logical import Filter, LogicalPlan, Project
+from batcher.plan.logical import Filter, LogicalPlan, Project, Scan
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
 __all__ = [
@@ -141,21 +141,30 @@ def _child_stats(
 def _exact_surviving_count(predicate, child: RelStats) -> int | None:
     """The exact number of rows a predicate keeps over `child`'s EXACT stats, or None."""
     pred = _strip_not(predicate)
+    # A null predicate is answered from the null count's **own** provenance, not the bundle's:
+    # a Parquet string column has truncatable bounds (a DEFAULT bundle) and an exactly recorded
+    # null count, and `WHERE name IS NULL` needs only the second.
     if isinstance(pred, IsNull) and isinstance(pred.input, Col):
         # `col IS NULL` — surviving count is exactly the recorded null count.
-        stat = _exact_col(child, pred.input.name)
-        if stat is not None and stat.null_count is not None:
-            return int(stat.null_count)
-        return None
+        return exact_null_count(child, pred.input.name)
     if isinstance(pred, IsNotNull) and isinstance(pred.input, Col):
         # `col IS NOT NULL` — rows minus the null count (needs both EXACT).
-        stat = _exact_col(child, pred.input.name)
-        if child.rows_exact and stat is not None and stat.null_count is not None:
-            return int(child.rows - stat.null_count)
+        nulls = exact_null_count(child, pred.input.name)
+        if child.rows_exact and nulls is not None:
+            return int(child.rows - nulls)
         return None
     if _is_null_tautology(pred) is not None and child.rows_exact:
         # `col IS NULL OR col IS NOT NULL` keeps every row (always true).
         return int(child.rows)
+    if isinstance(pred, Binary) and pred.op == "and":
+        # `A AND B` keeps a subset of what `A` keeps, so a provably-empty conjunct makes the
+        # whole conjunction provably empty. This is the shape of every real lakehouse filter
+        # (`day = 42 AND region = 'us'`), which the bare-comparison parse below could not see
+        # at all — so a partition pruned to nothing still executed to discover it.
+        for side in (pred.left, pred.right):
+            if _exact_surviving_count(side, child) == 0:
+                return 0
+        return None
     parsed = _parse_comparison(pred)
     if parsed is not None:
         op, name, value = parsed
@@ -181,8 +190,17 @@ def _exact_predicate_count(filt: Filter, child: RelStats, sources: list) -> int 
     whole-column count matches exactly what the filter sees.
     """
     scan = filt.input
-    if type(scan).__name__ != "Scan" or getattr(scan, "predicate", None) is not None:
-        return None  # not a bare scan — a whole-source count may not match the input
+    # `isinstance`, not a name-string: a string compare silently accepts any unrelated class
+    # called `Scan` and breaks silently if the class is renamed. `source_id == 0` makes the
+    # single-source binding explicit rather than relying on the `len(sources) != 1` check below.
+    # `getattr` for the predicate stays deliberate: a pushdown adds that attribute, a bare
+    # `Scan` does not carry it at all, so a direct access raises rather than declining.
+    if (
+        not isinstance(scan, Scan)
+        or getattr(scan, "predicate", None) is not None
+        or scan.source_id != 0
+    ):
+        return None  # not a bare scan of the one source — a whole-source count may not match
     parsed = _parse_comparison(filt.predicate)
     if parsed is None or len(sources) != 1 or not child.rows_exact:
         return None
@@ -259,6 +277,13 @@ def _comparison_empty(op: str, stat: ColumnStat | None, value) -> bool:
     lo, hi = stat.min, stat.max
     if _is_nan(lo) or _is_nan(hi) or _is_nan(value):
         return False
+    # A **zero** float bound is as unusable as a NaN one, and for the same reason: the engine
+    # compares floats on their *total* order, where `-0.0 < 0.0`, while the comparison below
+    # is Python's, where they are equal. A column whose minimum is `-0.0` would let us "prove"
+    # that `WHERE f < 0` keeps nothing — and executing it returns the `-0.0` row we proved
+    # away. Refusing costs a scan; answering costs a wrong count.
+    if _is_zero_float(lo) or _is_zero_float(hi):
+        return False
     try:
         if op == "lt":
             return lo is not None and value <= lo
@@ -297,9 +322,12 @@ def _is_nan(value) -> bool:
     return isinstance(value, float) and math.isnan(value)
 
 
-def _exact_col(stats: RelStats, name: str) -> ColumnStat | None:
-    """`name`'s `ColumnStat` iff its whole bundle is `Provenance.EXACT`, else None."""
-    stat = stats.columns.get(name)
-    if stat is None or stat.provenance is not Provenance.EXACT:
-        return None
-    return stat
+def _is_zero_float(value) -> bool:
+    """Whether `value` is a float zero — the bound where `-0.0` and `0.0` part company.
+
+    Python says `-0.0 == 0.0`; the engine's float comparison (arrow-rs's total order) says
+    `-0.0 < 0.0`. So a zero bound is a place where reasoning about the bound and executing the
+    predicate can disagree, and the only sound move is to decline. See the note in
+    `kyber.shortcuts.bounds.orderable`, which applies the identical rule.
+    """
+    return isinstance(value, float) and value == 0.0

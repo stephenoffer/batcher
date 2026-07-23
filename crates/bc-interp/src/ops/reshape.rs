@@ -7,8 +7,8 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, GenericListArray, Int64Array, LargeListArray, ListArray,
-    OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, GenericListArray, Int64Array,
+    LargeListArray, ListArray, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::compute::{concat, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -54,15 +54,22 @@ pub(crate) fn unnest_batch(
     batch: &RecordBatch,
     column: &str,
     alias: &str,
+    outer: bool,
+    index_alias: Option<&str>,
 ) -> Result<RecordBatch, InterpError> {
     let col = batch
         .column_by_name(column)
         .ok_or_else(|| InterpError::UnnestUnknownColumn(column.to_string()))?;
-    let (parent_idx, exploded) = match col.data_type() {
-        DataType::List(_) => explode_list(col.as_any().downcast_ref::<ListArray>().unwrap()),
-        DataType::LargeList(_) => {
-            explode_list(col.as_any().downcast_ref::<LargeListArray>().unwrap())
-        }
+    let plan = match col.data_type() {
+        DataType::List(_) => explode_list(col.as_any().downcast_ref::<ListArray>().unwrap(), outer),
+        DataType::LargeList(_) => explode_list(
+            col.as_any().downcast_ref::<LargeListArray>().unwrap(),
+            outer,
+        ),
+        DataType::FixedSizeList(_, _) => explode_fixed_size_list(
+            col.as_any().downcast_ref::<FixedSizeListArray>().unwrap(),
+            outer,
+        ),
         other => {
             return Err(InterpError::UnnestNotList {
                 column: column.to_string(),
@@ -70,6 +77,14 @@ pub(crate) fn unnest_batch(
             })
         }
     }?;
+    let ExplodePlan {
+        parent_idx,
+        child_idx,
+        positions,
+    } = plan;
+    // A `None` child index gathers to NULL — which is exactly the element an `outer` row
+    // that had no element must carry, so the same `take` serves both modes.
+    let exploded = take(values_of(col), &UInt32Array::from(child_idx), None)?;
     let parent_indices = UInt32Array::from(parent_idx);
 
     // Output preserves input column order, replacing the exploded column in place
@@ -92,37 +107,159 @@ pub(crate) fn unnest_batch(
             columns.push(gathered);
         }
     }
+    if let Some(index_name) = index_alias {
+        fields.push(Field::new(index_name, DataType::Int64, true));
+        columns.push(Arc::new(Int64Array::from(positions)) as ArrayRef);
+    }
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(fields)),
         columns,
     )?)
 }
 
-/// Build the (parent-row-index, exploded-values) pair for a list array of either
-/// offset width. A null list entry contributes no rows regardless of its offsets.
+/// The gather plan an explosion produces: which parent row each output row came from,
+/// which child element it takes (`None` → a NULL element, only produced by `outer`), and
+/// each element's 0-based position in its list (`None` for an `outer` placeholder row).
+struct ExplodePlan {
+    parent_idx: Vec<u32>,
+    child_idx: Vec<Option<u32>>,
+    positions: Vec<Option<i64>>,
+}
+
+/// The child values of a list column, whatever its offset width.
+fn values_of(col: &ArrayRef) -> &dyn Array {
+    match col.data_type() {
+        DataType::List(_) => col
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        DataType::LargeList(_) => col
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        _ => col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap()
+            .values()
+            .as_ref(),
+    }
+}
+
+/// Build the explode plan for a list array of either offset width.
+///
+/// A null or empty list contributes no rows by default (DuckDB `UNNEST`); under `outer`
+/// it contributes exactly one row whose element and position are NULL.
 fn explode_list<O: OffsetSizeTrait>(
     list: &GenericListArray<O>,
-) -> Result<(Vec<u32>, ArrayRef), InterpError> {
+    outer: bool,
+) -> Result<ExplodePlan, InterpError> {
     let offsets = list.value_offsets();
-    // The explosion emits one (parent, child) pair per non-null child element, so both
-    // index vectors are bounded by the child length — pre-size to skip the push reallocs.
-    let n_child = list.values().len();
-    let mut parent_idx: Vec<u32> = Vec::with_capacity(n_child);
-    let mut child_idx: Vec<u32> = Vec::with_capacity(n_child);
+    // One (parent, child) pair per child element, so the vectors are bounded by the child
+    // length — plus, under `outer`, at most one placeholder per parent row.
+    let cap = list.values().len() + if outer { list.len() } else { 0 };
+    let mut parent_idx: Vec<u32> = Vec::with_capacity(cap);
+    let mut child_idx: Vec<Option<u32>> = Vec::with_capacity(cap);
+    let mut positions: Vec<Option<i64>> = Vec::with_capacity(cap);
     for i in 0..list.len() {
-        if list.is_null(i) {
+        let (start, end) = if list.is_null(i) {
+            (0, 0)
+        } else {
+            (offsets[i].as_usize(), offsets[i + 1].as_usize())
+        };
+        if start == end {
+            if outer {
+                parent_idx.push(i as u32);
+                child_idx.push(None);
+                positions.push(None);
+            }
             continue;
         }
-        let start = offsets[i].as_usize();
-        let end = offsets[i + 1].as_usize();
-        for j in start..end {
+        for (pos, j) in (start..end).enumerate() {
             parent_idx.push(i as u32);
-            child_idx.push(j as u32);
+            child_idx.push(Some(j as u32));
+            positions.push(Some(pos as i64));
         }
     }
-    let child_indices = UInt32Array::from(child_idx);
-    let exploded = take(list.values().as_ref(), &child_indices, None)?;
-    Ok((parent_idx, exploded))
+    Ok(ExplodePlan {
+        parent_idx,
+        child_idx,
+        positions,
+    })
+}
+
+/// Build the (parent-row-index, exploded-values) pair for a `FixedSizeList` column.
+/// Each non-null row contributes exactly `value_length` child elements (a null row
+/// contributes none, matching the variable-length list semantics and DuckDB/Polars).
+fn explode_fixed_size_list(
+    list: &FixedSizeListArray,
+    outer: bool,
+) -> Result<ExplodePlan, InterpError> {
+    let width = list.value_length() as usize;
+    let cap = list.values().len() + if outer { list.len() } else { 0 };
+    let mut parent_idx: Vec<u32> = Vec::with_capacity(cap);
+    let mut child_idx: Vec<Option<u32>> = Vec::with_capacity(cap);
+    let mut positions: Vec<Option<i64>> = Vec::with_capacity(cap);
+    for i in 0..list.len() {
+        // A fixed-size list is empty only when its declared width is 0; both that and a
+        // null row take the placeholder path under `outer`.
+        if list.is_null(i) || width == 0 {
+            if outer {
+                parent_idx.push(i as u32);
+                child_idx.push(None);
+                positions.push(None);
+            }
+            continue;
+        }
+        // `value_offset(i)` is the start of row `i`'s slice in `values()`, accounting
+        // for any logical offset on the list array itself.
+        let start = list.value_offset(i) as usize;
+        for (pos, j) in (start..start + width).enumerate() {
+            parent_idx.push(i as u32);
+            child_idx.push(Some(j as u32));
+            positions.push(Some(pos as i64));
+        }
+    }
+    Ok(ExplodePlan {
+        parent_idx,
+        child_idx,
+        positions,
+    })
+}
+
+/// The common numeric supertype the melted `on` columns must all widen to before
+/// `concat` stacks them, or `None` when they already share a type (no cast needed) or
+/// have no safe numeric supertype (leave them be — `concat` then surfaces the mismatch
+/// as a clean error). Mirrors the control-plane `promote` lattice: an int∪int mix meets
+/// at `Int64`, any float wins (→ `Float64`, as DuckDB/Polars promote int∪float), so the
+/// stacked `value` column matches the type the planner advertised in the output schema.
+fn promote_value_columns(arrays: &[ArrayRef]) -> Option<DataType> {
+    use DataType::*;
+    let is_float = |t: &DataType| matches!(t, Float16 | Float32 | Float64);
+    let is_int = |t: &DataType| {
+        matches!(
+            t,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        )
+    };
+    let first = arrays.first()?.data_type();
+    if arrays.iter().all(|a| a.data_type() == first) {
+        return None; // already uniform — no promotion, no cast
+    }
+    let numeric = |t: &DataType| is_float(t) || is_int(t);
+    if arrays.iter().all(|a| numeric(a.data_type())) {
+        if arrays.iter().any(|a| is_float(a.data_type())) {
+            Some(Float64)
+        } else {
+            Some(Int64)
+        }
+    } else {
+        None
+    }
 }
 
 /// Reshape one batch wide → long (SQL `UNPIVOT` / `melt`). For `n` input rows and
@@ -171,11 +308,21 @@ pub(crate) fn unpivot_batch(
     fields.push(Field::new(variable_name, DataType::Utf8, false));
     columns.push(Arc::new(StringArray::from(var)));
 
-    // The `value` column: the `on` columns concatenated in order (same type).
-    let value_arrays: Vec<ArrayRef> = on
+    // The `value` column: the `on` columns concatenated in order. `concat` requires a
+    // single type, so a numeric mix (e.g. Int64 + Float64) is first promoted to a
+    // common supertype — matching DuckDB/Polars, and the promoted type the control
+    // plane already advertises in the output schema (`plan.types.lattice.promote`).
+    let mut value_arrays: Vec<ArrayRef> = on
         .iter()
         .map(|name| lookup(name).cloned())
         .collect::<Result<_, _>>()?;
+    if let Some(target) = promote_value_columns(&value_arrays) {
+        for a in value_arrays.iter_mut() {
+            if a.data_type() != &target {
+                *a = arrow::compute::cast(a, &target)?;
+            }
+        }
+    }
     let refs: Vec<&dyn Array> = value_arrays.iter().map(|a| a.as_ref()).collect();
     let value = concat(&refs)?;
     fields.push(Field::new(value_name, value.data_type().clone(), true));
@@ -301,4 +448,191 @@ fn fnv1a_seeded(bytes: &[u8], seed: u64) -> u64 {
     hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
     hash ^= hash >> 31;
     hash
+}
+
+#[cfg(test)]
+mod reshape_tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::buffer::OffsetBuffer;
+
+    /// `explode` of a `FixedSizeList` column expands each non-null row into its `width`
+    /// Build `{id, xs}` with row 0 = [1,2], row 1 = [] (empty), row 2 = null, row 3 = [3].
+    fn outer_fixture() -> RecordBatch {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+
+        let values = Int64Array::from(vec![1, 2, 3]);
+        let offsets = OffsetBuffer::new(vec![0, 2, 2, 2, 3].into());
+        let field = Arc::new(Field::new("item", DataType::Int64, true));
+        let nulls = arrow::buffer::NullBuffer::from(vec![true, true, false, true]);
+        let list = ListArray::new(field, offsets, Arc::new(values), Some(nulls));
+        let ids = Int64Array::from(vec![10, 20, 30, 40]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("xs", list.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(list)]).unwrap()
+    }
+
+    fn i64_col(batch: &RecordBatch, name: &str) -> Vec<Option<i64>> {
+        let a = batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..a.len())
+            .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+            .collect()
+    }
+
+    /// Without `outer`, an empty or null list contributes nothing — DuckDB `UNNEST`.
+    #[test]
+    fn unnest_default_drops_empty_and_null_lists() {
+        let out = unnest_batch(&outer_fixture(), "xs", "xs", false, None).unwrap();
+        assert_eq!(i64_col(&out, "id"), vec![Some(10), Some(10), Some(40)]);
+        assert_eq!(i64_col(&out, "xs"), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    /// With `outer`, each such row is kept once with a NULL element — the difference
+    /// between a document that chunked to nothing *vanishing* and being visible.
+    #[test]
+    fn unnest_outer_keeps_empty_and_null_lists_as_null_rows() {
+        let out = unnest_batch(&outer_fixture(), "xs", "xs", true, None).unwrap();
+        assert_eq!(
+            i64_col(&out, "id"),
+            vec![Some(10), Some(10), Some(20), Some(30), Some(40)]
+        );
+        assert_eq!(
+            i64_col(&out, "xs"),
+            vec![Some(1), Some(2), None, None, Some(3)]
+        );
+    }
+
+    /// `index_alias` emits each element's 0-based position within its own list.
+    #[test]
+    fn unnest_emits_the_element_position() {
+        let out = unnest_batch(&outer_fixture(), "xs", "xs", false, Some("pos")).unwrap();
+        assert_eq!(i64_col(&out, "pos"), vec![Some(0), Some(1), Some(0)]);
+    }
+
+    /// A row kept only by `outer` has no element, so it has no position either.
+    #[test]
+    fn unnest_outer_position_is_null_for_a_placeholder_row() {
+        let out = unnest_batch(&outer_fixture(), "xs", "xs", true, Some("pos")).unwrap();
+        assert_eq!(
+            i64_col(&out, "pos"),
+            vec![Some(0), Some(1), None, None, Some(0)]
+        );
+    }
+
+    /// The position restarts per list, so it is usable as a chunk ordinal.
+    #[test]
+    fn unnest_position_restarts_for_each_parent_row() {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+
+        let values = Int64Array::from(vec![1, 2, 3, 4, 5]);
+        let offsets = OffsetBuffer::new(vec![0, 3, 5].into());
+        let field = Arc::new(Field::new("item", DataType::Int64, true));
+        let list = ListArray::new(field, offsets, Arc::new(values), None);
+        let ids = Int64Array::from(vec![10, 20]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("xs", list.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(list)]).unwrap();
+
+        let out = unnest_batch(&batch, "xs", "xs", false, Some("pos")).unwrap();
+        assert_eq!(
+            i64_col(&out, "pos"),
+            vec![Some(0), Some(1), Some(2), Some(0), Some(1)]
+        );
+    }
+
+    /// elements — previously it errored (the planner advertised a schema for it, but the
+    /// interpreter only handled variable-length lists).
+    #[test]
+    fn unnest_fixed_size_list_expands_rows() {
+        // Row 0 = [1, 2], row 1 = null, row 2 = [3, 4].
+        let values = Int64Array::from(vec![Some(1), Some(2), Some(9), Some(9), Some(3), Some(4)]);
+        let field = Arc::new(Field::new("item", DataType::Int64, true));
+        let nulls = arrow::buffer::NullBuffer::from(vec![true, false, true]);
+        let fsl = FixedSizeListArray::new(field, 2, Arc::new(values), Some(nulls));
+        let ids = Int64Array::from(vec![10, 20, 30]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("xs", fsl.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(fsl)]).unwrap();
+        let out = unnest_batch(&batch, "xs", "xs", false, None).unwrap();
+        // The null row contributes nothing; rows 0 and 2 contribute two elements each.
+        let xs = out
+            .column_by_name("xs")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(xs.values(), &[1, 2, 3, 4]);
+        let id = out
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.values(), &[10, 10, 30, 30]);
+    }
+
+    /// `unpivot` over an Int64 + Float64 pair promotes both to Float64 (DuckDB/Polars
+    /// semantics and the schema the planner advertises) instead of erroring in `concat`.
+    #[test]
+    fn unpivot_promotes_mixed_numeric_on_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Float64Array::from(vec![2.5])),
+            ],
+        )
+        .unwrap();
+        let out = unpivot_batch(
+            &batch,
+            &["id".into()],
+            &["a".into(), "b".into()],
+            "variable",
+            "value",
+        )
+        .expect("mixed int/float unpivot must promote, not error");
+        let value = out.column_by_name("value").unwrap();
+        assert_eq!(value.data_type(), &DataType::Float64);
+        let v = value.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(v.values(), &[10.0, 2.5]);
+    }
+
+    /// A variable-length `List` with a null and an empty row keeps the documented
+    /// DuckDB semantics (null/empty lists drop; a null element is kept). Guards the
+    /// FixedSizeList arm from regressing the generic path.
+    #[test]
+    fn unnest_variable_list_drops_null_and_empty() {
+        let values = Int64Array::from(vec![Some(1), Some(2), Some(7)]);
+        let offsets = OffsetBuffer::new(vec![0, 2, 2, 2, 3].into()); // rows: [1,2], [], [], [7]
+        let field = Arc::new(Field::new("item", DataType::Int64, true));
+        let nulls = arrow::buffer::NullBuffer::from(vec![true, true, false, true]);
+        let list = ListArray::new(field, offsets, Arc::new(values), Some(nulls));
+        let ids = Int64Array::from(vec![1, 2, 3, 4]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("xs", list.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(list)]).unwrap();
+        let out = unnest_batch(&batch, "xs", "xs", false, None).unwrap();
+        assert_eq!(out.num_rows(), 3); // row 0 (2 elems) + row 3 (1 elem)
+    }
 }

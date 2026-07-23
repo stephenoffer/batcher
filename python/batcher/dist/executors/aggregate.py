@@ -12,10 +12,11 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     _apply_above,
     _partition_source,
-    source_pushdown,
+    consumer_pushdown,
 )
 from batcher.dist.executors.plan_analysis import _empty_agg_table, _relabel_single_source
 from batcher.dist.executors.ray_runtime import (
@@ -26,6 +27,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.io.source import Source
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, LogicalPlan
 
 
@@ -48,19 +50,19 @@ def _distributed_aggregate(
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to workers
 
-    group_keys_json = json.dumps(
-        [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
-    )
-    aggregates_json = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    group_keys_json, aggregates_json = agg_spec_json(agg)
     map_plan, source_id = _relabel_single_source(agg.input)
     map_ir = json.dumps(map_plan.to_ir())
     n_keys = len(agg.group_keys)
     # Global aggregate (no keys) cannot shuffle by key → a single reducer.
     n_reducers = 1 if n_keys == 0 else shuffle_partitions(workers)
 
-    # Push the sub-plan's projection + predicate into the source read (the map_ir
-    # still re-checks the filter, so this is a pure I/O optimization).
-    projection, predicate = source_pushdown(map_plan, 0)
+    # Push the projection + predicate into the source read (the map_ir still re-checks the
+    # filter, so this is a pure I/O optimization). Ask about the aggregate *over* the map
+    # prefix: the prefix of a plain `group_by(k).agg(sum(v))` is a bare `Scan`, which requires
+    # every column it has — so asking about the prefix alone read the whole wide table to
+    # answer a two-column aggregate. See `consumer_pushdown`.
+    projection, predicate = consumer_pushdown(agg, map_plan)
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
@@ -103,10 +105,14 @@ def _distributed_aggregate(
         shuffle_paths = [paths for paths, _metrics in map_results]
         record_worker_metrics(hub, (m for _paths, m in map_results), metrics_out)
 
-        # REDUCE: each reducer combines+finalizes the partials routed to it.
+        # REDUCE: each reducer combines+finalizes the partials routed to it. The worker
+        # config (shipped `cfg_json`) carries its memory envelope, so a reducer whose merged
+        # group state would exceed it spills out of core instead of OOMing.
         def _reduce_for(r: int):
             inputs = [paths[r] for paths in shuffle_paths]
-            return _reduce_task.remote(group_keys_json, aggregates_json, inputs, work_dir, r)
+            return _reduce_task.remote(
+                group_keys_json, aggregates_json, inputs, work_dir, r, cfg_json
+            )
 
         reduce_refs = [_reduce_for(r) for r in range(n_reducers)]
         result_paths = gather_with_backups(reduce_refs, _reduce_for, pol)  # [(path, rows)]
@@ -153,7 +159,7 @@ def _map_task(
 ):
     import os as _os
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
     from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc
@@ -177,7 +183,9 @@ def _map_task(
     return paths, metrics_json
 
 
-def _reduce_task(group_keys_json, aggregates_json, input_paths, work_dir, reducer_id):
+def _reduce_task(
+    group_keys_json, aggregates_json, input_paths, work_dir, reducer_id, engine_config=""
+):
     """Combine+finalize the partials routed to this reducer. Returns
     ``(ipc_path, row_count)`` for a non-empty bucket, else ``(None, 0)`` — the exact
     count lets the driver size a materialized intermediate without reading it back.
@@ -188,11 +196,42 @@ def _reduce_task(group_keys_json, aggregates_json, input_paths, work_dir, reduce
     skewed reducer's peak memory is one running state + one input, not the sum of all W
     inputs (the disk path now matches the Flight path's bounded tree-reduce). `combine` is
     associative+commutative, so the folded result is bit-identical to combining them all in
-    one call — the mergeable-algebra invariant."""
+    one call — the mergeable-algebra invariant.
+
+    The running state itself is still O(groups): a high-cardinality `GROUP BY` / `DISTINCT`
+    can make it exceed one worker's RAM even though each *input* is bounded. When the shipped
+    memory envelope (`memory_budget_bytes`) is set and this reducer's on-disk input exceeds
+    it, the fold is done **out of core** by `combine_finalize_spilling` — it reads the shuffle
+    files one at a time and grace-partitions them to disk, so the reducer completes instead of
+    OOMing. Result-identical to the in-memory fold (the mergeable algebra holds out-of-core).
+    On-disk bytes are a floor for the in-memory state (IPC never expands), so the small-state
+    common case keeps the fast in-memory fold and pays nothing."""
     import os as _os
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.shuffle_io import read_ipc, write_ipc
+
+    budget = 0
+    cfg = {}
+    if engine_config:
+        cfg = json.loads(engine_config)
+        budget = int(cfg.get("memory_budget_bytes", 0) or 0)
+    if budget > 0:
+        on_disk = sum(_os.path.getsize(p) for p in input_paths if _os.path.exists(p))
+        if on_disk > budget:
+            result = nat.combine_finalize_spilling(
+                group_keys_json,
+                aggregates_json,
+                list(input_paths),
+                budget,
+                cfg.get("spill_dir") or work_dir,
+                cfg.get("spill_compression"),
+            )
+            if result.num_rows == 0:
+                return (None, 0)
+            path = _os.path.join(work_dir, f"reduce_{reducer_id}.arrow")
+            write_ipc([result], path)
+            return (path, result.num_rows)
 
     running = None
     for path in input_paths:

@@ -65,5 +65,6 @@ proven first. A fast wrong answer is a bug.
 
 ## Gate before "done"
 
-`just test` runs the CI sequence: `check → test-rust → build → test-py`. Add
-`just lint-layers` and (for Python changes) `just lint-py`. See `/run-quality-gate`.
+The canonical gate matrix is in `CLAUDE.md` — run the rows your change touches. `just test`
+runs the whole CI sequence (`check → test-rust → build → test-py → cov-gate`) if you want it
+in one command. The `/run-quality-gate` skill triages failures.

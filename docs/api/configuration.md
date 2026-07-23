@@ -1,7 +1,6 @@
 # Configuration API reference
 
-The public configuration surface. For the full field-by-field reference of every
-section, see [configuration/options](../configuration/options.md).
+This page covers the public configuration surface: the `Config` dataclass, the two entry points that install one, and how the layers combine. For the field-by-field reference of every section, see [configuration/options](../configuration/options.md).
 
 ```python
 from batcher import Config, set_config, config_context
@@ -17,11 +16,10 @@ from batcher import Config
 
 cfg = Config()
 print(list(cfg.__dataclass_fields__))
-# ['execution', 'memory', 'flow_control', 'optimizer', 'pid', 'metadata', 'distributed']
+# ['execution', 'memory', 'flow_control', 'optimizer', 'pid', 'metadata', 'distributed', 'observability']
 ```
 
-Sections are themselves frozen dataclasses. Read fields directly; derive new configs
-to change them.
+Sections are themselves frozen dataclasses. Read fields directly, and derive new configs to change them. Each section covers one concern:
 
 | Section | Concern |
 |---------|---------|
@@ -51,7 +49,7 @@ The section dataclasses are exported so you can construct one and slot it into
 
 `Config.replace(**section_overrides)` returns a new `Config` with whole sections
 replaced. To change a single field within a section, pass a `dataclasses.replace` of
-that section. The individual sections do not expose a `.replace` method.
+that section. The individual sections don't expose a `.replace` method.
 
 ```python
 import dataclasses
@@ -95,9 +93,7 @@ cfg = Config.from_file("/etc/batcher/config.json")
 
 ### Config.validate and Config.engine_config_json
 
-`Config.validate()` checks the configuration and raises `ConfigError` on a bad
-value. `Config.engine_config_json()` serializes the Rust-relevant execution knobs
-for the data plane (the JSON the engine actually receives).
+`Config.validate()` checks the configuration and raises `ConfigError` on a bad value. `Config.engine_config_json()` serializes the Rust-relevant execution knobs for the data plane, which is the JSON the engine receives.
 
 ## set_config
 
@@ -114,8 +110,7 @@ set_config(Config())
 ## config_context
 
 `config_context(config)` is a context manager that activates a `Config` for the
-duration of a `with` block and restores the previous one on exit. It is the highest
-precedence layer.
+duration of a `with` block and restores the previous one on exit. It's the highest-precedence layer.
 
 ```python
 from batcher import Config, config_context
@@ -129,7 +124,4 @@ print(out)
 
 ## Precedence
 
-Highest first: `config_context` > `set_config` > `BATCHER_*` env vars >
-`BATCHER_CONFIG_FILE` JSON > defaults. The environment and file layers are read once
-at import; the runtime entry points override them. Full discussion in
-[configuration/index](../configuration/index.md).
+Highest first: `config_context` > `set_config` > `BATCHER_*` env vars > `BATCHER_CONFIG_FILE` JSON > defaults. The environment and file layers are read once at import, and the runtime entry points override them. See [configuration/index](../configuration/index.md) for the full discussion.

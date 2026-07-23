@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, current_date, current_timestamp, date_add, date_part, date_sub
 
 pytestmark = pytest.mark.differential
@@ -24,8 +25,6 @@ def _dates():
 
 
 def test_date_part_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _dates())
     out = (
         bt.from_arrow(_dates())
@@ -47,8 +46,6 @@ def test_date_part_matches_duckdb(duck):
 
 
 def test_date_add_sub_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _dates())
     out = (
         bt.from_arrow(_dates()).select(a=date_add(col("d"), 10), s=date_sub(col("d"), 5)).collect()

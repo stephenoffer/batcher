@@ -205,8 +205,14 @@ class CostModel:
             # trivial column map, and scales with model size. Costing it as the
             # bottleneck it is makes Kyber prefer to filter/sample *before* inference
             # (predicate pushdown below a map stage) — the key win for AI pipelines.
+            # Any accelerator, not just a GPU. Ray reports NVIDIA/AMD/Intel/MetaX as the `GPU`
+            # resource; a TPU, Trainium, or Gaudi stage carries `num_gpus == 0` plus a custom
+            # resource instead. Gating on `num_gpus` alone therefore costed those stages as a
+            # *trivial column map* — the cheapest node in the plan — so Kyber had no reason to
+            # push a filter below them, losing exactly the optimization this factor exists to
+            # produce on precisely the hardware whose forward pass is most expensive.
             factor = 1.0
-            if node.num_gpus > 0:
+            if node.num_gpus > 0 or getattr(node, "resources", ()):
                 factor = _GPU_INFERENCE_FACTOR * (1.0 + node.model_memory_gb)
             return Cost(cpu=c.map_row * out_rows * factor)
 
@@ -234,6 +240,17 @@ class CostModel:
         if isinstance(node, Join):
             build = self._rows(node.right)  # right is the build side by convention
             probe = self._rows(node.left)
+            # NOTE: the output term is deliberately **row**-based, not `rows x width`.
+            #
+            # The gather really does cost `rows x width` (measured: one join at fixed
+            # cardinality takes 12.1 ms carrying two payload columns and 19.8 ms carrying
+            # seven), so charging for width looks obviously right — and it was tried. It made
+            # TPC-H *worse*: 1.47x -> 1.58x against DuckDB in the same run, because
+            # `row_bytes` of an intermediate is itself an estimate, and feeding that
+            # uncertainty into the join enumerator's ranking moved more plans the wrong way
+            # than the right way. The width signal is real but the width *estimate* is not
+            # yet good enough to rank on; it belongs here once intermediate widths are
+            # measured rather than inferred. Recorded so it is not "fixed" again blind.
             return Cost(
                 cpu=c.hash_build_row * build + c.hash_probe_row * probe + c.output_row * out_rows,
                 # Hash table is built over the right side, so its byte width drives mem.

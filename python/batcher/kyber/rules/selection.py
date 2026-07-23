@@ -72,6 +72,16 @@ class BuildSideDecision:
     # is a *byte* threshold (`broadcast_max_bytes`), so its learned fit needs bytes, not
     # rows — and only Kyber, which has the row widths, can supply them.
     build_bytes: float = 0.0
+    # The plan signature SELECTION used to look up this join's learned strategy arm.
+    #
+    # It must be carried, not recomputed from the finished plan, because the two are not the
+    # same key. The ENFORCE phase runs *after* SELECTION and legitimately rewrites a join's
+    # inputs — a runtime/sideways filter lands directly on them — which changes the join's
+    # structural signature. The bandit then *read* under the pre-ENFORCE signature and the
+    # conductor *wrote* the reward under the post-ENFORCE one, so the arm it learned could
+    # never be found again and the loop silently never closed. Stamping the key here makes
+    # read and write the same key by construction, whatever ENFORCE does afterwards.
+    signature: str = ""
 
 
 def adaptive_build_side(
@@ -100,15 +110,17 @@ def adaptive_build_side(
     return _rewrite(plan, estimator, cost, decisions, max_bytes, smr), decisions
 
 
-def _broadcast_max_bytes() -> int:
-    """Build-side broadcast threshold in bytes — `OptimizerConfig.broadcast_max_bytes`.
+def _broadcast_max_bytes(l3_cache_bytes: int = 0) -> int:
+    """Build-side broadcast threshold in bytes, resolved against the last-level cache.
 
-    The single source of truth shared with the distributed executor's runtime guard;
-    a function (not an inlined read) so tests can patch the planner's threshold.
+    Delegates to `OptimizerConfig.resolved_broadcast_max_bytes`, so a pinned value wins and an
+    auto (`0`) value is sized to `l3_cache_bytes` — the residency the strategy actually depends
+    on. The single source of truth shared with the distributed executor's runtime guard; a
+    function (not an inlined read) so tests can patch the planner's threshold.
     """
     from batcher.config import active_config
 
-    return active_config().optimizer.broadcast_max_bytes
+    return active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes)
 
 
 def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
@@ -122,8 +134,9 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     equivalent physical algorithms, so the result is invariant."""
     if not ctx.sources:
         return plan
-    learned_bmax = learned_broadcast_max_bytes(ctx.hub)
-    max_bytes = learned_bmax if learned_bmax is not None else _broadcast_max_bytes()
+    cache_default = _broadcast_max_bytes(ctx.hardware.l3_cache_bytes)
+    learned_bmax = learned_broadcast_max_bytes(ctx.hub, default=cache_default)
+    max_bytes = learned_bmax if learned_bmax is not None else cache_default
     learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
     smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
     plan, decisions = adaptive_build_side(
@@ -256,6 +269,7 @@ def _rewrite(
                 broadcast,
                 cost_delta,
                 build_bytes,
+                plan_signature(node),
             )
         )
         return node

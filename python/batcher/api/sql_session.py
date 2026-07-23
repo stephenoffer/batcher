@@ -21,6 +21,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher._internal.sql_errors import parse_sql
 from batcher.api.dataset import Dataset
 
 __all__ = ["Session"]
@@ -79,13 +80,27 @@ class Session:
         self._tables: dict[str, Dataset] = {}
         self._functions: dict[str, _RegisteredFunction] = {}
         self._dialect = dialect
-        # Prepared-statement cache: query text -> (catalog generation, built Dataset).
-        # A repeated SELECT against an unchanged catalog skips the sqlglot parse + AST
-        # translation. `_generation` bumps on every catalog mutation (register / drop /
-        # create / clear / register_function), invalidating stale entries — so a plan
-        # never outlives the tables or functions it was built against.
-        self._plan_cache: dict[str, tuple[int, Dataset]] = {}
-        self._generation = 0
+        # Prepared-statement cache: (dialect, query, bound names) ->
+        # (catalog generation, bound objects, Dataset).
+        #
+        # A repeated SELECT skips the sqlglot parse + AST translation, which measures
+        # ~2.1 ms — the dominant fixed cost of a small query. Two things make a hit safe:
+        # the generation bumps on every catalog mutation (register / drop / create /
+        # clear / register_function), so a plan never outlives the tables or functions it
+        # was built against; and for a query with *per-call* bindings (`ds.sql(...)`,
+        # `bt.sql(q, a=ds1)`) the entry stores the bound objects and a hit requires each
+        # to be the **identical object** (`is`). Structural equality would not do: two
+        # different in-memory Datasets can share a plan shape, and serving one's plan for
+        # the other's data is a wrong answer, not a slow one.
+        #
+        # Storing the bound objects pins them alive, so the cache is capped and evicts
+        # oldest-first rather than growing with every dataset a caller queries.
+        # `_generation` is a one-slot list, not an int, because `_with_dialect` views
+        # share it by reference.
+        self._plan_cache: dict[
+            tuple[str, str, tuple[str, ...]], tuple[int, tuple[object, ...], Dataset]
+        ] = {}
+        self._generation: list[int] = [0]
 
     def __repr__(self) -> str:
         """Show the registered table names, e.g. ``Session(tables=['emp', 'dept'])``."""
@@ -150,7 +165,7 @@ class Session:
 
     def _bump(self) -> None:
         """Invalidate the prepared-statement cache after a catalog mutation."""
-        self._generation += 1
+        self._generation[0] += 1
 
     # --- tables ------------------------------------------------------------
     def register(self, name: str, dataset: Dataset | pa.Table) -> Dataset:
@@ -352,8 +367,11 @@ class Session:
 
         Keyword `tables` bind or override names for this call only (they do not
         mutate the catalog). ``CREATE TABLE/VIEW AS`` registers a lazy `Dataset`
-        into this session; ``DROP TABLE`` unregisters one. Everything else is a
-        ``SELECT``-family query returning a lazy `Dataset`.
+        into this session and ``DROP TABLE`` unregisters one; ``INSERT`` /
+        ``DELETE`` / ``UPDATE`` rebind the target table to its new state (a pure
+        plan rewrite — union / filter / projected CASE — that runs only on a later
+        terminal op). Everything else is a ``SELECT``-family query. Every form
+        returns a lazy `Dataset` — the query result, or the table's new state.
 
         Args:
             query: A SQL statement.
@@ -378,27 +396,50 @@ class Session:
         """Parse and dispatch `query` (tables passed as a dict to allow any name)."""
         # Prepared-statement fast path: re-running the same query text against an
         # unchanged catalog reuses its built plan, skipping the sqlglot parse + AST
-        # translation. Only for plain (SELECT-shaped) queries with no per-call table
-        # bindings — CREATE/DROP mutate the catalog and are never cached, and a
-        # `tables` override changes what the names resolve to.
-        cacheable = not tables
-        if cacheable:
-            hit = self._plan_cache.get(query)
-            if hit is not None and hit[0] == self._generation:
-                return hit[1]
+        # translation (~2.1 ms). Per-call bindings are cached too — `ds.sql(...)` always
+        # passes one, and it is the most-repeated SQL entry point there is — but only
+        # when every bound object is the identical object the plan was built over.
+        # CREATE/DROP/DML mutate the catalog and are never cached (they bump the
+        # generation, which invalidates everything anyway).
+        names = tuple(sorted(tables))
+        bound = tuple(tables[n] for n in names)
+        key = (self._dialect, query, names)
+        hit = self._plan_cache.get(key)
+        if (
+            hit is not None
+            and hit[0] == self._generation[0]
+            and len(hit[1]) == len(bound)
+            and all(a is b for a, b in zip(hit[1], bound, strict=True))
+        ):
+            return hit[2]
 
-        import sqlglot
         from sqlglot import expressions as exp
 
-        ast = sqlglot.parse_one(query, read=self._dialect)
+        ast = parse_sql(query, dialect=self._dialect)
         if isinstance(ast, exp.Create):
             return self._create(ast, tables)
         if isinstance(ast, exp.Drop):
             return self._drop(ast)
+        if isinstance(ast, (exp.Insert, exp.Delete, exp.Update)):
+            return self._dml(ast, tables)
         ds = self._translate(ast, tables)
-        if cacheable:
-            self._plan_cache[query] = (self._generation, ds)
+        self._remember(key, bound, ds)
         return ds
+
+    # How many prepared plans to keep. Entries pin their bound datasets alive, so this is
+    # a memory bound, not just a lookup bound: a caller that queries a stream of distinct
+    # datasets would otherwise retain every one of them.
+    _PLAN_CACHE_MAX = 256
+
+    def _remember(
+        self, key: tuple[str, str, tuple[str, ...]], bound: tuple[object, ...], ds: Dataset
+    ) -> None:
+        """Store a built plan, evicting oldest-first past `_PLAN_CACHE_MAX`."""
+        cache = self._plan_cache
+        if len(cache) >= self._PLAN_CACHE_MAX and key not in cache:
+            for stale in list(cache)[: len(cache) - self._PLAN_CACHE_MAX + 1]:
+                del cache[stale]
+        cache[key] = (self._generation[0], bound, ds)
 
     def _translate(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
         from batcher._sql import translate_ast
@@ -422,6 +463,22 @@ class Session:
         self._bump()
         return ds
 
+    def _dml(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
+        """Handle ``INSERT`` / ``DELETE`` / ``UPDATE`` — rebind the target table.
+
+        DML is a pure plan rewrite (union / filter / projected CASE) that produces
+        the target table's new lazy state; the catalog is rebound to it and the new
+        state is returned. Per-call `tables` bindings are visible to the rewrite but
+        the rebind lands on the session catalog (matching ``CREATE``).
+        """
+        from batcher._sql.dml import apply_dml
+
+        registry = {name: Session._as_dataset(t) for name, t in {**self._tables, **tables}.items()}
+        name, new_state = apply_dml(ast, registry, self._functions)
+        self._tables[name] = new_state
+        self._bump()
+        return new_state
+
     def _drop(self, ast: Any) -> Dataset:
         """Handle ``DROP TABLE [IF EXISTS] name`` — unregister the table."""
         name = ast.this.name
@@ -432,11 +489,20 @@ class Session:
         return self._as_dataset(pa.table({"dropped": pa.array([name], pa.string())}))
 
     def _with_dialect(self, dialect: str) -> Session:
-        """A view of this session reading `dialect`, sharing its tables and functions."""
+        """A view of this session reading `dialect`, sharing its tables and functions.
+
+        Everything mutable is shared *by reference* with the owning session — the
+        catalog, the function registry, the plan cache, and the generation counter —
+        so a table registered on either is visible to both. Only the read dialect
+        differs, and the plan cache is keyed by dialect, so the same query text
+        parsed as Spark and as DuckDB cannot collide.
+        """
         view = Session.__new__(Session)
         view._tables = self._tables
         view._functions = self._functions
         view._dialect = dialect
+        view._plan_cache = self._plan_cache
+        view._generation = self._generation
         return view
 
     @staticmethod

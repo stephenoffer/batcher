@@ -15,7 +15,8 @@ import base64
 import json
 from collections.abc import Iterator
 
-from batcher.metadata.store import Key
+from batcher._internal.errors import MissingDependencyError
+from batcher.metadata.store import Key, require_uri
 
 __all__ = ["ObjectStorageBackend"]
 
@@ -35,14 +36,30 @@ class ObjectStorageBackend:
     """A `MetadataBackend` storing each entry as one object under an fsspec root URI."""
 
     def __init__(self, uri: str | None) -> None:
-        if not uri:
-            raise ValueError(
-                "object_storage metadata backend requires a uri (e.g. s3://bucket/prefix)"
-            )
-        import fsspec
+        """Address a metadata store rooted at an fsspec URI.
 
+        Args:
+            uri: The root, e.g. ``s3://bucket/prefix`` or ``file:///var/batcher``.
+
+        Raises:
+            ConfigError: If `uri` is missing or empty.
+            MissingDependencyError: If `fsspec` is not installed.
+        """
+        uri = require_uri("object_storage", uri, example="s3://bucket/prefix")
+        try:
+            import fsspec
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise MissingDependencyError.of(
+                feature="The object_storage metadata backend", provides="fsspec", extra="cloud"
+            ) from exc
+
+        self._uri = uri
         self._fs, self._root = fsspec.core.url_to_fs(uri)
         self._root = self._root.rstrip("/")
+
+    def __repr__(self) -> str:
+        """Name the root URI — the one thing worth seeing when a shared store looks empty."""
+        return f"ObjectStorageBackend(uri={self._uri!r})"
 
     def _dir(self, table: str) -> str:
         return f"{self._root}/{table}"

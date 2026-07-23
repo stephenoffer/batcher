@@ -42,8 +42,17 @@ pub(crate) fn approx_distinct_state(
     let mut hlls: Vec<HyperLogLog> = (0..num_groups)
         .map(|_| HyperLogLog::default_precision())
         .collect();
-    let converter = RowConverter::new(vec![SortField::new(values.data_type().clone())])?;
-    let rows = converter.convert_columns(std::slice::from_ref(values))?;
+    // Canonicalize a Float64 value column FIRST so `-0.0`/`0.0` and every NaN bit pattern
+    // hash to one value — the same distinct identity the EXACT path uses (its raw-multikey
+    // dedup routes float values through `canon_f64`). Without this the row encoding, which is
+    // NOT canonical for floats, counted `-0.0` and `0.0` as two distinct values, so
+    // `approx_count_distinct` over a float column disagreed with `count(distinct)` and DuckDB
+    // (e.g. `{-0.0, 0.0, NaN, 1.5}` estimated 4 where the exact count is 3). Nulls carry
+    // through unchanged, so the validity check below is still correct.
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(values));
+    let encode = canon.as_ref().map_or(values, |c| &c[0]);
+    let converter = RowConverter::new(vec![SortField::new(encode.data_type().clone())])?;
+    let rows = converter.convert_columns(std::slice::from_ref(encode))?;
     for (i, &g) in group_ids.iter().enumerate() {
         if values.is_valid(i) {
             hlls[g as usize].add_hash(SEED.hash_one(rows.row(i)));
@@ -86,4 +95,34 @@ pub(crate) fn finalize_approx_distinct(state: &ArrayRef) -> ArrayRef {
         })
         .collect();
     Arc::new(Int64Array::from(counts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Float64Array;
+    use arrow::datatypes::Int64Type;
+
+    /// `-0.0`/`+0.0` are one value and every NaN is one value for distinct identity, so
+    /// `approx_count_distinct({-0.0, 0.0, NaN, NaN, 1.5})` must estimate 3 — matching the
+    /// exact `count(distinct)` and DuckDB — not 4. Small cardinalities are in HLL's exact
+    /// linear-counting regime, so the estimate is exact here.
+    #[test]
+    fn approx_distinct_canonicalizes_signed_zero_and_nan() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001), // a different NaN bit pattern
+            1.5,
+        ]));
+        let group_ids = [0u32, 0, 0, 0, 0];
+        let state = approx_distinct_state(&values, &group_ids, 1).unwrap();
+        let out = finalize_approx_distinct(&state);
+        let est = out.as_primitive::<Int64Type>().value(0);
+        assert_eq!(
+            est, 3,
+            "signed-zero/NaN must collapse to 3 distinct, got {est}"
+        );
+    }
 }

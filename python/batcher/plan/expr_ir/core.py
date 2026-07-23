@@ -18,10 +18,12 @@ avoid an import-time cycle.
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.ir_tags import ExprTag
 from batcher.plan.types import CAST_DTYPES
 
@@ -44,7 +46,23 @@ IntoExpr = Union["Expr", int, float, bool, str]
 
 
 def _wrap(value: IntoExpr) -> Expr:
-    return value if isinstance(value, Expr) else Lit(value)
+    # `AggExpr` is not an `Expr` but can be a leaf of one (``col("x").sum() / 2``);
+    # pass it through rather than lifting it to a `Lit`. `group_by().agg()` splits such
+    # leaves back out; any that reach `to_ir()` elsewhere raise a clear error there.
+    if isinstance(value, (Expr, AggExpr)):
+        return value  # type: ignore[return-value]
+    return Lit(value)
+
+
+def _col_or_expr(value: IntoExpr) -> Expr:
+    """An ordering/source argument: a bare string names a *column*, not a string literal.
+
+    ``_wrap`` would turn ``arg_max(v, "k")`` into an ordering by the constant ``'k'``;
+    an ``Expr`` passes through unchanged. Mirrors SQL ``arg_max(v, k)`` / DuckDB.
+    """
+    from batcher.plan.expr_ir.constructors import col
+
+    return col(value) if isinstance(value, str) else _wrap(value)
 
 
 def _cut_labels(edges: list[float], left_closed: bool) -> list[str]:
@@ -138,8 +156,7 @@ class Expr:
         """Element-wise inequality (``a != b``), yielding a boolean expression."""
         return Binary("ne", self, _wrap(other))
 
-    # Expr is used for plan building, not as a dict key; make that explicit.
-    __hash__ = None  # type: ignore[assignment]
+    # `Expr` stays unhashable (see `__hash__` below, which raises with the reason).
 
     def __repr__(self) -> str:
         """A source-like rendering of the expression, e.g. ``(col('x') + lit(1))``."""
@@ -195,15 +212,22 @@ class Expr:
         return Binary("mod", _wrap(other), self)
 
     def __floordiv__(self, other: IntoExpr) -> Expr:
-        """Floor division ``a // b`` — ``floor(a / b)`` (Polars/Python semantics:
-        rounds toward negative infinity, unlike SQL integer division which truncates
-        toward zero). The numerator is cast to Float64 so the division is true
-        (not integer) division before flooring; desugars to existing ops, no new IR."""
-        return MathExpr("floor", Binary("div", self.cast("float64"), _wrap(other)))
+        """Floor division ``a // b`` — the quotient rounded toward negative infinity.
+
+        These are Polars/Python semantics, deliberately *not* SQL integer division,
+        which truncates toward zero: ``-7 // 3`` is ``-3`` here, where ``-7 / 3``
+        gives ``-2``.
+
+        The operation is **type-preserving for integers**: Int64 ``//`` Int64 stays
+        Int64 and is computed exactly, including above 2^53 where routing through
+        Float64 would silently lose precision. A zero divisor yields NULL (matching
+        DuckDB and Polars) rather than ``inf``/``nan``. Float operands give the IEEE
+        ``floor(a / b)``."""
+        return Binary("floor_div", self, _wrap(other))
 
     def __rfloordiv__(self, other: IntoExpr) -> Expr:
         """Reflected floor division so ``scalar // expr`` works; see :meth:`__floordiv__`."""
-        return MathExpr("floor", Binary("div", _wrap(other).cast("float64"), self))
+        return Binary("floor_div", _wrap(other), self)
 
     # --- unary arithmetic operators ----------------------------------------
     def __neg__(self) -> Expr:
@@ -340,6 +364,142 @@ class Expr:
             length = None if key.stop is None else max(0, key.stop - offset)
             return ListSlice(self, offset, length)
         raise PlanError(f"cannot index an expression with {type(key).__name__}")
+
+    def __iter__(self) -> NoReturn:
+        """Refuse iteration: an expression is a scalar column, not a sequence.
+
+        `__getitem__` accepts an int index (``col("a")[2]`` → list element), which makes an
+        expression *look* iterable to ``list(expr)`` / ``for x in expr`` — but the index has
+        no upper bound (every ``expr[i]`` yields a fresh node), so the default iteration
+        protocol would loop forever and exhaust memory. Raising here turns any accidental
+        ``list(expr)`` (e.g. ``over(partition_by=col("g"))``) into an immediate, clear error.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> list(bt.col("a"))
+                Traceback (most recent call last):
+                    ...
+                TypeError: a batcher expression is not iterable; wrap it in a list ...
+
+        Raises:
+            TypeError: Always — naming the list-wrapping fix.
+        """
+        raise TypeError(
+            "a batcher expression is not iterable; wrap it in a list "
+            "(e.g. over(partition_by=[col('g')]), not over(partition_by=col('g'))). "
+            "For a row-wise minimum/maximum across columns use min_horizontal(a, b) / "
+            "max_horizontal(a, b); for a column aggregate use .min() / .max()"
+        )
+
+    def __len__(self) -> NoReturn:
+        """Refuse `len`: an expression describes a column, it does not hold one yet.
+
+        Nothing is materialized until a terminal op, so an expression has no row
+        count to report. The row count of the *result* is ``ds.count()``; the length
+        of a string or list value is ``.str.len()`` / ``.list.len()``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> len(bt.col("x"))
+                Traceback (most recent call last):
+                    ...
+                TypeError: a batcher expression has no len()...
+
+        Raises:
+            TypeError: Always — naming the three things `len` is usually reaching for.
+        """
+        raise TypeError(
+            "a batcher expression has no len(): it describes a column, it does not hold "
+            "one. Use .str.len() for string length, .list.len() for list length, or "
+            "ds.count() for the number of rows in the result"
+        )
+
+    def __contains__(self, item: object) -> NoReturn:
+        """Refuse ``x in expr``: the membership operators are `is_in` and `str.contains`.
+
+        Python coerces the result of ``in`` to a bool, so it could never return an
+        expression. Without this, ``1 in col("x")`` falls through to `__iter__` and
+        raises a confusing "not iterable" message for what is really a membership test.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> 1 in bt.col("x")
+                Traceback (most recent call last):
+                    ...
+                TypeError: `in` cannot be used on a batcher expression...
+
+        Args:
+            item: The value the caller tried to test for membership.
+
+        Raises:
+            TypeError: Always — naming `is_in` / `str.contains` / `list.contains`.
+        """
+        raise TypeError(
+            "`in` cannot be used on a batcher expression (Python forces the result to a "
+            "bool). Use col('x').is_in([...]) to test the value against a set, "
+            "col('s').str.contains(...) for substring search, or "
+            "col('l').list.contains(...) for list membership"
+        )
+
+    def __hash__(self) -> NoReturn:
+        """Refuse hashing: ``==`` builds an expression, so equality-based lookup is a trap.
+
+        A hash-based container compares candidates with ``==``, which here returns a
+        *predicate* rather than a bool — so a set or dict keyed on expressions would
+        silently misbehave. Batcher raises instead, matching pandas and Polars, whose
+        expression/series types are likewise unhashable. Key on the column name, or on
+        ``to_ir()`` for a structural key.
+
+        Raises:
+            TypeError: Always — naming the two workable keys.
+        """
+        raise TypeError(
+            "a batcher expression is not hashable, because `==` builds a predicate "
+            "instead of comparing. Key on the column name, or on repr(expr) / "
+            "str(expr.to_ir()) for a structural key"
+        )
+
+    def __divmod__(self, other: IntoExpr) -> tuple[Expr, Expr]:
+        """``divmod(a, b)`` — the ``(a // b, a % b)`` pair, as Python defines it.
+
+        Args:
+            other: The divisor value or expression.
+
+        Returns:
+            A ``(quotient, remainder)`` tuple of expressions.
+        """
+        return self // other, self % other
+
+    def __rdivmod__(self, other: IntoExpr) -> tuple[Expr, Expr]:
+        """Reflected `divmod` so ``divmod(scalar, expr)`` works.
+
+        Args:
+            other: The dividend value or expression.
+
+        Returns:
+            A ``(quotient, remainder)`` tuple of expressions.
+        """
+        return _wrap(other) // self, _wrap(other) % self
+
+    def __matmul__(self, other: IntoExpr) -> Expr:
+        """``a @ b`` — the dot product of two list (embedding) columns.
+
+        The numpy spelling of :meth:`_ListNamespace.dot`, which is what an embedding
+        similarity reads as: ``col("emb") @ col("query")``.
+
+        Args:
+            other: The other list column.
+
+        Returns:
+            A Float64 expression of the per-row dot product.
+        """
+        return self.list.dot(other)
 
     # --- bitwise integer operators (distinct from the boolean `&`/`|`) ------
     def bitwise_and(self, other: IntoExpr) -> Expr:
@@ -516,13 +676,18 @@ class Expr:
         return self._cast(dtype, try_cast=True)
 
     def _cast(self, dtype: str, *, try_cast: bool) -> Cast:
-        if dtype not in CAST_DTYPES:
+        # Type names are matched case-insensitively: pandas spells these `"Int64"` /
+        # `"Float64"` and SQL `"BIGINT"`, and a case mismatch is a typo the user cannot
+        # see. The IR always carries the canonical lowercase name, so the wire contract
+        # is unaffected.
+        canonical = dtype.lower() if isinstance(dtype, str) else dtype
+        if canonical not in CAST_DTYPES:
             import difflib
 
-            hint = difflib.get_close_matches(dtype, sorted(CAST_DTYPES), n=2, cutoff=0.5)
+            hint = difflib.get_close_matches(canonical, sorted(CAST_DTYPES), n=2, cutoff=0.5)
             suffix = f"; did you mean {' or '.join(map(repr, hint))}?" if hint else ""
             raise PlanError(f"unknown cast dtype {dtype!r}; valid: {sorted(CAST_DTYPES)}{suffix}")
-        return Cast(self, dtype, try_cast=try_cast)
+        return Cast(self, canonical, try_cast=try_cast)
 
     def is_null(self) -> IsNull:
         """True where the value is NULL (SQL ``IS NULL``).
@@ -580,11 +745,25 @@ class Expr:
                 {'r': [True, False, True]}
         """
         vals = list(values)
-        if not vals:
+        # SQL three-valued logic: a NULL member never yields True, but it turns a
+        # would-be False into NULL (``x IN (1, NULL)`` is True for x=1, NULL otherwise;
+        # DuckDB agrees). A NULL member contributes an always-null disjunct, which
+        # `nullif(lit(True), lit(True))` builds without a first-class null literal.
+        has_null = any(v is None for v in vals)
+        non_null = [v for v in vals if v is not None]
+        if not non_null:
+            if has_null:
+                from batcher.plan.expr_ir.constructors import lit, nullif
+
+                return nullif(lit(True), lit(True))
             return Lit(False)
-        expr: Expr = self == vals[0]
-        for v in vals[1:]:
+        expr: Expr = self == non_null[0]
+        for v in non_null[1:]:
             expr = expr | (self == v)
+        if has_null:
+            from batcher.plan.expr_ir.constructors import lit, nullif
+
+            expr = expr | nullif(lit(True), lit(True))
         return expr
 
     def between(self, low: IntoExpr, high: IntoExpr, closed: str = "both") -> Expr:
@@ -1004,6 +1183,1120 @@ class Expr:
                 {'r': [2.0, 3.0]}
         """
         return MathExpr("cbrt", self)
+
+    def square(self) -> Expr:
+        """Each value squared, i.e. ``x * x`` (dtype preserved; nulls propagate).
+
+        Returns:
+            A new expression of the squared values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [2, 3]})
+                >>> ds.select(r=bt.col("x").square()).to_pydict()
+                {'r': [4, 9]}
+        """
+        return self * self
+
+    def log1p(self) -> Expr:
+        """Natural log of ``1 + x``, accurate for small ``x`` (→ Float64; nulls propagate).
+
+        The composed ``(1 + x).ln()`` spelling, named for parity with NumPy/DuckDB
+        ``log1p``; use it when ``x`` is close to zero and ``ln(1 + x)`` would lose
+        precision.
+
+        Returns:
+            A new Float64 expression of ``ln(1 + x)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> ds.select(r=bt.col("x").log1p()).to_pydict()
+                {'r': [0.0, 0.6931471805599453]}
+        """
+        return (Lit(1) + self).ln()
+
+    def expm1(self) -> Expr:
+        """``e**x - 1``, accurate for small ``x`` (→ Float64; nulls propagate).
+
+        The inverse of :meth:`log1p`, named for parity with NumPy/DuckDB ``expm1``.
+
+        Returns:
+            A new Float64 expression of ``exp(x) - 1``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> ds.select(r=bt.col("x").expm1()).to_pydict()
+                {'r': [0.0, 1.718281828459045]}
+        """
+        return self.exp() - Lit(1)
+
+    def asinh(self) -> Expr:
+        """Inverse hyperbolic sine (→ Float64; defined for all reals; nulls propagate).
+
+        Composed as ``ln(x + sqrt(x*x + 1))``, matching NumPy/DuckDB ``asinh``.
+
+        Returns:
+            A new Float64 expression of the inverse hyperbolic sines.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> ds.select(r=bt.col("x").asinh()).to_pydict()
+                {'r': [0.0, 0.8813735870195429]}
+        """
+        return (self + (self * self + Lit(1)).sqrt()).ln()
+
+    def acosh(self) -> Expr:
+        """Inverse hyperbolic cosine (→ Float64; defined for ``x >= 1``; nulls propagate).
+
+        Composed as ``ln(x + sqrt(x*x - 1))``, matching NumPy/DuckDB ``acosh``. Inputs
+        below 1 yield NaN, as the real inverse is undefined there.
+
+        Returns:
+            A new Float64 expression of the inverse hyperbolic cosines.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0]})
+                >>> ds.select(r=bt.col("x").acosh()).to_pydict()
+                {'r': [0.0, 1.3169578969248166]}
+        """
+        return (self + (self * self - Lit(1)).sqrt()).ln()
+
+    def atanh(self) -> Expr:
+        """Inverse hyperbolic tangent (→ Float64; defined for ``|x| < 1``; nulls propagate).
+
+        Composed as ``0.5 * ln((1 + x) / (1 - x))``, matching NumPy/DuckDB ``atanh``.
+        ``|x| >= 1`` yields ±inf/NaN, as the real inverse diverges there.
+
+        Returns:
+            A new Float64 expression of the inverse hyperbolic tangents.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 0.5]})
+                >>> ds.select(r=bt.col("x").atanh()).to_pydict()
+                {'r': [0.0, 0.5493061443340549]}
+        """
+        return Lit(0.5) * ((Lit(1) + self) / (Lit(1) - self)).ln()
+
+    def arcsin(self) -> MathExpr:
+        """Arcsine in radians — the Polars/NumPy ``arcsin`` spelling of :meth:`asin`.
+
+        Returns:
+            A new Float64 expression of the arcsines, in radians.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> ds.select(r=bt.col("x").arcsin()).to_pydict()
+                {'r': [0.0, 1.5707963267948966]}
+        """
+        return self.asin()
+
+    def arccos(self) -> MathExpr:
+        """Arccosine in radians — the Polars/NumPy ``arccos`` spelling of :meth:`acos`.
+
+        Returns:
+            A new Float64 expression of the arccosines, in radians.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 0.0]})
+                >>> ds.select(r=bt.col("x").arccos()).to_pydict()
+                {'r': [0.0, 1.5707963267948966]}
+        """
+        return self.acos()
+
+    def arctan(self) -> MathExpr:
+        """Arctangent in radians — the Polars/NumPy ``arctan`` spelling of :meth:`atan`.
+
+        Returns:
+            A new Float64 expression of the arctangents, in radians.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> ds.select(r=bt.col("x").arctan()).to_pydict()
+                {'r': [0.0, 0.7853981633974483]}
+        """
+        return self.atan()
+
+    def arcsinh(self) -> Expr:
+        """Inverse hyperbolic sine — the Polars/NumPy ``arcsinh`` spelling of :meth:`asinh`.
+
+        Returns:
+            A new Float64 expression of the inverse hyperbolic sines.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> ds.select(r=bt.col("x").arcsinh()).to_pydict()
+                {'r': [0.0, 0.8813735870195429]}
+        """
+        return self.asinh()
+
+    def arccosh(self) -> Expr:
+        """Inverse hyperbolic cosine — the Polars/NumPy ``arccosh`` spelling of :meth:`acosh`.
+
+        Returns:
+            A new Float64 expression of the inverse hyperbolic cosines.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0]})
+                >>> ds.select(r=bt.col("x").arccosh()).to_pydict()
+                {'r': [0.0, 1.3169578969248166]}
+        """
+        return self.acosh()
+
+    def arctanh(self) -> Expr:
+        """Inverse hyperbolic tangent — the Polars/NumPy ``arctanh`` spelling of :meth:`atanh`.
+
+        Returns:
+            A new Float64 expression of the inverse hyperbolic tangents.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 0.5]})
+                >>> ds.select(r=bt.col("x").arctanh()).to_pydict()
+                {'r': [0.0, 0.5493061443340549]}
+        """
+        return self.atanh()
+
+    def is_between(self, lower: IntoExpr, upper: IntoExpr, closed: str = "both") -> Expr:
+        """Range test — the Polars ``is_between`` spelling of :meth:`between`.
+
+        Args:
+            lower: The lower bound.
+            upper: The upper bound.
+            closed: Which bounds are inclusive — ``"both"``/``"left"``/``"right"``/``"none"``.
+
+        Returns:
+            A boolean expression, true where the value lies in the range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.select(r=bt.col("x").is_between(2, 3)).to_pydict()
+                {'r': [False, True, True]}
+        """
+        return self.between(lower, upper, closed)
+
+    def clip_min(self, lower: IntoExpr) -> Expr:
+        """Clamp values up to at least `lower` — the Polars ``clip_min`` spelling of :meth:`clip`.
+
+        Args:
+            lower: The lower bound; values below it become it.
+
+        Returns:
+            A new expression with each value raised to at least `lower`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-1, 5, 20]})
+                >>> ds.select(r=bt.col("x").clip_min(0)).to_pydict()
+                {'r': [0, 5, 20]}
+        """
+        return self.clip(lower=lower)
+
+    def clip_max(self, upper: IntoExpr) -> Expr:
+        """Clamp values down to at most `upper` — the Polars ``clip_max`` spelling of :meth:`clip`.
+
+        Args:
+            upper: The upper bound; values above it become it.
+
+        Returns:
+            A new expression with each value lowered to at most `upper`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-1, 5, 20]})
+                >>> ds.select(r=bt.col("x").clip_max(10)).to_pydict()
+                {'r': [-1, 5, 10]}
+        """
+        return self.clip(upper=upper)
+
+    # --- feature engineering / ML transforms --------------------------------
+    # Scalers broadcast a *window* aggregate over the whole column (or per
+    # `partition_by` group) and combine it with the row value, so a fit-and-apply
+    # scaling is one pass with no Python state — and, being ordinary window +
+    # arithmetic nodes, identical single-node and distributed.
+
+    def _window_mean_std(self, partition_by: Iterable[IntoExpr]) -> tuple[Expr, Expr]:
+        """The broadcast ``(mean, sample stddev)`` of this column over its window.
+
+        The window engine offers `sum`/`avg`/`min`/`max`/`count` but no `stddev`, so the
+        deviation comes from the moments — ``Var = E[x^2] - E[x]^2`` with the Bessel
+        correction ``n / (n - 1)``, exactly as `rolling_var` does over a trailing frame."""
+        keys = list(partition_by)
+        n = self.count().over(partition_by=keys).cast("float64")
+        mean = self.mean().over(partition_by=keys)
+        mean_sq = (self * self).mean().over(partition_by=keys)
+        std = ((mean_sq - mean * mean) * (n / (n - Lit(1)))).sqrt()
+        return mean, std
+
+    def zscore(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Standardize to zero mean and unit variance — ``(x - mean) / stddev``.
+
+        The scikit-learn ``StandardScaler`` transform as one expression: the mean and
+        sample standard deviation are computed over the whole column, or per group with
+        `partition_by`, and broadcast back to every row.
+
+        Args:
+            partition_by: Standardize within each group of these key expressions
+                instead of across the whole column.
+
+        Returns:
+            A Float64 expression of the standardized values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0]})
+                >>> ds.select(z=bt.col("x").zscore().round(4)).to_pydict()
+                {'z': [-1.0, 0.0, 1.0]}
+        """
+        mean, std = self._window_mean_std(partition_by)
+        return (self - mean) / std
+
+    def minmax_scale(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Scale to ``[0, 1]`` — ``(x - min) / (max - min)`` (scikit-learn ``MinMaxScaler``).
+
+        A constant column divides by zero and yields NaN, as the transform is undefined
+        there.
+
+        Args:
+            partition_by: Scale within each group of these key expressions.
+
+        Returns:
+            A Float64 expression of the scaled values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0]})
+                >>> ds.select(s=bt.col("x").minmax_scale()).to_pydict()
+                {'s': [0.0, 0.5, 1.0]}
+        """
+        keys = list(partition_by)
+        lo = self.min().over(partition_by=keys)
+        hi = self.max().over(partition_by=keys)
+        return (self - lo) / (hi - lo)
+
+    def maxabs_scale(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Scale to ``[-1, 1]`` by the largest magnitude — ``x / max(|x|)``.
+
+        The scikit-learn ``MaxAbsScaler`` transform; it preserves sign and sparsity
+        (a zero stays zero) because it never subtracts a centre.
+
+        Args:
+            partition_by: Scale within each group of these key expressions.
+
+        Returns:
+            A Float64 expression of the scaled values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-1.0, 0.0, 2.0]})
+                >>> ds.select(s=bt.col("x").maxabs_scale()).to_pydict()
+                {'s': [-0.5, 0.0, 1.0]}
+        """
+        return self / self.abs().max().over(partition_by=list(partition_by))
+
+    def mean_center(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Subtract the mean — ``x - mean(x)`` — leaving the scale untouched.
+
+        Args:
+            partition_by: Centre within each group of these key expressions.
+
+        Returns:
+            An expression of the mean-centred values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0]})
+                >>> ds.select(c=bt.col("x").mean_center()).to_pydict()
+                {'c': [-1.0, 0.0, 1.0]}
+        """
+        return self - self.mean().over(partition_by=list(partition_by))
+
+    def is_outlier(self, threshold: float = 3.0, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """True where the value lies more than `threshold` standard deviations from the mean.
+
+        The z-score outlier rule, as a predicate you can filter on directly.
+
+        Args:
+            threshold: How many standard deviations away counts as an outlier.
+            partition_by: Judge outliers within each group of these key expressions.
+
+        Returns:
+            A Boolean expression, true for the outlying rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 1.0, 1.0, 1.0, 10.0]})
+                >>> ds.select(o=bt.col("x").is_outlier(1.5)).to_pydict()
+                {'o': [False, False, False, False, True]}
+        """
+        return self.zscore(partition_by).abs() > Lit(threshold)
+
+    def sigmoid(self) -> Expr:
+        """The logistic sigmoid ``1 / (1 + exp(-x))``, mapping any real to ``(0, 1)``.
+
+        The inverse of :meth:`logit`, and the activation that turns a linear score into
+        a probability.
+
+        Returns:
+            A Float64 expression of the sigmoid values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0]})
+                >>> ds.select(p=bt.col("x").sigmoid()).to_pydict()
+                {'p': [0.5]}
+        """
+        return Lit(1.0) / (Lit(1.0) + (Lit(0) - self).exp())
+
+    def logit(self) -> Expr:
+        """The log-odds ``ln(x / (1 - x))`` — the inverse of :meth:`sigmoid`.
+
+        Defined for ``0 < x < 1``; the bounds map to ∓inf.
+
+        Returns:
+            A Float64 expression of the log-odds.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.5]})
+                >>> ds.select(l=bt.col("x").logit()).to_pydict()
+                {'l': [0.0]}
+        """
+        return (self / (Lit(1.0) - self)).ln()
+
+    def relu(self) -> Expr:
+        """The rectified linear unit ``max(x, 0)`` — negatives clamped to zero.
+
+        Returns:
+            An expression with the negative values replaced by zero.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-1.0, 0.0, 2.0]})
+                >>> ds.select(r=bt.col("x").relu()).to_pydict()
+                {'r': [0.0, 0.0, 2.0]}
+        """
+        return self.clip(lower=Lit(0.0))
+
+    def softplus(self) -> Expr:
+        """The smooth rectifier ``ln(1 + exp(x))`` — a differentiable :meth:`relu`.
+
+        Returns:
+            A Float64 expression of the softplus values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0]})
+                >>> ds.select(s=bt.col("x").softplus()).to_pydict()
+                {'s': [0.6931471805599453]}
+        """
+        return (Lit(1.0) + self.exp()).ln()
+
+    def silu(self) -> Expr:
+        """The SiLU / Swish activation ``x * sigmoid(x)``.
+
+        The self-gated activation used across modern architectures (EfficientNet, many
+        transformer MLP blocks). Smooth, non-monotonic, and unbounded above.
+
+        Returns:
+            A Float64 expression of the SiLU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(s=bt.col("x").silu()).to_pydict()["s"]]
+                [0.0, 0.7311]
+        """
+        return self * self.sigmoid()
+
+    def gelu(self) -> Expr:
+        """The GELU activation (tanh approximation) — the transformer feed-forward default.
+
+        ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))``, matching
+        ``torch.nn.functional.gelu(x, approximate="tanh")`` (GPT-2 / BERT). Composed from
+        the engine's ``tanh`` so it runs in the data plane with no per-row Python.
+
+        Returns:
+            A Float64 expression of the GELU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(g=bt.col("x").gelu()).to_pydict()["g"]]
+                [0.0, 0.8412]
+        """
+        coeff = Lit(math.sqrt(2.0 / math.pi))
+        inner = coeff * (self + Lit(0.044715) * self * self * self)
+        return Lit(0.5) * self * (Lit(1.0) + inner.tanh())
+
+    def mish(self) -> Expr:
+        """The Mish activation ``x * tanh(softplus(x))``.
+
+        A smooth, self-regularizing activation (YOLOv4 and others). Composed from the
+        engine's ``softplus`` and ``tanh``. Matches ``torch.nn.functional.mish``.
+
+        Returns:
+            A Float64 expression of the Mish values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(m=bt.col("x").mish()).to_pydict()["m"]]
+                [0.0, 0.8651]
+        """
+        return self * self.softplus().tanh()
+
+    def hardsigmoid(self) -> Expr:
+        """The hard sigmoid ``clip((x + 3) / 6, 0, 1)`` — the cheap piecewise-linear sigmoid.
+
+        The mobile-friendly approximation used in MobileNetV3. Matches
+        ``torch.nn.functional.hardsigmoid``.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-3.0, 0.0, 3.0]})
+                >>> ds.select(h=bt.col("x").hardsigmoid()).to_pydict()
+                {'h': [0.0, 0.5, 1.0]}
+        """
+        return ((self + Lit(3.0)) / Lit(6.0)).clip(lower=Lit(0.0), upper=Lit(1.0))
+
+    def hardswish(self) -> Expr:
+        """The hard swish ``x * hardsigmoid(x)`` — the cheap piecewise-linear SiLU.
+
+        The activation in MobileNetV3's later layers. Matches
+        ``torch.nn.functional.hardswish``.
+
+        Returns:
+            A Float64 expression of the hard-swish values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-3.0, 0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(h=bt.col("x").hardswish()).to_pydict()["h"]]
+                [-0.0, 0.0, 0.6667]
+        """
+        return self * self.hardsigmoid()
+
+    def leaky_relu(self, negative_slope: float = 0.01) -> Expr:
+        """The leaky ReLU: ``x`` for ``x > 0``, else ``negative_slope * x``.
+
+        A ReLU that lets a small gradient through for negative inputs. Matches
+        ``torch.nn.functional.leaky_relu``.
+
+        Args:
+            negative_slope: The slope applied to negative inputs (default ``0.01``).
+
+        Returns:
+            A Float64 expression of the leaky-ReLU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2.0, 0.0, 3.0]})
+                >>> ds.select(r=bt.col("x").leaky_relu()).to_pydict()
+                {'r': [-0.02, 0.0, 3.0]}
+        """
+        from batcher.plan.expr_ir.constructors import when
+
+        return when(self > Lit(0.0)).then(self).otherwise(Lit(negative_slope) * self)
+
+    def elu(self, alpha: float = 1.0) -> Expr:
+        """The exponential linear unit: ``x`` for ``x > 0``, else ``alpha * (exp(x) - 1)``.
+
+        A smooth activation with negative saturation at ``-alpha``. Matches
+        ``torch.nn.functional.elu``.
+
+        Args:
+            alpha: The negative-saturation scale (default ``1.0``).
+
+        Returns:
+            A Float64 expression of the ELU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(r=bt.col("x").elu()).to_pydict()["r"]]
+                [0.0, 1.0]
+        """
+        from batcher.plan.expr_ir.constructors import when
+
+        return when(self > Lit(0.0)).then(self).otherwise(Lit(alpha) * (self.exp() - Lit(1.0)))
+
+    def hardtanh(self) -> Expr:
+        """The hard tanh ``clip(x, -1, 1)`` — a cheap piecewise-linear tanh.
+
+        Matches ``torch.nn.functional.hardtanh``.
+
+        Returns:
+            A Float64 expression clamped to ``[-1, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2.0, 0.5, 2.0]})
+                >>> ds.select(h=bt.col("x").hardtanh()).to_pydict()
+                {'h': [-1.0, 0.5, 1.0]}
+        """
+        return self.clip(lower=Lit(-1.0), upper=Lit(1.0))
+
+    def softsign(self) -> Expr:
+        """The softsign activation ``x / (1 + |x|)`` — a smooth, bounded ``(-1, 1)`` map.
+
+        A cheaper-to-compute alternative to tanh. Matches ``torch.nn.functional.softsign``.
+
+        Returns:
+            A Float64 expression in ``(-1, 1)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2.0, 0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(s=bt.col("x").softsign()).to_pydict()["s"]]
+                [-0.6667, 0.0, 0.5]
+        """
+        return self / (Lit(1.0) + self.abs())
+
+    def tanhshrink(self) -> Expr:
+        """The tanhshrink activation ``x - tanh(x)``.
+
+        Matches ``torch.nn.functional.tanhshrink``.
+
+        Returns:
+            A Float64 expression of the tanhshrink values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(t=bt.col("x").tanhshrink()).to_pydict()["t"]]
+                [0.0, 0.2384]
+        """
+        return self - self.tanh()
+
+    def is_positive(self) -> Expr:
+        """True where the value is strictly greater than zero (nulls stay null).
+
+        Returns:
+            A Boolean expression, true for positive values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2, 0, 3]})
+                >>> ds.select(p=bt.col("x").is_positive()).to_pydict()
+                {'p': [False, False, True]}
+        """
+        return self > Lit(0)
+
+    def is_negative(self) -> Expr:
+        """True where the value is strictly less than zero (nulls stay null).
+
+        Returns:
+            A Boolean expression, true for negative values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2, 0, 3]})
+                >>> ds.select(n=bt.col("x").is_negative()).to_pydict()
+                {'n': [True, False, False]}
+        """
+        return self < Lit(0)
+
+    def is_zero(self) -> Expr:
+        """True where the value equals zero (nulls stay null).
+
+        Returns:
+            A Boolean expression, true for zero values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2, 0, 3]})
+                >>> ds.select(z=bt.col("x").is_zero()).to_pydict()
+                {'z': [False, True, False]}
+        """
+        return self == Lit(0)
+
+    def is_even(self) -> Expr:
+        """True where the integer value is divisible by two (nulls stay null).
+
+        Returns:
+            A Boolean expression, true for even values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2, 0, 3]})
+                >>> ds.select(e=bt.col("x").is_even()).to_pydict()
+                {'e': [True, True, False]}
+        """
+        return self % Lit(2) == Lit(0)
+
+    def is_odd(self) -> Expr:
+        """True where the integer value is not divisible by two (nulls stay null).
+
+        Returns:
+            A Boolean expression, true for odd values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2, 0, 3]})
+                >>> ds.select(o=bt.col("x").is_odd()).to_pydict()
+                {'o': [False, False, True]}
+        """
+        return self % Lit(2) != Lit(0)
+
+    # --- expanding (cumulative) statistics and encodings ---------------------
+
+    def expanding_mean(
+        self,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Running mean of every value up to and including this row (pandas ``expanding().mean()``).
+
+        The cumulative counterpart to :meth:`rolling_mean` — the frame grows instead of
+        sliding. Composed as ``cum_sum / cum_count``, so it adds no operator.
+
+        Args:
+            partition_by: Restart the running mean per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Returns:
+            A Float64 expression of the running mean.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.with_columns(m=bt.col("x").expanding_mean()).to_pydict()["m"]
+                [1.0, 1.5, 2.0, 2.5]
+        """
+        keys, order = list(partition_by), list(order_by)
+        total = self.cum_sum(partition_by=keys, order_by=order)
+        n = self.cum_count(partition_by=keys, order_by=order)
+        return total / n
+
+    def expanding_var(
+        self,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+        ddof: int = 1,
+    ) -> Expr:
+        """Running variance of every value up to this row (pandas ``expanding().var()``).
+
+        Built from the running moments ``E[x^2] - E[x]^2`` with the Bessel correction, so
+        the first row of each partition (a single value) is undefined and yields NaN.
+
+        Args:
+            partition_by: Restart the accumulation per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+            ddof: Delta degrees of freedom; ``1`` for sample, ``0`` for population.
+
+        Returns:
+            A Float64 expression of the running variance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.with_columns(v=bt.col("x").expanding_var().round(4)).to_pydict()["v"]
+                [nan, 0.5, 1.0, 1.6667]
+        """
+        keys, order = list(partition_by), list(order_by)
+        n = self.cum_count(partition_by=keys, order_by=order).cast("float64")
+        mean = self.cum_sum(partition_by=keys, order_by=order) / n
+        mean_sq = (self * self).cum_sum(partition_by=keys, order_by=order) / n
+        var_pop = mean_sq - mean * mean
+        if ddof == 0:
+            return var_pop
+        return var_pop * (n / (n - Lit(ddof)))
+
+    def expanding_std(
+        self,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+        ddof: int = 1,
+    ) -> Expr:
+        """Running standard deviation up to this row — the square root of :meth:`expanding_var`.
+
+        Args:
+            partition_by: Restart the accumulation per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+            ddof: Delta degrees of freedom; ``1`` for sample, ``0`` for population.
+
+        Returns:
+            A Float64 expression of the running standard deviation.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.with_columns(s=bt.col("x").expanding_std().round(4)).to_pydict()["s"]
+                [nan, 0.7071, 1.0, 1.291]
+        """
+        return self.expanding_var(partition_by, order_by, ddof).sqrt()
+
+    def hash_bucket(self, buckets: int, seed: int = 0) -> Expr:
+        """Assign each value to one of `buckets` by a stable hash — ``|hash(x)| % buckets``.
+
+        Deterministic across partitions, runs, and machines, which is what makes it a
+        safe key for a reproducible train/test split, a shard assignment, or an A/B
+        bucket.
+
+        Args:
+            buckets: How many buckets to spread values across (must be >= 1).
+            seed: Hash seed; vary it for an independent bucketing of the same keys.
+
+        Returns:
+            An Int64 expression in ``[0, buckets)``.
+
+        Raises:
+            PlanError: If `buckets` < 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"k": ["a", "b", "c", "d"]})
+                >>> ds.select(b=bt.col("k").hash_bucket(4)).to_pydict()
+                {'b': [1, 3, 3, 1]}
+        """
+        if buckets < 1:
+            raise PlanError(f"hash_bucket(): buckets must be >= 1, got {buckets}")
+        return self.hash(seed=seed).abs() % Lit(buckets)
+
+    def pct_of_total(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Each value as a share of the column total — ``x / sum(x)``, summing to 1.
+
+        The "percent of total" every share/contribution chart needs, computed in one
+        pass by broadcasting the windowed sum back over the rows.
+
+        Args:
+            partition_by: Take the share within each group of these key expressions.
+
+        Returns:
+            A Float64 expression of the per-row share.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.select(p=bt.col("x").pct_of_total()).to_pydict()
+                {'p': [0.1, 0.2, 0.3, 0.4]}
+        """
+        return self / self.sum().over(partition_by=list(partition_by))
+
+    def cumulative_pct(
+        self,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Running share of the total — ``cum_sum(x) / sum(x)``, ending at 1.
+
+        The Pareto / cumulative-contribution curve: sort by the value descending and this
+        answers "how much of the total do the top N account for".
+
+        Args:
+            partition_by: Accumulate within each group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Returns:
+            A Float64 expression of the running share, rising to 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.with_columns(c=bt.col("x").cumulative_pct()).to_pydict()["c"]
+                [0.1, 0.3, 0.6, 1.0]
+        """
+        keys = list(partition_by)
+        running = self.cum_sum(partition_by=keys, order_by=list(order_by))
+        return running / self.sum().over(partition_by=keys)
+
+    def normalize_l1(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Scale by the sum of absolute values — ``x / sum(|x|)`` (L1 normalization).
+
+        The signed counterpart to :meth:`pct_of_total`: it handles negative values by
+        dividing by the total magnitude, so the absolute shares sum to 1.
+
+        Args:
+            partition_by: Normalize within each group of these key expressions.
+
+        Returns:
+            A Float64 expression of the L1-normalized values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.select(n=bt.col("x").normalize_l1()).to_pydict()
+                {'n': [0.1, 0.2, 0.3, 0.4]}
+        """
+        return self / self.abs().sum().over(partition_by=list(partition_by))
+
+    def safe_divide(self, other: IntoExpr) -> Expr:
+        """Divide, yielding null instead of an error or infinity when `other` is zero.
+
+        ``x / 0`` is the classic silent-corruption source in a derived metric; this makes
+        the undefined rows explicitly null so they propagate and can be filtered.
+
+        Args:
+            other: The divisor; rows where it is zero produce null.
+
+        Returns:
+            A Float64 expression of the quotient, null where the divisor is zero.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1.0, 2.0], "b": [2.0, 0.0]})
+                >>> ds.select(r=bt.col("a").safe_divide(bt.col("b"))).to_pydict()
+                {'r': [0.5, None]}
+        """
+        from batcher.plan.expr_ir.constructors import nullif
+
+        divisor = _wrap(other)
+        return self / nullif(divisor, Lit(0))
+
+    def rank_pct(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Percentile rank of each value in ``[0, 1]``, ascending — SQL ``PERCENT_RANK``.
+
+        The distribution-free position of a value among its peers: 0 for the smallest,
+        1 for the largest. Useful as a scale-free feature when the raw magnitude varies
+        between groups or over time. For a descending rank, rank the negated value.
+
+        Args:
+            partition_by: Rank within each group of these key expressions.
+
+        Returns:
+            A Float64 expression of the percentile rank.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.with_columns(p=bt.col("x").rank_pct()).to_pydict()["p"]
+                [0.0, 0.3333333333333333, 0.6666666666666666, 1.0]
+        """
+        from batcher.plan.expr_ir.nodes import percent_rank
+
+        return percent_rank().over(partition_by=list(partition_by), order_by=[self])
+
+    def softmax(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
+        """Softmax over the column — ``exp(x) / sum(exp(x))``, a distribution summing to 1.
+
+        Turns a column of scores into probabilities. Computed by broadcasting the
+        windowed sum of the exponentials, so it is one pass with no Python state.
+
+        Args:
+            partition_by: Normalize within each group of these key expressions.
+
+        Returns:
+            A Float64 expression of the softmax probabilities.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0]})
+                >>> ds.select(p=bt.col("x").softmax().round(4)).to_pydict()
+                {'p': [0.09, 0.2447, 0.6652]}
+        """
+        weights = self.exp()
+        return weights / weights.sum().over(partition_by=list(partition_by))
+
+    def abs_diff(self, other: IntoExpr) -> Expr:
+        """Absolute difference from `other` — ``|x - other|``.
+
+        The unsigned error/distance every comparison and drift check needs.
+
+        Args:
+            other: The value or expression to compare against.
+
+        Returns:
+            An expression of the absolute difference.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1.0, 5.0], "b": [3.0, 2.0]})
+                >>> ds.select(d=bt.col("a").abs_diff(bt.col("b"))).to_pydict()
+                {'d': [2.0, 3.0]}
+        """
+        return (self - _wrap(other)).abs()
+
+    def is_first_distinct(self, order_by: IntoExpr) -> Expr:
+        """True on the first occurrence of each distinct value, in `order_by` order.
+
+        The de-duplication marker: filtering on it keeps one row per distinct value.
+        `order_by` is required so the choice is deterministic and partition-independent
+        (an arrival-order "first" would differ between a single-node and a distributed
+        run).
+
+        Args:
+            order_by: The expression whose ascending order decides which occurrence
+                counts as first.
+
+        Returns:
+            A Boolean expression, true on each value's first row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"i": [0, 1, 2], "c": ["a", "b", "a"]})
+                >>> ds.select(f=bt.col("c").is_first_distinct(bt.col("i"))).to_pydict()
+                {'f': [True, True, False]}
+        """
+        from batcher.plan.expr_ir.nodes import row_number
+
+        rn = row_number().over(partition_by=[self], order_by=[_col_or_expr(order_by)])
+        return rn == Lit(1)
+
+    def is_last_distinct(self, order_by: IntoExpr) -> Expr:
+        """True on the last occurrence of each distinct value, in `order_by` order.
+
+        The mirror of :meth:`is_first_distinct`, useful for keeping the most recent row
+        per key. `order_by` is likewise required for determinism.
+
+        Args:
+            order_by: The expression whose ascending order decides which occurrence
+                counts as last.
+
+        Returns:
+            A Boolean expression, true on each value's last row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"i": [0, 1, 2], "c": ["a", "b", "a"]})
+                >>> ds.select(l=bt.col("c").is_last_distinct(bt.col("i"))).to_pydict()
+                {'l': [False, True, True]}
+        """
+        from batcher.plan.expr_ir.nodes import row_number
+
+        key = _col_or_expr(order_by)
+        rn = row_number().over(partition_by=[self], order_by=[key])
+        total = self.count().over(partition_by=[self])
+        return rn == total
+
+    def label_encode(self) -> Expr:
+        """Map each distinct value to a 0-based integer code, ordered by value.
+
+        The scikit-learn ``LabelEncoder`` transform as one expression: the codes are
+        assigned by sorting the distinct values, so they are deterministic and identical
+        single-node and distributed (an arrival-order encoding would not be).
+
+        Returns:
+            An Int64 expression of the 0-based codes.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"c": ["b", "a", "b", "c"]})
+                >>> ds.select(code=bt.col("c").label_encode()).to_pydict()
+                {'code': [1, 0, 1, 2]}
+        """
+        from batcher.plan.expr_ir.nodes import dense_rank
+
+        return dense_rank().over(order_by=[self]) - Lit(1)
 
     def asin(self) -> MathExpr:
         """Arcsine in radians, inverse of :meth:`sin` (→ Float64; outside [-1, 1] → NaN).
@@ -1465,7 +2758,9 @@ class Expr:
 
         Nulls are preserved (a null stays null, not pulled to a bound): the lowering
         is a conditional, so a comparison against a null input is null and falls
-        through to the original value.
+        through to the original value. NaN is likewise left untouched (matching
+        Polars/pandas), even though the engine's total order ranks NaN above every
+        finite value — an explicit guard re-injects it after the bounds are applied.
 
         Args:
             lower: Lower bound; ``None`` leaves the low side unclamped.
@@ -1485,10 +2780,17 @@ class Expr:
         from batcher.plan.expr_ir.constructors import when
 
         result: Expr = self
+        clamped = False
         if lower is not None:
             result = when(result < _wrap(lower)).then(lower).otherwise(result)
+            clamped = True
         if upper is not None:
             result = when(result > _wrap(upper)).then(upper).otherwise(result)
+            clamped = True
+        if clamped:
+            # NaN is total-order-greatest, so an upper bound would otherwise pull it
+            # down to `upper`; Polars/pandas leave NaN alone. Restore the original.
+            result = when(self.is_nan()).then(self).otherwise(result)
         return result
 
     # --- aggregate constructors (used inside group_by().agg(...)) -----------
@@ -1630,7 +2932,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").kurtosis()).to_pydict()
-                {'g': ['a'], 'r': [3.152000000000008]}
+                {'g': ['a'], 'r': [3.152000000000001]}
         """
         return AggExpr("kurtosis", self)
 
@@ -1834,7 +3136,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").first(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
         """
-        return AggExpr("arg_min", self, input2=_wrap(order_by))
+        return AggExpr("arg_min", self, input2=_col_or_expr(order_by))
 
     def last(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the last row in `order_by` order (SQL ``last``).
@@ -1857,7 +3159,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").last(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
         """
-        return AggExpr("arg_max", self, input2=_wrap(order_by))
+        return AggExpr("arg_max", self, input2=_col_or_expr(order_by))
 
     def arg_min(self, by: IntoExpr) -> AggExpr:
         """This expression's value at the row where `by` is minimal (SQL ``arg_min``/``min_by``).
@@ -1879,7 +3181,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").arg_min(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
         """
-        return AggExpr("arg_min", self, input2=_wrap(by))
+        return AggExpr("arg_min", self, input2=_col_or_expr(by))
 
     def arg_max(self, by: IntoExpr) -> AggExpr:
         """This expression's value at the row where `by` is maximal (SQL ``arg_max``/``max_by``).
@@ -1898,7 +3200,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").arg_max(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
         """
-        return AggExpr("arg_max", self, input2=_wrap(by))
+        return AggExpr("arg_max", self, input2=_col_or_expr(by))
 
     def bool_and(self) -> AggExpr:
         """Logical AND of this boolean expression's non-null values per group.
@@ -2028,11 +3330,14 @@ class Expr:
         return AggExpr("histogram", self)
 
     def array_agg(self) -> AggExpr:
-        """Collect non-null values in each group into a ``List`` (SQL ``array_agg``).
+        """Collect each group's values (including nulls) into a ``List`` (SQL ``array_agg``).
 
-        Spark ``collect_list``. Without an explicit order the element order is
-        arrival-dependent. Mergeable — the per-group value list is the partial state,
-        so the result is the same single-node and distributed.
+        Like DuckDB ``array_agg``/``list``: null elements are kept, so a group of
+        ``[10, None, 30]`` collects to ``[10, None, 30]``. An aggregate over zero rows
+        (a global ``array_agg`` on an empty relation) is NULL, not ``[]``. Without an
+        explicit order the element order is arrival-dependent. Mergeable — the per-group
+        value list is the partial state, so the result is the same single-node and
+        distributed.
 
         Chain a list reduction on the result column to summarize it, e.g.
         ``ds.group_by("g").agg(tags=col("t").array_agg())`` then
@@ -2435,6 +3740,101 @@ class Expr:
         """
         return self._rolling("count", window_size, min_periods, partition_by, order_by)
 
+    def _rolling_var(
+        self,
+        window_size: int,
+        ddof: int,
+        min_periods: int | None,
+        partition_by: Iterable[IntoExpr],
+        order_by: Iterable[IntoExpr],
+    ) -> Expr:
+        """Sample/population variance over the trailing frame, composed from moments.
+
+        ``Var = E[x^2] - E[x]^2`` gives the population variance over the frame; the
+        Bessel correction ``n / (n - ddof)`` lifts it to the sample statistic. All three
+        terms reuse the tested `_rolling` machinery over the *same* frame, so rolling
+        variance adds no new IR and inherits the leading-partial-frame / `min_periods`
+        semantics of :meth:`rolling_sum`."""
+        mean = self._rolling("avg", window_size, min_periods, partition_by, order_by)
+        mean_sq = (self * self)._rolling("avg", window_size, min_periods, partition_by, order_by)
+        var_pop = mean_sq - mean * mean
+        if ddof == 0:
+            return var_pop
+        count = self._rolling("count", window_size, min_periods, partition_by, order_by).cast(
+            "float64"
+        )
+        return var_pop * (count / (count - Lit(ddof)))
+
+    def rolling_var(
+        self,
+        window_size: int,
+        *,
+        ddof: int = 1,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Variance over the `window_size` rows ending at the current one — Polars ``rolling_var``.
+
+        Composed from windowed moments over the trailing frame (see :meth:`rolling_sum`
+        for framing). ``ddof=1`` (the default) is the sample variance; ``ddof=0`` is the
+        population variance. A degenerate frame holding fewer than ``ddof + 1`` values is
+        undefined and yields NaN — pass `min_periods` to make those rows null instead.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            ddof: Delta degrees of freedom; ``1`` for sample, ``0`` for population.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            A window expression carrying the rolling variance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+                >>> ds.with_columns(v=bt.col("x").rolling_var(2, min_periods=2)).to_pydict()
+                {'x': [1.0, 2.0, 3.0, 4.0], 'v': [None, 0.5, 0.5, 0.5]}
+        """
+        return self._rolling_var(window_size, ddof, min_periods, partition_by, order_by)
+
+    def rolling_std(
+        self,
+        window_size: int,
+        *,
+        ddof: int = 1,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Standard deviation over the `window_size` rows ending at the current one.
+
+        The square root of :meth:`rolling_var`; ``ddof`` and `min_periods` behave as they
+        do there. Polars ``rolling_std``.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            ddof: Delta degrees of freedom; ``1`` for sample, ``0`` for population.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            A window expression carrying the rolling standard deviation.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [2.0, 4.0, 6.0]})
+                >>> ds.with_columns(s=bt.col("x").rolling_std(2, min_periods=2)).to_pydict()
+                {'x': [2.0, 4.0, 6.0], 's': [None, 1.4142135623730951, 1.4142135623730951]}
+        """
+        return self._rolling_var(window_size, ddof, min_periods, partition_by, order_by).sqrt()
+
     def diff(
         self,
         n: int = 1,
@@ -2580,8 +3980,10 @@ class Expr:
             )
         # A null value makes every comparison null, so without this guard it would fall
         # through the CASE chain into the final `otherwise` and be labelled as the top
-        # bin. `nullif(x, x)` is a null of the label column's own type.
-        builder = when(self.is_null()).then(nullif(lit(names[0]), lit(names[0])))
+        # bin. NaN needs the same guard: the engine's total order ranks it above every
+        # edge, so it too would land in the top bin, but Polars/pandas leave it null.
+        # `nullif(x, x)` is a null of the label column's own type.
+        builder = when(self.is_null() | self.is_nan()).then(nullif(lit(names[0]), lit(names[0])))
         for edge, name in zip(edges, names, strict=False):
             below = self < lit(edge) if left_closed else self <= lit(edge)
             builder = builder.when(below).then(lit(name))
@@ -2707,13 +4109,35 @@ class Lit(Expr):
         elif isinstance(v, int):
             tagged = {"int": v}
         elif isinstance(v, float):
-            tagged = {"float": v}
+            # JSON has no NaN/Infinity tokens, and serde_json rejects the
+            # non-standard ones Python's ``json.dumps`` would emit — so a
+            # ``lit(float("nan"))`` / ``lit(inf)`` used to fail plan parsing
+            # entirely. Encode a non-finite float as a name string the Rust
+            # ``Literal::Float`` deserializer understands; finite floats stay
+            # numeric (unchanged wire, fast path).
+            if v != v:
+                tagged = {"float": "NaN"}
+            elif v == float("inf"):
+                tagged = {"float": "inf"}
+            elif v == float("-inf"):
+                tagged = {"float": "-inf"}
+            else:
+                tagged = {"float": v}
         elif isinstance(v, str):
             tagged = {"str": v}
         elif isinstance(v, _dt.datetime):
-            # Microseconds since the Unix epoch, naive = wall clock (matches how
-            # pyarrow stores tz-naive Timestamp(us) columns).
-            delta = v - _dt.datetime(1970, 1, 1)
+            # Microseconds since the Unix epoch. A tz-naive datetime is the wall clock (matching
+            # how pyarrow stores tz-naive Timestamp(us) columns); a tz-aware one is its UTC
+            # instant. Subtract a *matching* epoch — a UTC-aware epoch for an aware datetime —
+            # so an aware literal doesn't raise "can't subtract offset-naive and offset-aware
+            # datetimes" (which crashed `col("ts") > lit(aware_datetime)`), and its micros land
+            # on the true UTC instant that the engine's tz-aware comparison expects.
+            epoch = (
+                _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+                if v.tzinfo is not None
+                else _dt.datetime(1970, 1, 1)
+            )
+            delta = v - epoch
             micros = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
             tagged = {"timestamp": micros}
         elif isinstance(v, _dt.date):
@@ -2829,6 +4253,21 @@ class Aliased(Expr):
         return self.inner.to_ir()
 
 
+def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr]) -> list[IntoExpr]:
+    """Normalize a ``partition_by``/``order_by`` argument to a list of key expressions.
+
+    A single ``str`` column name or a lone ``Expr`` is wrapped in a one-element list; an
+    existing iterable of keys is materialized with ``list``. Without this, the natural
+    scalar spellings silently corrupt: ``over(partition_by="grp")`` would ``list("grp")``
+    into ``['g', 'r', 'p']`` (partition by three phantom columns), and
+    ``over(partition_by=col("g"))`` would iterate an `Expr` — which has an unbounded
+    `__getitem__` — until memory is exhausted.
+    """
+    if isinstance(keys, (str, Expr)):
+        return [keys]
+    return list(keys)
+
+
 class AggExpr:
     """An aggregate over an optional input expression.
 
@@ -2881,7 +4320,7 @@ class AggExpr:
         call = f"{self.func}({', '.join(args)})"
         return call if self.input is None else f"{self.input!r}.{call}"
 
-    def to_ir(self, alias: str) -> dict[str, Any]:
+    def to_ir(self, alias: str | None = None) -> dict[str, Any]:
         """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.
 
         Args:
@@ -2897,6 +4336,14 @@ class AggExpr:
                 >>> bt.col("x").sum().to_ir("total")
                 {'func': 'sum', 'alias': 'total', 'input': {'e': 'col', 'name': 'x'}}
         """
+        if alias is None:
+            # Reached as a *child* of some `Expr`'s `to_ir()` — i.e. an aggregate used
+            # where a scalar expression is expected. `group_by().agg()` splits aggregate
+            # leaves out before lowering, so an unaliased call means it escaped that path.
+            raise PlanError(
+                "an aggregate expression (e.g. col('x').sum()) can only be used inside "
+                "group_by().agg(); it cannot appear in select/with_columns/filter"
+            )
         item: dict[str, Any] = {"func": self.func, "alias": alias}
         if self.input is not None:
             item["input"] = self.input.to_ir()
@@ -2939,7 +4386,123 @@ class AggExpr:
 
         # `mean` is the DataFrame spelling; the window engine names the aggregate `avg`.
         func = "avg" if self.func == "mean" else self.func
-        return WindowExpr(func, self.input, list(partition_by), list(order_by), frame)
+        return WindowExpr(
+            func,
+            self.input,
+            normalize_key_list(partition_by),
+            normalize_key_list(order_by),
+            frame,
+        )
+
+    # --- arithmetic over aggregates ---------------------------------------
+    # An aggregate can be combined with scalars and other aggregates into one
+    # derived output — ``col("x").sum() / col("y").sum()``, ``corr(y, x) ** 2``.
+    # The operators reuse `Expr`'s node-building implementations verbatim (so the
+    # semantics are byte-identical), embedding this `AggExpr` as a leaf of the
+    # resulting `Expr`. `group_by().agg()` then splits the leaves back out into the
+    # aggregate pass and computes the surrounding expression in a following
+    # projection — one mergeable aggregate, one stateless map, distributed-safe.
+
+    def cast(self, dtype: str) -> Cast:
+        """Cast this aggregate's result to an Arrow type named as a string.
+
+        Lets an aggregate join an expression over aggregates at a chosen type — e.g.
+        forcing an integer ``sum`` to Float64 before a division. The cast applies to the
+        aggregated value, so it runs in the projection after the aggregate pass.
+
+        Args:
+            dtype: Target Arrow type name (e.g. ``"int64"``, ``"float64"``).
+
+        Returns:
+            An expression of the aggregate's result converted to `dtype`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.agg(r=bt.col("x").sum().cast("float64")).to_pydict()
+                {'r': [6.0]}
+        """
+        return Cast(self, dtype)
+
+    def __add__(self, other: IntoExpr) -> Expr:
+        """Combine this aggregate with `other` by addition (``agg + other``)."""
+        return Expr.__add__(self, other)
+
+    def __radd__(self, other: IntoExpr) -> Expr:
+        """Reflected addition so ``scalar + agg`` works."""
+        return Expr.__radd__(self, other)
+
+    def __sub__(self, other: IntoExpr) -> Expr:
+        """Combine this aggregate with `other` by subtraction (``agg - other``)."""
+        return Expr.__sub__(self, other)
+
+    def __rsub__(self, other: IntoExpr) -> Expr:
+        """Reflected subtraction so ``scalar - agg`` works."""
+        return Expr.__rsub__(self, other)
+
+    def __mul__(self, other: IntoExpr) -> Expr:
+        """Combine this aggregate with `other` by multiplication (``agg * other``)."""
+        return Expr.__mul__(self, other)
+
+    def __rmul__(self, other: IntoExpr) -> Expr:
+        """Reflected multiplication so ``scalar * agg`` works."""
+        return Expr.__rmul__(self, other)
+
+    def __truediv__(self, other: IntoExpr) -> Expr:
+        """Divide this aggregate by `other` (``agg / other``, → Float64)."""
+        return Expr.__truediv__(self, other)
+
+    def __rtruediv__(self, other: IntoExpr) -> Expr:
+        """Reflected true division so ``scalar / agg`` works (→ Float64)."""
+        return Expr.__rtruediv__(self, other)
+
+    def __floordiv__(self, other: IntoExpr) -> Expr:
+        """Floor-divide this aggregate by `other` (``agg // other``)."""
+        return Expr.__floordiv__(self, other)
+
+    def __rfloordiv__(self, other: IntoExpr) -> Expr:
+        """Reflected floor division so ``scalar // agg`` works."""
+        return Expr.__rfloordiv__(self, other)
+
+    def __mod__(self, other: IntoExpr) -> Expr:
+        """Modulo of this aggregate by `other` (``agg % other``)."""
+        return Expr.__mod__(self, other)
+
+    def __rmod__(self, other: IntoExpr) -> Expr:
+        """Reflected modulo so ``scalar % agg`` works."""
+        return Expr.__rmod__(self, other)
+
+    def __pow__(self, other: IntoExpr) -> Expr:
+        """Raise this aggregate to `other` (``agg ** other``, → Float64)."""
+        return Expr.__pow__(self, other)
+
+    def __rpow__(self, other: IntoExpr) -> Expr:
+        """Reflected exponentiation so ``scalar ** agg`` works (→ Float64)."""
+        return Expr.__rpow__(self, other)
+
+    def __neg__(self) -> Expr:
+        """Arithmetic negation ``-agg``."""
+        return Expr.__neg__(self)
+
+    def __abs__(self) -> Expr:
+        """Absolute value ``abs(agg)``."""
+        return Expr.__abs__(self)
+
+
+# Expose `Expr`'s unary/parametric math methods on `AggExpr` so an aggregate result can
+# be transformed inside `group_by().agg()` — ``col("x").sum().sqrt()``,
+# ``col("x").mean().round(2)``. Each embeds the aggregate as a leaf of the `Expr` the
+# method builds; the aggregate-expression splitter then evaluates the transform in the
+# projection after the aggregate pass. Bound by reference so the semantics and the
+# documented examples are exactly `Expr`'s — one definition, one behavior.
+for _agg_math_method in (
+    "sqrt", "cbrt", "exp", "ln", "log2", "log10", "log1p", "expm1", "square",
+    "abs", "sign", "round", "pow", "floor", "ceil", "trunc", "clip",
+):  # fmt: skip
+    setattr(AggExpr, _agg_math_method, getattr(Expr, _agg_math_method))
+del _agg_math_method
 
 
 @expr_node
@@ -2969,3 +4532,10 @@ class Coalesce(IRNode):
 
     tag = ExprTag.COALESCE
     inputs: list[Expr] = children()
+
+
+# The pandas-compatible spellings (``isna``, ``fillna``, ``add``, …) are defined in
+# `expr_ir.compat` and attached here, so this module stays the one-`Expr` hierarchy
+# rather than carrying a second, parallel copy of its own surface. The import is at
+# the bottom because `compat` names `Expr` only under `TYPE_CHECKING`.
+_bind_compat_methods(Expr)

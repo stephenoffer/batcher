@@ -18,12 +18,12 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher.kyber.rules.normalize import fold_constants
 from batcher.kyber.rules.normalize.fold import _fold_cast
 from batcher.plan.expr_ir import Lit
 from batcher.plan.logical import Filter
 from batcher.plan.visitor import walk
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

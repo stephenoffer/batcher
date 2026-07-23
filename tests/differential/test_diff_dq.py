@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher._internal.errors import DataQualityError
 
 
@@ -24,8 +25,6 @@ def _people():
 
 
 def test_drop_keeps_only_valid(duck):
-    from conftest import assert_same
-
     t = _people()
     duck.register("p", t)
     out = bt.from_arrow(t).dq.not_null("age").in_range("age", 0, 120).drop().collect()
@@ -47,8 +46,6 @@ def test_quarantine_is_total_partition(duck):
 
 
 def test_matches_and_accepted_values(duck):
-    from conftest import assert_same
-
     t = _people()
     duck.register("p", t)
     out = bt.from_arrow(t).dq.matches("email", r"^[^@]+@[^@]+$").drop().collect()
@@ -90,8 +87,6 @@ def test_unique_validate_counts_duplicate_keys():
 
 
 def test_foreign_key_finds_orphans(duck):
-    from conftest import assert_same
-
     facts = pa.table({"cid": [1, 2, 3, 9], "amt": [10, 20, 30, 40]})
     dim = pa.table({"id": [1, 2, 3]})
     duck.register("f", facts)

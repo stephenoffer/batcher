@@ -141,6 +141,12 @@ pub(crate) fn analyze(
                     Err(CodegenError::Unsupported("bitwise op".into()))
                 }
                 AddMonths => Err(CodegenError::Unsupported("date month arithmetic".into())),
+                // Floored division always falls back to the interpreter. Cranelift's
+                // `sdiv` truncates toward zero, so compiling it would need the explicit
+                // remainder-sign correction the interpreter applies — and the integer
+                // arm additionally traps on a zero divisor. The interpreter is exact
+                // and NULL-safe there; parity is worth more than the compile.
+                FloorDiv => Err(CodegenError::Unsupported("floored division".into())),
                 And | Or => unreachable!("handled above"),
             }
         }
@@ -249,6 +255,7 @@ pub(crate) fn analyze(
         Expr::Hash { .. } => Err(CodegenError::Unsupported("hash".into())),
         Expr::Sequence { .. } => Err(CodegenError::Unsupported("sequence".into())),
         Expr::ListSet { .. } => Err(CodegenError::Unsupported("list set op".into())),
+        Expr::ListZip { .. } => Err(CodegenError::Unsupported("list arithmetic".into())),
         Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
         Expr::ListFilter { .. } => Err(CodegenError::Unsupported("list filter".into())),
         Expr::MakeStruct { .. } => Err(CodegenError::Unsupported("struct construction".into())),
@@ -262,8 +269,9 @@ pub(crate) fn analyze(
                 ));
             }
             match func {
-                // `abs` preserves the input type (int abs -> int, float abs ->
-                // float), matching the interpreter's `eval_math`.
+                // `abs` preserves the input type (int abs -> int, float abs -> float),
+                // matching the interpreter's `eval_math`. Integer `abs(i64::MIN)` saturates
+                // to i64::MAX in both tiers (see `emit.rs` / `eval/math.rs`).
                 Abs => Ok(inner),
                 // floor/ceil/sqrt/trunc always produce f64 (ints are promoted to
                 // f64 first, exactly as the interpreter does via `cast`).

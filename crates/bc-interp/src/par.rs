@@ -225,6 +225,25 @@ enum Admit {
 /// against its live reservations. The latter is the runtime backstop a static
 /// estimate cannot enforce on its own. With no envelope (the default) `op_budget`
 /// is `None`, so it always admits with no accounting and the fast path is unchanged.
+impl ExecOptions {
+    /// Worker threads this query may use — `parallelism`, or the machine's available cores when
+    /// it is `0` ("all available cores"). The streaming executor shards its driving scan by this.
+    ///
+    /// Reads `available_parallelism` rather than `rayon::current_num_threads` deliberately. The
+    /// latter reports the *global* pool's width, and on a Ray worker that pool is built before
+    /// the actor's CPU affinity is applied and so is stuck at one thread (the throttle
+    /// [`execute_parallel_with_metrics`] documents). Sizing the shard count from it would inherit
+    /// that mistake and split a whole partition into a single shard; `available_parallelism`
+    /// reads the affinity that has since landed.
+    pub fn workers(&self) -> usize {
+        if self.parallelism > 0 {
+            self.parallelism
+        } else {
+            bc_arrow::usable_cores()
+        }
+    }
+}
+
 fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
     match opts.pool.as_ref() {
         // The pool accounts *actual* bytes, so it is the spill authority: reserve the
@@ -301,7 +320,7 @@ pub fn execute_parallel_with_metrics(
     // `parallelism == 0` ("all cores") therefore resolves to `available_parallelism`, which
     // reads the now-applied affinity; a positive value pins the requested width. On a
     // single node this is the same width as the global pool, so the result is unchanged.
-    let width = auto_width(opts, sources);
+    let width = auto_width(opts, sources, plan);
     let out = pool_for(width)?.install(|| exec(plan, sources, opts, &mut m, &mut ids))?;
     Ok((out, m))
 }
@@ -318,26 +337,57 @@ pub fn execute_parallel_with_metrics(
 /// stated goal of low fixed overhead on sub-second queries is exactly this case. The cap
 /// is an upper bound on useful parallelism at the leaves, so it can never remove
 /// parallelism a plan could have used, and it never changes a result (scheduling only).
-fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
+///
+/// **Exception — media decode.** The morsel cap assumes per-morsel work is O(morsel)
+/// cheap columnar work, so one morsel needs at most one core. A `.image`/`.audio`/`.video`
+/// decode breaks that assumption: it does heavy, embarrassingly-parallel per-row work
+/// *inside* the morsel (its own rayon fan-out — see `bc_expr::eval::media`), and its input
+/// is tiny *encoded* bytes (a 5 KB JPEG) that the byte-aware count still sees as one
+/// morsel. A whole corpus of images would then decode on a single core. When the plan
+/// carries a media decode we lift the cap to all cores; the intra-kernel fan-out shares
+/// this same pool (rayon work-stealing, no oversubscription), so it is right whether the
+/// input is one morsel or many. Still scheduling only — the result is unchanged.
+fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) -> usize {
     if opts.parallelism > 0 {
         return opts.parallelism;
     }
-    let cores = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let cores = bc_arrow::usable_cores();
+    if plan.contains_media_decode() {
+        return cores.max(1);
+    }
     cores.min(max_useful_workers(opts, sources)).max(1)
 }
 
 /// An upper bound on workers that could have a morsel to process: the largest number of
 /// morsels any single source yields. Operators fan out over one input's morsels at a
 /// time, so the widest leaf bounds the widest `par_iter`.
+///
+/// The count is **byte-aware**, matching how the scan actually splits: `morselize` bounds a
+/// morsel by rows *and* by the byte budget, so a byte-heavy source (few rows, large blobs —
+/// decoded audio/video/images, embeddings, wide strings) yields far more morsels than
+/// `rows / target_rows` suggests. Counting by rows alone capped those workloads to a single
+/// worker — a 176 MB audio batch of 2,000 rows morselizes into ~176 pieces but was scheduled
+/// on one core. Taking the max of the row- and byte-derived counts restores the parallelism
+/// the plan can genuinely use, while still collapsing to 1 for a truly tiny query.
 fn max_useful_workers(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
-    let target_rows = opts.morsel_target().rows.max(1);
+    let target = opts.morsel_target();
+    let target_rows = target.rows.max(1);
+    let target_bytes = target.bytes.max(1);
     sources
         .iter()
         .map(|batches| {
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            rows.div_ceil(target_rows)
+            let by_rows = rows.div_ceil(target_rows);
+            if target.byte_bounded() {
+                let bytes: usize = batches.iter().map(ops::sliced_batch_bytes).sum();
+                // A source cannot yield more morsels than it has rows: `morselize` keeps a
+                // single over-budget row as its own one-row morsel, never splits within a
+                // row. Capping the byte estimate by the row count keeps a few-row/huge-blob
+                // source from over-provisioning workers that would have no morsel to take.
+                by_rows.max(bytes.div_ceil(target_bytes).min(rows))
+            } else {
+                by_rows
+            }
         })
         .max()
         .unwrap_or(1)
@@ -402,9 +452,7 @@ fn pin_threads_enabled() -> bool {
 /// best-effort and never errors out of execution.
 #[cfg(target_os = "linux")]
 fn pin_current_thread(idx: usize) {
-    let n = std::thread::available_parallelism()
-        .map(|x| x.get())
-        .unwrap_or(1);
+    let n = bc_arrow::usable_cores();
     let core = idx % n;
     // SAFETY: a zeroed `cpu_set_t` is a valid empty set; `CPU_SET` sets one valid
     // core index (`< n`), and `sched_setaffinity(0, ...)` targets the current thread
@@ -450,6 +498,14 @@ fn exec(
     if opts.fuse_linear && is_fusable(plan) && fusable_input(plan).is_some_and(is_fusable) {
         return exec_fused(plan, op_id, sources, opts, m, ids);
     }
+    // Fuse a left-deep run of ≥2 inner hash joins into ONE pass over the probe's morsels:
+    // build every table once, then thread each morsel through every probe. Falls back
+    // (`None`) to the operator-at-a-time path for any chain it cannot stream.
+    if opts.fuse_linear {
+        if let Some(out) = exec_join_pipeline(plan, op_id, sources, opts, m, ids)? {
+            return Ok(out);
+        }
+    }
     match plan {
         RelOp::Scan { source_id } => {
             let t0 = Stopwatch::start();
@@ -457,7 +513,7 @@ fn exec(
                 source_id: *source_id,
                 available: sources.len(),
             })?;
-            let out = ops::morselize(batches, opts.morsel_target());
+            let out = ops::morselize_par(batches, opts.morsel_target());
             let rows = count_rows(&out);
             push_metric(m, op_id, "scan", rows, &out, t0, false, "interp");
             Ok(out)
@@ -486,7 +542,7 @@ fn exec(
             let jits: Vec<ops::Jit> = match parts.first() {
                 Some(sample) => exprs
                     .iter()
-                    .map(|e| ops::try_compile(&e.expr, sample))
+                    .map(|e| ops::try_compile_computed(&e.expr, sample))
                     .collect(),
                 None => exprs.iter().map(|_| None).collect(),
             };
@@ -506,13 +562,15 @@ fn exec(
             input,
             column,
             alias,
+            outer,
+            index_alias,
         } => {
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
             let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = parts
                 .par_iter()
-                .map(|b| ops::unnest_batch(b, column, alias))
+                .map(|b| ops::unnest_batch(b, column, alias, *outer, index_alias.as_deref()))
                 .collect::<Result<_, InterpError>>()?;
             // Unnest multiplies rows (a list of N explodes one row into N), so a
             // within-budget input morsel can produce an over-budget output morsel.
@@ -608,6 +666,16 @@ fn exec(
             // materializing path. The partials are exactly those the unfused parallel path
             // builds (same per-morsel partial-then-combine), so the result is identical
             // within the float tolerance the parallel path already carries.
+            // Fuse a join directly beneath the aggregate (optionally through a Filter/Project
+            // chain) so the join output is folded into partials in one pass, never materialized.
+            // Declines (`None`) to the operator-at-a-time path for any shape it cannot stream.
+            if opts.fuse_linear {
+                if let Some(out) = try_fused_join_aggregate(
+                    input, op_id, group_keys, aggregates, sources, opts, m, ids,
+                )? {
+                    return Ok(out);
+                }
+            }
             if opts.fuse_linear && is_fusable(input) && !needs_parts_for_spill(aggregates) {
                 return exec_agg_fused(input, op_id, group_keys, aggregates, sources, opts, m, ids);
             }
@@ -760,12 +828,21 @@ fn exec(
                     (merged.group_columns, agg_cols)
                 }
             };
-            let out = vec![ops::build_agg_batch(
-                group_keys,
-                aggregates,
-                &group_columns,
-                &agg_cols,
-            )?];
+            // Re-morselize the grouped output (zero-copy slices) so a downstream breaker — a
+            // post-aggregate projection, a sort, or a join on the grouped rows — fans back out
+            // across cores rather than running on the single combined batch. A high-cardinality
+            // GROUP BY (tens/hundreds of thousands of groups) otherwise emits one big batch whose
+            // consumers run single-threaded. Low-cardinality output is one small batch, so this
+            // is a no-op there. (The partitioned path already emits per-partition batches.)
+            let out = ops::remorselize(
+                vec![ops::build_agg_batch(
+                    group_keys,
+                    aggregates,
+                    &group_columns,
+                    &agg_cols,
+                )?],
+                opts.morsel_target(),
+            );
             push_breaker_spilled(
                 m,
                 op_id,
@@ -783,6 +860,81 @@ fn exec(
         }
 
         RelOp::Sort { input, keys, limit } => {
+            // Fused late-materialized join + top-N: when a `LIMIT k` top-N sits directly on an
+            // inner hash join, gather only the sort-key columns + a `(bucket, row, row)` locator,
+            // top-k that narrow relation, then gather the wide payload for just the `k` survivors
+            // — never materializing the (up to multi-GB) full join output. Declines (falls through
+            // to the ordinary join-then-top-N) for a spilling build or non-bare sort keys.
+            if let Some(k) = limit {
+                if let RelOp::HashJoin {
+                    left,
+                    right,
+                    left_keys,
+                    right_keys,
+                    join_type: bc_ir::JoinType::Inner,
+                    output,
+                    strategy: bc_ir::JoinStrategy::Hash,
+                } = input.as_ref()
+                {
+                    let jt0 = Stopwatch::start();
+                    // Whether this fusion applies can only be known after the build side is
+                    // materialized, so execute the join's children against a SCRATCH
+                    // `ExecMetrics`/`IdGen` and commit to the real ones only on success — a
+                    // bail must leave operator numbering and metrics exactly as the ordinary
+                    // fallback (which re-executes `input`) would produce them. The scratch ids
+                    // mirror a plain pre-order walk of the fused HashJoin: it consumes `op_id+1`
+                    // (no metric — it is folded into the sort), then its left/right subtrees.
+                    let mut sm = ExecMetrics::default();
+                    let mut sid = IdGen::at(op_id + 1);
+                    let _join_id = sid.next(); // the HashJoin's own pre-order id
+                    let lbs = exec(left, sources, opts, &mut sm, &mut sid)?;
+                    let rbs = exec(right, sources, opts, &mut sm, &mut sid)?;
+                    let build_rows = count_rows(&rbs) as usize;
+                    let build_bytes = batch_bytes(&rbs) as usize
+                        + bc_runtime::join::estimate_build_bytes(build_rows);
+                    if let Admit::InMemory(_reservation) = admit(opts, op_id, build_bytes) {
+                        let p = rayon::current_num_threads().max(1);
+                        if let Some(out) = ops::join_top_n(
+                            &lbs,
+                            &rbs,
+                            left_keys,
+                            right_keys,
+                            output,
+                            keys,
+                            *k,
+                            p,
+                            &opts.tuning,
+                        )? {
+                            // Commit the speculative numbering + metrics: `sid` now sits exactly
+                            // where a plain walk of `input` would leave it (`op_id + 1 +
+                            // input.node_count()`), so everything after the sort still aligns
+                            // with the control plane's annotation.
+                            *ids = sid;
+                            m.ops.extend(std::mem::take(&mut sm.ops));
+                            // Commit the speculative numbering + metrics: `sid` now sits exactly
+                            // where a plain walk of `input` would leave it (`op_id + 1 +
+                            // input.node_count()`), so everything after the sort still aligns
+                            // with the control plane's annotation.
+                            let rows_in = count_rows(&lbs) + count_rows(&rbs);
+                            push_metric(
+                                m,
+                                op_id,
+                                "sort",
+                                rows_in,
+                                &out,
+                                jt0,
+                                false,
+                                "interp-jointopn",
+                            );
+                            return Ok(out);
+                        }
+                    }
+                    // Declined: drop the scratch metrics/ids (leaving `ids` untouched at
+                    // `op_id + 1`) and fall through. The ordinary path below re-executes
+                    // `input` (join included) and numbers it exactly as a plain walk would —
+                    // rare (spill / computed sort key), so the re-execution is acceptable.
+                }
+            }
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
             // Captured before the input vector is consumed below.
@@ -802,18 +954,13 @@ fn exec(
             // under-count that pushes a sort near the spill boundary the wrong way.
             let mut sort_scratch = 0u64;
             let out = match limit {
-                // Top-N: each morsel computes its local top-k in parallel (cheap),
-                // then we merge only the P×k survivors and take the global top-k —
-                // no full-input materialization. This is also mergeable, so it is
-                // the same shape the distributed top-N uses.
-                Some(k) => {
-                    let locals: Vec<RecordBatch> = parts
-                        .par_iter()
-                        .map(|b| ops::sort_batch(b, keys, Some(*k)))
-                        .collect::<Result<_, InterpError>>()?;
-                    let merged = ops::materialize(&locals)?;
-                    vec![ops::sort_batch(&merged, keys, Some(*k))?]
-                }
+                // Top-N: each morsel computes its local top-k in parallel (cheap), and only
+                // the sort-key values + a (morsel, row) locator of the P×k survivors are
+                // merged — the wide payload is gathered once, for just the final k rows
+                // (`parallel_top_n`, result-identical to gathering every candidate eagerly).
+                // No full-input materialization; the same mergeable shape the distributed
+                // top-N uses.
+                Some(k) => vec![ops::parallel_top_n(&parts, keys, *k)?],
                 // Full sort: out-of-core (spill sorted runs + k-way merge) when the
                 // input exceeds the budget or the pool can't admit it; else
                 // in-memory.
@@ -1204,83 +1351,90 @@ fn exec(
                 return Ok(out);
             }
 
-            let p = rayon::current_num_threads().max(1);
-
-            // Bucket both sides straight from their morsels, gathering each row **once**.
-            // `materialize(&batches)` here used to concatenate a relation only for
-            // `partition_by_keys` to gather every row again a moment later — two full copies
-            // where one does. The buckets, their contents, and the row order within each are
-            // identical (`ops::repartition`), so the per-bucket join and the `seq == par`
-            // oracle see exactly what they saw before.
-            let rb = ops::partition_morsels(&right_batches, right_keys, p)?;
-            let lb = ops::partition_morsels(&left_batches, left_keys, p)?;
-
-            // Skew handling: a hot key sends all its rows to one bucket, making that
-            // per-bucket join a straggler. Detect it for free from the partition
-            // sizes (no extra pass) and spread the over-large bucket's *driving*
-            // (probe) side across worker chunks against its (co-partitioned) build
-            // bucket — the chunked join `broadcast_join` uses. The driving side is
-            // the right for a `Right` join, the left otherwise; `Full` is ineligible.
-            // Every bucket still computes the same relation.
-            let salt = skew_salting_eligible(*join_type);
-            let driving_is_right = matches!(*join_type, bc_ir::JoinType::Right);
-            let driving_bucket = |i: usize| if driving_is_right { &rb[i] } else { &lb[i] };
-            let (driving_rows, driving_bytes) = if driving_is_right {
-                (build_rows, batch_bytes(&right_batches) as usize)
-            } else {
-                (
-                    count_rows(&left_batches) as usize,
-                    batch_bytes(&left_batches) as usize,
-                )
-            };
-            let avg = driving_rows / p.max(1);
-            let avg_bytes = driving_bytes / p.max(1);
-            // Hot by rows OR by bytes: a hot key of wide rows concentrates work even
-            // at a modest row count, which the row-only test cannot see. Salting is
-            // result-invisible, so widening the trigger never changes the output.
-            let is_hot = |i: usize| {
-                let b = driving_bucket(i);
-                is_skewed_bucket(
-                    b.num_rows(),
-                    avg,
-                    opts.tuning.skew_bucket_factor,
-                    opts.tuning.skew_min_bucket_rows,
-                ) || is_skewed_bucket_bytes(
-                    b.get_array_memory_size(),
-                    avg_bytes,
-                    opts.tuning.skew_bucket_factor,
-                    opts.tuning.skew_min_bucket_bytes,
-                )
-            };
-            let skewed_any = salt && (0..p).any(is_hot);
-
-            // Per-bucket join honors the planner's strategy (hash or sort-merge);
-            // equal keys share a bucket, so the union of per-bucket joins is the
-            // full join for either algorithm.
-            let out: Vec<RecordBatch> = (0..p)
-                .into_par_iter()
-                .map(|i| -> Result<Vec<RecordBatch>, InterpError> {
-                    if salt && is_hot(i) {
-                        broadcast_join(&lb[i], &rb[i], left_keys, right_keys, *join_type, output)
-                    } else {
-                        Ok(vec![ops::join_batches_with(
-                            &lb[i],
-                            &rb[i],
-                            left_keys,
-                            right_keys,
-                            *join_type,
-                            output,
-                            *strategy,
-                            &opts.tuning,
-                        )?])
+            // A `Hash` join whose build side turns out to be small enough to hold as ONE table
+            // is better served by the streaming probe than by the shuffle below — and here, at
+            // execution, that is not an estimate: `right_batches` is in hand, so `build_rows`
+            // is the *fact* the planner could only guess at.
+            //
+            // Why it wins: the shuffle path scatters BOTH sides into buckets, and the probe is
+            // the query's largest relation — measured on TPC-H q5, partitioning the 1.2M-row
+            // probe cost 20 ms against the 6 ms of the join it was preparing. The streaming path
+            // copies no probe at all. What used to make it lose anyway was its *serial* build
+            // (10.7 ms on one core); `bc_runtime::join::build` now shards that across every
+            // core, so the trade that justified the shuffle no longer holds.
+            //
+            // `streaming_supported` answers from the build's schema + row count alone, so a join
+            // it cannot serve (a `Right`/`Full` join, a non-integer key, a build past the
+            // cache-radix cliff) falls through to the shuffle below having copied nothing. The
+            // planner's `Broadcast`/`SortMerge` choices are still honored above; this only
+            // reconsiders `Hash`, and only downward, where the real size says it is safe.
+            if *strategy == bc_ir::JoinStrategy::Hash && !right_batches.is_empty() {
+                let schema = right_batches[0].schema();
+                let key_types: Option<Vec<_>> = right_keys
+                    .iter()
+                    .map(|k| schema.field_with_name(k).ok().map(|f| f.data_type()))
+                    .collect();
+                let eligible = key_types.as_ref().is_some_and(|ts| {
+                    bc_runtime::join::streaming_supported(
+                        ops::map_join_type(*join_type),
+                        ts,
+                        build_rows,
+                    )
+                });
+                if eligible {
+                    let right = ops::materialize(&right_batches)?;
+                    // NOT morselized, unlike the planner-chosen broadcast above. Measured:
+                    // doing so here is a 4% geomean REGRESSION across TPC-H (10 queries worse,
+                    // 4 better). This branch is reached after the planner picked `Hash`, so the
+                    // probe has come through a filter/project that already re-morselized it —
+                    // the extra pass buys no parallelism and costs a copy. The other site is
+                    // fed straight from a scan, which is why it needs the split and this
+                    // does not.
+                    if let Some(out) = broadcast_join_streaming(
+                        &left_batches,
+                        &right,
+                        left_keys,
+                        right_keys,
+                        *join_type,
+                        output,
+                    )? {
+                        // The probe never materializes, so the true peak is the build side
+                        // (columns + table) plus one probe morsel and the result — the same
+                        // accounting the planner-chosen broadcast above records.
+                        let probe_morsel = left_batches
+                            .iter()
+                            .map(|b| batch_bytes(std::slice::from_ref(b)))
+                            .max()
+                            .unwrap_or(0);
+                        let build_live = batch_bytes(&right_batches)
+                            + bc_runtime::join::estimate_build_bytes(rows_build as usize) as u64;
+                        push_breaker(
+                            m,
+                            op_id,
+                            "hash_join",
+                            rows_in,
+                            rows_build,
+                            build_live.saturating_add(probe_morsel),
+                            &out,
+                            t0,
+                            false,
+                            "interp-shared",
+                        );
+                        return Ok(out);
                     }
-                })
-                .collect::<Result<Vec<_>, InterpError>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-            // Even out the per-bucket output batches (a hot key makes one bucket far larger
-            // than the rest) so the downstream operators see balanced, core-sized morsels.
+                }
+            }
+
+            let (out, skewed_any) = join_partitioned(
+                &left_batches,
+                &right_batches,
+                left_keys,
+                right_keys,
+                *join_type,
+                output,
+                *strategy,
+                opts,
+            )?;
             let out = ops::remorselize(out, opts.morsel_target());
             let backend = match (skewed_any, *strategy == bc_ir::JoinStrategy::SortMerge) {
                 (true, _) => "interp-skew",
@@ -1309,7 +1463,12 @@ fn exec(
             let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
             let (batch, spilled, spill_vol) = distinct(&parts, opts, op_id)?;
-            let out = vec![batch];
+            // `distinct` returns one materialized batch; re-morselize it (zero-copy slices) so a
+            // downstream breaker (a COUNT(DISTINCT)'s outer GROUP BY, or a join) fans back out
+            // across cores instead of processing the whole relation on one thread. A single
+            // large distinct batch feeding an aggregate ran that aggregate at ~1% CPU
+            // (TPC-H Q16: the outer group-by over the deduped rows was 62% of the query, serial).
+            let out = ops::remorselize(vec![batch], opts.morsel_target());
             push_breaker_spilled(
                 m, op_id, "distinct", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
             );
@@ -1324,6 +1483,9 @@ fn exec(
             for inp in inputs {
                 all.extend(exec(inp, sources, opts, m, ids)?);
             }
+            // Promotable-but-different branch types (`int64 ∪ float64`) are coerced to the
+            // union's advertised supertype before concat/dedup, matching DuckDB.
+            let all = crate::coerce_union_branches(all)?;
             let rows_in = count_rows(&all);
             // Captured before `all` is consumed: the dedup path materializes and hashes it.
             let in_bytes = batch_bytes(&all);
@@ -1364,6 +1526,388 @@ fn fusable_input(op: &RelOp) -> Option<&RelOp> {
         RelOp::Filter { input, .. } | RelOp::Project { input, .. } => Some(input),
         _ => None,
     }
+}
+
+/// Join two materialized relations with the **partitioned** algorithm: bucket both sides by
+/// key, then join each co-partitioned pair across cores, spreading a hot bucket's probe over
+/// worker chunks. Returns the joined batches and whether any bucket was skewed.
+///
+/// This is the algorithm to use when the build side is *not* small: it builds `p` tables of
+/// `build/p` rows across cores, where a broadcast/streamed join builds one table over the whole
+/// build side, serially. Shared by the ordinary hash-join arm and the fused join pipeline, so a
+/// pipeline stage whose build is too large to broadcast runs exactly what the unfused path runs.
+#[allow(clippy::too_many_arguments)]
+fn join_partitioned(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    left_keys: &[String],
+    right_keys: &[String],
+    join_type: bc_ir::JoinType,
+    output: &[bc_ir::JoinOutputCol],
+    strategy: bc_ir::JoinStrategy,
+    opts: &ExecOptions,
+) -> Result<(Vec<RecordBatch>, bool), InterpError> {
+    let p = rayon::current_num_threads().max(1);
+
+    // Bucket both sides straight from their morsels, gathering each row **once**.
+    // `materialize(&batches)` here used to concatenate a relation only for
+    // `partition_by_keys` to gather every row again a moment later — two full copies
+    // where one does. The buckets, their contents, and the row order within each are
+    // identical (`ops::repartition`), so the per-bucket join and the `seq == par`
+    // oracle see exactly what they saw before.
+    let rb = ops::partition_morsels(right_batches, right_keys, p)?;
+    let lb = ops::partition_morsels(left_batches, left_keys, p)?;
+
+    // Skew handling: a hot key sends all its rows to one bucket, making that
+    // per-bucket join a straggler. Detect it for free from the partition
+    // sizes (no extra pass) and spread the over-large bucket's *driving*
+    // (probe) side across worker chunks against its (co-partitioned) build
+    // bucket — the chunked join `broadcast_join` uses. The driving side is
+    // the right for a `Right` join, the left otherwise; `Full` is ineligible.
+    // Every bucket still computes the same relation.
+    let salt = skew_salting_eligible(join_type);
+    let driving_is_right = matches!(join_type, bc_ir::JoinType::Right);
+    let driving_bucket = |i: usize| if driving_is_right { &rb[i] } else { &lb[i] };
+    let (driving_rows, driving_bytes) = if driving_is_right {
+        (
+            count_rows(right_batches) as usize,
+            batch_bytes(right_batches) as usize,
+        )
+    } else {
+        (
+            count_rows(left_batches) as usize,
+            batch_bytes(left_batches) as usize,
+        )
+    };
+    let avg = driving_rows / p.max(1);
+    let avg_bytes = driving_bytes / p.max(1);
+    // Hot by rows OR by bytes: a hot key of wide rows concentrates work even
+    // at a modest row count, which the row-only test cannot see. Salting is
+    // result-invisible, so widening the trigger never changes the output.
+    let is_hot = |i: usize| {
+        let b = driving_bucket(i);
+        is_skewed_bucket(
+            b.num_rows(),
+            avg,
+            opts.tuning.skew_bucket_factor,
+            opts.tuning.skew_min_bucket_rows,
+        ) || is_skewed_bucket_bytes(
+            b.get_array_memory_size(),
+            avg_bytes,
+            opts.tuning.skew_bucket_factor,
+            opts.tuning.skew_min_bucket_bytes,
+        )
+    };
+    let skewed_any = salt && (0..p).any(is_hot);
+
+    // Per-bucket join honors the planner's strategy (hash or sort-merge);
+    // equal keys share a bucket, so the union of per-bucket joins is the
+    // full join for either algorithm.
+    let out: Vec<RecordBatch> = (0..p)
+        .into_par_iter()
+        .map(|i| -> Result<Vec<RecordBatch>, InterpError> {
+            if salt && is_hot(i) {
+                broadcast_join(&lb[i], &rb[i], left_keys, right_keys, join_type, output)
+            } else {
+                Ok(vec![ops::join_batches_with(
+                    &lb[i],
+                    &rb[i],
+                    left_keys,
+                    right_keys,
+                    join_type,
+                    output,
+                    strategy,
+                    &opts.tuning,
+                )?])
+            }
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    // Even out the per-bucket output batches (a hot key makes one bucket far larger
+    // than the rest) so the downstream operators see balanced, core-sized morsels.
+    let out = ops::remorselize(out, opts.morsel_target());
+    Ok((out, skewed_any))
+}
+
+/// One stage of a fused join pipeline: a build side hashed **once**, plus everything needed
+/// to probe a morsel against it and emit the joined batch.
+struct JoinStage<'a> {
+    op_id: u32,
+    table: bc_runtime::join::BroadcastProbe,
+    build: RecordBatch,
+    probe_keys: &'a [String],
+    output: &'a [bc_ir::JoinOutputCol],
+    schema: arrow::datatypes::SchemaRef,
+    rows_build: u64,
+}
+
+/// Execute a left-deep run of inner hash joins as ONE pass over the probe side's morsels.
+///
+/// The operator-at-a-time path runs a join chain by fully materializing each join's output
+/// and handing it to the next: TPC-H q5 writes a 94 MB intermediate, reads it back to join it
+/// again into a 17 MB one, and reads *that* back. Two costs follow. The obvious one is the
+/// memory traffic. The one that actually dominates is parallelism: each join fans out over
+/// *its own input's* morsels, so a chain that funnels 6 M rows down to 182 k and then to 7 k
+/// ends up running its last joins over a handful of morsels — a couple of busy cores while
+/// the rest idle (measured: ~50 % CPU on q5, with no single operator above 25 % of wall).
+///
+/// Fused, the chain is driven by the *base* probe's morsels — 366 of them for `lineitem` —
+/// and every stage runs inside that same `par_iter`. Each morsel is threaded through every
+/// probe in turn and only the final, joined batch is ever materialized. Parallelism is the
+/// base's morsel count for the whole chain, and the intermediates never exist.
+///
+/// **The relation is unchanged.** Each stage applies exactly the join the unfused path
+/// applies — same build table (`BroadcastProbe` is the same build/probe the streaming
+/// broadcast uses), same output columns, same row order (morsels in order, rows in order
+/// within a morsel). Only the boundary at which rows are materialized moves.
+///
+/// Returns `None` — having consumed nothing — for any chain it cannot stream: fewer than two
+/// joins, a non-inner join type, or a build side `BroadcastProbe` declines (too large for its
+/// table to stay cache-resident, or keys outside the streamable set). The caller then runs the
+/// ordinary path.
+///
+/// Whether it applies can only be known *after* the build sides are materialized, so the
+/// build/base execution runs against a **scratch** `ExecMetrics`/`IdGen` and is committed to
+/// the real ones only on success — a bail leaves operator numbering and metrics exactly as the
+/// fallback path will produce them.
+fn exec_join_pipeline(
+    plan: &RelOp,
+    op_id: u32,
+    sources: &[Vec<RecordBatch>],
+    opts: &ExecOptions,
+    m: &mut ExecMetrics,
+    ids: &mut IdGen,
+) -> Result<Option<Vec<RecordBatch>>, InterpError> {
+    // The left spine of inner hash joins, outermost first. `node` ends as the base probe.
+    let mut spine: Vec<&RelOp> = Vec::new();
+    let mut node = plan;
+    while let RelOp::HashJoin {
+        left, join_type, ..
+    } = node
+    {
+        if !matches!(join_type, bc_ir::JoinType::Inner) {
+            break;
+        }
+        spine.push(node);
+        node = left;
+    }
+    if spine.len() < 2 {
+        return Ok(None);
+    }
+    let base_plan = node;
+    let n = spine.len();
+
+    // Ids, without running anything: the spine takes the ids the recursion hands out on the way
+    // down, then the base probe's subtree, then each build side from the innermost out.
+    // `node_count` gives each subtree's span, so the builds can be executed after the base and
+    // still receive exactly the ids a plain pre-order walk would.
+    let join_ids: Vec<u32> = (0..n as u32).map(|i| op_id + i).collect();
+    let base_first_id = op_id + n as u32;
+    let mut build_first_ids: Vec<u32> = Vec::with_capacity(n);
+    let mut next_id = base_first_id + base_plan.node_count();
+    for join in spine.iter().rev() {
+        let RelOp::HashJoin { right, .. } = join else {
+            unreachable!("the spine holds only hash joins")
+        };
+        build_first_ids.push(next_id);
+        next_id += right.node_count();
+    }
+
+    // Probe side, then every build (innermost out) — the recursion's own order.
+    let mut sm = ExecMetrics::default();
+    let mut pid = IdGen::at(base_first_id);
+    let mut cur = exec(base_plan, sources, opts, &mut sm, &mut pid)?;
+    debug_assert_eq!(pid.peek(), build_first_ids[0]);
+    if cur.is_empty() {
+        return Ok(None); // empty probe: let the ordinary path produce the empty relation
+    }
+    let mut builds: Vec<Vec<RecordBatch>> = Vec::with_capacity(n);
+    for (i, join) in spine.iter().rev().enumerate() {
+        let RelOp::HashJoin { right, .. } = join else {
+            unreachable!("the spine holds only hash joins")
+        };
+        let mut bid = IdGen::at(build_first_ids[i]);
+        builds.push(exec(right, sources, opts, &mut sm, &mut bid)?);
+    }
+    // Committed. Everything below only chooses *how* to join what is already in hand, so the
+    // chain never hands work back after paying for it.
+    *ids = IdGen::at(next_id);
+    m.ops.extend(std::mem::take(&mut sm.ops));
+
+    // Walk the chain innermost out. Consecutive stages that should stream are fused into ONE
+    // pass over the morsels in flight; a stage that should not is joined the ordinary
+    // partitioned way, materializing at that point and no other.
+    // The *live* tuning, not the compiled-in default: these values are shipped from Python's
+    // `ExecutionConfig`, and a fused stage must make the same bloom decision the unfused join
+    // would — otherwise fusing a chain would silently change a user's configured behaviour.
+    let tuning = &opts.tuning;
+    let mut i = 0usize;
+    while i < n {
+        let cur_rows = count_rows(&cur);
+        let cur_schema = cur
+            .first()
+            .map(|b| b.schema())
+            .expect("cur is non-empty: the base was, and every stage emits at least a schema");
+
+        // How many consecutive stages from `i` can stream? A stage streams when its build is
+        // hashable into one table AND is the *smaller* side. The second condition is the one
+        // that matters: a streamed stage builds ONE table over the whole build side, serially,
+        // where the partitioned join builds `p` tables of `build/p` rows across cores — so
+        // streaming only pays once the probe is large enough to amortize that serial build.
+        // (TPC-H q2 is the counter-example: a 1.5 k-row probe against an 800 k-row build.)
+        let mut run: Vec<JoinStage> = Vec::new();
+        let mut schema = cur_schema;
+        let mut j = i;
+        while j < n {
+            let RelOp::HashJoin {
+                left_keys,
+                right_keys,
+                join_type,
+                output,
+                ..
+            } = spine[n - 1 - j]
+            else {
+                unreachable!("the spine holds only hash joins")
+            };
+            let rows_build = count_rows(&builds[j]);
+            // Judged against the rows entering this *run*. Inside a run the relation only
+            // changes by the joins we are fusing, and a chain is built to funnel down — so this
+            // is an upper bound on what a later stage in the run actually probes with.
+            if rows_build > cur_rows {
+                break;
+            }
+            let build = ops::materialize(&builds[j])?;
+            let Some(table) = bc_runtime::join::BroadcastProbe::new(
+                &ops::columns_by_name(&build, right_keys)?,
+                ops::map_join_type(*join_type),
+                cur_rows as usize,
+                tuning.bloom_fp_rate,
+                tuning.bloom_min_build_rows,
+            ) else {
+                break;
+            };
+            // One shape check per stage: every morsel reaching it carries `schema`, so a probe
+            // that accepts this sample's keys accepts all of them.
+            let sample = RecordBatch::new_empty(Arc::clone(&schema));
+            if !table.accepts(&ops::columns_by_name(&sample, left_keys)?) {
+                break;
+            }
+            let out_schema = ops::join_output_schema(&sample, &build, output)?;
+            run.push(JoinStage {
+                op_id: join_ids[n - 1 - j],
+                table,
+                build,
+                probe_keys: left_keys,
+                output,
+                schema: Arc::clone(&out_schema),
+                rows_build,
+            });
+            schema = out_schema;
+            j += 1;
+        }
+
+        if run.is_empty() {
+            // This stage's build is the larger side (or is unhashable): run the algorithm the
+            // unfused path would, on the relation in flight.
+            let RelOp::HashJoin {
+                left_keys,
+                right_keys,
+                join_type,
+                output,
+                strategy,
+                ..
+            } = spine[n - 1 - i]
+            else {
+                unreachable!("the spine holds only hash joins")
+            };
+            let t0 = Stopwatch::start();
+            let rows_in = count_rows(&cur);
+            let rows_build = count_rows(&builds[i]);
+            let (out, skewed) = join_partitioned(
+                &cur, &builds[i], left_keys, right_keys, *join_type, output, *strategy, opts,
+            )?;
+            m.record(OpMetric {
+                op_id: join_ids[n - 1 - i],
+                kind: "hash_join",
+                rows_in,
+                rows_build,
+                rows_out: count_rows(&out),
+                elapsed_ns: t0.elapsed_ns(),
+                cpu_ns: t0.cpu_ns(),
+                threads: rayon::current_num_threads().max(1) as u32,
+                peak_bytes: batch_bytes(&out),
+                result_bytes: batch_bytes(&out),
+                spilled: false,
+                spill_bytes: 0,
+                peak_rss_bytes: 0,
+                backend: if skewed { "interp-skew" } else { "interp" },
+            });
+            cur = out;
+            i += 1;
+            continue;
+        }
+
+        // One pass over the morsels in flight, through every stage of the run.
+        let t0 = Stopwatch::start();
+        let rows_in = count_rows(&cur);
+        let out: Vec<RecordBatch> =
+            cur.par_iter()
+                .map(|morsel| {
+                    let mut b = morsel.clone();
+                    for st in &run {
+                        let keys = ops::columns_by_name(&b, st.probe_keys)?;
+                        let idx = st.table.probe(&keys).ok_or_else(|| {
+                            InterpError::UnknownJoinColumn(st.probe_keys.join(", "))
+                        })?;
+                        b = ops::gather_join_output_with(
+                            &b,
+                            &st.build,
+                            &idx,
+                            st.output,
+                            Arc::clone(&st.schema),
+                        )?;
+                    }
+                    Ok(b)
+                })
+                .collect::<Result<Vec<_>, InterpError>>()?;
+        // A join concatenates both sides' columns, so re-bound the output to the byte budget
+        // exactly as the unfused join path does.
+        let out = ops::remorselize(out, opts.morsel_target());
+
+        // One metric per fused stage. Only the run's last stage has a materialized relation to
+        // measure and only its first sees the rows entering the run — an interior stage of a
+        // fused pass has no relation of its own, and inventing one would put a fiction into the
+        // cardinalities Kyber learns from.
+        let k = run.len() as u64;
+        let elapsed = t0.elapsed_ns().max(1) / k;
+        let cpu = t0.cpu_ns() / k;
+        let rows_out = count_rows(&out);
+        let out_bytes = batch_bytes(&out);
+        for (s, st) in run.iter().enumerate() {
+            let last = s + 1 == run.len();
+            m.record(OpMetric {
+                op_id: st.op_id,
+                kind: "hash_join",
+                rows_in: if s == 0 { rows_in } else { 0 },
+                rows_build: st.rows_build,
+                rows_out: if last { rows_out } else { 0 },
+                elapsed_ns: elapsed,
+                cpu_ns: cpu,
+                threads: rayon::current_num_threads().max(1) as u32,
+                peak_bytes: if last { out_bytes } else { 0 },
+                result_bytes: if last { out_bytes } else { 0 },
+                spilled: false,
+                spill_bytes: 0,
+                peak_rss_bytes: 0,
+                backend: "interp-pipelined",
+            });
+        }
+        cur = out;
+        i = j;
+    }
+    Ok(Some(cur))
 }
 
 /// One compiled stage of a fused linear pipeline: a per-morsel operator with its
@@ -1426,7 +1970,10 @@ fn compile_stage<'a>(op_id: u32, op: &'a RelOp, sample: Option<&RecordBatch>) ->
         }
         RelOp::Project { exprs, .. } => {
             let jits: Vec<ops::Jit> = match sample {
-                Some(s) => exprs.iter().map(|e| ops::try_compile(&e.expr, s)).collect(),
+                Some(s) => exprs
+                    .iter()
+                    .map(|e| ops::try_compile_computed(&e.expr, s))
+                    .collect(),
                 None => exprs.iter().map(|_| None).collect(),
             };
             let backend = backend_tag(&jits.iter().map(|j| j.is_some()).collect::<Vec<_>>());
@@ -1565,6 +2112,174 @@ fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
                 | AggFunc::ApproxQuantile
         )
     })
+}
+
+/// Fused HashJoin → (Filter/Project)* → Aggregate: build the broadcast probe table once, then
+/// thread each probe morsel through the join, the linear chain, and straight into a partial
+/// aggregate — the join's output (on TPC-H `lineitem ⋈ orders` it is 6M rows / ~200 MB) is
+/// never materialized, and the separate group-by pass over it is gone. DuckDB and Polars win
+/// this shape precisely because they fuse it; this is the same fusion, on the same mergeable
+/// partials the unfused path builds (same probe, same `gather_join_output_with`, same
+/// per-morsel `partial`-then-`combine`), so the `seq == par` oracle sees an identical relation.
+///
+/// Returns `None` — fall through to the operator-at-a-time path, which is correct for every
+/// shape — when the base is not an inner hash join, the probe is empty, or the build side is
+/// too large / unhashable for a broadcast probe (the partitioned shuffle join is right there).
+/// A value-list aggregate (median/quantile/mode/…) also declines: it needs the raw rows for its
+/// out-of-core spill. Gated on `fuse_linear`, like the sibling fusions.
+#[allow(clippy::too_many_arguments)]
+fn try_fused_join_aggregate(
+    input: &RelOp,
+    op_id: u32,
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    sources: &[Vec<RecordBatch>],
+    opts: &ExecOptions,
+    m: &mut ExecMetrics,
+    ids: &mut IdGen,
+) -> Result<Option<Vec<RecordBatch>>, InterpError> {
+    if needs_parts_for_spill(aggregates) {
+        return Ok(None);
+    }
+    // Peel the linear Filter/Project chain (outermost first); the base must be an inner join.
+    let mut chain: Vec<&RelOp> = Vec::new();
+    let mut node = input;
+    while is_fusable(node) {
+        chain.push(node);
+        node = fusable_input(node).expect("a fusable op has an input");
+    }
+    let RelOp::HashJoin {
+        left,
+        right,
+        left_keys,
+        right_keys,
+        join_type,
+        output,
+        ..
+    } = node
+    else {
+        return Ok(None);
+    };
+    if !matches!(join_type, bc_ir::JoinType::Inner) {
+        return Ok(None);
+    }
+
+    // Pre-order ids (matching `exec`): chain ops, the join, then the probe & build subtrees.
+    let chain_ids: Vec<u32> = chain.iter().map(|_| ids.next()).collect();
+    let join_id = ids.next();
+    let mut sm = ExecMetrics::default();
+    let mut pid = IdGen::at(ids.peek());
+    let probe_batches = exec(left, sources, opts, &mut sm, &mut pid)?;
+    if probe_batches.is_empty() {
+        return Ok(None); // empty probe: the ordinary path builds the empty relation. ids untouched.
+    }
+    let mut bid = IdGen::at(pid.peek());
+    let build_batches = exec(right, sources, opts, &mut sm, &mut bid)?;
+    let next_id = bid.peek();
+
+    // Broadcast the (small) build side; decline to the partitioned path when it is not small.
+    let build = ops::materialize(&build_batches)?;
+    let tuning = &opts.tuning;
+    let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+    let Some(table) = bc_runtime::join::BroadcastProbe::new(
+        &ops::columns_by_name(&build, right_keys)?,
+        ops::map_join_type(*join_type),
+        probe_rows,
+        tuning.bloom_fp_rate,
+        tuning.bloom_min_build_rows,
+    ) else {
+        return Ok(None);
+    };
+    let first_keys = ops::columns_by_name(&probe_batches[0], left_keys)?;
+    if !table.accepts(&first_keys) {
+        return Ok(None);
+    }
+
+    // Committed: advance ids and fold `sm`'s subtree metrics in exactly once.
+    *ids = IdGen::at(next_id);
+    m.ops.extend(std::mem::take(&mut sm.ops));
+
+    // Compile the chain stages and the aggregate against the (empty) post-join / post-chain
+    // schema — identical to the shape every morsel produces below.
+    let join_schema = ops::join_output_schema(&probe_batches[0], &build, output)?;
+    let mut sample = RecordBatch::new_empty(Arc::clone(&join_schema));
+    let mut stages: Vec<FusedStage> = Vec::with_capacity(chain.len());
+    for (id, op) in chain_ids.iter().zip(chain.iter()).rev() {
+        let stage = compile_stage(*id, op, Some(&sample));
+        sample = stage.apply(&sample)?;
+        stages.push(stage);
+    }
+    let agg_jit = ops::compile_agg(group_keys, aggregates, &sample);
+
+    let t0 = Stopwatch::start();
+    // One pass: probe → gather join output → linear chain → fold into a partial. The join
+    // output for a morsel lives only until it is folded, so peak memory is the build side
+    // (columns + hash table) plus one morsel's join output and its partial — never the whole
+    // join. Runs across cores; the partials merge associatively, so this equals the serial fold.
+    let partials: Vec<agg::Partial> = probe_batches
+        .par_iter()
+        .map(|morsel| {
+            let keys = ops::columns_by_name(morsel, left_keys)?;
+            let idx = table
+                .probe(&keys)
+                .ok_or_else(|| InterpError::UnknownJoinColumn(left_keys.join(", ")))?;
+            let mut cur = ops::gather_join_output_with(
+                morsel,
+                &build,
+                &idx,
+                output,
+                Arc::clone(&join_schema),
+            )?;
+            for stage in &stages {
+                cur = stage.apply(&cur)?;
+            }
+            ops::eval_partial_jit(&cur, group_keys, aggregates, &agg_jit)
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+
+    // Combine the partials — the same in-memory / grace-spill path as the unfused aggregate.
+    let funcs = ops::agg_funcs(aggregates);
+    let state_bytes = partial_state_bytes(&partials);
+    let (group_columns, agg_cols) = match admit(opts, op_id, state_bytes) {
+        Admit::Spill => {
+            let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+            let sp =
+                &global.with_budget(opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes));
+            let p = grace_partitions(&partials, sp.memory_budget_bytes);
+            let mut store =
+                DiskSpillStore::with_codec(sp.dir.join(format!("agg-{p}p")), p, sp.codec)?;
+            let res =
+                combine_finalize_spilling(partials, &funcs, &mut store, sp.memory_budget_bytes)?;
+            (res.group_columns, res.agg_columns)
+        }
+        Admit::InMemory(_reservation) => {
+            let merged =
+                agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+            let agg_cols = agg::finalize(&funcs, &merged)?;
+            (merged.group_columns, agg_cols)
+        }
+    };
+    let out = vec![ops::build_agg_batch(
+        group_keys,
+        aggregates,
+        &group_columns,
+        &agg_cols,
+    )?];
+    push_breaker(
+        m,
+        op_id,
+        "aggregate",
+        probe_rows as u64,
+        count_rows(&build_batches),
+        batch_bytes(&build_batches)
+            + bc_runtime::join::estimate_build_bytes(build.num_rows()) as u64,
+        &out,
+        t0,
+        false,
+        "fused-join-agg",
+    );
+    let _ = (join_id, join_type);
+    Ok(Some(out))
 }
 
 /// Fused Filter/Project → Aggregate: build each morsel's partial state directly from the
@@ -1985,6 +2700,231 @@ mod tests {
         .unwrap()
     }
 
+    /// A plan with no media decode — the common case for the `auto_width` cap tests.
+    fn no_media_plan() -> RelOp {
+        RelOp::Scan { source_id: 0 }
+    }
+
+    /// The fused join→aggregate must produce exactly what the sequential oracle produces —
+    /// over unique keys, a 1:N build (duplicate keys), null keys (never match), and an all-miss
+    /// join (empty output → the degenerate aggregate) — and must actually *fire* (not silently
+    /// fall back), else the test asserts nothing.
+    #[test]
+    fn fused_join_aggregate_matches_the_oracle() {
+        use bc_expr::Expr;
+        fn b2(c0: &str, v0: Vec<Option<i64>>, c1: &str, v1: Vec<Option<i64>>) -> RecordBatch {
+            RecordBatch::try_from_iter(vec![
+                (c0, Arc::new(Int64Array::from(v0)) as ArrayRef),
+                (c1, Arc::new(Int64Array::from(v1)) as ArrayRef),
+            ])
+            .unwrap()
+        }
+        // Aggregate(group by g, SUM(v)) over HashJoin(probe(pk,v) ⋈ build(bk,g)).
+        let plan = RelOp::Aggregate {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["pk".into()],
+                right_keys: vec!["bk".into()],
+                join_type: bc_ir::JoinType::Inner,
+                output: vec![
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Left,
+                        name: "v".into(),
+                        alias: "v".into(),
+                    },
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Right,
+                        name: "g".into(),
+                        alias: "g".into(),
+                    },
+                ],
+                strategy: bc_ir::JoinStrategy::Hash,
+            }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "g".into() },
+                alias: "g".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func: AggFunc::Sum,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                alias: "s".into(),
+                param: None,
+            }],
+        };
+        let norm = |bs: &[RecordBatch]| -> Vec<(Option<i64>, Option<i64>)> {
+            let mut rows = Vec::new();
+            for b in bs {
+                let g = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((
+                        (!g.is_null(i)).then(|| g.value(i)),
+                        (!s.is_null(i)).then(|| s.value(i)),
+                    ));
+                }
+            }
+            rows.sort();
+            rows
+        };
+        let cases: Vec<(
+            Vec<Option<i64>>,
+            Vec<Option<i64>>,
+            Vec<Option<i64>>,
+            Vec<Option<i64>>,
+        )> = vec![
+            (
+                (0..200).map(|i| Some(i % 10)).collect(),
+                (0..200).map(Some).collect(),
+                (0..10).map(Some).collect(),
+                (0..10).map(|i| Some(i % 3)).collect(),
+            ),
+            (
+                vec![Some(1), Some(2), Some(1), Some(2)],
+                vec![Some(10), Some(20), Some(30), Some(40)],
+                vec![Some(1), Some(1), Some(2)], // 1:N — key 1 appears twice on the build
+                vec![Some(5), Some(6), Some(7)],
+            ),
+            (
+                vec![None, Some(1), Some(2), None],
+                vec![Some(10), Some(11), Some(12), Some(13)],
+                vec![None, Some(1)], // a null build key never matches
+                vec![Some(0), Some(1)],
+            ),
+            (
+                vec![Some(99), Some(98)],
+                vec![Some(1), Some(2)],
+                vec![Some(1), Some(2)],
+                vec![Some(0), Some(1)], // all miss → empty join → degenerate aggregate
+            ),
+        ];
+        let mut fired = false;
+        for (pk, v, bk, g) in cases {
+            let sources = vec![vec![b2("pk", pk, "v", v)], vec![b2("bk", bk, "g", g)]];
+            let opts = ExecOptions {
+                fuse_linear: true,
+                morsel_rows: 8,
+                ..ExecOptions::default()
+            };
+            let (fused, mt) = execute_parallel_with_metrics(&plan, &sources, &opts).unwrap();
+            let oracle = execute(&plan, &sources).unwrap();
+            assert_eq!(
+                norm(&fused),
+                norm(&oracle),
+                "fused join-agg diverged from the oracle"
+            );
+            fired |= mt.ops.iter().any(|o| o.backend == "fused-join-agg");
+        }
+        assert!(
+            fired,
+            "the fused join-aggregate path never fired — the test proved nothing"
+        );
+    }
+
+    /// A byte-heavy source (few rows, large blobs) must lift the worker cap: counting
+    /// morsels by rows alone would collapse it to one worker even though the scan splits
+    /// it into many byte-bounded morsels. Regression for the media/embedding throttle.
+    #[test]
+    fn byte_heavy_source_lifts_worker_cap() {
+        use arrow::array::BinaryArray;
+
+        // 100 rows × 64 KiB ≈ 6.4 MiB of binary — far under the 16,384-row target but well
+        // over the 1 MiB byte budget, so the scan yields several morsels, not one.
+        let blob = vec![0u8; 64 * 1024];
+        let arr = BinaryArray::from_iter_values((0..100).map(|_| blob.as_slice()));
+        let rb = RecordBatch::try_from_iter(vec![("b", Arc::new(arr) as ArrayRef)]).unwrap();
+        let sources = vec![vec![rb]];
+        let opts = ExecOptions::default();
+
+        // Row-only counting would have been 100 / 16,384 = 1 worker.
+        assert_eq!(100usize.div_ceil(opts.morsel_target().rows), 1);
+        // Byte-aware counting sees the ~6 morsels the byte budget produces.
+        let workers = max_useful_workers(&opts, &sources);
+        assert!(
+            workers >= 6,
+            "byte-heavy source should allow >=6 workers, got {workers}"
+        );
+    }
+
+    /// The fused Sort-top-N-over-inner-hash-join path must number the join's children with
+    /// the SAME pre-order op-ids a plain walk assigns, so the runtime feedback keyed by op-id
+    /// still lines up with the operator the control plane annotated. The join is fused (folded
+    /// into the sort), so it emits no `hash_join` metric and its own id (1) is unused — but its
+    /// left/right subtrees must keep ids 2 and 3, not slide down to 1 and 2. Before the fix the
+    /// children were executed with the live `IdGen`, skipping the join's id, so every descendant
+    /// op-id was shifted by one (and on decline the subtree was numbered twice).
+    #[test]
+    fn fused_join_top_n_keeps_child_op_ids_aligned() {
+        use bc_expr::Expr;
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType, SortKey};
+
+        // Sort{limit=2}( HashJoin.Inner.Hash( Scan0, Scan1 ) ), ORDER BY the left key.
+        let plan = RelOp::Sort {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["k".into()],
+                right_keys: vec!["k".into()],
+                join_type: JoinType::Inner,
+                output: vec![
+                    JoinOutputCol {
+                        side: JoinSide::Left,
+                        name: "v".into(),
+                        alias: "lv".into(),
+                    },
+                    JoinOutputCol {
+                        side: JoinSide::Right,
+                        name: "v".into(),
+                        alias: "rv".into(),
+                    },
+                ],
+                strategy: JoinStrategy::Hash,
+            }),
+            keys: vec![SortKey {
+                expr: Expr::Col { name: "lv".into() },
+                descending: false,
+                nulls_first: false,
+            }],
+            limit: Some(2),
+        };
+        let sources = vec![
+            vec![batch(&[1, 2, 3, 4], &[10, 20, 30, 40])],
+            vec![batch(&[1, 2, 3, 4], &[100, 200, 300, 400])],
+        ];
+        let (_out, m) = execute_parallel_with_metrics(&plan, &sources, &ExecOptions::default())
+            .expect("fused join top-n runs");
+
+        // The fused sort is op 0; the join (op 1) is folded in and emits no metric; the two
+        // scans are the join's children and MUST carry the pre-order ids 2 and 3.
+        let sort = m
+            .ops
+            .iter()
+            .find(|o| o.kind == "sort")
+            .expect("a sort metric");
+        assert_eq!(sort.op_id, 0);
+        assert_eq!(
+            sort.backend, "interp-jointopn",
+            "the fused path must engage"
+        );
+        assert!(
+            m.ops.iter().all(|o| o.kind != "hash_join"),
+            "the join is fused, so it records no separate metric"
+        );
+        let mut scan_ids: Vec<u32> = m
+            .ops
+            .iter()
+            .filter(|o| o.kind == "scan")
+            .map(|o| o.op_id)
+            .collect();
+        scan_ids.sort_unstable();
+        assert_eq!(
+            scan_ids,
+            vec![2, 3],
+            "the join's children must keep the pre-order ids a plain walk assigns"
+        );
+    }
+
     /// Peak working-set measurement contract for the *parallel* breakers (the metrics
     /// contract integration test covers only the sequential oracle). These guard the
     /// under-counts Carbonite's per-family memory model would otherwise learn.
@@ -2263,7 +3203,10 @@ mod tests {
             ..ExecOptions::default()
         };
         // One tiny source: the morsel cap would say 1, but the explicit width wins.
-        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 7);
+        assert_eq!(
+            auto_width(&opts, &[vec![batch(&[1], &[1])]], &no_media_plan()),
+            7
+        );
     }
 
     /// A worker with no morsel to take still costs a wake-up and queue contention, so the
@@ -2277,11 +3220,14 @@ mod tests {
             ..ExecOptions::default()
         };
         // 1 row → 1 morsel → 1 worker.
-        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 1);
+        assert_eq!(
+            auto_width(&opts, &[vec![batch(&[1], &[1])]], &no_media_plan()),
+            1
+        );
         // 5 rows at 2 rows/morsel → 3 morsels; capped further by the machine's cores.
         let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
         let five = vec![batch(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5])];
-        assert_eq!(auto_width(&opts, &[five]), 3.min(cores));
+        assert_eq!(auto_width(&opts, &[five], &no_media_plan()), 3.min(cores));
     }
 
     /// The bound is the *widest* source, not their sum: an operator fans out over one
@@ -2297,7 +3243,10 @@ mod tests {
         let small = vec![batch(&[1], &[1])];
         let large = vec![batch(&[1, 2, 3, 4], &[1, 2, 3, 4])];
         let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
-        assert_eq!(auto_width(&opts, &[small, large]), 4.min(cores));
+        assert_eq!(
+            auto_width(&opts, &[small, large], &no_media_plan()),
+            4.min(cores)
+        );
     }
 
     /// No sources (a literal-only plan) still needs one worker, never zero.
@@ -2307,8 +3256,57 @@ mod tests {
             parallelism: 0,
             ..ExecOptions::default()
         };
-        assert_eq!(auto_width(&opts, &[]), 1);
-        assert_eq!(auto_width(&opts, &[vec![]]), 1);
+        assert_eq!(auto_width(&opts, &[], &no_media_plan()), 1);
+        assert_eq!(auto_width(&opts, &[vec![]], &no_media_plan()), 1);
+    }
+
+    /// A media-decode plan lifts the morsel-count cap: its per-row decode is heavy and
+    /// parallelizes *inside* the morsel, so a corpus that is a single (tiny-encoded-bytes)
+    /// morsel must still get every core — not one. Without this, `read.images(decode=True)`
+    /// over a sub-morsel corpus decodes single-threaded.
+    #[test]
+    fn media_decode_plan_uses_all_cores_despite_single_morsel() {
+        use bc_expr::{Expr, ImageFunc};
+
+        let opts = ExecOptions {
+            parallelism: 0,
+            ..ExecOptions::default()
+        };
+        // One tiny source → one morsel → the cap would say 1 worker.
+        let one_morsel = &[vec![batch(&[1], &[1])]][..];
+        assert_eq!(auto_width(&opts, one_morsel, &no_media_plan()), 1);
+
+        // The same input under an image-decode projection: width jumps to all cores.
+        let decode = RelOp::Project {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            exprs: vec![ProjectionItem {
+                expr: Expr::Image {
+                    func: ImageFunc::ToTensor,
+                    input: Box::new(Expr::Col { name: "k".into() }),
+                    width: Some(224),
+                    height: Some(224),
+                    mean: None,
+                    std: None,
+                    channels_first: false,
+                },
+                alias: "img".into(),
+            }],
+        };
+        // "All cores" means the cores this process may actually *use*: `usable_cores` caps
+        // `available_parallelism` by the cgroup CPU quota. Asserting against the raw
+        // `available_parallelism` would pin the oversubscription this lift used to cause on a
+        // quota-throttled node — the media path is exactly where it hurts, since it lifts the
+        // morsel cap specifically to take every core.
+        assert_eq!(
+            auto_width(&opts, one_morsel, &decode),
+            bc_arrow::usable_cores()
+        );
+        // An explicit parallelism still wins over the media lift (control-plane decision).
+        let pinned = ExecOptions {
+            parallelism: 3,
+            ..ExecOptions::default()
+        };
+        assert_eq!(auto_width(&pinned, one_morsel, &decode), 3);
     }
 
     fn str_batch(vals: &[&str]) -> RecordBatch {
@@ -3260,6 +4258,8 @@ mod tests {
         }
 
         let plan = RelOp::Unnest {
+            outer: false,
+            index_alias: None,
             input: Box::new(RelOp::Scan { source_id: 0 }),
             column: "xs".into(),
             alias: "x".into(),
@@ -4325,11 +5325,22 @@ mod tests {
         }
     }
 
-    /// A heavily skewed join (one hot key dominating one bucket) must (a) produce
-    /// the same relation as the sequential oracle, and (b) actually take the skew
-    /// path (the over-large bucket spread across worker chunks).
+    /// A heavily skewed join over a *tiny* build side must produce the sequential oracle's
+    /// relation — and it now does so on the **shared-build** path, not the salted shuffle.
+    ///
+    /// That is the point, not a regression. Salting exists to rescue the shuffle: a hot key
+    /// sends all its rows to one bucket, and that bucket's join becomes a straggler. The
+    /// shared-build path never buckets anything — it holds one table and streams the probe
+    /// morsel by morsel, and morsels are independent — so a hot *probe* key cannot make a
+    /// straggler in the first place. Skew-immunity by construction beats skew-repair.
+    /// (Spreading a 3-row dimension table across 8 buckets was never going to help anyway.)
+    ///
+    /// Salting is still exercised where the shuffle still runs:
+    /// `skewed_join_with_string_keys_still_salts` (below) and
+    /// `skewed_right_join_matches_oracle_and_salts` (a `Right` join, which the streaming path
+    /// cannot serve — it must reconcile unmatched build rows across every morsel).
     #[test]
-    fn skewed_join_matches_oracle_and_salts() {
+    fn skewed_join_takes_the_shared_build_path_and_matches_the_oracle() {
         use bc_ir::{JoinOutputCol, JoinSide, JoinType};
 
         // Left: ~80k rows of the hot key (1) with unique values, plus a little cold
@@ -4371,6 +5382,75 @@ mod tests {
         let (out, metrics) = execute_parallel_with_metrics(&plan, &[left, right], &opts).unwrap();
 
         assert_eq!(rows(&oracle), rows(&out), "skewed join result mismatch");
+        let join_backend = metrics
+            .ops
+            .iter()
+            .find(|m| m.kind == "hash_join")
+            .map(|m| m.backend);
+        assert_eq!(
+            join_backend,
+            Some("interp-shared"),
+            "a tiny int64 build should be held as one table, not shuffled"
+        );
+    }
+
+    /// The salting machinery itself, still on an *inner* join: a `Utf8` key is a shape the
+    /// streaming path cannot serve (it fast-paths integer keys only), so this falls through to
+    /// the shuffle — where a hot key really does concentrate one bucket, and the salt is what
+    /// spreads it. Same relation as the sequential oracle, and the skew path actually taken.
+    #[test]
+    fn skewed_join_with_string_keys_still_salts() {
+        use arrow::array::StringArray;
+        use bc_ir::{JoinOutputCol, JoinSide, JoinType};
+
+        fn str_batch(keys: &[&str], vals: &[i64]) -> RecordBatch {
+            RecordBatch::try_from_iter(vec![
+                ("k", Arc::new(StringArray::from(keys.to_vec())) as ArrayRef),
+                ("v", Arc::new(Int64Array::from(vals.to_vec())) as ArrayRef),
+            ])
+            .unwrap()
+        }
+
+        let hot = SKEW_MIN_BUCKET_ROWS + 5_000;
+        let mut keys: Vec<&str> = vec!["hot"; hot];
+        keys.extend(["a", "b", "a", "b"]);
+        let vals: Vec<i64> = (0..keys.len() as i64).collect();
+        let left = vec![str_batch(&keys, &vals)];
+        let right = vec![str_batch(&["hot", "a", "b"], &[1000, 2000, 3000])];
+
+        let plan = RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: JoinType::Inner,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+
+        let oracle = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+        let opts = ExecOptions {
+            parallelism: 8,
+            ..ExecOptions::default()
+        };
+        let (out, metrics) = execute_parallel_with_metrics(&plan, &[left, right], &opts).unwrap();
+
+        assert_eq!(
+            rows(&oracle),
+            rows(&out),
+            "skewed string join result mismatch"
+        );
         let join_backend = metrics
             .ops
             .iter()

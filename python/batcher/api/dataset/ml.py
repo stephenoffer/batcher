@@ -26,6 +26,11 @@ if TYPE_CHECKING:
 __all__ = ["DatasetML"]
 
 
+def _public_operations() -> list[str]:
+    """The public method names on `DatasetML`, for `__repr__`/`__dir__`/did-you-mean."""
+    return [n for n, v in vars(DatasetML).items() if not n.startswith("_") and callable(v)]
+
+
 def _validate_concurrency(concurrency: int | tuple[int, int] | None) -> None:
     """Validate the `map_batches` actor-pool size (an int or a ``(min, max)`` tuple)."""
     if concurrency is None:
@@ -48,6 +53,62 @@ def _as_key_columns(key: str | list[str] | None) -> list[str] | None:
     if key is None:
         return None
     return [key] if isinstance(key, str) else list(key)
+
+
+def _require_column(ds: Dataset, column: str, *, param: str) -> None:
+    """Raise a `ColumnNotFoundError` naming the closest real column when `column` is absent.
+
+    Turns the deferred, opaque failure a wrong column name would otherwise cause deep in the
+    engine into an eager, actionable one at the API edge (``did you mean 'text'?``).
+    """
+    if column in ds.columns:
+        return
+    from batcher._internal.errors import ColumnNotFoundError, unknown_message
+
+    raise ColumnNotFoundError(
+        unknown_message("column", column, ds.columns, hint=f"Pass an existing column to {param}.")
+    )
+
+
+def _bind_fn(
+    fn: Callable | type,
+    fn_kwargs: dict | None,
+    fn_constructor_kwargs: dict | None,
+) -> Callable | type:
+    """Bind extra call / constructor kwargs onto `fn`, preserving load-once semantics.
+
+    `fn_kwargs` are forwarded to every batch call, `fn_constructor_kwargs` to a class's
+    one-per-worker construction (the Ray Data ``map_batches`` convention). A class stays a
+    class after binding, so the engine still loads the model once per worker rather than
+    per batch.
+    """
+    fkw = fn_kwargs or {}
+    ckw = fn_constructor_kwargs or {}
+    if ckw and not isinstance(fn, type):
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            "fn_constructor_kwargs only applies to a class fn (loaded once per worker); "
+            f"got {type(fn).__name__}. Pass a class, or move the values into fn_kwargs."
+        )
+    if not fkw and not ckw:
+        return fn
+    if isinstance(fn, type):
+        base = fn
+
+        class _BoundModel:
+            def __init__(self) -> None:
+                self._inner = base(**ckw)
+
+            def __call__(self, batch: object) -> object:
+                return self._inner(batch, **fkw)
+
+        _BoundModel.__name__ = f"Bound{base.__name__}"
+        _BoundModel.__qualname__ = _BoundModel.__name__
+        return _BoundModel
+    import functools
+
+    return functools.partial(fn, **fkw)
 
 
 def _warn_if_model_reloads(fn: object, num_gpus: float) -> None:
@@ -89,17 +150,45 @@ class DatasetML:
         """Bind the ML accessor to its `Dataset`; reached as `ds.ml`, not constructed directly."""
         self._ds = ds
 
+    def __repr__(self) -> str:
+        """``<ds.ml accessor: infer, embed, map_batches, ...>`` — a discoverable summary."""
+        ops = ", ".join(_public_operations())
+        return f"<ds.ml accessor: {ops}>"
+
+    def __dir__(self) -> list[str]:
+        """Expose the ML operations to ``dir()`` and editor autocompletion."""
+        return sorted(set(_public_operations()) | set(object.__dir__(self)))
+
+    def __getattr__(self, name: str) -> object:
+        """Raise an `AttributeError` with a "did you mean ...?" for an unknown operation.
+
+        Only reached when normal attribute lookup fails, so a real method never gets here.
+        A near-miss (``ds.ml.embedd``) is caught with a suggestion rather than a bare error.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        from batcher._internal.errors import suggestion
+
+        hint = suggestion(name, _public_operations())
+        tail = f" {hint}" if hint else ""
+        raise AttributeError(f"ds.ml has no operation {name!r}.{tail}")
+
     def map_batches(
         self,
         fn: Callable | type,
         *,
         batch_size: int | None = None,
+        input_columns: list[str] | None = None,
+        preserves_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
+        fn_kwargs: dict | None = None,
+        fn_constructor_kwargs: dict | None = None,
         accelerator_type: str | None = None,
+        resources: dict[str, float] | None = None,
         model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
@@ -163,6 +252,21 @@ class DatasetML:
         Args:
             fn: A function (or class/factory) applied to each batch.
             batch_size: Rebatch to this many rows before each call.
+            input_columns: The columns `fn` reads. Declaring them lets the optimizer prune
+                everything else out of the scan — an embedding stage over one column of a
+                41-column Parquet file otherwise reads all 41, because the engine cannot see
+                inside a Python function and must assume it reads anything. Omitting a column
+                the `fn` actually reads is a correctness bug, not a slow path: it will be
+                pruned out from under the function. Leave unset (the default) if unsure.
+            preserves_columns: The columns `fn` returns UNCHANGED — same name and same value
+                in every output row. Declaring them lets the optimizer push a later `filter`
+                that reads only these columns *below* the UDF, so the (often GPU) `fn` runs on
+                the surviving rows instead of every row — filtering 60% of the rows before
+                inference saves 60% of the inference work. This is a stronger claim than
+                `input_columns` (which says only what `fn` reads): naming a column the `fn`
+                actually rewrites is a correctness bug, not a slow path — a predicate would
+                then filter on the pre-UDF value and change the result. Leave unset (the
+                default) unless you are certain the `fn` leaves the column untouched.
             output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent per-batch calls within a worker (``"auto"``
                 sizes to the stage), or an explicit int.
@@ -170,7 +274,15 @@ class DatasetML:
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: What `fn` sees — ``"pyarrow"``, ``"numpy"``, ``"pandas"``,
                 or ``"torch"``.
-            accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
+            fn_kwargs: Extra keyword arguments forwarded to every ``fn(batch, ...)`` call
+                (the Ray Data convention).
+            fn_constructor_kwargs: Extra keyword arguments for a class `fn`'s
+                one-per-worker construction; invalid for a plain-function `fn`.
+            accelerator_type: Pin actors to a device model (e.g. ``"NVIDIA_A100"``).
+            resources: Custom Ray resources per worker, e.g. ``{"TPU": 4}`` or
+                ``{"neuron_cores": 2}``. `num_gpus` covers only what Ray reports as the
+                ``GPU`` resource (NVIDIA, AMD, Intel); every other accelerator — and any
+                resource defined on your own cluster — is named here instead.
             model_memory_gb: The model's footprint, for memory budgeting.
             multiprocessing: Run CPU-bound pure-Python calls across processes.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
@@ -193,13 +305,21 @@ class DatasetML:
                 {'x': [11, 12, 13]}
         """
         from batcher.ml.batch_format import FORMATS
+        from batcher.ml.devices import validate_batch_size, validate_num_gpus
         from batcher.ml.gpu import resolve_num_workers
 
         if batch_format not in FORMATS:
-            from batcher._internal.errors import PlanError
+            from batcher._internal.errors import PlanError, suggestion
 
-            raise PlanError(f"batch_format must be one of {FORMATS}, got {batch_format!r}")
+            hint = suggestion(str(batch_format), FORMATS)
+            tail = f" {hint}" if hint else ""
+            raise PlanError(
+                f"batch_format must be one of {sorted(FORMATS)}, got {batch_format!r}.{tail}"
+            )
+        validate_batch_size(batch_size)
+        validate_num_gpus(num_gpus)
         _validate_concurrency(concurrency)
+        fn = _bind_fn(fn, fn_kwargs, fn_constructor_kwargs)
         _warn_if_model_reloads(fn, num_gpus)
         cols = tuple(output_columns) if output_columns is not None else None
         return self._ds._derive(
@@ -208,11 +328,16 @@ class DatasetML:
                 fn,
                 batch_size,
                 cols,
+                input_columns=tuple(input_columns) if input_columns is not None else None,
+                preserves_columns=(
+                    tuple(preserves_columns) if preserves_columns is not None else None
+                ),
                 num_workers=resolve_num_workers(num_workers, num_gpus),
                 num_gpus=num_gpus,
                 concurrency=concurrency,
                 batch_format=batch_format,
                 accelerator_type=accelerator_type,
+                resources=tuple(sorted((resources or {}).items())),
                 model_memory_gb=model_memory_gb,
                 multiprocessing=multiprocessing,
                 max_errored_rows=max_errored_rows,
@@ -255,8 +380,9 @@ class DatasetML:
         """
         from batcher.api.dataset.callbacks import _RowMap
 
+        cols = tuple(output_columns) if output_columns is not None else None
         return self.map_batches(
-            _RowMap(fn),
+            _RowMap(fn, cols),
             batch_size=batch_size,
             output_columns=output_columns,
             num_workers=num_workers,
@@ -297,8 +423,9 @@ class DatasetML:
         """
         from batcher.api.dataset.callbacks import _RowFlatMap
 
+        cols = tuple(output_columns) if output_columns is not None else None
         return self.map_batches(
-            _RowFlatMap(fn),
+            _RowFlatMap(fn, cols),
             batch_size=batch_size,
             output_columns=output_columns,
             num_workers=num_workers,
@@ -314,9 +441,13 @@ class DatasetML:
         output_columns: list[str] | None = None,
         task: str | None = None,
         batch_size: int | None = None,
+        device: str | None = None,
+        dtype: str | None = None,
+        num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
+        model_kwargs: dict | None = None,
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
     ) -> Dataset:
@@ -344,9 +475,17 @@ class DatasetML:
             output_columns: The result schema when a callable/class is passed.
             task: The pipeline kind for a model id (inferred when omitted).
             batch_size: Rebatch to this many rows before each call.
+            device: Where the model runs (model-id path): ``"auto"``/``None`` detect the
+                accelerator, or force ``"cuda"``/``"cpu"``/``"mps"``.
+            dtype: Model precision (model-id path): ``"float16"``, ``"bfloat16"``,
+                ``"float32"``, or an abbreviation such as ``"fp16"``; auto when omitted.
+            num_workers: Concurrent per-batch calls within a worker (``"auto"`` sizes to
+                the stage), or an explicit int.
             num_gpus: GPUs to reserve per distributed worker.
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: What a callable `model` sees (``"pyarrow"`` by default).
+            model_kwargs: Extra keyword arguments for the model load (model-id path),
+                e.g. ``{"trust_remote_code": True}``.
             accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
             model_memory_gb: The model's footprint, for memory budgeting.
 
@@ -355,6 +494,7 @@ class DatasetML:
 
         Raises:
             PlanError: if a model id is given without `column`.
+            ColumnNotFoundError: if `column` is not in the dataset (model-id path).
 
         Examples:
             .. doctest::
@@ -370,10 +510,17 @@ class DatasetML:
                 from batcher._internal.errors import PlanError
 
                 raise PlanError("ds.ml.infer(<model id>) requires column= (the input column)")
+            _require_column(self._ds, column, param="column")
             from batcher.ml.inference import transformers_pipeline_encoder
 
             encoder = transformers_pipeline_encoder(
-                model, column, output_column=output_column, task=task
+                model,
+                column,
+                output_column=output_column,
+                task=task,
+                device=device,
+                dtype=dtype,
+                model_kwargs=tuple(sorted((model_kwargs or {}).items())),
             )
             cols = (
                 [*self._ds.columns, output_column]
@@ -384,6 +531,7 @@ class DatasetML:
                 encoder,
                 output_columns=cols,
                 batch_size=batch_size,
+                num_workers=num_workers,
                 num_gpus=num_gpus,
                 concurrency=concurrency,
                 accelerator_type=accelerator_type,
@@ -393,6 +541,7 @@ class DatasetML:
             model,
             batch_size=batch_size,
             output_columns=output_columns,
+            num_workers=num_workers,
             num_gpus=num_gpus,
             concurrency=concurrency,
             batch_format=batch_format,
@@ -658,10 +807,155 @@ class DatasetML:
             right_key=right_key,
         )
 
+    def nearest_neighbors(
+        self,
+        query: list[float],
+        *,
+        column: str = "embedding",
+        k: int = 10,
+        metric: str = "cosine",
+        distance_column: str = "distance",
+    ) -> Dataset:
+        """Return the `k` rows whose embedding is nearest to `query` (exact brute force).
+
+        The retrieval primitive for RAG / similarity lookup when there is **no index**:
+        every row's embedding is scored against the one `query` vector, and the `k` nearest
+        are kept, with their distance in `distance_column`. It is exact (unlike
+        `similarity_join`'s LSH recall trade-off) and composes the operators the engine
+        already has — a projected distance, a sort, and a limit — so it runs wherever a
+        sort runs, including distributed, and nothing is materialized on the driver.
+
+        For a large corpus queried repeatedly, build a real ANN index instead (see
+        `batcher.ml.build_vector_index` / `vector_search`); brute force is `O(n)` per query.
+
+        Args:
+            query: The query embedding as a list of floats. Its length must match the
+                stored vectors' dimension.
+            column: The embedding column to search (a list/tensor of floats).
+            k: How many nearest rows to return.
+            metric: ``"cosine"`` (default), ``"l2"`` (Euclidean), or ``"dot"`` (inner
+                product). ``cosine``/``l2`` rank by smallest distance; ``dot`` by largest.
+            distance_column: Name of the appended score column.
+
+        Returns:
+            A new `Dataset` of the `k` nearest rows, nearest first, with `distance_column`
+            appended.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"id": [1, 2, 3], "embedding": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]}
+                ... )
+                >>> hits = ds.ml.nearest_neighbors([1.0, 0.0], column="embedding", k=2)
+                >>> hits.to_pydict()["id"]
+                [1, 3]
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import array, col, lit
+
+        if k < 1:
+            raise PlanError(f"nearest_neighbors k must be >= 1, got {k}")
+        q = array(*[lit(float(x)) for x in query])
+        vec = col(column)
+        # cosine/l2 are distances (smaller = nearer); dot is a similarity (larger = nearer).
+        if metric == "cosine":
+            score, descending = vec.list.cosine_distance(q), False
+        elif metric == "l2":
+            score, descending = vec.list.l2_distance(q), False
+        elif metric == "dot":
+            score, descending = vec.list.dot(q), True
+        else:
+            raise PlanError(f"metric must be 'cosine', 'l2', or 'dot', got {metric!r}")
+        return (
+            self._ds.with_columns(**{distance_column: score})
+            .sort(distance_column, descending=descending)
+            .head(k)
+        )
+
+    def normalize_embeddings(self, column: str, *, output_column: str | None = None) -> Dataset:
+        """Unit-normalize an embedding column (L2 norm = 1), in the data plane.
+
+        The standard preprocessing before dot-product retrieval: on unit vectors the inner
+        product ranks identically to cosine similarity but skips the per-query norm, so it
+        is the cheap, index-friendly form. A zero vector stays zero (no divide-by-zero).
+        Runs as a native `.list.normalize()` projection — no per-row Python.
+
+        Args:
+            column: The embedding column (a list/tensor of floats).
+            output_column: Where to write the normalized vector; defaults to `column`
+                (in place).
+
+        Returns:
+            A new `Dataset` with the normalized embedding column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"emb": [[3.0, 4.0]]})
+                >>> ds.ml.normalize_embeddings("emb").to_pydict()
+                {'emb': [[0.6, 0.8]]}
+        """
+        from batcher.plan.expr_ir import col
+
+        out = output_column or column
+        return self._ds.with_columns(**{out: col(column).list.normalize()})
+
+    def similarity_to(
+        self,
+        query: list[float],
+        *,
+        column: str = "embedding",
+        metric: str = "cosine",
+        output_column: str = "score",
+    ) -> Dataset:
+        """Score every row's embedding against a fixed `query` vector (→ a new column).
+
+        The retrieval-scoring step without the top-k cut: use it to threshold, rerank, or
+        combine the score with other predicates before selecting. `nearest_neighbors` is
+        this plus a sort and a limit. Composes the native `.list` distance kernels, so it
+        runs wherever a projection runs, including distributed.
+
+        Args:
+            query: The query embedding as a list of floats (length must match the column).
+            column: The embedding column to score (a list/tensor of floats).
+            metric: ``"cosine"`` similarity (default), ``"dot"`` inner product, or ``"l2"``
+                (negative Euclidean distance, so larger is still nearer).
+            output_column: Name of the appended score column.
+
+        Returns:
+            A new `Dataset` with `output_column` appended (larger = more similar).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "emb": [[1.0, 0.0], [0.0, 1.0]]})
+                >>> out = ds.ml.similarity_to([1.0, 0.0], column="emb").to_pydict()
+                >>> round(out["score"][0], 4), round(out["score"][1], 4)
+                (1.0, 0.0)
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import array, col, lit
+
+        q = array(*[lit(float(x)) for x in query])
+        vec = col(column)
+        if metric == "cosine":
+            score = vec.list.cosine_similarity(q)
+        elif metric == "dot":
+            score = vec.list.dot(q)
+        elif metric == "l2":
+            score = vec.list.l2_distance(q) * -1.0  # negate so "larger = nearer" holds
+        else:
+            raise PlanError(f"metric must be 'cosine', 'dot', or 'l2', got {metric!r}")
+        return self._ds.with_columns(**{output_column: score})
+
     def stream_loader(
         self,
         *,
-        batch_size: int,
+        batch_size: int = 256,
         world_size: int = 1,
         rank: int = 0,
         epoch: int = 0,
@@ -670,6 +964,7 @@ class DatasetML:
         drop_last: bool = True,
         columns: list[str] | None = None,
         global_consumed: int = 0,
+        collate_fn: object = None,
     ):
         """Feed this dataset to one training rank as a `torch` ``IterableDataset``.
 
@@ -683,7 +978,7 @@ class DatasetML:
         authority. Requires `torch`. See `batcher.ml.stream_loader`.
 
         Args:
-            batch_size: Rows per yielded ``{column: tensor}`` batch.
+            batch_size: Rows per yielded ``{column: tensor}`` batch (256 by default).
             world_size: Total number of training ranks.
             rank: This rank's index in ``[0, world_size)``.
             epoch: Epoch number, folded into the shuffle so passes differ.
@@ -692,6 +987,9 @@ class DatasetML:
             drop_last: Drop the final partial global batch so ranks stay balanced.
             columns: The columns to yield as tensors; defaults to all.
             global_consumed: Samples already consumed, to resume from a checkpoint.
+            collate_fn: Custom collation over each rank batch's `pyarrow.Table`. Also the
+                escape hatch for columns that do not tensorize (string labels or ids),
+                which are otherwise dropped from the yielded batch.
 
         Returns:
             A `torch.utils.data.IterableDataset` yielding this rank's batches.
@@ -721,6 +1019,7 @@ class DatasetML:
             drop_last=drop_last,
             columns=columns,
             global_consumed=global_consumed,
+            collate_fn=collate_fn,
         )
 
     def iter_torch_batches(
@@ -729,12 +1028,15 @@ class DatasetML:
         batch_size: int | None = None,
         columns: list[str] | None = None,
         device: object = "auto",
+        dtypes: dict[str, str] | str | None = None,
         collate_fn: object = None,
-        prefetch_batches: int = 1,
+        prefetch_batches: int = 2,
         pin_memory: bool = False,
         zero_copy: bool = False,
         local_shuffle_buffer_size: int | None = None,
         seed: int = 0,
+        epoch: int = 0,
+        drop_last: bool = False,
     ):
         """Stream this dataset to PyTorch as ``{column: tensor}`` batches (lazy).
 
@@ -751,12 +1053,20 @@ class DatasetML:
             batch_size: Rows per yielded ``{column: tensor}`` batch.
             columns: The columns to yield as tensors; defaults to all.
             device: Target device (``"auto"`` picks the best accelerator, else CPU).
+            dtypes: Cast the tensors to a torch dtype — one name for all columns, or a
+                ``{column: dtype}`` mapping. Abbreviations (``"fp16"``) are accepted.
             collate_fn: Custom collation applied to each batch before yielding.
-            prefetch_batches: Batches to prepare ahead in the background.
+            prefetch_batches: Batches to prepare ahead in the background. The default of
+                2 overlaps the host-to-device copy with compute; past 4 the prefetched
+                batches cost more memory than the overlap is worth.
             pin_memory: Pin host buffers for faster host-to-device copies.
             zero_copy: Yield read-only DLPack views instead of copying.
             local_shuffle_buffer_size: Window size for local shuffling; None disables.
             seed: Seed for the local shuffle.
+            epoch: Epoch number, folded into the shuffle seed so successive passes over
+                the same dataset see different orders. Without it every epoch replays
+                one order, which silently degrades convergence.
+            drop_last: Drop a final short batch so every step sees `batch_size` rows.
 
         Yields:
             ``{column: tensor}`` batches on `device`.
@@ -777,13 +1087,193 @@ class DatasetML:
             batch_size=batch_size,
             columns=columns,
             device=device,
+            dtypes=dtypes,
             collate_fn=collate_fn,
             prefetch_batches=prefetch_batches,
             pin_memory=pin_memory,
             zero_copy=zero_copy,
             local_shuffle_buffer_size=local_shuffle_buffer_size,
             seed=seed,
+            epoch=epoch,
+            drop_last=drop_last,
         )
+
+    def to_torch(
+        self,
+        *,
+        batch_size: int | None = None,
+        columns: list[str] | None = None,
+        device: object = "auto",
+        dtypes: dict[str, str] | str | None = None,
+        **kwargs: object,
+    ):
+        """Stream this dataset to PyTorch tensor batches (alias of `iter_torch_batches`).
+
+        The shorter name PyTorch users reach for; every keyword of `iter_torch_batches`
+        is accepted and forwarded unchanged.
+
+        Args:
+            batch_size: Rows per yielded ``{column: tensor}`` batch.
+            columns: The columns to yield as tensors; defaults to all.
+            device: Target device (``"auto"`` detects an accelerator, else CPU).
+            dtypes: Cast tensors to a torch dtype (one name, or a ``{column: dtype}`` map).
+            **kwargs: Further `iter_torch_batches` keyword arguments.
+
+        Yields:
+            ``{column: tensor}`` batches on `device`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> for batch in ds.ml.to_torch(batch_size=256):  # doctest: +SKIP
+                ...     train_step(batch)
+        """
+        return self.iter_torch_batches(
+            batch_size=batch_size, columns=columns, device=device, dtypes=dtypes, **kwargs
+        )
+
+    def to_torch_dataloader(
+        self,
+        *,
+        batch_size: int | None = None,
+        columns: list[str] | None = None,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        drop_last: bool = False,
+        shuffle: bool = False,
+        collate_fn: object = None,
+        local_shuffle_buffer_size: int | None = None,
+        **dataloader_kwargs: object,
+    ):
+        """Return a ready-to-iterate ``torch.utils.data.DataLoader`` over this dataset.
+
+        Batching happens in the engine (one Arrow batch is one training batch), so the
+        loader is built with ``batch_size=None`` and streams ready ``{column: tensor}``
+        dicts. `num_workers`, `pin_memory`, and further ``DataLoader`` keywords pass
+        straight through; `shuffle` sets a `local_shuffle_buffer_size` window when one is
+        not given (a streaming approximation of a full shuffle). Requires `torch`.
+
+        Args:
+            batch_size: Rows per training batch (engine default when None).
+            columns: The columns to yield as tensors; defaults to all.
+            num_workers: PyTorch DataLoader worker processes (0 loads in-process).
+            pin_memory: Page-lock host buffers for faster host-to-device copies.
+            drop_last: Drop a final short batch so every step sees `batch_size` rows.
+            shuffle: Locally shuffle rows before batching when no explicit
+                `local_shuffle_buffer_size` is given.
+            collate_fn: Custom collation over each ``{column: ndarray}`` batch.
+            local_shuffle_buffer_size: Explicit local-shuffle window; overrides `shuffle`.
+            **dataloader_kwargs: Further ``DataLoader`` keyword arguments.
+
+        Returns:
+            A ``torch.utils.data.DataLoader`` yielding ``{column: torch.Tensor}`` batches.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> loader = ds.ml.to_torch_dataloader(  # doctest: +SKIP
+                ...     batch_size=256, num_workers=4, pin_memory=True
+                ... )
+                >>> for batch in loader:  # doctest: +SKIP
+                ...     train_step(batch)
+        """
+        from torch.utils.data import DataLoader, IterableDataset
+
+        from batcher.ml.converters import _worker_stride
+
+        window = local_shuffle_buffer_size
+        if window is None and shuffle:
+            window = 8192
+        accessor = self
+
+        def _make_stream() -> object:
+            return accessor.iter_torch_batches(
+                batch_size=batch_size,
+                columns=columns,
+                device="cpu",
+                collate_fn=collate_fn,
+                drop_last=drop_last,
+                local_shuffle_buffer_size=window,
+            )
+
+        class _StreamDataset(IterableDataset):  # type: ignore[misc]
+            # Re-iterable (one fresh engine stream per epoch) and worker-strided, so
+            # DataLoader(num_workers=k) partitions the batches instead of replicating the
+            # whole stream into every worker — the classic IterableDataset duplication bug.
+            def __iter__(self) -> object:
+                offset, stride = _worker_stride()
+                for i, batch in enumerate(_make_stream()):
+                    if i % stride == offset:
+                        yield batch
+
+        return DataLoader(
+            _StreamDataset(),
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            **dataloader_kwargs,
+        )
+
+    def to_tf(
+        self,
+        *,
+        batch_size: int | None = None,
+        columns: list[str] | None = None,
+    ):
+        """Stream this dataset to a ``tf.data.Dataset`` of ``{column: tensor}`` batches.
+
+        The TensorFlow counterpart of `to_torch`, built over the public batch iterator so
+        nothing materializes. Non-numeric columns are dropped. Requires `tensorflow`.
+
+        Args:
+            batch_size: Rows per yielded batch (engine default when None).
+            columns: The columns to keep; defaults to all numeric columns.
+
+        Returns:
+            A ``tf.data.Dataset`` yielding one ``{column: tensor}`` dict per batch.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> tf_ds = ds.ml.to_tf(batch_size=256)  # doctest: +SKIP
+                >>> model.fit(tf_ds)  # doctest: +SKIP
+        """
+        from batcher.ml.converters import to_tf_dataset
+
+        return to_tf_dataset(self._ds.iter_batches(batch_size), columns=columns)
+
+    def to_numpy_batches(
+        self,
+        *,
+        batch_size: int | None = None,
+        columns: list[str] | None = None,
+    ):
+        """Stream this dataset as ``{column: np.ndarray}`` dicts, one per batch (lazy).
+
+        Numeric non-null columns convert zero-copy. The framework-agnostic loader for a
+        custom training loop or a NumPy pipeline.
+
+        Args:
+            batch_size: Rows per yielded batch (engine default when None).
+            columns: The columns to keep; defaults to all.
+
+        Yields:
+            One ``{column: np.ndarray}`` dict per batch.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> next(ds.ml.to_numpy_batches(batch_size=2))
+                {'x': array([1, 2])}
+        """
+        from batcher.ml.converters import to_numpy_batches
+
+        return to_numpy_batches(self._ds.iter_batches(batch_size), columns=columns)
 
     def generate(
         self,
@@ -1046,11 +1536,16 @@ class DatasetML:
         output_column: str = "embedding",
         output_columns: list[str] | None = None,
         batch_size: int | None = None,
+        device: str | None = None,
+        num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
+        normalize: bool = False,
+        fp16: bool = False,
+        output_type: str = "tensor",
     ) -> Dataset:
         """Compute embeddings over the dataset — `infer` shaped for embedding models.
 
@@ -1073,17 +1568,28 @@ class DatasetML:
             output_column: Name of the appended embedding column (model-id path).
             output_columns: The result schema when a callable/class is passed.
             batch_size: Rebatch to this many rows before each call.
+            device: Where the encoder runs (model-id path): ``"auto"``/``None`` detect the
+                accelerator, or force ``"cuda"``/``"cpu"``/``"mps"``.
+            num_workers: Concurrent per-batch calls within a worker (``"auto"`` sizes to
+                the stage), or an explicit int.
             num_gpus: GPUs to reserve per distributed worker.
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: What a callable `model` sees (``"pyarrow"`` by default).
             accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
             model_memory_gb: The model's footprint, for memory budgeting.
+            normalize: L2-normalize each vector in the producing pass (model-id path).
+                Cosine search needs normalized vectors, and doing it here avoids a second
+                full scan over the embedding column.
+            fp16: Run the encoder in half precision on GPU; ignored on CPU.
+            output_type: ``"tensor"`` (default) or ``"fixed_size_list"``, which is what
+                Lance ANN indexing expects.
 
         Returns:
             A new lazy `Dataset` with the embedding column(s) appended.
 
         Raises:
             PlanError: if a model id is given without `column`.
+            ColumnNotFoundError: if `column` is not in the dataset (model-id path).
 
         Examples:
             .. doctest::
@@ -1099,9 +1605,19 @@ class DatasetML:
                 from batcher._internal.errors import PlanError
 
                 raise PlanError("ds.ml.embed(<model id>) requires column= (the text column)")
+            _require_column(self._ds, column, param="column")
             from batcher.ml.embed import sentence_transformer_encoder
 
-            encoder = sentence_transformer_encoder(model, column, output_column=output_column)
+            encoder = sentence_transformer_encoder(
+                model,
+                column,
+                output_column=output_column,
+                device=device,
+                batch_size=batch_size,
+                normalize=normalize,
+                fp16=fp16,
+                output_type=output_type,
+            )
             cols = (
                 [*self._ds.columns, output_column]
                 if output_column not in self._ds.columns
@@ -1111,6 +1627,7 @@ class DatasetML:
                 encoder,
                 output_columns=cols,
                 batch_size=batch_size,
+                num_workers=num_workers,
                 num_gpus=num_gpus,
                 concurrency=concurrency,
                 accelerator_type=accelerator_type,
@@ -1120,6 +1637,7 @@ class DatasetML:
             model,
             batch_size=batch_size,
             output_columns=output_columns,
+            num_workers=num_workers,
             num_gpus=num_gpus,
             concurrency=concurrency,
             batch_format=batch_format,

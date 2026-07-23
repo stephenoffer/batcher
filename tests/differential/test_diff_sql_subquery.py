@@ -20,6 +20,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -72,8 +73,6 @@ def tables(duck):
     ],
 )
 def test_sql_subquery_vs_duckdb(duck, tables, query):
-    from conftest import assert_same
-
     emp, dept = tables
     out = bt.sql(query, emp=emp, dept=dept).collect()
     assert_same(out, duck.sql(query))
@@ -90,8 +89,6 @@ def test_correlated_subquery_raises(tables):
 
 
 def test_correlated_scalar_subquery_vs_duckdb(duck, tables):
-    from conftest import assert_same
-
     emp, dept = tables
     # Correlated scalar subquery is now supported and matches DuckDB.
     query = (
@@ -117,8 +114,6 @@ def test_correlated_scalar_subquery_vs_duckdb(duck, tables):
 )
 def test_aggregating_scalar_subquery_in_aggregate_query(duck, tables, query):
     """A scalar subquery that aggregates must not corrupt the enclosing aggregate query."""
-    from conftest import assert_same
-
     emp, dept = tables
     assert_same(bt.sql(query, emp=emp, dept=dept).collect(), duck.sql(query))
 
@@ -162,8 +157,6 @@ def tpch_like(duck):
     ],
 )
 def test_unqualified_correlated_subquery_vs_duckdb(duck, tpch_like, query):
-    from conftest import assert_same
-
     orders, lineitem, part = tpch_like
     out = bt.sql(query, orders=orders, lineitem=lineitem, part=part).collect()
     assert_same(out, duck.sql(query))

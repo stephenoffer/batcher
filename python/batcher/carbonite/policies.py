@@ -31,6 +31,7 @@ __all__ = [
     "DefaultSchedulingPolicy",
     "StaticCreditFlowControl",
     "credit_ceiling",
+    "learned_channel_morsel_bytes",
     "load_shuffle_window",
     "record_shuffle_window",
 ]
@@ -158,11 +159,44 @@ def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) ->
     fc = config.flow_control
     count_ceiling = fc.default_credits * fc.credit_ceiling_factor
     morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
-    byte_ceiling = max(1, fc.credit_byte_budget // morsel_bytes)
+    byte_ceiling = max(1, _channel_byte_budget(config) // morsel_bytes)
     return max(1, min(count_ceiling, byte_ceiling))
 
 
-def _learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
+#: Share of the machine's memory the *whole* shuffle may hold in flight across all its
+#: concurrent channels. Deliberately small: this buffer is pure transit, competing with the
+#: build tables and aggregate state that are the query's actual working set, and a shuffle
+#: that stalls for credit is slow while one that OOMs the node is fatal.
+_SHUFFLE_BUFFER_FRACTION = 0.10
+
+
+def _channel_byte_budget(config: Config) -> int:
+    """The per-channel buffered-byte budget: the configured cap, held under a share of the
+    memory this machine actually has.
+
+    `credit_byte_budget` is a fixed 256 MiB per channel, and `shuffle_fetch_fan_in` channels
+    fetch at once — up to 8 GiB in flight on the defaults. That is unremarkable on a 512 GiB
+    node and more than half the RAM of a 16 GiB one, and nothing in the credit path had ever
+    read how much memory exists: the admission path is memory-aware (`BudgetingAdmission`),
+    the backpressure path was not, so a node could be admitted for a query and then OOM'd by
+    the transit buffers carrying it.
+
+    Caps only — it never raises the configured budget, so an operator who tuned this down
+    keeps their value and the change can only ever buffer *less* than before.
+    """
+    fc = config.flow_control
+    configured = fc.credit_byte_budget
+    total = total_memory_bytes()
+    if total <= 0:
+        return configured
+    fan_in = max(1, fc.shuffle_fetch_fan_in)
+    headroom_per_channel = int(total * _SHUFFLE_BUFFER_FRACTION) // fan_in
+    # Floor at one morsel: a tiny container still has to be able to move one batch, and a
+    # zero budget here would collapse the window to a single credit and deadlock progress.
+    return max(config.execution.morsel_bytes, min(configured, headroom_per_channel))
+
+
+def learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
     """A channel's effective per-batch bytes from the learned row width, or `None`.
 
     The credit→bytes conversion assumes a `morsel_bytes`-sized batch; a workload whose
@@ -197,7 +231,7 @@ class StaticCreditFlowControl:
 
     def grant(self, requested: int, ctx: ResourceContext) -> int:
         fc = ctx.config.flow_control
-        ceiling = credit_ceiling(ctx.config, _learned_channel_morsel_bytes(ctx))
+        ceiling = credit_ceiling(ctx.config, learned_channel_morsel_bytes(ctx))
         if requested <= 0:
             return min(fc.default_credits, ceiling)
         return min(max(requested, 1), ceiling)
@@ -209,24 +243,45 @@ class StaticCreditFlowControl:
 # round, which would serialize the shuffle.
 _MIN_AIMD_BETA = 0.1
 _MAX_AIMD_BETA = 0.95
+# Slow-start multiplier: while a channel has never hit congestion, the window *doubles*
+# each headroom-to-spare round (TCP slow-start) instead of crawling up `+alpha`/RTT. A
+# cross-node shuffle's throughput ceiling is `window x batch / RTT`, so on a high-RTT link
+# a window that starts at `default_credits` (4) and grows `+1`/RTT reaches a BDP-filling
+# ~64 credits only after ~60 round trips — long after a short shuffle has finished, so it
+# runs the whole transfer memory-safe but bandwidth-starved. Doubling reaches the same
+# ceiling in ~log2 rounds (4->8->16->32->64 = 4 RTTs), then the first congestion switches
+# to additive-increase / multiplicative-decrease (congestion avoidance). Purely the
+# window's *ramp*: same ceiling, same backoff, so the memory bound and results are
+# unchanged.
+_SLOW_START_FACTOR = 2
 
 
 class AIMDFlowControl:
-    """Adaptive credit window via AIMD (additive-increase / multiplicative-decrease).
+    """Adaptive credit window via AIMD with TCP-style slow-start.
 
     The static policy fixes the window; this one *adapts* it from observed
     backpressure, the TCP-style control law the architecture specifies. It starts at
     the config default window and, per round, `observe`s whether the channel was
-    congested: a congested round cuts the window by `aimd_beta` (relieve memory
-    pressure fast), an uncongested round grows it by `aimd_alpha` (pipeline deeper
-    while memory is plentiful). The window is always clamped to the same memory-safe
-    band `[1, default_credits x credit_ceiling_factor]` the static policy uses.
+    congested. While it has never congested it is in **slow-start** — a headroom round
+    *doubles* the window (`_SLOW_START_FACTOR`) so it fills the bandwidth-delay product
+    in ~log2 rounds rather than crawling up `+alpha`/RTT. The first congestion exits
+    slow-start into classic AIMD: a congested round cuts by `aimd_beta` (relieve memory
+    pressure fast), a headroom round grows by `aimd_alpha` (pipeline deeper while memory
+    is plentiful). The window is always clamped to the same memory-safe band
+    `[1, default_credits x credit_ceiling_factor]` the static policy uses, so slow-start
+    can never exceed the byte-bounded ceiling.
 
     Stateful — hold one per adaptive channel. `grant` ignores its `requested`
     argument because the controller, not the caller, owns the evolving window.
     """
 
-    def __init__(self, config: Config | None = None, *, initial_window: int | None = None) -> None:
+    def __init__(
+        self,
+        config: Config | None = None,
+        *,
+        initial_window: int | None = None,
+        effective_morsel_bytes: int | None = None,
+    ) -> None:
         cfg = config or active_config()
         fc = cfg.flow_control
         self._alpha = max(1, fc.aimd_alpha)
@@ -236,13 +291,20 @@ class AIMDFlowControl:
         # Clamped rather than raised: flow control must never fail a query on a tunable.
         self._beta = min(max(fc.aimd_beta, _MIN_AIMD_BETA), _MAX_AIMD_BETA)
         self._floor = 1
-        self._ceiling = credit_ceiling(cfg)  # count + byte bound (C53)
+        # `effective_morsel_bytes` carries the learned wide-row width (embeddings/blobs) so the
+        # ceiling's *byte* bound (`credit_byte_budget`) is honored on this adaptive path exactly
+        # as it is on the static grant — otherwise AIMD would grow the window to the un-corrected
+        # count ceiling and a fast producer would buffer far past the byte budget (C53).
+        self._ceiling = credit_ceiling(cfg, effective_morsel_bytes)  # count + byte bound (C53)
         # A recurring shuffle warm-starts at the window its past runs converged to
         # (`initial_window`, learned per shuffle signature) instead of re-climbing from
         # `default_credits` every time — the AIMD control law still governs from there,
-        # so the window a channel actually uses is unchanged, only its starting point.
+        # so the window a channel actually uses is unchanged, only its starting point. A
+        # warm-started channel skips slow-start: its window already reflects a prior run's
+        # congestion, so exponential ramp from there would overshoot the learned value.
         start = fc.default_credits if initial_window is None else initial_window
         self._window: float = float(min(max(start, self._floor), self._ceiling))
+        self._slow_start = initial_window is None
 
     @property
     def window(self) -> int:
@@ -252,15 +314,42 @@ class AIMDFlowControl:
     def grant(self, requested: int, ctx: ResourceContext) -> int:  # noqa: ARG002
         return self.window
 
+    def rewindow(self, credits: int) -> int:
+        """Restart the window at a new grant — a reused channel now serving a *different* query.
+
+        A warm shuffle fleet outlives the query that spawned it, and `set_grant` re-grants each
+        worker for the query about to borrow it. Under adaptive credits that re-grant had
+        nowhere to land: the controller owns the window, so the new grant was dropped and the
+        fleet kept the window it had converged to for the *previous* query — the very
+        stale-grant regression (`0.6 s -> 3.2 s` on TPC-H sf10) that `set_grant` exists to
+        prevent, reintroduced on the default path.
+
+        Leaves slow-start off, exactly as a warm `initial_window` does: the grant already
+        reflects a real estimate, so an exponential ramp from it would overshoot.
+
+        Args:
+            credits: The new grant (1 credit = 1 in-flight batch), clamped to the band.
+
+        Returns:
+            The new current window.
+        """
+        self._window = float(min(max(credits, self._floor), self._ceiling))
+        self._slow_start = False
+        return self.window
+
     def observe(self, *, congested: bool) -> int:
         """Update the window from one round's congestion signal; return the new window.
 
         `congested` is true when the round hit backpressure (e.g. the producer ran
-        the window full, or memory pressure was high): cut multiplicatively. Else the
-        consumer kept up with headroom to spare: grow additively.
+        the window full, or memory pressure was high): cut multiplicatively and leave
+        slow-start. Else the consumer kept up with headroom to spare: double the window
+        in slow-start, otherwise grow additively.
         """
         if congested:
             self._window = max(self._floor, self._window * self._beta)
+            self._slow_start = False
+        elif self._slow_start:
+            self._window = min(self._ceiling, self._window * _SLOW_START_FACTOR)
         else:
             self._window = min(self._ceiling, self._window + self._alpha)
         return self.window
@@ -318,6 +407,41 @@ class DefaultSchedulingPolicy:
     by the manager from its flow-control policy.
     """
 
+    @staticmethod
+    def gpu_envelope(*, num_gpus: float, n_tasks: int, gpu_count: int) -> SchedulingEnvelope:
+        """Budget a GPU map/inference stage against the GPUs that actually exist.
+
+        The relational `envelope` below is the CPU shuffle grant and correctly requests no
+        GPU. This closes the gap that GPU demand previously reached Ray *only* as the raw
+        `map_batches(num_gpus=)` tag, so Carbonite — the layer that decides feasibility —
+        never saw it, and an infeasible request hung instead of erroring. The grant is
+        clamped to inventory: `gpu_count / num_gpus` tasks can hold a GPU at once, and a
+        cluster reporting no GPUs gets no GPU grant (the stage runs on CPU rather than
+        pending forever). Fractional `num_gpus` is preserved — packing four 0.25-GPU
+        actors onto one device is the point of a fractional request.
+
+        There is deliberately no VRAM envelope yet: the analogue of the RAM grant needs a
+        `gpu_memory_bytes` field on `SchedulingEnvelope` in the neutral `plan` layer, and
+        that contract change belongs in the same commit as its consumer.
+
+        Args:
+            num_gpus: GPUs requested per task, fractional allowed.
+            n_tasks: The desired worker fan-out before GPU clamping.
+            gpu_count: GPU devices the cluster/host reports.
+
+        Returns:
+            A `SchedulingEnvelope` whose GPU grant is feasible against the inventory.
+        """
+        if num_gpus <= 0 or gpu_count <= 0:
+            # No GPU visible (or none asked for): grant none. Asking for a GPU the
+            # cluster does not have makes the task permanently unschedulable.
+            return SchedulingEnvelope(num_gpus=0.0, n_tasks=max(1, n_tasks))
+        concurrent = max(1, int(gpu_count / num_gpus))
+        return SchedulingEnvelope(
+            num_gpus=num_gpus,
+            n_tasks=max(1, min(n_tasks, concurrent)),
+        )
+
     def envelope(
         self,
         plan: PhysicalPlan,
@@ -355,7 +479,12 @@ class DefaultSchedulingPolicy:
         # grant instead of one sized from the plan guess; cold families pass through.
         model = ctx.memory_model
         peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
-        morsel_bytes = max(1, cfg.execution.morsel_rows * cfg.optimizer.row_bytes)
+        # The configured value, not `morsel_rows * row_bytes`. The two agree only at the
+        # defaults (16,384 x 64 == 1 MiB); `ResourceManager.adapted_config` rewrites
+        # `morsel_rows` (from the learned per-row width) and `morsel_bytes` (from the
+        # pressure factor) *independently*, so after any adaptive resize the derivation
+        # drifts from the real morsel — and this value is the per-task memory floor below.
+        morsel_bytes = max(1, cfg.execution.morsel_bytes)
         if peak <= 0:
             # Kyber could not size the plan — a cold start, an unbounded source, or a
             # shape its estimator abstained on. Granting 0 here leaves each worker's

@@ -20,9 +20,9 @@ import dataclasses
 import functools
 import json
 import os
+import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 __all__ = [
     "CardinalityConfig",
@@ -54,6 +54,7 @@ _ENGINE_CONFIG_FIELDS = (
     "spill_compression",
     "fuse_linear",
     "shrink_output_dtypes",
+    "streaming",
     # Performance-threshold knobs (mirror `bc_arrow::RuntimeTuning`).
     "bloom_fp_rate",
     "bloom_min_build_rows",
@@ -142,6 +143,18 @@ class ExecutionConfig:
     # untouched) and is a measured win on linear pipelines with no regression elsewhere.
     # Set to False to pin the staged operator-at-a-time path.
     fuse_linear: bool = True
+    #: Run plans on the **streaming** executor: pull morsels through the linear runs and
+    #: materialize only at breakers, instead of collecting every operator's full output.
+    #: Peak memory becomes a constant (the breakers' state plus one morsel per worker) rather
+    #: than the sum of every intermediate — which is why TPC-H sf100's deep join trees peaked at
+    #: 133 GB and were OOM-killed — and on those shapes it is also *faster*, because the copies
+    #: it stops making were not free. Shipped to Rust as `EngineConfig.streaming`.
+    #:
+    #: The streaming breakers fold in memory rather than spilling, so one whose state exceeds
+    #: `memory.max_memory_bytes` hands the query back and it is re-run on the materializing
+    #: executor, which spills. Set False to force that executor for every query — a bisecting
+    #: escape hatch, not a tuning knob.
+    streaming: bool = True
     # Re-narrow output columns to their source numeric width. The FFI widens narrow
     # numerics (Int8/16/32, Float16/32) to Int64/Float64 once on input so every kernel
     # stays on two well-tested paths; with this on, an output column that is a
@@ -233,6 +246,11 @@ class MemoryConfig:
     # LZ4 for strings/mixed; "lz4"/"zstd"/None force one codec. Spilled data is
     # transient, so this only trades CPU for disk I/O and footprint at scale
     # (result-invariant — IPC self-describes its compression).
+    #
+    # `spill_local_budget_bytes` is `None` (auto: derived from measured free disk),
+    # a positive byte cap, or `0` — no local scratch, so every bucket overflows
+    # straight to `spill_remote_uri` (the "local disk already full" tier, e.g. a
+    # node with no usable NVMe). `0` without a remote URI keeps everything local.
     spill_dir: str | None = None
     spill_remote_uri: str | None = None
     spill_local_budget_bytes: int | None = None
@@ -304,15 +322,25 @@ class FlowControlConfig:
 
             >>> from batcher.config import FlowControlConfig
             >>> FlowControlConfig().default_credits
-            4
+            16
     """
 
-    # Credit window (in-flight RecordBatch slots) when the operator has no estimate.
-    # One credit = one buffered batch, so this bounds a shuffle channel's memory.
-    # Carbonite is the authority that supplies it, and clamps any per-operator
-    # request to `default_credits x ceiling`. Shipped to Rust as `EngineConfig`.
-    default_credits: int = 4
-    credit_ceiling_factor: int = 16  # max window = default_credits x this
+    # Credit window (in-flight RecordBatch slots) a shuffle channel *starts* at when the
+    # operator has no learned estimate. One credit = one buffered batch, so this bounds a
+    # channel's memory; the AIMD controller then slow-starts it up to the bandwidth-delay
+    # product and holds it there. A cross-node fetch's throughput is `window x batch / RTT`,
+    # so the start matters most for the first/short fetches AIMD can't yet have ramped:
+    # measured on a 50 ms-RTT link, a single 18 MiB partition transfers at 2.4 MiB/s at 4
+    # credits vs 7.7 MiB/s at 16 (3.2x) — the old default of 4 throttled every cross-node
+    # shuffle's opening rounds. 16 credits is ~16 MiB/channel of narrow-row buffering (the
+    # byte ceiling below re-shrinks it for wide rows), well within the per-channel budget.
+    # Carbonite is the authority that supplies it, and clamps any per-operator request to
+    # `default_credits x ceiling`. Shipped to Rust as `EngineConfig`.
+    default_credits: int = 16
+    # Max window = default_credits x this. Kept so the ceiling (16 x 4 = 64 credits ≈ 64
+    # MiB/channel of narrow rows) is unchanged from the historical `4 x 16`; only the
+    # *starting* window rose, not the memory ceiling.
+    credit_ceiling_factor: int = 4
     # Byte ceiling for one shuffle channel's credit window (C53). A credit ≈ one
     # `morsel_bytes` batch, so a count-only ceiling can buffer GBs for wide rows
     # (embeddings, blobs). The granted window is also clamped to
@@ -324,6 +352,17 @@ class FlowControlConfig:
     # reduce becomes a tree of combiner stages (depth log_fan_in(workers)), so
     # per-node fan-in stays bounded as the cluster grows to many thousands.
     shuffle_fan_in: int = 8
+    # Max mapper buckets a *flat* gather (join / sort / window reduce) streams at once.
+    # Distinct from `shuffle_fan_in` above, which bounds the aggregate's combiner-TREE
+    # depth so a node never *folds* more than that many partials. A flat gather has no
+    # tree: the reducer concatenates every mapper's bucket and therefore holds all of it
+    # regardless, so throttling the fetch to the tree's fan-in buys no memory — it only
+    # serializes the network. At the old shared value of 8, a 16-worker cluster pulled its
+    # buckets in two half-idle waves and a reducer's fetch ran at ~39 MB/s. In-flight
+    # memory stays bounded by the per-channel credit window (`credit_byte_budget`), which
+    # is the actual buffering governor; this only caps how many peers are dialed at once,
+    # so a thousand-mapper shuffle still can't open a thousand sockets.
+    shuffle_fetch_fan_in: int = 32
     aimd_alpha: int = 1  # additive increase: +1 credit / RTT
     aimd_beta: float = 0.5  # multiplicative decrease on congestion
     backpressure_high: float = 0.70
@@ -332,8 +371,10 @@ class FlowControlConfig:
 
 @dataclass(frozen=True, slots=True)
 class CardinalityConfig:
-    """Selinger-style defaults the cardinality estimator falls back to before
-    anything is learned. Superseded by learned/sketch values when present.
+    """Selinger-style defaults the cardinality estimator falls back to.
+
+    Cold-start values only: superseded by learned/sketch statistics once a query has run
+    and the measured selectivities are available.
 
     Examples:
         .. doctest::
@@ -370,7 +411,16 @@ class CardinalityConfig:
 @dataclass(frozen=True, slots=True)
 class CostWeights:
     """Relative importance of each axis when collapsing `Cost` to a scalar.
-    WS9 swaps these per query to honor latency/cost/throughput targets."""
+
+    Swapped per query to honor a latency / cost / throughput target.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import CostWeights
+            >>> CostWeights().net  # a shuffled byte costs twice a local one
+            2.0
+    """
 
     cpu: float = 1.0
     io: float = 1.0
@@ -379,8 +429,17 @@ class CostWeights:
 
 @dataclass(frozen=True, slots=True)
 class CostCoefficients:
-    """Per-unit costs. Constants today; calibrated from measured `op_stats` later.
-    All values are in abstract, mutually-comparable "work units" per row/byte."""
+    """Per-unit costs, in abstract, mutually-comparable "work units" per row or byte.
+
+    Constants today; calibrated from measured `op_stats` later.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import CostCoefficients
+            >>> CostCoefficients().hash_build_row  # inserting costs twice a probe
+            2.0
+    """
 
     scan_row: float = 1.0
     filter_row: float = 0.5
@@ -436,7 +495,10 @@ class OptimizerConfig:
     # take the max of the row- and byte-derived fan-out, so a few wide rows (GB
     # videos, embeddings) still shard finely enough to fit memory. ~target_rows × 64.
     target_bytes_per_task: int = 256 * 1024 * 1024  # 256 MiB
-    fixpoint_iterations: int = 8  # max rewrite-phase iterations before bailing
+    # Floor on rewrite-phase iterations. The effective bound is `max(this, plan_depth + 4)`:
+    # pushdown descends one level per iteration, so the distance to a fixpoint scales with plan
+    # depth (`kyber.optimizer._fixpoint_bound`). A convergent phase still exits early.
+    fixpoint_iterations: int = 8
     row_bytes: int = 64  # per-row footprint for the memory-budgeting estimate
     # `split_expensive_filter`: the engine's `and` evaluates BOTH operands over every
     # row (no short-circuit, no selection vector), so a conjunction pairing a cheap
@@ -454,7 +516,30 @@ class OptimizerConfig:
     # distributed executor's *runtime* guard read this one value: if the materialized
     # build side actually exceeds it (the estimate was wrong), the executor falls back
     # to a shuffle join instead of OOMing the driver by replicating an over-large side.
-    broadcast_max_bytes: int = 10 * 1024 * 1024  # 10 MiB
+    #
+    # Sized to *cache*, not to memory. A broadcast join builds ONE hash table and probes
+    # it from every core, so each probe row is a random access into it: the strategy wins
+    # only while that table stays cache-resident. Past it, the partitioned (shuffle) join
+    # wins, because each of its buckets probes a small, L2-resident table instead. TPC-H
+    # sf1 measures the crossover between 4 and 10 MiB (q3's 4.4 MB build over a 3.2M-row
+    # probe: 52 ms partitioned vs 83 ms broadcast), so the table — not the machine's RAM —
+    # is what this bounds.
+    #
+    # NOTE: this is a *true* byte size. It was previously read against a flat 64 B/row
+    # width estimate that over-sized narrow relations ~4x (a two-`int64` key costed as
+    # 64 B/row, not 16), so the effective threshold was ~4x smaller than its nominal
+    # 10 MiB. `plan.types.widths` now makes the width type-exact; this value is the
+    # recalibrated equivalent.
+    # `0` (the default) means **detect it from the last-level cache** — see
+    # `resolved_broadcast_max_bytes`. A positive value pins the threshold, for a machine whose
+    # cache the probe cannot read (a non-Linux host) or to deliberately force a strategy.
+    broadcast_max_bytes: int = 0
+    # The shuffle volume below which co-locating (PACK) a small shuffle's workers beats
+    # spreading them — a *network* decision, split out from `broadcast_max_bytes` which is a
+    # *cache* decision. The two shared one knob, so an L3-sized broadcast threshold would have
+    # silently moved a placement choice with it; they answer different questions and now have
+    # different homes. Kept at the historical 4 MiB so placement behavior is unchanged.
+    locality_max_bytes: int = 4 * 1024 * 1024  # 4 MiB
     # Static blend weight, NOT an EWMA rate: how far a *single* decision moves from its
     # plan estimate toward a measured value (`LearnedMemoryModel.blend_peak`, the pressure
     # EWMA, GPU/stream autobatch). Per-signature scalars that accumulate observations use
@@ -462,7 +547,7 @@ class OptimizerConfig:
     # two incompatible meanings.
     learning_smoothing_alpha: float = 0.5
     # Floor on the step of a per-signature scalar's exponential moving average
-    # (`kyber.learning._smooth`, `kyber.learned_tuning._smooth`). The step is
+    # (`kyber.learning._smooth`, `kyber.learned_tuning.priors._smooth`). The step is
     # `max(floor, 1/(n_obs+1))`: a running mean while evidence is thin, then an EWMA with a
     # ~`1/floor`-observation memory. A floor of 0.5 — the old shared value — meant the
     # newest run always carried half the weight, so a learned join size or partition count
@@ -510,6 +595,53 @@ class OptimizerConfig:
     cardinality: CardinalityConfig = CardinalityConfig()
     cost_coeffs: CostCoefficients = CostCoefficients()
     cost_weights: CostWeights = CostWeights()
+
+    def resolved_broadcast_max_bytes(self, l3_cache_bytes: int = 0) -> int:
+        """The build-side broadcast threshold in bytes, sized to the last-level cache.
+
+        A broadcast join builds one hash table and probes it from every core, so it wins only
+        while that table stays L3-resident; past that the partitioned (shuffle) join wins. The
+        right threshold is therefore a share of the L3 the probing cores share — not a fixed
+        byte count, which is wrong by the cache ratio across the fleet (≈1 MiB on a small ARM
+        core to 32+ MiB per CCX on an EPYC). Given the detected `l3_cache_bytes`, this returns
+        `_BROADCAST_L3_FRACTION` of it.
+
+        A pinned `broadcast_max_bytes` (any positive value) always wins. When it is `0` (auto)
+        and the cache is unknown (`l3_cache_bytes <= 0`, e.g. a non-Linux host), it falls back
+        to `_BROADCAST_FALLBACK_BYTES` — the historical 4 MiB — so behavior only ever *improves*
+        where the cache is readable and is unchanged where it is not.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import OptimizerConfig
+                >>> OptimizerConfig().resolved_broadcast_max_bytes(16 * 1024 * 1024)
+                4194304
+
+                >>> OptimizerConfig(broadcast_max_bytes=10 << 20).resolved_broadcast_max_bytes(0)
+                10485760
+
+        Args:
+            l3_cache_bytes: Detected last-level cache size; `0` when undetectable.
+
+        Returns:
+            The broadcast-eligibility threshold in bytes.
+        """
+        if self.broadcast_max_bytes > 0:
+            return self.broadcast_max_bytes
+        if l3_cache_bytes <= 0:
+            return _BROADCAST_FALLBACK_BYTES
+        return max(1, int(l3_cache_bytes * _BROADCAST_L3_FRACTION))
+
+
+#: Share of the last-level cache a broadcast hash table may occupy before the partitioned join
+#: wins. Chosen so a 16 MiB L3 — the machine the 4 MiB default was tuned on — resolves to that
+#: same 4 MiB, making the switch to detection a no-op there and an adaptation everywhere else.
+#: A policy ratio, not a hardware fact, so it stays a named constant rather than being detected.
+_BROADCAST_L3_FRACTION = 0.25
+#: Broadcast threshold when the cache cannot be read (non-Linux) and none was pinned — the
+#: historical default, so an unreadable machine behaves exactly as before.
+_BROADCAST_FALLBACK_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -595,6 +727,22 @@ class ShuffleTlsConfig:
     `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
     turn on mTLS (a connecting peer must present a certificate that CA signed).
     Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import ShuffleTlsConfig
+            >>> ShuffleTlsConfig().enabled  # plaintext shuffle by default
+            False
+            >>> tls = ShuffleTlsConfig(
+            ...     enabled=True,
+            ...     ca_cert_path="/etc/batcher/ca.pem",
+            ...     server_cert_path="/etc/batcher/server.pem",
+            ...     server_key_path="/etc/batcher/server.key",
+            ...     require_client_auth=True,
+            ... )
+            >>> tls.server_name  # the SAN a peer's certificate must carry
+            'batcher-shuffle'
     """
 
     enabled: bool = False
@@ -621,6 +769,15 @@ class DistributedConfig:
 
     Ray is scheduling only; the data plane shuffles via Carbonite/Arrow Flight or
     (single-node / shared filesystem) Arrow-IPC files. These knobs decide which.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import DistributedConfig
+            >>> DistributedConfig().ray_address is None  # attach locally, or $RAY_ADDRESS
+            True
+            >>> DistributedConfig().namespace  # the shuffle actors are isolated here
+            'batcher'
     """
 
     # Ray cluster address. None → attach to an existing cluster when ``RAY_ADDRESS``
@@ -670,11 +827,27 @@ class DistributedConfig:
     # survival). Set False to pin the static `default_credits` window.
     adaptive_credits: bool = True
     # Straggler mitigation: max concurrent speculative *backup* tasks at a shuffle
-    # barrier. 0 (default) disables speculation — the barrier behaves exactly like
-    # `ray.get`. Positive values let one slow survivor get a backup copy (the barrier
-    # takes whichever finishes first); shuffle tasks are deterministic so the result
-    # is identical. Bounded so speculation never oversubscribes the cluster.
-    speculation_max_backups: int = 0
+    # barrier. One slow survivor gets a backup copy and the barrier takes whichever
+    # finishes first; shuffle tasks are deterministic so the result is identical.
+    # Bounded so speculation never oversubscribes the cluster. 0 disables it entirely
+    # (the barrier becomes a plain `ray.get`).
+    #
+    # **1 by default.** A barrier is only as fast as its slowest task, so one straggler
+    # — a hot partition, a throttled disk, a noisy neighbour — stalls the whole stage.
+    # Ray Data has no straggler mitigation of any kind (no speculative execution, no
+    # task re-launch); its guides can only tell users to detect skew by hand and
+    # re-partition. Spark ships speculation, and this is Batcher's equivalent.
+    #
+    # The default is 1, not higher, because the cost of a wrong guess is a duplicated
+    # task: one backup catches the single worst straggler, which is the bulk of the win,
+    # without letting a uniformly-slow stage spawn a backup per task. Two gates keep it
+    # from firing spuriously — a task must exceed `speculation_straggler_factor` × the
+    # median finished time, AND `speculation_min_finished_frac` of tasks must already be
+    # done, so nothing is backed up before there is a meaningful median to compare to.
+    # The factor is additionally *learned* per operator family from measured task-time
+    # variance (`_learned_straggler_factor`), so a stage that finishes uniformly raises
+    # its own bar and effectively opts out.
+    speculation_max_backups: int = 1
     # Back up a still-running task whose elapsed time exceeds this multiple of the
     # median finished task's time, once `speculation_min_finished_frac` have finished.
     speculation_straggler_factor: float = 1.5
@@ -685,6 +858,39 @@ class DistributedConfig:
     # cluster with a higher background failure rate may want more attempts.
     recovery_max_attempts: int = 3
     recovery_backoff_base_s: float = 0.5
+    # Shuffle-output replication factor: how many workers hold each mapper's published
+    # buckets. 1 (default) = today's single copy, so a lost worker's output must be
+    # *recomputed* — re-reading its source partition from object storage and re-running
+    # the map, which is usually the longest part of the query. 2+ replicates each bucket
+    # onto peers on *other nodes*, so a reducer whose mapper is gone transparently fetches
+    # a byte-identical copy from a survivor: worker loss costs one re-fetch instead of a
+    # full recompute round, and the recompute loop stays as the backstop for when every
+    # copy is gone.
+    #
+    # This is affordable precisely because of the mergeable algebra: what a mapper
+    # publishes is *pre-aggregated partial state*, typically far smaller than the source
+    # that produced it, so copying it is much cheaper than regenerating it. (Spark cannot
+    # make the same trade — its shuffle carries raw rows, so it recomputes the map stage
+    # when a node takes its shuffle files with it.)
+    #
+    # The cost is one extra network copy of the shuffle output per additional replica, so
+    # it stays at 1 for a stable on-demand cluster and rises to 2 under the `spot`
+    # resilience profile, where preemption is expected rather than exceptional.
+    #
+    # **Scope: the flat aggregate reduce.** The driver placement lives in
+    # `dist/flight_aggregate.py::_replicate_shuffle_output`, which assigns off-node hosts
+    # (`carbonite/resilience/replication.py::assign_replica_hosts`), calls
+    # `replicate_buckets`, and passes the acked addresses into the reducers' `replicas=`.
+    # A **wide** shuffle (`workers > shuffle_fan_in`) reduces through the combiner tree
+    # instead, and that path does not thread replicas yet — it still degrades to recompute.
+    # So this buys re-fetch recovery on the common shuffle and nothing on a very wide one.
+    #
+    # A replica is advertised only once its `replicate_buckets` call has acked, and a
+    # source's replicas are retired when it is recomputed: a replica holds the *old*
+    # epoch's ticket, and an unregistered ticket reads back as an EMPTY bucket rather than
+    # an error, so a stale fallback would silently drop that mapper's rows rather than
+    # failing. That invariant is what makes the fallback safe; do not relax it.
+    shuffle_replication: int = 1
     # Broken-record tolerance for the distributed scan. A single corrupt file /
     # unreadable row-group otherwise raises out of a worker's read and — because the
     # error is *deterministic* (a rerun fails identically) — the recompute loop retries
@@ -763,6 +969,18 @@ class DistributedConfig:
     # follow). Sized longer than a node's boot time so a genuinely-launching node is not
     # abandoned before it joins.
     autoscale_stall_s: float = 90.0
+    # Grace window for the FIRST sign of growth. Distinct from `autoscale_stall_s`, which
+    # governs a stall *after* the cluster has started growing: this bounds how long to wait
+    # before concluding the autoscaler is not going to act at all. A request the autoscaler
+    # cannot satisfy — a fixed cluster already at max, or infeasible spot capacity — produces
+    # zero growth from the start, and the query is already runnable on the capacity it has
+    # (the fan-out clamps to it), so the extra nodes are an optimization, not a prerequisite.
+    # Waiting the full `autoscale_stall_s` for them taxed EVERY cold query that asked for more
+    # cores than the cluster has (a large aggregate's data-parallel fan-out routinely exceeds
+    # the node count) — 90 s of dead time before a 9 s query. Kept above a couple of poll
+    # intervals so a cluster whose nodes register as pending within a few seconds still gets
+    # its full `autoscale_stall_s`; the moment any growth appears, that longer window governs.
+    autoscale_startup_grace_s: float = 12.0
     # Skew-aware join salting for a huge x huge hot key. When a single join key is
     # dominated by a few "hot" values, those rows otherwise co-partition onto one
     # reducer and overload it (memory + the output explosion + a straggler). With
@@ -798,6 +1016,16 @@ class DistributedConfig:
     # appropriate on a trusted/isolated cluster network. Also read from the
     # `BATCHER_SHUFFLE_TOKEN` env var so it can be injected without a config file.
     shuffle_token: str | None = None
+    # Closed port range the Flight shuffle listener may bind, as (min, max) inclusive.
+    # None (default) takes an OS-ephemeral port, which never collides and needs no
+    # configuration — the right default on a flat cluster network. A firewalled network
+    # (most on-prem, and locked-down cloud VPCs) cannot open the whole ephemeral range
+    # node-to-node, so setting a range lets the operator open exactly it. Make it wide
+    # enough for every worker that shares a node: the bind takes the first free port and
+    # fails with a message naming the range if none is left, rather than falling back to a
+    # port nothing can reach. Also read from `BATCHER_SHUFFLE_PORT_RANGE` ("40000-40100")
+    # so a deployment can inject it without a config file.
+    shuffle_port_range: tuple[int, int] | None = None
     # Same-node shared-memory shuffle transfer. When on, a mapper mirrors each bucket to
     # a memory-mapped Arrow IPC file (Linux tmpfs `/dev/shm` when available, else a temp
     # dir) and a same-node reducer in another process reads it via mmap ZERO-COPY — no
@@ -858,10 +1086,19 @@ class DistributedConfig:
     # load-once inference stage) is split into per-stage actor pools that stream
     # partitions stage→stage over Arrow Flight, so the CPU and GPU stages OVERLAP (the
     # GPU runs partition k while the CPU prepares k+1) instead of one actor running the
-    # whole chain per partition. Off by default: with it off the chain runs
-    # embarrassingly parallel exactly as before, so single-node==distributed stays
-    # bit-identical. Result is unchanged either way — only the scheduling overlaps.
-    stream_inference: bool = False
+    # whole chain per partition. **On by default**: the non-overlapped path leaves the GPU
+    # idle for the whole CPU decode/preprocess of every partition — the single largest
+    # avoidable cost in a batch-inference pipeline, and the pathology the Ray guides spend
+    # their GPU-utilization chapter telling users to hand-tune around. Overlapping it is a
+    # pure scheduling win, so it should not need opting into.
+    # Result is unchanged either way — only the scheduling overlaps: every stage runs the
+    # identical sub-plan through `core.execute_with_udfs`, which is what
+    # `test_stream_inference.py::test_streaming_pipeline_equals_single_node` (and the
+    # three-stage and non-overlapped-map variants) pin. A chain with no resource-class
+    # boundary to split at (`split_at_first_pool_boundary` → None) falls back to the
+    # embarrassingly-parallel map, so a homogeneous pipeline is unaffected.
+    # Set False to pin the old non-overlapped scheduling.
+    stream_inference: bool = True
     # Keep GPU / load-once inference actor pools WARM across `collect()` calls in a session,
     # keyed by pipeline identity (the model's `map_batches` fn). The model then loads ONCE
     # per session and is reused, instead of every distributed-map call paying the actor spawn
@@ -920,7 +1157,10 @@ class DistributedConfig:
     # Break-even sits near ~10M rows, so below that `auto` stays on the CPU engine. Retune if the
     # CPU engine or the GPU data plane gets materially faster.
     gpu_min_rows: int = 10_000_000
-    gpu_memory_gb: float = 12.0
+    # `0.0` (the default) means **detect it** — see `resolved_gpu_memory_gb`. A positive value
+    # pins the budget, for a device the probe cannot see (a remote GPU worker sized from a
+    # CPU-only driver) or to deliberately under-commit a shared device.
+    gpu_memory_gb: float = 0.0
     # Estimated GPU activation bytes per row, used to seed a GPU inference stage's initial batch
     # size from the VRAM left after the model (headroom_bytes / this). A coarse per-row estimate
     # the online `ThroughputController` then corrects from measured VRAM/throughput — it only has
@@ -1015,6 +1255,98 @@ class DistributedConfig:
     # every config entry point (see `batcher.config.profiles`).
     resilience: str = "default"
 
+    def resolved_gpu_memory_gb(self) -> float:
+        """The usable memory budget of one GPU, detected when `gpu_memory_gb` is `0.0`.
+
+        Kyber routes on this: a working set that fits one device is dispatched to it, one that
+        does not is sharded across the cluster, and a GPU inference stage seeds its batch size
+        from the VRAM left after the model. All three are wrong by the ratio of the real device
+        to the assumed one, and the assumed one used to be a hardcoded 12.0 — a T4. On an 80 GB
+        A100 that shards a working set six times over that one device would have held, and
+        seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
+        failure this is supposed to prevent.
+
+        Detection reports *total* VRAM, so it is scaled by `_GPU_USABLE_FRACTION` to leave the
+        driver context, allocator fragmentation, and activation headroom — the same relationship
+        the old default encoded (12 usable of a 16 GB T4). Falls back to that historical default
+        when no device is visible, which keeps a CPU-only driver planning for a remote GPU
+        worker exactly as it did before.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import DistributedConfig
+                >>> DistributedConfig(gpu_memory_gb=40.0).resolved_gpu_memory_gb()
+                40.0
+
+        Returns:
+            Usable GPU memory in GB for a single device.
+        """
+        if self.gpu_memory_gb > 0.0:
+            return self.gpu_memory_gb
+        from batcher._internal.hardware import gpu_inventory
+
+        devices = [int(d.get("memory_bytes") or 0) for d in gpu_inventory()]
+        smallest = min((b for b in devices if b > 0), default=0)
+        if smallest <= 0:
+            return _GPU_MEMORY_GB_FALLBACK
+        return smallest / (1 << 30) * _GPU_USABLE_FRACTION
+
+
+#: Fraction of a device's total VRAM treated as usable — the rest is driver context,
+#: allocator fragmentation, and activation headroom. 12/16 is the ratio the previous
+#: hardcoded T4 default encoded, kept so detection reproduces it on that device.
+_GPU_USABLE_FRACTION = 0.75
+#: Usable GB assumed when no device is visible: the historical T4-shaped default, so a
+#: CPU-only driver planning for a remote GPU worker behaves exactly as it used to.
+_GPU_MEMORY_GB_FALLBACK = 12.0
+
+
+@dataclass(frozen=True, slots=True)
+class VerbosityLevel:
+    """One rung of the verbosity ladder: what it shows and what it costs."""
+
+    name: str
+    log_level: str
+    progress: str
+    #: The Rust `tracing` threshold, which can reach TRACE where Python's logging cannot.
+    native_level: str
+    summary: str
+
+
+# The ladder, index == integer verbosity, so `verbosity=2` and `verbosity="normal"` are the
+# same rung and a `-vv` style counter maps straight through. Ordered least → most output,
+# which is the order every `-v` convention uses. `normal` is the default and reproduces the
+# engine's historical behavior exactly (WARNING + auto progress), so adding this dial changed
+# nothing for anyone who does not touch it.
+VERBOSITY_LEVELS: tuple[VerbosityLevel, ...] = (
+    VerbosityLevel("silent", "CRITICAL", "off", "off", "nothing but unrecoverable failures"),
+    VerbosityLevel("quiet", "ERROR", "off", "error", "errors only; no progress bar"),
+    VerbosityLevel("normal", "WARNING", "auto", "warn", "warnings + progress bar (default)"),
+    VerbosityLevel("verbose", "INFO", "auto", "info", "+ optimizer and resource decisions"),
+    VerbosityLevel("debug", "DEBUG", "auto", "debug", "+ per-phase timings and plan detail"),
+    VerbosityLevel("trace", "DEBUG", "on", "trace", "+ Rust per-morsel spans; bar forced on"),
+)
+_VERBOSITY_BY_NAME = {level.name: i for i, level in enumerate(VERBOSITY_LEVELS)}
+DEFAULT_VERBOSITY = "normal"
+
+
+def _verbosity_rank(value: str | int) -> int:
+    """The ladder index for a name or number, clamped into range; unknown names → default.
+
+    Tolerant on purpose. This resolves a value that can arrive from an env var or a JSON
+    config file, and an unreadable verbosity must not be the thing that stops a query from
+    running — `validation` is where a bad value is *reported*, loudly and separately.
+    """
+    if isinstance(value, bool):  # `bool` is an `int`; treat True/False as unset, not 1/0.
+        return _VERBOSITY_BY_NAME[DEFAULT_VERBOSITY]
+    if isinstance(value, int):
+        return max(0, min(len(VERBOSITY_LEVELS) - 1, value))
+    text = str(value).strip().lower()
+    if text.isdigit():
+        return max(0, min(len(VERBOSITY_LEVELS) - 1, int(text)))
+    return _VERBOSITY_BY_NAME.get(text, _VERBOSITY_BY_NAME[DEFAULT_VERBOSITY])
+
 
 @dataclass(frozen=True, slots=True)
 class ObservabilityConfig:
@@ -1023,13 +1355,38 @@ class ObservabilityConfig:
     Controls the `batcher.*` logger hierarchy (console + optional rotating file) and the
     structured per-query event log (one JSON document per query: the plan, the
     Kyber/Carbonite decisions, and the measured per-operator profile). Env overrides use
-    the ``BATCHER_OBSERVABILITY_*`` prefix (e.g. ``BATCHER_OBSERVABILITY_LOG_LEVEL=DEBUG``,
+    the ``BATCHER_OBSERVABILITY_*`` prefix (e.g. ``BATCHER_OBSERVABILITY_VERBOSITY=debug``,
     ``BATCHER_OBSERVABILITY_EVENT_LOG=0`` to disable the event log).
+
+    **`verbosity` is the one dial most users need.** It is a named preset over the
+    individual knobs — the ``-v``/``-vv`` ladder every CLI has, spelled out. `log_level`
+    and `progress` are its two components, and each defaults to `None` meaning "derive me
+    from `verbosity`"; set either explicitly to override just that one. That `None` is what
+    makes the precedence unambiguous — with a concrete default there is no way to tell "the
+    user asked for WARNING" from "nobody said anything", so a preset could not know whether
+    it was allowed to act.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import ObservabilityConfig
+            >>> ObservabilityConfig().resolved_log_level  # quiet unless asked
+            'WARNING'
+            >>> ObservabilityConfig(verbosity="debug").resolved_log_level
+            'DEBUG'
+            >>> ObservabilityConfig(verbosity="debug", log_level="ERROR").resolved_log_level
+            'ERROR'
+            >>> ObservabilityConfig(verbosity="quiet").resolved_progress
+            'off'
     """
 
+    # The single user-facing dial. One of silent | quiet | normal | verbose | debug | trace,
+    # or the equivalent integer 0-5 (so `-vv` maps straight through). Sets `log_level` and
+    # `progress` together; see `resolved_log_level` / `resolved_progress` for the table.
+    verbosity: str | int = "normal"
     # Threshold for the `batcher.*` loggers and the Rust data-plane tracing bridge:
-    # one of CRITICAL/ERROR/WARNING/INFO/DEBUG. WARNING by default — quiet unless asked.
-    log_level: str = "WARNING"
+    # one of CRITICAL/ERROR/WARNING/INFO/DEBUG. `None` derives it from `verbosity`.
+    log_level: str | None = None
     # Emit log records to stderr. On by default (at `log_level`); set False for a
     # file-only setup.
     console: bool = True
@@ -1054,6 +1411,87 @@ class ObservabilityConfig:
     event_log_dir: str = ""
     # Keep at most this many event-log files (oldest pruned on write). 0 → unbounded.
     event_log_max_files: int = 200
+    # Live terminal progress bar: "auto" renders only into a real TTY that has not set
+    # NO_COLOR/TERM=dumb, "on" forces it, "off" disables it. `None` derives it from
+    # `verbosity`. "auto" is the only safe resolved default — escape codes written into a
+    # redirected log file are worse than no bar.
+    progress: str | None = None
+    # Start the web dashboard automatically on the first query. Off by default: binding a
+    # port is not something a library should do without being asked. `bt.start_ui()` is
+    # the explicit spelling; this is for a service that wants it always on.
+    ui: bool = False
+    # Where the dashboard binds. Loopback by default — the UI shows query text, plans, and
+    # logs, so exposing it on a routable address must be a deliberate act.
+    ui_host: str = "127.0.0.1"
+    ui_port: int = 4040
+
+    @property
+    def resolved_log_level(self) -> str:
+        """The effective logger threshold — `log_level` if set, else derived from `verbosity`.
+
+        Read this rather than `log_level`, which is `None` whenever the user is driving with
+        the `verbosity` dial.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import ObservabilityConfig
+                >>> ObservabilityConfig().resolved_log_level
+                'WARNING'
+                >>> ObservabilityConfig(verbosity="verbose").resolved_log_level
+                'INFO'
+                >>> ObservabilityConfig(verbosity="verbose", log_level="ERROR").resolved_log_level
+                'ERROR'
+
+        Returns:
+            One of CRITICAL/ERROR/WARNING/INFO/DEBUG.
+        """
+        return self.log_level or VERBOSITY_LEVELS[_verbosity_rank(self.verbosity)].log_level
+
+    @property
+    def resolved_progress(self) -> str:
+        """The effective progress mode — `progress` if set, else derived from `verbosity`.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import ObservabilityConfig
+                >>> ObservabilityConfig().resolved_progress
+                'auto'
+                >>> ObservabilityConfig(verbosity="quiet").resolved_progress
+                'off'
+                >>> ObservabilityConfig(verbosity="trace").resolved_progress
+                'on'
+
+        Returns:
+            One of ``"auto"``, ``"on"``, ``"off"``.
+        """
+        return self.progress or VERBOSITY_LEVELS[_verbosity_rank(self.verbosity)].progress
+
+    @property
+    def resolved_native_log_level(self) -> str:
+        """The Rust data plane's tracing threshold, which alone can reach ``TRACE``.
+
+        Python's `logging` has no level below DEBUG, but the engine's `tracing` spans do, and
+        they are where per-morsel work is visible. So ``verbosity="trace"`` means DEBUG in
+        Python and TRACE in Rust — the one place the two ladders legitimately differ, and the
+        reason this is a separate property rather than a reuse of `resolved_log_level`.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import ObservabilityConfig
+                >>> ObservabilityConfig(verbosity="trace").resolved_native_log_level
+                'trace'
+                >>> ObservabilityConfig(verbosity="debug").resolved_native_log_level
+                'debug'
+
+        Returns:
+            A `tracing` level name.
+        """
+        if self.log_level:
+            return self.log_level
+        return VERBOSITY_LEVELS[_verbosity_rank(self.verbosity)].native_level
 
 
 @dataclass(frozen=True, slots=True)
@@ -1190,6 +1628,7 @@ class Config:
             self.memory.spill_compression,
             self.execution.fuse_linear,
             self.execution.shrink_output_dtypes,
+            self.execution.streaming,
             self.execution.bloom_fp_rate,
             self.execution.bloom_min_build_rows,
             self.execution.window_parallel_row_threshold,
@@ -1238,16 +1677,28 @@ class Config:
         Derived statically from `MemoryConfig` so `config` stays neutral — it never
         senses (the `api` auto-tuning resolver fills `max_memory_bytes` from the live
         envelope before execution; see `api._autotune`). `0` means unbounded (stay
-        fully in-memory): returned when the user opted out via `unbounded_memory`, or
-        when `max_memory_bytes` is still unset because a caller bypassed the resolver
-        (an ad-hoc `Config`), in which case the safe pre-auto-tuning behavior holds.
+        fully in-memory) and is returned **only** when the user explicitly opted out
+        via `unbounded_memory`.
+
+        When `max_memory_bytes` is unset because a caller bypassed the resolver — an
+        ad-hoc `Config`, an embedded/library use, or the streaming aggregate path,
+        none of which run `api._autotune` — this falls back to the *static*
+        `default_total_bytes` envelope rather than to `0`. That distinction is the
+        difference between the spill machinery being real and being decorative: a `0`
+        budget disarms it everywhere at once (no `bc-resource` pool in `bc-py`, no
+        `agg_spill` in `bc-interp::par`, and `check_budget` a no-op in the streaming
+        breakers), so every stateful operator accumulates without bound and the
+        process OOMs instead of spilling. A budget that is merely *wrong* only costs
+        time: it is a spill threshold, and spilling is result-invariant, so
+        over-estimating it on a small box spills later and under-estimating it on a
+        large one spills sooner — either beats being killed.
         """
         mem = self.memory
         if mem.unbounded_memory:
             return 0
         cap = mem.max_memory_bytes
         if cap is None or cap <= 0:
-            return 0
+            cap = mem.default_total_bytes
         return int(cap * mem.hard_limit)
 
     @classmethod
@@ -1300,23 +1751,232 @@ class Config:
         Returns:
             A new Config with the document's overrides applied over `base`.
         """
-        data = json.loads(Path(path).read_text())
+        from batcher.config.serde import read_document
+
+        data = read_document(path)
         return _resolved(_overlay_dict(base if base is not None else cls(), data))
 
+    @classmethod
+    def from_dict(cls, data: dict[str, object], base: Config | None = None) -> Config:
+        """Build a Config from a nested dict of section overrides.
 
-def _coerce(raw: str, to: type) -> object:
+        The inverse of `to_dict`, and the shared implementation behind `from_file`. Keys
+        not naming a real section or field are ignored rather than raising, so a document
+        written for a newer Batcher still loads. Use `set_option` when you want an unknown
+        name to be an error.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> Config.from_dict({"execution": {"morsel_rows": 4096}}).execution.morsel_rows
+                4096
+
+        Args:
+            data: A nested dict mirroring the section structure.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new validated Config with the overrides applied over `base`.
+        """
+        return _resolved(_overlay_dict(base if base is not None else cls(), data))
+
+    @classmethod
+    def from_toml(cls, path: str | os.PathLike[str], base: Config | None = None) -> Config:
+        """Load a Config from a TOML document whose tables mirror the config sections.
+
+        Parsed with the standard library, so no extra dependency is needed. A section is a
+        TOML table: ``[execution]`` with ``morsel_rows = 4096`` under it.
+
+        Examples:
+            .. doctest::
+
+                >>> import tempfile
+                >>> from pathlib import Path
+                >>> from batcher.config import Config
+                >>> p = Path(tempfile.mkdtemp()) / "batcher.toml"
+                >>> _ = p.write_text("[execution]\\nmorsel_rows = 4096\\n")
+                >>> Config.from_toml(p).execution.morsel_rows
+                4096
+
+        Args:
+            path: The TOML document to read.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new validated Config with the document's overrides applied over `base`.
+        """
+        from batcher.config.serde import read_document
+
+        return cls.from_dict(read_document(path, fmt="toml"), base=base)
+
+    @classmethod
+    def from_yaml(cls, path: str | os.PathLike[str], base: Config | None = None) -> Config:
+        """Load a Config from a YAML document whose top-level keys mirror the sections.
+
+        Requires `pyyaml`; the error says so if it is missing rather than surfacing an
+        ImportError from inside the parser.
+
+        Examples:
+            .. doctest::
+
+                >>> import tempfile
+                >>> from pathlib import Path
+                >>> from batcher.config import Config
+                >>> p = Path(tempfile.mkdtemp()) / "batcher.yaml"
+                >>> _ = p.write_text("execution:\\n  morsel_rows: 4096\\n")
+                >>> Config.from_yaml(p).execution.morsel_rows  # doctest: +SKIP
+                4096
+
+        Args:
+            path: The YAML document to read.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new validated Config with the document's overrides applied over `base`.
+        """
+        from batcher.config.serde import read_document
+
+        return cls.from_dict(read_document(path, fmt="yaml"), base=base)
+
+    def to_dict(self, *, only_non_default: bool = False) -> dict[str, object]:
+        """Convert to a nested plain-dict, round-tripping through `from_dict`.
+
+        The round-trip is closed over *resolved* configs. `from_dict` runs the same
+        resolution step every entry point does, which auto-detects the environment (a spot
+        node, an autoscaling cluster), so reloading a config captured on one machine can
+        legitimately differ from raw defaults on another. Reloading an already-resolved
+        config is idempotent, which is the property to rely on.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> resolved = Config.from_dict(Config().to_dict())
+                >>> Config.from_dict(resolved.to_dict()) == resolved
+                True
+
+        Args:
+            only_non_default: Emit only the values differing from the built-in defaults,
+                producing the smallest document that reproduces this config.
+
+        Returns:
+            A nested dict mirroring the section structure.
+        """
+        from batcher.config.serde import config_to_dict
+
+        return config_to_dict(self, only_non_default=only_non_default)
+
+    def non_defaults(self) -> dict[str, object]:
+        """The options that differ from the built-in defaults, as a flat dotted-key dict.
+
+        The answer to "what is actually set here?" — the first thing worth printing when a
+        run behaves differently on one machine than another, because environment variables
+        and config files both land here.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config, ExecutionConfig
+                >>> Config().replace(execution=ExecutionConfig(morsel_rows=4096)).non_defaults()
+                {'execution.morsel_rows': 4096}
+
+        Returns:
+            A dict mapping dotted option path to its current value, for changed options only.
+        """
+        return self.diff(Config())
+
+    def diff(self, other: Config) -> dict[str, object]:
+        """The options where this config differs from `other`, as a flat dotted-key dict.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config, ExecutionConfig
+                >>> a = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+                >>> a.diff(Config())
+                {'execution.morsel_rows': 4096}
+                >>> Config().diff(Config())
+                {}
+
+        Args:
+            other: The config to compare against.
+
+        Returns:
+            A dict mapping dotted option path to *this* config's value, for each option
+            whose value differs.
+        """
+        from batcher.config.options import _leaves
+
+        theirs = dict(_leaves(other))
+        return {path: value for path, value in _leaves(self) if theirs.get(path) != value}
+
+    def __repr__(self) -> str:
+        """A one-line summary naming only the options that differ from the defaults.
+
+        The generated dataclass repr is 180 fields and roughly 4,500 characters, which is
+        unreadable in a traceback and useless in a notebook. This shows what was changed,
+        which is the only part that carries information; `describe_options` prints the full
+        table when you want it.
+        """
+        changed = self.non_defaults()
+        if not changed:
+            return "Config(<all defaults>)"
+        shown = ", ".join(f"{k}={v!r}" for k, v in list(changed.items())[:8])
+        more = f", +{len(changed) - 8} more" if len(changed) > 8 else ""
+        return f"Config({shown}{more})"
+
+
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _coerce(raw: str, to: object) -> object:
     if to is bool:
-        return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return raw.strip().lower() in _TRUE_TOKENS
     if to is int:
         return int(raw)
     if to is float:
         return float(raw)
+    # A `bool | str` field (e.g. `runtime_bloom_join = "auto"`): a recognized boolean
+    # token coerces to a real bool, everything else stays the string. Without this the
+    # whole union was returned uncoerced, so `BATCHER_..._RUNTIME_BLOOM_JOIN=true` shipped
+    # the *string* "true" — which then failed validation ("must be True, False, or 'auto'")
+    # while the string literal "auto" happened to pass. Enabling/disabling the feature via
+    # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
+    members = [a for a in typing.get_args(to) if a is not type(None)]
+    if bool in members and raw.strip().lower() in (_TRUE_TOKENS | _FALSE_TOKENS):
+        return raw.strip().lower() in _TRUE_TOKENS
+    if str in members:
+        return raw
     return raw
+
+
+def _scalar_type(annotation: object) -> object:
+    """The scalar member of an `Optional`/`X | None` annotation, else the annotation itself.
+
+    So an env override of an optional-typed field (`int | None`, `float | None`) coerces to
+    `int`/`float` rather than to the *default value's* runtime type — which is `NoneType` when
+    the default is `None`, and would leave the raw string uncoerced (a wrong-typed config that
+    then fails validation or ships a string across the Rust wire contract)."""
+    args = typing.get_args(annotation)
+    if args:
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0]
+    return annotation
+
+
+@functools.cache
+def _field_scalar_types(cls: type) -> dict[str, object]:
+    """Each field's coercion target type, resolved from the class annotations (cached)."""
+    return {name: _scalar_type(ann) for name, ann in typing.get_type_hints(cls).items()}
 
 
 def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
     """Recursively overlay env vars onto a (possibly nested) frozen config object."""
     updates: dict[str, object] = {}
+    field_types = _field_scalar_types(type(obj))
     for field in dataclasses.fields(obj):
         current = getattr(obj, field.name)
         key = f"{prefix}_{field.name.upper()}"
@@ -1325,7 +1985,9 @@ def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
             if replaced is not current:
                 updates[field.name] = replaced
         elif key in env:
-            updates[field.name] = _coerce(env[key], type(current))
+            # Coerce against the *declared* field type, not `type(current)`: an optional
+            # field defaulting to None would otherwise resolve to NoneType and skip coercion.
+            updates[field.name] = _coerce(env[key], field_types.get(field.name, type(current)))
     return replace(obj, **updates) if updates else obj
 
 
@@ -1383,7 +2045,22 @@ _active: contextvars.ContextVar[Config] = contextvars.ContextVar(
 
 
 def active_config() -> Config:
-    """The Config in effect for the current context."""
+    """The Config in effect for the current context.
+
+    Resolves to the innermost of: an enclosing `config_context` block, the process-wide
+    `set_config`, then the static defaults layered with the config file and env vars.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import active_config
+            >>> active_config().execution.morsel_rows
+            16384
+
+    Returns:
+        The active Config. It is frozen — derive a new one with `Config.replace` rather
+        than mutating it.
+    """
     return _active.get()
 
 

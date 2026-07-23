@@ -23,7 +23,7 @@ a win.
 ## No generated data — established public sources only
 
 The suite **never generates data**. Every table is read from a canonical public
-parquet location and normalized once (`sources.py`) so all engines see identical
+parquet location and normalized once (`sources/`) so all engines see identical
 inputs:
 
 | Dataset    | Default source                                                                 | Access |
@@ -63,7 +63,7 @@ layout the only variable:
 At scale 1 and 10 all three hold an **identical row count** (8,388,608 and 83,886,080),
 so the `_ms` columns are comparable across families. At scale 100 and above the
 many-small corpus is *not* row-count-equivalent (it mixes in a few ~133 MiB files, which
-`sources.py` filters to keep the layout genuinely many-small), so there the cross-family
+`sources/` filters to keep the layout genuinely many-small), so there the cross-family
 comparison is indicative and the per-engine one within a family still exact.
 
 Nine shapes run against each layout, chosen to separate the costs a layout moves:
@@ -133,6 +133,43 @@ open cost over S3** (see the `cluster/` GPU suites for the in-memory multimodal 
 comparison, which is where Batcher's warm-pool / streaming moat shows). This suite measures
 the read/decode path honestly, S3 penalty included.
 
+### Physical-AI ingest scenarios (self-contained, local, no S3)
+
+For a fast offline read of the multimodal ingest story, `benchmarks/scenarios/` holds
+single-file, correctness-gated head-to-heads that synthesize their own local corpus:
+
+```bash
+python benchmarks/scenarios/image_decode.py       # JPEG decode+resize vs Ray Data + Daft
+python benchmarks/scenarios/point_cloud_load.py   # LiDAR .npy -> torch tensors vs Ray Data
+python benchmarks/scenarios/audio_decode.py       # native audio decode vs a soundfile loop
+```
+
+On a 96-core node these show batcher **2.4× faster than Daft and 6× than Ray Data** on
+image decode+resize, and **2.4× than Ray Data** on point-cloud loading — the physical-AI
+(camera / LiDAR / audio) ingest path. Findings and the fix chain are in
+`BENCHMARK_RESULTS.md`; the mechanism is documented in `docs/user-guide/performance.md`
+("Multimodal & physical-AI ingest").
+
+### Structured streaming (Batcher vs Spark Structured Streaming)
+
+Batcher and Spark are the two real *structured-streaming* engines; this head-to-head
+runs the drain trigger both support (Spark `Trigger.AvailableNow`, Batcher
+`Trigger.available_now()`) over a Parquet backlog, folding a grouped aggregation, with a
+per-key correctness gate against DuckDB/Polars (which appear as a batch floor — they have
+no streaming engine):
+
+```bash
+python benchmarks/scenarios/streaming_throughput.py            # 4M rows, grouped agg
+# the Spark comparison needs a JVM: export JAVA_HOME=<jdk17-or-21> first (else it skips)
+```
+
+At 4M rows / 1000 keys this shows batcher streaming at **~81M rows/s vs Spark Structured
+Streaming's ~6.5M rows/s — 12.5× faster**, correctness-gated (both match DuckDB). Batcher's
+micro-batch overhead is small enough that its *streaming* aggregation also edges out
+Polars' *batch* aggregation on the same data. The distributed drain (`distributed=True`,
+Spark `AvailableNow` parity) fans the same work across the cluster; see
+`tests/integration/test_distributed_streaming.py`.
+
 ## `cluster/`: GPU multimodal compute (distributed)
 
 Beyond ingest, `benchmarks/cluster/` holds the distributed **GPU** multimodal benchmarks vs
@@ -154,7 +191,7 @@ engine adapter already has a `read_parquet`.
 benchmarks/
   harness.py     correctness check + best-of-N timing (the measurement core)
   registry.py    the benchmark registry, the suite(...) decorator, and sql_case
-  sources.py     established public parquet sources (no data generation)
+  sources/       established public parquet sources (no data generation)
   context.py     loads a benchmark's tables once, serves every engine
   engines/       one adapter per engine, behind a common contract
     base.py  lineup.py  batcher.py  duckdb.py  polars.py  pyarrow.py
@@ -166,9 +203,11 @@ benchmarks/
     multimodal/  unstructured ingest: images.py (list/decode/resize) vs Ray Data + Daft
   cluster/       distributed GPU multimodal benchmarks (inference/LLM/audio/video) vs Ray
   run.py         the CLI: select engines, load data, run, report
-  distributed.py             single-node == many-partition equivalence + timing
-  optimizer_bench.py         Kyber planning latency as the rule set grows
-  shuffle_vs_object_store.py Arrow Flight shuffle vs the Ray object store
+  internals/     benchmarks of Batcher's own subsystems, with their own reporting
+    distributed.py             single-node == many-partition equivalence + timing
+    optimizer_bench.py         Kyber planning latency as the rule set grows
+    metadata_bench.py          metadata-answered queries vs the O(rows) computation
+    shuffle_vs_object_store.py Arrow Flight shuffle vs the Ray object store
 ```
 
 ### Adding a benchmark
@@ -278,11 +317,11 @@ rows have been verified to match the reference engine. `PARTIAL` means an engine
 lineup legitimately could not express that query (e.g. Polars' SQL subset, PyArrow on
 the SQL suites) — the verified engines still agreed.
 
-## distributed.py: single-node vs many-partition equivalence
+## internals/distributed.py: single-node vs many-partition equivalence
 
 ```bash
-python3 benchmarks/distributed.py            # TPC-H scale 1, 8 partitions
-python3 benchmarks/distributed.py 10 16      # scale 10, 16 partitions
+python3 benchmarks/run.py --benchmark distributed        # TPC-H scale 1, 8 partitions
+python3 benchmarks/internals/distributed.py 10 16        # scale 10, 16 partitions
 ```
 
 Each query runs single-node and again across several partitions via

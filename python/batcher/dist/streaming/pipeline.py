@@ -142,6 +142,7 @@ def _consumer_pool_size(gpu_stage, workers: int, num_partitions: int) -> int:
         workers,
         num_partitions,
         getattr(gpu_stage, "accelerator_type", None),
+        resources=dict(getattr(gpu_stage, "resources", ()) or ()),
     )
     size = _resolve_pool_size(gpu_stage.concurrency, num_partitions, default)
     return max(1, min(size, num_partitions))

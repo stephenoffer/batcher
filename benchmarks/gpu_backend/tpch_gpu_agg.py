@@ -23,6 +23,7 @@ import time
 
 import numpy as np
 import pyarrow as pa
+from _ray_env import init_ray
 
 print = functools.partial(print, flush=True)
 
@@ -35,23 +36,6 @@ def _cfg() -> dict:
         "groups": int(os.environ.get("BENCH_GPUAGG_GROUPS", "1000")),
         "runs": int(os.environ.get("BENCH_RUNS", "3")),
     }
-
-
-def _init() -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env={"pip": None}, logging_level="ERROR", log_to_driver=False
-        )
 
 
 def _gpu_groupby_sum(keys_np, vals_np, runs: int) -> tuple[dict, float]:
@@ -77,7 +61,7 @@ def _gpu_groupby_sum(keys_np, vals_np, runs: int) -> tuple[dict, float]:
 
 def main() -> int:
     cfg = _cfg()
-    _init()
+    init_ray()
     import ray
 
     import batcher as bt

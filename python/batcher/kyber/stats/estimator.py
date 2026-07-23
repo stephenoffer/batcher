@@ -22,6 +22,7 @@ from dataclasses import replace
 from typing import Any
 
 from batcher.config import CardinalityConfig, active_config
+from batcher.kyber import learning
 from batcher.kyber.learning import (
     AVG_BYTES_KEY,
     CARDINALITY_CORRECTION_KEY,
@@ -29,9 +30,11 @@ from batcher.kyber.learning import (
     NDV_KEY,
     QUANTILES_KEY,
 )
+from batcher.kyber.properties import project_ordering
 from batcher.kyber.stats import columns as col_prop
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.plan.expr_ir import Col, Expr, Lit
+from batcher.kyber.stats.selectivity.scalars import _ordinal
+from batcher.plan.expr_ir import Col, Expr, IsNotNull, Lit
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -51,8 +54,9 @@ from batcher.plan.logical import (
     Window,
     is_cartesian_key_pair,
 )
-from batcher.plan.source_stats import SourceStatistics
-from batcher.plan.stats import Provenance, RelStats, weakest
+from batcher.plan.source_stats import SourceStatistics, source_stats_key
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, weakest
+from batcher.plan.types import column_bytes
 
 __all__ = ["StatsEstimator", "combine_ndv"]
 
@@ -65,11 +69,18 @@ __all__ = ["StatsEstimator", "combine_ndv"]
 # pipeline chunking documents 20-to-1 under-sizes every stage below it). Measuring it
 # once and correcting is the only way, and is precisely the Core-measures/Kyber-consumes
 # loop.
+# `MapBatches` belongs for the same reason as `Unnest`: a UDF may filter, explode, or pass
+# rows through 1:1, and which one is a property of the *code*, not the plan — the structural
+# estimator can only assume 1:1 and is wrong by the true fan-out on the first run. A
+# filtering embedding-dedup or an exploding chunker (both common AI-pipeline stages) is then
+# mis-sized for every stage below it until the measured ratio corrects it. This is safe only
+# because the `map_batches` signature now carries the UDF's identity (see
+# `kyber.signature._udf_identity`), so one UDF's learned fan-out cannot answer for another's.
 # `Filter` is deliberately excluded: its measured *selectivity* is already learned
 # per-signature, and correcting it here as well would count the same error twice.
 # Row-preserving operators (Project, Sort, Limit) need no correction — they inherit it
 # from their input.
-_CORRECTABLE = (Aggregate, Distinct, Join, Unnest)
+_CORRECTABLE = (Aggregate, Distinct, Join, MapBatches, Unnest)
 
 
 class StatsEstimator:
@@ -111,9 +122,11 @@ class StatsEstimator:
         # a freed node's reused `id()` can never produce a stale hit.
         self._row_cache: dict[int, tuple[LogicalPlan, RelStats]] = {}
         self._sig_cache: dict[int, tuple[LogicalPlan, str]] = {}
-        # Merged column→ndv map (source-stats NDV seeded under learned NDV), built once
-        # on first access since `_ndv` is read on every selectivity / join estimate.
-        self._ndv_cache: dict[str, float] | None = None
+        # Per-source learned column stats (`{source_id: {column: ColumnStat}}`), built
+        # lazily per source. Resolving them **per source** is the whole point: the learned
+        # maps are keyed by `(source, column)`, so a `Scan` gets its *own* table's measured
+        # ndv/quantiles/mcv/width and never another table's column of the same name.
+        self._learned_cols: dict[int, dict[str, ColumnStat]] = {}
 
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
@@ -236,12 +249,25 @@ class StatsEstimator:
         return sig
 
     def _estimate_uncached(self, node: LogicalPlan) -> RelStats:
-        # Learned-first: trust a measured absolute size for this exact shape — except
-        # a Filter, whose measured *selectivity* ratio (applied below to the current
-        # input) generalizes across input sizes better than a stale absolute count.
-        if not self._exact_first:
+        # Learned-first: trust a measured absolute size for this exact shape — but only for
+        # the operators a learned row count is *about*. `_CORRECTABLE` is that set, and the
+        # rest are excluded for reasons that all bite here:
+        #
+        #   - A `Scan`'s cardinality is not a thing to learn. The source already reports it
+        #     EXACTLY (a Parquet footer, an in-memory row count), and a learned value can
+        #     only shadow that exact number with a weaker one.
+        #   - Worse, `plan_signature` structures every scan as the bare token ``["scan"]``,
+        #     carrying no source identity — so *all* scans in a process share one learned
+        #     entry. Reading a 5M-row table therefore taught the optimizer that a 1,000-row
+        #     change set also has 5M rows, which made a pruned MERGE size its join at 2.4 TB
+        #     and spill a 100,000-row build side to disk. One table's measurement must never
+        #     become another table's estimate.
+        #   - A row-preserving operator (Project/Sort/Limit) inherits its input's count, and
+        #     a `Filter`'s learned *selectivity* ratio (applied below to the current input)
+        #     generalizes across input sizes better than a stale absolute count.
+        if not self._exact_first and isinstance(node, _CORRECTABLE):
             learned = self._learned.get(self._sig(node))
-            if learned is not None and "rows" in learned and not isinstance(node, Filter):
+            if learned is not None and "rows" in learned:
                 return RelStats(float(learned["rows"]), Provenance.LEARNED)
 
         if isinstance(node, Scan):
@@ -251,40 +277,53 @@ class StatsEstimator:
         if isinstance(node, Project):
             child = self.estimate(node.input)
             columns = col_prop.project_columns(node.items, child, node.input.available_schema())
-            return RelStats(child.rows, child.provenance, columns)
+            # A projection reorders nothing, so the input's row order survives under the
+            # output names (`kyber.properties.project_ordering`). Dropping it here — which is
+            # what this did — lost the delivered order at exactly the node that sits between
+            # a sort and its consumer in every real query, so the redundant-sort rule could
+            # never see across a `SELECT`.
+            ordering = project_ordering(node.items, child.sorted_by)
+            return RelStats(child.rows, child.provenance, columns, ordering)
         if isinstance(node, MapBatches):
-            # Row-preserving (map_batches may change rows, but assume 1:1); the
-            # opaque UDF means output columns are unknown.
+            # A UDF may filter/explode/pass-through — a property of the code the structural
+            # estimator can't see, so it assumes 1:1 and lets the measured fan-out from a
+            # previous run correct it (`MapBatches` is `_CORRECTABLE`, keyed by UDF identity).
+            # The opaque UDF means output columns are unknown.
             return RelStats(self.estimate(node.input).rows, Provenance.DEFAULT)
         if isinstance(node, Unnest):
             # Explode multiplies rows by the average list length — a property of the data
             # that no structural rule can know, so the neutral (1x) default here is wrong
             # by exactly that factor on the first run. `Unnest` is `_CORRECTABLE`, so the
             # measured fan-out from a previous run is applied by `estimate` on top of this.
-            return RelStats(self.estimate(node.input).rows, Provenance.DEFAULT)
+            child = self.estimate(node.input)
+            return RelStats(child.rows, Provenance.DEFAULT, col_prop.unnest_columns(node, child))
         if isinstance(node, Unpivot):
             # Unpivot emits one row per `on` column — an exact, data-independent fan-out.
             child = self.estimate(node.input)
             rows = child.rows * max(1, len(node.on))
-            return RelStats(rows, child.provenance)
+            return RelStats(rows, child.provenance, col_prop.unpivot_columns(node, child))
         if isinstance(node, Sample):
             child = self.estimate(node.input)
-            # Fixed-count sample yields exactly min(n, input); fraction scales the input.
-            rows = (
-                min(child.rows, float(node.n)) if node.n is not None else child.rows * node.fraction
-            )
-            return RelStats(rows, Provenance.DEFAULT, col_prop.sample_columns(child))
+            # A fixed-count sample yields exactly min(n, input) — a known small bound even
+            # over an uncountable source, so it is a real estimate.
+            if node.n is not None:
+                rows = min(child.rows, float(node.n))
+            # A *fractional* sample of an unknown-size input is itself unknown: scaling the
+            # placeholder down (× fraction) would drop it below the "unknown" threshold and
+            # let admission treat a guess as a budgetable estimate — the same trap the
+            # aggregate/distinct estimators guard (a small query wrongly rejected as
+            # infeasible). Keep it a placeholder; only scale a genuinely-known count.
+            elif child.rows >= self._cfg.unknown_rows:
+                rows = child.rows
+            else:
+                rows = child.rows * node.fraction
+            return RelStats(rows, Provenance.DEFAULT, col_prop.sample_columns(child, rows))
         if isinstance(node, Aggregate):
             return self._estimate_aggregate(node)
         if isinstance(node, Sort):
             return self._estimate_sort(node)
         if isinstance(node, Window):
-            # Row-preserving: Window appends columns, never changes the row count, so
-            # the input columns' stats (EXACT included) carry through untouched.
-            child = self.estimate(node.input)
-            return RelStats(
-                child.rows, child.provenance, col_prop.window_columns(child), child.sorted_by
-            )
+            return self._estimate_window(node)
         if isinstance(node, Limit):
             return self._estimate_limit(node)
         if isinstance(node, Distinct):
@@ -297,23 +336,32 @@ class StatsEstimator:
             # ASOF is left-style: exactly one output row per left row, so the count
             # (and its provenance) is the left input's — EXACT when the left is, so
             # `asof_join(...).count()` answers from metadata (incl. an empty left → 0).
+            # The left columns are preserved 1:1 and the right survive as bounds, so they
+            # propagate too instead of blinding every operator above the join.
             left = self.estimate(node.left)
-            return RelStats(left.rows, left.provenance)
+            right = self.estimate(node.right)
+            return RelStats(
+                left.rows, left.provenance, col_prop.asof_join_columns(node, left, right)
+            )
         return RelStats(self._cfg.unknown_rows, Provenance.DEFAULT)
 
     # --- per-operator estimators ------------------------------------------
     def _estimate_scan(self, node: Scan) -> RelStats:
+        # The `Scan` leaf is where measured statistics enter the plan, and where they are
+        # bound to the source that was actually measured. Everything above reads them off
+        # `RelStats.columns` as they propagate.
+        learned = self.learned_columns(node.source_id)
         src_stats = self._stats_for(node.source_id)
         if src_stats is not None:
             base = src_stats.to_relstats(default_rows=self._cfg.unknown_rows)
-            columns = col_prop.scan_columns(base.columns, self._ndv)
+            columns = col_prop.scan_columns(base.columns, learned)
             return RelStats(base.rows, base.provenance, columns, base.sorted_by)
         # Sources may be absent (plan-shape optimization with no bound inputs) or
         # duck-typed without `row_count`; treat either as unknown rather than crash.
         source = self._sources[node.source_id] if node.source_id < len(self._sources) else None
         row_count_fn = getattr(source, "row_count", None)
         n = row_count_fn() if callable(row_count_fn) else None
-        columns = col_prop.scan_columns({}, self._ndv)
+        columns = col_prop.scan_columns({}, learned)
         if n is None:
             return RelStats(self._cfg.unknown_rows, Provenance.DEFAULT, columns)
         return RelStats(float(n), Provenance.EXACT, columns)
@@ -329,25 +377,94 @@ class StatsEstimator:
             if node.predicate.value:
                 return child
             return RelStats(0.0, Provenance.EXACT)
+        # A filter over a **provably empty** relation is provably empty, whatever the
+        # predicate: it keeps a subset of no rows. Without this, any filter placed above an
+        # empty subtree downgrades it to a mere estimate and the emptiness proof is lost —
+        # which is not hypothetical, because the optimizer itself *inserts* filters there
+        # (a runtime/sideways join filter lands on the join's inputs). An inner join with an
+        # EXACT-empty side then stopped answering `count() == 0` from metadata and executed
+        # the join instead. Emptiness is the one property a filter can never destroy.
+        if child.rows == 0 and child.provenance is Provenance.EXACT:
+            return RelStats(0.0, Provenance.EXACT)
+        # `col IS NOT NULL` is the one predicate whose effect is *recorded*: it drops exactly
+        # the rows the column's null count counts. So the surviving row count is EXACT, and so
+        # are that column's bounds — `min`/`max`/`ndv` are defined over the non-null values, and
+        # dropping the nulls removes none of them.
+        #
+        # This is not a corner case, it is the common one: the optimizer *inserts* these filters
+        # itself, one on each side of every equi-join (`push_is_not_null_from_join_key`). Losing
+        # exactness here meant one rule destroyed precisely the statistic another needed, and a
+        # join whose key ranges provably cannot overlap ran a full shuffle to discover what the
+        # two footers already said.
+        exact = self._not_null_stats(node, child)
+        if exact is not None:
+            return exact
         sel = self._selectivity(node, child)
         # `prov` is LEARNED (measured selectivity) or DEFAULT (Selinger) — never
         # EXACT — so a filtered row count is never EXACT, however exact the child.
         prov = Provenance.LEARNED if self._has_learned(node) else Provenance.DEFAULT
+        out_rows = child.rows * sel
         return RelStats(
-            child.rows * sel,
+            out_rows,
             weakest(child.provenance, prov),
-            col_prop.filter_columns(child),
+            col_prop.filter_columns(child, out_rows),
             child.sorted_by,
         )
 
+    def _not_null_stats(self, node: Filter, child: RelStats) -> RelStats | None:
+        """EXACT stats for a `Filter(col IS NOT NULL)`, or None when this isn't that shape.
+
+        The one filter whose effect is already *recorded*: it drops exactly the rows the
+        column's null count counts. So the surviving count is EXACT — and so are that column's
+        bounds, because `min`/`max`/`ndv` are defined over the non-null values and dropping the
+        nulls removes none of them. Its null count becomes a known zero.
+
+        Every **other** column still downgrades, and must: a row dropped for a null in `col` may
+        have carried the extreme value of some other column.
+
+        Needs an EXACT child row count and an EXACT null count for the tested column; any weaker
+        input falls through to the ordinary selectivity estimate, exactly as before.
+        """
+        pred = node.predicate
+        if not isinstance(pred, IsNotNull) or not isinstance(pred.input, Col):
+            return None
+        name = pred.input.name
+        stat = child.columns.get(name)
+        if (
+            not child.rows_exact
+            or stat is None
+            or stat.null_count is None
+            or not stat.null_count_is_exact
+        ):
+            return None
+        surviving = float(child.rows - stat.null_count)
+        columns = col_prop.filter_columns(child, surviving)
+        # The tested column's own statistics survive the filter (see the docstring); its null
+        # count is now a known zero and its ndv is unchanged (dropping nulls removes no distinct
+        # value), so restore both after the generic downgrade. Its *bundle* provenance is
+        # whatever it was — a string column keeps its truncatable bounds untrusted, and that is
+        # right.
+        columns[name] = replace(stat, null_count=0.0)
+        return RelStats(surviving, Provenance.EXACT, columns, child.sorted_by)
+
     def _estimate_sort(self, node: Sort) -> RelStats:
         child = self.estimate(node.input)
-        rows = child.rows
-        prov = child.provenance
         if node.limit is not None:
-            rows = min(rows, float(node.limit))
-        # Sort preserves the exact value set, so column stats pass through unchanged.
-        return RelStats(rows, prov, dict(child.columns), _canonical_sort_prefix(node.keys))
+            # A top-N (fused Sort+Limit) keeps only `limit` rows and can exclude a column's
+            # extremes, so its `min`/`max`/`ndv` must downgrade to bounds exactly as a
+            # `Filter`/`Limit` does — leaving them EXACT would let `min()`/`count_distinct()`
+            # answer from metadata over rows the top-N dropped.
+            rows = min(child.rows, float(node.limit))
+            return RelStats(
+                rows,
+                child.provenance,
+                col_prop.limit_columns(child, rows),
+                _canonical_sort_prefix(node.keys),
+            )
+        # A full sort preserves the exact value set, so column stats pass through unchanged.
+        return RelStats(
+            child.rows, child.provenance, dict(child.columns), _canonical_sort_prefix(node.keys)
+        )
 
     def _estimate_limit(self, node: Limit) -> RelStats:
         child = self.estimate(node.input)
@@ -358,10 +475,15 @@ class StatsEstimator:
         # over an unknown source. Otherwise the (possibly truncated) count is as exact
         # as the child.
         prov = Provenance.EXACT if node.n == 0 else child.provenance
-        return RelStats(rows, prov, col_prop.limit_columns(child), child.sorted_by)
+        return RelStats(rows, prov, col_prop.limit_columns(child, rows), child.sorted_by)
 
     def _estimate_union(self, node: Union) -> RelStats:
         children = [self.estimate(i) for i in node.inputs]
+        # A union of provably-empty branches is provably empty (concatenation invents no
+        # row), so `count()`/`is_empty()` answer 0 from metadata — the same emptiness proof
+        # a filter/join preserves. Without this an all-pruned union executed to discover 0.
+        if children and all(c.rows_exact and c.rows == 0 for c in children):
+            return RelStats(0.0, Provenance.EXACT)
         total = sum(c.rows for c in children)
         prov = weakest(*(c.provenance for c in children)) if children else Provenance.DEFAULT
         names = node.available_columns()
@@ -370,6 +492,45 @@ class StatsEstimator:
             # Dedup across branches: row count is no longer exact (overlap unknown).
             return RelStats(total, weakest(prov, Provenance.DEFAULT), columns)
         return RelStats(total, prov, columns)
+
+    def _estimate_window(self, node: Window) -> RelStats:
+        """A window appends columns — unless it is rank-limited, in which case it drops rows.
+
+        `rank_limit` is the fused form of ``Filter(Window([row_number]), rn <= k)``
+        (`kyber.rules.fusion`): the engine keeps only the top-`k` rows **per partition** and
+        the `Filter` disappears from the plan. Treating that as row-preserving is not a soft
+        mis-estimate, it is a wrong answer — the count carried the child's `EXACT`
+        provenance, so `count()` answered it from metadata *without executing*, and
+        ``distinct(subset=…, keep="last", order_by=…)`` (which lowers to exactly this shape)
+        reported the number of input rows instead of the number of surviving ones. A merge
+        whose source was deduplicated that way then failed its own cardinality check.
+
+        Bounded above by `rank_limit` rows per partition, and never `EXACT`: a partition
+        holding fewer than `k` rows contributes fewer, so the bound is not the count.
+        """
+        child = self.estimate(node.input)
+        columns = col_prop.window_columns(node, child)
+        if node.rank_limit is None:
+            # Row-preserving: appends columns, never changes the row count, so the input
+            # columns' stats (EXACT included) carry through untouched.
+            return RelStats(child.rows, child.provenance, columns, child.sorted_by)
+
+        partitions = self._partition_count(node, child)
+        rows = min(child.rows, partitions * float(node.rank_limit))
+        return RelStats(rows, Provenance.DEFAULT, columns, child.sorted_by)
+
+    def _partition_count(self, node: Window, child: RelStats) -> float:
+        """How many partitions the window's keys cut the input into (1 when unpartitioned)."""
+        if not node.partition_keys:
+            return 1.0
+        ndv = _ndvs(child)
+        count = 1.0
+        for key in node.partition_keys:
+            if isinstance(key, Col) and key.name in ndv and ndv[key.name] > 0:
+                count *= ndv[key.name]
+            else:
+                return child.rows  # unknown ndv → assume every row its own partition
+        return min(count, child.rows)
 
     def _estimate_aggregate(self, node: Aggregate) -> RelStats:
         """Group-by output ≈ distinct group-key combinations; a global aggregate
@@ -386,28 +547,33 @@ class StatsEstimator:
             learned_rows = self._learned.get(self._sig(node), {}).get("rows")
             if learned_rows is not None:
                 return RelStats(float(learned_rows), Provenance.LEARNED, key_cols)
-        ndv = self._ndv
-        key_ndvs: list[float] = []
-        for key in node.group_keys:
-            if isinstance(key.expr, Col) and key.expr.name in ndv and ndv[key.expr.name] > 0:
-                key_ndvs.append(ndv[key.expr.name])
-            else:
-                # An unknown-placeholder input (an uncountable source — `from_batches`,
-                # a stream, an un-pushed SQL scan) must NOT be shrunk below the
-                # "unknown" threshold: the shrunk guess (0.1·unknown) is small enough
-                # to look like a real estimate, so the optimizer would *budget* it and
-                # Carbonite could wrongly reject an actually-small query as infeasible.
-                # Keep it a placeholder so it stays unbudgeted (a guess never fails a
-                # real query — the documented admission contract).
-                if child.rows >= self._cfg.unknown_rows:
-                    return RelStats(child.rows, Provenance.DEFAULT, key_cols)
-                return RelStats(max(1.0, child.rows * 0.1), Provenance.DEFAULT, key_cols)
-        # The distinct combinations of the group-key set — the same quantity a join
-        # computes for its key set, so the same (damped) combiner. Multiplying the
-        # per-key counts assumed independence; correlated keys then saturated the cap and
-        # the optimizer concluded that grouping reduced nothing.
-        groups = combine_ndv(key_ndvs, child.rows)
-        return RelStats(groups, Provenance.LEARNED, key_cols)
+        ndv = _ndvs(child)
+        key_ndvs = [
+            ndv[k.expr.name]
+            for k in node.group_keys
+            if isinstance(k.expr, Col) and k.expr.name in ndv and ndv[k.expr.name] > 0
+        ]
+        if len(key_ndvs) == len(node.group_keys):
+            # Every key measured: the distinct combinations of the group-key set — the same
+            # quantity a join computes for its key set, so the same (damped) combiner.
+            # Multiplying the per-key counts assumed independence; correlated keys then
+            # saturated the cap and the optimizer concluded that grouping reduced nothing.
+            return RelStats(combine_ndv(key_ndvs, child.rows), Provenance.LEARNED, key_cols)
+        # Not every key is measured. An unknown-placeholder input (an uncountable source —
+        # `from_batches`, a stream, an un-pushed SQL scan) must NOT be shrunk below the
+        # "unknown" threshold: the shrunk guess (0.1·unknown) is small enough to look like a
+        # real estimate, so the optimizer would *budget* it and Carbonite could wrongly reject
+        # an actually-small query. Keep it a placeholder (a guess never fails a real query).
+        if child.rows >= self._cfg.unknown_rows:
+            return RelStats(child.rows, Provenance.DEFAULT, key_cols)
+        # Otherwise the blunt 0.1 fallback, but floored by the distinct combinations the
+        # *measured* keys already imply — adding the unmeasured keys can only add groups, so
+        # the known combination is a firm lower bound and the floor only raises the estimate
+        # (over-budgeting the group hash table, the safe direction).
+        estimate = max(1.0, child.rows * 0.1)
+        if key_ndvs:
+            estimate = max(estimate, combine_ndv(key_ndvs, child.rows))
+        return RelStats(estimate, Provenance.DEFAULT, key_cols)
 
     def _estimate_distinct(self, node: Distinct) -> RelStats:
         """Dedup count ≈ the distinct combinations of the projected columns.
@@ -419,7 +585,7 @@ class StatsEstimator:
         when any column's ndv is unmeasured."""
         child = self.estimate(node.input)
         cols = node.available_columns()
-        ndv = self._ndv
+        ndv = _ndvs(child)
         columns = col_prop.distinct_columns(child)
         if cols and all(c in ndv and ndv[c] > 0 for c in cols):
             groups = combine_ndv((ndv[c] for c in cols), child.rows)
@@ -428,7 +594,14 @@ class StatsEstimator:
         # shrinking it would let admission wrongly reject a small query.
         if child.rows >= self._cfg.unknown_rows:
             return RelStats(child.rows, Provenance.DEFAULT, columns)
-        return RelStats(max(1.0, child.rows * 0.5), Provenance.DEFAULT, columns)
+        # The blunt 50% fallback, floored by the distinct combinations the *measured* columns
+        # already imply — a subset of the key columns is a firm lower bound on the full set's
+        # distinct count, so the floor only raises the estimate (the safe, over-budget way).
+        estimate = max(1.0, child.rows * 0.5)
+        measured = [ndv[c] for c in cols if c in ndv and ndv[c] > 0]
+        if measured:
+            estimate = max(estimate, combine_ndv(measured, child.rows))
+        return RelStats(estimate, Provenance.DEFAULT, columns)
 
     def _estimate_join(self, node: Join) -> RelStats:
         left = self.estimate(node.left)
@@ -438,6 +611,17 @@ class StatsEstimator:
         # `count()`/`is_empty()` answer 0 from metadata without executing the join.
         if _join_provably_empty(node.join_type, left, right):
             return RelStats(0.0, Provenance.EXACT)
+        # A key pair whose `[min, max]` ranges do not overlap can share no value, so an
+        # inner/semi join over it produces nothing — the join analogue of an out-of-bounds
+        # equality. Kept a DEFAULT-provenance estimate (not an EXACT-empty *proof*): it
+        # steers cost and join order toward killing the pipeline early without letting
+        # `count()` answer 0 from metadata, so a mis-propagated bound can never become a
+        # wrong result. Catches a filter-narrowed time-partition join (`WHERE d >= '2024'`
+        # over a table ending in 2023) that structural containment estimates at full size.
+        if node.join_type in ("inner", "semi") and self._join_keys_range_disjoint(
+            node, left, right
+        ):
+            return RelStats(0.0, Provenance.DEFAULT, col_prop.join_columns(node, left, right, 0.0))
         rows, provenance = self._join_rows(node, left, right)
         # A preserved column's values carry through as downgraded *bounds* (a join
         # removes/duplicates rows but invents no value); never EXACT. The output row
@@ -466,13 +650,13 @@ class StatsEstimator:
             if learned_rows is not None:
                 return float(learned_rows), Provenance.LEARNED
         if self._is_cartesian(node):
-            return left.rows * right.rows, Provenance.DEFAULT
+            return self._cartesian_rows(node, left, right)
 
-        left_ndv = self._side_ndv(node.left_keys, left.rows)
-        right_ndv = self._side_ndv(node.right_keys, right.rows)
+        left_ndv = self._side_ndv(node.left_keys, left)
+        right_ndv = self._side_ndv(node.right_keys, right)
 
         if node.join_type in ("semi", "anti"):
-            return self._semi_anti_rows(node.join_type, left, left_ndv, right_ndv)
+            return self._semi_anti_rows(node, left, right, left_ndv, right_ndv)
 
         inner = self._inner_join_rows(node, left, right, left_ndv, right_ndv)
         if node.join_type == "left":
@@ -485,7 +669,12 @@ class StatsEstimator:
         return inner, Provenance.DEFAULT
 
     def _semi_anti_rows(
-        self, join_type: str, left: RelStats, left_ndv: float | None, right_ndv: float | None
+        self,
+        node: Join,
+        left: RelStats,
+        right: RelStats,
+        left_ndv: float | None,
+        right_ndv: float | None,
     ) -> tuple[float, Provenance]:
         """Rows of a semi/anti join: the left rows whose key does (or does not) match.
 
@@ -494,12 +683,37 @@ class StatsEstimator:
         With either distinct count unmeasured the match fraction is unknowable, so both
         variants fall back to the upper bound `|L|` — over-budgeting memory rather than
         risking the under-estimate that would OOM the join's hash table.
+
+        A **semi** join is additionally floored by skew: a hot left value that also appears
+        in `R`'s measured MCV provably matches, so *all* `f_L(v)·|L|` of its rows survive —
+        a firm lower bound the uniform ``d_R/d_L`` fraction can undercount on a skewed key.
+        (No such floor for `anti`: absence from `R`'s top-values MCV does not prove a value
+        is missing from `R`, so it cannot prove a row is *un*matched.)
         """
         if not left_ndv or not right_ndv or left_ndv <= 0:
-            return left.rows, Provenance.DEFAULT
-        matched = min(1.0, right_ndv / left_ndv)
-        fraction = matched if join_type == "semi" else 1.0 - matched
-        return max(0.0, left.rows * fraction), Provenance.DEFAULT
+            base = left.rows
+        else:
+            matched = min(1.0, right_ndv / left_ndv)
+            fraction = matched if node.join_type == "semi" else 1.0 - matched
+            base = max(0.0, left.rows * fraction)
+        if node.join_type == "semi":
+            return max(base, self._semi_skew_floor(node, left, right)), Provenance.DEFAULT
+        return base, Provenance.DEFAULT
+
+    def _semi_skew_floor(self, node: Join, left: RelStats, right: RelStats) -> float:
+        """Left rows guaranteed to survive a semi-join because their (hot) key is in `R`.
+
+        A value in *both* sides' measured MCV certainly exists in `R`, so every left row
+        holding it matches — ``f_L(v)·|L|`` rows per shared hot value. Single-key only,
+        capped at `|L|`."""
+        if len(node.left_keys) != 1 or len(node.right_keys) != 1:
+            return 0.0
+        lstat = left.columns.get(node.left_keys[0])
+        rstat = right.columns.get(node.right_keys[0])
+        if lstat is None or rstat is None or not lstat.mcv or not rstat.mcv:
+            return 0.0
+        total = sum(f * left.rows for value, f in lstat.mcv.items() if value in rstat.mcv)
+        return min(total, left.rows)
 
     def _inner_join_rows(
         self,
@@ -523,18 +737,64 @@ class StatsEstimator:
         ratio (their ndv is measured directly, so it is accurate); a non-saturated
         composite is a genuine many-to-many join the ratio models well.
         """
+        skew = self._skew_matched_rows(node, left, right)
         if len(node.left_keys) >= 2 and _composite_pk_fk(
             left.rows, right.rows, left_ndv, right_ndv
         ):
-            return max(left.rows, right.rows)
+            return max(left.rows, right.rows, skew)
         ndvs = [v for v in (left_ndv, right_ndv) if v is not None and v > 0]
         if ndvs:
             # With only one side's ndv known, `max(d_L, d_R) >= d_known`, so dividing by
             # the known one over-estimates — the safe direction (over-budget, never OOM).
-            return min(left.rows * right.rows / max(ndvs), left.rows * right.rows)
+            selinger = min(left.rows * right.rows / max(ndvs), left.rows * right.rows)
+            return max(selinger, skew)
         # No distinct counts at all: assume the key is ~unique on the smaller side, so the
         # result is ≈ the larger side.
-        return max(left.rows, right.rows)
+        return max(left.rows, right.rows, skew)
+
+    def _skew_matched_rows(self, node: Join, left: RelStats, right: RelStats) -> float:
+        """A lower bound on an equi-join's output from matching heavy-hitter key values.
+
+        Selinger's uniform ``|L||R|/max(ndv)`` badly under-counts a **skewed** join key: a
+        single value `v` present `f_L(v)` of the time on the left and `f_R(v)` on the right
+        produces ``(f_L·|L|)·(f_R·|R|)`` output rows *by itself*, and a hot key (``cust_id = 7``
+        at 47%) contributes ~``0.22·|L|·|R|`` that the uniform estimate misses entirely.
+        Summing that cross product over the shared **measured** most-common values is a firm
+        lower bound on the join size, so using it as a floor only *raises* the estimate — the
+        safe direction, and precisely the one that keeps a skewed build side from OOMing.
+
+        Single-key only (a composite key's joint frequency is not measured) and capped at the
+        cartesian bound. Returns 0 when either side has no measured MCV for its key.
+        """
+        if len(node.left_keys) != 1 or len(node.right_keys) != 1:
+            return 0.0
+        lstat = left.columns.get(node.left_keys[0])
+        rstat = right.columns.get(node.right_keys[0])
+        if lstat is None or rstat is None or not lstat.mcv or not rstat.mcv:
+            return 0.0
+        total = 0.0
+        for value, f_left in lstat.mcv.items():
+            f_right = rstat.mcv.get(value)  # both keyed by str(value) of the same join key
+            if f_right is not None:
+                total += (f_left * left.rows) * (f_right * right.rows)
+        return min(total, left.rows * right.rows)
+
+    def _cartesian_rows(
+        self, node: Join, left: RelStats, right: RelStats
+    ) -> tuple[float, Provenance]:
+        """Rows of a cross join, per join type — every left row matches every right row.
+
+        `inner`/`left`/`right`/`full` all emit the full product `|L|x|R|` (with everything
+        matched there are no unmatched rows for an outer join to add). A `semi` keeps each
+        left row **once** when the right side is non-empty, and an `anti` keeps none — so they
+        must not be given the product, which is why the cross-join shortcut is dispatched per
+        type rather than applied blanketly.
+        """
+        if node.join_type == "semi":
+            return (left.rows if right.rows > 0 else 0.0), Provenance.DEFAULT
+        if node.join_type == "anti":
+            return (0.0 if right.rows > 0 else left.rows), Provenance.DEFAULT
+        return left.rows * right.rows, Provenance.DEFAULT
 
     def _is_cartesian(self, node: Join) -> bool:
         """Whether every key pair is a constant-on-both-sides pseudo-edge.
@@ -542,8 +802,10 @@ class StatsEstimator:
         A comma/cross join lowers to an equi-join on a synthetic `__cross_key` literal
         whose ndv is unmeasured, so the containment estimate fell through to
         ``max(|L|, |R|)`` — short of the true ``|L|x|R|`` by a factor of ``min(|L|, |R|)``.
+        Applies to every join type (a `LEFT`/`FULL` cross join is just as large); the per-type
+        row count is `_cartesian_rows`.
         """
-        if not node.left_keys or node.join_type != "inner":
+        if not node.left_keys:
             return False
         return all(
             is_cartesian_key_pair(node.left, lk, node.right, rk)
@@ -556,8 +818,8 @@ class StatsEstimator:
             return None
         return self._source_stats[source_id]
 
-    def expr_selectivity(self, predicate: Expr) -> float:
-        """Estimated fraction of rows `predicate` keeps, from the learned column stats.
+    def expr_selectivity(self, predicate: Expr, over: RelStats | None = None) -> float:
+        """Estimated fraction of rows `predicate` keeps, from the relation's column stats.
 
         The structural estimate only — unlike `_selectivity`, it is not attached to a
         `Filter` node and so cannot consult the per-signature measured ratio. Rules that
@@ -566,24 +828,38 @@ class StatsEstimator:
 
         Args:
             predicate: A boolean scalar expression.
+            over: The relation the predicate is applied to, whose column statistics
+                supply the distinct counts, quantiles and skew values. Omitting it
+                estimates from the predicate's structure and the cold-start constants
+                alone — correct, just blunter.
 
         Returns:
             The estimated kept fraction, in `[0, 1]`.
         """
-        return predicate_selectivity(predicate, self._ndv, self._cfg, self._quantiles, self._mcv)
+        stats = over if over is not None else RelStats(0.0, Provenance.DEFAULT)
+        return predicate_selectivity(
+            predicate,
+            _ndvs(stats),
+            self._cfg,
+            _quantiles(stats),
+            _mcvs(stats),
+            _bounds(stats),
+            _null_fractions(stats),
+        )
 
     def _selectivity(self, node: Filter, child: RelStats) -> float:
         # A measured selectivity for this exact plan shape always wins (the
-        # learning loop); otherwise estimate from the predicate's structure.
+        # learning loop); otherwise estimate from the predicate's structure over the
+        # *child's own* column statistics — the ones the scan seeded from this source.
         learned = self._learned.get(self._sig(node), {}).get("selectivity")
         if learned is not None:
             return learned
         return predicate_selectivity(
             node.predicate,
-            self._ndv,
+            _ndvs(child),
             self._cfg,
-            self._quantiles,
-            self._mcv,
+            _quantiles(child),
+            _mcvs(child),
             _bounds(child),
             _null_fractions(child),
         )
@@ -591,85 +867,156 @@ class StatsEstimator:
     def _has_learned(self, node: LogicalPlan) -> bool:
         return "selectivity" in self._learned.get(self._sig(node), {})
 
-    @property
-    def _ndv(self) -> dict[str, float]:
-        """Per-column distinct counts (column name → ndv), used to sharpen equality
-        selectivity to `1/ndv` and to estimate join cardinality as `|L||R|/max(ndv)`.
+    def _source_key(self, source_id: int) -> str | None:
+        """The key bound source `source_id`'s learned statistics are filed under."""
+        if source_id >= len(self._sources):
+            return None
+        return source_stats_key(self._sources[source_id])
 
-        Seeded from **source statistics** (footer / written-file HLL sketches carried by
-        `SourceStatistics.columns`) and overlaid with **learned** ndv from measured runs
-        (which wins, being workload-true). Source NDV is what gives a *cold* join — before
-        any run has been measured — an NDV-based cardinality instead of the
-        `max(left, right)` fallback that mis-estimates a low-NDV many-to-many join by
-        orders of magnitude and steers join order into huge intermediates.
+    def learned_columns(self, source_id: int) -> dict[str, ColumnStat]:
+        """The learned column statistics measured **for this source**, as `ColumnStat`s.
+
+        This is the one place the four learned column maps (`__column_ndv__`,
+        `__column_quantiles__`, `__column_mcv__`, `__column_avg_bytes__`) are read, and it
+        reads them *sliced by the source's own identity*. Everything downstream — filter
+        selectivity, join cardinality, group-by ndv, row width — then works from the
+        statistics propagated on `RelStats.columns`, so a column's measured distribution
+        travels with the relation it was measured from instead of being looked up by a
+        name that two tables can share.
         """
-        if self._ndv_cache is None:
-            merged: dict[str, float] = {}
-            for st in self._source_stats or ():
-                if st is None:
-                    continue
-                for name, col in st.columns.items():
-                    if col.ndv is not None and col.ndv > 0:
-                        merged[name] = float(col.ndv)
-            merged.update(self._learned.get(NDV_KEY, {}))  # measured wins
-            self._ndv_cache = merged
-        return self._ndv_cache
-
-    @property
-    def _quantiles(self) -> dict[str, Any]:
-        """Learned per-column quantile boundaries
-        (`{col: {"probs": [...], "values": [...]}}`, both ascending), used for
-        histogram-based range selectivity. Empty until the metadata loop fills it."""
-        return self._learned.get(QUANTILES_KEY, {})
-
-    @property
-    def _mcv(self) -> dict[str, dict[str, float]]:
-        """Learned per-column most-common-values (`{col: {str(value): frequency}}`),
-        used to sharpen equality selectivity on skewed columns to the value's measured
-        frequency. Empty until the metadata loop fills it."""
-        return self._learned.get(MCV_KEY, {})
-
-    @property
-    def _avg_bytes(self) -> dict[str, float]:
-        """Learned per-column average byte widths (column name → bytes/row),
-        measured from `ColumnStats.avg_byte_width`. Empty until the metadata loop
-        fills it; this is what turns the cost model's memory/IO/broadcast axes
-        byte-true for wide columns (large strings, embeddings, blob handles)."""
-        return self._learned.get(AVG_BYTES_KEY, {})
+        cached = self._learned_cols.get(source_id)
+        if cached is not None:
+            return cached
+        key = self._source_key(source_id)
+        ndv = learning.columns_for(self._learned, NDV_KEY, key)
+        quantiles = learning.columns_for(self._learned, QUANTILES_KEY, key)
+        mcv = learning.columns_for(self._learned, MCV_KEY, key)
+        widths = learning.columns_for(self._learned, AVG_BYTES_KEY, key)
+        cols: dict[str, ColumnStat] = {}
+        for name in set(ndv) | set(quantiles) | set(mcv) | set(widths):
+            measured = ndv.get(name)
+            cols[name] = ColumnStat(
+                ndv=float(measured) if measured and measured > 0 else None,
+                quantiles=quantiles.get(name),
+                mcv=mcv.get(name),
+                avg_bytes=widths.get(name),
+                # Measured by HLL/KLL/Misra-Gries — approximate by construction, so it may
+                # inform cost and pruning but must never answer an exact `count_distinct`.
+                provenance=Provenance.SKETCH,
+            )
+        self._learned_cols[source_id] = cols
+        return cols
 
     def row_width(self, node: LogicalPlan, default: float) -> float:
         """Estimated average bytes per output row of `node`.
 
-        Sums the node's output columns' *learned* average byte widths; columns
-        with no measured width contribute the mean of the measured ones (a neutral
-        per-column estimate). When **no** output column has a learned width yet,
-        falls back to `default` — the cost model's flat per-row constant — so a
-        cold-start plan costs exactly as it did before byte-awareness.
-        """
-        widths = self._avg_bytes
-        cols = node.available_columns()
-        measured = [widths[c] for c in cols if c in widths]
-        if not measured:
-            return default
-        avg_known = sum(measured) / len(measured)
-        return sum(widths.get(c, avg_known) for c in cols)
+        A column's width is taken from the first source that knows it: a *learned*
+        average byte width (measured, authoritative), else the width implied by its
+        Arrow **type** (exact for fixed-width types, a documented prior for
+        variable-length ones — see `plan.types.widths`), else the mean of this
+        node's measured columns. Only a node with no schema at all falls back to
+        `default`, the cost model's flat per-row constant.
 
-    def _side_ndv(self, keys: tuple[str, ...], rows: float) -> float | None:
+        The schema floor matters because the byte axes gate broadcast eligibility.
+        Costing every unmeasured relation at a flat per-row constant sized a
+        two-`int64` join key (16 B/row) exactly like a 20-column payload, which
+        over-sized narrow build sides by ~4x and forfeited their broadcast join.
+        """
+        widths = _avg_bytes(self.estimate(node))
+        cols = node.available_columns()
+        if not cols:
+            return default
+        schema = node.available_schema()
+        typed: dict[str, float] = {}
+        if schema is not None:
+            typed = {f.name: column_bytes(f.type) for f in schema.arrow}
+        measured = [widths[c] for c in cols if c in widths]
+        if not measured and not typed:
+            return default
+        # Neutral per-column filler for a column neither measured nor typed.
+        known = measured or list(typed.values())
+        avg_known = sum(known) / len(known)
+        return sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
+
+    def _side_ndv(self, keys: tuple[str, ...], side: RelStats) -> float | None:
         """Distinct count of one join side's key *set*, capped at its row count.
 
-        Returns `None` when any key lacks a learned distinct count. See `combine_ndv` for
-        why the per-key counts are combined with damping rather than multiplied.
+        The per-key counts come from **that side's own** propagated column statistics, so
+        a key named `id` is answered by the distinct count of the `id` this side actually
+        carries. Returns `None` when any key lacks a measured distinct count. See
+        `combine_ndv` for why the counts are combined with damping rather than multiplied.
         """
         if not keys:
             return None
-        ndv = self._ndv
+        ndv = _ndvs(side)
         if not all(k in ndv and ndv[k] > 0 for k in keys):
             return None
-        return combine_ndv((ndv[k] for k in keys), rows)
+        return combine_ndv((ndv[k] for k in keys), side.rows)
 
-    def input_sizes(self, node: Join) -> tuple[RelStats, RelStats]:
-        """The estimated sizes of a join's two inputs (for build-side choice)."""
-        return self.estimate(node.left), self.estimate(node.right)
+    def _join_keys_range_disjoint(self, node: Join, left: RelStats, right: RelStats) -> bool:
+        """Whether some equi-key pair has provably non-overlapping `[min, max]` ranges.
+
+        Bounds are valid (if loose) supersets of the actual values, so two disjoint key
+        ranges share no value and cannot match. Only numeric/date/decimal bounds are trusted
+        (`_ordinal`-mappable): a string column's footer bounds may be *truncated*, so they
+        are not a sound superset and a disjointness claim over them could be wrong. A single
+        disjoint key pair is enough — an equi-join requires every key to match.
+        """
+        for lk, rk in zip(node.left_keys, node.right_keys, strict=False):
+            lstat = left.columns.get(lk)
+            rstat = right.columns.get(rk)
+            if lstat is None or rstat is None:
+                continue
+            lo_l, hi_l = _ordinal(lstat.min), _ordinal(lstat.max)
+            lo_r, hi_r = _ordinal(rstat.min), _ordinal(rstat.max)
+            if None in (lo_l, hi_l, lo_r, hi_r):
+                continue
+            if hi_l < lo_r or hi_r < lo_l:  # the two ranges do not overlap
+                return True
+        return False
+
+
+def _ndvs(stats: RelStats) -> dict[str, float]:
+    """`{column: ndv}` for every column of `stats` whose distinct count is known.
+
+    Read off the relation's *propagated* statistics rather than a global name-keyed map,
+    which is what binds a distinct count to the column it was actually measured from.
+    """
+    return {
+        name: float(col.ndv)
+        for name, col in stats.columns.items()
+        if col.ndv is not None and col.ndv > 0
+    }
+
+
+def _quantiles(stats: RelStats) -> dict[str, Any]:
+    """`{column: {"probs": [...], "values": [...]}}` for every column with a quantile grid.
+
+    Feeds `predicate_selectivity`'s histogram interpolation for range predicates.
+    """
+    return {name: col.quantiles for name, col in stats.columns.items() if col.quantiles}
+
+
+def _mcvs(stats: RelStats) -> dict[str, dict[str, float]]:
+    """`{column: {str(value): frequency}}` for every column with measured top values.
+
+    Feeds `predicate_selectivity`'s skew-aware equality estimate, which is far sharper
+    than a uniform `1/ndv` on exactly the columns where uniformity is most wrong.
+    """
+    return {name: dict(col.mcv) for name, col in stats.columns.items() if col.mcv}
+
+
+def _avg_bytes(stats: RelStats) -> dict[str, float]:
+    """`{column: bytes/row}` for every column with a measured average width.
+
+    Makes the cost model's memory/IO/broadcast axes byte-true for wide columns (large
+    strings, embeddings, blob handles), where a flat per-row constant is off by orders.
+    """
+    return {
+        name: float(col.avg_bytes)
+        for name, col in stats.columns.items()
+        if col.avg_bytes is not None and col.avg_bytes > 0
+    }
 
 
 def _null_fractions(stats: RelStats) -> dict[str, float]:

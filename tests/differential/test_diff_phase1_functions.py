@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import coalesce, col, concat, concat_ws, format_string, iff, lit, log, nanvl
 
 pytestmark = pytest.mark.differential
@@ -31,8 +32,6 @@ def _nums():
 
 
 def test_floordiv_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _nums())
     out = bt.from_arrow(_nums()).select(fd=col("a") // col("b")).collect()
     # floor(a/b) with true division — floors toward -inf (Python/Polars `//`).
@@ -40,8 +39,6 @@ def test_floordiv_matches_duckdb(duck):
 
 
 def test_bitwise_operators_match_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _nums())
     out = (
         bt.from_arrow(_nums())
@@ -56,8 +53,6 @@ def test_bitwise_operators_match_duckdb(duck):
 
 
 def test_unary_and_round_builtins_match_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([3.4, -3.6, 2.5, None], type=pa.float64())})
     duck.register("t", data)
     out = (
@@ -82,8 +77,6 @@ def test_unary_and_round_builtins_match_duckdb(duck):
 
 
 def test_list_struct_indexing_matches_duckdb(duck):
-    from conftest import assert_same
-
     # list element (Python 0-based → DuckDB 1-based) and slice.
     out = (
         bt.from_arrow(pa.table({"id": [1, 2]}))
@@ -102,8 +95,6 @@ def test_list_struct_indexing_matches_duckdb(duck):
 
 
 def test_concat_treats_null_as_empty(duck):
-    from conftest import assert_same
-
     data = pa.table({"a": ["x", None, "z"], "b": ["1", "2", None]})
     duck.register("t", data)
     out = bt.from_arrow(data).select(c=concat(col("a"), col("b"))).collect()
@@ -111,8 +102,6 @@ def test_concat_treats_null_as_empty(duck):
 
 
 def test_concat_ws_skips_nulls(duck):
-    from conftest import assert_same
-
     data = pa.table({"a": ["x", None, "z"], "b": ["1", "2", None]})
     duck.register("t", data)
     out = bt.from_arrow(data).select(c=concat_ws("-", col("a"), col("b"))).collect()
@@ -120,8 +109,6 @@ def test_concat_ws_skips_nulls(duck):
 
 
 def test_format_string_matches_concat(duck):
-    from conftest import assert_same
-
     data = pa.table({"k": ["a", "b"], "v": [1, 2]})
     duck.register("t", data)
     out = bt.from_arrow(data).select(f=format_string("{}={}", col("k"), col("v"))).collect()
@@ -129,16 +116,12 @@ def test_format_string_matches_concat(duck):
 
 
 def test_iff_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _nums())
     out = bt.from_arrow(_nums()).select(s=iff(col("a") > 0, lit("pos"), lit("neg"))).collect()
     assert_same(out, duck.sql("SELECT CASE WHEN a > 0 THEN 'pos' ELSE 'neg' END AS s FROM t"))
 
 
 def test_nanvl_matches_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1.0, _NAN, None, -2.5], type=pa.float64())})
     duck.register("t", data)
     out = bt.from_arrow(data).select(r=nanvl(col("x"), lit(0.0))).collect()
@@ -146,16 +129,12 @@ def test_nanvl_matches_duckdb(duck):
 
 
 def test_coalesce_matches_duckdb_ifnull(duck):
-    from conftest import assert_same
-
     duck.register("t", _nums())
     out = bt.from_arrow(_nums()).select(r=coalesce(col("a"), lit(0))).collect()
     assert_same(out, duck.sql("SELECT ifnull(a, 0) AS r FROM t"))
 
 
 def test_log_base_matches_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([2.0, 8.0, 100.0], type=pa.float64())})
     duck.register("t", data)
     out = bt.from_arrow(data).select(l2=log(2, col("x")), l10=log(10, col("x"))).collect()

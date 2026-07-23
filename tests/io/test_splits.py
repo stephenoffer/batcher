@@ -189,7 +189,7 @@ def test_fragment_index_lru_evicts_least_recently_used(monkeypatch):
     """The fragment-index cache is a bounded LRU: a hit refreshes recency, and an
     insert past the bound drops only the least-recently-used table — not the whole
     cache (the old clear-all forced every live table to re-list)."""
-    from batcher.io import splits
+    from batcher.io.splits import parquet as splits
 
     monkeypatch.setattr(splits, "_FRAGMENT_INDEX_CACHE", splits.OrderedDict())
     monkeypatch.setattr(splits, "_FRAGMENT_CACHE_MAX", 3)

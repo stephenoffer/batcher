@@ -27,9 +27,11 @@ __all__ = [
     "NDV_KEY",
     "QUANTILES_KEY",
     "bump_generation",
+    "columns_for",
     "generation",
     "is_material_change",
     "load_learned_stats",
+    "qualify",
     "record_column_stats",
     "record_execution",
     "record_selectivity",
@@ -47,6 +49,50 @@ MCV_KEY = "__column_mcv__"  # per-column most-common-values (skew)
 # Derived, not stored: `load_learned_stats` folds the measured q-error history into
 # `{signature: correction_factor}` under this key. See `_cardinality_corrections`.
 CARDINALITY_CORRECTION_KEY = "__cardinality_correction__"
+
+# Column statistics are keyed by **source, then column** — never by column name alone.
+#
+# A bare column name does not identify a column. Two tables both have an `id`, a `key`, a
+# `date`; a flat `{name: stat}` map merges them, so whichever table was measured last
+# silently answers for every other table with a column of that name — process-wide, for
+# every join and group-by estimate that reads it. This repo already learned that lesson on
+# the *row* side (see `StatsEstimator._estimate_uncached`: every `Scan` shares the
+# signature `["scan"]`, so one table's measured 5M rows became a 1,000-row table's
+# estimate, and a pruned MERGE sized its join at 2.4 TB). The column maps had the same
+# defect and this is the qualifier that closes it.
+#
+# The key stays a flat string — `f"{source}\x1f{column}"` — so the stored shape is still
+# `dict[str, value]` and every backend, the generation-bump check, and the merge logic are
+# untouched. `\x1f` (ASCII unit separator) cannot occur in a column name.
+_SOURCE_SEP = "\x1f"
+
+
+def qualify(source_key: str, column: str) -> str:
+    """The store key for `column` **of `source_key`** (see `_SOURCE_SEP`)."""
+    return f"{source_key}{_SOURCE_SEP}{column}"
+
+
+def columns_for(learned: dict[str, Any], stat_key: str, source_key: str | None) -> dict[str, Any]:
+    """The `{column: value}` slice of a learned column map that describes `source_key`.
+
+    Entries written *unqualified* (no separator) are treated as applying to every source.
+    That is the legacy shape — a hub persisted by an older build, or a test that seeds the
+    map directly — and a source-qualified entry always wins over it. Nothing on the live
+    path writes unqualified any more (`record_column_stats` requires a source key), so the
+    fallback is a compatibility shim, not a way back into the collision.
+    """
+    table = learned.get(stat_key) or {}
+    prefix = f"{source_key}{_SOURCE_SEP}" if source_key is not None else None
+    out: dict[str, Any] = {}
+    qualified: dict[str, Any] = {}
+    for key, value in table.items():
+        if _SOURCE_SEP not in key:
+            out[key] = value  # legacy: unqualified, applies to any source
+        elif prefix is not None and key.startswith(prefix):
+            qualified[key[len(prefix) :]] = value
+    out.update(qualified)  # a measurement of *this* source beats a legacy global one
+    return out
+
 
 # Per-hub memo of the derived corrections, keyed weakly so a dropped hub evicts its
 # entry. The value is `(hub.version, fingerprint, corrections)`: valid while the hub has
@@ -351,44 +397,59 @@ def record_column_stats(
     quantiles: dict[str, dict[str, list[float]]],
     avg_bytes: dict[str, float] | None = None,
     mcv: dict[str, dict[str, float]] | None = None,
+    source_key: str | None = None,
 ) -> None:
     """Record measured per-column distinct counts, quantile boundaries, widths, and
-    most-common-values.
+    most-common-values, as statistics **of one source**.
 
-    These feed the `CardinalityEstimator`'s `__column_ndv__` (equality/join
-    selectivity), `__column_quantiles__` (range selectivity), `__column_avg_bytes__`
-    (byte-true memory/broadcast sizing), and `__column_mcv__` (skew-aware equality
-    selectivity), so a query that has seen a column's data once plans better on every
-    subsequent run. Best-effort; never raises. Core measures
-    (`core.column_statistics` / `core.heavy_hitters`); Kyber persists/consumes.
+    These feed the `StatsEstimator`'s `__column_ndv__` (equality/join selectivity),
+    `__column_quantiles__` (range selectivity), `__column_avg_bytes__` (byte-true
+    memory/broadcast sizing), and `__column_mcv__` (skew-aware equality selectivity), so a
+    query that has seen a column's data once plans better on every subsequent run.
+
+    `source_key` is the source these columns were measured from (a data-stable
+    `source.identity()`), and every key is qualified with it — because a column name alone
+    does not identify a column, and an unqualified map lets one table's `id` answer for
+    another's. Omitting it writes the legacy unqualified shape, which `columns_for` still
+    honors as a global fallback; nothing on the live path does.
+
+    Best-effort; never raises. Core measures (`core.column_statistics` /
+    `core.heavy_hitters`); Kyber persists/consumes.
     """
     avg_bytes = avg_bytes or {}
     mcv = mcv or {}
     if hub is None or (not ndv and not quantiles and not avg_bytes and not mcv):
         return
+
+    def keyed(values: dict[str, Any]) -> dict[str, Any]:
+        if source_key is None:
+            return values
+        return {qualify(source_key, col): v for col, v in values.items()}
+
     try:
         # Each reserved column key is its own backend entry, updated independently
         # so a concurrent per-signature record (or another column update) can't
         # clobber it.
         if ndv:
             col_ndv = dict(hub.get_keyed_param(_NAMESPACE, NDV_KEY) or {})
+            fresh = keyed(ndv)
             # A column measured for the first time can change every join and group-by
             # estimate that reads it — the one column-stat event worth re-planning for.
-            if any(name not in col_ndv for name in ndv):
+            if any(name not in col_ndv for name in fresh):
                 _bump_generation()
-            col_ndv.update(ndv)
+            col_ndv.update(fresh)
             hub.put_keyed_param(_NAMESPACE, NDV_KEY, col_ndv)
         if quantiles:
             col_q = dict(hub.get_keyed_param(_NAMESPACE, QUANTILES_KEY) or {})
-            col_q.update(quantiles)
+            col_q.update(keyed(quantiles))
             hub.put_keyed_param(_NAMESPACE, QUANTILES_KEY, col_q)
         if avg_bytes:
             col_w = dict(hub.get_keyed_param(_NAMESPACE, AVG_BYTES_KEY) or {})
-            col_w.update(avg_bytes)
+            col_w.update(keyed(avg_bytes))
             hub.put_keyed_param(_NAMESPACE, AVG_BYTES_KEY, col_w)
         if mcv:
             col_mcv = dict(hub.get_keyed_param(_NAMESPACE, MCV_KEY) or {})
-            col_mcv.update(mcv)
+            col_mcv.update(keyed(mcv))
             hub.put_keyed_param(_NAMESPACE, MCV_KEY, col_mcv)
     except Exception:  # pragma: no cover - learning must never break execution
         pass

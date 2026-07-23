@@ -12,6 +12,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from batcher._internal.errors import PlanError
+from batcher.governance._validate import reject_bare_string
+
 __all__ = ["Principal"]
 
 
@@ -39,11 +42,59 @@ class Principal:
     attrs: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Freeze `roles` and `attrs` so a `Principal` handed to the catalog cannot be
-        mutated afterwards — a mutable role set would make an authorization decision
-        depend on when it was read."""
-        object.__setattr__(self, "roles", frozenset(self.roles))
-        object.__setattr__(self, "attrs", MappingProxyType(dict(self.attrs)))
+        """Validate, then freeze `roles` and `attrs`.
+
+        Freezing is so a `Principal` handed to the catalog cannot be mutated afterwards
+        — a mutable role set would make an authorization decision depend on when it was
+        read. Validating is because every mistake here fails *open* rather than loudly:
+        ``roles="analyst"`` iterates into the eight single-character roles ``{'a', 'n',
+        ...}``, none of which any grant names, so the principal silently sees nothing and
+        the catalog looks broken. This is an authorization boundary; it must not guess.
+
+        Raises:
+            PlanError: If `name` is not a non-empty string, `roles` is a bare string, or
+                any role or attribute is not a string.
+        """
+        if not isinstance(self.name, str) or not self.name:
+            raise PlanError(
+                f"A Principal needs a non-empty name, but got "
+                f"{type(self.name).__name__} {self.name!r}.",
+                hint="The name identifies the principal in audit events.",
+            )
+        reject_bare_string(
+            self.roles,
+            what="Principal(roles=...)",
+            param="roles",
+            reads_as="one role per character",
+        )
+        roles = frozenset(self.roles)
+        bad_roles = sorted(repr(r) for r in roles if not isinstance(r, str))
+        if bad_roles:
+            raise PlanError(
+                f"Principal roles must all be strings, but got {', '.join(bad_roles)}.",
+                hint="A role is matched by name against the catalog's grants.",
+            )
+        attrs = dict(self.attrs)
+        bad_attrs = sorted(k for k, v in attrs.items() if not isinstance(v, str))
+        if bad_attrs:
+            raise PlanError(
+                f"Principal attribute values must be strings, but "
+                f"{', '.join(repr(k) for k in bad_attrs)} "
+                f"{'are' if len(bad_attrs) > 1 else 'is'} not.",
+                hint=(
+                    "Row filters compare an attribute against a column value, so a "
+                    "non-string would never match. Convert it, e.g. attrs={'level': '3'}."
+                ),
+            )
+        object.__setattr__(self, "roles", roles)
+        object.__setattr__(self, "attrs", MappingProxyType(attrs))
+
+    def __repr__(self) -> str:
+        """Name, roles, and attributes, in the spelling that reconstructs the principal.
+
+        The generated dataclass repr renders `attrs` as a `mappingproxy(...)`, which is
+        neither what the user wrote nor something they can paste back."""
+        return f"Principal({self.name!r}, roles={sorted(self.roles)!r}, attrs={dict(self.attrs)!r})"
 
     def has_role(self, role: str) -> bool:
         """Whether this principal holds `role`.

@@ -62,6 +62,7 @@ BINARY_COST: dict[str, float] = {
     "mul": 1.0,
     "div": 3.0,  # hardware divide is multi-cycle
     "mod": 3.0,
+    "floor_div": 4.0,  # a divide plus the remainder-sign floor correction
     "and": 0.5,
     "or": 0.5,
     "bit_and": 1.0,

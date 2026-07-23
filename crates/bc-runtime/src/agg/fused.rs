@@ -123,7 +123,11 @@ impl FusedAcc<'_> {
             }
             FusedAcc::SumDecimal { v, sums, valid, .. } => {
                 if v.is_valid(i) {
-                    sums[g] += v.value(i);
+                    // checked_add: a decimal SUM past i128 range errors, not wraps (as the
+                    // i64 SumInt arm above does).
+                    sums[g] = sums[g]
+                        .checked_add(v.value(i))
+                        .ok_or(RuntimeError::SumOverflow)?;
                     valid[g] = true;
                 }
             }
@@ -156,7 +160,16 @@ impl FusedAcc<'_> {
             } => {
                 if v.is_valid(i) {
                     let val = v.value(i);
-                    if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
+                    // Same total order the per-call `minmax_acc` uses (`crate::keys`), not raw
+                    // IEEE `<`/`>` — otherwise NaN never wins here and the fused path disagrees
+                    // with the per-call path, which `fused_minmax_nan_matches_per_call` pins.
+                    let ord = crate::keys::float_total_cmp(val, cur[g]);
+                    let wins = if *is_min {
+                        ord == std::cmp::Ordering::Less
+                    } else {
+                        ord == std::cmp::Ordering::Greater
+                    };
+                    if !valid[g] || wins {
                         cur[g] = val;
                         valid[g] = true;
                     }

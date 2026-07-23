@@ -1,8 +1,8 @@
 # Learning paths
 
-Role-based reading guides through the documentation. Each path is an ordered list of
-pages plus a couple of small runnable examples, so you can follow it top to bottom
-and arrive at the parts of Batcher that matter for your work.
+Pick the path that matches your job. Each one is an ordered reading list with a few
+runnable examples dropped in. Follow it top to bottom and you land on the parts of
+Batcher your work actually uses.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -10,13 +10,13 @@ and arrive at the parts of Batcher that matter for your work.
 :::{grid-item-card} {octicon}`database;1.1em` Data engineer
 :link: data-engineer
 :link-type: doc
-Pipelines, joins, aggregations, and reading and writing data.
+Build pipelines. Read a source, reshape it, join it, aggregate it, write the result.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Data scientist
 :link: data-scientist
 :link-type: doc
-Interactive analysis with expressions, SQL, and aggregations.
+Interactive analysis: expressions, SQL, and group-by aggregations.
 :::
 
 :::{grid-item-card} {octicon}`beaker;1.1em` ML engineer
@@ -28,9 +28,18 @@ Batch inference, embeddings, and GPU execution.
 :::{grid-item-card} {octicon}`server;1.1em` Platform engineer
 :link: platform-engineer
 :link-type: doc
-Configuration, resources, and operating the engine.
+Configure the engine, bound its memory, and keep it running under load.
 :::
 ::::
+
+## See also
+
+:::{seealso}
+- {doc}`../getting-started/index`: install and run a first query before starting a path.
+- {doc}`../user-guide/index`: the capability-by-capability reference each path points into.
+- {doc}`../examples/index`: runnable code for the workloads the paths describe.
+- {doc}`../migration/index`: start here instead if you are porting existing code.
+:::
 
 ```{toctree}
 :hidden:

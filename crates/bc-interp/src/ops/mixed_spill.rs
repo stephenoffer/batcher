@@ -28,7 +28,9 @@ use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
 use bc_runtime::agg;
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec};
 
-use super::quantile_spill::{bounded_group_distinct, bounded_group_mode, bounded_group_quantile};
+use super::quantile_spill::{
+    bounded_group_distinct, bounded_group_mode, bounded_group_quantile, canon_float_key,
+};
 use super::{agg_funcs, eval_partial};
 use crate::error::InterpError;
 
@@ -174,7 +176,12 @@ fn align_and_assemble(
             let n = vc.first().map_or(0, |c| c.len());
             UInt32Array::from_iter_values(0..n as u32)
         } else {
-            sort_perm(&gc)?
+            // Sort on the canonical float key so a group emitted as `-0.0` by one path
+            // and `0.0` by another (the value-list paths canonicalize; the grace path
+            // keeps the first-seen original) lands at the same rank in every path —
+            // otherwise the zip below would misalign that group's columns.
+            let canon: Vec<ArrayRef> = gc.iter().map(canon_float_key).collect();
+            sort_perm(&canon)?
         };
         let gc_s = take_all(&gc, &perm)?;
         let vc_s = take_all(&vc, &perm)?;

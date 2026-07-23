@@ -17,6 +17,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
 
@@ -25,11 +26,7 @@ __all__ = ["XMLSource"]
 
 def _require_xml2arrow() -> Any:
     """Import and return the `xml2arrow` module or raise `BackendError`."""
-    try:
-        import xml2arrow
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("XML requires xml2arrow: pip install 'batcher-engine[xml]'") from exc
-    return xml2arrow
+    return require("xml2arrow", feature="XML", provides="xml2arrow", extra="xml")
 
 
 def _to_table(fh: IO[Any]) -> pa.Table:

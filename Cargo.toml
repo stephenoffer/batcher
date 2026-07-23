@@ -18,7 +18,13 @@ authors = ["Batcher contributors"]
 # `ipc_compression` (LZ4_FRAME + ZSTD) lets the spill writer compress those IPC
 # streams — without it the write-side codec is a no-op and compressed streams cannot
 # be read back.
-arrow = { version = "56", features = ["ffi", "prettyprint", "ipc", "ipc_compression"] }
+# `chrono-tz` gives named-IANA-timezone support (e.g. `"UTC"`, `"America/New_York"`). Without it
+# arrow only parses *offset* zones (`"+00:00"`), so any operation touching a named-tz timestamp —
+# which is what pyarrow and Delta produce (a UTC-normalized Delta column is `timestamp[us, "UTC"]`) —
+# panics with `Invalid timezone "UTC": only offset based timezones supported`. That made a plain
+# `tz_col > lit(datetime)` (and the Delta residual-filter / count paths) crash. Enabled so the engine
+# actually supports the tz-aware timestamps it accepts across the FFI boundary.
+arrow = { version = "56", features = ["ffi", "prettyprint", "ipc", "ipc_compression", "chrono-tz"] }
 
 # PyO3 boundary — abi3 so one wheel covers all CPython >= 3.10.
 # Pinned to 0.25 to match arrow-pyarrow 56 (avoids a duplicate pyo3 in the graph).
@@ -31,6 +37,7 @@ serde_json = "1"
 
 # Internal crates (path deps wired here so members stay terse).
 bc-arrow = { path = "crates/bc-arrow" }
+bc-secrets = { path = "crates/bc-secrets" }
 bc-resource = { path = "crates/bc-resource" }
 bc-expr = { path = "crates/bc-expr" }
 bc-ir = { path = "crates/bc-ir" }

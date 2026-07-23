@@ -36,10 +36,24 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
     if first.num_columns() != 1 || !matches!(first.column(0).data_type(), DataType::Int64) {
         return Ok(None);
     }
-    let cols: Vec<&Int64Array> = parts
+    // Validate *every* part is a single `Int64` column, not just the first. Heterogeneous
+    // batches reach here — a `UNION`'s branches keep their own types, so an `Int64` branch
+    // and a `Float64` branch arrive as differently-typed single-column batches — and blindly
+    // `as_primitive::<Int64Type>()`-ing a non-`Int64` one panics ("primitive array"). Decline
+    // (return `None`) instead, so the caller's general path handles (or cleanly rejects) the
+    // mismatch rather than crashing the query.
+    let cols: Vec<&Int64Array> = match parts
         .iter()
-        .map(|b| b.column(0).as_primitive::<Int64Type>())
-        .collect();
+        .map(|b| {
+            (b.num_columns() == 1)
+                .then(|| b.column(0).as_any().downcast_ref::<Int64Array>())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(cols) => cols,
+        None => return Ok(None),
+    };
     if cols.iter().any(|c| c.null_count() != 0) {
         return Ok(None);
     }
@@ -171,25 +185,100 @@ pub(crate) fn merge_distinct(
     let list = state.as_list::<i32>();
     let offsets = list.value_offsets();
     let child = list.values();
-    // The loop emits exactly one entry per child element, so its size is known up front —
-    // reserve it and skip the reallocation churn of growing from empty.
-    let mut elem_idx: Vec<u32> = Vec::with_capacity(child.len());
+    // The concatenated child holds every partial list's values in list-row order with contiguous
+    // offsets, so flattening in row order visits child element `e` at output position `e` — the
+    // index would be `0..child.len()` and take-ing through it just copies every value (~tens of
+    // millions on a big COUNT(DISTINCT)) without reordering. Expand only the per-element group id
+    // and hand the child straight to the deduping bucketer.
+    let contiguous = offsets.first().copied().unwrap_or(0) == 0
+        && offsets.last().map(|&o| o as usize) == Some(child.len());
     let mut elem_groups: Vec<i64> = Vec::with_capacity(child.len());
     for row in 0..list.len() {
-        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let n = (offsets[row + 1] - offsets[row]) as usize;
         let g = group_ids[row] as i64;
-        for e in start..end {
-            elem_idx.push(e as u32);
-            elem_groups.push(g);
-        }
+        elem_groups.extend(std::iter::repeat_n(g, n));
     }
-    let values = take(child.as_ref(), &UInt32Array::from(elem_idx), None)?;
     let group_col: ArrayRef = Arc::new(Int64Array::from(elem_groups));
+    if contiguous {
+        return distinct_pairs_to_list(group_col, child.clone(), num_groups);
+    }
+    let elem_idx: Vec<u32> = (0..list.len())
+        .flat_map(|row| offsets[row] as u32..offsets[row + 1] as u32)
+        .collect();
+    let values = take(child.as_ref(), &UInt32Array::from(elem_idx), None)?;
     distinct_pairs_to_list(group_col, values, num_groups)
 }
 
 /// Dedup `(group, value)` pairs and bucket the distinct values into a per-group
 /// `List` column — the shared core of the distinct partial and merge steps.
+/// Dedup `(group, value)` `i64` pairs across cores by hash-partitioning them, then deduping
+/// each partition independently. Equal pairs share a partition, so the union of the partitions'
+/// distinct pairs is the global distinct set (order within a group is not preserved — only the
+/// COUNT(DISTINCT) caller uses this, and it counts, not orders). Returns the distinct groups and
+/// values as parallel vecs.
+fn par_dedup_pairs(grp: &Int64Array, vals: &Int64Array, n: usize) -> (Vec<i64>, Vec<i64>) {
+    use rayon::prelude::*;
+
+    let parts = rayon::current_num_threads().clamp(2, 256);
+    let state = ahash::RandomState::with_seed(0);
+    let g = grp.values();
+    let v = vals.values();
+    // Bucket the row indices by pair hash, in parallel: per-chunk CSR (histogram → prefix-sum →
+    // scatter), then each partition's list is the chunks' slices concatenated (same shape as the
+    // combine's radix bucketing). Cheap flat allocations, no per-(chunk,bucket) growing vectors.
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = n.div_ceil(nthreads).max(1);
+    let bucket_of = |i: usize| (state.hash_one((g[i], v[i])) % parts as u64) as usize;
+    let per_chunk: Vec<(Vec<u32>, Vec<u32>)> = (0..n)
+        .into_par_iter()
+        .step_by(chunk)
+        .map(|start| {
+            let end = (start + chunk).min(n);
+            let mut off = vec![0u32; parts + 1];
+            for i in start..end {
+                off[bucket_of(i) + 1] += 1;
+            }
+            for b in 0..parts {
+                off[b + 1] += off[b];
+            }
+            let mut cursor = off[..parts].to_vec();
+            let mut rows = vec![0u32; end - start];
+            for i in start..end {
+                let b = bucket_of(i);
+                rows[cursor[b] as usize] = i as u32;
+                cursor[b] += 1;
+            }
+            (rows, off)
+        })
+        .collect();
+    // Dedup each partition independently, in parallel.
+    let per: Vec<(Vec<i64>, Vec<i64>)> = (0..parts)
+        .into_par_iter()
+        .map(|b| {
+            let mut seen: hashbrown::HashSet<(i64, i64), ahash::RandomState> =
+                hashbrown::HashSet::with_hasher(ahash::RandomState::with_seed(1));
+            let (mut dg, mut dv) = (Vec::new(), Vec::new());
+            for (rows, off) in &per_chunk {
+                for &i in &rows[off[b] as usize..off[b + 1] as usize] {
+                    let pair = (g[i as usize], v[i as usize]);
+                    if seen.insert(pair) {
+                        dg.push(pair.0);
+                        dv.push(pair.1);
+                    }
+                }
+            }
+            (dg, dv)
+        })
+        .collect();
+    let total: usize = per.iter().map(|(dg, _)| dg.len()).sum();
+    let (mut dgroups, mut dvalues) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    for (dg, dv) in per {
+        dgroups.extend_from_slice(&dg);
+        dvalues.extend_from_slice(&dv);
+    }
+    (dgroups, dvalues)
+}
+
 fn distinct_pairs_to_list(
     groups: ArrayRef,
     values: ArrayRef,
@@ -203,6 +292,23 @@ fn distinct_pairs_to_list(
     // bucketed lists are identical.
     if let Some(vals) = values.as_any().downcast_ref::<Int64Array>() {
         let grp = groups.as_primitive::<Int64Type>();
+        // Large input: dedup in parallel by hash-partitioning the `(group, value)` pairs across
+        // cores. Equal pairs hash equally so they co-locate in one partition; deduping each
+        // partition independently and unioning the survivors yields the same distinct SET as the
+        // serial pass. COUNT(DISTINCT) only counts each group's list length, so the (now
+        // per-partition-first-seen) order within a group is irrelevant to the result — this path
+        // feeds only CountDistinct. Turns the serial hash-set scan (the whole cost of a big
+        // COUNT(DISTINCT id) combine) into a parallel one.
+        const PAR_DEDUP_MIN: usize = 1 << 18;
+        if n >= PAR_DEDUP_MIN {
+            let (dgroups, dvalues) = par_dedup_pairs(grp, vals, n);
+            let distinct_values: ArrayRef = Arc::new(Int64Array::from(dvalues));
+            return bucket_values_into_list(
+                &Int64Array::from(dgroups),
+                &distinct_values,
+                num_groups,
+            );
+        }
         // Dedup through hashbrown + a fixed-seed ahash hasher, not `std::HashSet`'s
         // cryptographic SipHash — ~5-10× faster on these small `(i64, i64)` integer keys,
         // and the result is hasher-independent (first-seen order is preserved by the
@@ -320,6 +426,25 @@ mod dense_tests {
         assert!(distinct_dense(&parts).unwrap().is_none());
     }
 
+    /// Heterogeneous batch types (a `UNION` of an `Int64` branch and a `Float64` branch
+    /// arrives as differently-typed single-column batches) must DECLINE, not panic. Before
+    /// the fix, `distinct_dense` validated only the first batch's type, then
+    /// `as_primitive::<Int64Type>()`-ed the `Float64` batch — an "primitive array" panic on a
+    /// reachable data path.
+    #[test]
+    fn heterogeneous_batch_types_decline() {
+        let int_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let flt_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let flts: ArrayRef = Arc::new(Float64Array::from(vec![2.0, 3.5]));
+        let parts = vec![
+            RecordBatch::try_new(int_schema, vec![ints]).unwrap(),
+            RecordBatch::try_new(flt_schema, vec![flts]).unwrap(),
+        ];
+        // Must return None (decline), never panic.
+        assert!(distinct_dense(&parts).unwrap().is_none());
+    }
+
     /// A sparse range exceeds the budget and declines rather than allocating a huge map.
     #[test]
     fn sparse_range_declines() {
@@ -372,5 +497,146 @@ mod dense_tests {
         want.sort_unstable();
         assert_eq!(n, want.len());
         assert_eq!(values(&dense), want);
+    }
+
+    /// The parallel `(group, value)` dedup path (n ≥ 2^18) yields the exact same distinct SET
+    /// per group as a serial reference — the invariant COUNT(DISTINCT) rests on. Order within a
+    /// group is unspecified (parallel first-seen), so both sides compare sorted.
+    #[test]
+    fn par_dedup_pairs_matches_serial() {
+        use std::collections::HashSet;
+        let n = (1usize << 18) + 12_345; // over the parallel threshold
+        let mut s: u64 = 99;
+        let mut gv: Vec<i64> = Vec::with_capacity(n);
+        let mut vv: Vec<i64> = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            gv.push(((s >> 40) % 4) as i64); // 4 groups
+            vv.push(((s >> 20) % 50_000) as i64); // ~50k distinct values → lots of dupes
+        }
+        let (dg, dv) = super::par_dedup_pairs(
+            &Int64Array::from(gv.clone()),
+            &Int64Array::from(vv.clone()),
+            n,
+        );
+        // Parallel result as a set of pairs.
+        let got: HashSet<(i64, i64)> = dg.iter().copied().zip(dv.iter().copied()).collect();
+        // Serial reference set.
+        let want: HashSet<(i64, i64)> = gv.iter().copied().zip(vv.iter().copied()).collect();
+        assert_eq!(
+            got.len(),
+            dg.len(),
+            "parallel path emitted a duplicate pair"
+        );
+        assert_eq!(got, want, "parallel distinct set differs from serial");
+    }
+}
+
+#[cfg(test)]
+mod scratch_timing {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn time_ungrouped() {
+        let n = 8_000_000usize;
+        let card = 5_000_000i64;
+        let mut s: u64 = 7;
+        let vals: Vec<i64> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 20) % card as u64) as i64
+            })
+            .collect();
+        let values: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+        let gids = vec![0u32; n];
+
+        let t = Instant::now();
+        let st = distinct_state(&values, &gids, 1).unwrap();
+        println!(
+            "distinct_state(num_groups=1): {:?} -> len {}",
+            t.elapsed(),
+            st.len()
+        );
+
+        // sub-parts
+        let grp: ArrayRef = Arc::new(Int64Array::from(vec![0i64; n]));
+        let t = Instant::now();
+        let (dg, dv) = par_dedup_pairs(
+            grp.as_primitive::<Int64Type>(),
+            values.as_any().downcast_ref::<Int64Array>().unwrap(),
+            n,
+        );
+        println!(
+            "  par_dedup_pairs: {:?} -> {} distinct",
+            t.elapsed(),
+            dg.len()
+        );
+
+        let dvals: ArrayRef = Arc::new(Int64Array::from(dv));
+        let t = Instant::now();
+        let l = bucket_values_into_list(&Int64Array::from(dg), &dvals, 1).unwrap();
+        println!(
+            "  bucket_values_into_list: {:?} -> {}",
+            t.elapsed(),
+            l.len()
+        );
+
+        let t = Instant::now();
+        let m = merge_distinct(&st, &[0u32], 1).unwrap();
+        println!("merge_distinct: {:?} -> {}", t.elapsed(), m.len());
+    }
+
+    /// Simulate the ungrouped executor path: per-morsel partials (parallel) then combine.
+    #[test]
+    #[ignore]
+    fn time_ungrouped_pipeline() {
+        use crate::agg::{combine_with, finalize, partial, AggCall, AggFunc};
+        use arrow::datatypes::{Field, Schema};
+        use rayon::prelude::*;
+
+        let n = 8_000_000usize;
+        let card = 5_000_000i64;
+        let morsel = 16_384usize;
+        let mut s: u64 = 7;
+        let vals: Vec<i64> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 20) % card as u64) as i64
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let morsels: Vec<RecordBatch> = vals
+            .chunks(morsel)
+            .map(|c| {
+                let a: ArrayRef = Arc::new(Int64Array::from(c.to_vec()));
+                RecordBatch::try_new(schema.clone(), vec![a]).unwrap()
+            })
+            .collect();
+        println!("morsels: {}", morsels.len());
+
+        let t = Instant::now();
+        let partials: Vec<_> = morsels
+            .par_iter()
+            .map(|b| {
+                let v: ArrayRef = b.column(0).clone();
+                partial(
+                    &[],
+                    &[AggCall::new(AggFunc::CountDistinct, Some(v))],
+                    b.num_rows(),
+                )
+            })
+            .collect::<Result<_, _>>()
+            .unwrap();
+        println!("partial (parallel): {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let merged = combine_with(&partials, &[AggFunc::CountDistinct], 200_000).unwrap();
+        println!("combine_with: {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let out = finalize(&[AggFunc::CountDistinct], &merged).unwrap();
+        println!("finalize: {:?} -> {:?}", t.elapsed(), out[0].len());
     }
 }

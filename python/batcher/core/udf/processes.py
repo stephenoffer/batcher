@@ -34,10 +34,9 @@ def _pool_context():
     each worker starts single-threaded and the pool scales with cores. ``fork`` is the
     fallback where ``forkserver`` is unavailable (non-Unix).
     """
-    import multiprocessing as mp
+    from batcher._internal.hardware import process_start_method_context
 
-    methods = mp.get_all_start_methods()
-    return mp.get_context("forkserver" if "forkserver" in methods else "fork")
+    return process_start_method_context()
 
 
 # A process pool is expensive to stand up (fork/forkserver N children), so a fresh one

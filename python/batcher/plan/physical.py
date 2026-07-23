@@ -51,6 +51,13 @@ class PlanProperties:
     """
 
     est_rows: float = float("nan")
+    #: Byte-true bytes per output row, as `annotate_ops` sized this operator with
+    #: (`estimator.row_width`: learned per-column widths when measured, else the flat
+    #: `optimizer.row_bytes`). Published because `m_max_bytes == est_rows * row_size` is a
+    #: *lossy* product: a consumer that needs one factor back cannot divide by the flat
+    #: default without being wrong by `row_size / row_bytes` — an order of magnitude on the
+    #: wide payloads (blobs, embeddings) the learned width exists to model. Carbonite's spill
+    #: sizing did exactly that. NaN when the operator was not sized.
     row_size: float = float("nan")
     confidence: float = 0.0
     provenance: Provenance = Provenance.DEFAULT

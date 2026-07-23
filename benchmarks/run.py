@@ -2,7 +2,7 @@
 
 Benchmarks are registered by family under ``suites/`` and discovered through
 ``registry.REGISTRY``; this module is the thin CLI that selects the engines, loads the
-public dataset (``sources.py`` — no data is generated), runs the cases, and reports
+public dataset (``sources`` — no data is generated), runs the cases, and reports
 them. Correctness is verified before any timing is trusted (see ``harness.py``): a
 query is only timed once the engines agree.
 
@@ -52,11 +52,11 @@ def _parse_size(text: str) -> int:
 
 
 # Engine-comparison datasets (run through the correctness-gated compare()).
-BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators", "scan", "images")
+BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators", "json", "scan", "images")
 # What `--benchmark all` sweeps. `scan` and `images` are deliberately excluded: each
 # re-reads its corpus from object storage on every repeat, so a full run is tens of
 # minutes. They are opt-in (`--benchmark scan` / `images`) for the same reason Spark is.
-ALL_DATASETS = ("tpch", "tpcds", "clickbench", "operators")
+ALL_DATASETS = ("tpch", "tpcds", "clickbench", "operators", "json")
 # Standalone benchmarks with their own reporting, dispatched by this single runner.
 AUX = ("distributed", "optimizer", "shuffle")
 
@@ -178,14 +178,14 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
 def _run_aux(which: str, args: argparse.Namespace) -> int:
     """Dispatch a standalone benchmark (its own reporting, not the compare() table)."""
     if which == "distributed":
-        import distributed
+        from internals import distributed
 
         return distributed.run(args.scale, args.partitions)
     if which == "optimizer":
-        import optimizer_bench
+        from internals import optimizer_bench
 
         return optimizer_bench.main()
-    import shuffle_vs_object_store
+    from internals import shuffle_vs_object_store
 
     return shuffle_vs_object_store.main()
 

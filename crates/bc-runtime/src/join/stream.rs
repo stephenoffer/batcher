@@ -73,6 +73,26 @@ fn is_probe_driven(join_type: JoinType) -> bool {
     )
 }
 
+/// Whether [`BroadcastProbe`] can serve this join — answerable from the build side's *schema
+/// and row count alone*, before anything is concatenated.
+///
+/// [`BroadcastProbe::new`] re-checks all of this and returns `None` if it disagrees; this
+/// exists so a caller weighing the streaming path against a shuffle can find out **without
+/// first paying to materialize the build side**. The conditions are the module's: a
+/// probe-driven join type, one or two `Int64` key columns, and a build that stays under the
+/// cache-radix cliff.
+pub fn streaming_supported(
+    join_type: JoinType,
+    key_types: &[&arrow::datatypes::DataType],
+    build_rows: usize,
+) -> bool {
+    use arrow::datatypes::DataType;
+    is_probe_driven(join_type)
+        && build_rows <= super::RADIX_MIN_BUILD_ROWS_BROADCAST
+        && matches!(key_types.len(), 1 | 2)
+        && key_types.iter().all(|t| *t == &DataType::Int64)
+}
+
 /// A hash table over a broadcast build side, ready to be probed morsel by morsel.
 pub struct BroadcastProbe {
     table: JoinTable,
@@ -147,7 +167,12 @@ impl BroadcastProbe {
             return None;
         }
         let rows = probe_keys.first().map_or(0, |a| a.len());
-        let probe_null = null_mask(probe_keys, rows);
+        // Build the null mask only when a probe key actually carries nulls. This runs once per
+        // morsel — hundreds of times per join — and a foreign-key probe (`l_orderkey`, never
+        // null) hits the `None` arm, skipping a 16 KB `vec![false; 16384]` allocate-and-zero
+        // that `probe_range` would only ever read as `false`.
+        let probe_null =
+            (probe_keys.iter().any(|k| k.null_count() != 0)).then(|| null_mask(probe_keys, rows));
         let mut left = super::IndexBuf::with_capacity(rows);
         let mut right = super::IndexBuf::with_capacity(rows);
         match self.shape {
@@ -156,7 +181,7 @@ impl BroadcastProbe {
                 self.table.probe_range(
                     &keys,
                     0..rows,
-                    &probe_null,
+                    probe_null.as_deref(),
                     self.join_type,
                     &mut left,
                     &mut right,
@@ -168,7 +193,7 @@ impl BroadcastProbe {
                 self.table.probe_range(
                     &keys,
                     0..rows,
-                    &probe_null,
+                    probe_null.as_deref(),
                     self.join_type,
                     &mut left,
                     &mut right,

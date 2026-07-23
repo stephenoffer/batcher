@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import atan2, col
 
 
@@ -32,15 +33,11 @@ def n(duck):
 
 
 def test_str_right_ascii_vs_duckdb(duck, s):
-    from conftest import assert_same
-
     out = bt.from_arrow(s).select(r2=col("s").str.right(2), a=col("s").str.ascii()).collect()
     assert_same(out, duck.sql("SELECT right(s, 2) r2, ascii(s) a FROM s"))
 
 
 def test_pow_round_atan2_vs_duckdb(duck, n):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(n)
         .select(

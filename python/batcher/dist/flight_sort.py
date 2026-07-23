@@ -19,27 +19,47 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 
 import pyarrow as pa
 
+from batcher._internal.logging import get_logger, log_kv
+from batcher._internal.native import engine
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
 from batcher.dist.executors.partition_io import (
     merge_boundaries,
     partition_descriptors,
     source_pushdown,
 )
+from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
-    release_placement,
     shuffle_partitions,
 )
-from batcher.dist.fleet import acquire_fleet
+from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
+from batcher.dist.flight_worker import current_plan_id
 from batcher.io.source import Source
+from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.logical import LogicalPlan, Sort
 
 __all__ = ["execute_sort_flight", "execute_topn_flight"]
+
+_log = get_logger("dist.sort")
+
+
+def _phase(name: str, seconds: float, **fields: object) -> None:
+    """Record one distributed-sort phase timing on the central logger.
+
+    These timings used to be `print`s behind a `BATCHER_SORT_PROFILE` env var: invisible to
+    the log file, unfilterable, on stdout in the middle of a user's results, and unknown to
+    the dashboard. As DEBUG records on `batcher.dist.sort` they answer to the same
+    `log_level` as everything else, and the phase name and duration are structured fields
+    rather than a sentence — so "which phase dominates this sort" is a query, not a grep.
+    """
+    log_kv(_log, logging.DEBUG, "sort phase", phase=name, seconds=round(seconds, 3), **fields)
+
 
 # Per-worker CDF sample granularity: a fine grid (33 probe points) so the merged
 # boundaries balance the ranges well. Precision affects only balance, not result.
@@ -52,10 +72,7 @@ def _sort_ir(keys, limit, input_ir):
         {
             "op": "sort",
             "input": input_ir,
-            "keys": [
-                {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
-                for k in keys
-            ],
+            "keys": sort_keys_ir(keys),
             "limit": limit,
         }
     )
@@ -77,8 +94,7 @@ def execute_topn_flight(
     """
     import ray
 
-    import batcher._native as nat
-
+    nat = engine()
     _ensure_ray(workers)
     cfg_json = engine_config_json()
     map_plan, sid = _relabel_single_source(sort.input)
@@ -95,17 +111,16 @@ def execute_topn_flight(
         # otherwise parts and actors mismatch: a larger fleet indexes past `parts`, a smaller
         # one silently drops the tail partitions' rows (a wrong result). `execute_sort_flight`
         # already orders it this way.
-        projection, predicate = source_pushdown(map_plan, sid)
+        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
+        # source's original index: a staged plan whose input is an intermediate (source id >
+        # 0) missed the lookup and silently read every column.
+        projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )
         results = ray.get([actors[i].local_topn.remote(local_ir, parts[i]) for i in range(workers)])
     finally:
-        if owns:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        release_fleet(actors, pg, owns)
 
     gathered = [b for r in results for b in r if b.num_rows > 0]
     merged = nat.execute_plan(merge_ir, [gathered], cfg_json) if gathered else []
@@ -132,16 +147,13 @@ def execute_sort_flight(
     bucket whose worker dies before the reduce fetches it. `_fault_inject` /
     `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
     barrier."""
-    import os as _os0
     import time as _tt0
 
     import ray
 
-    _profE = _os0.environ.get("BATCHER_SORT_PROFILE")
     _enter = _tt0.perf_counter()
     _ensure_ray(workers)
-    if _profE:
-        print(f"[sort] _ensure_ray {_tt0.perf_counter() - _enter:.1f}s", flush=True)
+    _phase("ensure_ray", _tt0.perf_counter() - _enter)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
 
     key = sort.keys[0]  # caller guarantees a plain-column leading key
@@ -153,40 +165,34 @@ def execute_sort_flight(
         {
             "op": "sort",
             "input": {"op": "scan", "source_id": 0},
-            "keys": [
-                {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
-                for k in sort.keys
-            ],
+            "keys": sort_keys_ir(sort.keys),
             "limit": sort.limit,
         }
     )
     credits = _shuffle_credits()
 
-    import os as _os
     import time as _tt
 
-    _prof0 = _os.environ.get("BATCHER_SORT_PROFILE")
     _ps = _tt.perf_counter()
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
     actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
-    if _prof0:
-        print(f"[sort] acquire_fleet {_tt.perf_counter() - _ps:.1f}s", flush=True)
+    _phase("acquire_fleet", _tt.perf_counter() - _ps, workers=workers, buckets=n_buckets)
     try:
         # Push the map prefix's projection + predicate into the read so each worker
         # fetches only the columns/rows it needs (the sort keys + carried output), not
         # the whole wide source — the projection the `map_ir` would otherwise discard
         # after paying to read it (see flight_aggregate).
-        projection, predicate = source_pushdown(map_plan, sid)
+        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
+        # source's original index: a staged plan whose input is an intermediate (source id >
+        # 0) missed the lookup and silently read every column.
+        projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )
 
-        import os
         import time as _t
-
-        _prof = os.environ.get("BATCHER_SORT_PROFILE")
 
         # Simulate worker loss BEFORE the sample/map barriers (test hook).
         if _fault_inject_map:
@@ -209,21 +215,33 @@ def execute_sort_flight(
             ),
             dead=dead,
         )
-        boundaries = merge_boundaries(grids, workers)
-        if _prof:
-            print(f"[sort] SAMPLE {_t.perf_counter() - _s:.1f}s", flush=True)
+        # Cut into exactly `n_buckets` ranges: `shuffle_partitions` can trim the reducer
+        # count below `workers` (the `max_shuffle_partitions` cap / learned fan-out), and
+        # `merge_boundaries(grids, workers)` would emit up to `workers-1` boundaries — more
+        # than `n_buckets-1` — routing rows past the last bucket and panicking the range
+        # partitioner. Size the boundaries by the actual bucket count.
+        boundaries = merge_boundaries(grids, n_buckets)
+        _phase("sample", _t.perf_counter() - _s, buckets=n_buckets)
 
         # MAP: range-partition each split by the boundaries and publish raw rows.
         _s = _t.perf_counter()
         mapper_addrs, dead = map_barrier(
             workers,
             lambda host, src: actors[host].range_publish.remote(
-                map_ir, key_name, boundaries, n_buckets, nulls_first, desc, parts[src], src
+                map_ir,
+                key_name,
+                boundaries,
+                n_buckets,
+                nulls_first,
+                desc,
+                parts[src],
+                src,
+                0,
+                current_plan_id(),
             ),
             dead=dead,
         )
-        if _prof:
-            print(f"[sort] MAP(range_publish) {_t.perf_counter() - _s:.1f}s", flush=True)
+        _phase("map_range_publish", _t.perf_counter() - _s)
 
         if _fault_inject:
             for i in _fault_inject:
@@ -244,14 +262,9 @@ def execute_sort_flight(
             workers,
             dead=dead,
         )
-        if _prof:
-            print(f"[sort] REDUCE(gather+sort) {_t.perf_counter() - _s:.1f}s", flush=True)
+        _phase("reduce_gather_sort", _t.perf_counter() - _s)
     finally:
-        if owns:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        release_fleet(actors, pg, owns)
 
     # Concatenate the ranges in leading-key order (reversed for a descending sort) —
     # each bucket is globally ordered relative to the others, so no final merge.
@@ -261,17 +274,12 @@ def execute_sort_flight(
     for r in order:
         out.extend(b for b in results.get(r, []) if b.num_rows > 0)
     table = (
-        pa.Table.from_batches(out) if out else pa.table({c: [] for c in sort.available_columns()})
+        pa.Table.from_batches(out) if out else empty_result_table(sort, sort.available_columns())
     )
-    if _prof0:
-        print(
-            f"[sort] driver_concat {_tt.perf_counter() - _pc:.1f}s ({table.num_rows} rows)",
-            flush=True,
-        )
+    _phase("driver_concat", _tt.perf_counter() - _pc, rows=table.num_rows)
     if sort.limit is not None:
         table = table.slice(0, sort.limit)
-    if _prof0:
-        print(f"[sort] execute_sort_flight TOTAL {_tt.perf_counter() - _enter:.1f}s", flush=True)
+    _phase("total", _tt.perf_counter() - _enter)
     return table if not above else _apply_above(above, table)
 
 
@@ -334,7 +342,7 @@ def _sort_reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            ref = actors[host].sort_reduce.remote(sort_ir, addrs, r)
+            ref = actors[host].sort_reduce.remote(sort_ir, addrs, r, None, None, current_plan_id())
             ref_host[ref] = host
             return ref
 
@@ -370,7 +378,16 @@ def _sort_reduce_with_recovery(
             target = _pick_live({src})
             addrs[src] = ray.get(
                 actors[target].range_publish.remote(
-                    map_ir, key_name, boundaries, n_buckets, nulls_first, desc, parts[src], src
+                    map_ir,
+                    key_name,
+                    boundaries,
+                    n_buckets,
+                    nulls_first,
+                    desc,
+                    parts[src],
+                    src,
+                    0,
+                    current_plan_id(),
                 )
             )
 

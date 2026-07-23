@@ -153,6 +153,23 @@ pub enum RelOp {
         /// Output column name for the exploded element (defaults to `column` on the
         /// control-plane side).
         alias: String,
+        /// Keep a row whose list is null or empty, with a NULL element (Spark
+        /// `explode_outer`, SQL `LEFT JOIN LATERAL … ON true`). Default `false` is the
+        /// DuckDB `UNNEST` semantics: such a row contributes nothing.
+        ///
+        /// This matters for document pipelines: with the default, a document that
+        /// chunked to nothing vanishes from the relation entirely, taking its id and
+        /// metadata with it — invisible row loss rather than an error.
+        #[serde(default)]
+        outer: bool,
+        /// When set, also emit this column holding each element's 0-based position
+        /// within its list (Spark `posexplode`). NULL for a row kept only by `outer`,
+        /// which has no element and therefore no position.
+        ///
+        /// 0-based to match `RowId`/`with_row_index`, not the 1-based SQL `WITH
+        /// ORDINALITY` — one convention per engine beats matching each source dialect.
+        #[serde(default)]
+        index_alias: Option<String>,
     },
 
     /// Append a 0-based (plus `offset`) sequential row-index column over the input,
@@ -376,7 +393,9 @@ pub struct WindowFrame {
 
 /// Frame units. `Rows` counts physical rows; `Range`/`Groups` count peer groups
 /// (rows with an equal ORDER BY value). `Range` supports peer bounds (CURRENT ROW /
-/// UNBOUNDED); a numeric `RANGE` offset falls back to the default running frame.
+/// UNBOUNDED) only; a numeric `RANGE` offset is value-based and is *rejected* by the
+/// interpreter rather than approximated, since substituting the peer frame would
+/// silently return wrong rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameUnits {
@@ -440,6 +459,103 @@ pub struct ProjectionItem {
 }
 
 impl RelOp {
+    /// This node's input plans, in the order an executor visits them.
+    ///
+    /// The order is the contract: it is the pre-order the executors and the Python control
+    /// plane both number operators by, so `children()` and [`Self::node_count`] agree with
+    /// the ids a recursive walk hands out.
+    pub fn children(&self) -> Vec<&RelOp> {
+        match self {
+            RelOp::Scan { .. } => Vec::new(),
+            RelOp::Filter { input, .. }
+            | RelOp::Project { input, .. }
+            | RelOp::Aggregate { input, .. }
+            | RelOp::Sort { input, .. }
+            | RelOp::Limit { input, .. }
+            | RelOp::Distinct { input }
+            | RelOp::Window { input, .. }
+            | RelOp::Unnest { input, .. }
+            | RelOp::RowId { input, .. }
+            | RelOp::Unpivot { input, .. }
+            | RelOp::Sample { input, .. } => vec![input],
+            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+                vec![left, right]
+            }
+            RelOp::Union { inputs, .. } => inputs.iter().collect(),
+        }
+    }
+
+    /// Number of operators in this subtree — i.e. how many pre-order ids executing it consumes.
+    ///
+    /// Lets an executor know a subtree's id span *without running it*, so it can execute the
+    /// children of a node out of order and still hand each the ids a plain recursive walk
+    /// would. The fused join pipeline uses this to test its (cheap) build sides for
+    /// streamability before committing to its (expensive) probe side.
+    pub fn node_count(&self) -> u32 {
+        1 + self.children().iter().map(|c| c.node_count()).sum::<u32>()
+    }
+
+    /// True if any expression anywhere in this plan is a library-backed media decode
+    /// (`.image`/`.audio`/`.video`).
+    ///
+    /// A *scheduling* signal, not a semantic one: a media-decode kernel parallelizes
+    /// *within* a single morsel (heavy per-row JPEG/audio/video decode — see
+    /// [`Expr::contains_media_decode`]), so a plan carrying one can saturate every core
+    /// even when its input is a single morsel. The parallel executor uses this to lift
+    /// its morsel-count cap on pool width for such plans. Exhaustive by construction: a
+    /// new `RelOp` variant is a compile error here until it is classified.
+    pub fn contains_media_decode(&self) -> bool {
+        match self {
+            RelOp::Scan { .. } => false,
+            RelOp::Filter { input, predicate } => {
+                predicate.contains_media_decode() || input.contains_media_decode()
+            }
+            RelOp::Project { input, exprs } => {
+                exprs.iter().any(|p| p.expr.contains_media_decode())
+                    || input.contains_media_decode()
+            }
+            RelOp::Aggregate {
+                input,
+                group_keys,
+                aggregates,
+            } => {
+                group_keys.iter().any(|p| p.expr.contains_media_decode())
+                    || aggregates.iter().any(|a| {
+                        a.input.as_ref().is_some_and(Expr::contains_media_decode)
+                            || a.input2.as_ref().is_some_and(Expr::contains_media_decode)
+                    })
+                    || input.contains_media_decode()
+            }
+            RelOp::Sort { input, keys, .. } => {
+                keys.iter().any(|k| k.expr.contains_media_decode()) || input.contains_media_decode()
+            }
+            RelOp::Limit { input, .. }
+            | RelOp::Distinct { input }
+            | RelOp::Unnest { input, .. }
+            | RelOp::RowId { input, .. }
+            | RelOp::Unpivot { input, .. }
+            | RelOp::Sample { input, .. } => input.contains_media_decode(),
+            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+                left.contains_media_decode() || right.contains_media_decode()
+            }
+            RelOp::Window {
+                input,
+                partition_keys,
+                order_keys,
+                functions,
+                ..
+            } => {
+                partition_keys.iter().any(Expr::contains_media_decode)
+                    || order_keys.iter().any(|k| k.expr.contains_media_decode())
+                    || functions
+                        .iter()
+                        .any(|f| f.input.as_ref().is_some_and(Expr::contains_media_decode))
+                    || input.contains_media_decode()
+            }
+            RelOp::Union { inputs, .. } => inputs.iter().any(RelOp::contains_media_decode),
+        }
+    }
+
     /// Parse a plan from the JSON IR document emitted by the Python control plane.
     ///
     /// serde_json guards against stack overflow with a default 128-deep recursion limit,

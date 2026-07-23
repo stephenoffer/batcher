@@ -20,6 +20,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
@@ -31,13 +32,9 @@ _LEN = struct.Struct(">I")  # 4-byte big-endian length prefix per record.
 
 def _require_ormsgpack() -> Any:
     """Import and return the `ormsgpack` module or raise `BackendError`."""
-    try:
-        import ormsgpack
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "MessagePack support requires ormsgpack: pip install 'batcher-engine[msgpack]'"
-        ) from exc
-    return ormsgpack
+    return require(
+        "ormsgpack", feature="MessagePack support", provides="ormsgpack", extra="msgpack"
+    )
 
 
 def _iter_records(fh: IO[bytes], ormsgpack: Any) -> Any:
@@ -71,21 +68,19 @@ class MsgpackSource(FileSource):
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         ormsgpack = _require_ormsgpack()
         batch_rows = active_config().execution.morsel_rows
-        out: list[pa.RecordBatch] = []
-        rows: list[dict[str, Any]] = []
-        for record in _iter_records(fh, ormsgpack):
-            rows.append(record)
-            if len(rows) >= batch_rows:
-                out.append(self._to_batch(rows, projection))
-                rows = []
-        if rows:
-            out.append(self._to_batch(rows, projection))
-        return out
-
-    @staticmethod
-    def _to_batch(rows: list[dict[str, Any]], projection: list[str] | None) -> pa.RecordBatch:
-        batch = pa.RecordBatch.from_pylist(rows)
-        return batch.select(projection) if projection is not None else batch
+        # Infer one schema over ALL records, then slice into morsels — NOT one schema
+        # per morsel. Per-batch inference makes the split-point decide the type: 16,384
+        # integers followed by a null tail infer `int64` then `null`, and the resulting
+        # batches fail to concatenate (`Table.from_batches` raises "Schema ... different").
+        # This materializes the file, but the previous code already accumulated every
+        # batch, so it is no worse on memory.
+        rows: list[dict[str, Any]] = list(_iter_records(fh, ormsgpack))
+        if not rows:
+            return []
+        table = pa.Table.from_pylist(rows)
+        if projection is not None:
+            table = table.select(projection)
+        return table.to_batches(max_chunksize=batch_rows)
 
 
 @SINKS.register("msgpack")

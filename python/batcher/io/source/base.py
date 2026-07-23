@@ -27,28 +27,106 @@ class Source(Protocol):
     sources (Kafka and other brokers, incremental file discovery) set it ``False``
     so terminal operations choose a streaming path and `collect()` refuses to
     materialize an infinite stream. Read it via `is_bounded` to honor the default.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.io import InMemorySource, Source
+            >>> src = InMemorySource([pa.record_batch({"x": [1, 2, 3]})])
+            >>> isinstance(src, Source)
+            True
     """
 
     bounded: bool
 
     def schema(self) -> pa.Schema:
-        """The full schema of the source, without reading the data."""
+        """The full schema of the source, without reading the data.
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> InMemorySource([pa.record_batch({"x": [1]})]).schema().names
+                ['x']
+
+        Returns:
+            The Arrow schema every batch this source produces conforms to.
+        """
         ...
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        """Read the source, optionally only `projection` columns."""
+        """Read the source, optionally only `projection` columns.
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> src = InMemorySource([pa.record_batch({"x": [1, 2], "y": [3, 4]})])
+                >>> src.read(["x"])[0].num_columns
+                1
+
+        Args:
+            projection: Columns the scan must produce. All columns when omitted;
+                a columnar source reads only these.
+
+        Returns:
+            Every batch of the source, materialized.
+        """
         ...
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        """Yield record batches lazily (the streaming read path)."""
+        """Yield record batches lazily (the streaming read path).
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> src = InMemorySource([pa.record_batch({"x": [1, 2, 3]})])
+                >>> next(src.iter_batches()).num_rows
+                3
+
+        Args:
+            projection: Columns the scan must produce. All columns when omitted.
+
+        Returns:
+            An iterator over the source's batches, read one at a time.
+        """
         ...
 
     def row_count(self) -> int | None:
-        """The number of rows, if known cheaply without reading data (else None)."""
+        """The number of rows, if known cheaply without reading data (else None).
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> InMemorySource([pa.record_batch({"x": [1, 2, 3]})]).row_count()
+                3
+
+        Returns:
+            The exact row count, or None when counting would cost a data scan.
+        """
         ...
 
     def identity(self) -> str:
-        """A stable identifier for this source (for keyed metadata/learning)."""
+        """A stable identifier for this source (for keyed metadata/learning).
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> InMemorySource([pa.record_batch({"x": [1]})]).identity()[:4]
+                'mem:'
+
+        Returns:
+            A key the metadata hub stores learned statistics under.
+        """
         ...
 
     # Optional (duck-typed via `source_statistics`): a connector may also expose
@@ -62,6 +140,22 @@ class Source(Protocol):
         """Independently-readable slices for distributed/parallel reads.
 
         A source that cannot subdivide returns a single `WholeSourceSplit`.
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> src = InMemorySource([pa.record_batch({"x": [1, 2, 3]})])
+                >>> len(src.splits())
+                1
+
+        Args:
+            target_size: Rough size (bytes) to aim for per split. The source
+                chooses its own granularity when omitted.
+
+        Returns:
+            The splits covering the source exactly once.
         """
         ...
 

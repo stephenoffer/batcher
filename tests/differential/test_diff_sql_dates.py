@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -39,8 +40,6 @@ def t(duck):
     ],
 )
 def test_date_interval(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -55,9 +54,56 @@ def test_date_interval(duck, t, q):
     ],
 )
 def test_date_functions(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.fixture
+def ts(duck):
+    tbl = pa.table(
+        {
+            "id": [1, 2, 3],
+            "ev": pa.array(
+                [
+                    dt.datetime(2013, 7, 15, 12, 40, 37),
+                    dt.datetime(2013, 7, 15, 12, 41, 5),
+                    dt.datetime(2020, 12, 25, 23, 59, 59),
+                ],
+                pa.timestamp("us"),
+            ),
+        }
+    )
+    duck.register("ts", tbl)
+    return tbl
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["minute", "hour", "day", "month", "year", "second"],
+)
+def test_date_trunc(duck, ts, unit):
+    """DATE_TRUNC('<unit>', ts) — the ClickBench Q42 shape — matches DuckDB."""
+    q = f"SELECT id, DATE_TRUNC('{unit}', ev) m FROM ts ORDER BY id"
+    assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
+        # TIMESTAMP ± INTERVAL DAY/WEEK must add exact days to the *microsecond*
+        # instant (keeping the time-of-day), not route the value through a Date32
+        # epoch-day cast. Regression: the DAY/WEEK branch cast the operand to int64
+        # and back to DATE, so a timestamp (µs since epoch) either crashed the
+        # Date32 cast or produced a garbage date. DuckDB keeps the time component.
+        "SELECT id, ev + INTERVAL 5 DAY r FROM ts ORDER BY id",
+        "SELECT id, ev - INTERVAL 10 DAY r FROM ts ORDER BY id",
+        "SELECT id, ev + INTERVAL 2 WEEK r FROM ts ORDER BY id",
+        "SELECT id, ev + INTERVAL 1 MONTH r FROM ts ORDER BY id",
+        "SELECT id, ev + INTERVAL 1 YEAR r FROM ts ORDER BY id",
+        "SELECT id, date_add(ev, INTERVAL 3 DAY) r FROM ts ORDER BY id",
+    ],
+)
+def test_timestamp_interval(duck, ts, q):
+    assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
 
 
 @pytest.mark.parametrize(
@@ -74,6 +120,4 @@ def test_date_functions(duck, t, q):
     ],
 )
 def test_month_year_interval(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))

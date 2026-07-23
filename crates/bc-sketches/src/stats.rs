@@ -10,6 +10,23 @@ use arrow::array::{Array, ArrayRef};
 
 use crate::{HyperLogLog, KllSketch, Mergeable};
 
+/// In-memory Arrow bytes attributable to *this* array's rows.
+///
+/// [`Array::get_array_memory_size`] reports the whole backing buffer, so for a
+/// **sliced** array — a morsel carved from a larger buffer, which is the common case
+/// in the engine — it returns the parent buffer's size, not the slice's. That would
+/// inflate `avg_byte_width` by the slice ratio (a 10-row slice of a 100k-row buffer
+/// reported ~80 KB/row instead of ~8 B/row), poisoning the cost model's memory /
+/// broadcast sizing. `get_slice_memory_size` counts only the sliced rows' bytes;
+/// fall back to the buffer size for the exotic nested types it does not support.
+fn slice_bytes(array: &ArrayRef) -> u64 {
+    array
+        .to_data()
+        .get_slice_memory_size()
+        .map(|b| b as u64)
+        .unwrap_or_else(|_| array.get_array_memory_size() as u64)
+}
+
 /// Cheap, mergeable statistics for one column, computed in a single pass.
 #[derive(Clone)]
 pub struct ColumnStats {
@@ -40,7 +57,7 @@ impl ColumnStats {
         Self {
             count: array.len(),
             null_count: array.null_count(),
-            total_bytes: array.get_array_memory_size() as u64,
+            total_bytes: slice_bytes(array),
             distinct,
             quantiles,
         }
@@ -93,46 +110,79 @@ impl ColumnStats {
     // for non-numeric columns; equality and null fractions only need the
     // distinct/count fields and are always available. Every selectivity is
     // clamped to `[0.0, 1.0]`.
+    //
+    // **NULLs.** Every method here reports a fraction of *rows*, but the inner
+    // sketches only ever saw the **non-null** values (`count` is `array.len()`,
+    // nulls included; the HLL and KLL are fed from the non-null iterator). So the
+    // sketch answers — `rank`, `1/distinct` — are fractions of the *non-null*
+    // values and must be scaled by [`nonnull_fraction`](Self::nonnull_fraction)
+    // to become row fractions. In SQL a comparison against NULL is not true, so a
+    // null row is filtered out by every predicate below; skipping the scale is a
+    // silent over-estimate that grows with the null rate (a 90%-null column
+    // over-reports by 10×) and propagates straight into join ordering.
 
-    /// Estimated fraction of rows kept by `col = <value>`, under a uniform
-    /// distribution: `1 / distinct`. Independent of the literal (the uniform
-    /// model assigns every distinct value the same mass). Distinct is guarded to
-    /// be `>= 1` and the result is clamped to `(0, 1]`.
-    pub fn selectivity_eq(&self) -> f64 {
-        let distinct = self.distinct_estimate().max(1.0);
-        (1.0 / distinct).clamp(f64::MIN_POSITIVE, 1.0)
+    /// Fraction of rows that are not null — the ceiling on any comparison
+    /// predicate's selectivity, since `NULL <op> x` is never true.
+    fn nonnull_fraction(&self) -> f64 {
+        (1.0 - self.null_fraction()).clamp(0.0, 1.0)
     }
 
-    /// Estimated fraction of rows kept by `col <= x` — exactly `rank(x)`.
-    /// `None` for non-numeric columns.
+    /// Per-value mass **among the non-null values**, under a uniform
+    /// distribution: `1 / distinct`. This is the sketch-space quantity the range
+    /// helpers combine with `rank` before either is scaled to a row fraction.
+    fn eq_among_nonnull(&self) -> f64 {
+        (1.0 / self.distinct_estimate().max(1.0)).clamp(0.0, 1.0)
+    }
+
+    /// Estimated fraction of rows kept by `col = <value>`, under a uniform
+    /// distribution: `1 / distinct` of the non-null values, scaled by the non-null
+    /// row fraction. Independent of the literal (the uniform model assigns every
+    /// distinct value the same mass). Distinct is guarded to be `>= 1`; the result
+    /// is clamped to `[0, 1]` and is 0 for an all-null column.
+    pub fn selectivity_eq(&self) -> f64 {
+        (self.eq_among_nonnull() * self.nonnull_fraction()).clamp(0.0, 1.0)
+    }
+
+    /// Estimated fraction of rows kept by `col <= x` — `rank(x)` scaled to a row
+    /// fraction. `None` for non-numeric columns.
     pub fn selectivity_le(&self, x: f64) -> Option<f64> {
-        self.rank(x).map(|r| r.clamp(0.0, 1.0))
+        let nn = self.nonnull_fraction();
+        self.rank(x).map(|r| (r * nn).clamp(0.0, 1.0))
     }
 
     /// Estimated fraction of rows kept by `col < x`. `None` for non-numeric
     /// columns.
     ///
-    /// Approximation: `rank(x)` is the fraction `<= x`; subtracting the
-    /// equality mass (`selectivity_eq`, the per-value mass under uniformity)
-    /// removes the rows equal to `x`, yielding `max(0, rank(x) - selectivity_eq)`.
-    /// This is exact only when `x` is a value present in the column; for an `x`
-    /// absent from the column it slightly under-counts, but it is the standard
+    /// Approximation: `rank(x)` is the non-null fraction `<= x`; subtracting the
+    /// equality mass (the per-value mass under uniformity) removes the values
+    /// equal to `x`, and the result is then scaled to a row fraction. This is
+    /// exact only when `x` is a value present in the column; for an `x` absent
+    /// from the column it slightly under-counts, but it is the standard
     /// uniform-model estimate and keeps `lt <= le`.
     pub fn selectivity_lt(&self, x: f64) -> Option<f64> {
+        let (nn, eq) = (self.nonnull_fraction(), self.eq_among_nonnull());
         self.rank(x)
-            .map(|r| (r - self.selectivity_eq()).clamp(0.0, 1.0))
+            .map(|r| ((r - eq).max(0.0) * nn).clamp(0.0, 1.0))
     }
 
-    /// Estimated fraction of rows kept by `col > x` — `1 - rank(x)`. `None` for
-    /// non-numeric columns.
+    /// Estimated fraction of rows kept by `col > x` — the non-null complement of
+    /// `rank(x)`, scaled to a row fraction. `None` for non-numeric columns.
+    ///
+    /// Note this is **not** `1 - selectivity_le(x)`: null rows satisfy neither
+    /// predicate, so `le + gt` sums to the non-null fraction, not to 1.
     pub fn selectivity_gt(&self, x: f64) -> Option<f64> {
-        self.rank(x).map(|r| (1.0 - r).clamp(0.0, 1.0))
+        let nn = self.nonnull_fraction();
+        self.rank(x)
+            .map(|r| ((1.0 - r).max(0.0) * nn).clamp(0.0, 1.0))
     }
 
-    /// Estimated fraction of rows kept by `col >= x` — `1 - selectivity_lt(x)`.
-    /// `None` for non-numeric columns.
+    /// Estimated fraction of rows kept by `col >= x` — the non-null complement of
+    /// `selectivity_lt(x)`, scaled to a row fraction. `None` for non-numeric
+    /// columns.
     pub fn selectivity_ge(&self, x: f64) -> Option<f64> {
-        self.selectivity_lt(x).map(|s| (1.0 - s).clamp(0.0, 1.0))
+        let (nn, eq) = (self.nonnull_fraction(), self.eq_among_nonnull());
+        self.rank(x)
+            .map(|r| ((1.0 - (r - eq).max(0.0)).max(0.0) * nn).clamp(0.0, 1.0))
     }
 
     /// Fraction of rows that are null: `null_count / count` (0.0 when empty).
@@ -397,6 +447,41 @@ mod tests {
     }
 
     #[test]
+    fn avg_byte_width_of_a_slice_is_not_inflated_by_the_parent_buffer() {
+        // A morsel is often a slice of a much larger buffer. `avg_byte_width` must
+        // reflect the slice's own rows (~8 B/row for i64), not the whole parent
+        // buffer — otherwise the cost model sees a wildly inflated per-row width.
+        let big: ArrayRef = Arc::new(Int64Array::from((0..100_000i64).collect::<Vec<_>>()));
+        let slice: ArrayRef = big.slice(0, 10);
+        let w = ColumnStats::from_array(&slice).avg_byte_width();
+        assert!(
+            w < 16.0,
+            "sliced i64 avg_byte_width {w} inflated by the parent buffer (expected ~8)"
+        );
+        // Sanity: an unsliced array of the same 10 rows measures the same.
+        let small: ArrayRef = Arc::new(Int64Array::from((0..10i64).collect::<Vec<_>>()));
+        let ws = ColumnStats::from_array(&small).avg_byte_width();
+        assert!((w - ws).abs() < 1e-9, "slice {w} vs unsliced {ws} disagree");
+    }
+
+    #[test]
+    fn avg_byte_width_of_a_string_slice_tracks_only_its_rows() {
+        // Variable-width columns must also measure only the sliced rows' value bytes.
+        let big: ArrayRef = Arc::new(StringArray::from(
+            (0..10_000)
+                .map(|i| format!("value-{i}"))
+                .collect::<Vec<_>>(),
+        ));
+        let slice: ArrayRef = big.slice(0, 5);
+        let w = ColumnStats::from_array(&slice).avg_byte_width();
+        // ~7-char strings + 4-byte offsets ≈ 11-15 B/row, nowhere near the parent buffer.
+        assert!(
+            w < 100.0,
+            "sliced string avg_byte_width {w} inflated by parent buffer"
+        );
+    }
+
+    #[test]
     fn avg_byte_width_empty_is_zero() {
         let arr: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
         assert_eq!(ColumnStats::from_array(&arr).avg_byte_width(), 0.0);
@@ -425,6 +510,69 @@ mod tests {
         let stats = ColumnStats::from_array(&arr);
         let back = ColumnStats::from_bytes(&stats.to_bytes()).expect("valid blob");
         assert!((back.avg_byte_width() - stats.avg_byte_width()).abs() < 1e-9);
+    }
+
+    /// Regression: `count` is `array.len()` (nulls included) but the KLL and HLL
+    /// are fed only non-null values, so `rank` is the fraction of *non-null*
+    /// values ≤ x. The selectivity helpers returned it unscaled as "the fraction
+    /// of ROWS kept", their documented meaning. In SQL a comparison against NULL
+    /// is not true, so those rows are filtered out: with 900 of 1000 rows null and
+    /// the rest in 0..99, `selectivity_le(200.0)` reported 1.0 against a truth of
+    /// 0.10 — a 10× over-estimate feeding Kyber's cost model.
+    #[test]
+    fn selectivity_excludes_nulls() {
+        let vals: Vec<Option<i64>> = (0..1_000)
+            .map(|i| if i < 100 { Some(i % 100) } else { None })
+            .collect();
+        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
+        let stats = ColumnStats::from_array(&arr);
+        assert_eq!(stats.count, 1_000);
+        assert_eq!(stats.null_count, 900);
+        assert!((stats.null_fraction() - 0.9).abs() < 1e-9);
+
+        // Every non-null value is ≤ 200, and they are 10% of the rows.
+        let le = stats.selectivity_le(200.0).unwrap();
+        assert!((le - 0.10).abs() < 0.01, "selectivity_le(200) = {le}");
+        let lt = stats.selectivity_lt(200.0).unwrap();
+        assert!((lt - 0.10).abs() < 0.02, "selectivity_lt(200) = {lt}");
+
+        // Nothing is > 200, and nothing is >= 200 either.
+        let gt = stats.selectivity_gt(200.0).unwrap();
+        assert!(gt < 0.01, "selectivity_gt(200) = {gt}");
+        let ge = stats.selectivity_ge(200.0).unwrap();
+        assert!(ge < 0.02, "selectivity_ge(200) = {ge}");
+
+        // ~half the non-nulls are ≤ 50 ⇒ ~5% of rows.
+        let half = stats.selectivity_le(49.0).unwrap();
+        assert!((half - 0.05).abs() < 0.01, "selectivity_le(49) = {half}");
+
+        // Equality is a row fraction too: 1/100 distinct × 10% non-null.
+        let eq = stats.selectivity_eq();
+        assert!((eq - 0.001).abs() < 0.0005, "selectivity_eq = {eq}");
+
+        // No predicate can keep more rows than there are non-null rows.
+        for x in [-1e9, 0.0, 50.0, 1e9] {
+            assert!(stats.selectivity_le(x).unwrap() <= 0.1 + 1e-9);
+            assert!(stats.selectivity_gt(x).unwrap() <= 0.1 + 1e-9);
+        }
+    }
+
+    /// An all-null column keeps no rows under any comparison.
+    #[test]
+    fn selectivity_all_null_column_keeps_nothing() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; 64]));
+        let stats = ColumnStats::from_array(&arr);
+        assert_eq!(stats.null_fraction(), 1.0);
+        assert_eq!(stats.selectivity_eq(), 0.0);
+        for s in [
+            stats.selectivity_le(0.0),
+            stats.selectivity_lt(0.0),
+            stats.selectivity_gt(0.0),
+            stats.selectivity_ge(0.0),
+        ] {
+            // Non-numeric/absent quantiles yield None; if present it must be 0.
+            assert!(s.is_none_or(|v| v == 0.0));
+        }
     }
 
     #[test]

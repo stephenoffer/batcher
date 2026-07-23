@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import coalesce, col, lit
 
 
@@ -40,15 +41,11 @@ def t(duck):
     ],
 )
 def test_expr_vs_duckdb(duck, t, expr, sql):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r=expr).collect()
     assert_same(out, duck.sql(f"SELECT {sql} AS r FROM t"))
 
 
 def test_set_operations_vs_duckdb(duck):
-    from conftest import assert_same
-
     a = pa.table({"x": [1, 2, 3, 3, 4]})
     b = pa.table({"x": [3, 4, 5]})
     duck.register("a", a)
@@ -64,8 +61,6 @@ def test_set_operations_vs_duckdb(duck):
 
 
 def test_sql_set_operations_vs_duckdb(duck):
-    from conftest import assert_same
-
     u = pa.table({"x": [1, 2, 3, 3]})
     v = pa.table({"x": [3, 4]})
     duck.register("u", u)

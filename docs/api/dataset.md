@@ -26,6 +26,8 @@ print(ds.columns)
 # ['category', 'price', 'qty']
 ```
 
+The following table lists the in-memory and framework entry points, ordered from the most commonly used:
+
 | Entry point | Source |
 | --- | --- |
 | {py:obj}`bt.from_pydict(mapping) <batcher.from_pydict>` | A column-oriented dict (`{name: [values]}`). |
@@ -182,12 +184,7 @@ without collapsing rows. `functions` maps an output name to a spec:
 - Aggregates: `("sum"|"avg"|"min"|"max"|"count", "column")`, optionally with a frame.
 - Value: `("first_value"|"last_value"|"lag"|"lead", "column"[, offset])`.
 
-`order_by` entries are a column name, `("col", descending_bool)`, or an
-expression. `frame=(start, end)` gives ROWS offsets where negative is preceding,
-0 is current, positive is following, and `None` is unbounded. A third element
-selects the frame unit — `frame=(start, end, "groups")` counts peer groups (ties in
-the order key) instead of physical rows, and `frame=(None, 0, "range")` is the
-value-based peer frame (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`).
+`order_by` entries are a column name, `("col", descending_bool)`, or an expression. `frame=(start, end)` gives ROWS offsets where negative is preceding, 0 is current, positive is following, and `None` is unbounded. A third element selects the frame unit. `frame=(start, end, "groups")` counts peer groups, meaning ties in the order key, instead of physical rows. `frame=(None, 0, "range")` is the value-based peer frame, equivalent to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 
 ```python
 ranked = ds.window(
@@ -225,11 +222,7 @@ print(with_total.select("category", "total").to_pydict())
 
 ### repartition
 
-`repartition` changes only the file layout the next `write` produces, not the data.
-Pass exactly one sizing option: `num_files` (split into that many files),
-`target_size_mb` (coalesce into ~that-size files — the small-files fix), or neither
-with only `by` to Hive-partition by column(s). `by` may combine with a sizing
-option. For in-place use against an existing path, see {py:obj}`bt.compact <batcher.compact>`.
+`repartition` changes only the file layout the next `write` produces, not the data. Pass exactly one sizing option. `num_files` splits into that many files. `target_size_mb` coalesces into files of roughly that size, which is the fix for the small-files problem. Pass neither and give only `by` to Hive-partition by one or more columns. `by` may combine with a sizing option. For in-place use against an existing path, see {py:obj}`bt.compact <batcher.compact>`.
 
 ```python
 # docs: skip
@@ -247,10 +240,7 @@ aggregate; the keyword is the name.
 
 For reducing every value column the same way, `GroupBy` also has the shortcut
 methods `sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `n_unique`, `std`,
-`var`, `count` (non-null values per column), and `len` (per-group row count) — each
-reduces all non-key columns by default, or the column names / selector you pass.
-`agg` also accepts a bare positional aggregate (`agg(col("x").sum())`) that keeps
-its source column name.
+`var`, `count` for non-null values per column, and `len` for the per-group row count. Each reduces all non-key columns by default, or the column names or selector you pass. `agg` also accepts a bare positional aggregate such as `agg(col("x").sum())`, which keeps its source column name.
 
 ```python
 summary = (
@@ -314,7 +304,7 @@ print(total_rows)
 
 ```python
 print(ds.explain().splitlines()[0])
-# Scan  (≈6 rows, exact)
+# scan                            est≈6 (exact)
 ```
 
 Writers persist results; they need a real path, so they are not run here.
@@ -327,8 +317,7 @@ ds.write("output/", fmt="parquet", partition_by=["category"])
 
 ## Introspection
 
-`.columns` lists the output column names and `.schema` gives the pyarrow `Schema` —
-both without executing the plan.
+`.columns` lists the output column names and `.schema` gives the pyarrow `Schema`. Neither executes the plan.
 
 ```python
 print(ds.columns)
@@ -338,8 +327,7 @@ print(ds.columns)
 ## Interoperability
 
 A `Dataset` implements the Arrow **PyCapsule stream interface**
-(`__arrow_c_stream__`), so any library that speaks the Arrow C Data Interface consumes
-one directly — no `to_arrow()`, no copy, and no conversion through Python objects.
+(`__arrow_c_stream__`), so any library that speaks the Arrow C Data Interface consumes one directly. There's no `to_arrow()` call, no copy, and no conversion through Python objects.
 
 ```python
 # docs: skip
@@ -362,8 +350,7 @@ the consumer's iteration is what drives execution, this is a terminal operation.
 ## Reshaping
 
 `explode(col)` turns a list column into one row per element (SQL `UNNEST`).
-`unnest(col)` is the struct counterpart — it expands a struct column's fields into
-top-level columns in place (Polars `unnest`; Spark `select("s.*")`):
+`unnest(col)` is the struct counterpart. It expands a struct column's fields into top-level columns in place, matching Polars `unnest` and Spark `select("s.*")`:
 
 ```python
 import pyarrow as pa
@@ -395,6 +382,8 @@ print(ds.null_count().to_pydict())
 `null_fraction`, and `approx_distinct` (HyperLogLog cardinality).
 
 ## Data quality and dimension upserts
+
+Two accessors hang off a `Dataset` for validation and dimension maintenance:
 
 | Accessor | Purpose |
 | --- | --- |

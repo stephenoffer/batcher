@@ -1,13 +1,13 @@
 # ETL pipeline
 
-A small but complete extract-transform-load: read raw records, clean and
-deduplicate them, derive columns, roll them up, and write the result. Every block
-runs as written; swap `from_pydict` for `bt.read(...)` and the same code scales to
-files or object storage.
+A complete extract-transform-load, small enough to read in one sitting: raw records
+in, deduplicated and rolled up, Parquet out. Every block runs as written. Swap
+`from_pydict` for `bt.read(...)` and the same code scales to files or object storage.
 
 ## Extract
 
-Start from raw records — here with duplicates, mixed-case keys, and a null.
+Start from raw records. Two rows share an `id`, the region keys come in mixed case,
+and one of them is null.
 
 ```python
 import batcher as bt
@@ -69,14 +69,17 @@ print(back.count())
 # 3
 ```
 
-At scale, only the endpoints change: `bt.read("s3://bucket/raw/*.parquet")` in,
-`rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])` out, and
-`collect(distributed=True)` to run it across a cluster — the transform is identical.
+Only the endpoints change when the data grows. Read with
+`bt.read("s3://bucket/raw/*.parquet")` and write with
+`rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])`; add
+`collect(distributed=True)` to spread the work across a cluster. The transform in
+between is untouched.
 
 ## Next steps
 
 - [Data quality](../user-guide/data-quality.md): turn the cleaning step into an
-  enforced contract — validate, quarantine, or fail on bad rows.
+  enforced contract, so a bad row is quarantined or fails the job instead of
+  slipping through.
 - [Lakehouse tables](../user-guide/lakehouse.md): write to Delta with merge/upsert
   and slowly-changing dimensions instead of plain Parquet.
 - [Performance and memory](../user-guide/performance.md): cache and spill as the

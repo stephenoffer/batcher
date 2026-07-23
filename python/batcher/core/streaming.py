@@ -19,10 +19,12 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.config import active_config
+from batcher.core.mergeable import RunningAggregate
 from batcher.io.source import Source
-from batcher.plan.expr_ir import Col
-from batcher.plan.logical import Aggregate, Distinct, Limit, Projection, Sort
+from batcher.plan.ir_specs import sort_keys_ir
+from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 
 
 def _rebatch(result: pa.RecordBatch, batch_size: int | None) -> Iterator[pa.RecordBatch]:
@@ -46,18 +48,12 @@ class _AggFold:
     snapshots for checkpoint recovery.
     """
 
-    __slots__ = ("_aggregates_json", "_group_keys_json", "_input_ir", "_nat", "_running")
+    __slots__ = ("_fold", "_input_ir", "_nat")
 
     def __init__(self, agg: Aggregate) -> None:
-        import batcher._native as nat
-
-        self._nat = nat
-        self._group_keys_json = json.dumps(
-            [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
-        )
-        self._aggregates_json = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+        self._nat = engine()
+        self._fold = RunningAggregate(agg)
         self._input_ir = json.dumps(agg.input.to_ir())  # scans source 0
-        self._running: pa.RecordBatch | None = None
 
     def push(self, batch: pa.RecordBatch) -> int:
         """Fold one source batch into the running state; return rows consumed."""
@@ -68,32 +64,20 @@ class _AggFold:
         )
         if not rows or sum(b.num_rows for b in rows) == 0:
             return 0
-        partial = self._nat.partial_aggregate(self._group_keys_json, self._aggregates_json, rows)
-        self._running = (
-            partial
-            if self._running is None
-            else self._nat.combine(
-                self._group_keys_json, self._aggregates_json, [self._running, partial]
-            )
-        )
+        self._fold.push(rows)
         return batch.num_rows
 
     def finalize(self) -> pa.RecordBatch | None:
         """Materialize the current aggregate result, or None if no groups yet."""
-        if self._running is None:
-            return None
-        result = self._nat.combine_finalize(
-            self._group_keys_json, self._aggregates_json, [self._running]
-        )
-        return result if result.num_rows else None
+        return self._fold.finalize()
 
     def state(self) -> pa.RecordBatch | None:
         """The running partial state, for a checkpoint snapshot (None if empty)."""
-        return self._running
+        return self._fold.state()
 
     def restore(self, state: pa.RecordBatch) -> None:
         """Seed the running partial state from a checkpoint snapshot."""
-        self._running = state
+        self._fold.restore(state)
 
 
 def stream_aggregate(
@@ -110,8 +94,23 @@ def stream_aggregate(
     for batch in source.iter_batches(None):
         fold.push(batch)
     result = fold.finalize()
+    if result is None and not agg.group_keys:
+        # A *global* aggregate over an empty input still yields exactly one row — `SUM` is
+        # NULL, `COUNT` is 0 — which is what SQL, DuckDB, and `collect()` all produce. The
+        # fold has no partial to finalize (it skips empty batches), so it would yield nothing
+        # and silently disagree with the oracle. Ask the engine for the empty-input result
+        # through the ordinary plan path, so the answer comes from the same operator.
+        result = _empty_global_aggregate(agg, source)
     if result is not None:
         yield from _rebatch(result, batch_size)
+
+
+def _empty_global_aggregate(agg: Aggregate, source: Source) -> pa.RecordBatch | None:
+    """The one-row result of a keyless aggregate over an empty input, via the engine."""
+    nat = engine()
+    empty = pa.RecordBatch.from_pylist([], schema=source.schema())
+    out = nat.execute_plan(json.dumps(agg.to_ir()), [[empty]], active_config().engine_config_json())
+    return next((b for b in out if b.num_rows), None)
 
 
 _EPOCH = datetime.datetime(1970, 1, 1)
@@ -120,6 +119,12 @@ _EPOCH = datetime.datetime(1970, 1, 1)
 def _td(micros: int) -> datetime.timedelta:
     """A timedelta of `micros` microseconds (added to `_EPOCH` to build a literal)."""
     return datetime.timedelta(microseconds=micros)
+
+
+#: Schema-metadata key under which a windowed fold's watermark travels with its state batch.
+#: The `StateStore` persists exactly one `RecordBatch`, and the watermark is a scalar — this is
+#: how the scalar rides along without forking that contract.
+_WATERMARK_META = b"batcher.watermark_micros"
 
 
 def _window_key(agg: Aggregate) -> tuple[str, int] | None:
@@ -152,13 +157,11 @@ class _WindowedAggFold:
     """
 
     __slots__ = (
-        "_ag",
         "_cap",
-        "_gk",
+        "_fold",
         "_input_ir",
         "_lateness",
         "_nat",
-        "_running",
         "_time_col",
         "_w_alias",
         "_width",
@@ -166,17 +169,13 @@ class _WindowedAggFold:
     )
 
     def __init__(self, agg: Aggregate, w_alias: str, width: int) -> None:
-        import batcher._native as nat
-
-        self._nat = nat
-        self._gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
-        self._ag = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+        self._nat = engine()
+        self._fold = RunningAggregate(agg)
         self._input_ir = json.dumps(agg.input.to_ir())
         self._w_alias = w_alias
         self._width = width
         self._time_col = agg.watermark.time_col
         self._lateness = agg.watermark.lateness_micros
-        self._running: pa.RecordBatch | None = None
         self._wm: int | None = None
         # The retained open-window state is bounded by the watermark advancing; cap it
         # so a stalled watermark fails loudly instead of OOMing (read once here).
@@ -189,7 +188,12 @@ class _WindowedAggFold:
         hi = pc.max(col)
         if not hi.is_valid:
             return
-        micros = pc.cast(hi, pa.int64()).as_py()
+        # The watermark, window widths, and `window_start` all live in microseconds
+        # (the engine's `window_start` output is always `timestamp[us]`), but the event-
+        # time column may be any timestamp resolution (s/ms/us/ns). Normalize to
+        # microseconds first — reading the raw int64 ticks of a non-`us` column would
+        # scale the watermark by 1000× (dropping every row, or overflowing the literal).
+        micros = pc.cast(pc.cast(hi, pa.timestamp("us")), pa.int64()).as_py()
         candidate = micros - self._lateness
         self._wm = candidate if self._wm is None else max(self._wm, candidate)
 
@@ -199,25 +203,20 @@ class _WindowedAggFold:
         if batch.num_rows == 0:
             return []
         cfg = active_config().engine_config_json()
-        # Drop rows below the current watermark (late records) in Rust.
+        # Drop rows below the current watermark (late records) in Rust. The watermark
+        # literal is microseconds (`timestamp[us]`); normalize the event-time column to
+        # the same resolution so a non-`us` timestamp neither mis-compares nor raises a
+        # unit-mismatch error in the engine.
         if self._wm is not None:
-            kept = self._nat.execute_plan(
-                _scan_filter_ir(col(self._time_col) >= lit(_EPOCH + _td(self._wm))), [[batch]], cfg
-            )
+            on_time = col(self._time_col).cast("timestamp") >= lit(_EPOCH + _td(self._wm))
+            kept = self._nat.execute_plan(_scan_filter_ir(on_time), [[batch]], cfg)
         else:
             kept = [batch]
         self._advance_watermark(batch)
         for b in kept:
             if b.num_rows == 0:
                 continue
-            rows = self._nat.execute_plan(self._input_ir, [[b]], cfg)
-            if rows and sum(r.num_rows for r in rows):
-                partial = self._nat.partial_aggregate(self._gk, self._ag, rows)
-                self._running = (
-                    partial
-                    if self._running is None
-                    else self._nat.combine(self._gk, self._ag, [self._running, partial])
-                )
+            self._fold.push(self._nat.execute_plan(self._input_ir, [[b]], cfg))
         out = self._evict(cfg)
         # After eviction, what remains is the open-window state; if it has outgrown the
         # cap the watermark is not closing windows (a stall), so fail clearly.
@@ -225,9 +224,7 @@ class _WindowedAggFold:
         return out
 
     def _check_state_bounded(self) -> None:
-        if self._running is None:
-            return
-        size = self._running.nbytes
+        size = self._fold.nbytes()
         if size > self._cap:
             from batcher._internal.errors import ResourceError
 
@@ -242,35 +239,59 @@ class _WindowedAggFold:
     def _evict(self, cfg: str) -> list[pa.RecordBatch]:
         from batcher.plan.expr_ir import col, lit
 
-        if self._running is None or self._wm is None:
+        state = self._fold.state()
+        if state is None or self._wm is None:
             return []
         thr = _EPOCH + _td(self._wm - self._width)  # window_start ≤ thr ⟺ window closed
         wk = col(self._w_alias)
         closed = [
             b
-            for b in self._nat.execute_plan(_scan_filter_ir(wk <= lit(thr)), [[self._running]], cfg)
+            for b in self._nat.execute_plan(_scan_filter_ir(wk <= lit(thr)), [[state]], cfg)
             if b.num_rows
         ]
         open_ = [
             b
             for b in self._nat.execute_plan(
-                _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[self._running]], cfg
+                _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[state]], cfg
             )
             if b.num_rows
         ]
-        self._running = self._nat.combine(self._gk, self._ag, open_) if open_ else None
-        if not closed:
-            return []
-        result = self._nat.combine_finalize(self._gk, self._ag, closed)
-        return [result] if result.num_rows else []
+        self._fold.combine_all(open_)
+        result = self._fold.finalize_partials(closed)
+        return [result] if result is not None else []
 
     def flush(self) -> pa.RecordBatch | None:
         """Finalize and emit every remaining (open) window — the end-of-stream flush."""
-        if self._running is None:
+        return self._fold.take()
+
+    def state(self) -> pa.RecordBatch | None:
+        """The open-window partials **and the watermark**, as one checkpointable batch.
+
+        Both halves are state, and checkpointing only the partials would be worse than
+        checkpointing nothing: on restore the engine would hold windows it could never close,
+        and would re-admit as on-time the very rows the old watermark had already ruled late.
+        So the watermark rides in the batch's schema metadata (Arrow IPC persists it), keeping
+        the `StateStore`'s "state is one RecordBatch" contract intact.
+
+        A watermark that has advanced with no open windows still has to survive, so that case
+        snapshots a zero-column batch carrying only the metadata — dropping it would silently
+        rewind event time to the next batch's maximum.
+        """
+        running = self._fold.state()
+        if running is None and self._wm is None:
             return None
-        result = self._nat.combine_finalize(self._gk, self._ag, [self._running])
-        self._running = None
-        return result if result.num_rows else None
+        meta = {_WATERMARK_META: b"" if self._wm is None else str(self._wm).encode()}
+        if running is None:
+            return pa.RecordBatch.from_pylist([], schema=pa.schema([], metadata=meta))
+        return running.replace_schema_metadata({**(running.schema.metadata or {}), **meta})
+
+    def restore(self, state: pa.RecordBatch) -> None:
+        """Resume the open windows and the watermark from a checkpoint snapshot."""
+        raw = (state.schema.metadata or {}).get(_WATERMARK_META)
+        # `b""` means "no watermark yet"; `b"0"` and `b"-5"` are real watermarks, so test for
+        # emptiness rather than truthiness of the decoded int.
+        self._wm = int(raw) if raw else None
+        self._fold.restore(state if state.num_columns else None)
 
 
 def stream_windowed_aggregate(
@@ -300,10 +321,7 @@ def stream_distinct(
     reuses the incremental aggregate driver verbatim: identical rows fold into the
     same running group, and the state is bounded by the number of distinct rows.
     """
-    cols = distinct.input.available_columns()
-    group_keys = tuple(Projection(c, Col(c)) for c in cols)
-    agg = Aggregate(distinct.input, group_keys, ())
-    yield from stream_aggregate(agg, source, batch_size)
+    yield from stream_aggregate(distinct.as_aggregate(), source, batch_size)
 
 
 def stream_limit(
@@ -319,7 +337,7 @@ def stream_limit(
     partition-independent, so taking the first `n` rows across source batches in
     iteration order equals applying the `Limit` to the whole pipeline.
     """
-    import batcher._native as nat
+    nat = engine()
 
     input_ir = json.dumps(limit.input.to_ir())
     cfg = active_config().engine_config_json()
@@ -362,16 +380,13 @@ def stream_topn(
     running set is the global top-N, identical to sorting the whole input then
     taking the first `limit` rows.
     """
-    import batcher._native as nat
+    nat = engine()
 
     sort_ir = json.dumps(
         {
             "op": "sort",
             "input": {"op": "scan", "source_id": 0},
-            "keys": [
-                {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
-                for k in sort.keys
-            ],
+            "keys": sort_keys_ir(sort.keys),
             "limit": limit,
         }
     )
@@ -391,8 +406,9 @@ def stream_topn(
     if not running:
         return
     result = pa.Table.from_batches(running)
+    # `to_batches` yields `RecordBatch`es (the `iter_batches` contract); slicing the
+    # `Table` directly would leak `pa.Table` objects to the caller.
     if batch_size is None:
         yield from result.to_batches()
     else:
-        for off in range(0, result.num_rows, batch_size):
-            yield result.slice(off, batch_size)
+        yield from result.to_batches(max_chunksize=batch_size)

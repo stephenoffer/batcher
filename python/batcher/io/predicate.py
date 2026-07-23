@@ -19,6 +19,7 @@ from typing import Any
 __all__ = [
     "to_iceberg_expression",
     "to_mongo_filter",
+    "to_native_predicate",
     "to_pyarrow_expression",
     "to_sql_where",
 ]
@@ -44,10 +45,14 @@ def _literal(ir: dict[str, Any]) -> Any:
         import datetime as _dt
 
         return _dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)
+    if kind == "time":
+        import datetime as _dt
+
+        return (_dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)).time()
     return value
 
 
-def _pa_literal(ir: dict[str, Any]) -> Any:
+def _pa_literal(ir: dict[str, Any], col_type: Any | None = None) -> Any:
     """A pyarrow scalar for a literal IR, typed for temporal kinds.
 
     A bare ``date``/``timestamp`` literal is an epoch offset (days / micros); handed to
@@ -56,6 +61,14 @@ def _pa_literal(ir: dict[str, Any]) -> Any:
     int16)``). Building an explicitly-typed ``date32``/``timestamp[us]`` scalar makes the
     column-vs-literal comparison type-check and enables row-group/page pruning on date
     columns (the common TPC-H shipdate/orderdate filters).
+
+    When the column's own type is known (`col_type`), a ``timestamp`` literal is built to
+    match it exactly. This is what a timezone-aware column needs: pyarrow refuses to
+    compare a ``timestamp[us, tz=UTC]`` column against a tz-naive ``timestamp[us]`` scalar
+    (``Cannot compare timestamp with timezone to timestamp without timezone``), which
+    crashed a pushed filter on any UTC-normalized lakehouse timestamp column — the norm for
+    event-time data. The literal's raw value is UTC micros, so the same instant is
+    expressed in the column's unit and zone.
     """
     import pyarrow as pa
 
@@ -63,10 +76,27 @@ def _pa_literal(ir: dict[str, Any]) -> Any:
     if kind == "date":
         return pa.scalar(value, pa.date32())
     if kind == "timestamp":
+        if col_type is not None and pa.types.is_timestamp(col_type):
+            return _timestamp_scalar(value, col_type, pa)
         return pa.scalar(value, pa.timestamp("us"))
     if kind == "time":
         return pa.scalar(value, pa.time64("us"))
     return value
+
+
+def _timestamp_scalar(micros: int, col_type: Any, pa: Any) -> Any:
+    """A timestamp scalar for `micros` (UTC epoch micros) in `col_type`'s unit and zone.
+
+    Building the scalar from a Python ``datetime`` lets pyarrow convert the unit; a tz-aware
+    column gets a UTC-aware datetime (same instant), a tz-naive column a naive one, so the
+    comparison type-checks either way.
+    """
+    import datetime as _dt
+
+    moment = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=micros)
+    if col_type.tz is None:
+        moment = moment.replace(tzinfo=None)
+    return pa.scalar(moment, col_type)
 
 
 def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, Any, bool] | None:
@@ -79,27 +109,47 @@ def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, 
 
 
 def _col_and_pa_literal(
-    left: dict[str, Any], right: dict[str, Any]
+    left: dict[str, Any], right: dict[str, Any], schema: Any | None = None
 ) -> tuple[str, Any, bool] | None:
-    """Like :func:`_col_and_literal`, but the value is a typed pyarrow scalar."""
+    """Like :func:`_col_and_literal`, but the value is a typed pyarrow scalar.
+
+    `schema` (when known) types a temporal literal to its column's own type, so a filter
+    on a timezone-aware timestamp column type-checks instead of raising.
+    """
     if left.get("e") == "col" and right.get("e") == "lit":
-        return left["name"], _pa_literal(right), False
+        return left["name"], _pa_literal(right, _field_type(schema, left["name"])), False
     if left.get("e") == "lit" and right.get("e") == "col":
-        return right["name"], _pa_literal(left), True
+        return right["name"], _pa_literal(left, _field_type(schema, right["name"])), True
     return None
 
 
-def to_pyarrow_expression(ir: dict[str, Any]) -> Any | None:
+def _field_type(schema: Any | None, name: str) -> Any | None:
+    """The Arrow type of column `name` in `schema`, or None if unknown."""
+    if schema is None:
+        return None
+    try:
+        return schema.field(name).type
+    except Exception:
+        return None
+
+
+def to_pyarrow_expression(ir: dict[str, Any], schema: Any | None = None) -> Any | None:
     """Translate the pushable subset of `ir` to a `pyarrow.dataset.Expression`.
+
+    `schema` is the scanned table's Arrow schema, when the caller has it. It lets a
+    temporal literal be typed to its column — the tz-aware timestamp columns common in
+    lakehouse tables cannot be compared against a tz-naive literal, so without it a pushed
+    filter on such a column raises rather than prunes. Omitting it keeps the prior
+    behavior (a tz-naive ``timestamp[us]`` literal).
 
     Returns ``None`` if the predicate is not (fully) pushable.
     """
     import pyarrow.dataset as ds
 
-    return _to_pa(ir, ds)
+    return _to_pa(ir, ds, schema)
 
 
-def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
+def _to_pa(ir: dict[str, Any], ds: Any, schema: Any | None = None) -> Any | None:
     e = ir.get("e")
     if e == "is_null":
         inner = ir["input"]
@@ -111,13 +161,13 @@ def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
         return None
     op = ir["op"]
     if op in ("and", "or"):
-        left = _to_pa(ir["left"], ds)
-        right = _to_pa(ir["right"], ds)
+        left = _to_pa(ir["left"], ds, schema)
+        right = _to_pa(ir["right"], ds, schema)
         if left is None or right is None:
             return None
         return (left & right) if op == "and" else (left | right)
     if op in _CMP:
-        parsed = _col_and_pa_literal(ir["left"], ir["right"])
+        parsed = _col_and_pa_literal(ir["left"], ir["right"], schema)
         if parsed is None:
             return None
         col, value, flipped = parsed
@@ -135,12 +185,26 @@ def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
 
 
 def _sql_literal(value: Any) -> str:
+    import datetime as _dt
+
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, str):
         return "'" + value.replace("'", "''") + "'"
     if value is None:
         return "NULL"
+    # Temporal literals MUST be emitted as typed, quoted SQL literals. A bare
+    # ``str(date)`` renders ``2021-01-15``, which the server parses as the integer
+    # arithmetic ``2021 - 1 - 15`` (→ 2005), and ``str(datetime)`` renders an
+    # unquoted ``2021-01-15 00:00:00`` that is a syntax error. ANSI ``DATE '…'`` /
+    # ``TIMESTAMP '…'`` / ``TIME '…'`` literals are accepted across the warehouses
+    # these connectors target. (datetime is a subclass of date — check it first.)
+    if isinstance(value, _dt.datetime):
+        return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+    if isinstance(value, _dt.date):
+        return f"DATE '{value.isoformat()}'"
+    if isinstance(value, _dt.time):
+        return f"TIME '{value.isoformat()}'"
     return str(value)
 
 
@@ -165,6 +229,14 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
         if parsed is None:
             return None
         col, value, flipped = parsed
+        # NaN/Inf have no portable SQL literal spelling: ``col = nan`` / ``col < inf``
+        # are rejected by every warehouse these connectors target (Snowflake,
+        # BigQuery, ClickHouse, …). Leave the term unpushed — the engine's Filter
+        # re-checks every row, so a non-pushed predicate is always correct.
+        import math
+
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         effective = _FLIP[op] if flipped else op
         return f"{col} {_SQL_OP[effective]} {_sql_literal(value)}"
     return None
@@ -208,6 +280,65 @@ def to_iceberg_expression(ir: dict[str, Any]) -> Any | None:
         return None
 
     return walk(ir)
+
+
+def _native_scalar(ir: dict[str, Any]) -> tuple[Any, bool]:
+    """A literal for the native reader: ``(value, ok)``.
+
+    Only plain ``int``/``float``/``str``/``bool`` literals push to the native reader's
+    zone-map pruning. Temporal kinds (``date``/``timestamp``/``time``) are epoch offsets
+    whose parquet physical unit the reader cannot verify without risking an unsound prune,
+    so they mark the term non-pushable (``ok=False``) and the pyarrow path handles them.
+    """
+    ((kind, value),) = ir["value"].items()
+    if kind in ("int", "float", "str", "bool"):
+        return value, True
+    return None, False
+
+
+def to_native_predicate(ir: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate the pushable subset of `ir` to the native reader's compact predicate.
+
+    The shape `bc_io`'s `predicate` module deserializes: ``{"node":"cmp","col":..,"op":..,
+    "lit":..}`` / ``{"node":"and"/"or","left":..,"right":..}`` / ``{"node":"is_null","col":..,
+    "negated":..}``. Comparisons are normalized so the column is on the left. Returns
+    ``None`` if any term is not pushable (a non-column/literal comparison, a temporal
+    literal, or an unsupported node) — the caller then reads without native pruning.
+
+    The ``"is_null"`` tag is load-bearing: `bc_io`'s `Pred` is
+    ``#[serde(tag = "node", rename_all = "snake_case")]``, so its `IsNull` variant is spelled
+    ``is_null``. Emitting anything else makes `parse()` reject the *whole* predicate — and
+    because pruning is only ever an optimization, that failure is silent (correct results, zero
+    row-groups pruned). Keep this in lockstep with `crates/bc-io/src/predicate.rs`.
+    """
+    e = ir.get("e")
+    if e in ("is_null", "is_not_null"):
+        inner = ir["input"]
+        if inner.get("e") != "col":
+            return None
+        return {"node": "is_null", "col": inner["name"], "negated": e == "is_not_null"}
+    if e != "binary":
+        return None
+    op = ir["op"]
+    if op in ("and", "or"):
+        left = to_native_predicate(ir["left"])
+        right = to_native_predicate(ir["right"])
+        if left is None or right is None:
+            return None
+        return {"node": op, "left": left, "right": right}
+    if op in _CMP:
+        left, right = ir["left"], ir["right"]
+        if left.get("e") == "col" and right.get("e") == "lit":
+            col, lit_ir, flipped = left["name"], right, False
+        elif left.get("e") == "lit" and right.get("e") == "col":
+            col, lit_ir, flipped = right["name"], left, True
+        else:
+            return None
+        value, ok = _native_scalar(lit_ir)
+        if not ok:
+            return None
+        return {"node": "cmp", "col": col, "op": _FLIP[op] if flipped else op, "lit": value}
+    return None
 
 
 _MONGO_OP = {"eq": "$eq", "ne": "$ne", "lt": "$lt", "le": "$lte", "gt": "$gt", "ge": "$gte"}

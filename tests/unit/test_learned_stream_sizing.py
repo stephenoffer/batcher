@@ -132,3 +132,49 @@ def test_streaming_gpu_batch_size_is_result_invariant():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_the_learned_gpu_cap_can_recover_and_is_not_a_one_way_ratchet():
+    """The folded size must measure the data, not the cap it just produced.
+
+    The applied GPU size is `min(learned_cap, by_bytes)`, which is `<= learned_cap` by
+    construction. Folding *that* made the EMA its own input, so every run could only ever
+    contribute a value at or below the prior EMA — a monotonically non-increasing ratchet
+    with `int()` truncation drifting it further down and no path back up. One run over wide
+    rows (large frames) therefore shrank a model's GPU batch permanently, on every later
+    run, even over narrow rows, sliding toward `_GPU_STREAM_BATCH_MIN`.
+
+    Sizing the folded observation against the *config* cap keeps it a property of the data,
+    so a narrow-row run recovers. Batch size never changes what the model computes.
+    """
+    import pyarrow as pa
+
+    cap = stream._GPU_STREAM_BATCH_ROWS
+    sig = "test.ratchet_model"
+
+    def morsel(per_row_bytes: int, rows: int) -> pa.RecordBatch:
+        payload = b"\0" * per_row_bytes
+        return pa.RecordBatch.from_pydict({"blob": [payload] * rows})
+
+    # Wide enough that the byte budget, not the row cap, binds (3 MB frames); few rows so
+    # the fixture stays small. Narrow rows let the row cap bind instead.
+    wide, narrow = morsel(3_000_000, 4), morsel(64, 512)
+    # A wide morsel really does size down, and a narrow one really does size up — otherwise
+    # this test would pass on a broken implementation that ignored width entirely.
+    assert stream._gpu_batch_rows(wide, cap) < stream._gpu_batch_rows(narrow, cap)
+
+    # Run 1 is all wide rows: the learned cap settles small.
+    default_hub().put_keyed_param(stream._GPU_BATCH_NS, sig, {})
+    stream._fold_ema(stream._GPU_BATCH_NS, sig, float(stream._gpu_batch_rows(wide, cap)))
+    after_wide = stream._read_ema(stream._GPU_BATCH_NS, sig)
+    assert after_wide is not None
+
+    # Run 2 is all narrow rows. The observation is sized against the CONFIG cap, so it
+    # reports what the narrow data permits and the EMA climbs back.
+    learned_cap = min(cap, int(after_wide))
+    stream._fold_ema(stream._GPU_BATCH_NS, sig, float(stream._gpu_batch_rows(narrow, cap)))
+    assert stream._read_ema(stream._GPU_BATCH_NS, sig) > after_wide  # recovered
+
+    # Sizing against the previously *learned* cap — what the old code folded — could not
+    # have exceeded it, which is precisely why the EMA could only ever fall.
+    assert stream._gpu_batch_rows(narrow, learned_cap) <= learned_cap

@@ -13,7 +13,13 @@ import contextvars
 import math
 import threading
 
+from batcher._internal.accelerators import (
+    accelerator_units,
+    binding_gpu_memory_bytes,
+    is_accelerator_node,
+)
 from batcher.config import active_config
+from batcher.plan.resource import HardwareProfile
 
 
 class _Topology:
@@ -189,7 +195,7 @@ def worker_node_memory_bytes() -> int:
 
 
 def node_classes() -> list[dict]:
-    """Per-alive-node resource class: ``{"cpus", "gpus", "accelerator_type"}``.
+    """Per-alive-node resource class: ``{"cpus", "gpus", "accelerators", "accelerator_type"}``.
 
     The explicit cluster-heterogeneity model the scheduler lacked: a node is a "GPU
     node" when it exposes a `GPU` resource, a "CPU-only node" otherwise. The accelerator
@@ -211,6 +217,9 @@ def node_classes() -> list[dict]:
                 {
                     "cpus": cpus,
                     "gpus": float(res.get("GPU", 0.0)),
+                    # Non-GPU accelerators (TPU / Trainium / Gaudi / NPU) Ray doesn't count as
+                    # `GPU`; lets the CPU-fleet isolation treat a TPU node as an accelerator node.
+                    "accelerators": accelerator_units(res),
                     "accelerator_type": labels.get("ray.io/accelerator-type"),
                 }
             )
@@ -219,20 +228,60 @@ def node_classes() -> list[dict]:
         return []
 
 
+def cluster_hardware_profile() -> HardwareProfile | None:
+    """The `HardwareProfile` Kyber should plan against for a distributed run, or `None`.
+
+    Built from live topology so the optimizer's cache/memory-sized thresholds track the
+    *workers*, not the driver — which may be a fat head node next to small workers. Every
+    field is the **binding** (weakest) worker so a plan sized against it is valid on every
+    node it might land on: cores from the smallest worker, RAM from `worker_node_memory_bytes`
+    (already the minimum), VRAM from the smallest device model any GPU node advertises, and L3
+    cache from the smallest-cache node shape (probed from the workers — Ray's topology omits it,
+    so this used to be `0` and every cluster query fell back to the config broadcast threshold).
+
+    `gpu_count` is the cluster's **device** total, not the number of GPU-bearing nodes. Those
+    differ on any multi-GPU node, and the figure is consumed as a device count (a whole-cluster
+    VRAM budget is `one_gpu_gb * gpu_count`), so reporting nodes under-counted an 8-GPU box
+    eightfold and refused work the cluster could hold.
+
+    Returns `None` when the topology is unreadable (Ray down), so the caller falls back to the
+    single-node local profile rather than a fabricated one.
+    """
+    classes = node_classes()
+    if not classes:
+        return None
+    worker_count = len(classes)
+    min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
+    gpu_devices = int(sum(c["gpus"] for c in classes))
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_l3_cache_bytes
+
+    return HardwareProfile.for_cluster(
+        cpu_cores=min_cores,
+        memory_bytes=worker_node_memory_bytes(),
+        worker_count=worker_count,
+        gpu_count=gpu_devices,
+        gpu_memory_bytes=binding_gpu_memory_bytes(classes),
+        # The binding worker's L3, probed from the workers themselves — Ray's topology omits
+        # cache, so this was left `0` and every cluster query fell back to the config broadcast
+        # threshold. Cached per topology and best-effort, so an unprobeable cluster is unchanged.
+        l3_cache_bytes=cluster_l3_cache_bytes(),
+    )
+
+
 def cpu_only_can_host(workers: int, num_cpus: float) -> bool:
     """Whether the cluster's **CPU-only** nodes alone can host `workers` x `num_cpus` cores.
 
-    The gate for keeping a relational (CPU) fleet off GPU nodes on a heterogeneous
+    The gate for keeping a relational (CPU) fleet off accelerator nodes on a heterogeneous
     cluster: only restrict the fleet to CPU-only nodes when those nodes have the capacity
     to run it — otherwise the restriction would under-provision (or fail to place) the
     query, so the fleet is left free to use every node (today's behavior). Returns False
-    on a homogeneous cluster (no GPU nodes ⇒ nothing to keep off ⇒ no restriction needed)
-    or unreadable topology.
+    on a homogeneous cluster (no accelerator nodes ⇒ nothing to keep off) or unreadable
+    topology. Accelerator = GPU or custom accelerator (see `is_accelerator_node`).
     """
     classes = node_classes()
-    if not classes or not any(c["gpus"] > 0 for c in classes):
-        return False  # homogeneous / GPU-less → no restriction (use all nodes)
-    cpu_only_cores = sum(c["cpus"] for c in classes if c["gpus"] <= 0)
+    if not classes or not any(is_accelerator_node(c) for c in classes):
+        return False  # homogeneous / accelerator-less → no restriction (use all nodes)
+    cpu_only_cores = sum(c["cpus"] for c in classes if not is_accelerator_node(c))
     return cpu_only_cores >= workers * max(num_cpus, 1e-9)
 
 
@@ -294,6 +343,11 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     capacity = int(avail_cpus / num_cpus)
     if num_gpus > 0:
         capacity = min(capacity, int(topo["gpus"] / num_gpus))
+    # ...and by what a single node can *host* (see `capacity.placeable_workers`).
+    from batcher.dist.executors.ray_runtime.capacity import placeable_workers
+
+    fits = placeable_workers(num_cpus, num_gpus)
+    capacity = capacity if fits is None else min(capacity, fits)
     if avail_cpus <= 0 or workers <= capacity:
         return workers
     # The query scope already asked the autoscaler for these resources
@@ -306,87 +360,53 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     fit = int(avail_now / num_cpus)
     if num_gpus > 0:
         fit = min(fit, int(float(cluster_topology()["gpus"]) / num_gpus))
+    # Re-read after the wait: the grown cluster's shape decides what fits, not its totals.
+    fits_now = placeable_workers(num_cpus, num_gpus)
+    fit = fit if fits_now is None else min(fit, fits_now)
     return max(1, min(workers, fit))
 
 
-# --- Autoscaler request lifecycle (scale up for a query, reclaim after) -------------
-# `request_resources` sets a *sticky* floor: the autoscaler keeps that many cores until
-# told otherwise. Left unmanaged, one big query pins the cluster scaled-up forever. We
-# track a process-wide high-water floor across in-flight query scopes and reset it to 0
-# the moment the last one ends, so the autoscaler reclaims the now-idle nodes. A
-# running query's nodes are *busy* (tasks / persistent-fleet actors), so they are never
-# reclaimed mid-query regardless of the floor — the floor only drives scale-*up* and
-# keeps a node from being reclaimed in the brief gap before it picks up work.
-_autoscale_lock = threading.Lock()
-_autoscale_active = 0
-_autoscale_floor = 0
-_autoscale_gpu_floor = 0
+# The capacity a wait *confirmed* the autoscaler won't exceed (set when a wait stalls below
+# target): a later query asking for more skips the wait instead of re-discovering the same
+# ceiling, so a fixed-at-max cluster pays the startup grace ONCE, not per cold query. A wait
+# that grows the cluster lifts it (`_note_reached`), so real scale-up is never pinned stale.
+_reachable_ceiling: float = float("inf")
+_ceiling_lock = threading.Lock()
 
 
-def _apply_autoscale_floor(cpus: int, gpus: int = 0) -> None:
-    with contextlib.suppress(Exception):
-        from ray.autoscaler.sdk import request_resources
-
-        if gpus > 0:
-            # A GPU floor needs GPU *bundles* — `request_resources(num_cpus=)` alone never
-            # triggers GPU-node scale-up, so a GPU query would hang or fall back to CPU
-            # nodes it can't run on. One `{"GPU": 1}` bundle per requested GPU asks the
-            # autoscaler for that many GPUs; the CPU floor rides alongside for the
-            # relational stages. (Whole-GPU bundles — fractional packing is a scheduling
-            # concern, not an autoscale-shape one.)
-            request_resources(num_cpus=cpus, bundles=[{"GPU": 1}] * gpus)
-        else:
-            request_resources(num_cpus=cpus)
+def _note_ceiling(best_cpus: int) -> None:
+    """Record that the autoscaler stalled at `best_cpus` — the cluster will not exceed it."""
+    global _reachable_ceiling
+    with _ceiling_lock:
+        _reachable_ceiling = min(_reachable_ceiling, float(best_cpus))
 
 
-def request_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
-    """Register a query scope wanting `target_cpus` cores (and `target_gpus` GPUs); maintain
-    the high-water floor.
-
-    The autoscaler is asked for the max over every in-flight scope, so concurrent
-    queries compose and one scope never lowers the floor a live sibling still needs. A
-    GPU query (`target_gpus > 0`) also lifts a GPU floor so the autoscaler provisions GPU
-    nodes — not just cores. Balanced by exactly one `release_autoscale` at the scope's
-    teardown.
-    """
-    global _autoscale_active, _autoscale_floor, _autoscale_gpu_floor
-    with _autoscale_lock:
-        _autoscale_active += 1
-        _autoscale_floor = max(_autoscale_floor, target_cpus)
-        _autoscale_gpu_floor = max(_autoscale_gpu_floor, math.ceil(target_gpus))
-        _apply_autoscale_floor(_autoscale_floor, _autoscale_gpu_floor)
+def _note_reached(cpus: int) -> None:
+    """Lift a stale ceiling once capacity has climbed past it (the cluster grew/recovered)."""
+    global _reachable_ceiling
+    with _ceiling_lock:
+        if cpus > _reachable_ceiling:
+            _reachable_ceiling = float("inf")
 
 
-def release_autoscale() -> None:
-    """End one query scope; when the last one ends, drop the autoscaler floor (CPU and GPU)
-    to 0 so it can reclaim the idle nodes the query scaled up (instead of pinning them
-    forever)."""
-    global _autoscale_active, _autoscale_floor, _autoscale_gpu_floor
-    with _autoscale_lock:
-        _autoscale_active -= 1
-        if _autoscale_active <= 0:
-            _autoscale_active = 0
-            _autoscale_floor = 0
-            _autoscale_gpu_floor = 0
-            _apply_autoscale_floor(0, 0)
+def _reset_capacity_ceiling() -> None:
+    """Forget the learned ceiling (tests; and any caller that wants a fresh probe)."""
+    global _reachable_ceiling
+    with _ceiling_lock:
+        _reachable_ceiling = float("inf")
 
 
 def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
     """Block (bounded, growth-detected) until the autoscaler grows the cluster toward
     `target_cpus` cores (and `target_gpus` GPUs).
 
-    Called *before* the fan-out is sized to the cluster, so a query that triggered a
-    scale-up (`request_autoscale`) fills the SCALED-UP cluster rather than the pre-scale
-    one — the load-bearing step for out-of-the-box cluster saturation. Without it, the
-    worker-per-node fill reads the current (small) topology and the query never uses the
-    nodes it asked for; the wait inside `clamp_workers` can't fix that because the fill
-    has already made `workers == capacity`.
-
-    A no-op when the wait is disabled (`autoscale_wait_s <= 0`), Ray is down, or the
-    cluster already covers the target. On a fixed cluster (or spot capacity the autoscaler
-    cannot get) it returns quickly via `_await_autoscale`'s stall-window bail, so it never
-    blocks the whole budget on nodes that will not arrive. Pure scheduling — the result is
-    identical whether it waits or not.
+    Called *before* the fan-out is sized to the cluster, so a query that triggered a scale-up
+    (`request_autoscale`) fills the SCALED-UP cluster rather than the pre-scale one — without
+    it the worker-per-node fill reads the current (small) topology and the query never uses
+    the nodes it asked for. A no-op when the wait is disabled, Ray is down, the cluster already
+    covers the target, or a previous wait learned it will not reach the target
+    (`_reachable_ceiling`) — so a fixed cluster pays the startup grace once, not per query.
+    Pure scheduling — the result is identical whether it waits or not.
     """
     if active_config().distributed.autoscale_wait_s <= 0 or target_cpus <= 0:
         return
@@ -395,7 +415,21 @@ def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
     if not ray.is_initialized():
         return
     topo = cluster_topology()
-    _await_autoscale(target_cpus, int(topo["cpus"]), target_gpus, float(topo["gpus"]))
+    avail = int(topo["cpus"])
+    # Read current capacity BEFORE the ceiling short-circuit, so a cluster grown since the
+    # ceiling was learned re-probes: covering the target returns satisfied (lifting the stale
+    # ceiling); merely exceeding it drops the bound and waits for the rest.
+    if avail >= target_cpus and float(topo["gpus"]) >= target_gpus:
+        if target_gpus <= 0:
+            _note_reached(avail)
+        return
+    with _ceiling_lock:
+        ceiling = _reachable_ceiling
+    if avail > ceiling:
+        _note_reached(avail)  # capacity climbed past the old ceiling — it is stale
+    elif target_cpus > ceiling and target_gpus <= 0:
+        return  # a prior wait proved this is unreachable — don't re-discover it
+    _await_autoscale(target_cpus, avail, target_gpus, float(topo["gpus"]))
 
 
 def _await_autoscale(
@@ -404,15 +438,11 @@ def _await_autoscale(
     """Wait (bounded) for the cluster to grow to `target_cpus` (and `target_gpus`), returning
     observed CPUs.
 
-    Polls the live CPU/GPU counts every `autoscale_poll_s` until both cover their targets
-    or `autoscale_wait_s` elapses, then returns the CPU count — so a query that triggered a
-    scale-up runs on the bigger cluster. A GPU stage waits for the GPUs to arrive too, not
-    just the cores (otherwise it would clamp to the 0 GPUs visible before the GPU node is
-    up). A no-op (returns `avail` immediately) when the wait is disabled or the cluster
-    already fits. Stops the instant capacity is sufficient, and — via the
-    `autoscale_stall_s` grace window — also stops early once capacity has been flat that
-    long (a fixed cluster, or spot capacity the autoscaler cannot get), so it never blocks
-    the whole budget on nodes that will not arrive.
+    Polls the live CPU/GPU counts every `autoscale_poll_s` until both cover their targets or
+    `autoscale_wait_s` elapses, then returns the CPU count. A GPU stage waits for the GPUs
+    too, not just the cores (else it clamps to the 0 GPUs visible before the GPU node boots).
+    A no-op (returns `avail`) when the wait is disabled or the cluster already fits; stops
+    early via the grace windows below when capacity goes flat.
     """
     dc = active_config().distributed
     if dc.autoscale_wait_s <= 0 or (avail >= target_cpus and avail_gpus >= target_gpus):
@@ -421,12 +451,21 @@ def _await_autoscale(
 
     deadline = time.monotonic() + dc.autoscale_wait_s
     poll = max(0.1, dc.autoscale_poll_s)
-    # Give up early once capacity has been flat for the grace window: the autoscaler is
-    # done (fixed cluster) or cannot satisfy the request (spot capacity unavailable), so
-    # the rest of the budget would block on nodes that will not arrive. Any capacity gain
-    # resets the window — a cluster that is still growing keeps its full wait.
-    grace = max(dc.autoscale_stall_s, poll * 2)
+    # Give up early once capacity has been flat for the grace window — the autoscaler is done
+    # (fixed cluster) or cannot satisfy the request (spot unavailable), so the rest of the
+    # budget would block on nodes that will not arrive; any gain resets the window. Two
+    # regimes: until the FIRST growth a short `startup_grace` applies — an infeasible request
+    # (a fixed cluster already at max, the common case where a large aggregate's fan-out
+    # exceeds the node count) grows zero from the start, and the query already runs on current
+    # capacity, so it must not eat the full 90 s stall for nodes that never come. Once any
+    # growth appears the cluster is genuinely scaling and the longer `autoscale_stall_s`
+    # governs. `startup_grace` sits above a couple of polls so nodes registering within a few
+    # seconds still cross into the growing regime.
+    stall_grace = max(dc.autoscale_stall_s, poll * 2)
+    startup_grace = max(dc.autoscale_startup_grace_s, poll * 2)
     best = (avail, avail_gpus)
+    saw_growth = False
+    reached = False
     last_growth = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
@@ -434,10 +473,20 @@ def _await_autoscale(
         avail = int(topo["cpus"])
         avail_gpus = float(topo["gpus"])
         if avail >= target_cpus and avail_gpus >= target_gpus:
+            reached = True
             break
         if (avail, avail_gpus) > best:
             best = (avail, avail_gpus)
+            saw_growth = True
             last_growth = time.monotonic()
-        elif time.monotonic() - last_growth >= grace:
-            break  # no new capacity for the grace window — nothing more is coming
+        elif time.monotonic() - last_growth >= (stall_grace if saw_growth else startup_grace):
+            break  # nothing is coming (never started, or grew then stopped)
+    # A CPU-only wait that stalled below its target has learned a ceiling; one that reached
+    # (or grew past a stale ceiling) lifts it. GPU waits don't participate — a 0-GPU snapshot
+    # before a GPU node boots must not cap future GPU requests.
+    if target_gpus <= 0:
+        if reached or avail >= target_cpus:
+            _note_reached(avail)
+        else:
+            _note_ceiling(int(best[0]))
     return avail

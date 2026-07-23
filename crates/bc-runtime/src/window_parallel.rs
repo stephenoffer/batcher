@@ -274,3 +274,80 @@ fn bucket_of_each_row(
         .map(|i| (SEED.hash_one(rows.row(i)) % n) as u32)
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::{window_serial, window_with, WindowCall, WindowFn};
+    use arrow::array::{BooleanArray, Int64Array, StringArray};
+
+    fn i64s(v: &[i64]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+    fn asc(a: ArrayRef) -> (ArrayRef, SortOptions) {
+        (
+            a,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )
+    }
+
+    /// The parallel scatter for NON-primitive outputs (`scatter_by_gather`) must equal the
+    /// serial kernel. Prior parity tests only exercised Int64/Float64 outputs (the
+    /// `scatter_blocked` path); a String `first_value`/`last_value` and a Boolean min/max
+    /// output route through the fallback gather, which was never checked seq==par.
+    #[test]
+    fn parallel_matches_serial_nonprimitive_outputs() {
+        let n = 400usize;
+        let part = i64s(&(0..n as i64).map(|i| i % 30).collect::<Vec<_>>());
+        let ord = i64s(&(0..n as i64).map(|i| (i * 7 + 13) % 50).collect::<Vec<_>>());
+        let svals: ArrayRef = Arc::new(StringArray::from(
+            (0..n).map(|i| format!("s{}", i % 17)).collect::<Vec<_>>(),
+        ));
+        let bvals: ArrayRef = Arc::new(BooleanArray::from(
+            (0..n).map(|i| i % 3 == 0).collect::<Vec<_>>(),
+        ));
+        let order = [asc(ord)];
+
+        let cases: Vec<WindowCall> = vec![
+            WindowCall {
+                func: WindowFn::FirstValue,
+                values: Some(svals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::LastValue,
+                values: Some(svals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Min,
+                values: Some(bvals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Max,
+                values: Some(bvals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Min,
+                values: Some(svals.clone()),
+                offset: 1,
+                frame: None,
+            },
+        ];
+        for call in cases {
+            let f = [call];
+            let par = window_with(&[part.clone()], &order, &f, n, 1).unwrap();
+            let ser = window_serial(&[part.clone()], &order, &f, n).unwrap();
+            assert_eq!(par[0].as_ref(), ser[0].as_ref(), "{:?}", f[0].func);
+        }
+    }
+}

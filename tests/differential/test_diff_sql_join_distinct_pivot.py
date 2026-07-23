@@ -1,7 +1,7 @@
 """SQL parity fixes for the four silent-wrong-answer cases the DuckDB audit found.
 
 NATURAL JOIN is now implemented (join on shared columns) and must match DuckDB;
-DISTINCT ON, PIVOT/UNPIVOT, and a window-frame EXCLUDE clause are rejected with a
+A window-frame EXCLUDE clause is rejected with a
 clear error rather than silently returning the wrong rows.
 """
 
@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -33,8 +34,6 @@ def ab(duck):
 )
 def test_natural_join_matches_duckdb(duck, ab, query):
     """NATURAL JOIN joins on every shared column name — matches DuckDB (not a cross join)."""
-    from conftest import assert_same
-
     a, b = ab
     out = bt.sql(query, a=a, b=b).collect()
     # Shared columns (k, g) appear once, in the left's order — same as DuckDB.
@@ -56,12 +55,9 @@ def test_natural_join_without_shared_columns_raises(ab):
 @pytest.mark.parametrize(
     ("query", "message"),
     [
-        ("SELECT DISTINCT ON (g) g, va FROM a ORDER BY va", "DISTINCT ON"),
-        ("SELECT * FROM a PIVOT (SUM(va) FOR g IN ('x', 'y'))", "PIVOT"),
-        (
-            "SELECT * FROM (SELECT 1 AS x, 2 AS y) UNPIVOT (val FOR col IN (x, y))",
-            "UNPIVOT",
-        ),
+        # NB: SELECT DISTINCT ON is now supported (see test_diff_distinct_on.py), and so
+        # are PIVOT / UNPIVOT (see test_diff_sql_pivot.py) — both were removed from this
+        # list when they stopped raising. What remains is genuinely unsupported.
         (
             "SELECT SUM(va) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW "
             "EXCLUDE TIES) FROM a",

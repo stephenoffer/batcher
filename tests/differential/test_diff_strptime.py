@@ -10,13 +10,12 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 def test_to_datetime_parses_and_nulls_bad(duck):
     """Parse ``%Y-%m-%d %H:%M:%S`` strings; junk → NULL (vs DuckDB try_strptime)."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "s": [
@@ -38,8 +37,6 @@ def test_to_datetime_parses_and_nulls_bad(duck):
 
 def test_to_datetime_via_str_namespace(duck):
     """The accessor spelling ``col.str.to_datetime`` is equivalent."""
-    from conftest import assert_same
-
     t = pa.table({"s": ["2024-06-23 12:00:00", "bad", "2024-06-23 23:59:59"]})
     duck.register("ts2", t)
     out = bt.from_arrow(t).select(d=col("s").str.to_datetime("%Y-%m-%d %H:%M:%S")).collect()
@@ -48,8 +45,6 @@ def test_to_datetime_via_str_namespace(duck):
 
 def test_to_date_parses_iso(duck):
     """`to_date` parses date-only strings to Date32 (junk → NULL)."""
-    from conftest import assert_same
-
     t = pa.table({"s": ["2024-02-15", "2023-12-31", "nope", None]})
     duck.register("td", t)
     out = bt.from_arrow(t).select(d=col("s").str.to_date()).collect()

@@ -48,9 +48,21 @@ def try_gpu_collect(
     gpu_count = _cluster_gpu_count()
     if gpu_count < 1:
         return None
+    from batcher.dist.executors.ray_runtime.accelerators import (
+        cluster_accelerator_type,
+        cluster_gpu_memory_gb,
+    )
     from batcher.kyber.gpu.policy import decide_gpu_backend
 
-    decision = decide_gpu_backend(plan, sources, hub, gpu_count=gpu_count, force=force)
+    decision = decide_gpu_backend(
+        plan,
+        sources,
+        hub,
+        gpu_count=gpu_count,
+        force=force,
+        gpu_memory_gb=cluster_gpu_memory_gb(),
+        accelerator_type=cluster_accelerator_type(),
+    )
     if not decision.use_gpu:
         return None
     import pyarrow as pa
@@ -146,9 +158,11 @@ def _record_gpu_timing(hub, plan, sources, est_rows: int, wall_ms: float) -> Non
     rows = _agg_input_rows(plan, sources, fallback=est_rows)
     if hub is None or rows <= 0:
         return
+    from batcher.dist.executors.ray_runtime.accelerators import cluster_accelerator_type
     from batcher.kyber.gpu import record_backend_timing
 
-    record_backend_timing(hub, "gpu", rows, wall_ms)
+    # Tagged with the device that produced it, so an H100 fleet's timings never join a T4's line.
+    record_backend_timing(hub, "gpu", rows, wall_ms, cluster_accelerator_type())
 
 
 def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:

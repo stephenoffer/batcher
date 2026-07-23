@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 
@@ -29,8 +30,6 @@ def nulls(duck):
 
 def test_null_aggregates_ignore_nulls(duck, nulls):
     """sum/avg/min/max/count(v) skip nulls; an all-null group yields NULL (count 0)."""
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(nulls)
         .group_by("k")
@@ -54,8 +53,6 @@ def test_null_aggregates_ignore_nulls(duck, nulls):
 
 
 def test_null_median_and_count_distinct(duck, nulls):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(nulls)
         .group_by("k")
@@ -66,8 +63,6 @@ def test_null_median_and_count_distinct(duck, nulls):
 
 
 def test_null_var_stddev(duck, nulls):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(nulls)
         .group_by("k")
@@ -81,8 +76,6 @@ def test_null_var_stddev(duck, nulls):
 
 
 def test_null_group_key_is_its_own_group(duck, nulls):
-    from conftest import assert_same
-
     out = bt.from_arrow(nulls).group_by("k").agg(c=count()).collect()
     assert_same(out, duck.sql("SELECT k, COUNT(*) c FROM t GROUP BY k"))
 
@@ -106,8 +99,6 @@ def join_nulls(duck):
 )
 def test_null_join_keys_never_match(duck, join_nulls, how, sql):
     """NULL keys must not match (SQL NULL != NULL), on either side of any join."""
-    from conftest import assert_same
-
     left, right = join_nulls
     out = (
         bt.from_arrow(left)
@@ -137,16 +128,12 @@ def test_global_aggregate_over_empty_input(duck):
     )
     # SUM/AVG over no rows → NULL; COUNT(*) → 0.
     assert out.to_pylist() == [{"s": None, "c": 0, "a": None}]
-    from conftest import assert_same
-
     assert_same(out, duck.sql("SELECT SUM(v) s, COUNT(*) c, AVG(v) a FROM e WHERE v > 1000"))
 
 
 def test_all_null_column_aggregates(duck):
     t = pa.table({"k": [1, 1, 2], "v": pa.array([None, None, None], pa.int64())})
     duck.register("a", t)
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .group_by("k")
@@ -167,8 +154,6 @@ def test_single_row_dataset():
 def test_kleene_and_or_three_valued_logic(duck):
     """`FALSE AND NULL` is FALSE and `TRUE OR NULL` is TRUE (SQL Kleene logic),
     not NULL — the difference between arrow `and`/`or` and `and_kleene`/`or_kleene`."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "a": pa.array([True, True, False, False, None, None, True, False], pa.bool_()),
@@ -183,8 +168,6 @@ def test_kleene_and_or_three_valued_logic(duck):
 def test_substr_zero_and_negative_start(duck):
     """SQL substring is 1-based; a start < 1 shrinks the result (out-of-range
     positions are clipped but still consume length), it does not shift the window."""
-    from conftest import assert_same
-
     t = pa.table({"s": ["abcdef", "hello", "x", ""]})
     duck.register("ss", t)
     out = (
@@ -214,8 +197,6 @@ def test_substr_zero_and_negative_start(duck):
 def test_cast_float_to_int_rounds_half_to_even(duck):
     """`CAST(float AS BIGINT)` rounds half-to-even like DuckDB (2.5→2, 3.5→4,
     2.7→3), not truncates toward zero like the raw arrow cast."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "f": [2.7, -2.7, 2.5, 3.5, 2.4, -2.5, 0.5],
@@ -229,8 +210,6 @@ def test_cast_float_to_int_rounds_half_to_even(duck):
 
 def test_is_in_and_between(duck):
     """`is_in`/`between` match SQL IN/BETWEEN, including NULL three-valued logic."""
-    from conftest import assert_same
-
     t = pa.table({"v": pa.array([1, 2, 3, 4, 5, None], pa.int64())})
     duck.register("ib", t)
     out = (
@@ -252,8 +231,6 @@ def test_jit_null_propagating_exprs_vs_duckdb(duck, nulls):
     """Projections/filters over nullable columns now take the JIT null-propagating
     path (arithmetic + comparison); the result must still match DuckDB exactly,
     nulls included."""
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(nulls)
         .select(
@@ -275,8 +252,6 @@ def test_jit_null_propagating_exprs_vs_duckdb(duck, nulls):
 
 def test_jit_null_filter_predicate_vs_duckdb(duck, nulls):
     """A filter whose predicate is null on null rows (excluded) over the JIT path."""
-    from conftest import assert_same
-
     out = bt.from_arrow(nulls).filter(col("v") > 8).collect()
     expected = duck.sql("SELECT * FROM t WHERE v > 8")
     assert_same(out, expected)

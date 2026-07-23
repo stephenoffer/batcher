@@ -17,7 +17,6 @@ from batcher.plan.logical import (
     Limit,
     Project,
     Projection,
-    Sort,
     SortKeySpec,
     Union,
 )
@@ -72,11 +71,9 @@ def test_all_rules_registered():
         "prune_empty_union_branch",
         "dedup_distinct_union_branches",
         "drop_distinct_in_distinct_union",
-        "eliminate_sort_in_distinct_union_branch",
         "push_project_through_union",
         "fold_distinct_union_all",
         "push_filter_through_distinct",
-        "eliminate_sort_before_distinct",
         "prune_distinct_of_empty",
     }
     assert expected <= set(_RULES)
@@ -209,31 +206,13 @@ def test_drop_branch_distinct_idempotent_nested():
     )
 
 
-# --- eliminate_sort_in_distinct_union_branch ----------------------------------
-
-
-def test_drop_branch_sort_under_distinct_union():
-    a, b, _c = _abc()
-    out = _apply(
-        "eliminate_sort_in_distinct_union_branch",
-        Union((Sort(a, _keys()), b), distinct=True),
-    )
-    assert not any(isinstance(i, Sort) for i in out.inputs)
-
-
-def test_branch_sort_refused_for_union_all():
-    a, b, _c = _abc()
-    plan = Union((Sort(a, _keys()), b), distinct=False)
-    assert _apply("eliminate_sort_in_distinct_union_branch", plan).to_ir() == plan.to_ir()
-
-
-def test_branch_sort_with_limit_kept():
-    a, b, _c = _abc()
-    plan = Union((Sort(a, _keys(), limit=2), b), distinct=True)  # top-N: which rows matters
-    assert _apply("eliminate_sort_in_distinct_union_branch", plan).to_ir() == plan.to_ir()
-    _assert_idempotent(
-        "eliminate_sort_in_distinct_union_branch", Union((Sort(a, _keys()), b), distinct=True)
-    )
+# `eliminate_sort_in_distinct_union_branch` and `eliminate_sort_before_distinct` were
+# removed, and their tests with them, because both rewrites were unsound: `Distinct` is
+# order-preserving here, so stripping the sort below it changed the observable row order
+# (and therefore which rows a downstream `limit` returned). The tests deleted alongside
+# them asserted the sort *was* stripped — they pinned the defect, so keeping them would
+# have blocked the fix. `tests/differential/test_diff_setops.py` now asserts the opposite,
+# order-sensitively.
 
 
 # --- push_project_through_union -----------------------------------------------
@@ -291,22 +270,6 @@ def test_push_filter_noop_without_distinct():
     plan = Filter(a, _pred())
     assert _apply("push_filter_through_distinct", plan).to_ir() == plan.to_ir()
     _assert_idempotent("push_filter_through_distinct", Filter(Distinct(a), _pred()))
-
-
-# --- eliminate_sort_before_distinct -------------------------------------------
-
-
-def test_eliminate_sort_before_distinct():
-    a, _b, _c = _abc()
-    out = _apply("eliminate_sort_before_distinct", Distinct(Sort(a, _keys())))
-    assert isinstance(out, Distinct) and not isinstance(out.input, Sort)
-
-
-def test_sort_before_distinct_with_limit_kept():
-    a, _b, _c = _abc()
-    plan = Distinct(Sort(a, _keys(), limit=2))
-    assert _apply("eliminate_sort_before_distinct", plan).to_ir() == plan.to_ir()
-    _assert_idempotent("eliminate_sort_before_distinct", Distinct(Sort(Sort(a, _keys()), _keys())))
 
 
 # --- prune_distinct_of_empty --------------------------------------------------

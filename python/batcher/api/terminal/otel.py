@@ -85,13 +85,25 @@ def _emit(tracer: object, profile: QueryProfile) -> None:
         for op in profile.ops:
             if op.measured:
                 _emit_op(tracer, op)
+        # On the distributed path the driver tree is unmeasured — the measured per-operator
+        # facts live in the worker map sub-plan (a separate op-id space). Emit those as child
+        # spans too, or a distributed query (the one whose operators matter most) would trace
+        # as a bare query span with no operator detail, unlike `render()` / `stats()` which
+        # both surface the worker ops.
+        for op in profile.worker_ops:
+            _emit_op(tracer, op, scope="worker")
 
 
-def _emit_op(tracer: object, op) -> None:
-    """One operator's measured facts as a child span."""
+def _emit_op(tracer: object, op, *, scope: str = "driver") -> None:
+    """One operator's measured facts as a child span.
+
+    `scope` distinguishes the driver-tree operators from the distributed map sub-plan's
+    worker operators (a separate op-id space), so a trace consumer can tell them apart.
+    """
     with tracer.start_as_current_span(f"batcher.op.{op.kind}") as span:  # type: ignore[attr-defined]
         span.set_attribute("batcher.op.id", op.op_id)
         span.set_attribute("batcher.op.kind", op.kind)
+        span.set_attribute("batcher.op.scope", scope)
         span.set_attribute("batcher.op.rows_in", op.rows_in)
         span.set_attribute("batcher.op.rows_out", op.rows_out)
         span.set_attribute("batcher.op.elapsed_ms", op.elapsed_ms)

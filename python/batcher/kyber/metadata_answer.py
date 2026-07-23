@@ -18,14 +18,15 @@ executes or measures.
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 from batcher.config import Config
-from batcher.kyber.learning import QUANTILES_KEY, load_learned_stats
-from batcher.kyber.optimizer import Optimizer
+from batcher.kyber.learning import QUANTILES_KEY, columns_for, load_learned_stats
+from batcher.kyber.optimizer import optimize_logical
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
-from batcher.plan.logical import Aggregate, LogicalPlan
+from batcher.plan.logical import Aggregate, LogicalPlan, Project
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "answer_n_unique",
     "answer_null_count",
     "approx_count_distinct",
+    "exact_null_count",
 ]
 
 
@@ -58,8 +60,13 @@ def _root_stats(
     run — the difference between answering from metadata and falling back to
     execution.
     """
-    optimizer = Optimizer(config=config, sources=sources, hub=hub, source_stats=source_stats)
-    rewritten = optimizer.logical_rewrite(plan)
+    # `optimize_logical` is the *memoized* form of this exact call. Constructing a fresh
+    # `Optimizer` and calling `logical_rewrite` directly bypassed the plan cache entirely, so
+    # every `.count()`, `.is_empty()`, `.min()` — and every `Facts` construction, which the
+    # shortcut layer builds per accessor — paid a full optimizer run, join-order search
+    # included. That flatly contradicted `shortcuts.facts`'s own claim that "a namespace that
+    # answers thirty questions about a dataset pays for the plan analysis once".
+    rewritten = optimize_logical(plan, config, sources, hub, source_stats)
     learned = load_learned_stats(hub) if hub is not None else {}
     estimator = StatsEstimator(sources, learned, source_stats=source_stats, exact_first=True)
     return rewritten, estimator.estimate(rewritten)
@@ -98,22 +105,37 @@ def answer_aggregate(
 ) -> dict[str, Any] | None:
     """The one-row result of a *global* aggregate, from metadata, or None.
 
-    Returns `{alias: value}` only when the plan's root is a keyless `Aggregate`
-    and **every** output aggregate is exactly derivable from the child's EXACT
-    column stats (e.g. `count(*)`, `min`/`max` over footer bounds,
-    `count_distinct` over an exact distinct count). If any output is not
-    derivable, returns None so the caller executes — a partial answer is never
-    returned.
+    Returns `{alias: value}` only when `plan` is a keyless `Aggregate` and **every** output
+    is exactly derivable from the child's EXACT column stats (e.g. `count(*)`, `min`/`max`
+    over footer bounds, `count_distinct` over an exact distinct count). If any output is not
+    derivable, returns None so the caller executes — a partial answer is never returned.
+
+    The *rewritten* root may be either the `Aggregate` itself or a `Project` of constants a
+    rule already folded it into; both are read the same way (see below).
     """
+    if not isinstance(plan, Aggregate) or plan.group_keys:
+        return None  # this answers a *global* aggregate; the caller's plan must be one
     rewritten, stats = _root_stats(plan, sources, source_stats, hub, config)
-    if not isinstance(rewritten, Aggregate) or rewritten.group_keys:
+
+    # The rewrite may have already answered the question. A rule that folds a keyless
+    # aggregate to constants reads the *same* EXACT statistics this path does, and leaves a
+    # `Project` of literals where the `Aggregate` was — so insisting the root still be an
+    # `Aggregate` would refuse to answer precisely the plans the optimizer understood best,
+    # and send them to the engine to re-derive a constant. Either shape is accepted; the
+    # answer is read from the root's column statistics in exactly the same way.
+    if isinstance(rewritten, Aggregate) and not rewritten.group_keys:
+        aliases = [spec.alias for spec in rewritten.aggregates]
+    elif isinstance(rewritten, Project):
+        aliases = [item.alias for item in rewritten.items]
+    else:
         return None
+
     answer: dict[str, Any] = {}
-    for spec in rewritten.aggregates:
-        col = stats.columns.get(spec.alias)
+    for alias in aliases:
+        col = stats.columns.get(alias)
         if col is None or col.provenance is not Provenance.EXACT:
             return None  # at least one output isn't exactly derivable → execute
-        answer[spec.alias] = col.min  # constant column: min == max == the value
+        answer[alias] = col.min  # constant column: min == max == the value
     return answer
 
 
@@ -149,6 +171,75 @@ def _exact_col(stats: RelStats, column: str) -> ColumnStat | None:
     return stat
 
 
+def _has_float_column(columns: set[str], sources: list) -> bool:
+    """Whether any of `columns` is a floating-point column in some source's schema."""
+    import pyarrow as pa
+
+    for src in sources:
+        try:
+            schema = src.schema()
+        except Exception:  # pragma: no cover - a source that cannot describe itself
+            continue
+        for name in columns:
+            idx = schema.get_field_index(name)
+            if idx >= 0 and pa.types.is_floating(schema.field(idx).type):
+                return True
+    return False
+
+
+def nan_aware_bounds(sources: list, source_stats: list | None) -> bool:
+    """Whether **every** source declares that its bounds rank NaN the way SQL does.
+
+    The one gate that decides whether a float column's upper bound (and anything derived
+    from it) may answer a query. A source sets `bounds_include_nan` only when it computed
+    its own bounds over the real values and recorded NaN as the maximum; a footer-derived
+    source cannot, and leaves it False. Unknown or missing statistics count as *not*
+    NaN-aware, so the safe answer is the default.
+    """
+    if source_stats is None or len(source_stats) != len(sources):
+        return False
+    return bool(sources) and all(
+        stat is not None and getattr(stat, "bounds_include_nan", False) for stat in source_stats
+    )
+
+
+def _bound_cannot_answer(column_or_expr: Any, sources: list, source_stats: list | None) -> bool:
+    """Whether a **`max`** over this column may NOT be answered from a stored bound.
+
+    A float bound is not a sound answer for `max` unless the source that produced it ranks
+    NaN the way SQL does — because the usual producers of a bound deliberately exclude NaN:
+
+    * the KLL quantile sketch drops NaN on `add` ("it has no place in an ordered sketch"),
+      which is right for quantiles and fatal for a bound; and
+    * the Parquet spec omits NaN from a column's min/max statistics.
+
+    But SQL's total order — the one our own `ORDER BY` uses — makes NaN the *greatest*
+    value, so `max(f)` over a column containing a NaN **is** NaN. Answering from such a
+    bound returns the largest non-NaN value instead, and the query silently disagrees with
+    what executing it would produce. The bound cannot represent the answer, and nothing in
+    the stats says whether a NaN was dropped, so the only sound move is to execute.
+
+    A source that computes its bounds itself (an immutable in-memory relation) *does* record
+    NaN as the max, and says so via `bounds_include_nan` — its float bound is then a sound
+    answer and this returns False. Everything else is gated.
+
+    `min` is deliberately **not** gated at all: because NaN is the greatest value, a dropped
+    NaN can never have been the minimum, so a float `min` bound is sound whatever produced
+    it. (An all-NaN column has no bound at all, so it falls through to execution rather than
+    answering wrongly.) Integers, strings, and temporals have no NaN and answer from metadata
+    for both.
+    """
+    from batcher.plan.expr_ir.walk import referenced_columns
+
+    if nan_aware_bounds(sources, source_stats):
+        return False
+    if isinstance(column_or_expr, str):
+        columns = {column_or_expr}
+    else:
+        columns = referenced_columns(column_or_expr)
+    return _has_float_column(columns, sources)
+
+
 def answer_min(
     column: str,
     plan: LogicalPlan,
@@ -181,9 +272,27 @@ def answer_max(
 
     Mirror of `answer_min`; None (execute) unless the upper bound is provably exact.
     """
+    if _bound_cannot_answer(column, sources, source_stats):
+        return None
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
     stat = _exact_col(stats, column)
     return None if stat is None else stat.max
+
+
+def exact_null_count(stats: RelStats, column: str) -> int | None:
+    """`column`'s null count iff it is provably exact, else None — the one gate for nulls.
+
+    Deliberately **not** `_exact_col`. That gate asks whether the column's whole statistics
+    bundle is EXACT, which is the right question for a *bound* and the wrong one for a null
+    count: a Parquet footer records the null count exactly for every type, but a string
+    column's min/max may be writer-truncated, so the bundle is DEFAULT and a bundle-gated
+    answer threw the exact null count away with the inexact bounds. `null_count_is_exact`
+    reads the null count's own provenance, so the two facts are trusted independently.
+    """
+    stat = stats.columns.get(column)
+    if stat is None or stat.null_count is None or not stat.null_count_is_exact:
+        return None
+    return int(stat.null_count)
 
 
 def answer_null_count(
@@ -196,14 +305,11 @@ def answer_null_count(
 ) -> int | None:
     """Exact null count of `column` (`count(*) - count(column)`) from metadata, or None.
 
-    Needs both an EXACT row count and an EXACT per-column null count (a Parquet/ORC
-    footer records the latter per row group). Any weaker input → None (execute).
+    Needs an EXACT per-column null count — which a Parquet/ORC footer records per row group,
+    for every column type. Any weaker input → None (execute).
     """
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
-    stat = _exact_col(stats, column)
-    if not stats.rows_exact or stat is None or stat.null_count is None:
-        return None
-    return int(stat.null_count)
+    return exact_null_count(stats, column)
 
 
 def answer_n_unique(
@@ -223,7 +329,10 @@ def answer_n_unique(
     """
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
     stat = _exact_col(stats, column)
-    if stat is None or stat.ndv is None:
+    # `_exact_col` vouches for the *bundle*; the ndv carries its own tag, because a Parquet
+    # column now holds a measured (SKETCH) distinct count alongside its exact bounds. Only an
+    # exact ndv may answer an exact `n_unique`.
+    if stat is None or stat.ndv is None or not stat.ndv_is_exact:
         return None
     return int(stat.ndv)
 
@@ -238,10 +347,8 @@ def answer_has_nulls(
 ) -> bool | None:
     """Whether `column` contains any null, from an EXACT null count, or None (execute)."""
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
-    stat = _exact_col(stats, column)
-    if stat is None or stat.null_count is None:
-        return None
-    return stat.null_count > 0
+    nulls = exact_null_count(stats, column)
+    return None if nulls is None else nulls > 0
 
 
 def answer_all_null(
@@ -258,16 +365,17 @@ def answer_all_null(
     relation is *not* reported all-null). Needs both counts EXACT; else None (execute).
     """
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
-    stat = _exact_col(stats, column)
-    if not stats.rows_exact or stat is None or stat.null_count is None:
+    nulls = exact_null_count(stats, column)
+    if not stats.rows_exact or nulls is None:
         return None
-    return stats.rows > 0 and int(stat.null_count) == int(stats.rows)
+    return stats.rows > 0 and nulls == int(stats.rows)
 
 
 def answer_learned_quantile(
     column: str,
     q: float,
     hub: MetadataHub | None = None,
+    source_key: str | None = None,
 ) -> float | None:
     """Approximate quantile `q` of `column` from the hub's learned quantile grid, or None.
 
@@ -275,9 +383,17 @@ def answer_learned_quantile(
     run measured (SKETCH/HISTOGRAM provenance), so it must only ever back an
     `approx_*` terminal, never an exact one. Returns None when no grid has been learned
     for `column` (the caller then streams an exact-ish sketch instead).
+
+    Resolved through `learning.columns_for`, like every other learned column map. Reading
+    `grid[column]` directly could never hit: a bare column name identifies nothing (two
+    tables both have an `id`), so `record_column_stats` qualifies every entry as
+    `source_key\\x1f column` and refuses to write a source it cannot key. An unqualified
+    lookup therefore missed 100% of the time and this shortcut always fell through to the
+    streaming TDigest. `columns_for` still honors the legacy unqualified shape, so a hub
+    persisted by an older build keeps resolving.
     """
     learned = load_learned_stats(hub) if hub is not None else {}
-    grid = learned.get(QUANTILES_KEY, {}).get(column)
+    grid = columns_for(learned, QUANTILES_KEY, source_key).get(column)
     if not grid:
         return None
     return _value_at_quantile(float(q), grid.get("probs", []), grid.get("values", []))
@@ -288,6 +404,11 @@ def _value_at_quantile(q: float, probs: list[float], values: list[float]) -> flo
     quantile boundaries — the inverse of the estimator's `_fraction_below`. None if the
     boundaries are unusable."""
     if len(probs) != len(values) or len(values) < 2:
+        return None
+    # The bracketing search below assumes an **ascending** grid; a corrupted or mis-merged
+    # learned grid would otherwise fall through it and interpolate nonsense rather than
+    # decline. This function only backs the `approx_*` terminals, so declining is free.
+    if any(b < a for a, b in itertools.pairwise(probs)):
         return None
     q = max(0.0, min(1.0, q))
     if q <= probs[0]:

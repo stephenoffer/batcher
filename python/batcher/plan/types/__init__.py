@@ -14,5 +14,15 @@ from __future__ import annotations
 from batcher.plan.types.infer import infer_type
 from batcher.plan.types.lattice import promote, widen
 from batcher.plan.types.registry import CAST_DTYPES, DTYPE_REGISTRY
+from batcher.plan.types.widths import DEFAULT_VARLEN_BYTES, column_bytes, schema_row_bytes
 
-__all__ = ["CAST_DTYPES", "DTYPE_REGISTRY", "infer_type", "promote", "widen"]
+__all__ = [
+    "CAST_DTYPES",
+    "DEFAULT_VARLEN_BYTES",
+    "DTYPE_REGISTRY",
+    "column_bytes",
+    "infer_type",
+    "promote",
+    "schema_row_bytes",
+    "widen",
+]

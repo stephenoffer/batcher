@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from batcher.ml.gpu import recommend_inference_dtype
@@ -19,6 +21,31 @@ def test_cpu_and_unknown_backends_keep_fp32(monkeypatch):
     monkeypatch.setattr("batcher.ml.gpu.detect_backend", lambda: "cpu")
     assert recommend_inference_dtype() is None
     assert recommend_inference_dtype("tpu") is None
+
+
+def test_cpu_backend_configures_silently(monkeypatch):
+    pytest.importorskip("torch")
+    monkeypatch.setattr("batcher.ml.gpu.detect_backend", lambda: "cpu")
+    # A genuine CPU environment must not warn — the fallback is expected there.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert "device" not in _pipeline_accel_kwargs()
+
+
+def test_misconfigured_accelerator_warns_instead_of_silent_cpu(monkeypatch):
+    from batcher._internal.errors import PerformanceWarning
+
+    pytest.importorskip("torch")
+    # An accelerator is *detected* but placing on it blows up (a broken driver / stale CUDA).
+    monkeypatch.setattr("batcher.ml.gpu.detect_backend", lambda: "cuda")
+
+    def _boom(_backend):
+        raise RuntimeError("CUDA driver version is insufficient")
+
+    monkeypatch.setattr("batcher.ml.gpu.torch_device", _boom)
+    with pytest.warns(PerformanceWarning, match="accelerator configuration failed"):
+        out = _pipeline_accel_kwargs()
+    assert out == {}  # falls back to CPU, but loudly
 
 
 @pytest.mark.parametrize(

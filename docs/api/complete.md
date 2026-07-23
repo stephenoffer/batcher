@@ -1,8 +1,6 @@
 # Complete reference
 
-Every public name in `batcher`, generated from the source docstrings — the
-exhaustive backstop behind the [quick reference](reference.md) and the
-example-first [area pages](index.md). Each top-level function links to its own page.
+This page lists every public name in `batcher`, rendered from the source docstrings. It's the exhaustive backstop behind the [quick reference](reference.md) and the example-first [area pages](index.md). Each top-level function links to its own page.
 
 ## Construction and I/O
 
@@ -17,20 +15,38 @@ register SQL functions or sessions.
    :nosignatures:
 
    from_pydict
+   from_dict
    from_pylist
+   from_dicts
+   from_records
    from_items
+   from_iter
    from_arrow
    from_batches
    from_numpy
    from_pandas
    from_polars
+   from_duckdb
    from_spark
    from_dask
    from_huggingface
    from_torch
    from_tf
    from_ray_dataset
+   from_any
    read
+   read_table
+   read_csv
+   read_parquet
+   read_json
+   read_ndjson
+   read_ipc
+   read_orc
+   read_avro
+   read_excel
+   read_delta
+   read_iceberg
+   read_database
    read_memory
    sql
    streams
@@ -38,7 +54,13 @@ register SQL functions or sessions.
    register_function
    udf
    compact
+   vacuum
    engine_version
+   versions
+   show_versions
+   start_ui
+   stop_ui
+   ui_url
 ```
 
 ## Expressions and columns
@@ -64,10 +86,7 @@ Reference and derive columns, build literals, and branch.
 
 ## Column selectors
 
-Stand for *every column matching a predicate* — pass one anywhere a column is
-expected (`ds.select(bt.numeric())`, `ds.with_columns(bt.floating().round(2))`) and it
-expands against the input schema. See the
-[transformations guide](../user-guide/transformations.md) for how they compose.
+A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the [transformations guide](../user-guide/transformations.md) for how they compose.
 
 ```{eval-rst}
 .. autosummary::
@@ -110,6 +129,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    greatest
    least
    atan2
+   arctan2
    hypot
    gcd
    lcm
@@ -117,6 +137,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    nanvl
    width_bucket
    concat
+   concat_str
    concat_ws
    format_string
    mask
@@ -134,10 +155,9 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    hash_rows
 ```
 
-## Horizontal (row-wise across columns) functions
+## Horizontal functions
 
-These reduce *across* the listed expressions within one row, rather than down a
-column. The vertical counterparts are the aggregates below.
+These reduce *across* the listed expressions within one row, rather than down a column. The vertical counterparts are the aggregates below.
 
 ```{eval-rst}
 .. autosummary::
@@ -148,8 +168,12 @@ column. The vertical counterparts are the aggregates below.
    max_horizontal
    sum_horizontal
    mean_horizontal
+   count_horizontal
+   product_horizontal
    all_horizontal
    any_horizontal
+   reduce_horizontal
+   fold_horizontal
 ```
 
 ## Aggregate and window functions
@@ -171,10 +195,54 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
    std
    var
    n_unique
+   product
+   mode
+   skewness
+   kurtosis
+   bool_and
+   bool_or
+   bit_and
+   bit_or
+   bit_xor
+   array_agg
+   quantile
+   approx_quantile
+   approx_median
+   approx_n_unique
+   histogram
    count_if
    corr
    covar_pop
    covar_samp
+   regr_slope
+   regr_intercept
+   regr_r2
+   regr_count
+   regr_avgx
+   regr_avgy
+   regr_sxx
+   regr_syy
+   regr_sxy
+   var_pop
+   stddev_pop
+   geometric_mean
+   harmonic_mean
+   rms
+   cv
+   sem
+   midrange
+   weighted_mean
+   q1
+   q3
+   iqr
+   value_range
+   null_rate
+   non_null_rate
+   nunique_ratio
+   first
+   last
+   arg_min
+   arg_max
    row_number
    rank
    dense_rank
@@ -199,6 +267,56 @@ Read and override the engine tunables. See the [configuration guide](configurati
 
    set_config
    config_context
+```
+
+```{eval-rst}
+.. autofunction:: batcher.config.active_config
+```
+
+### Options by name
+
+Address any tunable by its dotted path, in the style of `pandas.set_option` and
+`spark.conf.set`. See the [configuration guide](../configuration/index.md).
+
+```{eval-rst}
+.. autofunction:: batcher.config.get_option
+.. autofunction:: batcher.config.set_option
+.. autofunction:: batcher.config.reset_option
+.. autofunction:: batcher.config.option_context
+.. autofunction:: batcher.config.option_names
+.. autofunction:: batcher.config.describe_options
+```
+
+### Serialization
+
+```{eval-rst}
+.. autofunction:: batcher.config.config_to_dict
+.. autofunction:: batcher.config.env_var_names
+```
+
+### Logging and verbosity
+
+One-line switches over `ObservabilityConfig`. See
+[observability](../user-guide/observability.md).
+
+```{eval-rst}
+.. autofunction:: batcher.config.set_log_level
+.. autofunction:: batcher.config.enable_logging
+.. autofunction:: batcher.config.disable_logging
+.. autofunction:: batcher.config.set_verbosity
+.. autofunction:: batcher.config.set_progress
+.. autofunction:: batcher.config.get_logger
+```
+
+### Metrics export
+
+Process-wide counters as plain data, for Prometheus, OpenTelemetry, or a log line.
+
+```{eval-rst}
+.. autofunction:: batcher.observe.metrics_snapshot
+.. autofunction:: batcher.observe.prometheus_text
+.. autofunction:: batcher.observe.start_metrics
+.. autofunction:: batcher.observe.reset_metrics
 ```
 
 ## Dataset
@@ -251,8 +369,7 @@ Column-level lineage is reached from the dataset itself: :meth:`batcher.Dataset.
 
 ### Expression accessors
 
-The typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`,
-`.json`, `.map`, and — for multimodal columns — `.image`, `.audio`, and `.video`.
+These are the typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`, `.json`, and `.map`. Multimodal columns add `.image`, `.audio`, and `.video`.
 
 ```{eval-rst}
 .. autoclass:: batcher.plan.expr_ir.namespaces.strings._StrNamespace
@@ -329,6 +446,44 @@ and slowly-changing-dimension workflows.
    :member-order: bysource
 ```
 
+## Metadata shortcuts
+
+The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the [metadata shortcuts guide](../user-guide/metadata-shortcuts.md).
+
+```{eval-rst}
+.. autoclass:: batcher.api.dataset.meta.frame.DatasetMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.column.ColumnMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.checks.ColumnChecks
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.schema.SchemaMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.nulls.NullsMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.approx.ApproxMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.storage.StorageMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.pair.PairMeta
+   :members:
+   :member-order: bysource
+```
+
 ## SQL sessions
 
 ```{eval-rst}
@@ -384,5 +539,11 @@ for what each one does and when to change it.
    :members:
 
 .. autoclass:: batcher.MetadataConfig
+   :members:
+
+.. autoclass:: batcher.config.config.ObservabilityConfig
+   :members:
+
+.. autoclass:: batcher.config.config.ShuffleTlsConfig
    :members:
 ```

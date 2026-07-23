@@ -25,9 +25,11 @@ performance and scheduling, never correctness.
 
 from __future__ import annotations
 
+import math
 import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass
+from statistics import median
 
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
@@ -62,13 +64,6 @@ _MODEL_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, LearnedMe
 )
 
 
-def _median(xs: list[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    mid = n // 2
-    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
-
-
 @dataclass(frozen=True, slots=True)
 class LearnedMemoryModel:
     """Measured bytes-per-input-row per operator family, with plan-estimate blending.
@@ -90,6 +85,13 @@ class LearnedMemoryModel:
     # goes to disk, which is smaller than the total working-set `peak` the plan otherwise
     # shards on. Empty until a family has spilled enough times to fit.
     _spill_per_row: dict[str, float]
+    # The cardinality placeholder Kyber stamps on an operator it could not size
+    # (`optimizer.cardinality.unknown_rows`, ~1e12). `predicted_spill_bytes` must reject an
+    # `est_rows` at or above it rather than multiply a per-row figure by the sentinel.
+    # Defaults to 0.0 — "no sentinel supplied, so trust no estimate" — which makes a model
+    # built without it fall back to the caller's peak-based sizing, per this module's
+    # contract that anything unlearned defers to the plan estimate.
+    _unknown_rows: float = 0.0
 
     def bytes_per_row(self, kind: str) -> float | None:
         """Measured peak bytes per input row for `kind`'s family, or `None` if unlearned."""
@@ -100,20 +102,52 @@ class LearnedMemoryModel:
         spilled enough to fit. The size-general basis for predicting a plan's spill volume."""
         return self._spill_per_row.get(_canonical_kind(kind))
 
+    def _est_input_rows(self, op: object) -> float:
+        """The op's estimated row count: Kyber's own figure when usable, else recovered.
+
+        Kyber already publishes the exact estimate at `properties.est_rows` (`annotate.py`),
+        so prefer it. The fallback divides the peak-byte bound back out by `row_bytes`, which
+        is only correct when the plan sized that op with the *flat* default width — since
+        `annotate` moved to a byte-true `row_width`, inverting with the flat constant is off
+        by `row_width / row_bytes`, an order of magnitude on the wide payloads (blobs,
+        embeddings) `row_width` exists to model. It is kept solely for objects that carry
+        bounds but no properties (bare-sized test doubles, as in `plan_peak`).
+
+        Returns `0.0` for an operator Kyber could not size: `est_rows` at or above the
+        `unknown_rows` placeholder is a sentinel, not a count, and multiplying a per-row
+        figure by ~1e12 would swamp the total. A NaN `est_rows` is the field's *unset*
+        default (`PlanProperties`), not an estimate of zero, so it falls through to the
+        recovered figure rather than silently contributing nothing.
+        """
+        props = getattr(op, "properties", None)
+        rows = getattr(props, "est_rows", None) if props is not None else None
+        if rows is not None and not math.isnan(rows):
+            return float(rows) if 0.0 <= rows < self._unknown_rows else 0.0
+        # Recovering rows from the byte bound: divide by the width the plan actually sized
+        # with (`row_size`) when it published one, and only fall back to the flat
+        # `row_bytes` default when it did not — inverting a learned width with the flat
+        # constant is wrong by exactly their ratio.
+        width = getattr(props, "row_size", None) if props is not None else None
+        divisor = float(width) if width is not None and width == width and width > 0 else 0.0
+        if divisor <= 0.0:
+            divisor = float(self._row_bytes)
+        if divisor <= 0.0:
+            return 0.0
+        return op.bounds.m_max_bytes / divisor  # type: ignore[attr-defined]
+
     def predicted_spill_bytes(self, plan_ops: object) -> int:
         """Predicted total out-of-core spill volume for `plan_ops`, or `0` if unlearned.
 
         For each op with a learned spill-per-row, multiply by that op's estimated input rows
-        (recovered from its plan peak estimate ÷ the assumed row width) and sum. `0` when no
-        op's family has a spill history — the caller then keeps its peak-based sizing.
+        (`_est_input_rows`) and sum. `0` when no op's family has a spill history — the caller
+        then keeps its peak-based sizing.
         """
         total = 0.0
         for op in plan_ops:  # type: ignore[attr-defined]
             spr = self.spill_bytes_per_row(getattr(op, "kind", ""))
-            if spr is None or self._row_bytes <= 0:
+            if spr is None:
                 continue
-            est_rows = op.bounds.m_max_bytes / self._row_bytes
-            total += spr * est_rows
+            total += spr * self._est_input_rows(op)
         return int(total)
 
     def max_bytes_per_row(self, kinds: Iterable[str] | None = None) -> float | None:
@@ -214,14 +248,15 @@ def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
                 spill_samples.append(spill / basis)
         canon = _canonical_kind(kind)
         if len(samples) >= min_samples:
-            bpr[canon] = _median(samples)
+            bpr[canon] = median(samples)
         if len(spill_samples) >= min_samples:
-            spr[canon] = _median(spill_samples)
+            spr[canon] = median(spill_samples)
     return LearnedMemoryModel(
         _bytes_per_row=bpr,
         _alpha=opt.learning_smoothing_alpha,
         _clamp=max(1.0, opt.cost_calibration_clamp),
         _row_bytes=max(1, opt.row_bytes),
+        _unknown_rows=opt.cardinality.unknown_rows,
         _spill_per_row=spr,
     )
 
@@ -246,6 +281,7 @@ def learned_memory_model(
         opt.cost_calibration_min_samples,
         opt.cost_calibration_clamp,
         opt.row_bytes,
+        opt.cardinality.unknown_rows,
     )
     version = hub.version
     cached = _MODEL_CACHE.get(hub)
@@ -266,5 +302,6 @@ def _empty_model(cfg: Config) -> LearnedMemoryModel:
         _alpha=opt.learning_smoothing_alpha,
         _clamp=max(1.0, opt.cost_calibration_clamp),
         _row_bytes=max(1, opt.row_bytes),
+        _unknown_rows=opt.cardinality.unknown_rows,
         _spill_per_row={},
     )

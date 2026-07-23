@@ -21,6 +21,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListSimhash,
     ListSlice,
     ListTransform,
+    ListZip,
     MapFunc,
     StrFunc,
     StructField,
@@ -457,6 +458,310 @@ class _ListNamespace:
         """
         return ListSet("array_union", self._e, _wrap(other))
 
+    def add(self, other: Any) -> ListZip:
+        """Element-wise sum of this vector and ``other`` (→ List<Float64>).
+
+        The embedding-math primitive: combine two embedding columns, or add a bias
+        vector. Both must be the same length per row (a mismatch raises); a null element
+        on either side yields null at that position. A null list row yields a null row.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List<Float64> expression of the per-element sums.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1.0, 2.0]], "b": [[10.0, 20.0]]})
+                >>> ds.select(bt.col("a").list.add(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[11.0, 22.0]]}
+        """
+        return ListZip("list_add", self._e, _wrap(other))
+
+    def subtract(self, other: Any) -> ListZip:
+        """Element-wise difference ``this - other`` (→ List<Float64>).
+
+        Mean-center an embedding by subtracting a centroid, or take a difference vector.
+        Same length rules as :meth:`add`.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List<Float64> expression of the per-element differences.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[10.0, 20.0]], "b": [[1.0, 2.0]]})
+                >>> ds.select(bt.col("a").list.subtract(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[9.0, 18.0]]}
+        """
+        return ListZip("list_subtract", self._e, _wrap(other))
+
+    def multiply(self, other: Any) -> ListZip:
+        """Element-wise (Hadamard) product of this vector and ``other`` (→ List<Float64>).
+
+        Gate or weight an embedding per dimension (e.g. a learned feature mask). Same
+        length rules as :meth:`add`.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List<Float64> expression of the per-element products.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[2.0, 3.0]], "b": [[5.0, 10.0]]})
+                >>> ds.select(bt.col("a").list.multiply(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[10.0, 30.0]]}
+        """
+        return ListZip("list_multiply", self._e, _wrap(other))
+
+    # --- embedding / vector helpers -------------------------------------------------
+
+    def magnitude(self) -> ListFunc:
+        """Euclidean length of the vector — the ``l2_norm`` spelling used in ML code.
+
+        Returns:
+            A Float64 expression of the vector magnitude.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[3.0, 4.0]]})
+                >>> ds.select(r=bt.col("v").list.magnitude()).to_pydict()
+                {'r': [5.0]}
+        """
+        return self.l2_norm()
+
+    def is_unit_norm(self, tolerance: float = 1e-6) -> Expr:
+        """True where the vector's magnitude is 1 within `tolerance`.
+
+        Embedding pipelines normalize before a cosine/dot search; this asserts the
+        invariant held, catching an un-normalized batch before it silently skews
+        similarity scores.
+
+        Args:
+            tolerance: How far the magnitude may stray from 1.
+
+        Returns:
+            A Boolean expression, true for unit-length vectors.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[1.0, 0.0], [3.0, 4.0]]})
+                >>> ds.select(r=bt.col("v").list.is_unit_norm()).to_pydict()
+                {'r': [True, False]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        return (self.l2_norm() - Lit(1.0)).abs() < Lit(tolerance)
+
+    def euclidean_distance(self, other: Any) -> ListBinary:
+        """Straight-line distance between two vectors — the ``l2_distance`` spelling.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A Float64 expression of the Euclidean distance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]})
+                >>> ds.select(r=bt.col("a").list.euclidean_distance(bt.col("b"))).to_pydict()
+                {'r': [5.0]}
+        """
+        return self.l2_distance(other)
+
+    def angular_distance(self, other: Any) -> Expr:
+        """Normalized angle between two vectors, in ``[0, 1]`` — ``acos(cosine) / pi``.
+
+        Unlike ``1 - cosine_similarity``, this is a true metric (it satisfies the triangle
+        inequality), which is what nearest-neighbour indexes and clustering algorithms
+        need to stay correct.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A Float64 expression of the angular distance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1.0, 0.0]], "b": [[0.0, 1.0]]})
+                >>> ds.select(r=bt.col("a").list.angular_distance(bt.col("b"))).to_pydict()
+                {'r': [0.5]}
+        """
+        import math
+
+        from batcher.plan.expr_ir.core import Lit
+
+        return self.cosine_similarity(other).acos() / Lit(math.pi)
+
+    def dim(self) -> ListFunc:
+        """Number of components in the vector — the embedding dimension.
+
+        The named spelling of ``len`` for embedding columns; asserting it is uniform is
+        the first check when two models' outputs get mixed in one table.
+
+        Returns:
+            An Int64 expression of the vector dimension.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[3.0, 4.0]]})
+                >>> ds.select(r=bt.col("v").list.dim()).to_pydict()
+                {'r': [2]}
+        """
+        return self.len()
+
+    def is_zero_vector(self) -> Expr:
+        """True where every component is zero — the failed-embedding check.
+
+        A zero vector has no direction, so cosine similarity against it is undefined; a
+        batch of them usually means the encoder silently failed.
+
+        Returns:
+            A Boolean expression, true for all-zero vectors.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[3.0, 4.0], [0.0, 0.0]]})
+                >>> ds.select(r=bt.col("v").list.is_zero_vector()).to_pydict()
+                {'r': [False, True]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        return self.l2_norm() == Lit(0.0)
+
+    def sum_squares(self) -> ListBinary:
+        """Sum of squared components — the squared magnitude, ``dot(v, v)``.
+
+        Cheaper than :meth:`magnitude` when only relative distances matter, since it
+        skips the square root.
+
+        Returns:
+            A Float64 expression of the squared magnitude.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[3.0, 4.0]]})
+                >>> ds.select(r=bt.col("v").list.sum_squares()).to_pydict()
+                {'r': [25.0]}
+        """
+        return self.dot(self._e)
+
+    def mean_pool(self) -> ListFunc:
+        """Average of the components — mean pooling over a token-embedding sequence.
+
+        Returns:
+            A Float64 expression of the mean component.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[1.0, 3.0]]})
+                >>> ds.select(r=bt.col("v").list.mean_pool()).to_pydict()
+                {'r': [2.0]}
+        """
+        return self.mean()
+
+    def max_pool(self) -> ListFunc:
+        """Largest component — max pooling over a token-embedding sequence.
+
+        Returns:
+            An expression of the maximum component.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[1.0, 3.0]]})
+                >>> ds.select(r=bt.col("v").list.max_pool()).to_pydict()
+                {'r': [3.0]}
+        """
+        return self.max()
+
+    def set_union(self, other: Any) -> ListSet:
+        """Set union of the two lists — the Polars ``set_union`` spelling of :meth:`union`.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the combined distinct elements.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [[2, 3]]})
+                >>> ds.select(bt.col("a").list.set_union(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[1, 2, 3]]}
+        """
+        return self.union(other)
+
+    def set_intersection(self, other: Any) -> ListSet:
+        """Set intersection — the Polars ``set_intersection`` spelling of :meth:`intersect`.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the elements present in both lists.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
+                >>> ds.select(bt.col("a").list.set_intersection(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[2, 3]]}
+        """
+        return self.intersect(other)
+
+    def set_difference(self, other: Any) -> ListSet:
+        """Set difference — the Polars ``set_difference`` spelling of :meth:`difference`.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the elements in this list but not ``other``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
+                >>> ds.select(bt.col("a").list.set_difference(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[1]]}
+        """
+        return self.difference(other)
+
     def transform(self, func: Any) -> ListTransform:
         """Apply ``func`` to every element, preserving list lengths (→ List).
 
@@ -583,6 +888,28 @@ class _ListNamespace:
                 {'r': [[20, 30]]}
         """
         return ListSlice(self._e, offset, length)
+
+    def head(self, n: int = 5) -> ListSlice:
+        """Return the first ``n`` elements of each list — the leading sub-range.
+
+        A convenience for ``slice(0, n)`` (Polars ``list.head``): a null list stays null,
+        an empty or shorter list yields all it has.
+
+        Args:
+            n: How many leading elements to keep.
+
+        Returns:
+            A new List expression: the first ``n`` elements of each list.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[10, 20, 30, 40]]})
+                >>> ds.select(bt.col("a").list.head(2).alias("r")).to_pydict()
+                {'r': [[10, 20]]}
+        """
+        return ListSlice(self._e, 0, n)
 
     def join(self, separator: str) -> ListJoin:
         """Concatenate each list's elements into one string, joined by ``separator``.
@@ -740,6 +1067,52 @@ class _ListNamespace:
         """
         return ListBinary("l2_distance", self._e, _wrap(other))
 
+    def l1_distance(self, other: Any) -> ListBinary:
+        """Manhattan (L1) distance to another vector column (→ Float64).
+
+        The sum of absolute per-element differences ``Σ|aᵢ - bᵢ|`` — the metric some
+        embedding models and sparse features are trained under. Both vectors must have
+        the same length.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new Float64 expression: the Manhattan distance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]})
+                >>> ds.select(bt.col("a").list.l1_distance(bt.col("b")).alias("r")).to_pydict()
+                {'r': [7.0]}
+        """
+        return ListBinary("l1_distance", self._e, _wrap(other))
+
+    def hamming_distance(self, other: Any) -> ListBinary:
+        """Number of positions where two vectors differ (→ Float64).
+
+        The distance for **binary or quantized embeddings** (each element ``0``/``1`` or a
+        small integer), where it is far cheaper than a float metric and is what a binary
+        vector index ranks by. Both vectors must have the same length.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new Float64 expression: the count of differing positions.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 0, 1, 1]], "b": [[1, 1, 0, 1]]})
+                >>> ds.select(bt.col("a").list.hamming_distance(bt.col("b")).alias("r")).to_pydict()
+                {'r': [2.0]}
+        """
+        return ListBinary("hamming", self._e, _wrap(other))
+
 
 # Python accessor name → engine `ListFunc` wire tag.
 _LIST_FUNCS = {
@@ -758,8 +1131,14 @@ _LIST_FUNCS = {
     "median": "median",
     "arg_min": "arg_min",  # index of min element (→ Int64)
     "arg_max": "arg_max",  # index of max element (→ Int64)
+    "arg_sort": "arg_sort",  # indices that sort ascending (→ list of Int64)
     "l2_norm": "l2_norm",  # Euclidean norm = sqrt(sum of squares) (-> Float64)
+    "l1_norm": "l1_norm",  # Manhattan norm = sum of absolute values (-> Float64)
+    "max_abs": "max_abs",  # max absolute value = the MaxAbs-scaling divisor (-> Float64)
     "normalize": "normalize",  # L2-normalize to unit length (→ list); embedding prep
+    "softmax": "softmax",  # logits → probability distribution per row (→ list)
+    "cum_sum": "cum_sum",  # cumulative sum per row (→ list)
+    "diff": "diff",  # first difference xᵢ−xᵢ₋₁ per row, leading null (→ list)
 }
 
 

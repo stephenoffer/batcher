@@ -10,6 +10,7 @@ skippable one.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
@@ -218,9 +219,25 @@ def _flat_or_equalities(expr: Expr) -> tuple[str, list] | None:
         return None
     cols = {name for name, _ in leaves}
     values = [v for _, v in leaves]
-    if len(cols) != 1 or any(v is None or isinstance(v, bool) for v in values):
+    if len(cols) != 1 or any(_bad_range_literal(v) for v in values):
         return None
     return cols.pop(), values
+
+
+def _bad_range_literal(value: object) -> bool:
+    """Whether a literal cannot participate in a min/max range bound.
+
+    ``NULL`` and booleans are excluded (a range over them is meaningless), and so is
+    **NaN**: the engine's ``=`` matches a NaN row (``col = NaN`` is TRUE where ``col`` is
+    NaN), but ``NaN >= lo`` / ``NaN <= hi`` are both FALSE — so a range bound derived from a
+    disjunction containing ``col = NaN`` would drop the very NaN rows that disjunct keeps,
+    and Python's ``min``/``max`` over a list containing NaN is order-dependent garbage (a
+    leading NaN yields ``col >= NaN``, which rejects every row). Such a disjunction gets no
+    range bound at all — the original ``OR`` still selects exactly the right rows.
+    """
+    if value is None or isinstance(value, bool):
+        return True
+    return isinstance(value, float) and math.isnan(value)
 
 
 @rule(name="or_to_in_and_range", phase=Phase.NORMALIZE, matches=(Filter,))

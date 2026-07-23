@@ -18,19 +18,33 @@ from __future__ import annotations
 
 from batcher.kyber.rules.extra import adaptive_meta as _adaptive_meta  # noqa: F401
 from batcher.kyber.rules.extra import agg_extra as _agg_extra  # noqa: F401
+from batcher.kyber.rules.extra import agg_rules as _agg_rules  # noqa: F401
 from batcher.kyber.rules.extra import arith_algebra as _arith_algebra  # noqa: F401
+from batcher.kyber.rules.extra import arith_extra as _arith_extra  # noqa: F401
 from batcher.kyber.rules.extra import boolean_algebra as _boolean_algebra  # noqa: F401
+from batcher.kyber.rules.extra import casts as _casts  # noqa: F401
+from batcher.kyber.rules.extra import conditional as _conditional  # noqa: F401
+from batcher.kyber.rules.extra import cse as _cse  # noqa: F401
 from batcher.kyber.rules.extra import disjunction_infer as _disjunction_infer  # noqa: F401
 from batcher.kyber.rules.extra import empty_relation as _empty_relation  # noqa: F401
 from batcher.kyber.rules.extra import filter_split as _filter_split  # noqa: F401
+from batcher.kyber.rules.extra import join_elim as _join_elim  # noqa: F401
 from batcher.kyber.rules.extra import join_extra as _join_extra  # noqa: F401
+from batcher.kyber.rules.extra import limit_extra as _limit_extra  # noqa: F401
 from batcher.kyber.rules.extra import metadata_adaptive as _metadata_adaptive  # noqa: F401
+from batcher.kyber.rules.extra import nullability as _nullability  # noqa: F401
 from batcher.kyber.rules.extra import predicate_infer as _predicate_infer  # noqa: F401
 from batcher.kyber.rules.extra import projection_scan as _projection_scan  # noqa: F401
+from batcher.kyber.rules.extra import pushdown_gaps as _pushdown_gaps  # noqa: F401
+from batcher.kyber.rules.extra import runtime_filters as _runtime_filters  # noqa: F401
 from batcher.kyber.rules.extra import sargable as _sargable  # noqa: F401
 from batcher.kyber.rules.extra import setops as _setops  # noqa: F401
+from batcher.kyber.rules.extra import setops_extra as _setops_extra  # noqa: F401
+from batcher.kyber.rules.extra import strings as _strings  # noqa: F401
+from batcher.kyber.rules.extra import temporal_extra as _temporal_extra  # noqa: F401
 from batcher.kyber.rules.extra import temporal_sargable as _temporal_sargable  # noqa: F401
 from batcher.kyber.rules.extra import topn_limit as _topn_limit  # noqa: F401
+from batcher.kyber.rules.extra import window_extra as _window_extra  # noqa: F401
 from batcher.kyber.rules.extra import window_rules as _window_rules  # noqa: F401
 
 __all__: list[str] = []

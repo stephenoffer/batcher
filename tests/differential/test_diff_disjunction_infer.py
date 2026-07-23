@@ -16,6 +16,7 @@ import batcher as bt
 
 # Registers the @rule on import so the full optimizer applies it under `.collect()`.
 import batcher.kyber.rules.extra.disjunction_infer
+from _harness import assert_same
 from batcher import col
 
 
@@ -43,8 +44,6 @@ def _facts(duck):
 
 
 def test_two_column_dnf(duck):
-    from conftest import assert_same
-
     ds = _facts(duck).filter(
         ((col("a") == 1) & (col("b") == 2)) | ((col("a") == 3) & (col("b") == 4))
     )
@@ -55,8 +54,6 @@ def test_two_column_dnf(duck):
 
 
 def test_dnf_with_nulls_and_no_match(duck):
-    from conftest import assert_same
-
     # A pair that matches nothing plus a null-bearing column — the derived IN must not
     # admit a null row the disjunction rejects.
     ds = _facts(duck).filter(
@@ -69,8 +66,6 @@ def test_dnf_with_nulls_and_no_match(duck):
 
 
 def test_self_join_nation_pair_q7_shape(duck):
-    from conftest import assert_same
-
     # TPC-H Q7's core: the same dimension joined twice under aliases, with a
     # cross-alias disjunction. The derived `name IN (FRANCE, GERMANY)` on each side must
     # push through the alias rename onto that scan — the case that requires InList's

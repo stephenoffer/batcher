@@ -200,7 +200,7 @@ pub(crate) fn bounded_group_quantile(
         let mut fields: Vec<Field> = Vec::with_capacity(n_keys + 1);
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_keys + 1);
         for (i, gk) in group_keys.iter().enumerate() {
-            let a = gk.expr.eval(part)?;
+            let a = canon_float_key(&gk.expr.eval(part)?);
             fields.push(Field::new(format!("g{i}"), a.data_type().clone(), true));
             cols.push(a);
         }
@@ -364,15 +364,55 @@ pub(crate) fn bounded_group_quantile(
     Ok((group_columns, Arc::new(out.finish())))
 }
 
+/// Canonicalize a `Float64` group-key column so `-0.0`/`0.0` fold to one value and every
+/// NaN bit-pattern maps to one canonical quiet NaN — the same identity the in-memory
+/// `assign_groups` groups by (`bc_runtime::keys::canon_f64`). Any other column type (or a
+/// non-`Float64` key) is returned unchanged.
+///
+/// Without this the bounded out-of-core paths sort/boundary-detect on the raw
+/// `RowConverter` encoding, which maps `-0.0` and `0.0` to different bytes — so a
+/// GROUP BY on a float key holding both would return **two groups where the in-memory
+/// grace path (and DuckDB) return one**: a silent spill-only wrong answer. `bc-runtime`'s
+/// canonicalizer is `pub(crate)` there, so the identity is restated here for the one
+/// crate that cannot import it.
+pub(super) fn canon_float_key(arr: &ArrayRef) -> ArrayRef {
+    if arr.data_type() != &DataType::Float64 {
+        return arr.clone();
+    }
+    let a = arr.as_primitive::<Float64Type>();
+    let out: Float64Array = a
+        .iter()
+        .map(|opt| {
+            opt.map(|v| {
+                if v.is_nan() {
+                    f64::from_bits(0x7ff8_0000_0000_0000) // one canonical quiet NaN
+                } else if v == 0.0 {
+                    0.0 // fold -0.0 into +0.0
+                } else {
+                    v
+                }
+            })
+        })
+        .collect();
+    Arc::new(out)
+}
+
 /// Flatten `parts` to `(g0..gN, v)` rows with the value kept in its **native** type
 /// (so distinctness/equality is exact for any type — an `f64` cast would collide
 /// strings etc.). Returns the flattened batches and their shared schema, or a `None`
 /// schema when every input batch is empty. Shared by the bounded distinct and mode
 /// paths, which need the same native-value run.
+/// `canon_value` folds a `Float64` *value* column to canonical float identity
+/// (`-0.0`==`0.0`, one NaN) as well. `n_unique`, `mode`, and `histogram` all need this:
+/// each in-memory finalizer canonicalizes the value's float identity (`n_unique` via
+/// `assign_groups`; `mode`/`histogram` via `canonicalize_float_keys` in
+/// `bc_runtime::agg::median`), so the spilled path must fold identically or the same
+/// column yields a different mode/histogram/distinct-count under memory pressure.
 pub(super) fn flatten_native_value(
     parts: &[RecordBatch],
     group_keys: &[ProjectionItem],
     value_expr: &bc_expr::Expr,
+    canon_value: bool,
 ) -> Result<(Vec<RecordBatch>, Option<Arc<Schema>>), InterpError> {
     let n_keys = group_keys.len();
     let mut flat: Vec<RecordBatch> = Vec::with_capacity(parts.len());
@@ -384,11 +424,14 @@ pub(super) fn flatten_native_value(
         let mut fields: Vec<Field> = Vec::with_capacity(n_keys + 1);
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_keys + 1);
         for (i, gk) in group_keys.iter().enumerate() {
-            let a = gk.expr.eval(part)?;
+            let a = canon_float_key(&gk.expr.eval(part)?);
             fields.push(Field::new(format!("g{i}"), a.data_type().clone(), true));
             cols.push(a);
         }
-        let v = value_expr.eval(part)?;
+        let mut v = value_expr.eval(part)?;
+        if canon_value {
+            v = canon_float_key(&v);
+        }
         fields.push(Field::new("v", v.data_type().clone(), true));
         cols.push(v);
         let s = Arc::new(Schema::new(fields));
@@ -433,7 +476,9 @@ pub(crate) fn bounded_group_distinct(
 ) -> Result<(Vec<ArrayRef>, ArrayRef), InterpError> {
     let n_keys = group_keys.len();
 
-    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr)?;
+    // `canon_value = true`: fold a float value's `-0.0`/`0.0`/NaN so distinctness matches
+    // the in-memory `assign_groups`-based dedup (which canonicalizes floats).
+    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr, true)?;
     let Some(schema) = schema else {
         return Ok((Vec::new(), Arc::new(Int64Array::from(Vec::<i64>::new()))));
     };
@@ -551,7 +596,10 @@ pub(crate) fn bounded_group_mode(
         None => DataType::Null,
     };
 
-    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr)?;
+    // `canon_value = true`: the in-memory `finalize_mode` canonicalizes float leaves
+    // (`bc_runtime::agg::median::finalize_mode`), so the spill path must fold `-0.0`/`0.0`
+    // and every NaN identically — else `mode` over `[-0.0, -0.0, 0.0]` differs under spill.
+    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr, true)?;
     let Some(schema) = schema else {
         return Ok((Vec::new(), new_empty_array(&value_type)));
     };
@@ -683,4 +731,139 @@ pub(super) fn empty_key_columns(schema: &Schema, n_keys: usize) -> Vec<ArrayRef>
     (0..n_keys)
         .map(|c| arrow::array::new_empty_array(schema.field(c).data_type()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+    use bc_runtime::agg::spill::SpillCodec;
+
+    /// Build a `(k: Float64, v: Int64)` batch for the float-group-key tests.
+    fn fbatch(ks: &[f64], vs: &[i64]) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Float64, true),
+            Field::new("v", DataType::Int64, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(ks.to_vec())),
+                Arc::new(Int64Array::from(vs.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn gk() -> Vec<ProjectionItem> {
+        vec![ProjectionItem {
+            expr: bc_expr::Expr::Col { name: "k".into() },
+            alias: "k".into(),
+        }]
+    }
+
+    fn vexpr() -> bc_expr::Expr {
+        bc_expr::Expr::Col { name: "v".into() }
+    }
+
+    /// A GROUP BY on a `Float64` key holding both `-0.0` and `0.0` is ONE group under
+    /// SQL/DuckDB semantics (and the in-memory `assign_groups`, which canonicalizes
+    /// float keys). The bounded out-of-core paths sort/boundary-detect on the raw
+    /// (`RowConverter`, total-order) key, which encodes `-0.0` and `0.0` differently —
+    /// so without canonicalization they split one group into two: a silent spill-only
+    /// wrong answer.
+    #[test]
+    fn neg_zero_and_zero_are_one_group_quantile() {
+        let parts = vec![fbatch(&[-0.0, 0.0, -0.0, 0.0], &[1, 3, 5, 7])];
+        let dir = std::env::temp_dir().join(format!("bc_negzero_q_{}", std::process::id()));
+        let (gc, _qc) =
+            bounded_group_quantile(&parts, &gk(), &vexpr(), 0.5, &dir, SpillCodec::None).unwrap();
+        assert_eq!(gc[0].len(), 1, "-0.0 and 0.0 must be one group");
+    }
+
+    #[test]
+    fn neg_zero_and_zero_are_one_group_distinct() {
+        let parts = vec![fbatch(&[-0.0, 0.0, -0.0, 0.0], &[1, 3, 5, 7])];
+        let dir = std::env::temp_dir().join(format!("bc_negzero_d_{}", std::process::id()));
+        let (gc, cc) =
+            bounded_group_distinct(&parts, &gk(), &vexpr(), &dir, SpillCodec::None).unwrap();
+        assert_eq!(gc[0].len(), 1, "-0.0 and 0.0 must be one group");
+        // 4 distinct values {1,3,5,7} all in the single group.
+        let cc = cc.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(cc.value(0), 4);
+    }
+
+    /// `n_unique` on a `Float64` **value** column must fold `-0.0`/`0.0` to one distinct
+    /// value — the in-memory `distinct_pairs_to_list` routes a non-int value through
+    /// `assign_groups`, which canonicalizes floats. The spill path deduped the raw
+    /// `RowConverter` encoding (`-0.0` != `0.0`), over-counting under memory pressure.
+    #[test]
+    fn distinct_value_folds_signed_zero() {
+        // One group (k=1.0), float values {-0.0, 0.0, 5.0} → 2 distinct ({0.0, 5.0}).
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Float64, true),
+            Field::new("v", DataType::Float64, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(vec![1.0, 1.0, 1.0])),
+                Arc::new(Float64Array::from(vec![-0.0, 0.0, 5.0])),
+            ],
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_distinct_negz_{}", std::process::id()));
+        let (_gc, cc) =
+            bounded_group_distinct(&[batch], &gk(), &vexpr(), &dir, SpillCodec::None).unwrap();
+        let cc = cc.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(cc.value(0), 2, "-0.0 and 0.0 are one distinct value");
+    }
+
+    /// All NaN bit-patterns are one group (matching `canon_f64`/DuckDB). A single NaN
+    /// column is degenerate but this pins the contract.
+    #[test]
+    fn nan_keys_are_one_group_quantile() {
+        let nan = f64::NAN;
+        let parts = vec![fbatch(&[nan, nan, nan], &[1, 2, 3])];
+        let dir = std::env::temp_dir().join(format!("bc_nan_q_{}", std::process::id()));
+        let (gc, _qc) =
+            bounded_group_quantile(&parts, &gk(), &vexpr(), 0.5, &dir, SpillCodec::None).unwrap();
+        assert_eq!(gc[0].len(), 1, "all NaN keys must be one group");
+    }
+
+    /// `mode` over a `Float64` **value** column must fold `-0.0`/`0.0` to one value — the
+    /// in-memory `finalize_mode` canonicalizes float leaves. The spill path once passed
+    /// `canon_value = false`, so `mode([-0.0, -0.0, 0.0])` returned `-0.0` (a spurious
+    /// 2-vs-1 split) under memory pressure while the in-memory answer is `0.0` (count 3):
+    /// a silent spill-only wrong answer that violates single-node==spilled.
+    #[test]
+    fn mode_value_folds_signed_zero() {
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(Float64Array::from(vec![-0.0, -0.0, 0.0])),
+            ],
+        )
+        .unwrap();
+        let gk = vec![ProjectionItem {
+            expr: bc_expr::Expr::Col { name: "k".into() },
+            alias: "k".into(),
+        }];
+        let dir = std::env::temp_dir().join(format!("bc_mode_negz_{}", std::process::id()));
+        let (_gc, mc) =
+            bounded_group_mode(&[batch], &gk, &vexpr(), &dir, SpillCodec::None).unwrap();
+        let mc = mc.as_any().downcast_ref::<Float64Array>().unwrap();
+        // Canonical representative of the single folded value is `+0.0`.
+        assert_eq!(
+            mc.value(0).to_bits(),
+            0.0_f64.to_bits(),
+            "mode folds signed zero"
+        );
+    }
 }

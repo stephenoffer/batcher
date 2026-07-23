@@ -7,9 +7,9 @@ their first argument so they can recurse via `tr.statement` / `tr._scalar`.
 
 from __future__ import annotations
 
-from batcher._sql.parser.core_utils import _has_aggregate
+from batcher._sql.parser.core_utils import _has_aggregate, _join_and, _split_and
 from batcher.api.dataset import Dataset
-from batcher.plan.expr_ir import lit
+from batcher.plan.expr_ir import col, lit
 
 
 def _apply_subquery_predicates(tr, ds: Dataset, pred):
@@ -31,13 +31,30 @@ def _apply_subquery_predicates(tr, ds: Dataset, pred):
     """
     from sqlglot import expressions as exp
 
-    # Split a conjunction into its leaf predicates so each can be inspected.
-    if isinstance(pred, exp.And):
-        ds, left = _apply_subquery_predicates(tr, ds, pred.this)
-        ds, right = _apply_subquery_predicates(tr, ds, pred.expression)
-        if left is not None and right is not None:
-            return ds, exp.And(this=left, expression=right)
-        return ds, (left if left is not None else right)
+    from batcher._sql.parser.subquery_neq import _fuse_correlated_neq
+
+    # Flatten the top conjunction so leaves can be co-optimized (two correlated `<>`
+    # EXISTS over the same base table fuse into one group-by + join) before each
+    # remaining leaf is folded individually.
+    leaves = _split_and(pred)
+    handled: set[int] = set()
+    if len(leaves) >= 2:
+        ds, handled = _fuse_correlated_neq(tr, ds, leaves)
+
+    residual = None
+    for i, leaf in enumerate(leaves):
+        if i in handled:
+            continue
+        ds, r = _apply_single_predicate(tr, ds, leaf)
+        if r is not None:
+            residual = r if residual is None else exp.And(this=residual, expression=r)
+    return ds, residual
+
+
+def _apply_single_predicate(tr, ds: Dataset, pred):
+    """Fold one WHERE leaf: an IN/EXISTS subquery becomes a join (no residual);
+    anything else is returned unchanged as a residual for a normal ``filter``."""
+    from sqlglot import expressions as exp
 
     # A bare IN-subquery / EXISTS predicate becomes a join (no residual).
     if _is_in_subquery(pred):
@@ -92,8 +109,10 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     # A plain column, or a row value `(a, b, …)` — a multi-column IN → multi-key semi-join.
     if _is_plain_column(target):
         left_keys = [target.name]
-    elif isinstance(target, exp.Tuple) and target.expressions and all(
-        _is_plain_column(e) for e in target.expressions
+    elif (
+        isinstance(target, exp.Tuple)
+        and target.expressions
+        and all(_is_plain_column(e) for e in target.expressions)
     ):
         left_keys = [e.name for e in target.expressions]
     else:
@@ -115,12 +134,12 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         inner_ds = tr.statement(inner_select)
         if len(inner_ds.columns) != len(left_keys):
             raise NotImplementedError("IN subquery must project one column per left-hand column")
-        return ds.join(
-            inner_ds.distinct(),
-            left_on=left_keys,
-            right_on=list(inner_ds.columns[: len(left_keys)]),
-            how=how,
-        )
+        right_keys = list(inner_ds.columns[: len(left_keys)])
+        # `x NOT IN (S)` needs SQL three-valued logic, not a plain anti-join (the
+        # classic NOT-IN bug — see `_not_in_antijoin`). Handle single-key exactly.
+        if negate and len(left_keys) == 1:
+            return _not_in_antijoin(ds, left_keys[0], inner_ds, right_keys[0])
+        return ds.join(inner_ds.distinct(), left_on=left_keys, right_on=right_keys, how=how)
 
     # Correlated IN: semi/anti join on (target = projected) AND the correlation
     # equalities, with local predicates applied to the inner relation.
@@ -131,8 +150,16 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         raise NotImplementedError("correlated IN subquery must project one column")
     in_col = inner_select.expressions[0]
     inner_select.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
-    inner_select.set("group", None)
     inner_select.set("expressions", [in_col, *(exp.column(ic) for (_oc, ic) in corr)])
+    # A correlated IN whose projection aggregates (`sal IN (SELECT max(sal) …
+    # WHERE e2.dept = e.dept)`) is a per-correlation-key aggregate: it must GROUP
+    # BY the inner correlation columns, exactly as the scalar decorrelation does.
+    # Without the GROUP BY the query mixes an aggregate with a bare key column and
+    # errors ("references unknown column(s) ['dept']").
+    if _has_aggregate(in_col):
+        inner_select.set("group", exp.Group(expressions=[exp.column(ic) for (_oc, ic) in corr]))
+    else:
+        inner_select.set("group", None)
     _reject_correlated(inner_select)
     inner_ds = tr.statement(inner_select).distinct()
     return ds.join(
@@ -141,6 +168,25 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         right_on=[inner_ds.columns[0], *(ic for (_oc, ic) in corr)],
         how=how,
     )
+
+
+def _not_in_antijoin(ds: Dataset, left_key: str, inner_ds: Dataset, right_key: str) -> Dataset:
+    """`x NOT IN (uncorrelated subquery)` with correct SQL three-valued semantics.
+
+    A plain anti-join is wrong three ways: an **empty** set makes NOT IN TRUE for
+    every row (even NULL ``x``); a **NULL** anywhere in the set makes it UNKNOWN for
+    all rows (none survive); otherwise a NULL ``x`` against a non-empty set is UNKNOWN
+    and must drop (anti-join keeps it). NULL/emptiness are probed eagerly (uncorrelated,
+    like the EXISTS path); the row-volume anti-join stays lazy.
+    """
+    key_only = inner_ds.select(right_key)
+    if key_only.filter(col(right_key).is_null()).limit(1).collect().num_rows > 0:
+        return ds.filter(lit(False))  # a NULL in the set → NOT IN is never TRUE
+    if key_only.filter(col(right_key).is_not_null()).limit(1).collect().num_rows == 0:
+        return ds  # empty set → NOT IN is TRUE for all rows (NULL x included)
+    # Non-empty, NULL-free set: drop NULL outer keys, then anti-join the rest.
+    ds = ds.filter(col(left_key).is_not_null())
+    return ds.join(key_only.distinct(), left_on=[left_key], right_on=[right_key], how="anti")
 
 
 def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
@@ -176,6 +222,18 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         keep = non_empty if not negate else (not non_empty)
         return ds if keep else ds.filter(lit(False))
 
+    # A single correlated `<>` residual (`inner.c <> outer.c`) is not an equi-join and not
+    # local — it correlates on a value, not a key. It decorrelates to a per-key min/max
+    # bound test (`min(c) <> outer.c OR max(c) <> outer.c`), a group-by + join + filter that
+    # runs single-node, streaming, and distributed — no row id. Two such subqueries over the
+    # same base table fuse into one pass upstream in `_apply_subquery_predicates`. TPC-H q21
+    # is exactly this shape. See `subquery_neq`.
+    from batcher._sql.parser.subquery_neq import _decorrelate_neq_single, _parse_neq_exists
+
+    spec = _parse_neq_exists(tr, node)
+    if spec is not None:
+        return _decorrelate_neq_single(tr, ds, spec, negate)
+
     # Correlated → semi/anti join on the correlation keys, with the local
     # (non-correlated) predicates applied to the inner relation.
     inner.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
@@ -192,33 +250,6 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     )
 
 
-def _split_and(pred) -> list:
-    """Flatten a conjunction into its leaf predicates."""
-    from sqlglot import expressions as exp
-
-    out: list = []
-    stack = [pred]
-    while stack:
-        p = stack.pop()
-        if isinstance(p, exp.And):
-            stack.extend((p.this, p.expression))
-        elif isinstance(p, exp.Paren):
-            stack.append(p.this)
-        else:
-            out.append(p)
-    return out
-
-
-def _join_and(preds):
-    """Re-combine leaf predicates into a single AND chain."""
-    from sqlglot import expressions as exp
-
-    out = preds[0]
-    for p in preds[1:]:
-        out = exp.And(this=out, expression=p)
-    return out
-
-
 def _local_tables(select_node) -> set[str]:
     """Table names + aliases introduced by this SELECT's own FROM/JOINs."""
     from sqlglot import expressions as exp
@@ -231,9 +262,15 @@ def _local_tables(select_node) -> set[str]:
     sources += [j.this for j in select_node.args.get("joins", []) or []]
     for t in sources:
         if isinstance(t, exp.Table):
-            local.add(t.name)
+            # An aliased table is referenceable only by its alias — SQL scoping
+            # shadows the base name. Adding the base name of an *inner* aliased
+            # table (`FROM emp e2`) would misclassify an outer reference that
+            # happens to use that base name (`emp.dept`, an unaliased outer `emp`)
+            # as local, so the correlation is missed and every group counts all rows.
             if t.alias:
                 local.add(t.alias)
+            else:
+                local.add(t.name)
     return local
 
 
@@ -413,60 +450,6 @@ def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> D
             else:
                 sub.replace(exp.column(alias))
     return ds
-
-
-def _rewrite_self_joins(tr, select_node) -> None:
-    """Rewrite a self-join so the alias-blind column resolver sees distinct columns.
-
-    The translator resolves a column by name only, so two aliases of one table
-    (``nation n1, nation n2``) would collapse onto the same physical columns. Each
-    aliased instance of a table that appears more than once in this SELECT's FROM is
-    wrapped in a subquery that renames its columns to flat ``alias__col`` names, and
-    every ``alias.col`` reference in this scope is rewritten to match — so downstream
-    translation sees uniquely-named, unqualified columns. A duplicated table whose
-    columns can't be enumerated (an unknown name) is rejected rather than mis-answered.
-    """
-    from sqlglot import expressions as exp
-
-    from_ = select_node.args.get("from") or select_node.args.get("from_")
-    if from_ is None:
-        return
-    sources = [from_.this, *(j.this for j in select_node.args.get("joins", []) or [])]
-    names = [t.name for t in sources if isinstance(t, exp.Table)]
-    dups = {n for n in names if names.count(n) > 1}
-    if not dups:
-        return
-
-    alias_map: dict[str, dict[str, str]] = {}
-    for t in sources:
-        if isinstance(t, exp.Table) and t.name in dups:
-            if t.name not in tr._registry:
-                raise NotImplementedError(
-                    f"self-join on {t.name!r} is not supported (its columns can't be "
-                    f"enumerated to disambiguate the aliases)"
-                )
-            alias = t.alias or t.name
-            cols = list(tr._registry[t.name].columns)
-            flat = {c: f"{alias}__{c}" for c in cols}
-            alias_map[alias] = flat
-            inner = exp.Select(expressions=[exp.alias_(exp.column(c), flat[c]) for c in cols])
-            inner = inner.from_(exp.table_(t.name))
-            t.replace(exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias))))
-
-    # Preserve output names: a bare `alias.col` projected directly would otherwise be
-    # named `alias__col` instead of `col`.
-    for p in list(select_node.expressions):
-        if isinstance(p, exp.Column) and p.table in alias_map and p.name in alias_map[p.table]:
-            p.replace(exp.alias_(exp.column(alias_map[p.table][p.name]), p.name))
-
-    # Flatten every remaining `alias.col` reference in this SELECT's own scope.
-    for c in list(select_node.find_all(exp.Column)):
-        if (
-            c.table in alias_map
-            and c.name in alias_map[c.table]
-            and c.find_ancestor(exp.Select) is select_node
-        ):
-            c.replace(exp.column(alias_map[c.table][c.name]))
 
 
 def _is_plain_column(node) -> bool:

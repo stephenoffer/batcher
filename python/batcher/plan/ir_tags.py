@@ -83,6 +83,7 @@ class ExprTag:
     LIST_CONTAINS: Final = "list_contains"
     LIST_POSITION: Final = "list_position"
     LIST_SET: Final = "list_set"
+    LIST_ZIP: Final = "list_zip"
     LIST_TRANSFORM: Final = "list_transform"
     LIST_FILTER: Final = "list_filter"
     LIST_SLICE: Final = "list_slice"
@@ -109,3 +110,7 @@ WINDOW_VALUE: Final = (
     frozenset({"first_value", "last_value", "lag", "lead", "nth_value"}) | WINDOW_FILL
 )
 WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE
+# Functions that honour an explicit frame: the reducing aggregates, plus the
+# positional value functions that pick the frame's first/last/nth row. `lag`/`lead`
+# and the fills carry no frame (theirs is fixed by their own offset / nullness).
+WINDOW_FRAMEABLE: Final = WINDOW_AGGREGATES | frozenset({"first_value", "last_value", "nth_value"})

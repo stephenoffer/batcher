@@ -134,7 +134,6 @@ expression API). Hold it to a higher bar:
 
 ## Gate before "done"
 
-`just lint-py` (ruff check + format) clean, `just lint-layers` green, and — if you
-touched the public API — `just lint-docstrings` clean and `just docs` green. Full type
-hints on touched public code, no new duplication or dead code. Then the test gate
-in `.claude/rules/testing.md`.
+The canonical gate matrix is in `CLAUDE.md` — run the rows your change touches. Quality
+delta: full type hints on touched public code, and no new duplication or dead code —
+neither is fully mechanical, so check them yourself.

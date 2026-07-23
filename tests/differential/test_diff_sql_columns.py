@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -39,8 +40,6 @@ def wide(duck):
     ],
 )
 def test_columns_matches_duckdb(duck, wide, query):
-    from conftest import assert_same
-
     out = bt.sql(query, t=wide).collect()
     duck_table = duck.sql(query).to_arrow_table()
     # COLUMNS keeps each matched source column's name, in schema order.

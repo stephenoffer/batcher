@@ -32,21 +32,175 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
-/// Split `batches` into morsels bounded by `target`'s row and byte limits.
+/// Split `batches` into morsels bounded by `target`'s row and byte limits, coalescing
+/// a run of undersized batches into one morsel first.
 ///
-/// Rows are preserved exactly (same multiset, same order); only the batch
-/// boundaries change. Empty batches pass through unchanged.
+/// Rows are preserved exactly (same multiset, same order); only the batch boundaries
+/// change. Empty batches pass through unchanged.
+///
+/// Two failure modes of a source's own batching are corrected here so the parallel
+/// scheduler always sees well-sized morsels:
+///   * **Too large** — an over-target batch is split into row/byte-bounded morsels.
+///   * **Too small** — a run of under-target batches (a streaming reader, a highly
+///     selective upstream, a fine-grained shuffle emitting thousands of tiny batches)
+///     is concatenated up to the target before splitting. Without this, each tiny
+///     batch becomes its own morsel — one poorly-parallelized task, and one partial
+///     state to merge, *per batch* — which measured ~19x slower on a high-cardinality
+///     group-by fed 256-row batches than the same rows in morsel-sized batches.
+///
+/// A batch that already fills a morsel is never buffered: it splits (if over) or passes
+/// through, both zero-copy — so well-sized input pays nothing (no concat, no byte walk).
 pub(crate) fn morselize(
     batches: &[RecordBatch],
     target: bc_arrow::MorselTarget,
 ) -> Vec<RecordBatch> {
-    // At least one morsel per input batch (splitting only ever adds more) — pre-size to
-    // that floor so the common already-small-enough case allocates the backing store once.
     let mut out = Vec::with_capacity(batches.len());
+    // A run of consecutive undersized batches, held until it reaches the target (or a
+    // full/empty batch forces a flush) and then merged into one morsel.
+    let mut pending: Vec<RecordBatch> = Vec::new();
+    let mut pending_rows = 0usize;
+    let mut pending_bytes = 0usize;
     for b in batches {
-        split_batch(&mut out, b, target);
+        let n = b.num_rows();
+        if n == 0 {
+            // Preserve the historical empty-batch passthrough; flush first so order holds.
+            flush_coalesced(
+                &mut out,
+                &mut pending,
+                &mut pending_rows,
+                &mut pending_bytes,
+                target,
+            );
+            out.push(b.clone());
+            continue;
+        }
+        if batch_stands_alone(b, n, target) {
+            flush_coalesced(
+                &mut out,
+                &mut pending,
+                &mut pending_rows,
+                &mut pending_bytes,
+                target,
+            );
+            split_batch(&mut out, b, target);
+            continue;
+        }
+        pending.push(b.clone());
+        pending_rows += n;
+        if target.byte_bounded() {
+            pending_bytes += sliced_batch_bytes(b);
+        }
+        if pending_rows >= target.rows || (target.byte_bounded() && pending_bytes >= target.bytes) {
+            flush_coalesced(
+                &mut out,
+                &mut pending,
+                &mut pending_rows,
+                &mut pending_bytes,
+                target,
+            );
+        }
     }
+    flush_coalesced(
+        &mut out,
+        &mut pending,
+        &mut pending_rows,
+        &mut pending_bytes,
+        target,
+    );
     out
+}
+
+/// Whether `b` is already a well-sized morsel on its own — so it passes straight through
+/// (splitting if it overshoots) rather than being buffered to coalesce with its neighbours.
+///
+/// "Well-sized" is **at least half** the target (rows, or — when byte-bounded — bytes), not
+/// the full target. Coalescing only pays when it turns many *tiny* batches into one morsel;
+/// concatenating a batch that is already a healthy fraction of a morsel copies its whole
+/// payload to gain nothing. The motivating regression: an 88%-selective filter emits
+/// ~14 k-row batches from 16 k-row morsels; at the full-target threshold every one was below
+/// it, so the whole filtered relation was concatenated and re-split — a full extra copy
+/// (~2.4x slower on a broad filter). Half-target lets those near-full batches through
+/// untouched while still coalescing a fine-grained source's genuinely small batches (the
+/// 256-row-batch pathology is `1/64` of the target, far under the line). The row check
+/// short-circuits the byte walk on the common fast path.
+fn batch_stands_alone(b: &RecordBatch, n: usize, target: bc_arrow::MorselTarget) -> bool {
+    n.saturating_mul(2) >= target.rows
+        || (target.byte_bounded() && sliced_batch_bytes(b).saturating_mul(2) >= target.bytes)
+}
+
+/// Emit the buffered undersized run: concatenate it into one contiguous batch and split
+/// that to the target (the merged batch may slightly overshoot, so it still gets bounded).
+/// A single buffered batch needs no concat. On a concat error — impossible for the
+/// schema-identical batches of one source, but handled rather than panicked on a data
+/// path — each buffered batch is emitted on its own.
+fn flush_coalesced(
+    out: &mut Vec<RecordBatch>,
+    pending: &mut Vec<RecordBatch>,
+    pending_rows: &mut usize,
+    pending_bytes: &mut usize,
+    target: bc_arrow::MorselTarget,
+) {
+    match pending.len() {
+        0 => {}
+        1 => split_batch(out, &pending[0], target),
+        _ => match arrow::compute::concat_batches(&pending[0].schema(), pending.iter()) {
+            Ok(merged) => split_batch(out, &merged, target),
+            Err(_) => {
+                for b in pending.iter() {
+                    split_batch(out, b, target);
+                }
+            }
+        },
+    }
+    pending.clear();
+    *pending_rows = 0;
+    *pending_bytes = 0;
+}
+
+/// Parallel [`morselize`] for the scan: split each input batch across rayon, preserving
+/// order. Byte-bounded splitting of a variable-width (string/list) column reads that
+/// column's offsets for every row ([`split_batch`]'s per-row-cost path) — an O(rows) walk
+/// the sequential `morselize` runs on **one** core. On a wide, string-heavy table that walk
+/// is the scan's dominant cost (measured ~450 ms and `cpu≈1 core` splitting 60 M rows of
+/// TPC-H `lineitem` for a `SELECT *` — the whole rest of the query is faster than it). The
+/// split of one batch is independent of every other, so fanning it across cores is a pure
+/// scheduling win: `batches.len()` was already the parallelism the downstream operators use.
+///
+/// Correctness: when no batch needs **coalescing** (every batch already stands alone as a
+/// morsel), `morselize` reduces to "split each batch, in order" with no cross-batch state —
+/// exactly what the parallel map computes, so the morsels are byte-for-byte identical. The
+/// coalescing path (a fine-grained source's undersized batches merged across boundaries) is
+/// inherently sequential, so if *any* batch is undersized this falls back to `morselize`.
+/// Row-only targets never walk offsets, so they gain nothing here and take the cheap
+/// sequential path too.
+pub(crate) fn morselize_par(
+    batches: &[RecordBatch],
+    target: bc_arrow::MorselTarget,
+) -> Vec<RecordBatch> {
+    use rayon::prelude::*;
+    // Parallelizing only pays for a byte-bounded target (the offset walk) with enough
+    // batches to fan out; and only the no-coalescing case is order-independent.
+    let worth_parallel = target.byte_bounded()
+        && batches.len() > 1
+        && batches
+            .iter()
+            .all(|b| b.num_rows() == 0 || batch_stands_alone(b, b.num_rows(), target));
+    if !worth_parallel {
+        return morselize(batches, target);
+    }
+    batches
+        .par_iter()
+        .map(|b| {
+            let mut out = Vec::new();
+            if b.num_rows() == 0 {
+                out.push(b.clone());
+            } else {
+                split_batch(&mut out, b, target);
+            }
+            out
+        })
+        .flatten()
+        .collect()
 }
 
 /// Re-bound already-produced morsels after a width-changing operator.
@@ -67,7 +221,10 @@ pub(crate) fn remorselize(
     if !target.byte_bounded() {
         return batches;
     }
-    morselize(&batches, target)
+    // Same parallel split as the scan: a wide join/aggregate output (14 GB of TPC-H
+    // `lineitem` for a `SELECT *` join) is re-split here, and the per-row byte walk over its
+    // string columns is the same single-threaded O(rows) cost `morselize_par` fans across cores.
+    morselize_par(&batches, target)
 }
 
 /// Emit the morsels for one batch into `out`.
@@ -133,7 +290,7 @@ fn split_batch(out: &mut Vec<RecordBatch>, b: &RecordBatch, target: bc_arrow::Mo
 /// contribute `width × rows`; string/binary columns their slice's data span (last minus first
 /// offset) plus the offset slots; other variable-width columns fall back to the memory-size
 /// over-count (which only makes the byte guard more conservative for those rarer types).
-fn sliced_batch_bytes(b: &RecordBatch) -> usize {
+pub(crate) fn sliced_batch_bytes(b: &RecordBatch) -> usize {
     b.columns().iter().map(sliced_column_bytes).sum()
 }
 
@@ -479,6 +636,140 @@ mod tests {
         let out = morselize(&[b], bc_arrow::MorselTarget::rows(16_384));
         assert_eq!(out.len(), 1, "row-only target must not byte-split");
         assert_eq!(total_rows(&out), 3);
+    }
+
+    /// A run of many tiny batches is coalesced into full morsels — the fix for the
+    /// per-batch-task pathology on fine-grained sources. Rows are preserved and every
+    /// morsel (bar the trailing remainder) reaches the row target.
+    #[test]
+    fn tiny_batches_are_coalesced_to_the_target() {
+        let tiny: Vec<RecordBatch> = (0..500).map(|_| int_batch(64)).collect(); // 64 rows each
+        let target = bc_arrow::MorselTarget::rows(16_384);
+        let out = morselize(&tiny, target);
+        assert_eq!(total_rows(&out), 500 * 64, "rows preserved");
+        assert!(
+            out.len() < 500 / 10,
+            "coalesced to far fewer morsels than input batches, got {}",
+            out.len()
+        );
+        // Every full morsel is at the target; only the last may be a smaller remainder.
+        for m in &out[..out.len() - 1] {
+            assert_eq!(m.num_rows(), 16_384);
+        }
+    }
+
+    /// Coalescing preserves row order across the run (the concatenation is in order).
+    #[test]
+    fn coalescing_preserves_row_order() {
+        // Three tiny batches of distinct value ranges, in order.
+        let mk = |lo: i64, hi: i64| {
+            let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+            let arr = Arc::new(Int64Array::from((lo..hi).collect::<Vec<_>>())) as ArrayRef;
+            RecordBatch::try_new(schema, vec![arr]).unwrap()
+        };
+        let batches = vec![mk(0, 100), mk(100, 250), mk(250, 300)];
+        let out = morselize(&batches, bc_arrow::MorselTarget::rows(16_384));
+        let stitched: Vec<i64> = out
+            .iter()
+            .flat_map(|m| {
+                let a = m.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(stitched, (0..300).collect::<Vec<_>>(), "order preserved");
+    }
+
+    /// An already-full batch is never buffered/copied: a run of morsel-sized batches
+    /// passes through as the same Arc-backed batches (zero coalescing on the fast path).
+    #[test]
+    fn full_batches_pass_through_without_coalescing() {
+        let full: Vec<RecordBatch> = (0..3).map(|_| int_batch(16_384)).collect();
+        let target = bc_arrow::MorselTarget::rows(16_384);
+        let out = morselize(&full, target);
+        assert_eq!(out.len(), 3, "each full batch stays its own morsel");
+        for (a, b) in out.iter().zip(full.iter()) {
+            assert_eq!(a.num_rows(), b.num_rows());
+        }
+    }
+
+    /// Near-full batches (an 88%-selective filter's output) stand alone: they pass through
+    /// as their own morsels with no concat/re-split copy — the fix for the broad-filter
+    /// regression. Each ~14 k-row batch is above the half-target line, so none is buffered.
+    #[test]
+    fn near_full_batches_are_not_coalesced() {
+        let nearly: Vec<RecordBatch> = (0..8).map(|_| int_batch(14_400)).collect();
+        let target = bc_arrow::MorselTarget::rows(16_384);
+        let out = morselize(&nearly, target);
+        assert_eq!(
+            out.len(),
+            8,
+            "each near-full batch stays its own morsel, no coalescing"
+        );
+        assert_eq!(total_rows(&out), 8 * 14_400, "rows preserved");
+        for m in &out {
+            assert_eq!(
+                m.num_rows(),
+                14_400,
+                "batches passed through unchanged (no re-split)"
+            );
+        }
+    }
+
+    /// `morselize_par` must produce byte-for-byte the same morsels as `morselize` on every
+    /// shape — it only changes *which core* splits each batch, never the boundaries. Covers
+    /// the parallel fast path (full wide string batches, byte-bounded) and the fall-throughs
+    /// (row-only target, undersized/coalescing batches, empties).
+    #[test]
+    fn morselize_par_matches_sequential() {
+        let long = "z".repeat(300); // wide enough to trip the per-row byte walk
+        let wide: Vec<RecordBatch> = (0..40)
+            .map(|_| str_batch(&[long.as_str(); 8_000]))
+            .collect();
+        let cases: Vec<(Vec<RecordBatch>, bc_arrow::MorselTarget)> = vec![
+            // Parallel fast path: many full wide batches, byte-bounded.
+            (wide.clone(), bc_arrow::MorselTarget::new(16_384, 64 * 1024)),
+            // Row-only target: falls back to sequential (identity split).
+            (wide, bc_arrow::MorselTarget::rows(16_384)),
+            // Undersized batches: coalescing path, must fall back to sequential.
+            (
+                (0..50).map(|_| int_batch(64)).collect(),
+                bc_arrow::MorselTarget::new(16_384, 1 << 20),
+            ),
+            // Mixed with an empty batch interleaved.
+            (
+                vec![str_batch(&["a", "b"]), str_batch(&[]), int_batch(20_000)],
+                bc_arrow::MorselTarget::new(16_384, 1 << 20),
+            ),
+        ];
+        for (batches, target) in cases {
+            let seq = morselize(&batches, target);
+            let par = morselize_par(&batches, target);
+            assert_eq!(par.len(), seq.len(), "morsel count differs");
+            for (p, s) in par.iter().zip(&seq) {
+                assert_eq!(p.num_rows(), s.num_rows(), "morsel row count differs");
+            }
+            assert_eq!(total_rows(&par), total_rows(&seq), "total rows differ");
+        }
+    }
+
+    /// A tiny run followed by a big batch: the run flushes before the big one splits,
+    /// so global row order holds across the boundary.
+    #[test]
+    fn tiny_run_then_large_batch_keeps_order() {
+        let mk = |lo: i64, hi: i64| {
+            let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+            let arr = Arc::new(Int64Array::from((lo..hi).collect::<Vec<_>>())) as ArrayRef;
+            RecordBatch::try_new(schema, vec![arr]).unwrap()
+        };
+        let batches = vec![mk(0, 50), mk(50, 100), mk(100, 100_000)];
+        let out = morselize(&batches, bc_arrow::MorselTarget::rows(16_384));
+        assert_eq!(total_rows(&out), 100_000);
+        let first = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(first.value(0), 0, "the tiny run leads");
     }
 
     /// `remorselize` is a no-op in row-only mode and re-splits over-budget output

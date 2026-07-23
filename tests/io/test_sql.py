@@ -82,14 +82,24 @@ def test_apply_predicate_appends_where() -> None:
 
 
 def test_identity_does_not_require_backend() -> None:
-    assert ADBCSource(driver="d", db_kwargs={}, table="t").identity() == "adbc:d:t"
-    assert ConnectorXSource("SELECT 1", "mysql://h/db").identity() == "connectorx:SELECT 1"
-    assert SnowflakeSource("SELECT 1", {"account": "a"}).identity() == "snowflake:SELECT 1"
+    # Every identity carries a fingerprint of the connection between the backend and the
+    # relation, so the same query against two databases is two relations rather than one
+    # shared learned-statistics key. Empty `db_kwargs` has nothing to fingerprint: "-".
+    #
+    # The digests are pinned as literals on purpose. They are `sha256` of the identifying
+    # connection kwargs, so they are stable across processes and releases; a literal that
+    # starts failing means the fingerprint input or algorithm moved, which silently orphans
+    # every statistic already stored under the old key.
+    assert ADBCSource(driver="d", db_kwargs={}, table="t").identity() == "adbc:d:-:t"
     assert ClickHouseSource("SELECT 1", host="h").identity() == "clickhouse:h:SELECT 1"
-    assert ODBCSource("SELECT 1", dsn="d").identity() == "odbc:d:SELECT 1"
+    assert ODBCSource("SELECT 1", dsn="d").identity() == "odbc:40bc07689471:SELECT 1"
     assert BigQuerySource(project="p", table="d.s.t").identity() == "bigquery:p:d.s.t"
+    cx = ConnectorXSource("SELECT 1", "mysql://h/db")
+    assert cx.identity() == "connectorx:26b4553410e9:SELECT 1"
+    sf = SnowflakeSource("SELECT 1", {"account": "a"})
+    assert sf.identity() == "snowflake:4eaba920a72e:SELECT 1"
     dbx = DatabricksSource(table="c.s.t", workspace="w", token="x")
-    assert dbx.identity() == "databricks:c.s.t"
+    assert dbx.identity() == "databricks:d4315541e735:c.s.t"
 
 
 def test_construction_validation() -> None:
@@ -179,7 +189,7 @@ def test_adbc_single_query_submission(monkeypatch) -> None:
     def _fake_connect(driver, db_kwargs, conn_kwargs):
         return _SpyConn(log)
 
-    monkeypatch.setattr("batcher.io.formats.sql.adbc._connect", _fake_connect)
+    monkeypatch.setattr("batcher.io.formats.sql.adbc.source._connect", _fake_connect)
     src = ADBCSource(driver="d", db_kwargs={}, query="SELECT * FROM t")
     rows = pa.Table.from_batches(src.read())
     assert rows.num_rows == 2
@@ -195,7 +205,7 @@ def test_adbc_flightsql_partitions_single_submission(monkeypatch) -> None:
     def _fake_connect(driver, db_kwargs, conn_kwargs):
         return _SpyConn(log)
 
-    monkeypatch.setattr("batcher.io.formats.sql.adbc._connect", _fake_connect)
+    monkeypatch.setattr("batcher.io.formats.sql.adbc.source._connect", _fake_connect)
     src = ADBCSource(driver="d", db_kwargs={}, query="SELECT 1", partition=True)
     splits = src.splits()
     assert len(splits) == 2

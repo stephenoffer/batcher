@@ -199,14 +199,14 @@ class _StubLlm:
 
 def test_chat_false_uses_the_completion_endpoint():
     llm = _StubLlm()
-    texts, _ = _generate_routed(llm, None, ["hi"], {None: None})
+    texts, _usage, _reasons = _generate_routed(llm, None, ["hi"], {None: None})
     assert texts == ["completion"]
     assert llm.chat_calls == []
 
 
 def test_chat_true_routes_through_the_chat_template():
     llm = _StubLlm()
-    texts, _ = _generate_routed(llm, None, ["hi"], {None: None}, chat=True)
+    texts, _usage, _reasons = _generate_routed(llm, None, ["hi"], {None: None}, chat=True)
     assert texts == ["chat"]
     assert llm.generate_calls == []
     assert llm.chat_calls == [[[{"role": "user", "content": "hi"}]]]
@@ -224,10 +224,15 @@ def test_chat_prepends_the_system_turn():
 def test_chat_preserves_order_across_lora_groups():
     llm = _StubLlm()
     prompts = [{"prompt": "a", "adapter": "x"}, {"prompt": "b"}, {"prompt": "c", "adapter": "x"}]
-    texts, usage = _generate_routed(llm, None, prompts, {None: "BASE", "x": "LX"}, chat=True)
+    texts, usage, _reasons = _generate_routed(
+        llm, None, prompts, {None: "BASE", "x": "LX"}, chat=True
+    )
     assert texts == ["chat", "chat", "chat"]
     assert len(usage) == 3
-    assert len(llm.chat_calls) == 2  # one call per adapter group
+    # The stub accepts a per-prompt adapter list, so all three rows co-batch into a
+    # single scheduler step instead of one call per adapter group.
+    assert len(llm.chat_calls) == 1
+    assert len(llm.chat_calls[0]) == 3
 
 
 def test_chat_messages_rejects_a_vision_request():

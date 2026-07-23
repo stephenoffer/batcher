@@ -7,7 +7,32 @@ general two-argument form (DuckDB/Spark ``log(base, x)``).
 
 from __future__ import annotations
 
+from batcher.plan.expr_ir import atan2
 from batcher.plan.expr_ir.core import Binary, Expr, IntoExpr, Math2Expr, MathExpr, _wrap
+
+
+def arctan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
+    """Two-argument arctangent — the NumPy/Polars ``arctan2`` spelling of :func:`atan2`.
+
+    The angle in radians of the point ``(x, y)`` from the positive x-axis, using both
+    signs to place it in the correct quadrant (unlike a plain ``arctan(y / x)``).
+
+    Args:
+        y: The ordinate (numerator).
+        x: The abscissa (denominator).
+
+    Returns:
+        A Float64 expression of the angle in radians, in ``(-pi, pi]``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"y": [1.0], "x": [1.0]})
+            >>> ds.select(a=bt.arctan2(bt.col("y"), bt.col("x")).round(4)).to_pydict()
+            {'a': [0.7854]}
+    """
+    return atan2(y, x)
 
 
 def log(base: IntoExpr, value: IntoExpr) -> Expr:

@@ -2,7 +2,7 @@
 
 Each query is the standard TPC-H statement with the validation-default substitution
 parameters, written once as SQL and fanned across every SQL-capable engine. Columns
-follow the canonical ``l_``/``o_``/... names that ``sources.py`` renames the public
+follow the canonical ``l_``/``o_``/... names that ``sources`` renames the public
 parquet to; dates are compared as timestamps (``sources`` normalizes date columns to
 ``timestamp[us]`` for cross-engine parity).
 """

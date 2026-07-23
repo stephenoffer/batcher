@@ -55,6 +55,40 @@ class OpStat:
             return float("nan")
         return self.rows_out / self.est_rows
 
+    def to_dict(self) -> dict[str, object]:
+        """This operator's measurements as a flat, JSON-encodable dict.
+
+        Includes the derived `selectivity` and `est_error` alongside the raw fields, so a
+        metrics pipeline gets the interpreted numbers without re-deriving them.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3]}).filter(bt.col("a") > 1)
+                >>> _ = ds.collect()
+                >>> sorted(ds.stats().ops[0].to_dict())[:3]
+                ['backend', 'cpu_util', 'elapsed_ms']
+
+        Returns:
+            A dict of this operator's fields plus `selectivity` and `est_error`.
+        """
+        return {
+            "op_id": self.op_id,
+            "kind": self.kind,
+            "rows_in": self.rows_in,
+            "rows_out": self.rows_out,
+            "elapsed_ms": self.elapsed_ms,
+            "result_bytes": self.result_bytes,
+            "spilled": self.spilled,
+            "backend": self.backend,
+            "est_rows": self.est_rows,
+            "provenance": self.provenance,
+            "cpu_util": self.cpu_util,
+            "selectivity": self.selectivity,
+            "est_error": self.est_error,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class RunStats:
@@ -106,6 +140,157 @@ class RunStats:
     def spilled(self) -> bool:
         """Whether any operator spilled to disk during the run."""
         return any(o.spilled for o in self.ops)
+
+    @property
+    def spill_count(self) -> int:
+        """How many operators spilled to disk — the memory-pressure headline number."""
+        return sum(1 for o in self.ops if o.spilled)
+
+    @property
+    def rows_in(self) -> int:
+        """Rows read by the scan operators, i.e. how much data the run actually touched."""
+        return sum(o.rows_in for o in self.ops if o.kind == "scan")
+
+    @property
+    def rows_out(self) -> int:
+        """Rows the run produced — the same number `len()` on the collected result gives."""
+        return self.rows
+
+    @property
+    def peak_memory_bytes(self) -> int:
+        """The largest single operator output, the best available proxy for peak memory.
+
+        The engine measures each operator's *output* size, not its working set, so this is
+        a lower bound on true peak memory rather than a measurement of it. Read `spilled`
+        for the authoritative signal that memory was actually tight.
+        """
+        return max((o.result_bytes for o in self.ops), default=0)
+
+    def summary(self) -> str:
+        """A three-line digest: wall time, rows, memory, and the bottleneck call.
+
+        What to print when you want the shape of a run without the full per-operator
+        table. `str(stats)` gives the table; this gives the headline.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3]}).filter(bt.col("a") > 1)
+                >>> _ = ds.collect()
+                >>> ds.stats().summary().splitlines()[0].startswith("wall time:")
+                True
+
+        Returns:
+            A short multi-line summary, ready to print or log.
+        """
+        spill = f", {self.spill_count} operator(s) spilled" if self.spill_count else ""
+        return "\n".join(
+            [
+                f"wall time: {self.total_ms:.2f} ms across {len(self.ops)} operator(s)",
+                f"rows: {self.rows_in:,} read -> {self.rows_out:,} out"
+                f", peak output {self.peak_memory_bytes / 1e6:.1f} MB{spill}",
+                self.bottleneck_summary(),
+            ]
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """The whole run as a JSON-encodable dict, totals plus a list of per-operator dicts.
+
+        The export format: hand it to `json.dumps`, push the totals to Prometheus, or ship
+        it as a job artifact. Nothing here is a Batcher type, so no consumer needs to
+        import Batcher to read it.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3]}).filter(bt.col("a") > 1)
+                >>> _ = ds.collect()
+                >>> sorted(ds.stats().to_dict())[:4]
+                ['bottleneck', 'ops', 'peak_memory_bytes', 'rows_in']
+
+        Returns:
+            A dict of run totals, with the per-operator detail under ``"ops"``.
+        """
+        bottleneck = self.bottleneck
+        return {
+            "total_ms": self.total_ms,
+            "rows_in": self.rows_in,
+            "rows_out": self.rows_out,
+            "peak_memory_bytes": self.peak_memory_bytes,
+            "spilled": self.spilled,
+            "spill_count": self.spill_count,
+            "bottleneck": bottleneck.kind if bottleneck is not None else None,
+            "ops": [o.to_dict() for o in self.ops],
+        }
+
+    def to_pandas(self) -> object:
+        """The per-operator table as a `pandas.DataFrame`, one row per operator.
+
+        For sorting, filtering, and plotting a profile interactively. Requires `pandas`;
+        use `to_dict` if you would rather not add the dependency.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3]}).filter(bt.col("a") > 1)
+                >>> _ = ds.collect()
+                >>> list(ds.stats().to_pandas().columns)[:2]
+                ['op_id', 'kind']
+
+        Returns:
+            A DataFrame whose columns are the `OpStat` fields plus the derived ones.
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            msg = "RunStats.to_pandas() needs pandas — install it, or use to_dict() instead"
+            raise ImportError(msg) from exc
+        return pd.DataFrame([o.to_dict() for o in self.ops])
+
+    def __repr__(self) -> str:
+        """The formatted table, so a bare `ds.stats()` in a REPL shows the profile."""
+        return self.__str__()
+
+    def _repr_html_(self) -> str:
+        """Render the per-operator table as HTML for Jupyter and friends.
+
+        Notebooks call this automatically, so `ds.stats()` in a cell renders a real table
+        instead of a monospace blob. Spilled operators are flagged in their own column so
+        memory pressure is visible at a glance.
+        """
+        head = "".join(
+            f"<th style='text-align:right;padding:2px 8px'>{c}</th>"
+            for c in ("op", "kind", "rows in", "rows out", "ms", "out KB", "backend", "spill")
+        )
+        rows = []
+        for o in self.ops:
+            cells = (
+                o.op_id,
+                o.kind,
+                f"{o.rows_in:,}",
+                f"{o.rows_out:,}",
+                f"{o.elapsed_ms:.2f}",
+                f"{o.result_bytes // 1024:,}",
+                o.backend,
+                "yes" if o.spilled else "",
+            )
+            rows.append(
+                "<tr>"
+                + "".join(f"<td style='text-align:right;padding:2px 8px'>{c}</td>" for c in cells)
+                + "</tr>"
+            )
+        caption = self.summary().replace("\n", "<br>")
+        return (
+            "<table style='border-collapse:collapse;font-family:monospace;font-size:90%'>"
+            f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+            f"<p style='font-family:monospace;font-size:85%'>{caption}</p>"
+        )
 
     def bottleneck_summary(self) -> str:
         """One line naming the dominant operator and whether the run is I/O- or

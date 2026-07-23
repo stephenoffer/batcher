@@ -1,12 +1,32 @@
 # Errors
 
-Batcher raises typed exceptions so failures are specific and actionable. These
-types live in `batcher._internal.errors`. That module is internal: there is no
-public `batcher.exceptions` module to import from, and the names are not part of
-the stable public API. You catch these errors by type when they surface, but you
-do not construct them yourself.
+Batcher raises typed exceptions so failures are specific and actionable. They're reachable straight from the top level, so `except bt.BatcherError` works without importing anything else:
 
-In practice you handle them with `try` / `except`, usually catching the base type.
+```{eval-rst}
+.. currentmodule:: batcher
+
+.. autoexception:: BatcherError
+.. autoexception:: PlanError
+.. autoexception:: ColumnNotFoundError
+.. autoexception:: ConfigError
+.. autoexception:: MissingDependencyError
+.. autoexception:: AccessDeniedError
+.. autoexception:: ExecutionError
+.. autoexception:: OptimizationError
+.. autoexception:: CompileError
+.. autoexception:: ResourceError
+.. autoexception:: IOError
+.. autoexception:: FormatError
+.. autoexception:: CommitError
+.. autoexception:: SchemaError
+.. autoexception:: DataQualityError
+.. autoexception:: BackendError
+.. autoexception:: TransportError
+```
+
+`BatcherError` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: `PlanError`, `ConfigError`, and `DataQualityError` are each a `ValueError`; `ColumnNotFoundError` is a `KeyError` and carries the missing `.column`; `MissingDependencyError` is an `ImportError` and carries the `.install` hint for the extra to install; `AccessDeniedError` is a `PermissionError`.
+
+In practice you handle them with `try` and `except`, usually catching the base type.
 
 ```python
 import batcher as bt
@@ -39,8 +59,7 @@ can catch a specific type when you want to react differently.
 | `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
 | `FormatError`, `BackendError`, `CommitError`, `TransportError` | Lower-level IO, backend, write-commit, and shuffle failures. |
 
-`PlanError` is the one most user code encounters, because it is raised eagerly
-when you build an invalid plan rather than when you execute it.
+`PlanError` is the one most user code encounters, because it's raised eagerly when you build an invalid plan rather than when you execute it.
 
 ## Catching errors
 
@@ -49,17 +68,18 @@ inspect the message, or to import the base type from its internal location if yo
 need to branch on it.
 
 ```python
-from batcher._internal.errors import BatcherError
+import batcher as bt
+
+ds = bt.from_pydict({"a": [1, 2, 3]})
 
 try:
     ds.select(bt.col("missing")).to_pydict()
-except BatcherError as exc:
+except bt.BatcherError as exc:
     print(f"query failed: {exc}")
-# query failed: ...
+# query failed: projection 'missing' references unknown column(s) ['missing']; available: ['a']
 ```
 
-Catching `BatcherError` covers every Batcher-specific failure while letting
-unrelated exceptions (a bug in your own batch function, for example) propagate.
+Catching `bt.BatcherError` covers every Batcher-specific failure while letting unrelated exceptions propagate, such as a bug in your own batch function.
 
 ## Next steps
 

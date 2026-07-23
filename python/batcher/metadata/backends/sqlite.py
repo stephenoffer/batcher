@@ -11,6 +11,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 
+from batcher._internal.errors import ConfigError
 from batcher.metadata.store import Key
 
 __all__ = ["SQLiteBackend"]
@@ -25,13 +26,44 @@ class SQLiteBackend:
     """A `MetadataBackend` backed by a SQLite database (file path or ``:memory:``)."""
 
     def __init__(self, uri: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(uri)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS kv ("
-            "  tbl TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,"
-            "  PRIMARY KEY (tbl, key))"
-        )
-        self._conn.commit()
+        """Open (or create) the learned-stats database.
+
+        Args:
+            uri: A filesystem path, or ``":memory:"`` for an ephemeral store.
+
+        Raises:
+            ConfigError: If `uri` is not a string, or the database cannot be opened.
+                SQLite answers a missing parent directory, a read-only volume, and a
+                path that is actually a directory with the same five words — "unable to
+                open database file" — so the path itself has to be in the message.
+        """
+        if not isinstance(uri, str):
+            raise ConfigError(
+                f"The sqlite metadata backend needs a path string, but got "
+                f"{type(uri).__name__} {uri!r}.",
+                hint="Pass a filesystem path, or ':memory:' for an ephemeral store.",
+            )
+        self._uri = uri
+        try:
+            self._conn = sqlite3.connect(uri)
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS kv ("
+                "  tbl TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,"
+                "  PRIMARY KEY (tbl, key))"
+            )
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            raise ConfigError(
+                f"Cannot open the sqlite metadata database at {uri!r}: {exc}.",
+                hint=(
+                    "Check that the parent directory exists and is writable, or use "
+                    "':memory:' to keep learned stats for this process only."
+                ),
+            ) from exc
+
+    def __repr__(self) -> str:
+        """Name the database file, so two hubs on different stores are distinguishable."""
+        return f"SQLiteBackend(uri={self._uri!r})"
 
     def get(self, table: str, key: Key) -> bytes | None:
         row = self._conn.execute(

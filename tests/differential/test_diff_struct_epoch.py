@@ -7,6 +7,7 @@ import datetime as dt
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -24,8 +25,6 @@ def test_struct_field_extraction():
 
 
 def test_dt_epoch_vs_duckdb(duck):
-    from conftest import assert_same
-
     ts = [dt.datetime(2021, 1, 1) + dt.timedelta(hours=i * 37) for i in range(20)]
     tbl = pa.table({"ts": pa.array(ts, type=pa.timestamp("us"))})
     duck.register("t", tbl)

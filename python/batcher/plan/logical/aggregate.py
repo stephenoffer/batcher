@@ -12,8 +12,9 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.plan.expr_ir import AggExpr, Expr
+from batcher.plan.ir_specs import aggregates_ir, group_keys_ir, sort_keys_ir
 from batcher.plan.ir_tags import Op
-from batcher.plan.logical.base import LogicalPlan, _validate_refs
+from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases, _validate_refs
 from batcher.plan.logical.relational import Projection
 from batcher.plan.schema import SchemaRef
 from batcher.plan.streaming import Watermark
@@ -36,11 +37,14 @@ _AGG_FLOAT = frozenset(
         "covar_samp",
         "skewness",
         "kurtosis",
+        # `product` is unconditionally Float64 in the engine (Rust `AggFunc::Product`),
+        # not `widen(input)` — an int column's product still comes back as double.
+        "product",
     }
 )
 _AGG_BOOL = frozenset({"bool_and", "bool_or"})
 _AGG_INPUT = frozenset({"min", "max", "mode", "arg_min", "arg_max"})  # preserve input type
-_AGG_WIDEN_INPUT = frozenset({"sum", "product", "bit_and", "bit_or", "bit_xor"})  # widen(input)
+_AGG_WIDEN_INPUT = frozenset({"sum", "bit_and", "bit_or", "bit_xor"})  # widen(input)
 
 
 def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | None:
@@ -88,13 +92,17 @@ class Aggregate(LogicalPlan):
         for spec in self.aggregates:
             if spec.agg.input is not None:
                 _validate_refs(spec.agg.input, available, what=f"aggregate {spec.alias!r}")
+        _reject_duplicate_aliases(
+            [k.alias for k in self.group_keys] + [s.alias for s in self.aggregates],
+            what="group_by().agg()",
+        )
 
     def to_ir(self) -> dict[str, Any]:
         return {
             "op": Op.AGGREGATE,
             "input": self.input.to_ir(),
-            "group_keys": [{"expr": k.expr.to_ir(), "alias": k.alias} for k in self.group_keys],
-            "aggregates": [s.agg.to_ir(s.alias) for s in self.aggregates],
+            "group_keys": group_keys_ir(self.group_keys),
+            "aggregates": aggregates_ir(self.aggregates),
         }
 
     def available_columns(self) -> list[str]:
@@ -149,14 +157,7 @@ class Sort(LogicalPlan):
         return {
             "op": Op.SORT,
             "input": self.input.to_ir(),
-            "keys": [
-                {
-                    "expr": k.expr.to_ir(),
-                    "descending": k.descending,
-                    "nulls_first": k.nulls_first,
-                }
-                for k in self.keys
-            ],
+            "keys": sort_keys_ir(self.keys),
             "limit": self.limit,
         }
 

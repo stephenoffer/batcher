@@ -22,7 +22,6 @@ Run:
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import functools
 import io
 import os
@@ -30,6 +29,7 @@ import time
 
 import numpy as np
 import pyarrow as pa
+from _ray_env import init_batcher_ray
 
 print = functools.partial(print, flush=True)
 
@@ -332,36 +332,7 @@ def bench(cfg: dict, n: int) -> dict:
 
 
 def _init(cfg: dict) -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import batcher
-    from batcher.config import active_config, set_config
-
-    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    # Propagate the benchmark's model/task selection to the workers (the UDF reads them).
-    env_vars = {k: os.environ[k] for k in ("BENCH_GPU_TASK", "BENCH_GPU_MODEL") if k in os.environ}
-    renv = {"py_modules": [pkg], "pip": None, "env_vars": env_vars}
-    base = active_config()
-    set_config(
-        base.replace(
-            distributed=dataclasses.replace(
-                base.distributed,
-                ray_address="auto",
-                runtime_env=renv,
-                stream_inference=cfg["stream"],
-            )
-        )
-    )
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(address="auto", runtime_env=renv, logging_level="ERROR", log_to_driver=False)
+    init_batcher_ray(forward=("BENCH_GPU_TASK", "BENCH_GPU_MODEL"), stream_inference=cfg["stream"])
 
 
 def main() -> int:

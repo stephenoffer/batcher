@@ -11,8 +11,17 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, AsArray, Int64Builder, ListBuilder};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Int64Type};
+use arrow::error::ArrowError;
 
 use crate::ExprError;
+
+/// The most elements a whole `sequence` column may hold. The `List<Int64>` output is
+/// built with 32-bit offsets, so the child array cannot exceed `i32::MAX` values — and
+/// well before that, an unbounded range (`sequence(1, 10_000_000_000)`) would exhaust
+/// memory. DuckDB likewise refuses a list past `2^32` rather than attempting it; we cap
+/// at the offset limit and error, so the failure is a clean message rather than an OOM
+/// kill or a silently overflowed offset buffer.
+const MAX_SEQUENCE_ELEMENTS: i128 = i32::MAX as i128;
 
 /// Build the per-row integer series `[start, start±…, stop]` (inclusive) as a
 /// `List<Int64>` column. Inputs are cast to Int64; a null argument → null row.
@@ -30,6 +39,7 @@ pub(crate) fn eval_sequence(
     let step = step.as_primitive::<Int64Type>();
 
     let mut b = ListBuilder::new(Int64Builder::new());
+    let mut total: i128 = 0;
     for i in 0..n {
         if start.is_null(i) || stop.is_null(i) || step.is_null(i) {
             b.append(false);
@@ -38,6 +48,23 @@ pub(crate) fn eval_sequence(
         let (s, e, d) = (start.value(i), stop.value(i), step.value(i));
         if d == 0 {
             return Err(ExprError::DivideByZero);
+        }
+        // Bound the allocation up front (in `i128` to dodge `e - s` overflow). The series
+        // is empty when `d` points away from `s → e`; otherwise it has
+        // `(e - s) / d + 1` elements. Refusing an over-large series here turns an OOM /
+        // silently-overflowed 32-bit offset buffer into a clean error (see the cap docs).
+        let count: i128 = if (d > 0 && s > e) || (d < 0 && s < e) {
+            0
+        } else {
+            (i128::from(e) - i128::from(s)) / i128::from(d) + 1
+        };
+        total += count;
+        if total > MAX_SEQUENCE_ELEMENTS {
+            return Err(ArrowError::ComputeError(format!(
+                "sequence: result of {total} elements exceeds the supported maximum of \
+                 {MAX_SEQUENCE_ELEMENTS}"
+            ))
+            .into());
         }
         // Walk from `s` toward `e` by `d`; the direction of `d` must match s→e or the
         // series is empty (matches DuckDB `generate_series`).
@@ -86,6 +113,26 @@ mod tests {
         assert_eq!(row(1), vec![10, 7, 4]); // backward
         assert!(list.value(2).is_empty()); // step wrong direction → empty
         assert!(list.is_null(3)); // null arg → null row
+    }
+
+    #[test]
+    fn an_over_large_range_errors_instead_of_exhausting_memory() {
+        // ~10^10 elements: without the cap this allocates ~80 GB and overflows the 32-bit
+        // list-offset buffer. It must return an error, cheaply, having built nothing.
+        let s: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let e: ArrayRef = Arc::new(Int64Array::from(vec![10_000_000_000]));
+        let d: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        assert!(eval_sequence(&s, &e, &d).is_err());
+    }
+
+    #[test]
+    fn the_count_bound_dodges_span_overflow() {
+        // `stop - start` overflows `i64` here (MAX - MIN); the `i128` count computation
+        // must still classify it as over-large and error, not panic on the subtraction.
+        let s: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN]));
+        let e: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX]));
+        let d: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        assert!(eval_sequence(&s, &e, &d).is_err());
     }
 
     #[test]

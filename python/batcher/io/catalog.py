@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 
 if TYPE_CHECKING:
     from pyiceberg.catalog import Catalog
@@ -53,13 +54,13 @@ CatalogSpec = dict[str, Any]
 
 def _require_pyiceberg() -> Any:
     """Import and return the `pyiceberg.catalog` module or raise `BackendError`."""
-    try:
-        from pyiceberg import catalog
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Iceberg catalogs require pyiceberg: pip install 'batcher-engine[iceberg]'"
-        ) from exc
-    return catalog
+    return require(
+        "pyiceberg",
+        "catalog",
+        feature="Iceberg catalog support",
+        provides="pyiceberg",
+        extra="iceberg",
+    )
 
 
 def _normalize_type(raw: str) -> str:

@@ -35,6 +35,7 @@ hint* (`num_cpus`), never a result, so error costs throughput, not correctness:
 from __future__ import annotations
 
 import weakref
+from statistics import median
 
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
@@ -95,20 +96,13 @@ def _is_confident(xs: list[float]) -> bool:
     """
     if len(xs) <= 1:
         return True
-    med = _median(xs)
+    med = median(xs)
     return med <= 0.0 or (max(xs) - min(xs)) <= _MAX_REL_SPREAD * med
 
 
 def class_ir_tag(class_name: str) -> str | None:
     """The native metrics `kind` tag for a `LogicalPlan` class name, if measured."""
     return _CLASS_TO_TAG.get(class_name)
-
-
-def _median(xs: list[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    mid = n // 2
-    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
 
 
 def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) -> dict[str, float]:
@@ -144,7 +138,7 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
             utils = [u for r in rows if (u := float(r.get("cpu_utilization", 0.0) or 0.0)) > 0.0]
             # Confidence gate: enough samples AND concentrated enough to trust the median.
             if len(utils) >= min_samples and _is_confident(utils):
-                med = _median(utils)
+                med = median(utils)
                 p = prior.get(tag)
                 out[tag] = med if p is None else _SMOOTH_ALPHA * med + (1.0 - _SMOOTH_ALPHA) * p
     except Exception:  # pragma: no cover - planning must never break on bad feedback

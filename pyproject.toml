@@ -50,7 +50,11 @@ polars = ["polars>=1.0"]
 duckdb = ["duckdb>=1.0"]
 # Pluggable MetadataHub backends.
 redis = ["redis>=5"]
-cloud = ["fsspec", "s3fs", "gcsfs"]
+# One extra that covers every object store the filesystem façade routes to fsspec: S3,
+# GCS, Azure (`adlfs` — `az://`, and the fallback for `abfs://` when pyarrow is built
+# without its native Azure backend), and HTTP(S) presigned URLs (`aiohttp`). Without adlfs
+# and aiohttp the error told users to install this extra and installing it did not help.
+cloud = ["fsspec", "s3fs", "gcsfs", "adlfs", "aiohttp"]
 # OpenTelemetry span export (observability.otel_traces). Only the API is needed to emit;
 # the host app owns the SDK + OTLP exporter that ships spans to its collector.
 otel = ["opentelemetry-api>=1.20"]
@@ -108,6 +112,11 @@ pulsar = ["pulsar-client>=3.4"]
 image = ["pillow>=10"]
 audio = ["soundfile>=0.12"]
 video = ["av>=12"]
+# --- Robotics / ADAS logs ---
+# `mcap` reads the container; `mcap-ros2-support` decodes ROS 2 message payloads out of
+# the `data` column, which is a downstream step the reader deliberately does not do.
+mcap = ["mcap>=1.1"]
+ros2 = ["mcap-ros2-support>=0.5"]
 # --- Framework interop (Ray Data `from_*` parity) ---
 pandas = ["pandas>=2"]
 huggingface = ["datasets>=2.18"]
@@ -117,6 +126,7 @@ warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickh
 nosql = ["batcher-engine[mongo,elasticsearch,couchbase,cassandra,nosql-redis,dynamodb,neo4j,hbase]"]
 streaming = ["batcher-engine[kafka,kinesis,eventhubs,pubsub,pulsar]"]
 multimodal = ["batcher-engine[image,audio,video,pdf]"]
+robotics = ["batcher-engine[mcap,ros2,hdf5]"]
 ml-formats = ["batcher-engine[lance,avro,hdf5,zarr,tfrecord]"]
 dev = [
     "maturin>=1.7,<2",
@@ -126,10 +136,22 @@ dev = [
     "hypothesis>=6",
     "import-linter>=2",
     "ruff>=0.6",
+    # Runs the dashboard's JavaScript in `tests/unit/test_observe.py`. That JS has no other
+    # gate — a syntax error would ship a blank dashboard with every Python test green.
+    # QuickJS, not esprima: esprima is stuck at ES2017 and fails on object spread, `?.`,
+    # and `??`, so it flagged correct code as broken.
+    "quickjs>=1.19",
     "duckdb>=1.0",
     "polars>=1.0",
     "numpy>=1.24",
     "scikit-learn>=1.3",
+    # The lakehouse backends are optional *for a user*, but not for the suite: the
+    # lakehouse guides, the Delta/Iceberg integration pages, and `examples/lakehouse_scd.py`
+    # are executed for real by `tests/docs/`, and `tests/io/test_lakehouse.py` round-trips
+    # a real table. Without these the suite skips its way to green while the docs it
+    # publishes go unchecked — so a dev/CI environment carries them.
+    "deltalake>=0.18",
+    "pyiceberg>=0.7",
 ]
 # Competitive benchmarking lineup: the single-node and multi-node engines Batcher is
 # measured against (`benchmarks/`). DuckDB/Polars are also the correctness oracles;
@@ -182,22 +204,15 @@ modules = [
     "batcher.core",
     "batcher.governance",
 ]
-# Core imports the compiled engine as `batcher._native`; import-linter cannot see
-# into the extension module and mis-attributes it to the root `batcher` package
-# (which re-exports the api). Those edges are the engine dependency, not layer ones.
-# (Carbonite also drives `batcher._native` to govern the data plane — the
-# bc-resource pool / bc-transport shuffle — but grimp resolves that to the
-# `batcher._native` submodule, outside the independence set, so it needs no ignore.)
-ignore_imports = [
-    "batcher.core.executor -> batcher",
-    "batcher.core.udf.execute -> batcher",
-    "batcher.core.stats -> batcher",
-    "batcher.core.streaming -> batcher",
-    # The native Parquet reader (`bc_io`) is called from the neutral IO layer via
-    # `batcher._native`; grimp mis-attributes that submodule import to the root `batcher`
-    # package (as with core above), so this is the engine dependency, not a layer edge.
-    "batcher.io.formats.structured._parquet_native -> batcher",
-]
+# No `ignore_imports`, deliberately. There used to be one entry per module that wrote
+# `import batcher._native` — grimp cannot see into a compiled extension, so it attributed
+# each such import to the ROOT `batcher` package, which re-exports `api`, which imports every
+# subsystem: a phantom `core -> batcher -> api -> kyber` cycle that broke this contract. The
+# allowlist silenced the symptom, and grew by one line per new module — until a new IO format
+# added the same import, was not on the list, and broke all six independence directions at once.
+# The engine is now reached through the single accessor `batcher._internal.native`, so the
+# phantom edge does not exist and nothing needs excusing. If you find yourself adding an entry
+# here, you have almost certainly bypassed that shim — don't.
 
 [[tool.importlinter.contracts]]
 name = "plan is the neutral contract layer"
@@ -210,6 +225,54 @@ forbidden_modules = [
     "batcher.governance",
     "batcher.api",
 ]
+
+# `io` sits below every subsystem (layer 2 in the import matrix in
+# `.claude/rules/architecture.md`): sources/sinks/formats are infrastructure that `kyber`,
+# `core`, and `dist` all legitimately depend on. That only holds while `io` itself stays
+# neutral — the moment a format reaches back up into a subsystem, `io` stops being a shared
+# foundation and becomes a cycle, taking the independence contract down with it.
+[[tool.importlinter.contracts]]
+name = "io is neutral infrastructure"
+type = "forbidden"
+source_modules = ["batcher.io"]
+forbidden_modules = [
+    "batcher.kyber",
+    "batcher.carbonite",
+    "batcher.core",
+    "batcher.governance",
+    "batcher.dist",
+    "batcher.api",
+    "batcher.ml",
+]
+
+# `observe` holds the observability *sinks* (terminal reporter, activity store, web UI). Every
+# subsystem publishes to the event bus in `_internal.events`; only this package consumes it. It
+# sits at layer 2 beside `io` for exactly one reason: if a sink could import a subsystem, the
+# subsystem it observes would end up importing it back through the bus wiring, and "observability
+# is decoupled from the engine" would stop being true. A sink reads events, never the engine.
+[[tool.importlinter.contracts]]
+name = "observe is a neutral sink layer"
+type = "forbidden"
+source_modules = ["batcher.observe"]
+forbidden_modules = [
+    "batcher.kyber",
+    "batcher.carbonite",
+    "batcher.core",
+    "batcher.governance",
+    "batcher.dist",
+    "batcher.api",
+    "batcher.ml",
+    "batcher.io",
+]
+
+# `dist` is a *backend* of the conductor, not a peer of it: `api` decides to distribute and
+# calls `dist`. If `dist` imports `api` back, the conductor becomes a dependency of the thing
+# it conducts, and "api is the only conductor" stops meaning anything.
+[[tool.importlinter.contracts]]
+name = "dist is a backend, not a second conductor"
+type = "forbidden"
+source_modules = ["batcher.dist"]
+forbidden_modules = ["batcher.api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

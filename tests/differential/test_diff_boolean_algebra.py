@@ -14,6 +14,7 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.boolean_algebra
+from _harness import assert_same
 from batcher import col
 from batcher.plan.expr_ir import Col, InList
 from batcher.plan.expr_ir.constructors import coalesce
@@ -37,22 +38,16 @@ def empty(duck):
 
 
 def test_and_false_is_empty(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter((col("a") > 1) & bt.lit(False)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) AND FALSE"))
 
 
 def test_or_true_is_everything(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter((col("a") > 1) | bt.lit(True)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) OR TRUE"))
 
 
 def test_and_false_empty_input(duck, empty):
-    from conftest import assert_same
-
     out = bt.from_arrow(empty).filter((col("a") > 1) & bt.lit(False)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) AND FALSE"))
 
@@ -61,15 +56,11 @@ def test_and_false_empty_input(duck, empty):
 
 
 def test_and_idempotent(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter((col("a") > 1) & (col("a") > 1)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) AND (a > 1)"))
 
 
 def test_or_idempotent(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter((col("a") > 1) | (col("a") > 1)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) OR (a > 1)"))
 
@@ -78,16 +69,12 @@ def test_or_idempotent(duck, t):
 
 
 def test_and_absorption(duck, t):
-    from conftest import assert_same
-
     x, y = col("a") > 1, col("x") < 25
     out = bt.from_arrow(t).filter(x & (x | y)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) AND ((a > 1) OR (x < 25))"))
 
 
 def test_or_absorption(duck, t):
-    from conftest import assert_same
-
     x, y = col("a") > 1, col("x") < 25
     out = bt.from_arrow(t).filter(x | (x & y)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) OR ((a > 1) AND (x < 25))"))
@@ -97,15 +84,11 @@ def test_or_absorption(duck, t):
 
 
 def test_complement_and_is_empty(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(col("a").is_null() & ~col("a").is_null()).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE a IS NULL AND NOT (a IS NULL)"))
 
 
 def test_complement_or_is_everything(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(col("a").is_not_null() | ~col("a").is_not_null()).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE a IS NOT NULL OR NOT (a IS NOT NULL)"))
 
@@ -114,16 +97,12 @@ def test_complement_or_is_everything(duck, t):
 
 
 def test_fold_not_lt(duck, t):
-    from conftest import assert_same
-
     # The null-a row is excluded by `NOT (a < 2)` either way (comparison is null).
     out = bt.from_arrow(t).filter(~(col("a") < 2)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE NOT (a < 2)"))
 
 
 def test_fold_not_eq(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(~(col("a") == 2)).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE NOT (a = 2)"))
 
@@ -132,15 +111,11 @@ def test_fold_not_eq(duck, t):
 
 
 def test_bool_eq_true(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter((col("a") > 1) == True).collect()  # noqa: E712
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) = TRUE"))
 
 
 def test_bool_eq_false(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter((col("a") > 1) == False).collect()  # noqa: E712
     assert_same(out, duck.sql("SELECT * FROM t WHERE (a > 1) = FALSE"))
 
@@ -149,15 +124,11 @@ def test_bool_eq_false(duck, t):
 
 
 def test_single_in_list(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(InList(Col("a"), (2,))).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE a IN (2)"))
 
 
 def test_dedup_in_list(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(InList(Col("a"), (2, 2, 3, 3))).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE a IN (2, 2, 3, 3)"))
 
@@ -166,21 +137,15 @@ def test_dedup_in_list(duck, t):
 
 
 def test_coalesce_nested(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r=coalesce(col("a"), coalesce(col("x"), bt.lit(0)))).collect()
     assert_same(out, duck.sql("SELECT COALESCE(a, COALESCE(x, 0)) AS r FROM t"))
 
 
 def test_coalesce_truncate_after_literal(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r=coalesce(col("a"), bt.lit(99), col("x"))).collect()
     assert_same(out, duck.sql("SELECT COALESCE(a, 99, x) AS r FROM t"))
 
 
 def test_coalesce_empty_input(duck, empty):
-    from conftest import assert_same
-
     out = bt.from_arrow(empty).select(r=coalesce(col("a"), coalesce(col("x"), bt.lit(0)))).collect()
     assert_same(out, duck.sql("SELECT COALESCE(a, COALESCE(x, 0)) AS r FROM t"))

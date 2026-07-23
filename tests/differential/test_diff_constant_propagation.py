@@ -6,6 +6,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -16,30 +17,22 @@ def _t(duck):
 
 
 def test_propagate_into_comparison(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("x") == 5) & (col("y") > col("x")))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE x = 5 AND y > x"))
 
 
 def test_propagate_with_null_rows(duck):
-    from conftest import assert_same
-
     # The null-x row is dropped by `x = 5` either way.
     ds = _t(duck).filter((col("x") == 5) & (col("y") <= col("x")))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE x = 5 AND y <= x"))
 
 
 def test_contradiction_is_empty(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("x") == 5) & (col("x") == 3))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE x = 5 AND x = 3"))
 
 
 def test_multiple_constants(duck):
-    from conftest import assert_same
-
     t = pa.table({"a": [1, 1, 2], "b": [2, 5, 2], "c": [3, 3, 9]})
     duck.register("m", t)
     pred = (col("a") == 1) & (col("b") == 2) & (col("c") > col("a") + col("b"))

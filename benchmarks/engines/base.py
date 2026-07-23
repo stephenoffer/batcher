@@ -28,6 +28,22 @@ import pyarrow.fs as pafs
 # A pre-registered SQL executor: query string -> result table.
 SqlRunner = Callable[[str], pa.Table]
 
+# Per-table ``{stored column name -> canonical name}`` for the scan path (see
+# ``sources.scan_rename``): the public TPC-H parquet is positionally named.
+Rename = dict[str, dict[str, str]]
+
+
+def sql_projection(cols: dict[str, str] | None) -> str:
+    """The SELECT list that renames a scanned table's columns — ``*`` when there is none.
+
+    Shared by the SQL engines whose scan binding is a view (DuckDB, Spark): a rename is
+    expressed as ``stored AS canonical``, which every SQL planner folds into the parquet
+    read rather than materializing.
+    """
+    if not cols:
+        return "*"
+    return ", ".join(f'"{stored}" AS "{canonical}"' for stored, canonical in cols.items())
+
 
 class Engine:
     """Base adapter. Subclasses set the class attributes and override what they support.
@@ -63,7 +79,9 @@ class Engine:
         """
         return None
 
-    def sql_runner_scan(self, _uris: dict[str, str]) -> SqlRunner | None:
+    def sql_runner_scan(
+        self, _uris: dict[str, str], _rename: Rename | None = None
+    ) -> SqlRunner | None:
         """A ``query -> pa.Table`` callable with each named table bound to a *lazy
         native parquet scan* of ``uris[name]`` (a glob), or ``None``.
 
@@ -72,6 +90,11 @@ class Engine:
         reads parquet natively and lazily through its own scan — the representative way
         these engines run at scale, and the only way that fits in memory. SQL engines
         override it; the base returns ``None`` (the suite omits the engine).
+
+        ``_rename`` (from :func:`sources.scan_rename`) maps each table's stored column
+        names to the canonical ones the queries use, applied inside the scan binding.
+        The public TPC-H parquet is named positionally, so the scan path needs it; it is
+        the identical pure-metadata projection for every engine.
         """
         return None
 

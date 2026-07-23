@@ -18,13 +18,22 @@ pytest.importorskip("ray", reason="ray not installed")
 from batcher.dist import requires_staging
 
 
-def _d(name):
-    return bt.from_pydict({name: [1], "k": [1], "d1": [1], "d2": [1], "v": [1]})
+def _d(name, *keys):
+    """A one-row table: an identity column named `name`, plus the join `keys` it carries."""
+    return bt.from_pydict({name: [1], **{k: [1] for k in keys}})
 
 
 @pytest.fixture
 def tables():
-    return _d("a"), _d("b"), _d("c"), _d("e")
+    """`a` carries the payload (`v`) and every key; each dim shares exactly one key with it.
+
+    A join merges the key it joins on but *suffixes* any other shared column (`d2` ->
+    `d2_right`), so tables sharing their non-key names make a second join's suffix collide
+    with the first's — a duplicate-output shape Batcher rejects with `PlanError` and DuckDB
+    rejects as an ambiguous reference. Keeping the non-key names distinct keeps these tests
+    about `requires_staging` rather than about join naming.
+    """
+    return _d("a", "k", "d1", "d2", "v"), _d("b", "k"), _d("c", "d1"), _d("e", "d2")
 
 
 def test_two_table_join_needs_no_staging(tables):

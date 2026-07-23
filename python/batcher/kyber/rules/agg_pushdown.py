@@ -66,6 +66,95 @@ _FANOUT_SAFE_AGGS = frozenset({"min", "max"})
 _PREAGG_MERGE = {"sum": "sum", "count": "sum", "count_star": "sum", "min": "min", "max": "max"}
 _ADDITIVE_AGGS = frozenset({"sum", "count", "count_star"})
 
+#: Minimum row-reduction factor for a pushed pre-aggregate to be worth its cost. A pushed
+#: pre-aggregate groups by the join key, so its cardinality is *at least* the join key's — a
+#: near-unique key (e.g. ``l_orderkey``, ~4 rows/key) buys only a ~4x reduction while building a
+#: multi-million-entry, cache-cold hash table that costs far more than the join input it shrinks.
+#: The classic eager-aggregation win is a low-cardinality grouping (large fan-out per key), which
+#: clears this bar by orders of magnitude; a marginal reduction does not. Measured: a global
+#: ``SUM(...) FROM lineitem JOIN orders`` regressed **5.5x (74 ms -> 510 ms)** because a 4x
+#: reduction slipped through the old ``rows_out < rows_in`` gate. The cost model cannot catch it —
+#: it prices a hash aggregate linearly in input rows, blind to the cache penalty of a huge group
+#: count — so the guard lives here, on the reduction the rewrite must actually achieve.
+_MIN_PREAGG_REDUCTION = 8.0
+
+
+def _already_grouped_by(plan: LogicalPlan, keys: set[str]) -> bool:
+    """Whether `plan` already holds at most one row per `keys` combination.
+
+    An `Aggregate` whose group-key aliases are a subset of `keys` emits one row per
+    group and therefore per `keys` tuple — pre-aggregating it again by `keys` reduces
+    nothing. This is the exact shape the pushdown rules here produce, so the check is a
+    *structural* idempotency guard: it stops a rule re-firing on its own output no matter
+    what the cost estimator reports. That matters for correctness, not only cost — a
+    re-fire of the LEFT-join `count` merge silently drops the `coalesce(..., 0)` that maps
+    an unmatched group's NULL partial to 0 (the outer aggregate is a `sum` on re-entry,
+    not a `count`), turning a fully-unmatched group's answer from 0 into NULL.
+    """
+    return isinstance(plan, Aggregate) and {k.alias for k in plan.group_keys} <= keys
+
+
+def _reduces_enough(ctx: OptimizerContext, pushed: LogicalPlan, source: LogicalPlan) -> bool:
+    """Whether pushing ``pushed`` below the join shrinks ``source`` enough to pay for itself.
+
+    Requires a *measured* reduction of at least :data:`_MIN_PREAGG_REDUCTION`x. A
+    ``DEFAULT``-provenance estimate is a guess, not a measurement, so it never licenses the push
+    — which also keeps the rewrite idempotent (a second push, over an already-reduced side, finds
+    no further reduction and stops).
+    """
+    stats = ctx.estimator.estimate(pushed)
+    if stats.provenance is Provenance.DEFAULT or stats.rows <= 0:
+        return False
+    return stats.rows * _MIN_PREAGG_REDUCTION <= ctx.estimator.estimate(source).rows
+
+
+def _join_out_reduces_more(ctx: OptimizerContext, pushed: LogicalPlan, join: Join) -> bool:
+    """Whether the join already reduces harder than the pre-aggregate would — a veto.
+
+    :data:`_MIN_PREAGG_REDUCTION` prices the push as a *ratio* against the side being shrunk,
+    blind to what the join then does with it. A selective join is the stronger reducer, and
+    pre-aggregating in front of one is pure added work: the group-by still reads every source
+    row, and the join it feeds emits fewer rows than the group-by produced. TPC-H Q17 motivates
+    this — lineitem pre-aggregated 6M rows to 201,152 groups (29.8x, past the ratio gate) to feed
+    a join against 195 parts emitting 5,514 rows, taking it from **12 ms to 242 ms**. A **veto,
+    not a license**, as :func:`_measured_as_non_reducing` is: `_reduces_enough` must approve
+    first, so this only withdraws it — hence reading the join estimate at any provenance.
+    """
+    join_rows = ctx.estimator.estimate(join).rows
+    if join_rows <= 0:
+        return False
+    return ctx.estimator.estimate(pushed).rows >= join_rows
+
+
+def _measured_as_non_reducing(ctx: OptimizerContext, node: Aggregate) -> bool:
+    """Whether a *past run* measured this group-by as collapsing almost nothing.
+
+    `record_group_reduction` records every group-by's real `groups / input_rows` against the
+    aggregate's own signature, and `learned_partial_agg` reads it back — but nothing called the
+    reader, so the measurement was written on every query and consumed by none. This closes
+    that loop at the one decision the ratio exists to inform: pre-aggregation pays exactly when
+    a group-by collapses many rows into few groups, and is wasted work when nearly every row is
+    its own group.
+
+    Deliberately a **veto, not a license**. `_reduces_enough` above still has to approve the
+    push from the estimator's `ndv`; a measurement can only *withdraw* that approval, never
+    grant it. So a stale or unlucky measurement can at worst skip a beneficial rewrite — it can
+    never introduce one the cost model rejected. Absent a measurement (`None`, the cold case)
+    nothing changes, so a first run is byte-for-byte the previous behavior.
+
+    Result-invariant either way: engaging or skipping the partial pre-aggregate is an algebraic
+    identity, so this moves only how much work the join's left side does.
+    """
+    if ctx.hub is None:
+        return False
+    try:
+        from batcher.kyber.learned_tuning import learned_partial_agg
+        from batcher.kyber.signature import plan_signature
+
+        return learned_partial_agg(ctx.hub, plan_signature(node)) is False
+    except Exception:  # pragma: no cover - a learned read must never break planning
+        return False
+
 
 @rule(name="count_distinct_to_distinct_count", phase=Phase.REWRITE, matches=(Aggregate,))
 def count_distinct_to_distinct_count(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
@@ -148,6 +237,11 @@ def eager_aggregation(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | N
     # Build the pushed (partial) aggregate on the left input: group by the left group
     # columns plus the join keys (needed for the join), aggregate the same way.
     keep_sources: list[str] = list(dict.fromkeys([*left_group_sources, *join.left_keys]))
+    # Structural idempotency guard (see `_already_grouped_by`): never re-push onto a left
+    # side this rule already reduced, which otherwise loops to the fixpoint cap building an
+    # invalid re-`__eag_`-named join output.
+    if _already_grouped_by(join.left, set(keep_sources)):
+        return None
     partial_keys = tuple(Projection(s, Col(s)) for s in keep_sources)
     partials = tuple(
         AggregateSpec(f"__eag_{i}", AggExpr(spec.agg.func, Col(src)))
@@ -158,10 +252,11 @@ def eager_aggregation(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | N
     # Cost gate: fire only on a *measured* reduction (a learned `ndv`, not the
     # estimator's default guess), so a stats-less plan never pushes a pointless
     # group-by and a second push (already reduced) finds no further gain → no-op.
-    pushed_stats = ctx.estimator.estimate(pushed)
-    if pushed_stats.provenance is Provenance.DEFAULT:
+    if not _reduces_enough(ctx, pushed, join.left):
         return None
-    if not pushed_stats.rows < ctx.estimator.estimate(join.left).rows:
+    if _join_out_reduces_more(ctx, pushed, join):
+        return None
+    if _measured_as_non_reducing(ctx, node):
         return None
 
     # Rewrite the join output: keep right columns and the left columns the pushed
@@ -235,6 +330,11 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
         return None  # additive partials are only safe without fan-out
 
     keep_sources = list(dict.fromkeys([*left_group_sources, *join.left_keys]))
+    # Structural idempotency guard (see `_already_grouped_by`): never re-push onto a left
+    # side this rule already reduced, which otherwise loops to the fixpoint cap building an
+    # invalid re-`__pre_`-named join output.
+    if _already_grouped_by(join.left, set(keep_sources)):
+        return None
     partial_keys = tuple(Projection(s, Col(s)) for s in keep_sources)
     partials = tuple(
         AggregateSpec(
@@ -246,10 +346,11 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
     pushed = Aggregate(join.left, partial_keys, partials)
 
     # Cost gate: fire only on a measured reduction (not the estimator's default guess).
-    pushed_stats = ctx.estimator.estimate(pushed)
-    if pushed_stats.provenance is Provenance.DEFAULT:
+    if not _reduces_enough(ctx, pushed, join.left):
         return None
-    if not pushed_stats.rows < ctx.estimator.estimate(join.left).rows:
+    if _join_out_reduces_more(ctx, pushed, join):
+        return None
+    if _measured_as_non_reducing(ctx, node):
         return None
 
     provided = set(keep_sources) | {f"__pre_{i}" for i in range(len(partials))}
@@ -336,6 +437,14 @@ def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> Logic
 
     m_input = join.left if measure_side == "left" else join.right
     m_key = (join.left_keys if measure_side == "left" else join.right_keys)[0]
+
+    # Structural idempotency guard (correctness, not just cost) — see `_already_grouped_by`.
+    # Without it a second application drops the LEFT-join `count`'s `coalesce(..., 0)` and a
+    # fully-unmatched group's answer flips from 0 to NULL; the cost gate normally masks the
+    # re-fire, but correctness must not hinge on an estimate.
+    if _already_grouped_by(m_input, {m_key}):
+        return None
+
     alias_to_src = {a: out_map[a].name for a in side_aliases[measure_side]}
 
     # Partial aggregate on the measure side: group by its join key, the (remapped to
@@ -351,10 +460,11 @@ def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> Logic
     # Cost gate: fire only on a *measured* reduction of the measure side (a learned `ndv`,
     # not the estimator's default), so a stats-less plan never pushes a pointless
     # group-by and a second push (measure side already unique) is a no-op.
-    pushed_stats = ctx.estimator.estimate(pushed)
-    if pushed_stats.provenance is Provenance.DEFAULT:
+    if not _reduces_enough(ctx, pushed, m_input):
         return None
-    if not pushed_stats.rows < ctx.estimator.estimate(m_input).rows:
+    if _join_out_reduces_more(ctx, pushed, join):
+        return None
+    if _measured_as_non_reducing(ctx, node):
         return None
 
     # New join: keep the group side's outputs (the group keys read them); replace the

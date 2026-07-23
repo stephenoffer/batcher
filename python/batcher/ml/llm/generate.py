@@ -1,25 +1,36 @@
 """LLM batch generation — the columnar half of offline text generation.
 
 Builds each row's request from its columns (a `template`, an image column for
-vision-language models, a per-row LoRA adapter tag), hands the batch to an `Engine`,
-and appends the generated text — optionally parsed as JSON into a struct column, and
-with per-row token usage. The engine is built **once per worker** (the load-once
-pattern) and does its *own* continuous batching, so no outer fixed batch size is
-imposed: an outer batch-size PID would fight vLLM's scheduler.
+vision-language models, a per-row LoRA adapter tag, per-row sampling overrides), hands
+the batch to an `Engine`, and appends the generated text — optionally parsed as JSON
+into a struct column, and with per-row token usage, finish reason, and logprob.
 
-Two entry points over the same core: `llm_generate` streams `RecordBatch`es (the
-library form), and `llm_udf` wraps it as a load-once class UDF so `ds.ml.generate`
-can schedule it on GPU actors through `map_batches`.
+Two entry points over **one** implementation: `llm_udf` packages the work as a
+load-once class UDF (what `ds.ml.generate` schedules on GPU actors), and `llm_generate`
+streams `RecordBatch`es for library use by instantiating that same class. Both describe
+what they want with a single `GenerateSpec`, so an option added to one reaches the other
+by construction rather than by remembering to.
+
+The engine is built **once per worker** and does its *own* continuous batching, so no
+outer batch size is imposed by default: an outer fixed batch would fight vLLM's
+scheduler, and re-chunking the caller's stream would change its memory shape. Both are
+available through `llm_generate(target_batch_rows=...)` when a caller wants them.
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Iterable, Iterator
-from typing import TYPE_CHECKING
+from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING, Any
 
-from batcher.ml.inference import InferencePool
+from batcher.ml.llm.columns import _usage_columns as _usage_columns  # test seam (relocated)
 from batcher.ml.llm.engines import Engine, EngineFactory
+from batcher.ml.llm.requests import (
+    GenerateSpec,
+    _build_requests,
+    _length_sorted_order,
+    _restore_order,
+)
+from batcher.ml.llm.requests import _decode_image_inputs as _decode_image_inputs  # test seam
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -27,64 +38,86 @@ if TYPE_CHECKING:
 __all__ = ["llm_generate", "llm_udf"]
 
 
-def _render(template: str | None, column: str, batch: pa.RecordBatch) -> list[str]:
-    """The prompt for each row: ``column`` verbatim, or `template` formatted with the
-    row's columns (``"{system} Q: {question}"``-style ``str.format`` placeholders)."""
-    if template is None:
-        return [str(v) for v in batch.column(column).to_pylist()]
-    rows = batch.to_pylist()
-    return [template.format(**row) for row in rows]
-
-
-def _build_requests(
-    template: str | None,
+def llm_udf(
+    engine_factory: EngineFactory,
+    *,
     prompt_column: str,
-    image_column: str | None,
-    adapter_column: str | None,
-    batch: pa.RecordBatch,
-) -> list:
-    """Per-row engine requests: plain prompt strings, or ``{prompt, image?, adapter?}``
-    dicts when an `image_column` (vision-language) or `adapter_column` (per-row LoRA) is
-    given. A null image/adapter for a row drops that key (text-only / base model)."""
-    prompts = _render(template, prompt_column, batch)
-    if image_column is None and adapter_column is None:
-        return prompts
-    n = len(prompts)
-    images = _decode_image_inputs(batch.column(image_column)) if image_column else [None] * n
-    adapters = batch.column(adapter_column).to_pylist() if adapter_column else [None] * n
-    requests = []
-    for prompt, image, adapter in zip(prompts, images, adapters, strict=True):
-        request: dict = {"prompt": prompt}
-        if image is not None:
-            request["image"] = image
-        if adapter is not None:
-            request["adapter"] = adapter
-        requests.append(request)
-    return requests
+    output_column: str = "response",
+    template: str | None = None,
+    image_column: str | None = None,
+    adapter_column: str | None = None,
+    max_tokens_column: str | None = None,
+    temperature_column: str | None = None,
+    parse_json: bool = False,
+    usage: bool = False,
+    finish_reason: bool = False,
+    logprobs: bool = False,
+) -> type:
+    """A **load-once class UDF** that appends an LLM-generated column to each batch.
 
+    The implementation both entry points share, packaged as a class so `map_batches`
+    builds the engine once per worker and schedules it on GPU actors — which is what lets
+    `ds.ml.generate` reuse the whole `num_gpus`/`concurrency`/`accelerator_type`
+    machinery instead of owning a second scheduler. A plain function would rebuild the
+    engine (reloading the model) on every batch.
 
-def _decode_image_inputs(column: pa.Array) -> list:
-    """A list of PIL images for a column of raw image bytes or decoded pixel tensors.
+    Examples:
+        .. doctest::
 
-    Bytes → ``PIL.Image.open``; a fixed-shape-tensor ``(H, W, 3)`` → ``Image.fromarray``.
-    Null rows yield ``None`` (the model sees a text-only request for that row)."""
-    import io as _io
+            >>> from batcher.ml import llm_udf, vllm_engine  # doctest: +SKIP
+            >>> engine = vllm_engine("meta-llama/Llama-3-8B")  # doctest: +SKIP
+            >>> udf = llm_udf(engine, prompt_column="question")  # doctest: +SKIP
+            >>> ds.ml.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
 
-    from batcher.io.formats.ml.tensor import is_tensor_column
+    Args:
+        engine_factory: zero-arg callable returning an `Engine`; called once per worker.
+        prompt_column: the text column to send (ignored when `template` is set).
+        output_column: name of the appended generated column.
+        template: optional ``str.format`` template over the row's columns.
+        image_column: optional image column for vision-language models.
+        adapter_column: optional per-row LoRA adapter name.
+        max_tokens_column: optional column giving each row its own token budget, so one
+            batch can mix a 16-token classification with a 2000-token summary instead of
+            paying the longest budget for every row. A null uses the engine's default.
+        temperature_column: optional column giving each row its own sampling temperature
+            (a null uses the engine's default), so a factual extraction and a creative
+            rewrite can share one pass over the data.
+        parse_json: parse each output as JSON into a struct column (null on error).
+        usage: also append ``prompt_tokens`` / ``completion_tokens``.
+        finish_reason: also append a ``finish_reason`` column, so a generation truncated
+            at ``max_tokens`` is detectable rather than silently corrupting a parse.
+        logprobs: also append a ``logprob`` column holding the generation's cumulative
+            log-probability — the model's own confidence, for routing the least certain
+            rows to review. Null for an engine that does not report one.
 
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover - optional extra
-        from batcher._internal.errors import BackendError
+    Returns:
+        A class whose instances map a `pyarrow.RecordBatch` to the batch plus the
+        generated column(s).
+    """
+    spec = GenerateSpec(
+        prompt_column=prompt_column,
+        output_column=output_column,
+        template=template,
+        image_column=image_column,
+        adapter_column=adapter_column,
+        max_tokens_column=max_tokens_column,
+        temperature_column=temperature_column,
+        parse_json=parse_json,
+        usage=usage,
+        finish_reason=finish_reason,
+        logprobs=logprobs,
+    )
 
-        msg = "vision LLM input needs Pillow: pip install 'batcher-engine[image]'"
-        raise BackendError(msg) from exc
+    class _LlmGenerate:
+        """Holds one engine for the worker's lifetime; called once per batch."""
 
-    if is_tensor_column(column):
-        if hasattr(column, "combine_chunks"):
-            column = column.combine_chunks()
-        return [Image.fromarray(row) for row in column.to_numpy_ndarray()]
-    return [None if b is None else Image.open(_io.BytesIO(b)) for b in column.to_pylist()]
+        def __init__(self) -> None:
+            self._engine = engine_factory()
+
+        def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+            return _generate_batch(self._engine, batch, spec)
+
+    return _LlmGenerate
 
 
 def llm_generate(
@@ -96,12 +129,32 @@ def llm_generate(
     template: str | None = None,
     image_column: str | None = None,
     adapter_column: str | None = None,
+    max_tokens_column: str | None = None,
+    temperature_column: str | None = None,
     parse_json: bool = False,
     usage: bool = False,
-    num_workers: int = 2,
-    target_batch_rows: int = 256,
+    finish_reason: bool = False,
+    logprobs: bool = False,
+    num_workers: int = 1,
+    target_batch_rows: int | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Append an LLM-generated `output_column` to each batch.
+
+    The streaming form of `llm_udf`, and built from it, so the two cannot produce
+    different columns for the same input. By default each input batch comes back with the
+    generated column appended and its **row boundaries unchanged**, generated by a single
+    engine — the same shape `ds.ml.generate` produces. `num_workers` and
+    `target_batch_rows` opt into extra scheduling on top of that; see their descriptions
+    for what each costs.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import llm_generate, vllm_engine  # doctest: +SKIP
+            >>> engine = vllm_engine("meta-llama/Llama-3-8B")  # doctest: +SKIP
+            >>> batches = ds.iter_batches()  # doctest: +SKIP
+            >>> out = list(llm_generate(batches, engine, prompt_column="q"))  # doctest: +SKIP
 
     Args:
         batches: an iterable of `pyarrow.RecordBatch`.
@@ -118,145 +171,168 @@ def llm_generate(
         adapter_column: optional column naming the **LoRA adapter** to use per row
             (multi-adapter serving). The engine routes each row to that adapter; a null
             uses the base model. Pair with ``vllm_engine(lora_paths={name: path})``.
+        max_tokens_column: optional per-row token budget; a null uses the engine default.
+        temperature_column: optional per-row sampling temperature; a null uses the
+            engine default.
         parse_json: parse each output as JSON into a struct column (guided/structured
             decoding); on a parse error the row's value is null.
         usage: also append integer ``prompt_tokens`` and ``completion_tokens`` columns
             (the per-row token counts the engine reported — `vllm_engine` and
             `http_engine` do). Aggregate them to track cost (tokens * price) or
             throughput. Null for an engine that does not report usage.
-        num_workers / target_batch_rows: forwarded to `InferencePool` (no latency
-            controller — the engine owns its own batching).
+        finish_reason: also append a string ``finish_reason`` column (``"stop"`` when the
+            model finished, ``"length"`` when it was cut off at ``max_tokens``). Without
+            it a truncated generation is indistinguishable from a complete one, and it
+            silently corrupts a downstream `parse_json`. Null for an engine that does not
+            report one.
+        logprobs: also append a float ``logprob`` column (the generation's cumulative
+            log-probability). Null for an engine that does not report one.
+        num_workers: how many engines to build **in this process** and run batches
+            across. Leave at ``1`` for a GPU-resident engine: each worker calls
+            `engine_factory` again, so ``2`` loads two full copies of the weights onto
+            the same device. Raise it for a network-bound engine such as `http_engine`,
+            where the workers are waiting on sockets rather than holding a model.
+        target_batch_rows: re-chunk the stream to about this many rows per engine call,
+            hill-climbing the size for throughput. Unset (the default) preserves the
+            caller's batch boundaries. Setting it helps when the caller's batches are far
+            smaller than the engine's scheduler can fill, and costs the memory of holding
+            that many rows.
 
     Yields:
-        Each input batch with `output_column` appended, in order.
+        Each input batch with `output_column` appended, in order. With
+        `target_batch_rows` set the boundaries are the re-chunked ones instead.
     """
+    worker_class = llm_udf(
+        engine_factory,
+        prompt_column=prompt_column,
+        output_column=output_column,
+        template=template,
+        image_column=image_column,
+        adapter_column=adapter_column,
+        max_tokens_column=max_tokens_column,
+        temperature_column=temperature_column,
+        parse_json=parse_json,
+        usage=usage,
+        finish_reason=finish_reason,
+        logprobs=logprobs,
+    )
+    if num_workers <= 1 and target_batch_rows is None:
+        # The documented default: one engine, the caller's batches, in order. No pool,
+        # because a pool here would re-chunk the stream and build a second engine — both
+        # of which this function's contract says it does not do.
+        worker = worker_class()
+        for batch in batches:
+            yield worker(batch)
+        return
+    yield from _pooled(batches, worker_class, num_workers, target_batch_rows)
 
-    def make_worker() -> Callable[[pa.RecordBatch], pa.RecordBatch]:
-        engine = engine_factory()  # built once per worker
-        return lambda batch: _generate_batch(
-            engine,
-            batch,
-            prompt_column=prompt_column,
-            output_column=output_column,
-            template=template,
-            image_column=image_column,
-            adapter_column=adapter_column,
-            parse_json=parse_json,
-            usage=usage,
-        )
 
-    pool = InferencePool(make_worker, num_workers=num_workers, target_batch_rows=target_batch_rows)
+def _pooled(
+    batches: Iterable[pa.RecordBatch],
+    worker_class: type,
+    num_workers: int,
+    target_batch_rows: int | None,
+) -> Iterator[pa.RecordBatch]:
+    """Run the same worker across an `InferencePool`, re-chunking toward throughput.
+
+    Only reached when the caller explicitly asks for more than one worker or a target
+    batch size, since both change the shape `llm_generate` otherwise promises.
+    """
+    from batcher.ml.inference import InferencePool
+
+    pool = InferencePool(
+        worker_class,
+        num_workers=num_workers,
+        target_batch_rows=target_batch_rows or 256,
+        objective="throughput",
+    )
     yield from pool.run(batches)
 
 
 def _generate_batch(
-    engine: Engine,
-    batch: pa.RecordBatch,
-    *,
-    prompt_column: str,
-    output_column: str,
-    template: str | None,
-    image_column: str | None,
-    adapter_column: str | None,
-    parse_json: bool,
-    usage: bool,
+    engine: Engine, batch: pa.RecordBatch, spec: GenerateSpec | None = None, **spec_kwargs: Any
 ) -> pa.RecordBatch:
     """One batch through the engine: build requests, generate, append the columns.
 
-    The single place the columnar work lives, shared by the streaming `llm_generate`
-    and the `llm_udf` class UDF, so the two entry points cannot drift.
+    The single place the columnar work lives, reached by both entry points, so the two
+    cannot drift. Pass a `GenerateSpec`, or the spec's fields as keywords — the latter is
+    the seam the engine tests drive, so a caller need not construct a spec to exercise
+    one batch.
+
+    Requests are dispatched **length-sorted** and the results un-permuted (see
+    `_length_sorted_order`), so the appended columns line up with the caller's rows
+    exactly as they did before.
     """
     import pyarrow as pa
 
-    requests = _build_requests(template, prompt_column, image_column, adapter_column, batch)
-    outputs = list(engine(requests))
-    if parse_json:
-        col = pa.array([_safe_json(o) for o in outputs])
-    else:
-        col = pa.array([str(o) for o in outputs], type=pa.string())
-    arrays = [batch.column(i) for i in range(batch.num_columns)] + [col]
-    names = [*batch.schema.names, output_column]
-    if usage:
-        prompt_toks, completion_toks = _usage_columns(engine, len(outputs))
-        arrays += [prompt_toks, completion_toks]
-        names += ["prompt_tokens", "completion_tokens"]
-    return pa.RecordBatch.from_arrays(arrays, names=names)
+    if spec is None:
+        spec = GenerateSpec(**spec_kwargs)
+
+    from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
+
+    requests = _build_requests(spec, batch)
+    order = _length_sorted_order(requests)
+    with usage_sink().capture(), finish_reason_sink().capture(), logprob_sink().capture():
+        generated = list(engine([requests[i] for i in order]))
+        reported = _Reported(
+            usage=usage_sink().collected(),
+            reasons=finish_reason_sink().collected(),
+            logprobs=logprob_sink().collected(),
+        )
+    if len(generated) != len(order):
+        raise _count_mismatch(engine, len(generated), len(order))
+    outputs = _restore_order(generated, order)
+
+    arrays = [batch.column(i) for i in range(batch.num_columns)]
+    arrays.append(_output_column(outputs, spec))
+    arrays += _reported_columns(engine, outputs, order, reported, spec)
+    return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, *spec.appended_columns])
 
 
-def llm_udf(
-    engine_factory: EngineFactory,
-    *,
-    prompt_column: str,
-    output_column: str = "response",
-    template: str | None = None,
-    image_column: str | None = None,
-    adapter_column: str | None = None,
-    parse_json: bool = False,
-    usage: bool = False,
-) -> type:
-    """A **load-once class UDF** that appends an LLM-generated column to each batch.
+class _Reported:
+    """What the engine pushed into the per-call channels, in dispatch order."""
 
-    The same generation as `llm_generate`, packaged as a class so `map_batches` builds
-    the engine once per worker and schedules it on GPU actors — which is what lets
-    `ds.ml.generate` reuse the whole `num_gpus`/`concurrency`/`accelerator_type`
-    machinery instead of owning a second scheduler. A plain function would rebuild the
-    engine (reloading the model) on every batch.
+    __slots__ = ("logprobs", "reasons", "usage")
 
-    Args:
-        engine_factory: zero-arg callable returning an `Engine`; called once per worker.
-        prompt_column: the text column to send (ignored when `template` is set).
-        output_column: name of the appended generated column.
-        template: optional ``str.format`` template over the row's columns.
-        image_column: optional image column for vision-language models.
-        adapter_column: optional per-row LoRA adapter name.
-        parse_json: parse each output as JSON into a struct column (null on error).
-        usage: also append ``prompt_tokens`` / ``completion_tokens``.
-
-    Returns:
-        A class whose instances map a `pyarrow.RecordBatch` to the batch plus the
-        generated column(s).
-    """
-
-    class _LlmGenerate:
-        """Holds one engine for the worker's lifetime; called once per batch."""
-
-        def __init__(self) -> None:
-            self._engine = engine_factory()
-
-        def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-            return _generate_batch(
-                self._engine,
-                batch,
-                prompt_column=prompt_column,
-                output_column=output_column,
-                template=template,
-                image_column=image_column,
-                adapter_column=adapter_column,
-                parse_json=parse_json,
-                usage=usage,
-            )
-
-    return _LlmGenerate
+    def __init__(self, usage: list | None, reasons: list | None, logprobs: list | None) -> None:
+        self.usage = usage
+        self.reasons = reasons
+        self.logprobs = logprobs
 
 
-def _safe_json(text: str) -> object | None:
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        return None
-
-
-def _usage_columns(engine: object, n: int):
-    """Per-row `(prompt_tokens, completion_tokens)` Int64 arrays from the engine's
-    `last_usage` (set on its most recent call), or all-null when it reports none.
-
-    `last_usage` is `n` `(prompt_tokens, completion_tokens)` pairs in prompt order; a
-    `None` pair (a request whose usage the engine couldn't report) yields nulls for that
-    row."""
+def _output_column(outputs: list, spec: GenerateSpec) -> Any:
+    """The generated column: parsed JSON structs, or plain strings."""
     import pyarrow as pa
 
-    reported = getattr(engine, "last_usage", None)
-    pairs = list(reported) if reported is not None else [None] * n
-    prompt = [p[0] if p else None for p in pairs]
-    completion = [p[1] if p else None for p in pairs]
-    return pa.array(prompt, type=pa.int64()), pa.array(completion, type=pa.int64())
+    from batcher.ml.llm.columns import _safe_json
+
+    if spec.parse_json:
+        return pa.array([_safe_json(o) for o in outputs])
+    return pa.array([str(o) for o in outputs], type=pa.string())
+
+
+def _reported_columns(
+    engine: Engine, outputs: list, order: list[int], reported: _Reported, spec: GenerateSpec
+) -> list:
+    """The optional side-channel columns, in the order `GenerateSpec.appended_columns`
+    names them — the one place that ordering is decided for both."""
+    from batcher.ml.llm.columns import _finish_reason_column, _logprob_column, _usage_columns
+
+    n = len(outputs)
+    arrays: list = []
+    if spec.usage:
+        arrays.extend(_usage_columns(engine, n, reported.usage, order))
+    if spec.finish_reason:
+        arrays.append(_finish_reason_column(reported.reasons, n, order))
+    if spec.logprobs:
+        arrays.append(_logprob_column(reported.logprobs, n, order))
+    return arrays
+
+
+def _count_mismatch(engine: object, got: int, expected: int) -> Exception:
+    from batcher._internal.errors import BackendError
+
+    return BackendError(
+        f"{type(engine).__name__} returned {got} generations for {expected} requests; "
+        "an engine must return exactly one string per request, in request order."
+    )

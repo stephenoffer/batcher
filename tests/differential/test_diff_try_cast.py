@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -21,8 +22,6 @@ def test_try_cast_string_to_int_nulls_bad_values(duck):
     Batcher follows Arrow here; this test exercises integer and junk strings only,
     which is the safe-ingest contract `try_cast` is for.
     """
-    from conftest import assert_same
-
     t = pa.table({"s": ["10", "-5", "abc", "", "42", None, "999"]})
     duck.register("tc", t)
     out = bt.from_arrow(t).select(si=col("s").try_cast("int64")).collect()
@@ -31,8 +30,6 @@ def test_try_cast_string_to_int_nulls_bad_values(duck):
 
 def test_try_cast_string_to_float(duck):
     """String → float64 with junk values nulled (vs DuckDB ``TRY_CAST``)."""
-    from conftest import assert_same
-
     t = pa.table({"s": ["1.5", "nope", "-2.25", None, "1e3"]})
     duck.register("tcf", t)
     out = bt.from_arrow(t).select(f=col("s").try_cast("float64")).collect()
@@ -41,8 +38,6 @@ def test_try_cast_string_to_float(duck):
 
 def test_try_cast_dataset_strict_false(duck):
     """`Dataset.cast(strict=False)` applies ``TRY_CAST`` to every named column."""
-    from conftest import assert_same
-
     t = pa.table({"a": ["1", "x", "3"], "b": ["9", "8", "bad"]})
     duck.register("tcd", t)
     out = bt.from_arrow(t).cast({"a": "int64", "b": "int64"}, strict=False).collect()

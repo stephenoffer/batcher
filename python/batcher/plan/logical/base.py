@@ -54,6 +54,27 @@ def _memoize_noarg(fn, slot: str):
     return wrapper
 
 
+def _reject_duplicate_aliases(aliases: list[str], *, what: str) -> None:
+    """Raise `PlanError` if `aliases` names a column more than once.
+
+    A relation's output column names must be unique: a duplicate silently collapses
+    when the result is materialized to a name-keyed structure (``to_pydict``), losing
+    one of the columns. Rejecting at build time (as Polars does) turns that silent data
+    loss into an actionable error. `what` labels the site (e.g. ``"select"``).
+    """
+    seen: set[str] = set()
+    dups: list[str] = []
+    for name in aliases:
+        if name in seen and name not in dups:
+            dups.append(name)
+        seen.add(name)
+    if dups:
+        raise PlanError(
+            f"{what} would produce duplicate output column(s) {dups}; each output column "
+            "needs a distinct name — rename one with .alias('...') or a keyword"
+        )
+
+
 def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
     """Raise `PlanError` if `expr` references a column not in `available`.
 
@@ -97,11 +118,22 @@ class LogicalPlan:
         `sort_keys` is unnecessary — `to_ir()` builds its dicts in a fixed, deterministic
         order, so the serialization already canonicalizes an identical plan — which is why
         the compact, unsorted dump is a safe key (never a wrong hit; at worst a missed one).
+
+        A plan carrying an **opaque** node (`map_batches` runs in Python and deliberately has
+        no engine IR, so its `to_ir()` raises) cannot be fingerprinted by content. Such a plan
+        is keyed by *instance identity* instead: the memo still hits when the same plan object
+        is optimized twice (the adaptive loop, a `collect` loop), and two different UDFs can
+        never collide onto one key — a collision would hand one query the other's optimized
+        plan, i.e. a wrong answer. A rebuilt-from-scratch UDF plan simply misses and
+        re-optimizes, which is only ever a cost, never an error.
         """
         cache = self.__dict__
         val = cache.get("_c_content_key", _UNSET)
         if val is _UNSET:
-            payload = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
+            try:
+                payload = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
+            except NotImplementedError:
+                payload = f"opaque:{id(self):x}"
             val = hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
             cache["_c_content_key"] = val
         return val

@@ -72,5 +72,6 @@ asserting it. Don't ship a positioning statement the benchmark doesn't support.
 
 ## Gate before "done"
 
-For any perf-relevant change: correctness gate first (`.claude/rules/testing.md`),
-then `python benchmarks/run.py` with no regression vs the prior ratios.
+The canonical gate matrix is in `CLAUDE.md` — run the rows your change touches. Performance
+delta: **correctness first**, then `python benchmarks/run.py` with no regression vs the prior
+ratios. A fast wrong answer is a bug, so never report a timing on an unverified path.

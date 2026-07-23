@@ -37,7 +37,11 @@ pub(crate) fn bounded_group_histogram(
         None => DataType::Null,
     };
 
-    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr)?;
+    // `canon_value = true`: the in-memory `finalize_histogram` canonicalizes float leaves
+    // (`bc_runtime::agg::median::finalize_histogram`), so the spill path must fold `-0.0`/
+    // `0.0` and every NaN identically — else the histogram of a signed-zero column splits
+    // one bucket into two under memory pressure.
+    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr, true)?;
     let Some(schema) = schema else {
         let empty = histogram_map(
             new_empty_array(&value_type),

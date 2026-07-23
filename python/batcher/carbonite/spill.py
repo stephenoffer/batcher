@@ -18,6 +18,7 @@ always works.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 from dataclasses import dataclass
@@ -69,6 +70,28 @@ def _clamp_to_free_disk(local_dir: str, budget: int | None) -> int | None:
     return safe if budget is None else min(budget, safe)
 
 
+# Free bytes below which the local tier is treated as exhausted regardless of how much of
+# its own budget the store has used. The budget accounts for *this store's* bytes, so it is
+# blind to anyone else consuming the same volume — a co-tenant process, another query's
+# scratch, or a log that grew. Re-measuring catches that; this floor is the headroom the
+# measurement is compared against, matching `_SPILL_DISK_FRACTION`'s intent of never taking
+# the last sliver.
+_SPILL_DISK_FLOOR_BYTES = 256 << 20
+
+
+def _free_disk_bytes(path: str) -> int | None:
+    """Measured free bytes on the filesystem holding `path`, or `None` if it can't be stat'd."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:  # pragma: no cover - unstat-able volume
+        return None
+
+
+def _is_out_of_space(exc: OSError) -> bool:
+    """Whether `exc` is the disk filling up, as opposed to any other IO failure."""
+    return exc.errno == errno.ENOSPC
+
+
 def _open_local_map(path: str) -> pa.MemoryMappedFile:
     """Memory-map a local spill file, mapping a *missing* file to a retryable error.
 
@@ -98,11 +121,18 @@ class SpillTier(Enum):
 
 @dataclass(frozen=True, slots=True)
 class SpillHandle:
-    """An opaque reference to one spilled partition (tier + path + size)."""
+    """An opaque reference to one spilled partition (tier + path + sizes).
+
+    `nbytes` is the **compressed, on-disk** size (what the local-budget accounting charges).
+    `logical_nbytes` is the **uncompressed, in-memory** size of everything written — what a
+    reducer must budget against before reading the bucket back into RAM, since a compressible
+    bucket's on-disk size can be many times smaller than its resident footprint.
+    """
 
     tier: SpillTier
     path: str
     nbytes: int
+    logical_nbytes: int = 0
 
 
 def _fsspec_open(path: str, mode: str):
@@ -163,21 +193,56 @@ class _BucketWriter:
         self._path: str | None = None
         self._fh = None
         self._writer: pa.ipc.RecordBatchStreamWriter | None = None
+        # Bytes this writer has streamed to the LOCAL tier but not yet finalized. Counted
+        # live against the store's local budget so a *sibling* bucket opened later routes to
+        # the remote tier once the buckets already streaming have exhausted the local budget
+        # — the on-close accounting alone cannot see an open bucket's growth (see the store).
+        self._pending_bytes = 0
 
     def write(self, batch: pa.RecordBatch) -> None:
         if batch.num_rows == 0:
             return
         if self._writer is None:
             self._open(batch.schema)
-        self._writer.write_batch(batch)
+        try:
+            self._writer.write_batch(batch)
+        except OSError as exc:
+            # A full scratch disk otherwise surfaces as a bare `OSError: [Errno 28]` from
+            # deep inside the Arrow writer, which names neither the spill tier nor the way
+            # out. It cannot be recovered in place — the batches already streamed to this
+            # bucket are not retained, so failing over to the remote tier mid-stream would
+            # silently drop them — so the honest move is to fail with the fix in the message.
+            if self._tier is SpillTier.LOCAL and _is_out_of_space(exc):
+                raise ResourceError(
+                    f"the local spill disk is full while writing {self._path!r}. Free space "
+                    f"on the scratch volume, point memory.spill_dir at a larger one, or set "
+                    f"memory.spill_remote_uri so buckets overflow to object storage instead."
+                ) from exc
+            raise
+        if self._tier is SpillTier.LOCAL:
+            # Charge the batch's (uncompressed, in-memory) size to the store's live local
+            # usage as it lands, not just at close. A slight over-estimate vs the compressed
+            # on-disk size only makes overflow trigger a touch early — safe (never over-fills
+            # the disk), and result-invariant (the remote tier reads back identically).
+            self._pending_bytes += batch.nbytes
+            self._store._local_pending += batch.nbytes
 
     def _open(self, schema: pa.Schema) -> None:
         store = self._store
-        overflow = (
-            store._remote_uri is not None
-            and store._local_budget is not None
-            and store._local_used >= store._local_budget
+        # Two independent reasons to overflow, and the second is why the first is not enough:
+        # the budget accounts only for bytes *this store* wrote, so a volume filled by anyone
+        # else (a co-tenant, another query's scratch, a growing log) stays invisible to it and
+        # the local tier keeps writing until the filesystem returns ENOSPC — a hard query
+        # failure. The clamp at construction is a single sample taken before any of that
+        # happened. Re-measuring per bucket is the only way overflow can track a disk that
+        # fills *during* the query; a bucket's tier is fixed at open, so this is also the last
+        # point where the choice is still free (mid-stream there are already-written batches
+        # that would have to be rewritten).
+        over_budget = (
+            store._local_budget is not None
+            and store._local_used + store._local_pending >= store._local_budget
         )
+        overflow = store._remote_uri is not None and (over_budget or store._local_disk_low())
         if overflow:
             self._tier = SpillTier.REMOTE
             self._path = f"{store._remote_uri}/{self._name}.arrow"
@@ -199,8 +264,19 @@ class _BucketWriter:
             return None
         self._writer.close()
         self._fh.close()
+        # The uncompressed (in-memory) size of everything written — captured before the LOCAL
+        # branch zeroes the pending estimate. The reducer budgets against this, not the
+        # compressed on-disk `nbytes` below (which for a compressible bucket can be far smaller
+        # and would let an over-large bucket skip re-spill recursion and OOM the finalize).
+        logical_nbytes = self._pending_bytes
+        if self._tier is SpillTier.LOCAL:
+            # This bucket is finalized: hand its bytes from the live "pending" estimate to
+            # the store's confirmed `_local_used` (`_on_closed` adds the real file size), so
+            # the two are never double-counted.
+            self._store._local_pending -= self._pending_bytes
+            self._pending_bytes = 0
         nbytes = self._store._on_closed(self._tier, self._path)
-        return SpillHandle(self._tier, self._path, nbytes)
+        return SpillHandle(self._tier, self._path, nbytes, logical_nbytes)
 
 
 class TieredSpillStore:
@@ -231,7 +307,24 @@ class TieredSpillStore:
         self._local_budget = _clamp_to_free_disk(local_dir, local_budget_bytes)
         self._compression = compression
         self._local_used = 0
+        # Bytes streamed to the local tier by writers that are still OPEN. The tier decision
+        # is made once, on a bucket's first write, from the local budget — but `_local_used`
+        # only grows when a bucket CLOSES, so with several buckets streaming at once (the
+        # partition phase's pattern) none of them ever observes the others' growth and the
+        # remote overflow tier never engages, letting the local disk fill past its budget.
+        # Tracking in-flight bytes here lets a later-opened bucket overflow correctly.
+        self._local_pending = 0
         self._local_paths: list[str] = []
+
+    def _local_disk_low(self) -> bool:
+        """Whether the scratch volume is too full to start another local bucket.
+
+        Measured, not accounted: this is what catches a disk filled by something other
+        than this store. An unstat-able volume reads as "not low", so the budget alone
+        decides and behavior is exactly as before.
+        """
+        free = _free_disk_bytes(self._local_dir)
+        return free is not None and free < _SPILL_DISK_FLOOR_BYTES
 
     @property
     def local_bytes(self) -> int:
@@ -298,3 +391,4 @@ class TieredSpillStore:
                 os.remove(path)
         self._local_paths.clear()
         self._local_used = 0
+        self._local_pending = 0

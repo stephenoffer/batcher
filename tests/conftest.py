@@ -15,7 +15,64 @@ Learning *within* a single test (multiple `collect()`s in one function) is prese
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
+
+_DOCS_TESTS = Path(__file__).parent / "docs"
+
+
+def pytest_configure(config):
+    """Drop the platform's injected Ray runtime-env hook before any test starts Ray.
+
+    A managed workspace (Anyscale) exports ``RAY_RUNTIME_ENV_HOOK``, and that hook merges
+    the workspace's cluster-wide pip list into *every* runtime env Ray builds. If any entry
+    in that list is unresolvable, every Ray worker dies in `RuntimeEnvSetupError` before it
+    runs a line — and one entry is reliably unresolvable, because installing this project
+    the way its own docs say to (``pip install 'batcher-engine[delta]'``) registers
+    ``batcher-engine[delta]`` as a cluster dependency that no index can serve.
+
+    The engine already pins ``pip: None`` in the runtime env it builds itself
+    (`dist/executors/ray_runtime/lifecycle.py::_self_ship_runtime_env`), but the hook runs
+    on *any* ``ray.init``, including the implicit one Ray Data does inside
+    `bt.from_ray_dataset`. So the interop and distributed tests inherited the broken list
+    from a code path the engine never sees.
+
+    Dropping the hook for the test process only. Workers then use the node's base image,
+    which is where the workspace's packages already live, so nothing is lost. This is the
+    same defence the engine applies to a hook whose module is missing.
+    """
+    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
+        os.environ.pop(var, None)
+
+
+@pytest.fixture(autouse=True)
+def _docs_run_like_a_reader(request, monkeypatch):
+    """Doc examples execute the way a reader runs them: one process, no attached cluster.
+
+    `resolve_distributed("auto", ...)` consults the *live* Ray session, which makes the docs
+    suite order-dependent. Run it alone and every example executes locally, exactly as a
+    reader sees it; run it after a suite that happened to start Ray (the io and distributed
+    tests do) and the same examples suddenly route to a multi-node cluster.
+
+    That is not hypothetical. A doc example that defines its own `Source` — the custom
+    connector guide does, and it is the whole point of that page — cannot report a row
+    count, so "auto" takes the *unknown size means assume large* branch and distributes it.
+    The class is defined in the doc block, so it exists on no worker, and the page fails for
+    a reason that has nothing to do with the page.
+
+    Scoped by path here rather than in a `tests/docs/conftest.py`, because a second
+    top-level module named `conftest` shadows `tests/differential/conftest.py` — and 174
+    differential tests import `assert_same` from it by bare name.
+    """
+    if _DOCS_TESTS not in request.path.parents:
+        return
+    try:
+        import ray
+    except ImportError:
+        return
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
 
 @pytest.fixture(autouse=True)

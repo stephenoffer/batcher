@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -22,8 +23,6 @@ def t(duck):
 
 def test_base64_encode_vs_duckdb(duck, t):
     # DuckDB `to_base64(encode(s))` is standard base64 of the UTF-8 bytes.
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(b=col("s").str.base64()).collect()
     expected = duck.sql("SELECT to_base64(encode(s)) b FROM t")
     assert_same(out, expected)
@@ -39,8 +38,6 @@ def test_base64_roundtrip():
 def test_unhex_roundtrip_vs_duckdb(duck, t):
     # hex (existing) then unhex recovers the original; DuckDB agrees via
     # decode(unhex(hex(s))).
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r=col("s").str.hex().str.unhex()).collect()
     expected = duck.sql("SELECT decode(unhex(hex(s))) r FROM t")
     assert_same(out, expected)

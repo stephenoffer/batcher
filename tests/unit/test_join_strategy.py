@@ -66,9 +66,11 @@ def test_small_build_side_picks_broadcast():
 
 
 def test_large_build_side_stays_hash():
-    # 500k rows × 64 B ≈ 32 MiB > the 10 MiB broadcast budget, and below the
-    # 1M-row sort-merge floor → plain hash.
-    big = 500_000
+    # The build side is the narrower `k`-only scan: 2M rows × 8 B (int64) = 16 MB,
+    # over the broadcast budget and under the sort-merge row floor → plain hash.
+    # (Sized in *true* bytes: widths come from the column's Arrow type, so a row's
+    # width is its schema's, not a flat per-row constant — see plan.types.widths.)
+    big = 2_000_000
     plan, est = _plan_with_sizes(left_rows=big, right_rows=big)
     out, decisions = adaptive_build_side(plan, est)
     assert out.strategy == "hash"
@@ -150,6 +152,6 @@ def test_already_sorted_medium_sides_stay_hash():
         join_type="inner",
         output=(JoinOutputCol("left", "k", "k"), JoinOutputCol("right", "v", "v")),
     )
-    est = CardinalityEstimator([_Source(500_000), _Source(500_000)], None)
+    est = CardinalityEstimator([_Source(2_000_000), _Source(2_000_000)], None)
     out, _decisions = adaptive_build_side(join, est)
     assert out.strategy == "hash"

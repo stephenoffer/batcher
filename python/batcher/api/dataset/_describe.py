@@ -144,5 +144,69 @@ def profile(ds: Dataset) -> Dataset:
     )
 
 
+def corr_matrix(ds: Dataset, columns: list[str] | None) -> Dataset:
+    """The pairwise Pearson correlation matrix over numeric columns (one scan).
+
+    Every pair's ``corr`` runs as one aggregate in a **single** pass — not ``N**2``
+    separate queries — then the tiny one-row result is transposed into a labeled matrix
+    (a control-plane reshape, never a per-row touch). The diagonal is ``1.0`` (or ``None``
+    for a constant column, which has no correlation); the matrix is symmetric.
+    """
+    from batcher.plan.functions.aggregate import corr
+
+    return _pairwise_matrix(ds, columns, corr, "corr_matrix")
+
+
+def cov_matrix(ds: Dataset, columns: list[str] | None) -> Dataset:
+    """The pairwise sample covariance matrix over numeric columns (one scan).
+
+    The covariance companion to `corr_matrix` (uses ``covar_samp``): the same
+    single-pass, symmetric, transposed-matrix shape. The diagonal is each column's
+    variance. Feeds PCA / whitening and Gaussian modeling.
+    """
+    from batcher.plan.functions.aggregate import covar_samp
+
+    return _pairwise_matrix(ds, columns, covar_samp, "cov_matrix")
+
+
+def _pairwise_matrix(ds: Dataset, columns: list[str] | None, agg_fn, what: str) -> Dataset:
+    """Build a symmetric matrix of a pairwise aggregate over numeric columns, one scan.
+
+    Shared by `corr_matrix` and `cov_matrix`: `agg_fn(col_a, col_b)` is the per-pair
+    aggregate. Only the unordered pairs are computed (the aggregate is symmetric), then
+    the one-row result is transposed into a ``column``-labeled matrix.
+    """
+    all_cols = ds.columns
+    types = dict(zip(all_cols, ds.schema.types, strict=True))
+    if columns is None:
+        cols = [c for c in all_cols if _is_numeric(types[c])]
+    else:
+        for c in columns:
+            if c not in types:
+                raise PlanError(f"{what}: unknown column {c!r}")
+            if not _is_numeric(types[c]):
+                raise PlanError(f"{what}: column {c!r} is not numeric")
+        cols = list(columns)
+    if not cols:
+        raise PlanError(f"{what}: no numeric columns")
+
+    aggs = {}
+    for i, a in enumerate(cols):
+        for j in range(i, len(cols)):
+            aggs[f"c__{i}__{j}"] = agg_fn(col(a), col(cols[j]))
+    cell = ds.agg(**aggs).collect().to_pydict()
+
+    def _pair(i: int, j: int) -> float | None:
+        lo, hi = (i, j) if i <= j else (j, i)
+        return _as_float(cell[f"c__{lo}__{hi}"][0])
+
+    from batcher.api.session import from_arrow
+
+    out = {"column": pa.array(cols, pa.string())}
+    for j, b in enumerate(cols):
+        out[b] = pa.array([_pair(i, j) for i in range(len(cols))], type=pa.float64())
+    return from_arrow(pa.table(out))
+
+
 def _as_float(value: object) -> float | None:
     return None if value is None else float(value)  # type: ignore[arg-type]

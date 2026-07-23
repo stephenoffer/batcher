@@ -7,12 +7,12 @@ only referenced for typing here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector
-from batcher.plan.logical import Aggregate, AggregateSpec, Projection
+from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -65,14 +65,71 @@ class GroupBy:
         keys = [*self._keys, *self._named]
         return f"GroupBy(keys={keys!r})"
 
-    def agg(self, *aggs: AggExpr, **named: AggExpr) -> Dataset:
+    def __iter__(self) -> NoReturn:
+        """Reject iteration, pointing at the relational spelling instead.
+
+        pandas lets you loop over ``(key, sub_frame)`` pairs. Batcher cannot: that
+        materializes one frame per distinct key in the control plane, which is
+        ``O(groups)`` Python over data the engine is meant to reduce in Rust — and it
+        caps the operation at a single machine.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "b"], "v": [1, 2]})
+                >>> try:
+                ...     iter(ds.group_by("g"))
+                ... except Exception as exc:
+                ...     print(type(exc).__name__)
+                PlanError
+
+        Raises:
+            PlanError: Always.
+        """
+        raise PlanError(
+            "a GroupBy is not iterable — looping over groups would materialize one "
+            "frame per key in Python. Aggregate instead: .agg(total=col('x').sum()), "
+            "or use .window(partition_by=[...]) to compute per-group values while "
+            "keeping every row."
+        )
+
+    @property
+    def keys(self) -> list[str]:
+        """The grouping key column names, in order.
+
+        Returns:
+            The positional key names followed by any named key expressions.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"g": ["a"], "v": [1]}).group_by("g").keys
+                ['g']
+        """
+        return [*self._keys, *self._named]
+
+    def agg(self, *aggs: AggExpr | dict[str, Any], **named: AggExpr | Expr) -> Dataset:
         """Compute aggregates per group, returning a new `Dataset`.
+
+        A single positional ``dict`` is the pandas spelling:
+        ``agg({"salary": "sum"})`` names the output after the column, and
+        ``agg({"salary": ["min", "max"]})`` suffixes each reducer
+        (``salary_min``, ``salary_max``), as pandas does when it flattens.
 
         Keyword args bind an output name to an aggregate (`col("x").sum()`,
         `count()`, ...). A positional arg is a bare single-column aggregate
         (``col("x").sum()``) that keeps its source column's name — use a keyword when
         you want a different output name. The result columns are the group keys
         followed by the aggregates, in the order given.
+
+        A keyword value may also be a whole **expression over aggregates** —
+        ``col("x").sum() / col("y").sum()``, ``col("v").max() - col("v").min()`` — not
+        just a single one. The engine still runs one mergeable aggregate pass; the
+        surrounding arithmetic is computed in a projection over the aggregated columns, so
+        the result is identical single-node and distributed. Aggregates cannot be nested
+        (``sum(x).mean()``).
 
         For the common case of reducing every value column the same way, prefer the
         shortcut methods (`sum`, `mean`, `count`, ...) over spelling out `agg`.
@@ -89,28 +146,103 @@ class GroupBy:
                 ... ).sort("dept").to_pydict()
                 {'dept': ['eng', 'sales'], 'total': [220, 90], 'n': [2, 1]}
 
+                >>> ds.group_by("dept").agg(
+                ...     avg=bt.col("salary").sum() / bt.count()
+                ... ).sort("dept").to_pydict()
+                {'dept': ['eng', 'sales'], 'avg': [110.0, 90.0]}
+
         Args:
             *aggs: Bare single-column aggregates (``col(name).<agg>()``) that keep
-                ``name`` as the output column.
-            **named: Output column name to aggregate expression.
+                ``name`` as the output column, or a single pandas-style
+                ``{column: reducer}`` / ``{column: [reducers]}`` dict.
+            **named: Output column name to an aggregate, or an expression over aggregates.
 
         Returns:
             A new lazy `Dataset` of the group keys followed by the aggregates.
 
         Raises:
-            PlanError: If no aggregate is given, or a value is not an aggregate
-                expression.
+            PlanError: If no aggregate is given, or a value neither is nor contains an
+                aggregate expression.
         """
+        if len(aggs) == 1 and isinstance(aggs[0], dict):
+            return self.agg(**{**self._spec_to_aggs(aggs[0]), **named})
         resolved = {**self._named_aggs(aggs), **named}
         if not resolved:
             raise PlanError("agg() requires at least one aggregate")
-        for alias, agg in resolved.items():
-            if not isinstance(agg, AggExpr):
+        return self._source._derive(self._lower_aggregates(resolved))
+
+    def _spec_to_aggs(self, spec: dict[str, Any]) -> dict[str, AggExpr]:
+        """Expand a pandas ``{column: "sum"}`` / ``{column: ["min", "max"]}`` agg spec.
+
+        A single reducer keeps the source column's name (``{"v": "sum"}`` → ``v``);
+        a list disambiguates with a suffix (``{"v": ["min", "max"]}`` → ``v_min``,
+        ``v_max``), which is how pandas names the flattened result.
+        """
+        out: dict[str, AggExpr] = {}
+        available = self._source._plan.available_columns()
+        for column, reducers in spec.items():
+            if column not in available:
+                raise PlanError(f"agg(): unknown column {column!r}; available: {sorted(available)}")
+            names = [reducers] if isinstance(reducers, str) else list(reducers)
+            for fn in names:
+                reducer = getattr(Col(column), fn, None)
+                if reducer is None or not callable(reducer):
+                    raise PlanError(
+                        f"agg(): {fn!r} is not an aggregate; try 'sum', 'mean', 'min', "
+                        "'max', 'count', 'median', 'std', 'var', or 'n_unique'"
+                    )
+                out[column if len(names) == 1 else f"{column}_{fn}"] = reducer()
+        return out
+
+    def _group_key_projections(self) -> tuple[Projection, ...]:
+        """The group-by output columns: positional keys by name, plus named key exprs."""
+        return tuple(Projection(k, Col(k)) for k in self._keys) + tuple(
+            Projection(alias, expr) for alias, expr in self._named.items()
+        )
+
+    def _lower_aggregates(self, resolved: dict[str, AggExpr | Expr]):
+        """Lower ``{alias: aggregate-or-expression-over-aggregates}`` to a logical plan.
+
+        A pure aggregate becomes one `AggregateSpec`. An expression *over* aggregates has
+        its aggregate leaves hoisted into hidden columns (deduplicated) and the surrounding
+        scalar expression re-evaluated in a following `Project`. When every output is a
+        bare aggregate the projection is skipped — the plan shape is exactly as before.
+        """
+        from batcher.plan.expr_ir.walk import (
+            AggregateLeafRegistry,
+            contains_aggregate,
+            split_aggregate_leaves,
+        )
+
+        registry = AggregateLeafRegistry()
+        pure_specs: list[AggregateSpec] = []
+        project_items: list[Projection] = []
+        has_composite = False
+        for alias, value in resolved.items():
+            if isinstance(value, AggExpr):
+                pure_specs.append(AggregateSpec(alias, value))
+                project_items.append(Projection(alias, Col(alias)))
+            elif isinstance(value, Expr) and contains_aggregate(value):
+                has_composite = True
+                project_items.append(Projection(alias, split_aggregate_leaves(value, registry)))
+            else:
                 raise PlanError(
-                    f"agg() value for {alias!r} must be an aggregate expression, "
-                    f"e.g. col('x').sum() or count()"
+                    f"agg() value for {alias!r} must be an aggregate expression or an "
+                    "expression over aggregates, e.g. col('x').sum() or "
+                    "col('x').sum() / col('y').sum()"
                 )
-        return self._finish(tuple(AggregateSpec(a, e) for a, e in resolved.items()))
+
+        group_keys = self._group_key_projections()
+        watermark = self._source._watermark
+        if not has_composite:
+            return Aggregate(self._source._plan, group_keys, tuple(pure_specs), watermark=watermark)
+
+        hidden = tuple(AggregateSpec(name, agg) for name, agg in registry.leaves())
+        agg_plan = Aggregate(
+            self._source._plan, group_keys, tuple(pure_specs) + hidden, watermark=watermark
+        )
+        passthrough = tuple(Projection(k.alias, Col(k.alias)) for k in group_keys)
+        return Project(agg_plan, passthrough + tuple(project_items))
 
     def len(self, name: str = "len") -> Dataset:
         """Count the rows in each group.
@@ -313,6 +445,183 @@ class GroupBy:
         """
         return self._reduce("n_unique", columns)
 
+    def nunique(self, *columns: str | Selector) -> Dataset:
+        """Count distinct values per group — the pandas ``nunique`` spelling of :meth:`n_unique`.
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every
+                non-key column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group distinct counts.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
+                >>> ds.group_by("g").nunique().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [1, 1]}
+        """
+        return self._reduce("n_unique", columns)
+
+    def size(self, name: str = "size") -> Dataset:
+        """Count the rows in each group — the pandas ``size`` spelling of :meth:`len`.
+
+        Args:
+            name: Name of the output count column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group row count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"]})
+                >>> ds.group_by("g").size().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'size': [2, 1]}
+        """
+        return self.len(name)
+
+    def first(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
+        """The first value of each column per group, along an explicit `order_by`.
+
+        `order_by` is required, and deliberately so: a relation has no inherent row
+        order, so a "first" without one would return whichever row a morsel happened
+        to reach first — an answer that changes between runs and between one machine
+        and a cluster. pandas and Polars leave this implicit; Batcher does not.
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every
+                non-key column.
+            order_by: The column or expression defining "first" within each group.
+
+        Returns:
+            A new `Dataset` of the group keys followed by each column's first value.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a"], "t": [2, 1], "v": [20, 10]})
+                >>> ds.group_by("g").first("v", order_by="t").to_pydict()
+                {'g': ['a'], 'v': [10]}
+        """
+        return self._ordered_reduce("first", columns, order_by)
+
+    def last(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
+        """The last value of each column per group, along an explicit `order_by`.
+
+        `order_by` is required for the same reason as in :meth:`first`: without a
+        defined order, "last" is whichever row arrived last, which is not a result.
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every
+                non-key column.
+            order_by: The column or expression defining "last" within each group.
+
+        Returns:
+            A new `Dataset` of the group keys followed by each column's last value.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a"], "t": [2, 1], "v": [20, 10]})
+                >>> ds.group_by("g").last("v", order_by="t").to_pydict()
+                {'g': ['a'], 'v': [20]}
+        """
+        return self._ordered_reduce("last", columns, order_by)
+
+    def head(self, n: int = 5, *, order_by: str | Expr) -> Dataset:
+        """The first `n` rows of each group along `order_by`, keeping every column.
+
+        The pandas ``groupby().head(n)`` idiom, and unlike the reducers it returns
+        *rows*, not aggregates. It lowers to a `row_number` window partitioned by the
+        group keys plus a filter, so it stays one streaming pass and is identical
+        single-node and distributed.
+
+        `order_by` is required for the same reason as in :meth:`first`: without a
+        defined order, "the first n" is whichever rows a morsel reached first.
+
+        Args:
+            n: How many rows to keep per group.
+            order_by: The column or expression defining the order within each group.
+
+        Returns:
+            A new `Dataset` of the surviving rows, with the original columns.
+
+        Raises:
+            PlanError: If `n` is less than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [2, 1, 3]})
+                >>> ds.group_by("g").head(1, order_by="v").sort("g").to_pydict()
+                {'g': ['a', 'b'], 'v': [1, 3]}
+        """
+        return self._ranked_rows(n, order_by, descending=False)
+
+    def tail(self, n: int = 5, *, order_by: str | Expr) -> Dataset:
+        """The last `n` rows of each group along `order_by`, keeping every column.
+
+        The pandas ``groupby().tail(n)`` idiom. Implemented as :meth:`head` over the
+        reversed order, so it carries the same streaming and distribution properties.
+
+        Args:
+            n: How many rows to keep per group.
+            order_by: The column or expression defining the order within each group.
+
+        Returns:
+            A new `Dataset` of the surviving rows, with the original columns.
+
+        Raises:
+            PlanError: If `n` is less than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [2, 1, 3]})
+                >>> ds.group_by("g").tail(1, order_by="v").sort("g").to_pydict()
+                {'g': ['a', 'b'], 'v': [2, 3]}
+        """
+        return self._ranked_rows(n, order_by, descending=True)
+
+    def _ranked_rows(self, n: int, order_by: str | Expr, *, descending: bool) -> Dataset:
+        """Keep the `n` lowest- (or highest-) ranked rows per group, via `row_number`."""
+        if n < 1:
+            raise PlanError(f"group_by().head()/tail(): n must be >= 1, got {n}")
+        if self._named:
+            raise PlanError(
+                "group_by().head()/tail() needs plain column keys — a derived key "
+                "(group_by(k=expr)) has no column on the input rows to partition by. "
+                "Add the derived key with with_columns() first, then group by its name."
+            )
+        rank = "__bc_group_rank"
+        ranked = self._source.window(
+            partition_by=list(self._keys),
+            order_by=[(order_by, descending)] if isinstance(order_by, str) else [order_by],
+            functions={rank: "row_number"},
+        )
+        return ranked.filter(Col(rank) <= n).drop(rank)
+
+    def _ordered_reduce(
+        self, fn: str, columns: tuple[str | Selector, ...], order_by: str | Expr
+    ) -> Dataset:
+        """Reduce with an order-dependent aggregate (`first`/`last`) along `order_by`."""
+        targets = self._resolve_columns(columns, numeric_only=False)
+        if not targets:
+            raise PlanError(
+                f"group_by().{fn}() has no value columns to reduce; name them explicitly"
+            )
+        key = Col(order_by) if isinstance(order_by, str) else order_by
+        specs = tuple(AggregateSpec(c, getattr(Col(c), fn)(key)) for c in targets)
+        return self._finish(specs)
+
     def std(self, *columns: str | Selector) -> Dataset:
         """Sample standard deviation per group (every non-key numeric column by default).
 
@@ -353,10 +662,115 @@ class GroupBy:
         """
         return self._reduce("var", columns)
 
+    def product(self, *columns: str | Selector) -> Dataset:
+        """Product of each value column per group (every non-key numeric column by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every
+                non-key numeric column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group products.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 5]})
+                >>> ds.group_by("g").product().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [6.0, 5.0]}
+        """
+        return self._reduce("product", columns)
+
+    def array_agg(self, *columns: str | Selector) -> Dataset:
+        """Collect each value column's values into a list per group (all non-key by default).
+
+        The group-wise ``array_agg`` / ``list`` aggregate — gather each group's values into a
+        `List` column, e.g. to build a per-entity sequence of features for a model. Values
+        appear in input order.
+
+        Args:
+            *columns: Columns (names or selectors) to collect; defaults to every non-key
+                column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by a `List` column per collected column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
+                >>> ds.group_by("g").array_agg().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [[1, 2], [3]]}
+        """
+        return self._reduce("array_agg", columns)
+
+    def mode(self, *columns: str | Selector) -> Dataset:
+        """The most frequent value of each column per group (all non-key columns by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every non-key column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group modes.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "a", "b"], "x": [5, 5, 7, 9]})
+                >>> ds.group_by("g").mode().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [5, 9]}
+        """
+        return self._reduce("mode", columns)
+
+    def skewness(self, *columns: str | Selector) -> Dataset:
+        """Sample skewness of each column per group (every non-key numeric column by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every non-key
+                numeric column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group skewness.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [1.0, 2.0, 3.0]})
+                >>> ds.group_by("g").skewness().to_pydict()
+                {'g': ['a'], 'x': [0.0]}
+        """
+        return self._reduce("skewness", columns)
+
+    def kurtosis(self, *columns: str | Selector) -> Dataset:
+        """Sample excess kurtosis of each column per group (numeric columns by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every non-key
+                numeric column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group kurtosis.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "a", "a"], "x": [1.0, 2.0, 3.0, 4.0]})
+                >>> round(ds.group_by("g").kurtosis().to_pydict()["x"][0], 2)
+                -1.2
+        """
+        return self._reduce("kurtosis", columns)
+
     # Reductions whose default (all non-key columns) is restricted to numeric columns,
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
     # so an explicit-columns call is required to attempt it.
-    _NUMERIC_ONLY = frozenset({"sum", "mean", "median", "std", "var"})
+    _NUMERIC_ONLY = frozenset(
+        {"sum", "mean", "median", "std", "var", "product", "skewness", "kurtosis"}
+    )
 
     def _value_columns(self, numeric_only: bool) -> list[str]:
         """The default reduction targets: non-key columns, optionally numeric ones only."""
@@ -408,6 +822,12 @@ class GroupBy:
         out: dict[str, AggExpr] = {}
         for a in aggs:
             if isinstance(a, AggExpr) and isinstance(a.input, Col):
+                if a.input.name in out:
+                    raise PlanError(
+                        f"agg() got two positional aggregates over column {a.input.name!r}, "
+                        "which would both be named after it; give one a keyword name, "
+                        "e.g. agg(total=col('x').sum(), avg=col('x').mean())"
+                    )
                 out[a.input.name] = a
             else:
                 raise PlanError(
@@ -418,8 +838,10 @@ class GroupBy:
         return out
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
-        group_keys = tuple(Projection(k, Col(k)) for k in self._keys) + tuple(
-            Projection(alias, expr) for alias, expr in self._named.items()
+        plan = Aggregate(
+            self._source._plan,
+            self._group_key_projections(),
+            specs,
+            watermark=self._source._watermark,
         )
-        plan = Aggregate(self._source._plan, group_keys, specs, watermark=self._source._watermark)
         return self._source._derive(plan)

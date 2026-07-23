@@ -181,11 +181,18 @@ impl ShuffleExchange {
     /// concrete win over routing every partition through an object store. `None`
     /// if nothing was published under `ticket` here. RecordBatch clones are shallow
     /// (Arc buffer bumps), so this does not copy the underlying data.
+    ///
+    /// Zero-row batches are dropped so the result is identical to what a network
+    /// `fetch` of the same ticket returns: the credit-gated `do_exchange` producer
+    /// filters empty batches (the Flight encoder emits no message for one), so if
+    /// `local_partition` did *not*, a co-located source would hand the reducer stray
+    /// zero-row batches a remote source never would — a divergence between the
+    /// DIRECT_MEMORY and network transfer modes for the same published partition.
     pub async fn local_partition(&self, ticket: &ShuffleTicket) -> Option<Vec<RecordBatch>> {
         self.store
             .get(&ticket.to_string())
             .await
-            .map(|b| (*b).clone())
+            .map(|b| b.iter().filter(|rb| rb.num_rows() > 0).cloned().collect())
     }
 
     /// High-water mark of how many batches the producer had in flight (sent but
@@ -574,11 +581,19 @@ impl ClientPool {
     /// This is what makes the striping reach Batcher's real reduce path: it runs one
     /// Flight endpoint per node, so a reducer pulls each node's whole bucket over one
     /// stream; sharding turns that one stream into `stripe` flows. `stripe <= 1` is
-    /// exactly [`Self::fetch_secured`]. The per-shard credit window is `credits/stripe`
-    /// (min 1), so the total in-flight memory bound is unchanged. The shards' union is
-    /// the whole bucket; within-bucket order is not preserved (the reducer re-orders or
-    /// commutatively combines downstream, as it already must across sources). A shard
-    /// fault propagates so the gather's recovery layer recomputes the source.
+    /// exactly [`Self::fetch_secured`]. Each shard runs its **own full `credits` window**,
+    /// not `credits/stripe`: a shard is an independent TCP flow with its own congestion
+    /// window, and on a high-bandwidth-delay-product (cross-region) link that per-flow
+    /// cwnd — not the app credit window — is the throughput ceiling. Splitting one window
+    /// across the flows starves each to ~1 credit and forfeits the parallelism entirely
+    /// (measured: N full-window flows scale aggregate throughput ~N x over a 100 ms-RTT
+    /// link — 1 -> 16 flows = 1.9 -> 22 MiB/s — versus flat with a split window). Total
+    /// in-flight is therefore `stripe x credits` batches; `stripe` is bounded upstream by
+    /// `connections_per_peer` (and the fan-in), and `credits` by Carbonite's byte budget,
+    /// so the product stays within the channel envelope. The shards' union is the whole
+    /// bucket; within-bucket order is not preserved (the reducer re-orders or commutatively
+    /// combines downstream, as it already must across sources). A shard fault propagates so
+    /// the gather's recovery layer recomputes the source.
     pub async fn fetch_secured_striped(
         &self,
         addr: &str,
@@ -590,7 +605,7 @@ impl ClientPool {
         if stripe <= 1 {
             return self.fetch_secured(addr, ticket, credits, token).await;
         }
-        let per_shard = (credits / stripe).max(1);
+        let per_shard = credits.max(1);
         let fetches = (0..stripe).map(|shard| async move {
             let channel = self.channel(addr).await?;
             let mut client = FlightClient::from_channel(channel);

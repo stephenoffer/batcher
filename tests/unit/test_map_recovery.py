@@ -112,7 +112,7 @@ def test_actor_pool_replaces_a_dead_actor(monkeypatch):
             self.run = _Remote(self._run)
             self.gpu_stats = _Remote(lambda: None)
 
-        def _run(self, part):
+        def _run(self, part, idx=0):
             # The partition "p1" preempts its actor the first time it is seen.
             if part == "p1" and part not in crashed:
                 crashed.add(part)
@@ -125,7 +125,7 @@ def test_actor_pool_replaces_a_dead_actor(monkeypatch):
             return cls
 
         @classmethod
-        def remote(cls, plan0):
+        def remote(cls, plan0, write_spec=None):
             return _FakeActor()
 
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)
@@ -157,7 +157,7 @@ def test_actor_pool_reraises_deterministic_error(monkeypatch):
 
     class _FakeActor:
         def __init__(self) -> None:
-            self.run = _Remote(lambda part: _raise(RayTaskError("UDF bug")))
+            self.run = _Remote(lambda part, idx=0: _raise(RayTaskError("UDF bug")))
             self.gpu_stats = _Remote(lambda: None)
 
     class _FakeMapActor:
@@ -166,7 +166,7 @@ def test_actor_pool_reraises_deterministic_error(monkeypatch):
             return cls
 
         @classmethod
-        def remote(cls, plan0):
+        def remote(cls, plan0, write_spec=None):
             return _FakeActor()
 
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)

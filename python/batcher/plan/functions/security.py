@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import warnings
 
 from batcher._internal.errors import PlanError, SecurityWarning
@@ -46,7 +47,14 @@ __all__ = ["aes_decrypt", "aes_encrypt", "hmac_sha256", "mask"]
 _AES_KEY_BYTES = 32
 
 #: Key-reference schemes resolved by the data plane at execution time (never in Python).
-_KEY_REF_SCHEMES = ("env:", "file:")
+#:
+#: **This list is a two-sided contract with `bc-secrets`.** Python only decides whether a
+#: key is a *reference* (pass it through) or an *inline literal* (warn, and validate that
+#: it decodes to 32 bytes); the resolution happens in Rust. A scheme missing here is not
+#: merely unsupported — it is validated as raw key material and rejected at plan-build
+#: time, so the engine never gets the chance to resolve it. Add a backend in
+#: `bc-secrets` and a scheme here in the same change.
+_KEY_REF_SCHEMES = ("env:", "file:", "cmd:")
 
 
 def _is_key_ref(key: str) -> bool:
@@ -58,8 +66,35 @@ def _is_key_ref(key: str) -> bool:
     return isinstance(key, str) and key.startswith(_KEY_REF_SCHEMES)
 
 
+#: Env var that upgrades the inline-key warning to a hard error. Set it (to any truthy
+#: value) in a deployment where a key must never enter a plan.
+_REQUIRE_KEY_REFS_VAR = "BATCHER_REQUIRE_KEY_REFS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _require_key_refs() -> bool:
+    """Whether inline keys are forbidden outright in this deployment."""
+    return os.environ.get(_REQUIRE_KEY_REFS_VAR, "").strip().lower() in _TRUTHY
+
+
 def _warn_inline_key(func: str) -> None:
-    """Warn that an inline key is embedded in the query and its serialized plan."""
+    """Warn that an inline key is embedded in the query and its serialized plan.
+
+    Under `BATCHER_REQUIRE_KEY_REFS` this raises instead. A warning is the right default
+    (an inline key is legitimate in a notebook or a test), but it is a weak control for a
+    regulated deployment: `SecurityWarning` is a `UserWarning`, so Python prints it once
+    per location and any caller that has filtered warnings never sees it at all — while
+    the key still travels verbatim in the IR JSON, into `explain(format="json")`, into the
+    plan fingerprint, and out to every Ray worker the plan is shipped to. The env var lets
+    an operator make that unrepresentable rather than merely discouraged.
+    """
+    if _require_key_refs():
+        raise PlanError(
+            f"{func}(): an inline key is refused because {_REQUIRE_KEY_REFS_VAR} is set. "
+            f"Use a reference — key='env:MY_KEY' or key='file:/run/secrets/key' — which "
+            f"the engine resolves on the executing node, so the secret never enters the "
+            f"plan, its serialized IR, or any explain/profile output."
+        )
     warnings.warn(
         f"{func}(): an inline key is embedded in the query plan (and any plan log / "
         f"profile / explain output). Prefer a reference — key='env:MY_KEY' or "

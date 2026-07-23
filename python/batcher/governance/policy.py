@@ -40,6 +40,16 @@ class Grant:
     principal then sees exactly the union of the columns its roles are granted. A table
     with no grant at all is ungoverned for access (though it may still carry masks and
     row filters), so installing a catalog does not silently lock out every query.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import Grant
+            >>> grant = Grant("analyst", "orders", columns={"order_id", "total"})
+            >>> sorted(grant.columns)
+            ['order_id', 'total']
+            >>> Grant("admin", "orders").columns is None  # every column
+            True
     """
 
     role: str
@@ -58,6 +68,15 @@ class ColumnMask:
     The mask is applied at the scan, so *everything* downstream — filters, joins,
     aggregates, the final projection — sees only the masked value. A principal cannot
     recover the underlying value by filtering on it or grouping by it.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import ColumnMask, Redact
+            >>> policy = ColumnMask("customers", "ssn", Redact(show_last=4))
+            >>> policy.mask(col("ssn"))
+            col('ssn').cast('string').str.mask('X', 0, 4)
     """
 
     table: str
@@ -77,6 +96,16 @@ class TagMask:
     (``catalog.tag(table, column, "pii")``) and one `TagMask` governs every column so
     classified, in every table, including tables added later. An explicit `ColumnMask`
     on a column overrides the tag-derived mask for that column.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import Nullify, TagMask
+            >>> policy = TagMask("pii", Nullify(), exempt_roles={"security"})
+            >>> policy.tag
+            'pii'
+            >>> sorted(policy.exempt_roles)  # these roles read the raw value
+            ['security']
     """
 
     tag: str
@@ -98,6 +127,17 @@ class RowFilter:
 
     Multiple row filters on one table are conjoined (``AND``): filters restrict, and
     adding one can never widen what a principal sees.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import MatchesAttribute, Principal, RowFilter
+            >>> policy = RowFilter(
+            ...     "orders", MatchesAttribute("region", "region"), name="by_region"
+            ... )
+            >>> analyst = Principal("ana", roles={"analyst"}, attrs={"region": "EU"})
+            >>> policy.predicate(analyst)
+            (col('region') == lit('EU'))
     """
 
     table: str

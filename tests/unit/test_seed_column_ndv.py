@@ -18,9 +18,10 @@ import batcher as bt
 from batcher import core, kyber
 from batcher.api.terminal._metadata import ndv_columns, seed_column_ndv
 from batcher.config import active_config, config_context
-from batcher.io.source._impl import InMemorySource
+from batcher.io.source import InMemorySource
 from batcher.metadata.backends import InProcessBackend
 from batcher.metadata.hub import MetadataHub
+from batcher.plan.source_stats import source_stats_key
 
 pytestmark = pytest.mark.unit
 
@@ -43,15 +44,24 @@ def _hub() -> MetadataHub:
     return MetadataHub(InProcessBackend())
 
 
-def _ndv(hub: MetadataHub) -> dict[str, float]:
-    return kyber.load_learned_stats(hub).get(kyber.NDV_KEY, {})
+def _ndv(hub: MetadataHub, src: InMemorySource | None = None) -> dict[str, float]:
+    """The distinct counts learned **for `src`** (every source's, when `src` is None).
+
+    Column statistics are filed per source, so reading them back means asking about a
+    source — a bare column name identifies nothing (two tables both have an `id`).
+    """
+    learned = kyber.load_learned_stats(hub)
+    if src is None:
+        return learned.get(kyber.NDV_KEY, {})
+    return kyber.columns_for(learned, kyber.NDV_KEY, source_stats_key(src))
 
 
 def test_seeds_distinct_counts_for_a_resident_source():
     hub = _hub()
     assert _ndv(hub) == {}
-    seed_column_ndv(hub, [_source()])
-    ndv = _ndv(hub)
+    src = _source()
+    seed_column_ndv(hub, [src])
+    ndv = _ndv(hub, src)
     assert ndv["uniq"] == pytest.approx(50_000, rel=0.03)  # HLL error budget
     assert ndv["ten"] == pytest.approx(10, rel=0.03)
     assert ndv["const"] == pytest.approx(1, rel=0.03)
@@ -164,6 +174,6 @@ def test_seeding_restricted_to_relevant_columns():
     session.register("t", table)
     plan = session.sql("SELECT const, sum(ten) s FROM t GROUP BY const")._plan
     seed_column_ndv(hub, [src], plan)
-    measured = set(_ndv(hub))
+    measured = set(_ndv(hub, src))
     assert "const" in measured
     assert "uniq" not in measured  # never referenced by the plan

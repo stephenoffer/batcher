@@ -121,6 +121,12 @@ exclude_patterns = [
     # An engineering audit ledger (findings fixed / still open), kept in-tree so the
     # analysis is recoverable. A working record for contributors, not a site page.
     "internals/audit_ledger.md",
+    # The same: a measured audit of the connectors at TB/PB scale, kept in-tree as the
+    # record behind the scale work. A working document, not a published page.
+    "internals/connector_scale_audit.md",
+    # The same again: the running ledger of the engine-wide defect hunt (found / fixed /
+    # open). A contributor's working record, not a site page.
+    "internals/bug_hunt_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
@@ -131,6 +137,23 @@ exclude_patterns = [
     # Design/migration note for porting the optimizer's cold hot-path passes to Rust.
     # A contributor working record (scope + dependency-ordered migration), not a site page.
     "internals/rust_optimizer_port.md",
+    # A code-checked audit of Batcher's architecture against DuckDB / Polars / Spark /
+    # Flink / Ray Data / Daft / Snowflake: where it genuinely wins, where it loses, the
+    # structural ceilings, and the claims the code does not support. A working record for
+    # contributors (and deliberately blunt about our own marketing), not a site page.
+    "internals/competitive_architecture.md",
+    # A code-checked parity scorecard against the Databricks stack (Catalyst/AQE, Photon,
+    # Reyden/Lakehouse//RT) covering the optimizer, vectorized execution, the distributed
+    # path, and the enterprise surface — plus the Databricks claims that are secondary-
+    # sourced and must not be cited. A working record for contributors, not a site page.
+    "internals/databricks_parity.md",
+    # A code-checked audit of which Ray performance pitfalls Batcher avoids by design and
+    # which it still inherits, read against a field-engineering corpus. A contributor
+    # working record like the parity scorecards above, not a site page.
+    "internals/ray_pitfall_parity.md",
+    # The authoring guide for the diagram sources that live beside it (palette, the
+    # rsvg-convert render step). A contributor note in an asset directory, not a page.
+    "_static/diagrams/README.md",
 ]
 
 # -- Options for HTML output -------------------------------------------------

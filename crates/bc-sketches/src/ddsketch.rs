@@ -176,10 +176,33 @@ impl DDSketch {
         self.quantile(0.5)
     }
 
+    /// Upper boundary of bucket `i`: bucket `i` holds magnitudes in
+    /// `(γ^(i-1), γ^i]`, so `γ^i` is the largest magnitude it can contain.
+    ///
+    /// This — not [`value_of`](Self::value_of), the bucket's geometric *centre* —
+    /// is what a "is the whole bucket ≤ x?" test must compare against. Testing the
+    /// centre drops a bucket whenever `x` falls in its upper α-band, which is how
+    /// `rank` used to lose the maximum's own bucket and return 0.99 for `rank(max)`.
+    #[inline]
+    fn upper_bound_of(&self, i: i32) -> f64 {
+        self.gamma.powi(i)
+    }
+
     /// Approximate fraction of values ≤ `x`, in `[0, 1]` — the selectivity of
     /// `col <= x`. Returns 0 for an empty sketch.
+    ///
+    /// Clamped at the tracked exact min/max (as `TDigest::rank` and
+    /// `KllSketch::rank` are), so `rank(max) == 1.0` and `rank(< min) == 0.0`
+    /// exactly. Without that clamp `selectivity_gt = 1 - rank` carries a non-zero
+    /// floor no predicate can ever clear, which biases the optimizer's cost model.
     pub fn rank(&self, x: f64) -> f64 {
         if self.n == 0 {
+            return 0.0;
+        }
+        if x >= self.max {
+            return 1.0;
+        }
+        if x < self.min {
             return 0.0;
         }
         let mut below = 0u64;
@@ -187,19 +210,20 @@ impl DDSketch {
             // x ≥ 0: every negative and every zero is ≤ x.
             below += self.negative.values().sum::<u64>();
             below += self.zeros;
-            // Positive buckets whose representative value ≤ x.
+            // Positive buckets lying entirely at or below x.
             for (&i, &c) in self.positive.iter() {
-                if self.value_of(i) <= x {
+                if self.upper_bound_of(i) <= x {
                     below += c;
                 } else {
                     break;
                 }
             }
         } else {
-            // x < 0: only sufficiently large-magnitude negatives are ≤ x.
-            // Negative value -value_of(i) ≤ x  ⇔  value_of(i) ≥ -x.
+            // x < 0: only sufficiently large-magnitude negatives are ≤ x. Bucket
+            // `i` of the mirror map holds values in `[-γ^i, -γ^(i-1))`, so the
+            // whole bucket is ≤ x when its *least* negative end is: -γ^(i-1) ≤ x.
             for (&i, &c) in self.negative.iter().rev() {
-                if -self.value_of(i) <= x {
+                if -self.upper_bound_of(i - 1) <= x {
                     below += c;
                 } else {
                     break;
@@ -436,6 +460,113 @@ mod tests {
         // rank below everything → ~0, above everything → 1.
         assert!(s.rank(0.0) < 0.001, "rank(0)={}", s.rank(0.0));
         assert_eq!(s.rank(200_000.0), 1.0);
+    }
+
+    /// Regression: `rank` compared `x` against each bucket's geometric *centre*
+    /// rather than its upper boundary, so a bucket was dropped whenever `x` landed
+    /// in its upper α-band — and unlike `TDigest`/`KllSketch`, `rank` had no
+    /// min/max clamp. `rank(max)` came back 0.99 instead of 1.0, giving
+    /// `selectivity_gt = 1 - rank` a non-zero floor it could never clear.
+    #[test]
+    fn rank_at_max_is_one() {
+        let mut d = DDSketch::new(0.01);
+        for i in 1..=100 {
+            d.add(i as f64);
+        }
+        assert_eq!(d.rank(100.0), 1.0, "rank at the maximum must be exactly 1");
+        assert_eq!(d.rank(1.0e9), 1.0);
+        assert_eq!(d.rank(0.5), 0.0, "rank below the minimum must be 0");
+
+        // Signed data: the same must hold on the negative side.
+        let mut e = DDSketch::new(0.01);
+        for i in -50..=50 {
+            e.add(i as f64);
+        }
+        assert_eq!(e.rank(50.0), 1.0);
+        assert_eq!(e.rank(-50.0 - 1e-9), 0.0);
+        // The max clamp is the asymmetric one that matters: `1 - rank` is the
+        // `>` selectivity, so a missing top bucket becomes a floor no predicate
+        // can clear. At the minimum, under-counting by one bucket is inside α.
+        assert!(e.rank(-49.0) < 0.05);
+    }
+
+    /// `rank` must be monotone and must honour DDSketch's *value* guarantee: the
+    /// reported fraction is the true fraction ≤ some `x'` within one γ-bucket of
+    /// `x` — it can only be wrong about values in `x`'s own bucket.
+    #[test]
+    fn rank_respects_relative_accuracy() {
+        for alpha in [0.01, 0.05] {
+            // Signed data spanning zero, plus a Pareto tail.
+            let mut vals: Vec<f64> = (-500..=500).map(|i| i as f64 * 0.37).collect();
+            for i in 1..=2_000u32 {
+                vals.push(10.0 / (i as f64 / 2_000.0).powf(1.5)); // heavy tail
+                vals.push(-3.0 / (i as f64 / 2_000.0).powf(1.2));
+            }
+            let mut d = DDSketch::new(alpha);
+            for &v in &vals {
+                d.add(v);
+            }
+            let n = vals.len() as f64;
+            let frac_le = |t: f64| vals.iter().filter(|&&v| v <= t).count() as f64 / n;
+
+            let mut probes: Vec<f64> = vec![-1e6, -1_000.0, -1.0, -0.001, 0.0, 0.001, 1.0, 1e6];
+            probes.extend((0..40).map(|i| d.quantile(i as f64 / 40.0).unwrap()));
+
+            let mut prev = 0.0;
+            probes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for &x in &probes {
+                let r = d.rank(x);
+                assert!((0.0..=1.0).contains(&r), "rank {r} out of range at {x}");
+                assert!(r >= prev - 1e-12, "rank not monotone at {x}: {prev} -> {r}");
+                prev = r;
+
+                // Widen by one bucket (factor γ) in *value* space; the band must
+                // contain the estimate.
+                let gamma = (1.0 + alpha) / (1.0 - alpha);
+                let (lo, hi) = if x >= 0.0 {
+                    (x / gamma, x * gamma)
+                } else {
+                    (x * gamma, x / gamma)
+                };
+                assert!(
+                    r >= frac_le(lo) - 1e-12 && r <= frac_le(hi) + 1e-12,
+                    "alpha={alpha} x={x}: rank {r} outside [{}, {}]",
+                    frac_le(lo),
+                    frac_le(hi)
+                );
+            }
+            assert_eq!(d.rank(d.max().unwrap()), 1.0);
+        }
+    }
+
+    /// The α relative-error guarantee on *quantiles* is what the bucket-boundary
+    /// change must not disturb.
+    #[test]
+    fn quantile_relative_error_within_alpha() {
+        for alpha in [0.01, 0.05] {
+            let mut vals: Vec<f64> = (1..=5_000).map(|i| i as f64 * 0.11).collect();
+            for i in 1..=2_000u32 {
+                vals.push(10.0 / (i as f64 / 2_000.0).powf(1.5));
+            }
+            let mut d = DDSketch::new(alpha);
+            for &v in &vals {
+                d.add(v);
+            }
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+            for i in 1..100 {
+                let q = i as f64 / 100.0;
+                let k = (q * (sorted.len() - 1) as f64).round() as usize;
+                let got = d.quantile(q).unwrap();
+                // ±1 rank of slack for the 0-based index convention; the assertion
+                // under test is the *relative value* error, which is the guarantee.
+                let err = (k.saturating_sub(1)..=(k + 1).min(sorted.len() - 1))
+                    .map(|j| (got - sorted[j]).abs() / sorted[j].abs())
+                    .fold(f64::INFINITY, f64::min);
+                assert!(err <= alpha + 1e-9, "alpha={alpha} q={q}: rel err {err}");
+            }
+        }
     }
 
     #[test]

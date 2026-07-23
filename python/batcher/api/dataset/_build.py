@@ -17,7 +17,7 @@ from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, nullif, when
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
-from batcher.plan.ir_tags import WINDOW_AGGREGATES
+from batcher.plan.ir_tags import WINDOW_FRAMEABLE
 from batcher.plan.logical import (
     Sample,
     SortKeySpec,
@@ -74,6 +74,12 @@ def build_window(
     for alias, spec in functions.items():
         if isinstance(spec, str):
             specs.append(WindowFuncSpec(spec, None, alias))
+        elif isinstance(spec, tuple) and spec and spec[0] == "ntile":
+            # ntile: a no-input ranking function whose bucket count rides in `offset`
+            # — spelled ``("ntile", n)`` since it takes a count, not a column.
+            if len(spec) != 2:
+                raise PlanError(f"window function {alias!r}: ntile takes ('ntile', n)")
+            specs.append(WindowFuncSpec("ntile", None, alias, int(spec[1]), None))
         elif isinstance(spec, tuple):
             # (func, column) or, for lag/lead, (func, column, offset).
             if len(spec) == 2:
@@ -89,7 +95,7 @@ def build_window(
             # window engine names the aggregate `avg`, so accept both here.
             if func == "mean":
                 func = "avg"
-            fn_frame = wframe if func in WINDOW_AGGREGATES else None
+            fn_frame = wframe if func in WINDOW_FRAMEABLE else None
             specs.append(WindowFuncSpec(func, _as_key_expr(column), alias, int(offset), fn_frame))
         else:
             raise PlanError(
@@ -217,15 +223,47 @@ def build_train_test_split(
     return train, test
 
 
-def build_cast(ds: Dataset, dtypes: str | dict[str, str], *, strict: bool = True) -> Dataset:
-    """Cast columns — one dtype string for every column, or per-column via a dict.
+# Python builtins and NumPy/pandas dtype objects accepted where a Batcher dtype name
+# is expected, so `astype(float)` and `astype({"x": int})` read the way pandas spells
+# them. Widths follow the FFI boundary's normalization (Int*/Float* → 64-bit).
+_PY_TYPE_DTYPES: dict[Any, str] = {
+    int: "int64",
+    float: "float64",
+    str: "string",
+    bool: "boolean",
+    bytes: "binary",
+}
 
-    `strict=False` selects ``TRY_CAST`` (NULL on an unconvertible value).
+
+def _dtype_name(dtype: Any) -> str:
+    """Normalize a dtype specification to the string the IR expects."""
+    if isinstance(dtype, str):
+        return dtype
+    if dtype in _PY_TYPE_DTYPES:
+        return _PY_TYPE_DTYPES[dtype]
+    # A pyarrow DataType (or anything else that names itself) stringifies to the
+    # same vocabulary the cast expression already understands.
+    name = getattr(dtype, "__name__", None) or str(dtype)
+    if name in _PY_TYPE_DTYPES.values() or not isinstance(dtype, type):
+        return name
+    raise PlanError(
+        f"cast(): cannot interpret {dtype!r} as a dtype; pass a dtype name such as "
+        "'int64', a Python type (int/float/str/bool), or a pyarrow DataType"
+    )
+
+
+def build_cast(ds: Dataset, dtypes: str | type | dict[str, Any], *, strict: bool = True) -> Dataset:
+    """Cast columns — one dtype for every column, or per-column via a dict.
+
+    A dtype is a Batcher dtype name, a Python type (``int``, ``float``, ``str``,
+    ``bool``), or a pyarrow `DataType`. `strict=False` selects ``TRY_CAST`` (NULL on
+    an unconvertible value).
     """
 
-    def _cast(name: str, dtype: str) -> Expr:
+    def _cast(name: str, dtype: Any) -> Expr:
         e = Col(name)
-        return e.cast(dtype) if strict else e.try_cast(dtype)
+        target = _dtype_name(dtype)
+        return e.cast(target) if strict else e.try_cast(target)
 
     if isinstance(dtypes, dict):
         unknown = set(dtypes) - set(ds.columns)
@@ -286,11 +324,18 @@ def build_distinct(
     return ranked.filter(Col(rn) == 1).drop(rn)
 
 
-def build_explode(ds: Dataset, column: str, alias: str | None) -> Dataset:
+def build_explode(
+    ds: Dataset,
+    column: str,
+    alias: str | None,
+    *,
+    outer: bool = False,
+    index: str | None = None,
+) -> Dataset:
     """Construct an `Unnest` node (see `Dataset.explode` for the contract)."""
     if column not in ds.columns:
         raise PlanError(f"explode(): unknown column {column!r}")
-    return ds._derive(Unnest(ds._plan, column, alias or column))
+    return ds._derive(Unnest(ds._plan, column, alias or column, outer, index))
 
 
 def build_session_window(

@@ -78,6 +78,21 @@ pub struct EngineConfig {
     /// — keeping the physical schema equal to the statically-inferred `Dataset.schema`.
     /// Mirrors `ExecutionConfig.shrink_output_dtypes`.
     pub shrink_output_dtypes: bool,
+    /// Run the plan on the **streaming** executor: pull morsels through the linear runs and
+    /// materialize only at breakers, instead of collecting every operator's full output.
+    ///
+    /// This is the pipeline/breaker model the engine has always documented and never
+    /// implemented. Its peak memory is the breakers' state plus one morsel per worker — a
+    /// constant, independent of the input size — where the materializing path's grows with it,
+    /// which is why TPC-H sf100's deep join trees peaked at 133 GB and were OOM-killed. On the
+    /// same shape it also runs *faster*, because the copies it stops making were not free.
+    ///
+    /// `true` by default. It is not used for every plan: the engine falls back to the
+    /// materializing path where streaming cannot serve the shape — see `bc_py::execute_plan`.
+    /// Set `false` to force the materializing executor (a bisecting escape hatch, not a tuning
+    /// knob). Mirrors `ExecutionConfig.streaming`.
+    #[serde(default = "default_true")]
+    pub streaming: bool,
     // --- Performance-threshold knobs (mirror `bc_arrow::RuntimeTuning`) ----------
     // These are performance-only: they change *how* the parallel executor runs an
     // operator, never the relation it produces. Each default equals the historical
@@ -103,6 +118,11 @@ pub struct EngineConfig {
     pub skew_min_bucket_bytes: usize,
 }
 
+/// `#[serde(default)]` for a `bool` that defaults to `true` (serde's own default is `false`).
+fn default_true() -> bool {
+    true
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -115,6 +135,7 @@ impl Default for EngineConfig {
             op_budgets: HashMap::new(),
             fuse_linear: true,
             shrink_output_dtypes: false,
+            streaming: true,
             // Mirror `bc_arrow::RuntimeTuning::default()` field-for-field; the skew
             // floors reference the morsel consts the tuning struct derives them from.
             bloom_fp_rate: 0.01,

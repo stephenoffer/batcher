@@ -102,3 +102,149 @@ def test_an_empty_parquet_file_reads_as_no_rows(tmp_path):
     schema = pa.schema([("a", pa.int64())])
     pq.write_table(pa.table({"a": pa.array([], type=pa.int64())}, schema=schema), path)
     assert _rows(ParquetSource(path).read()) == []
+
+
+# ---- native reader predicate pushdown (footer-statistics row-group pruning) ----------
+
+
+def _multi_rg_parquet(tmp_path) -> str:
+    path = str(tmp_path / "rg.parquet")
+    # 4 row-groups of 250: column `a` = 0..999, so each group owns a disjoint 250-range.
+    pq.write_table(
+        pa.table({"a": list(range(1000)), "s": [str(i % 4) for i in range(1000)]}),
+        path,
+        row_group_size=250,
+    )
+    return path
+
+
+def test_native_predicate_translation_pushable_and_not():
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    # Column-vs-literal comparison (with the column on the right → operator flips).
+    assert to_native_predicate((col("a") >= 500).to_ir()) == {
+        "node": "cmp",
+        "col": "a",
+        "op": "ge",
+        "lit": 500,
+    }
+    assert to_native_predicate((5 < col("a")).to_ir()) == {  # noqa: SIM300 (tests operator flip)
+        "node": "cmp",
+        "col": "a",
+        "op": "gt",
+        "lit": 5,
+    }
+    # AND of two pushable terms.
+    both = to_native_predicate(((col("a") >= 500) & (col("s") == "1")).to_ir())
+    assert both == {
+        "node": "and",
+        "left": {"node": "cmp", "col": "a", "op": "ge", "lit": 500},
+        "right": {"node": "cmp", "col": "s", "op": "eq", "lit": "1"},
+    }
+    # A temporal literal is not pushable to the native zone-map (unit ambiguity) → None.
+    temporal = {
+        "e": "binary",
+        "op": "ge",
+        "left": col("a").to_ir(),
+        "right": {"e": "lit", "value": {"date": 100}},
+    }
+    assert to_native_predicate(temporal) is None
+
+
+def test_native_predicate_null_test_uses_the_tag_rust_deserializes():
+    """`IS [NOT] NULL` must be tagged `is_null` — the name `bc_io`'s `Pred` enum spells.
+
+    `Pred` is `#[serde(tag = "node", rename_all = "snake_case")]`, so its `IsNull` variant
+    deserializes from `"is_null"`. This emitted `"null"` once, and because an unparseable
+    predicate only costs *pruning* (the `Filter` always still runs), the drift was silent:
+    right answers, zero row-groups skipped. Worse, `parse` is all-or-nothing over a
+    conjunction — so a single null test disabled pruning for the whole filter.
+    """
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    assert to_native_predicate(col("a").is_null().to_ir()) == {
+        "node": "is_null",
+        "col": "a",
+        "negated": False,
+    }
+    assert to_native_predicate(col("a").is_not_null().to_ir()) == {
+        "node": "is_null",
+        "col": "a",
+        "negated": True,
+    }
+    # The regression shape: a null test ANDed with a prunable comparison.
+    assert to_native_predicate(((col("a") >= 500) & col("s").is_not_null()).to_ir()) == {
+        "node": "and",
+        "left": {"node": "cmp", "col": "a", "op": "ge", "lit": 500},
+        "right": {"node": "is_null", "col": "s", "negated": True},
+    }
+
+
+def test_native_read_prunes_row_groups_through_a_null_test(tmp_path):
+    """`a >= 500 AND s IS NOT NULL` must still prune — end to end, through the real reader.
+
+    The unit test above pins the tag; this pins the *consequence*. Before the fix the whole
+    conjunction failed to parse, so all 4 row-groups were read. Both reads return the same
+    rows either way (pruning is superset-safe), so the only observable difference is how much
+    was skipped — which is exactly why this needs its own assertion.
+    """
+    import json
+
+    import batcher._native as nat
+
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    path = _multi_rg_parquet(tmp_path)  # `s` is non-null in every group
+    pred = json.dumps(to_native_predicate(((col("a") >= 500) & col("s").is_not_null()).to_ir()))
+
+    out = nat.read_parquet_filtered(path, [], ["a"], 65536, pred)
+    vals = sorted(v for b in out for v in b.column(0).to_pylist())
+    # 500 rows, not 1000: groups 0+1 were pruned by the `a >= 500` arm, which can only happen
+    # if the `s IS NOT NULL` arm alongside it parsed.
+    assert len(vals) == 500
+    assert min(vals) == 500 and max(vals) == 999
+
+
+def test_native_filtered_read_prunes_row_groups_superset_safe(tmp_path):
+    import json
+
+    import batcher._native as nat
+
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    path = _multi_rg_parquet(tmp_path)
+    pred = json.dumps(to_native_predicate((col("a") >= 500).to_ir()))
+
+    # Pruned read: only row-groups 2+3 (a in [500,999]) survive → 500 rows, all >= 500.
+    out = nat.read_parquet_filtered(path, [], ["a"], 65536, pred)
+    vals = sorted(v for b in out for v in b.column(0).to_pylist())
+    assert len(vals) == 500
+    assert min(vals) == 500 and max(vals) == 999  # a strict superset would still be >= 500
+
+    # No row-group can match → provably empty.
+    none = json.dumps(to_native_predicate((col("a") > 100000).to_ir()))
+    assert nat.read_parquet_filtered(path, [], ["a"], 65536, none) == []
+
+    # A non-pushable / malformed predicate reads everything (never under-reads).
+    assert sum(b.num_rows for b in nat.read_parquet_filtered(path, [], ["a"], 65536, "x")) == 1000
+
+
+def test_native_scan_batches_pushes_predicate(tmp_path):
+    """The distributed native scan path applies predicate pruning and stays a superset."""
+    from batcher.dist.executors.scan_read import _native_scan_batches
+    from batcher.io.splits import parquet_row_group_splits
+    from batcher.plan.expr_ir import col
+
+    path = _multi_rg_parquet(tmp_path)
+    splits = parquet_row_group_splits(path, None)  # one split per row-group
+    result = _native_scan_batches(splits, ["a"], (col("a") >= 500).to_ir())
+    assert result is not None
+    vals = sorted(v for b in result for v in b.column(0).to_pylist())
+    # Row-group pruning keeps groups 2+3; every returned value satisfies the predicate's
+    # necessary condition (>= 500), and the true matches are all present.
+    assert set(range(500, 1000)) <= set(vals)
+    assert all(v >= 500 for v in vals)

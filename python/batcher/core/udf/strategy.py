@@ -20,6 +20,7 @@ It imports the callable builder from `udf` lazily, inside the probe, so there is
 from __future__ import annotations
 
 import pickle
+import threading
 import warnings
 
 import pyarrow as pa
@@ -30,6 +31,7 @@ __all__ = [
     "PROC_BATCHES_PER_WORKER",
     "PROC_MIN_BATCH_ROWS",
     "disable_processes",
+    "error_budget",
     "map_strategy",
     "thread_batch_target",
     "wants_processes",
@@ -63,6 +65,13 @@ _LIGHT_FN_ROW_SECONDS = 5e-8
 # exceeds `_PROC_WORTH_SECONDS` (cpu-heavy enough that multi-core beats the process overhead).
 _PROBE_ROWS = 65_536
 _PROBE_REPEATS = 3
+# Wall-clock ceiling for one `fn`'s per-row-cost probe. The probe RUNS the user's `fn`, so its
+# cost is the `fn`'s cost: a warm call plus `_PROBE_REPEATS` timed calls over `_PROBE_ROWS` rows
+# used to be paid before the query started, whatever the `fn` did per row. A `fn` already slower
+# than this on the sample is decisively "heavy" — the only verdict the probe feeds — so one
+# measurement answers the question and repeating it just multiplies a real cost (a remote API
+# call, a model forward). A cheap `fn` still gets every repeat, because every repeat is cheap.
+_PROBE_TIME_BUDGET_SECONDS = 0.05
 _GIL_BOUND_MAX = 1.4
 _PROC_WORTH_SECONDS = 0.5
 # Below this row count the thread path keeps the morsel and never probes — coarsening can't
@@ -133,6 +142,36 @@ def _persist_strategy(key: str | None, **fields: object) -> None:
         hub.put_keyed_param(_LEARN_NS, key, entry)
     except Exception:  # pragma: no cover - learning must never break a query
         return
+
+
+# The `max_errored_rows` allowances, one shared list per (`fn`, allowance) per worker process.
+#
+# The public contract says the allowance is "per worker". The code did not mean that: both
+# `execute._apply_udf` and `stream._apply_udf_stream` built `[op.max_errored_rows]` fresh on
+# every invocation, so each partition, each streaming window, and each of the two paths a single
+# query can route through got its OWN full allowance. `max_errored_rows=100` therefore meant
+# "100 per call", and the real bound grew with the number of calls — effectively unbounded at
+# scale, which is exactly the reverse of what a budget is for. Sharing one list per worker makes
+# the code mean the documented thing.
+#
+# It is deliberately NOT global across workers: a cluster-wide counter would need a round trip
+# per dropped row on the hot path. So the honest cluster bound is `workers x max_errored_rows`,
+# and that is what the public docstring must say.
+_ERROR_BUDGETS: dict[tuple[str, int], list[int]] = {}
+_BUDGET_LOCK = threading.Lock()
+
+
+def error_budget(op: MapBatches) -> list[int]:
+    """The shared ``[remaining, dropped]`` error budget for `op`'s UDF in this worker process.
+
+    One list per (`fn`, `max_errored_rows`) pair, so every batch, partition, window, and
+    execution path in this process draws down the same allowance. `_resilient_call` mutates
+    it in place: ``budget[0]`` counts down, ``budget[1]`` accumulates the drops (appended on
+    the first drop, so a one-element list stays valid).
+    """
+    key = _fn_probe_key(op.fn) or f"id:{id(op.fn)}"
+    with _BUDGET_LOCK:
+        return _ERROR_BUDGETS.setdefault((key, op.max_errored_rows), [op.max_errored_rows])
 
 
 def disable_processes(exc: BaseException) -> None:
@@ -251,7 +290,8 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
 
     Works for any callable (a closure/lambda too, unlike the process probe which needs a
     picklable `fn`), so the thread batch target can tell a light vectorized transform from a
-    heavy per-row one. Returns None if it can't be measured (unkeyable / probe raised).
+    heavy per-row one. Returns None if it can't be measured (unkeyable, not probe-safe, or
+    the probe raised) — the caller then keeps the conservative morsel floor.
     """
     key = _fn_probe_key(op.fn)
     if key is not None and key in _FN_ROW_SECONDS:
@@ -263,6 +303,8 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
         if isinstance(learned, (int, float)):
             _FN_ROW_SECONDS[key] = float(learned)
             return float(learned)
+    if not _probe_safe(op):
+        return None
     try:
         secs = _measure_row_seconds(op, current)
     except Exception:
@@ -273,8 +315,33 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
     return secs
 
 
+def _probe_safe(op: MapBatches) -> bool:
+    """Whether it is acceptable to CALL `op.fn` just to time it.
+
+    The probe answers one question — is this `fn` cheap enough per row that coarsening its
+    batches beats filling every core? — and it answers it by running the `fn` for real. Two
+    kinds of `fn` must never be asked:
+
+    * a **class (factory)** `fn`, which is a load-once model: `_probe_callable` instantiates
+      it and runs inference several times before the query has produced a row;
+    * a **GPU** `fn`, whose probe is the same device forward pass, on a device the query is
+      about to need.
+
+    Neither is ever "a cheap vectorized transform", so the verdict was predetermined and the
+    calls were pure cost. Both keep the conservative morsel floor instead. A side-effecting
+    plain function (one that calls a paid API) can't be detected statically; it is bounded
+    instead by `_PROBE_TIME_BUDGET_SECONDS`, which cuts it to a single call.
+    """
+    return not isinstance(op.fn, type) and op.num_gpus <= 0
+
+
 def _measure_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | None:
-    """Time `op.fn` on a small warmed sample; return seconds per row (None if no sample)."""
+    """Time `op.fn` on a small warmed sample; return seconds per row (None if no sample).
+
+    Bounded by `_PROBE_TIME_BUDGET_SECONDS`: a `fn` that is already slow on the warm call is
+    decisively heavy and is not re-run, and the repeats stop once the budget is spent. A cheap
+    `fn` — the only case whose exact cost changes the batch target — still gets every repeat.
+    """
     import time
 
     sample = pa.Table.from_batches(current[:1]).slice(0, _PROBE_ROWS).to_batches()
@@ -283,12 +350,18 @@ def _measure_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float
     probe = sample[0]
     rows = max(1, probe.num_rows)
     call = _probe_callable(op)
+    t0 = time.perf_counter()
     call(probe)  # warm
-    best = float("inf")
+    best = time.perf_counter() - t0
+    if best > _PROBE_TIME_BUDGET_SECONDS:
+        return best / rows
+    deadline = time.perf_counter() + _PROBE_TIME_BUDGET_SECONDS
     for _ in range(_PROBE_REPEATS):
         t0 = time.perf_counter()
         call(probe)
         best = min(best, time.perf_counter() - t0)
+        if time.perf_counter() >= deadline:
+            break
     return best / rows
 
 
@@ -335,7 +408,8 @@ def _run_proc_probe(op: MapBatches, total_rows: int, current: list[pa.RecordBatc
 
 def _probe_callable(op: MapBatches):
     """Build the per-batch callable for the probe (Arrow in/out, or format-wrapped)."""
-    from batcher.core.udf.execute import _formatted, build_udf_callable
+    from batcher.core.udf.call import _formatted
+    from batcher.core.udf.execute import build_udf_callable
 
     fn = build_udf_callable(op.fn)
     return fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)

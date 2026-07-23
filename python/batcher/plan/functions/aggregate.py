@@ -7,7 +7,7 @@ single-node and distributed with no new engine state.
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit, _wrap
+from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.conditional import iff
 
 
@@ -33,7 +33,7 @@ def corr(x: IntoExpr, y: IntoExpr) -> AggExpr:
             >>> ds.agg(c=bt.corr(bt.col("x"), bt.col("y"))).to_pydict()
             {'c': [1.0]}
     """
-    return AggExpr("corr", _wrap(x), input2=_wrap(y))
+    return AggExpr("corr", _as_column(x), input2=_as_column(y))
 
 
 def covar_pop(x: IntoExpr, y: IntoExpr) -> AggExpr:
@@ -56,7 +56,7 @@ def covar_pop(x: IntoExpr, y: IntoExpr) -> AggExpr:
             >>> ds.agg(c=bt.covar_pop(bt.col("x"), bt.col("y"))).to_pydict()
             {'c': [2.0]}
     """
-    return AggExpr("covar_pop", _wrap(x), input2=_wrap(y))
+    return AggExpr("covar_pop", _as_column(x), input2=_as_column(y))
 
 
 def covar_samp(x: IntoExpr, y: IntoExpr) -> AggExpr:
@@ -80,7 +80,7 @@ def covar_samp(x: IntoExpr, y: IntoExpr) -> AggExpr:
             >>> ds.agg(c=bt.covar_samp(bt.col("x"), bt.col("y"))).to_pydict()
             {'c': [4.0]}
     """
-    return AggExpr("covar_samp", _wrap(x), input2=_wrap(y))
+    return AggExpr("covar_samp", _as_column(x), input2=_as_column(y))
 
 
 def count_if(condition: Expr) -> AggExpr:
@@ -273,3 +273,203 @@ def n_unique(column: str | Expr) -> AggExpr:
             {'g': ['a', 'b'], 'x': [1, 1]}
     """
     return _as_column(column).n_unique()
+
+
+def product(column: str | Expr) -> AggExpr:
+    """Multiply a column's values — the ``pl.product('x')`` shorthand for ``col('x').product()``.
+
+    Args:
+        column: The column to multiply, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 4]})
+            >>> ds.group_by("g").agg(p=bt.product("x")).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'p': [6.0, 4.0]}
+    """
+    return _as_column(column).product()
+
+
+def mode(column: str | Expr) -> AggExpr:
+    """Most frequent value of a column (SQL ``MODE`` / DuckDB ``mode``; ties break low).
+
+    Args:
+        column: The column to summarize, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [5, 5, 9]})
+            >>> ds.group_by("g").agg(m=bt.mode("x")).to_pydict()
+            {'g': ['a'], 'm': [5]}
+    """
+    return _as_column(column).mode()
+
+
+def skewness(column: str | Expr) -> AggExpr:
+    """Sample skewness — the third standardized moment (DuckDB ``skewness``).
+
+    Args:
+        column: The column to summarize, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
+            >>> ds.agg(s=bt.skewness("x").round(4)).to_pydict()
+            {'s': [2.2324]}
+    """
+    return _as_column(column).skewness()
+
+
+def kurtosis(column: str | Expr) -> AggExpr:
+    """Sample excess kurtosis — the fourth standardized moment (DuckDB ``kurtosis``).
+
+    Args:
+        column: The column to summarize, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
+            >>> ds.agg(k=bt.kurtosis("x").round(4)).to_pydict()
+            {'k': [4.9869]}
+    """
+    return _as_column(column).kurtosis()
+
+
+def bool_and(column: str | Expr) -> AggExpr:
+    """True when every non-null value is true (SQL ``BOOL_AND`` / ``EVERY``).
+
+    Args:
+        column: The boolean column to reduce, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "ok": [True, False, True]})
+            >>> ds.group_by("g").agg(a=bt.bool_and("ok")).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'a': [False, True]}
+    """
+    return _as_column(column).bool_and()
+
+
+def bool_or(column: str | Expr) -> AggExpr:
+    """True when any non-null value is true (SQL ``BOOL_OR`` / ``SOME``).
+
+    Args:
+        column: The boolean column to reduce, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "ok": [True, False, False]})
+            >>> ds.group_by("g").agg(o=bt.bool_or("ok")).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'o': [True, False]}
+    """
+    return _as_column(column).bool_or()
+
+
+def bit_and(column: str | Expr) -> AggExpr:
+    """Bitwise AND of the non-null integer values in each group (SQL ``BIT_AND``).
+
+    Args:
+        column: The integer column to reduce, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [6, 10]})
+            >>> ds.group_by("g").agg(r=bt.bit_and("x")).to_pydict()
+            {'g': ['a'], 'r': [2]}
+    """
+    return _as_column(column).bit_and()
+
+
+def bit_or(column: str | Expr) -> AggExpr:
+    """Bitwise OR of the non-null integer values in each group (SQL ``BIT_OR``).
+
+    Args:
+        column: The integer column to reduce, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [6, 10]})
+            >>> ds.group_by("g").agg(r=bt.bit_or("x")).to_pydict()
+            {'g': ['a'], 'r': [14]}
+    """
+    return _as_column(column).bit_or()
+
+
+def bit_xor(column: str | Expr) -> AggExpr:
+    """Bitwise XOR of the non-null integer values in each group (SQL ``BIT_XOR``).
+
+    Args:
+        column: The integer column to reduce, as a name or an expression.
+
+    Returns:
+        An aggregate expression; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [6, 10]})
+            >>> ds.group_by("g").agg(r=bt.bit_xor("x")).to_pydict()
+            {'g': ['a'], 'r': [12]}
+    """
+    return _as_column(column).bit_xor()
+
+
+def array_agg(column: str | Expr) -> AggExpr:
+    """Collect each group's values into a list (SQL ``ARRAY_AGG`` / Spark ``collect_list``).
+
+    Args:
+        column: The column to collect, as a name or an expression.
+
+    Returns:
+        An aggregate expression producing a `List` column; pass it to ``agg(...)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 4]})
+            >>> ds.group_by("g").agg(xs=bt.array_agg("x")).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'xs': [[2, 3], [4]]}
+    """
+    return _as_column(column).array_agg()

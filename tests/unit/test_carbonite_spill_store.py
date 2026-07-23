@@ -137,6 +137,40 @@ def test_local_fills_then_later_buckets_overflow(tmp_path):
     assert store.local_bytes == first.nbytes
 
 
+def test_concurrent_open_writers_overflow_on_live_budget(tmp_path):
+    pytest.importorskip("fsspec", reason="fsspec (cloud extra) not installed")
+    # The partition phase holds one writer per bucket open at once and interleaves writes
+    # across them (a hash partition scatters every input batch into all buckets). The tier
+    # is decided on a bucket's first write from the local budget — but `_local_used` only
+    # grows when a bucket *closes*, so historically none of the still-open siblings ever
+    # observed the others' growth: with a tiny budget and a configured remote tier, all
+    # buckets stayed LOCAL and the local disk filled far past its budget, defeating the
+    # "overflow to object storage before the disk fills" guarantee. Live in-flight
+    # accounting fixes it — once the streamed bytes cross the budget, later-opened buckets
+    # overflow. (The first bucket to receive data correctly stays local: the budget is not
+    # yet touched when it opens.)
+    store = TieredSpillStore(
+        str(tmp_path / "spill"),
+        remote_uri="memory://batcher-spill-test-concurrent",
+        local_budget_bytes=1,  # any real write immediately exhausts the local tier
+        compression=None,
+    )
+    writers = {i: store.writer(f"bucket_{i}") for i in range(4)}
+    for _ in range(3):  # interleave writes across all open buckets
+        for w in writers.values():
+            w.write(_batch(200))
+    handles = {i: w.close() for i, w in writers.items()}
+
+    tiers = [handles[i].tier for i in range(4)]
+    assert tiers[0] is SpillTier.LOCAL  # first bucket to be written lands local
+    assert all(t is SpillTier.REMOTE for t in tiers[1:])  # the rest overflow off the budget
+    # Live accounting balances exactly back out once every bucket closes.
+    assert store._local_pending == 0
+    # No data is lost or misrouted across the overflow: every bucket round-trips its rows.
+    for i in range(4):
+        assert sum(b.num_rows for b in store.read(handles[i])) == 600
+
+
 def test_cleanup_removes_local(tmp_path):
     store = TieredSpillStore(str(tmp_path / "spill"))
     store.spill([_batch(10)])
@@ -161,3 +195,29 @@ def test_lost_local_file_raises_retryable_resource_error(tmp_path):
         store.read(handle)
     with pytest.raises(ResourceError, match="reclaimed"):
         list(store.read_stream(handle))
+
+
+def test_spill_handle_reports_uncompressed_logical_size(tmp_path):
+    """`logical_nbytes` is the uncompressed in-memory size the reducer must budget against.
+
+    The grace-recursion decision (`dist/spill.py::_reduce_agg_bucket`) reads a bucket back
+    into RAM, which decompresses it — so it must budget against the *uncompressed* size, not
+    the on-disk compressed `nbytes` (which for a compressible bucket can be far smaller and
+    would let an over-large bucket skip re-spill recursion and OOM `combine_finalize`).
+    """
+    store = TieredSpillStore(str(tmp_path / "spill"), compression="zstd")
+    # A single repeated value over many rows: hugely compressible, so on-disk << resident.
+    batch = pa.record_batch({"k": pa.array([7] * 20_000), "v": pa.array([1] * 20_000)})
+    handle = store.spill([batch])
+    # The logical size is exactly the batch's in-memory footprint...
+    assert handle.logical_nbytes == batch.nbytes
+    # ...and never smaller than the compressed on-disk size (here strictly larger).
+    assert handle.logical_nbytes >= handle.nbytes
+
+
+def test_spill_handle_logical_size_accumulates_across_batches(tmp_path):
+    """A streamed multi-batch bucket's `logical_nbytes` sums every batch's uncompressed size."""
+    store = TieredSpillStore(str(tmp_path / "spill"))
+    b1, b2 = _batch(100), _batch(100, 100)
+    handle = store.spill([b1, b2])
+    assert handle.logical_nbytes == b1.nbytes + b2.nbytes

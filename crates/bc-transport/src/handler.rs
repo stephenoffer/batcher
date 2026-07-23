@@ -286,13 +286,26 @@ impl FlightService for FlightHandler {
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(Schema::empty()));
         // Serve only this shard's interleaved slice (whole bucket when nshards == 1).
+        //
+        // Zero-row batches are dropped: the Flight encoder emits no data message for one, so
+        // a bucket made only of them would stream nothing while the consumer waits for a
+        // batch that never comes — it blocks for the whole fetch idle timeout and then
+        // reports this (perfectly healthy) worker as an unreachable peer. An empty bucket
+        // must resolve to "no rows" immediately, which an empty `batch_vec` does: the gated
+        // stream simply ends. Publishers avoid empty buckets too, but the server must not
+        // depend on their doing so.
         let batch_vec: Vec<_> = if nshards == 1 {
-            (*batches).clone()
+            batches
+                .iter()
+                .filter(|b| b.num_rows() > 0)
+                .cloned()
+                .collect()
         } else {
             batches
                 .iter()
                 .skip(shard)
                 .step_by(nshards)
+                .filter(|b| b.num_rows() > 0)
                 .cloned()
                 .collect()
         };

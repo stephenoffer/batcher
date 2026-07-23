@@ -61,7 +61,7 @@ class _CassandraSourceBase(ScanSource):
     # engine's `Filter` re-check then drops the rows. See `_pushed_cql`.
     supports_predicate = True
 
-    __slots__ = ("_pushed_cql",)
+    __slots__ = ()
 
     def __init__(
         self,
@@ -83,21 +83,6 @@ class _CassandraSourceBase(ScanSource):
             port=port,
             auth=auth,
         )
-        # The CQL WHERE fragment for the active read (no token-range part), or None.
-        # Set per-read by `read`/`iter_batches`; consumed in `_read_partition`.
-        self._pushed_cql: str | None = None
-
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection, predicate))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        self._pushed_cql = _pushed_cql(predicate)
-        for partition in self._enumerate_partitions():
-            yield from self._read_partition(partition, projection)
 
     def _session(self) -> tuple[Any, Any]:
         cassandra_cluster = require_driver("cassandra.cluster", "cassandra")
@@ -122,6 +107,26 @@ class _CassandraSourceBase(ScanSource):
     def _identity_suffix(self) -> str:
         return f"{self._conn_kwargs['keyspace']}.{self._conn_kwargs['table']}"
 
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """`_conn_kwargs` with the auth block reduced to its non-secret half.
+
+        `ScanSource.identity()` drops credentials by *key name*, and Cassandra's do not
+        have one: the password sits inside ``auth={"username", "password"}``, under a key
+        called ``auth``. So the raw password was being digested into `identity()`, which is
+        **persisted** as the learned-statistics key.
+
+        The digest is one-way, so this is not a plaintext leak — it is a stability bug.
+        Every rotation of the Cassandra password changes the key, and the table's
+        accumulated cardinalities are orphaned with nothing to indicate it; Kyber quietly
+        goes back to cold estimates. Keeping the username preserves the part that actually
+        distinguishes two connections to the same ring.
+        """
+        auth = self._conn_kwargs.get("auth")
+        return {
+            **self._conn_kwargs,
+            "auth": auth.get("username") if isinstance(auth, dict) else auth,
+        }
+
     def _infer_schema(self) -> pa.Schema:
         kw = self._conn_kwargs
         cluster, session = self._session()
@@ -138,23 +143,34 @@ class _CassandraSourceBase(ScanSource):
         return _token_ranges(max(1, self._partition_spec.segments))
 
     def _read_partition(
-        self, partition: _TokenRange, projection: list[str] | None
+        self,
+        partition: _TokenRange,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
         kw = self._conn_kwargs
         start, end = partition
+        pushed = _pushed_cql(predicate)
         cols = ", ".join(projection) if projection else "*"
         pk = self._pk_expr()
+        stmt = (
+            f"SELECT {cols} FROM {kw['table']} WHERE token({pk}) >= {start} AND token({pk}) < {end}"
+        )
+        if pushed is not None:
+            stmt += f" AND {pushed} ALLOW FILTERING"
+        # Resolve the schema *before* opening this partition's session. `self.schema()`
+        # falls through to `_infer_schema`, which builds and shuts down a cluster of its
+        # own — done inside the `try` below, that stood up a second connection to the ring
+        # while this one was live, on the first partition of every read. The result is
+        # cached, so hoisting it costs nothing and the nesting simply disappears.
+        schema = self.schema() if not projection else None
         cluster, session = self._session()
         try:
-            stmt = (
-                f"SELECT {cols} FROM {kw['table']} "
-                f"WHERE token({pk}) >= {start} AND token({pk}) < {end}"
-            )
-            if self._pushed_cql is not None:
-                stmt += f" AND {self._pushed_cql} ALLOW FILTERING"
-            schema = self.schema()
+            # `session.execute` returns a paging ResultSet, so the rows genuinely stream:
+            # the driver fetches a page at a time and `rows_to_batches` converts at batch
+            # granularity. Nothing here materializes the token range.
             rows = (dict(row._asdict()) for row in session.execute(stmt))
-            yield from rows_to_batches(rows, schema=schema if not projection else None)
+            yield from rows_to_batches(rows, schema=schema)
         finally:
             cluster.shutdown()
 

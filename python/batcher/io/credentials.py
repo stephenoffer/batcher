@@ -1,4 +1,17 @@
-"""Cloud credential helpers and Databricks Unity Catalog credential vending.
+"""Credential resolution for connectors, plus Databricks Unity Catalog vending.
+
+**Credentials by reference.** Every connector password, token, API key, and
+connection URI accepts ``env:NAME`` or ``file:PATH`` in place of the literal secret.
+Only the *reference* is stored on the source object and pickled to workers; the secret
+is read on the machine that opens the connection, from *its* environment or a mounted
+secret file. This mirrors the crypto-key design in `plan.functions.security` and exists
+for the same reason: a distributed query must not ship secrets over the wire, and a
+secret that never enters the object cannot leak through a traceback, a log line, or a
+pickled split.
+
+Resolution is deliberately **lazy** — call `resolve_secret` at connect time, never in a
+constructor. Resolving early would put the plaintext back on the object that gets
+pickled, defeating the whole point.
 
 Direct-read connectors (delta-rs, pyiceberg's pyarrow scan) need short-lived
 cloud storage credentials scoped to a single table's storage location, rather
@@ -16,23 +29,69 @@ failure raises `BackendError`.
 
 from __future__ import annotations
 
+import pathlib
 from typing import Any
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 
-__all__ = ["vend_unity_credentials"]
+__all__ = ["is_secret_ref", "resolve_secret", "vend_unity_credentials"]
+
+#: Reference schemes resolved on the machine that opens the connection.
+_SECRET_REF_SCHEMES = ("env:", "file:")
+
+
+def is_secret_ref(value: str | None) -> bool:
+    """Whether `value` is an ``env:NAME`` / ``file:PATH`` reference rather than a literal."""
+    return isinstance(value, str) and value.startswith(_SECRET_REF_SCHEMES)
+
+
+def resolve_secret(value: str | None, *, what: str = "credential") -> str | None:
+    """Resolve an ``env:``/``file:`` reference to its secret; pass a literal through.
+
+    Call this where the connection is opened, not where the source is built — see the
+    module docstring. `None` and a plain literal are returned unchanged, so a connector
+    that has not been migrated, and a user who passes a raw password, both keep working.
+
+    Args:
+        value: A literal secret, an ``env:NAME`` / ``file:PATH`` reference, or None.
+        what: What is being resolved, for the error message (e.g. ``"ClickHouse password"``).
+
+    Returns:
+        The resolved secret, or `value` unchanged when it is not a reference.
+
+    Raises:
+        BackendError: If the reference cannot be resolved. The message names the
+            *reference*, never the secret.
+    """
+    if not is_secret_ref(value):
+        return value
+    assert value is not None  # narrowed by is_secret_ref
+    scheme, _, target = value.partition(":")
+    if scheme == "env":
+        import os
+
+        resolved = os.environ.get(target)
+        if resolved is None:
+            raise BackendError(
+                f"{what}: environment variable {target!r} is not set (referenced as {value!r})"
+            )
+        return resolved
+    try:
+        return pathlib.Path(target).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise BackendError(f"{what}: cannot read secret file {target!r}: {exc}") from exc
 
 
 def _require_databricks_sdk() -> Any:
     """Import and return the Databricks `WorkspaceClient` class or raise."""
-    try:
-        from databricks.sdk import WorkspaceClient
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Unity Catalog credential vending requires the Databricks SDK: "
-            "pip install 'batcher-engine[databricks]'"
-        ) from exc
-    return WorkspaceClient
+    return require(
+        "databricks.sdk",
+        "WorkspaceClient",
+        feature="Unity Catalog credential vending",
+        provides="the Databricks SDK",
+        extra="databricks",
+    )
 
 
 def _storage_options_from_credentials(creds: Any) -> dict[str, str]:

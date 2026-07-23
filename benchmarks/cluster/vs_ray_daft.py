@@ -262,20 +262,42 @@ def _with_timeout(fn, timeout_s: float):
     return wrapped
 
 
-def bench_pipeline(name: str, scale: int, runs: int) -> dict:
+def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int) -> dict:
+    """Time one engine across every pipeline, with the cluster to itself.
+
+    Returns `{pipeline: {ms, sig, util} | {error}}`.
+
+    **Engine-major on purpose.** Timing the three engines pipeline-by-pipeline (all three
+    on `scan_count`, then all three on `filter_count`, ...) silently lets one engine's
+    cluster residue distort the next engine's numbers, in two ways this harness has
+    actually been bitten by:
+
+      * Daft's Ray runner (flotilla) spawns worker actors on first use and holds them for
+        the lifetime of the process — there is no shutdown hook — so from the second
+        pipeline on, they hold cluster CPUs while *another* engine is being timed.
+      * `_with_timeout` abandons a timed-out engine's thread (deliberately — see its
+        docstring), so a slow engine that blew its cap keeps *running* and consuming the
+        cluster while the next engine is timed.
+
+    Interleaved, that made Batcher's distributed join read 3.2-3.7 s where it measures
+    ~0.6 s with the cluster to itself — a 5x distortion, and one that pointed at a
+    regression that did not exist. Running each engine's whole sweep before the next
+    confines every engine's residue to its own numbers. Batcher runs first (a clean
+    cluster); an engine that leaks only ever taxes itself.
+    """
     from cluster_util import ClusterMonitor
 
     out: dict = {}
-    for eng, builder in ENGINES.items():
+    # Per-engine wall-clock cap so one pathological engine (e.g. Ray Data's join) is
+    # recorded as a timeout instead of hanging the whole sweep.
+    timeout_s = float(os.environ.get("BENCH_ENGINE_TIMEOUT", "180"))
+    for name in pipelines:
         thunk = builder(name, scale)
         if thunk is None:
             continue
-        # Per-engine wall-clock cap so one pathological engine (e.g. Ray Data's join)
-        # is recorded as a timeout instead of hanging the whole sweep.
-        timeout_s = float(os.environ.get("BENCH_ENGINE_TIMEOUT", "180"))
         try:
             run = _with_timeout(thunk, timeout_s)
-            print(f"  [{name}/{eng}] warmup ...")
+            print(f"  [{eng}/{name}] warmup ...")
             # warmup (untimed): pays cold scheduling / shipping / planning.
             warm_sig = run()
             # timed best-of-N; utilization sampled on the first timed run.
@@ -288,14 +310,14 @@ def bench_pipeline(name: str, scale: int, runs: int) -> dict:
                     mon.shutdown()
                     util = meta["util"]
                 best = min(best, dt)
-            out[eng] = {"ms": best * 1000, "sig": warm_sig, "util": util}
+            out[name] = {"ms": best * 1000, "sig": warm_sig, "util": util}
         except TimeoutError:
-            out[eng] = {"error": f"TIMEOUT (>{timeout_s:.0f}s)"}
+            out[name] = {"error": f"TIMEOUT (>{timeout_s:.0f}s)"}
         except Exception as e:
-            out[eng] = {"error": f"{type(e).__name__}: {e}"}
+            out[name] = {"error": f"{type(e).__name__}: {e}"}
         finally:
             # Free batcher's warm session fleet so the next engine gets the whole
-            # cluster (fair comparison); a no-op for ray/daft.
+            # cluster; a no-op for ray/daft (neither exposes one).
             if eng == "batcher":
                 with contextlib.suppress(Exception):
                     from batcher.dist.fleet import release_session_fleet
@@ -335,14 +357,22 @@ def main() -> int:
     print(f"cluster: {ray.cluster_resources().get('CPU')} CPU, {len(ray.nodes())} nodes")
     print(f"TPC-H sf{scale}, best-of-{runs}\n")
 
+    # Engine-major: each engine gets the cluster to itself for its whole sweep, so no
+    # engine's residue (Daft's resident flotilla actors, an abandoned timed-out thread)
+    # is charged to another engine's clock. See `bench_engine`.
+    by_engine = {
+        eng: bench_engine(eng, builder, pipelines, scale, runs) for eng, builder in ENGINES.items()
+    }
+
     h = ("pipeline", "batcher_ms", "ray_ms", "daft_ms", "vs_ray", "vs_daft")
     w = (14, 12, 11, 11, 9, 9)
     cols = "".join(c.ljust(w[0]) if i == 0 else c.rjust(w[i]) for i, c in enumerate(h))
     hdr = f"{cols}  util(batcher | ray)"
+    print()
     print(hdr)
     print("-" * len(hdr))
     for name in pipelines:
-        res = bench_pipeline(name, scale, runs)
+        res = {eng: r[name] for eng, r in by_engine.items() if name in r}
 
         def ms(e, res=res):
             return res.get(e, {}).get("ms")

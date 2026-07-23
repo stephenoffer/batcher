@@ -1,10 +1,8 @@
 # Configuration recipes
 
-Batcher has no built-in named profiles and no `apply_profile`. A "profile" is just a
-`Config` object you build for a goal and activate with `set_config` or
-`config_context`. This page collects recipes for common goals. Each one derives from
-`Config()` with `dataclasses.replace` on the sections it changes, leaving every
-other field at its tuned default.
+This page collects worked `Config` recipes for common deployment goals.
+
+Batcher has no built-in named profiles and no `apply_profile`. A profile here is a `Config` object you build for a goal and activate with `set_config` or `config_context`. Each recipe derives from `Config()` with `dataclasses.replace` on the sections it changes, leaving every other field at its tuned default.
 
 ```python
 import dataclasses
@@ -84,7 +82,7 @@ print((aggressive.optimizer.reoptimize_error, aggressive.optimizer.join_dp_max_t
 # (1.5, 16)
 ```
 
-## OOM-resilient (bounded memory, spill instead of crash)
+## Bounded memory: spill instead of crash
 
 To make a single-node job survive an input far larger than memory, set
 `max_memory_bytes`. That bounds the engine **and** opts it into out-of-core
@@ -137,14 +135,9 @@ print(resilient_cluster.distributed.task_max_retries)
 # 4
 ```
 
-## Cluster saturation (tuning the autoscale wait)
+## Tuning the autoscale wait
 
-Out of the box the engine already fills the cluster — one worker per node, an even share
-of each node's cores, reducers scaled to the fan-out — and on an autoscaling cluster it
-waits (bounded) for autoscaler-launched nodes before sizing the fan-out, so a big query
-runs on the grown cluster. That wait auto-enables when an autoscaling cluster is detected
-(Anyscale / spot / `BATCHER_AUTOSCALE=1`); the recipe below only tunes it. Set
-`autoscale_wait_s=0` to opt out on a fixed cluster, or raise it when nodes boot slowly.
+Out of the box the engine already fills the cluster. It runs one worker per node, gives each an even share of that node's cores, and scales the reducer count with the fan-out. On an autoscaling cluster it also waits, with a bound, for autoscaler-launched nodes before sizing the fan-out, so a big query runs on the grown cluster. That wait auto-enables when Batcher detects an autoscaling cluster, meaning Anyscale, a spot node, or `BATCHER_AUTOSCALE=1`. The recipe below only tunes it. Set `autoscale_wait_s=0` to opt out on a fixed cluster, or raise it when nodes boot slowly.
 
 ```python
 base = Config()
@@ -161,12 +154,11 @@ print(saturating.distributed.autoscale_wait_s)
 # 300.0
 ```
 
-Pin the fan-out instead (skipping the wait entirely) by passing `num_workers=` to the
-terminal call, e.g. `ds.collect(num_workers=16)`.
+To pin the fan-out instead and skip the wait entirely, pass `num_workers=` to the terminal call, such as `ds.collect(num_workers=16)`. That's a call parameter, not a `Config` field.
 
 ## Reusing a recipe
 
 A recipe is an ordinary `Config`. Define it once, then activate it process-wide with
 `set_config` or per block with `config_context`. Because `Config` is immutable, the
 same object can be reused freely and combined by chaining `replace` calls. See
-[options](options.md) for every field you can change.
+{doc}`options` for every field you can change.

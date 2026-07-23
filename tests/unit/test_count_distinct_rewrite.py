@@ -20,16 +20,12 @@ from batcher.plan.logical import Aggregate, Distinct, Project
 
 
 def _ds():
-    return bt.from_pydict(
-        {"g": ["a", "a", "b", "b", "b"], "v": [1, 1, 2, 3, 3]}
-    )
+    return bt.from_pydict({"g": ["a", "a", "b", "b", "b"], "v": [1, 1, 2, 3, 3]})
 
 
 def _ctx(ds):
     est = StatsEstimator(ds._sources, learned={})
-    return OptimizerContext(
-        config=active_config(), sources=ds._sources, hub=None, estimator=est
-    )
+    return OptimizerContext(config=active_config(), sources=ds._sources, hub=None, estimator=est)
 
 
 def test_rule_registered():

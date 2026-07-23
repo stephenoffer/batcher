@@ -31,6 +31,7 @@ import shutil
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
 from batcher.dist.spill import _fd_safe, _make_store, _work_dir
@@ -78,7 +79,7 @@ def stream_spilling_global_window(
     """Stream a global window in bounded memory via ordered-bucket offsetting."""
     import pyarrow.compute as pc
 
-    import batcher._native as nat
+    nat = engine()
 
     cfg_json = active_config().engine_config_json()
     key = window.order_keys[0]
@@ -96,7 +97,7 @@ def stream_spilling_global_window(
     store = _make_store(work_dir)
     try:
         handles = stage_and_partition(
-            sources[sid], map_ir, key_name, nulls_first, n_buckets, store, cfg_json
+            sources[sid], map_ir, key_name, nulls_first, desc, n_buckets, store, cfg_json
         )
         # Process buckets in *global sort order* (reversed for descending) so the
         # running offsets accumulate correctly.

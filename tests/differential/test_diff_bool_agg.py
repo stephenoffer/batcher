@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -22,8 +23,6 @@ def _t() -> pa.Table:
 
 
 def test_bool_and_or_grouped_matches_duckdb(duck):
-    from conftest import assert_same
-
     t = _t()
     duck.register("t", t)
     out = (
@@ -36,8 +35,6 @@ def test_bool_and_or_grouped_matches_duckdb(duck):
 
 
 def test_bool_and_or_global_matches_duckdb(duck):
-    from conftest import assert_same
-
     t = _t()
     duck.register("t", t)
     out = bt.from_arrow(t).agg(ba=col("flag").bool_and(), bo=col("flag").bool_or()).collect()
@@ -45,8 +42,6 @@ def test_bool_and_or_global_matches_duckdb(duck):
 
 
 def test_mode_grouped_matches_duckdb(duck):
-    from conftest import assert_same
-
     # Unique mode per group (no frequency ties) so the tiebreak rule is irrelevant
     # and the result matches DuckDB's mode() exactly.
     t = pa.table(
@@ -68,7 +63,6 @@ def test_mode_grouped_spilled_matches_duckdb(duck):
     import pyarrow.compute as pc
 
     from batcher.config import Config, MemoryConfig, config_context
-    from conftest import assert_same
 
     rng = np.random.default_rng(11)
     n = 20000
@@ -86,8 +80,6 @@ def test_mode_grouped_spilled_matches_duckdb(duck):
 
 
 def test_arg_min_max_grouped_matches_duckdb(duck):
-    from conftest import assert_same
-
     # Unique keys per group → arg_min/arg_max are unambiguous and match DuckDB's
     # arg_min/arg_max(value, key).
     t = pa.table(

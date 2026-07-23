@@ -51,6 +51,7 @@ def test_torch_kernel_matches_cpu_engine():
         .collect()
         .to_pydict()
     )
+
     def _rows(d):
         cols = (d["k"], d["s"], d["c"], d["m"], d["mn"], d["mx"])
         return {r[0]: r[1:] for r in zip(*cols, strict=True)}

@@ -1,8 +1,9 @@
 # Quickstart
 
-This page walks through a complete pipeline: build a dataset, transform it,
-aggregate it, and read the result. The examples use small in-memory data so they
-run anywhere; the same API applies at any scale.
+This page walks a complete pipeline from start to finish, building a dataset and
+transforming, aggregating, joining, and reading it back. The data is small and
+in-memory so the examples run anywhere, and the API is the same one you'd point at a
+terabyte of Parquet.
 
 ## Import and build a dataset
 
@@ -26,8 +27,8 @@ print(ds.columns)
 # ['id', 'name', 'category', 'price', 'qty']
 ```
 
-A `Dataset` is lazy: each operation returns a new `Dataset` describing a plan, and
-no work runs until a terminal operation such as `to_pydict` or `collect`.
+A `Dataset` is lazy. Each operation returns a new `Dataset` describing a plan, and no
+work runs until a terminal operation such as `to_pydict` or `collect`.
 
 ## Filter rows
 
@@ -37,7 +38,7 @@ Filters are expressions built from {py:obj}`bt.col(...) <batcher.col>`. Combine 
 ```python
 filtered = ds.filter(bt.col("price") >= 30.0)
 print(filtered.to_pydict())
-# {'category': ['a', 'b', 'a'], 'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
+# {'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
 ```
 
 ## Select and transform columns
@@ -103,10 +104,10 @@ print(table.num_rows)
 print(ds.filter(bt.col("price") > 25.0).explain())
 ```
 
-## Reading and writing files
+## Read and write files
 
-File readers and writers use the same API; only the source or sink changes. These
-need real files, so they are shown but not run here.
+Readers and writers use the same API. Only the source or the sink changes. The
+snippet below needs real files, so it's shown rather than run.
 
 ```python
 # docs: skip

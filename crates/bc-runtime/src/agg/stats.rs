@@ -1,8 +1,17 @@
 //! Two-input covariance/correlation and single-input skewness/kurtosis.
 //!
-//! All use a *sum-of-powers* partial state so `combine` is plain column-wise
-//! summation (associative + commutative) — the same trick `var` uses, which is
-//! what makes these mergeable single-node and distributed.
+//! All use a **central-moment** partial state (co-moment for covar/corr, the first
+//! four central moments for skew/kurt) accumulated in one pass, and merged with the
+//! parallel (Chan/Terriberry) update formulas — associative + commutative, so they
+//! distribute single-node and distributed.
+//!
+//! The earlier state was a *sum-of-powers* (`Σx`, `Σx²`, `Σxy`, …) merged by plain
+//! column-wise summation. That is mergeable, but the finalize then recovered the
+//! moment as `Σx² − (Σx)²/n` (and `Σxy − Σx·Σy/n`) — a subtraction of two nearly
+//! equal large numbers that **catastrophically cancels** when the mean dwarfs the
+//! spread: `covar_pop([1e9+1,1e9+2,…],[…])` came back as exactly `0` (true `2`), and
+//! `corr` as `NULL`. The central-moment form never forms that difference, so it is
+//! accurate at large offsets — the same fix `var` took (Welford / B9).
 
 use std::sync::Arc;
 
@@ -14,9 +23,11 @@ use super::AggFunc;
 use crate::error::RuntimeError;
 
 /// Per-group covariance/correlation state, 6 columns:
-/// `[n, Σx, Σy, Σxy, Σx², Σy²]` (n is Int64, the rest Float64). A pair counts only
-/// when both `x` and `y` are non-null. `covar_*` use the first four columns;
-/// `corr` uses all six. All columns merge across partitions by summing.
+/// `[n, mean_x, mean_y, C2, M2x, M2y]` (n is Int64, the rest Float64), where
+/// `C2 = Σ(x−x̄)(y−ȳ)` is the co-moment and `M2x`/`M2y` are the centered squared-
+/// deviation sums of `x`/`y`. A pair counts only when both `x` and `y` are non-null.
+/// `covar_*` use `[n, C2]`; `corr` uses all six. The state merges via Chan's parallel
+/// mean-difference correction ([`merge_covar`]), not summation.
 pub(crate) fn covar_state(
     x: &ArrayRef,
     y: &ArrayRef,
@@ -27,40 +38,105 @@ pub(crate) fn covar_state(
     let yf = cast(y, &DataType::Float64)?;
     let xa = xf.as_primitive::<Float64Type>();
     let ya = yf.as_primitive::<Float64Type>();
-    let (mut n, mut sx, mut sy) = (
-        vec![0i64; num_groups],
-        vec![0f64; num_groups],
-        vec![0f64; num_groups],
-    );
-    let (mut sxy, mut sxx, mut syy) = (
-        vec![0f64; num_groups],
-        vec![0f64; num_groups],
-        vec![0f64; num_groups],
-    );
+    // Two-pass within this partition: pass 1 accumulates the exact per-group sums, pass 2
+    // the centered products around the resulting mean. A single mean rounding followed by
+    // well-conditioned centered sums is far more accurate than a streaming (Welford)
+    // co-moment at a large offset — it matches DuckDB exactly for a single-partition
+    // aggregate (the common small-query path) — and the state still merges via Chan's
+    // parallel formula ([`merge_covar`]) across partitions/morsels.
+    let mut n = vec![0i64; num_groups];
+    let mut mean_x = vec![0f64; num_groups];
+    let mut mean_y = vec![0f64; num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
         if xa.is_valid(i) && ya.is_valid(i) {
-            let (g, vx, vy) = (g as usize, xa.value(i), ya.value(i));
+            let g = g as usize;
             n[g] += 1;
-            sx[g] += vx;
-            sy[g] += vy;
-            sxy[g] += vx * vy;
-            sxx[g] += vx * vx;
-            syy[g] += vy * vy;
+            mean_x[g] += xa.value(i);
+            mean_y[g] += ya.value(i);
+        }
+    }
+    for g in 0..num_groups {
+        if n[g] > 0 {
+            let nn = n[g] as f64;
+            mean_x[g] /= nn;
+            mean_y[g] /= nn;
+        }
+    }
+    let mut c2 = vec![0f64; num_groups];
+    let mut m2x = vec![0f64; num_groups];
+    let mut m2y = vec![0f64; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if xa.is_valid(i) && ya.is_valid(i) {
+            let g = g as usize;
+            let dx = xa.value(i) - mean_x[g];
+            let dy = ya.value(i) - mean_y[g];
+            c2[g] += dx * dy;
+            m2x[g] += dx * dx;
+            m2y[g] += dy * dy;
         }
     }
     Ok(vec![
         Arc::new(Int64Array::from(n)),
-        Arc::new(Float64Array::from(sx)),
-        Arc::new(Float64Array::from(sy)),
-        Arc::new(Float64Array::from(sxy)),
-        Arc::new(Float64Array::from(sxx)),
-        Arc::new(Float64Array::from(syy)),
+        Arc::new(Float64Array::from(mean_x)),
+        Arc::new(Float64Array::from(mean_y)),
+        Arc::new(Float64Array::from(c2)),
+        Arc::new(Float64Array::from(m2x)),
+        Arc::new(Float64Array::from(m2y)),
     ])
 }
 
-/// Per-group moment state for skewness/kurtosis, 5 columns:
-/// `[n, Σx, Σx², Σx³, Σx⁴]` (n is Int64, the rest Float64). Null-skipping; merges by
-/// summing each column.
+/// Merge partial covar/corr states by group with Chan's parallel formula — the
+/// mergeable combine for [`covar_state`]. Associative + commutative, so partials
+/// merge in any order and single-node == distributed.
+pub(crate) fn merge_covar(
+    state: &[ArrayRef],
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
+    let n_in = state[0].as_primitive::<Int64Type>();
+    let mx_in = state[1].as_primitive::<Float64Type>();
+    let my_in = state[2].as_primitive::<Float64Type>();
+    let c2_in = state[3].as_primitive::<Float64Type>();
+    let m2x_in = state[4].as_primitive::<Float64Type>();
+    let m2y_in = state[5].as_primitive::<Float64Type>();
+
+    let mut n = vec![0i64; num_groups];
+    let mut mean_x = vec![0f64; num_groups];
+    let mut mean_y = vec![0f64; num_groups];
+    let mut c2 = vec![0f64; num_groups];
+    let mut m2x = vec![0f64; num_groups];
+    let mut m2y = vec![0f64; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        let nb = n_in.value(i);
+        if nb == 0 {
+            continue;
+        }
+        let g = g as usize;
+        let na = n[g];
+        let ntot = na + nb;
+        let (naf, nbf, nf) = (na as f64, nb as f64, ntot as f64);
+        let dx = mx_in.value(i) - mean_x[g];
+        let dy = my_in.value(i) - mean_y[g];
+        mean_x[g] += dx * nbf / nf;
+        mean_y[g] += dy * nbf / nf;
+        c2[g] += c2_in.value(i) + dx * dy * naf * nbf / nf;
+        m2x[g] += m2x_in.value(i) + dx * dx * naf * nbf / nf;
+        m2y[g] += m2y_in.value(i) + dy * dy * naf * nbf / nf;
+        n[g] = ntot;
+    }
+    Ok(vec![
+        Arc::new(Int64Array::from(n)),
+        Arc::new(Float64Array::from(mean_x)),
+        Arc::new(Float64Array::from(mean_y)),
+        Arc::new(Float64Array::from(c2)),
+        Arc::new(Float64Array::from(m2x)),
+        Arc::new(Float64Array::from(m2y)),
+    ])
+}
+
+/// Per-group central-moment state for skewness/kurtosis, 5 columns:
+/// `[n, mean, M2, M3, M4]` (n is Int64, the rest Float64), where `Mk = Σ(x−x̄)^k`.
+/// Null-skipping; merges via Terriberry's parallel formula ([`merge_moments`]).
 pub(crate) fn moment_state(
     values: &ArrayRef,
     group_ids: &[u32],
@@ -72,87 +148,164 @@ pub(crate) fn moment_state(
         dtype: values.data_type().to_string(),
     })?;
     let a = f.as_primitive::<Float64Type>();
+    // Two-pass within this partition (exact mean, then centered power sums): far more
+    // accurate at a large offset than a streaming higher-moment update, matching DuckDB
+    // exactly for a single-partition aggregate. The state still merges across partitions
+    // via Terriberry's parallel formula ([`merge_moments`]).
     let mut n = vec![0i64; num_groups];
-    let (mut s1, mut s2) = (vec![0f64; num_groups], vec![0f64; num_groups]);
-    let (mut s3, mut s4) = (vec![0f64; num_groups], vec![0f64; num_groups]);
+    let mut mean = vec![0f64; num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
         if a.is_valid(i) {
-            let (g, v) = (g as usize, a.value(i));
-            let (v2, v3, v4) = (v * v, v * v * v, v * v * v * v);
+            let g = g as usize;
             n[g] += 1;
-            s1[g] += v;
-            s2[g] += v2;
-            s3[g] += v3;
-            s4[g] += v4;
+            mean[g] += a.value(i);
+        }
+    }
+    for g in 0..num_groups {
+        if n[g] > 0 {
+            mean[g] /= n[g] as f64;
+        }
+    }
+    let mut m2 = vec![0f64; num_groups];
+    let mut m3 = vec![0f64; num_groups];
+    let mut m4 = vec![0f64; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if a.is_valid(i) {
+            let g = g as usize;
+            let d = a.value(i) - mean[g];
+            let d2 = d * d;
+            m2[g] += d2;
+            m3[g] += d2 * d;
+            m4[g] += d2 * d2;
         }
     }
     Ok(vec![
         Arc::new(Int64Array::from(n)),
-        Arc::new(Float64Array::from(s1)),
-        Arc::new(Float64Array::from(s2)),
-        Arc::new(Float64Array::from(s3)),
-        Arc::new(Float64Array::from(s4)),
+        Arc::new(Float64Array::from(mean)),
+        Arc::new(Float64Array::from(m2)),
+        Arc::new(Float64Array::from(m3)),
+        Arc::new(Float64Array::from(m4)),
     ])
 }
 
-/// `covar_pop = Σxy/n − (Σx/n)(Σy/n)` (n ≥ 1) or `covar_samp = (Σxy − Σx·Σy/n)/(n−1)`
-/// (n ≥ 2). Null when the count is too small.
+/// Merge partial `[n, mean, M2, M3, M4]` states by group with Terriberry's parallel
+/// higher-moment formula — the mergeable combine for [`moment_state`]. Associative +
+/// commutative, so partials merge in any order and single-node == distributed.
+pub(crate) fn merge_moments(
+    state: &[ArrayRef],
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
+    let n_in = state[0].as_primitive::<Int64Type>();
+    let mean_in = state[1].as_primitive::<Float64Type>();
+    let m2_in = state[2].as_primitive::<Float64Type>();
+    let m3_in = state[3].as_primitive::<Float64Type>();
+    let m4_in = state[4].as_primitive::<Float64Type>();
+
+    let mut n = vec![0i64; num_groups];
+    let mut mean = vec![0f64; num_groups];
+    let mut m2 = vec![0f64; num_groups];
+    let mut m3 = vec![0f64; num_groups];
+    let mut m4 = vec![0f64; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        let nb = n_in.value(i);
+        if nb == 0 {
+            continue;
+        }
+        let g = g as usize;
+        let na = n[g];
+        if na == 0 {
+            n[g] = nb;
+            mean[g] = mean_in.value(i);
+            m2[g] = m2_in.value(i);
+            m3[g] = m3_in.value(i);
+            m4[g] = m4_in.value(i);
+            continue;
+        }
+        let ntot = na + nb;
+        let (naf, nbf, nf) = (na as f64, nb as f64, ntot as f64);
+        let delta = mean_in.value(i) - mean[g];
+        let delta2 = delta * delta;
+        let delta3 = delta2 * delta;
+        let delta4 = delta2 * delta2;
+        let (m2a, m2b) = (m2[g], m2_in.value(i));
+        let (m3a, m3b) = (m3[g], m3_in.value(i));
+        let (m4a, m4b) = (m4[g], m4_in.value(i));
+        let new_mean = mean[g] + delta * nbf / nf;
+        let new_m2 = m2a + m2b + delta2 * naf * nbf / nf;
+        let new_m3 = m3a
+            + m3b
+            + delta3 * naf * nbf * (naf - nbf) / (nf * nf)
+            + 3.0 * delta * (naf * m2b - nbf * m2a) / nf;
+        let new_m4 = m4a
+            + m4b
+            + delta4 * naf * nbf * (naf * naf - naf * nbf + nbf * nbf) / (nf * nf * nf)
+            + 6.0 * delta2 * (naf * naf * m2b + nbf * nbf * m2a) / (nf * nf)
+            + 4.0 * delta * (naf * m3b - nbf * m3a) / nf;
+        n[g] = ntot;
+        mean[g] = new_mean;
+        m2[g] = new_m2;
+        m3[g] = new_m3;
+        m4[g] = new_m4;
+    }
+    Ok(vec![
+        Arc::new(Int64Array::from(n)),
+        Arc::new(Float64Array::from(mean)),
+        Arc::new(Float64Array::from(m2)),
+        Arc::new(Float64Array::from(m3)),
+        Arc::new(Float64Array::from(m4)),
+    ])
+}
+
+/// `covar_pop = C2/n` (n ≥ 1) or `covar_samp = C2/(n−1)` (n ≥ 2). Null when the count
+/// is too small.
 pub(crate) fn finalize_covar(state: &[ArrayRef], sample: bool) -> Result<ArrayRef, RuntimeError> {
     let n = state[0].as_primitive::<Int64Type>();
-    let sx = state[1].as_primitive::<Float64Type>();
-    let sy = state[2].as_primitive::<Float64Type>();
-    let sxy = state[3].as_primitive::<Float64Type>();
+    let c2 = state[3].as_primitive::<Float64Type>();
     let mut b = Float64Builder::with_capacity(n.len());
     for i in 0..n.len() {
         let cnt = n.value(i);
-        let cov = sxy.value(i) - sx.value(i) * sy.value(i) / cnt as f64;
         if sample {
             if cnt < 2 {
                 b.append_null();
             } else {
-                b.append_value(cov / (cnt - 1) as f64);
+                b.append_value(c2.value(i) / (cnt - 1) as f64);
             }
         } else if cnt < 1 {
             b.append_null();
         } else {
-            b.append_value(cov / cnt as f64);
+            b.append_value(c2.value(i) / cnt as f64);
         }
     }
     Ok(Arc::new(b.finish()))
 }
 
-/// `corr = (n·Σxy − Σx·Σy) / sqrt((n·Σx² − Σx²)(n·Σy² − Σy²))`. Null when n < 2 or
-/// either variable has zero variance (a flat column has no correlation).
+/// `corr = C2 / sqrt(M2x · M2y)`. Null when n < 2 or either variable has zero variance
+/// (a flat column has no correlation).
 pub(crate) fn finalize_corr(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
     let n = state[0].as_primitive::<Int64Type>();
-    let sx = state[1].as_primitive::<Float64Type>();
-    let sy = state[2].as_primitive::<Float64Type>();
-    let sxy = state[3].as_primitive::<Float64Type>();
-    let sxx = state[4].as_primitive::<Float64Type>();
-    let syy = state[5].as_primitive::<Float64Type>();
+    let c2 = state[3].as_primitive::<Float64Type>();
+    let m2x = state[4].as_primitive::<Float64Type>();
+    let m2y = state[5].as_primitive::<Float64Type>();
     let mut b = Float64Builder::with_capacity(n.len());
     for i in 0..n.len() {
-        let cnt = n.value(i) as f64;
         if n.value(i) < 2 {
             b.append_null();
             continue;
         }
-        let cov = cnt * sxy.value(i) - sx.value(i) * sy.value(i);
-        let vx = cnt * sxx.value(i) - sx.value(i) * sx.value(i);
-        let vy = cnt * syy.value(i) - sy.value(i) * sy.value(i);
-        let denom = (vx * vy).max(0.0).sqrt();
+        let denom = (m2x.value(i) * m2y.value(i)).max(0.0).sqrt();
         if denom == 0.0 {
             b.append_null();
         } else {
-            b.append_value(cov / denom);
+            b.append_value(c2.value(i) / denom);
         }
     }
     Ok(Arc::new(b.finish()))
 }
 
 /// Sample skewness (adjusted Fisher–Pearson, matching DuckDB):
-/// `g1·√(n(n−1))/(n−2)` where `g1 = m3 / m2^1.5` and `mk` are the central moments.
-/// Null when n < 3 or the variance is zero.
+/// `g1·√(n(n−1))/(n−2)` where `g1 = m3 / m2^1.5` and `mk` are the population central
+/// moments. Null when n < 3 or the variance is zero.
 pub(crate) fn finalize_skewness(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
     moment_finalize(state, |n, m2, m3, _m4| {
         if n < 3.0 || m2 <= 0.0 {
@@ -176,36 +329,188 @@ pub(crate) fn finalize_kurtosis(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeE
     })
 }
 
-/// Shared finalize for the moment aggregates: derive the population central moments
-/// `m2/m3/m4` (per element, dividing by n) from the sum-of-powers state and apply
-/// `f(n, m2, m3, m4)` (which returns `None` for the null cases).
+/// Shared finalize for the moment aggregates: read the population central moments
+/// `m2/m3/m4` (per element, dividing the accumulated `Mk` by n) from the state and
+/// apply `f(n, m2, m3, m4)` (which returns `None` for the null cases).
 fn moment_finalize(
     state: &[ArrayRef],
     f: impl Fn(f64, f64, f64, f64) -> Option<f64>,
 ) -> Result<ArrayRef, RuntimeError> {
     let n = state[0].as_primitive::<Int64Type>();
-    let s1 = state[1].as_primitive::<Float64Type>();
-    let s2 = state[2].as_primitive::<Float64Type>();
-    let s3 = state[3].as_primitive::<Float64Type>();
-    let s4 = state[4].as_primitive::<Float64Type>();
+    let m2 = state[2].as_primitive::<Float64Type>();
+    let m3 = state[3].as_primitive::<Float64Type>();
+    let m4 = state[4].as_primitive::<Float64Type>();
     let mut b = Float64Builder::with_capacity(n.len());
     for i in 0..n.len() {
-        let cnt = n.value(i) as f64;
-        if cnt < 1.0 {
+        let cnt = n.value(i);
+        if cnt < 1 {
             b.append_null();
             continue;
         }
-        let mean = s1.value(i) / cnt;
-        // Population central moments via the binomial expansion of Σ(x−μ)^k.
-        let m2 = s2.value(i) / cnt - mean * mean;
-        let m3 = s3.value(i) / cnt - 3.0 * mean * s2.value(i) / cnt + 2.0 * mean.powi(3);
-        let m4 = s4.value(i) / cnt - 4.0 * mean * s3.value(i) / cnt
-            + 6.0 * mean * mean * s2.value(i) / cnt
-            - 3.0 * mean.powi(4);
-        match f(cnt, m2, m3, m4) {
+        let nf = cnt as f64;
+        match f(nf, m2.value(i) / nf, m3.value(i) / nf, m4.value(i) / nf) {
             Some(v) => b.append_value(v),
             None => b.append_null(),
         }
     }
     Ok(Arc::new(b.finish()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f64s(v: &[f64]) -> ArrayRef {
+        Arc::new(Float64Array::from(v.to_vec()))
+    }
+
+    /// The whole-input central-moment state, finalized.
+    fn covar_whole(x: &[f64], y: &[f64], sample: bool) -> Option<f64> {
+        let g = vec![0u32; x.len()];
+        let st = covar_state(&f64s(x), &f64s(y), &g, 1).unwrap();
+        let out = finalize_covar(&st, sample).unwrap();
+        let a = out.as_primitive::<Float64Type>();
+        a.is_valid(0).then(|| a.value(0))
+    }
+
+    /// covar at a large offset must not catastrophically cancel: covar([1e9+i],[…])
+    /// with the sum-of-products formula returned 0; the co-moment form returns 2.
+    #[test]
+    fn covar_stable_at_large_offset() {
+        let x = [1e9 + 1.0, 1e9 + 2.0, 1e9 + 3.0, 1e9 + 4.0, 1e9 + 5.0];
+        let y = [1e9 + 1.0, 1e9 + 3.0, 1e9 + 2.0, 1e9 + 7.0, 1e9 + 4.0];
+        let pop = covar_whole(&x, &y, false).unwrap();
+        assert!((pop - 2.0).abs() < 1e-6, "covar_pop {pop} != 2.0");
+        let samp = covar_whole(&x, &y, true).unwrap();
+        assert!((samp - 2.5).abs() < 1e-6, "covar_samp {samp} != 2.5");
+    }
+
+    /// corr at a large offset: the naive form denominator cancelled to 0 → NULL; the
+    /// centered form recovers ~0.6868 (DuckDB).
+    #[test]
+    fn corr_stable_at_large_offset() {
+        let x = [1e9 + 1.0, 1e9 + 2.0, 1e9 + 3.0, 1e9 + 4.0, 1e9 + 5.0];
+        let y = [1e9 + 1.0, 1e9 + 3.0, 1e9 + 2.0, 1e9 + 7.0, 1e9 + 4.0];
+        let g = vec![0u32; x.len()];
+        let st = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
+        let out = finalize_corr(&st).unwrap();
+        let a = out.as_primitive::<Float64Type>();
+        assert!(a.is_valid(0), "corr must not be NULL");
+        assert!(
+            (a.value(0) - 0.6868028194537991).abs() < 1e-9,
+            "corr {} != 0.6868",
+            a.value(0)
+        );
+    }
+
+    /// Partial→merge→finalize must equal the whole-input covar/corr (single-node ==
+    /// distributed), even split across an uneven chunk boundary at a large offset.
+    #[test]
+    fn covar_corr_merge_equals_whole() {
+        let x: Vec<f64> = (0..97).map(|i| 1000.0 + (i as f64) * 0.5).collect();
+        let y: Vec<f64> = (0..97)
+            .map(|i| 1000.0 - (i as f64) * 0.3 + (i % 7) as f64)
+            .collect();
+        let g = vec![0u32; x.len()];
+        let whole = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
+        // Split into three chunks, build a partial per chunk, concat, and merge.
+        let bounds = [0usize, 13, 55, 97];
+        let mut ns = Vec::new();
+        let (mut mx, mut my, mut c2, mut m2x, mut m2y) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let g = vec![0u32; b - a];
+            let st = covar_state(&f64s(&x[a..b]), &f64s(&y[a..b]), &g, 1).unwrap();
+            ns.push(st[0].as_primitive::<Int64Type>().value(0));
+            mx.push(st[1].as_primitive::<Float64Type>().value(0));
+            my.push(st[2].as_primitive::<Float64Type>().value(0));
+            c2.push(st[3].as_primitive::<Float64Type>().value(0));
+            m2x.push(st[4].as_primitive::<Float64Type>().value(0));
+            m2y.push(st[5].as_primitive::<Float64Type>().value(0));
+        }
+        let cat: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(ns)),
+            Arc::new(Float64Array::from(mx)),
+            Arc::new(Float64Array::from(my)),
+            Arc::new(Float64Array::from(c2)),
+            Arc::new(Float64Array::from(m2x)),
+            Arc::new(Float64Array::from(m2y)),
+        ];
+        let gids: Vec<u32> = vec![0; 3];
+        let merged = merge_covar(&cat, &gids, 1).unwrap();
+        for stat in [false, true] {
+            let w = finalize_covar(&whole, stat).unwrap();
+            let m = finalize_covar(&merged, stat).unwrap();
+            let wv = w.as_primitive::<Float64Type>().value(0);
+            let mv = m.as_primitive::<Float64Type>().value(0);
+            assert!((wv - mv).abs() < 1e-6, "covar merge {mv} != whole {wv}");
+        }
+        let wc = finalize_corr(&whole).unwrap();
+        let mc = finalize_corr(&merged).unwrap();
+        assert!(
+            (wc.as_primitive::<Float64Type>().value(0) - mc.as_primitive::<Float64Type>().value(0))
+                .abs()
+                < 1e-9,
+            "corr merge != whole"
+        );
+    }
+
+    /// skewness/kurtosis stable at a large offset and mergeable across chunks.
+    #[test]
+    fn moments_merge_equals_whole() {
+        let x: Vec<f64> = (0..120).map(|i| 1000.0 + ((i * 7) % 13) as f64).collect();
+        let g = vec![0u32; x.len()];
+        let whole = moment_state(&f64s(&x), &g, 1, AggFunc::Skewness).unwrap();
+        let bounds = [0usize, 17, 60, 120];
+        let (mut ns, mut me, mut m2, mut m3, mut m4) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let g = vec![0u32; b - a];
+            let st = moment_state(&f64s(&x[a..b]), &g, 1, AggFunc::Skewness).unwrap();
+            ns.push(st[0].as_primitive::<Int64Type>().value(0));
+            me.push(st[1].as_primitive::<Float64Type>().value(0));
+            m2.push(st[2].as_primitive::<Float64Type>().value(0));
+            m3.push(st[3].as_primitive::<Float64Type>().value(0));
+            m4.push(st[4].as_primitive::<Float64Type>().value(0));
+        }
+        let cat: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(ns)),
+            Arc::new(Float64Array::from(me)),
+            Arc::new(Float64Array::from(m2)),
+            Arc::new(Float64Array::from(m3)),
+            Arc::new(Float64Array::from(m4)),
+        ];
+        let merged = merge_moments(&cat, &vec![0u32; 3], 1).unwrap();
+        for (wcol, mcol) in whole.iter().zip(&merged) {
+            // Compare each moment column (skip n, which is exact).
+            if let (Some(wf), Some(mf)) = (
+                wcol.as_any().downcast_ref::<Float64Array>(),
+                mcol.as_any().downcast_ref::<Float64Array>(),
+            ) {
+                let rel = (wf.value(0) - mf.value(0)).abs() / (wf.value(0).abs() + 1.0);
+                assert!(
+                    rel < 1e-9,
+                    "moment merge {} != whole {}",
+                    mf.value(0),
+                    wf.value(0)
+                );
+            }
+        }
+        let ws = finalize_skewness(&whole).unwrap();
+        let ms = finalize_skewness(&merged).unwrap();
+        assert!(
+            (ws.as_primitive::<Float64Type>().value(0) - ms.as_primitive::<Float64Type>().value(0))
+                .abs()
+                < 1e-9
+        );
+        let wk = finalize_kurtosis(&whole).unwrap();
+        let mk = finalize_kurtosis(&merged).unwrap();
+        assert!(
+            (wk.as_primitive::<Float64Type>().value(0) - mk.as_primitive::<Float64Type>().value(0))
+                .abs()
+                < 1e-9
+        );
+    }
 }

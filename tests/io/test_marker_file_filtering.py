@@ -13,7 +13,8 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from batcher.io.filesystem import LocalFileSystem, _is_data_file
+from batcher.io._backend import _is_data_file
+from batcher.io.filesystem import LocalFileSystem
 
 
 def test_is_data_file_predicate():

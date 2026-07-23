@@ -82,7 +82,7 @@ def build_op_profiles(
     planned = {int(op.op_id): op for op in physical_ops}
     measured = {int(m.get("op_id", -1)): m for m in (metric_ops or [])}
     out: list[OpProfile] = []
-    for op_id, (depth, node) in enumerate(_walk_ir(ir)):
+    for op_id, (depth, node) in enumerate(walk_ir(ir)):
         kind = str(node.get("op", "?"))
         p = planned.get(op_id)
         est_rows = float(p.properties.est_rows) if p is not None else float("nan")
@@ -238,20 +238,32 @@ def _is_plan_node(value: Any) -> bool:
     return isinstance(value, Mapping) and "op" in value and "e" not in value
 
 
-def _walk_ir(ir: Mapping[str, Any], depth: int = 0) -> Iterator[tuple[int, Mapping[str, Any]]]:
+def walk_ir(ir: Mapping[str, Any], depth: int = 0) -> Iterator[tuple[int, Mapping[str, Any]]]:
     """Yield ``(depth, op_dict)`` pre-order over the relational IR tree.
 
     A child plan is any nested value that `_is_plan_node` accepts (a list contributes
     each such element); predicates/projections are skipped. Pre-order matches the `op_id`
     numbering used by both `annotate_ops` and the engine's `IdGen`.
+
+    Public because that walk order *is* the `op_id` contract: the profile builder, the
+    engine's id generator, and the dashboard's DAG builder must all number operators
+    identically or they silently describe different operators. One walk, imported — never
+    a second copy that can drift.
+
+    Args:
+        ir: A relational IR node (the ``to_ir()`` shape).
+        depth: Starting depth, used by the recursion.
+
+    Returns:
+        An iterator of ``(depth, node)`` pairs in pre-order.
     """
     if not _is_plan_node(ir):
         return
     yield depth, ir
     for value in ir.values():
         if _is_plan_node(value):
-            yield from _walk_ir(value, depth + 1)
+            yield from walk_ir(value, depth + 1)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 if _is_plan_node(item):
-                    yield from _walk_ir(item, depth + 1)
+                    yield from walk_ir(item, depth + 1)

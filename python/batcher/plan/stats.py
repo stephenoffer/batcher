@@ -28,11 +28,45 @@ provenance may only *inform* cost/cardinality or power an explicitly-named
 from __future__ import annotations
 
 import enum
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["ColumnStat", "Provenance", "RelStats", "weakest"]
+__all__ = ["ColumnStat", "Provenance", "RelStats", "ambiguous_float_bound", "weakest"]
+
+
+def ambiguous_float_bound(value: Any) -> bool:
+    """Whether reasoning about this bound with Python's comparisons could contradict the engine.
+
+    The engine does not order floats the way Python does, and the two disagree in exactly two
+    places:
+
+    * **NaN** — the engine's comparisons follow arrow-rs's *total* order, which ranks NaN above
+      every number; Python's `>` ranks it nowhere. (And a key path goes further: `bc_runtime::
+      keys` canonicalizes every NaN to one value, so a *join* matches NaN to NaN while a
+      comparison need not.)
+    * **zero** — the engine separates `-0.0` from `0.0` in a comparison (`-0.0 < 0.0` on that
+      total order), while Python calls them equal; and the key paths canonicalize them *back*
+      together, so a join matches `-0.0` to `0.0` that a `BETWEEN` would have filtered apart.
+
+    Any rewrite that reasons about a float bound with a Python comparison — folding a predicate
+    to FALSE, pushing a `BETWEEN` onto a join side, proving two key ranges disjoint — is
+    therefore unsound on such a bound, and must decline. Declining costs a scan; not declining
+    costs a row. This is the single definition, shared by every such rule, so they cannot drift
+    apart on the question of when a float bound may be trusted.
+
+    (The underlying engine divergence — its scalar float comparisons follow the total order
+    rather than IEEE, so `WHERE f = 0.0` misses `-0.0` and disagrees with DuckDB — is recorded
+    as B26 in `docs/internals/bug_hunt_ledger.md`. This guard is sound under either semantics.)
+
+    Args:
+        value: A recorded `min` or `max` bound.
+
+    Returns:
+        ``True`` if the bound is a float NaN or a float zero, and so cannot be reasoned from.
+    """
+    return isinstance(value, float) and (math.isnan(value) or value == 0.0)
 
 
 class Provenance(enum.IntEnum):
@@ -98,13 +132,76 @@ class ColumnStat:
     # the bloom" still proves absence in any subset — independent of `provenance`
     # (the bloom is consulted only to prove *absence*, never to answer a value).
     bloom: bytes | None = None
+    # The three *measured* distributional statistics, carried here rather than in a
+    # side map keyed by bare column name. That distinction is the whole point: a
+    # relation's statistics must travel **with the relation**, because a column name
+    # alone does not identify a column — two tables both have an `id`, and a global
+    # `{name: stat}` map silently lets one table's measurement answer for the other's.
+    #
+    #   `quantiles`  — an ascending quantile grid `{"probs": [...], "values": [...]}`
+    #                  (a KLL sketch), for interpolating range selectivity.
+    #   `mcv`        — most-common-values `{str(value): frequency}` (Misra-Gries), which
+    #                  sharpens equality selectivity on a skewed column far past `1/ndv`.
+    #   `avg_bytes`  — measured average width, which makes memory/broadcast sizing
+    #                  byte-true for wide columns (strings, embeddings, blobs).
+    quantiles: Mapping[str, list[float]] | None = None
+    mcv: Mapping[str, float] | None = None
+    avg_bytes: float | None = None
+    # The distinct count's *own* provenance, when it differs from the bundle's.
+    #
+    # `provenance` describes the bundle, and that single tag is a real constraint: a Parquet
+    # footer gives EXACT min/max/null_count but **no distinct count**, so the only ndv a
+    # columnar source can ever have is a measured (HLL) one. With one shared tag, attaching
+    # it would tag it EXACT and let an approximate count answer `count_distinct` — so it was
+    # refused, and every Parquet column therefore reached the optimizer with **no ndv at
+    # all**. Join cardinality then fell back to `max(|L|, |R|)`, every join in a query looked
+    # the same size, and join ordering was blind on precisely the workload that matters:
+    # TPC-H q9 applied its 5%-selective `part` filter *last* and ran 5.8x slower than DuckDB.
+    #
+    # Giving the ndv its own tag lets an approximate distinct count ride alongside exact
+    # bounds. `ndv_is_exact` is the gate every answer path reads, so a sketch ndv still can
+    # never answer an exact `count_distinct` — it only ever informs cost and cardinality.
+    ndv_provenance: Provenance | None = None
+    # The null count's *own* provenance — the same lesson, learned in the other direction.
+    #
+    # The bundle's single tag was refusing an **exact** statistic because it sat next to an
+    # inexact one. A Parquet footer records every column's null count exactly, whatever the
+    # type — but a *string* column's min/max may be byte-truncated by the writer, so the whole
+    # bundle was tagged `DEFAULT` and the exact null count went with it. The consequence was
+    # quiet and large: `n_null("name")`, `has_nulls("name")`, `null_count()`, `count(name)`, and
+    # `dq.not_null("name")` all fell back to a full scan on precisely the columns most real
+    # tables are made of. The footer knew the answer; the trust model could not express it.
+    #
+    # `null_count_is_exact` is the gate every null-answer path now reads, so an exact null count
+    # rides alongside untrustworthy bounds — exactly as `ndv_provenance` lets a sketched distinct
+    # count ride alongside exact ones.
+    null_count_provenance: Provenance | None = None
+
+    @property
+    def ndv_is_exact(self) -> bool:
+        """True iff `ndv` may answer an exact `count_distinct` (never for a sketch)."""
+        tag = self.ndv_provenance if self.ndv_provenance is not None else self.provenance
+        return tag.is_exact
+
+    @property
+    def null_count_is_exact(self) -> bool:
+        """True iff `null_count` may answer an exact question, whatever the bounds are worth."""
+        tag = (
+            self.null_count_provenance
+            if self.null_count_provenance is not None
+            else self.provenance
+        )
+        return tag.is_exact
 
     def downgrade(self, floor: Provenance) -> ColumnStat:
         """Return a copy whose provenance is weakened to at least `floor`.
 
         Used by row-shrinking operators (filter, limit, join) that preserve the
         *values* as bounds but can no longer vouch for them as exact extremes. The
-        bloom is preserved — it stays a sound absence proof over any subset.
+        bloom is preserved — it stays a sound absence proof over any subset. So are
+        the measured distributional stats: dropping rows can only *shrink* a column's
+        support, so its quantile grid and top values remain the best description of it
+        we have — and they are only ever read to *estimate*, never to answer.
         """
         return ColumnStat(
             min=self.min,
@@ -112,8 +209,22 @@ class ColumnStat:
             null_count=self.null_count,
             ndv=self.ndv,
             total_sum=self.total_sum,
+            mean=self.mean,
             provenance=weakest(self.provenance, floor),
             bloom=self.bloom,
+            quantiles=self.quantiles,
+            mcv=self.mcv,
+            avg_bytes=self.avg_bytes,
+            ndv_provenance=weakest(
+                self.ndv_provenance if self.ndv_provenance is not None else self.provenance,
+                floor,
+            ),
+            null_count_provenance=weakest(
+                self.null_count_provenance
+                if self.null_count_provenance is not None
+                else self.provenance,
+                floor,
+            ),
         )
 
 

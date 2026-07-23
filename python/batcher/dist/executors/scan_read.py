@@ -75,6 +75,35 @@ _NATIVE_RG_WINDOW = max(1, int(os.environ.get("BATCHER_NATIVE_RG_WINDOW", "8")))
 # and run at compute speed. Bounded LRU by total cached bytes — defaults to a fraction of
 # the node's RAM so it never crowds out the working set; `BATCHER_SCAN_CACHE_BYTES=0`
 # disables it. Lives on the worker process, so it persists exactly as long as the fleet.
+def _scan_cache_siblings() -> int:
+    """How many worker processes share this node's RAM with us — never below 1.
+
+    A Ray node runs about one worker process per CPU, and this cache is a module-level
+    constant *per process*. Sizing it against the node's whole RAM therefore promises each
+    of them the same bytes: on a 16-CPU / 32 GB worker the node-level budget came to
+    ~154 GB. The cap has to be this process's *share*, not the machine.
+    """
+    try:
+        import ray
+
+        if ray.is_initialized():
+            # The node's own CPU count, not the cluster's — the RAM being divided is local.
+            node_id = ray.get_runtime_context().get_node_id()
+            for node in ray.nodes():
+                if node.get("NodeID") == node_id:
+                    cpus = int(node.get("Resources", {}).get("CPU", 0))
+                    if cpus > 0:
+                        return cpus
+    except Exception:
+        pass
+    # The cgroup/affinity-aware count, not `os.cpu_count()`'s host total. A worker container
+    # limited to 4 of a host's 64 cores runs ~4 sibling processes, not 64, so dividing the RAM
+    # budget by the host count shrinks each process's cache ~16x below its real share.
+    from batcher._internal.hardware import available_cpu_count
+
+    return max(1, available_cpu_count())
+
+
 def _default_scan_cache_cap() -> int:
     frac = max(0.0, float(os.environ.get("BATCHER_SCAN_CACHE_FRACTION", "0.3")))
     try:
@@ -83,7 +112,10 @@ def _default_scan_cache_cap() -> int:
         total = psutil.virtual_memory().total
     except Exception:
         total = 8 * 1024**3
-    return int(total * frac)
+    # `total` is the *node's* RAM but this cap is enforced per process, so divide it by the
+    # processes sharing the node. Without this the bound is real per process and meaningless
+    # per node — every worker independently fills to `frac * node_RAM` and the node OOMs.
+    return int(total * frac / _scan_cache_siblings())
 
 
 _SCAN_CACHE_CAP = int(os.environ.get("BATCHER_SCAN_CACHE_BYTES", str(_default_scan_cache_cap())))
@@ -101,12 +133,28 @@ _SKIPPED_LOCK = threading.Lock()
 
 
 def skipped_splits() -> int:
-    """The number of splits this worker skipped under ``on_read_error="skip"``.
+    """Cumulative count of splits this worker skipped under ``on_read_error="skip"``.
 
     Non-zero means the scan dropped unreadable data (a corrupt file / row-group) rather
-    than failing — the count makes that data loss observable instead of silent.
+    than failing. It is a worker-process total, so on a persistent fleet worker it answers
+    "how much has this process ever skipped", not "how much did my query skip" — use
+    `drain_skipped_splits` for the per-query figure.
     """
     return _SKIPPED_SPLITS
+
+
+def drain_skipped_splits() -> int:
+    """Return this worker's skip count and reset it to zero — the per-query reading.
+
+    A fleet worker outlives the query that ran on it, so a cumulative counter cannot answer
+    "did MY job lose data", the only question that matters when a petabyte-scale scan
+    quietly drops a corrupt shard. Draining per task lets the driver sum one number per
+    partition and report the job's true loss.
+    """
+    global _SKIPPED_SPLITS
+    with _SKIPPED_LOCK:
+        total, _SKIPPED_SPLITS = _SKIPPED_SPLITS, 0
+    return total
 
 
 def _record_skipped(split, exc: Exception) -> None:
@@ -236,8 +284,8 @@ def _read_split_batches_uncached(splits, projection, predicate, on_read_error="e
             splits, projection, predicate, _SCAN_PREFETCH, skip_errors=True
         )
         return
-    if _NATIVE_READER and predicate is None:
-        native = _native_scan_batches(splits, projection)
+    if _NATIVE_READER:
+        native = _native_scan_batches(splits, projection, predicate)
         if native is not None:
             yield from native
             return
@@ -248,20 +296,23 @@ def _read_split_batches_uncached(splits, projection, predicate, on_read_error="e
         yield from _prefetch_split_reads(splits, projection, predicate, _SCAN_PREFETCH)
 
 
-def _native_scan_batches(splits, projection):
+def _native_scan_batches(splits, projection, predicate=None):
     """Read uniform Parquet row-group splits with the native Rust reader, or `None`.
 
     Groups the splits by file and reads each file's requested row-groups in one native
-    call (which fetches them concurrently). Returns `None` (caller falls back to pyarrow)
-    when the splits aren't all `RowGroupSplit`s or the native extension/read is
+    call (which fetches them concurrently). A pushed `predicate` is applied as native
+    row-group pruning — its zone-map-provably-empty groups are never fetched or decoded;
+    the pruning is superset-safe (the engine keeps the `Filter` operator downstream, so a
+    non-pushable predicate just reads more rows). Returns `None` (caller falls back to
+    pyarrow) when the splits aren't all `RowGroupSplit`s or the native extension/read is
     unavailable — so an unsupported scheme or any read error never fails the scan.
     """
+    from batcher.io.formats.structured import _parquet_native
     from batcher.io.splits import RowGroupSplit
 
     if not splits or not all(isinstance(s, RowGroupSplit) for s in splits):
         return None
     try:
-        import batcher._native as nat
         from batcher.config import active_config
 
         batch_rows = active_config().execution.morsel_rows
@@ -281,7 +332,12 @@ def _native_scan_batches(splits, projection):
             # memory + read/compute overlap) instead of materializing its whole partition.
             for i in range(0, len(ordered), _NATIVE_RG_WINDOW):
                 window = ordered[i : i + _NATIVE_RG_WINDOW]
-                yield from nat.read_parquet(uri, window, cols, batch_rows)
+                batches = _parquet_native.read_row_groups_filtered(
+                    uri, window, cols, predicate, batch_rows
+                )
+                if batches is None:  # native unavailable/failed → fall back to pyarrow
+                    raise _NativeUnavailable
+                yield from batches
 
     # Probe the first read eagerly so a failure falls back to pyarrow instead of yielding
     # a half-stream; on success, chain the probed batches back in.
@@ -296,6 +352,11 @@ def _native_scan_batches(splits, projection):
 
 
 _SENTINEL = object()
+
+
+class _NativeUnavailable(Exception):
+    """Raised inside the native scan generator when the native read returns no result, so
+    the eager first-batch probe falls back to the pyarrow dataset scan."""
 
 
 def _chain_first(first, rest):
@@ -316,6 +377,10 @@ def _native_uri(path: str) -> str:
     A no-op for non-S3 schemes / local paths, and when the URI already carries a region.
     """
     if not path.startswith(("s3://", "s3a://")) or "region=" in path:
+        return path
+    # Skip the AWS-only GetBucketLocation probe when an endpoint override already says
+    # where the bucket lives: on-prem S3 (MinIO / Ceph) may not implement that call at all.
+    if "endpoint" in path or os.environ.get("AWS_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT"):
         return path
     bucket = path.split("://", 1)[1].split("/", 1)[0]
     region = _S3_REGION.get(bucket)

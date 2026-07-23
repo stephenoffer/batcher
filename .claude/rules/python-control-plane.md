@@ -8,7 +8,7 @@ API hygiene) live in `.claude/rules/python-quality.md`.
 
 ## The user-facing API: lazy, immutable, expression-first
 
-The surface (`api/dataset.py`, `plan/expr_ir.py`, `python/batcher/__init__.py`) is
+The surface (`api/dataset/`, `plan/expr_ir/`, `python/batcher/__init__.py`) is
 deliberately small. Keep it that way.
 
 - **Lazy + immutable.** A `Dataset` is a handle to a `LogicalPlan` plus bound
@@ -70,6 +70,5 @@ Keep batch and micro-batch paths on the same operator semantics.
 
 ## Gate before "done"
 
-`just lint-layers` (layer independence) + the Python quality gate in
-`.claude/rules/python-quality.md` + `just build` && `just test-py`. If you changed
-IR tags, you also changed Rust — run `just test-rust` too.
+The canonical gate matrix is in `CLAUDE.md` — run the rows your change touches. Control-plane
+delta: if you changed IR tags you also changed Rust, so the Rust rows apply too.

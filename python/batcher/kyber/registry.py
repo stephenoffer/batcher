@@ -49,7 +49,7 @@ class RuleRegistry:
         phase: Phase,
         matches: tuple[type, ...],
         category: RuleCategory = RuleCategory.REWRITE,
-        idempotent: bool = True,
+        expr: Callable | None = None,
     ) -> Callable[
         [Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None]],
         Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None],
@@ -67,7 +67,7 @@ class RuleRegistry:
                     fn,
                     matches=matches,
                     category=category,
-                    idempotent=idempotent,
+                    expr_fn=expr,
                 )
             )
             return fn
@@ -88,11 +88,18 @@ def rule(
     phase: Phase,
     matches: tuple[type, ...],
     category: RuleCategory = RuleCategory.REWRITE,
-    idempotent: bool = True,
+    expr: Callable | None = None,
 ):
-    """Register a node-local rule into the default registry (see `RuleRegistry.rule`)."""
+    """Register a node-local rule into the default registry (see `RuleRegistry.rule`).
+
+    `expr` declares the rule's body as a leaf `Expr -> Expr` rewrite, letting the driver run
+    it in one shared expression traversal with every other expression rule in the phase."""
     return DEFAULT_REGISTRY.rule(
-        name=name, phase=phase, matches=matches, category=category, idempotent=idempotent
+        name=name,
+        phase=phase,
+        matches=matches,
+        category=category,
+        expr=expr,
     )
 
 
@@ -106,7 +113,7 @@ def register_builtin_rules(registry: RuleRegistry) -> None:
       - NORMALIZE:    constant folding, expression simplification (whole-tree, confluent)
       - PUSHDOWN:     predicate pushdown (Filter), projection/column pruning
       - JOIN_REORDER: cost-based join ordering (DPccp/DPhyp with a greedy fallback,
-                      registered as `join_reorder` from `rules.join_order`)
+                      registered as `join_reorder` from `rules.joins.order`)
       - FUSION:       top-N fusion (Sort+Limit → partial sort)
       - SELECTION:    adaptive join build-side (cost-based, records its decision)
 

@@ -41,6 +41,28 @@ pub(crate) fn partition_morsels(
     keys: &[String],
     parts: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
+    partition_morsels_with(batches, parts, |b| columns_by_name(b, keys))
+}
+
+/// [`partition_morsels`] keyed by column *index* — the form the distributed shuffle
+/// speaks (`dist::partition_batches` receives key indices, not names).
+pub(crate) fn partition_morsels_by_index(
+    batches: &[RecordBatch],
+    key_indices: &[usize],
+    parts: usize,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    partition_morsels_with(batches, parts, |b| {
+        Ok(key_indices.iter().map(|&i| b.column(i).clone()).collect())
+    })
+}
+
+/// The shared body: everything but *how a morsel's key columns are selected* is
+/// independent of whether the caller names its keys or indexes them.
+fn partition_morsels_with(
+    batches: &[RecordBatch],
+    parts: usize,
+    key_cols_of: impl Fn(&RecordBatch) -> Result<Vec<ArrayRef>, InterpError> + Sync,
+) -> Result<Vec<RecordBatch>, InterpError> {
     debug_assert!(parts >= 1);
     if parts == 1 || batches.is_empty() {
         return Ok(vec![crate::ops::materialize(batches)?]);
@@ -52,7 +74,7 @@ pub(crate) fn partition_morsels(
     let per_morsel: Vec<(Vec<u32>, Vec<u32>)> = batches
         .par_iter()
         .map(|batch| {
-            let key_cols = columns_by_name(batch, keys)?;
+            let key_cols = key_cols_of(batch)?;
             let part_of = shuffle::bucket_of_rows(&key_cols, batch.num_rows(), parts)?;
             Ok(shuffle::bucket_csr(&part_of, parts))
         })

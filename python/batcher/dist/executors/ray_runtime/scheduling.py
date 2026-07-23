@@ -58,8 +58,18 @@ def task_options(env: SchedulingEnvelope | None) -> dict:
             opts["memory"] = int(env.memory_bytes)
         if env.num_gpus > 0:
             opts["num_gpus"] = env.num_gpus
-            if env.accelerator_type is not None:
-                opts["accelerator_type"] = env.accelerator_type
+        # Custom accelerator resources: Ray reports NVIDIA/AMD/Intel/MetaX as `GPU`
+        # (covered by `num_gpus`) but everything else as a named resource — `TPU`,
+        # `neuron_cores`, `HPU`, `NPU` — as does any resource an operator defined on their
+        # own cluster. Merged, not assigned, so it composes with the CPU-only node selector
+        # below rather than one silently overwriting the other.
+        if env.resources:
+            opts["resources"] = {**opts.get("resources", {}), **dict(env.resources)}
+        # Applied for any accelerator, not just GPUs: a TPU/Trainium node has `num_gpus == 0`,
+        # so gating this on GPUs dropped the device-model pin on exactly the hardware that
+        # most needs it, letting the task land anywhere in the cluster.
+        if env.accelerator_type is not None and (env.num_gpus > 0 or env.resources):
+            opts["accelerator_type"] = env.accelerator_type
         # Hard-restrict a CPU-only fleet to CPU-only nodes when the cluster opts in and can
         # host it (a no-op otherwise). Keeps a CPU shuffle from stealing an inference
         # stage's GPU-node cores; additive to Ray's soft GPU-node avoidance.
@@ -112,13 +122,11 @@ def worker_runtime_env() -> dict | None:
         return None
     if _WORKER_RT_ENV_DONE:
         return _WORKER_RT_ENV
-    import os
-
     from ray._private.runtime_env.py_modules import upload_py_modules_if_needed
 
-    import batcher
+    from batcher._internal.paths import package_dir
 
-    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
+    pkg = package_dir()
     # include_gitignore=False → upload the dir verbatim (the maturin-built native
     # `.so` may be gitignored; it must reach the worker for `import batcher` to work).
     rt = upload_py_modules_if_needed({"py_modules": [pkg]}, include_gitignore=False)
@@ -156,6 +164,14 @@ def _bundle(env: SchedulingEnvelope | None, node_class: dict | None = None) -> d
         bundle["GPU"] = env.num_gpus
     if env and env.memory_bytes > 0:
         bundle["memory"] = int(env.memory_bytes)
+    # Custom accelerator resources belong in the bundle for the same reason the node-class
+    # selector below does: a bundle reserves by resource, so a `TPU`/`neuron_cores`/`HPU`
+    # request that lives only in `.options()` reserves nothing. The gang would then be
+    # placed on whatever nodes satisfied CPU alone, and each task would afterwards demand
+    # an accelerator its own bundle never held — pending forever on a CPU node, or
+    # oversubscribing the one accelerator node the group happened to land on.
+    if env and env.resources:
+        bundle.update(dict(env.resources))
     # A PG bundle is matched by resource, so the CPU-only restriction must live in the
     # bundle (not just `.options`) for the gang to land on CPU-only nodes.
     extra = _fleet_node_class_resources(env) if node_class is None else node_class

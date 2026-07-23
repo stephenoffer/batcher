@@ -50,6 +50,15 @@ class CheckpointStore:
         """Mark `batch_id` durably done (the last step of the micro-batch)."""
         self.commits.commit(batch_id, sink_token)
 
+    def prune_state(self, keep_through: int) -> None:
+        """Delete running-state snapshots older than `keep_through` (bounded state dir).
+
+        Recovery restores from the *latest committed* snapshot only, so every earlier one
+        is dead weight; pruning them after each commit keeps a long-running stateful query's
+        ``state/`` directory bounded (one live snapshot) instead of growing without limit.
+        """
+        self.state.prune(keep_through)
+
     def close(self) -> None:
         self.offsets.close()
         self.commits.close()

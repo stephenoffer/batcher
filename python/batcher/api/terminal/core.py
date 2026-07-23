@@ -189,7 +189,18 @@ def _collect(
 
     from batcher import core
     from batcher.api import executors
-    from batcher.api.terminal.event_log import event_log_collector, write_event_log
+    from batcher.api.terminal.event_log import (
+        event_log_collector,
+        pipeline_signature,
+        query_label,
+        report_failure,
+        start_query_report,
+        write_event_log,
+    )
+    from batcher.observe import ensure_sinks
+
+    ensure_sinks()  # attach the progress bar / dashboard the config asks for (idempotent)
+    query_id = start_query_report(query_label(plan), pipeline_signature(plan))
 
     ctx = core.ExecutionContext(
         columns=columns,
@@ -201,9 +212,16 @@ def _collect(
         profile=event_log_collector(),
     )
     t0 = time.perf_counter()
-    table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    try:
+        table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    except BaseException as exc:
+        # A failed query must close out on the bus too, or its progress bar spins forever
+        # and the dashboard shows it as still running. Re-raised unchanged — reporting the
+        # failure must not alter it.
+        report_failure(query_id, total_ms=(time.perf_counter() - t0) * 1000.0, exc=exc)
+        raise
     total_ms = (time.perf_counter() - t0) * 1000.0
-    write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
+    write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows, query_id=query_id)
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
@@ -393,7 +411,15 @@ def _streaming_write_eligible(
     return not all(isinstance(s, InMemorySource | MaterializedSource) for s in sources)
 
 
-def _commit(sink, manifest: WriteManifest, path: str, fmt: str) -> WriteManifest:
+def _commit(
+    sink,
+    manifest: WriteManifest,
+    path: str,
+    fmt: str,
+    schema: pa.Schema | None = None,
+    *,
+    auto_compact: bool = False,
+) -> WriteManifest:
     """Commit the write, then drop any statistics this session cached for `path`.
 
     Those statistics are a zone map the optimizer prunes predicates and join sides with,
@@ -402,10 +428,25 @@ def _commit(sink, manifest: WriteManifest, path: str, fmt: str) -> WriteManifest
     `ds.scd.apply_changes` — rewrites a path it also reads, so this is the common case,
     not a corner one. Routed through one helper because `_write` commits from three
     branches and a missed one is a silent wrong answer.
+
+    `schema` is the write's output schema. A transactional sink creating a table needs
+    it and cannot recover it from the data files alone — a partitioned write stores its
+    partition columns in the path, not the file — so the driver, which knows the plan's
+    output type, attaches it here for every branch.
     """
+    import dataclasses
+
     from batcher.api.orchestration import invalidate_source_stats
 
+    if schema is not None and manifest.schema is None:
+        manifest = dataclasses.replace(manifest, schema=schema)
     sink.commit(manifest, path)
+    if auto_compact:
+        # After the commit, never before: the data is already durable, so a compaction that
+        # fails costs nothing but the compaction.
+        from batcher.io.formats.lakehouse.maintenance import auto_compact as _auto_compact
+
+        _auto_compact(path, fmt)
     invalidate_source_stats(path, fmt)
     return manifest
 
@@ -419,13 +460,16 @@ def _write(
     fmt: str,
     *,
     partition_by: list[str] | None = None,
-    distributed: bool = False,
+    distributed: bool | str = "auto",
     num_workers: int | None = None,
     resume: bool = False,
     max_rows_per_file: int | None = None,
     num_files: int | None = None,
     target_bytes_per_file: int | None = None,
+    auto_compact: bool = False,
     sink_kwargs: dict[str, Any] | None = None,
+    sink: Any | None = None,
+    directory: bool = False,
 ) -> WriteManifest:
     """Execute the plan and write the result via the `fmt` sink.
 
@@ -433,9 +477,15 @@ def _write(
     directory of ``part-*`` files). `partition_by` writes a Hive-layout directory.
     Workers write their own data files in parallel; the driver then performs one
     atomic `commit` over the merged manifest.
+
+    `distributed` resolves through the SAME `"auto"` routing as `collect()`. It used to
+    default to `False`, so on a cluster every write — the one terminal whose output size
+    is the whole result — ran the read, the transform, and the write on the driver alone.
     """
     from batcher.io.sink import SINKS
     from batcher.plan.logical import is_streamable
+
+    distributed = _resolve_distributed(distributed, plan, sources)
 
     # Validate the row cap up front: 0 would raise an opaque `range() step zero`, and
     # a negative value would silently produce an *empty* range — writing no files at
@@ -445,20 +495,59 @@ def _write(
 
         raise PlanError(f"max_rows_per_file must be >= 1, got {max_rows_per_file}")
 
-    sink = SINKS.get(fmt)(**(sink_kwargs or {}))
+    # The transactional (lakehouse) sinks commit on the DRIVER from a manifest of
+    # worker-staged files, so the driver's sink — a separate instance from the workers'
+    # — must carry `partition_by` (the workers get it via `write_partitioned`, but the
+    # driver only sees it here). Thread it through the constructor so the commit
+    # partitions correctly. File sinks take partition_by per-call and ignore this.
+    sink_kwargs = dict(sink_kwargs or {})
+    if fmt == "delta" and partition_by is not None:
+        sink_kwargs.setdefault("partition_by", partition_by)
+    if fmt == "iceberg":
+        # For Iceberg the write `path` IS the table identifier (the sink needs it at
+        # construction for staging + commit, on the driver and every worker).
+        sink_kwargs.setdefault("identifier", path)
+        # One write token shared by every worker's sink so all shards of this write name
+        # their staged files under the same token (and a later write uses a different one,
+        # so `add_files` never lets it clobber a file a prior snapshot still references).
+        import uuid
 
-    # Streaming distributed write: for a breaker-free single-source plan, each
+        sink_kwargs.setdefault("write_token", uuid.uuid4().hex[:12])
+    # `sink` lets a caller supply the writer instead of taking the registry's default. The
+    # copy-on-write MERGE needs it: its output files land *beside* files it deliberately did
+    # not read, so they must carry a unique token (`TokenizedParquetSink`) rather than the
+    # registry sink's deterministic `part-{index}` name, which would overwrite a survivor.
+    if sink is None:
+        sink = SINKS.get(fmt)(**sink_kwargs)
+
+    # Streaming distributed write: for a breaker-free single-source *relational* plan, each
     # worker writes its own output files and only manifests return — the full
     # result never materializes on the driver (no OOM on tables bigger than one
     # node). Plans with a breaker (aggregate/join/sort) reduce the result first,
     # so the collect-then-write path below is fine for them.
+    #
+    # `map_batches`/UDF pipelines go through here TOO. `_distributed_write_plan` routes them to
+    # the UDF-aware distributed map with the sink bound into each worker, so a batch-inference
+    # job writes its output from the worker that produced it. Excluding them here (as this path
+    # used to) sent them down `_collect(distributed=True)`, which lands the whole post-inference
+    # result on the driver — an unconditional OOM on any job whose output exceeds one node.
     if distributed and len(sources) == 1 and is_streamable(plan):
+        from batcher.dist import resolve_worker_fanout
         from batcher.dist.executors.write import _distributed_write_plan
 
+        out_schema = _schema(plan, sources, columns)
         manifest = _distributed_write_plan(
-            plan, sources, path, fmt, sink_kwargs, partition_by, num_workers or 4
+            plan, sources, path, fmt, sink_kwargs, partition_by, resolve_worker_fanout(num_workers)
         )
-        return _commit(sink, manifest, path, fmt)
+        # Every shard produced zero rows (a filter that matched nothing). Each worker
+        # correctly wrote no file, but the single-node path writes ONE empty file, so
+        # without this the distributed result is an absent path where single-node leaves a
+        # readable empty table — a `distributed != single-node` divergence that surfaces
+        # downstream as "path does not exist" rather than an empty read.
+        if not manifest.files and out_schema is not None:
+            empty = pa.Table.from_batches([], schema=out_schema)
+            manifest = WriteManifest(tuple(sink.write_partitioned(empty, path, file_index=0)))
+        return _commit(sink, manifest, path, fmt, out_schema, auto_compact=auto_compact)
 
     # An unbounded source reaching the materialize path below would never finish.
     # The streaming distributed write above handles breaker-free shapes; otherwise
@@ -483,7 +572,7 @@ def _write(
     # Streaming single-node write: a breaker-free plan over a lazy source
     # (read→filter→project→write) streams batch-by-batch into one file, so the driver
     # holds one batch — never the whole result.
-    if _streaming_write_eligible(
+    if hasattr(sink, "write_stream") and _streaming_write_eligible(
         plan,
         sources,
         distributed,
@@ -502,7 +591,9 @@ def _write(
             _iter_batches(plan, sources, columns), lambda: _schema(plan, sources, columns)
         )
         written = sink.write_stream(prefetch(stream), path, schema=schema, resume=resume)
-        return _commit(sink, WriteManifest((written,)), path, fmt)
+        return _commit(
+            sink, WriteManifest((written,)), path, fmt, schema, auto_compact=auto_compact
+        )
 
     table = _collect(plan, sources, columns, distributed=distributed, num_workers=num_workers)
     # Resolve a `repartition` layout to a per-file row cap now that the size is known
@@ -515,13 +606,35 @@ def _write(
             rows = table.num_rows * target_bytes_per_file // table.nbytes
             max_rows_per_file = max(1, int(rows))
     if distributed:
+        from batcher.dist import resolve_worker_fanout
         from batcher.dist.executors.write import _distributed_write
 
-        manifest = _distributed_write(sink, table, path, partition_by, num_workers or 4)
-    elif partition_by or max_rows_per_file is not None:
+        manifest = _distributed_write(
+            sink, table, path, partition_by, resolve_worker_fanout(num_workers)
+        )
+    elif (
+        directory
+        or partition_by
+        or max_rows_per_file is not None
+        or getattr(sink, "partitions_itself", False)
+    ):
         # A row cap (or partitioning) writes a directory of `part-*` files; the cap
         # bounds each file's size (no single giant file; tiny files coalesce upstream).
-        written = sink.write_partitioned(
+        # `directory` forces that layout with neither: a copy-on-write MERGE writes *into*
+        # an existing directory of data files, so a single-file write at `path` would try
+        # to replace the directory itself.
+        #
+        # `partitions_itself` is how a sink says its layout is a property of the *table*,
+        # not of the write. A partitioned Iceberg table declares its partitioning in the
+        # catalog's spec, so no `partition_by` argument ever appears at the call site — and
+        # this branch used to be skipped, the shard written as one flat file, and the commit
+        # rejected it ("more than one partition values"). A partitioned Iceberg table was
+        # simply unwritable.
+        #
+        # `resume`/`max_rows_per_file` are file-sink concepts; a warehouse/DB sink ignores
+        # them (each shard appends to one table), so pass them only when accepted.
+        written = _sink_write_partitioned(
+            sink,
             table,
             path,
             partition_by=partition_by,
@@ -530,13 +643,70 @@ def _write(
         )
         manifest = WriteManifest(tuple(written))
     else:
-        manifest = WriteManifest((sink.write(table, path, resume=resume),))
+        manifest = WriteManifest((_sink_write(sink, table, path, resume=resume),))
         # Single-file write: remember the result's stats so a later read of this
         # exact path can be answered from metadata even for a footerless format.
         from batcher.api.orchestration import persist_written_source_stats
 
         persist_written_source_stats(table, path, fmt)
-    return _commit(sink, manifest, path, fmt)
+    return _commit(sink, manifest, path, fmt, table.schema, auto_compact=auto_compact)
+
+
+def _sink_write(sink, table: pa.Table, path: str, *, resume: bool):
+    """`sink.write`, tolerating sinks whose `write` has no `resume` parameter.
+
+    The `Sink` protocol's `write(table, path)` does not include `resume`; only the file
+    sinks (which write atomically to an idempotent path) added it. A warehouse/DB sink
+    (Snowflake/Mongo/ADBC/Lance) implements the bare protocol signature, so passing
+    `resume=` crashed. Resume is meaningless for an append-to-table sink, so drop it for
+    those — but a *requested* `resume=True` the sink cannot honor is surfaced, never
+    silently ignored (silently ignoring it would risk duplicate ingest on a re-run).
+    """
+    try:
+        return sink.write(table, path, resume=resume)
+    except TypeError:
+        if resume:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"write(resume=True) is not supported by the {type(sink).__name__} sink "
+                "(resume is exactly-once only for the atomic file sinks). Write without "
+                "resume, or land the data in a file format first."
+            ) from None
+        return sink.write(table, path)
+
+
+def _sink_write_partitioned(
+    sink,
+    table: pa.Table,
+    path: str,
+    *,
+    partition_by: list[str] | None,
+    resume: bool,
+    max_rows_per_file: int | None,
+):
+    """`sink.write_partitioned`, tolerating sinks whose signature omits the file-sink-only
+    `resume`/`max_rows_per_file` (warehouse/DB sinks — each shard just appends to one table).
+
+    A *requested* `resume=True` a sink cannot honor is surfaced rather than silently dropped
+    (dropping it risks duplicate ingest on a re-run), mirroring `_sink_write`."""
+    try:
+        return sink.write_partitioned(
+            table,
+            path,
+            partition_by=partition_by,
+            resume=resume,
+            max_rows_per_file=max_rows_per_file,
+        )
+    except TypeError:
+        if resume:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"write(resume=True) is not supported by the {type(sink).__name__} sink "
+                "(resume is exactly-once only for the atomic file sinks)."
+            ) from None
+        return sink.write_partitioned(table, path, partition_by=partition_by)
 
 
 def _to_pydict(
@@ -572,6 +742,13 @@ def _to_polars(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> 
 
 
 def _show(plan: LogicalPlan, sources: list[Source], columns: list[str], limit: int) -> None:
-    """Print a preview of the result."""
-    table = _collect(plan, sources, columns)
-    print(table.slice(0, limit))
+    """Print a preview of the result.
+
+    The `limit` is pushed into the PLAN, not applied to a materialized table: `show()`
+    on a billion-row dataset must read only enough of the source to produce `limit`
+    rows (the streaming early-stop / distributed top-N paths), never collect the whole
+    result to the driver just to slice ten rows off it.
+    """
+    from batcher.plan.logical import Limit
+
+    print(_collect(Limit(plan, limit), sources, columns))

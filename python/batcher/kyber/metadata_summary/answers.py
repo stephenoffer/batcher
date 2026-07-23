@@ -75,7 +75,11 @@ def approx_column_summary(
     for col in columns:
         entry = _exact_entry(stats, col)
         stat = stats.columns.get(col)
-        if stat is not None and stat.ndv is not None:
+        # An entry holding *only* `approx_n_unique` is intentional — surfacing the sketch for
+        # a column with no exact facets is the whole point of this variant. But the count must
+        # be genuinely approximate: when the ndv is exact, `_exact_entry` already reported it
+        # as `n_unique`, and repeating it here would label an exact value approximate.
+        if stat is not None and stat.ndv is not None and not stat.ndv_is_exact:
             entry["approx_n_unique"] = int(stat.ndv)
         if entry:
             result[col] = entry
@@ -102,6 +106,11 @@ def _exact_entry(stats: RelStats, col: str) -> dict[str, Any]:
         entry["min"] = stat.min
     if stat.max is not None:
         entry["max"] = stat.max
-    if stat.ndv is not None:
+    # `ndv_is_exact`, not the bundle tag: a Parquet column carries EXACT bounds *and* a
+    # measured (SKETCH) HLL distinct count, so gating on the bundle alone reported an
+    # approximate `n_unique` as exact — the one thing `plan.stats` says every answer path
+    # must read `ndv_is_exact` to prevent. The sketch is still surfaced, as the explicitly
+    # approximate `approx_n_unique` in `approx_column_summary`.
+    if stat.ndv is not None and stat.ndv_is_exact:
         entry["n_unique"] = int(stat.ndv)
     return entry

@@ -66,8 +66,50 @@ class EmbeddingSource:
 
     def _dimension(self) -> int:
         if self._dim is None:
-            self._dim = self._file_vectors(self._files()[0]).shape[1]
+            self._dim = self._header_dim(self._files()[0])
         return self._dim
+
+    def _header_dim(self, path: str) -> int:
+        """The embedding dimension from the file *header*, never its payload.
+
+        `schema()` needs only the width of the fixed-size-list column. A ``.npy`` states
+        its shape in the header block (``read_array_header``) and a ``.parquet``
+        ``fixed_size_list`` states its width in the schema — both are readable without
+        touching a single vector. The previous code ``np.load``-ed / ``read_table``-d the
+        whole first file just to take ``.shape[1]``, so learning the schema of a directory
+        of large embedding matrices paid a full file read. Only an untyped/variable-width
+        source falls back to reading the payload.
+        """
+        import numpy as np
+
+        if path.endswith(".npy"):
+            header_readers = {
+                (1, 0): np.lib.format.read_array_header_1_0,
+                (2, 0): np.lib.format.read_array_header_2_0,
+            }
+            try:
+                with self._fs.open(path) as fh:
+                    version = np.lib.format.read_magic(fh)
+                    reader = header_readers.get(version)
+                    if reader is not None:
+                        shape = reader(fh)[0]
+                        if len(shape) == 2:
+                            return shape[1]
+                        if len(shape) == 1:
+                            return shape[0]  # a 1-D vector is one row of width len(vector)
+            except Exception:
+                pass  # unknown .npy version/layout — fall back to a full read below
+        elif path.endswith(".parquet"):
+            import pyarrow.parquet as pq
+
+            try:
+                with self._fs.open(path) as fh:
+                    schema = pq.read_schema(fh)
+                if len(schema) == 1 and pa.types.is_fixed_size_list(schema.field(0).type):
+                    return schema.field(0).type.list_size
+            except Exception:
+                pass  # variable-width or unreadable schema — fall back to a full read
+        return self._file_vectors(path).shape[1]
 
     def schema(self) -> pa.Schema:
         dim = self._dimension()

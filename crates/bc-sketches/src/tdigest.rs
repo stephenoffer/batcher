@@ -313,7 +313,10 @@ impl TDigest {
         let min = c.f64()?;
         let max = c.f64()?;
         let len = c.u64()? as usize;
-        let mut centroids = Vec::with_capacity(len);
+        // Don't trust `len` for the reservation: each centroid is 16 bytes on the
+        // wire, so cap by the bytes that remain. A crafted blob claiming a huge
+        // `len` then hits the short-read `None` path, not `capacity overflow`.
+        let mut centroids = Vec::with_capacity(len.min(c.remaining() / 16));
         let mut wsum = 0.0;
         for _ in 0..len {
             let mean = c.f64()?;
@@ -376,6 +379,12 @@ impl<'a> Cursor<'a> {
 
     fn is_done(&self) -> bool {
         self.pos == self.bytes.len()
+    }
+
+    /// Bytes not yet consumed. Used to bound `Vec::with_capacity` against an
+    /// untrusted length field so a crafted blob cannot request a giant allocation.
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
 }
 
@@ -636,6 +645,20 @@ mod tests {
         bad.extend_from_slice(&f64::NEG_INFINITY.to_le_bytes());
         bad.extend_from_slice(&0u64.to_le_bytes()); // len
         assert!(TDigest::from_bytes(&bad).is_none());
+    }
+
+    #[test]
+    fn from_bytes_rejects_absurd_centroid_count_without_panic() {
+        // A crafted/corrupt blob with a valid header but an enormous centroid `len`
+        // must be rejected with `None`, not abort the process pre-allocating a `Vec`
+        // of that many centroids (`Vec::with_capacity(huge)` → capacity overflow).
+        let mut b = Vec::new();
+        b.extend_from_slice(&100.0f64.to_le_bytes()); // compression
+        b.extend_from_slice(&0.0f64.to_le_bytes()); // n
+        b.extend_from_slice(&f64::INFINITY.to_le_bytes()); // min
+        b.extend_from_slice(&f64::NEG_INFINITY.to_le_bytes()); // max
+        b.extend_from_slice(&u64::MAX.to_le_bytes()); // len = absurd
+        assert!(TDigest::from_bytes(&b).is_none());
     }
 
     #[test]

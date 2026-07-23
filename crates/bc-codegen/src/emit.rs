@@ -209,9 +209,9 @@ impl Codegen<'_, '_> {
                 use bc_expr::MathFunc::*;
                 let (v, vt) = self.emit_typed(input);
                 match func {
-                    // `abs`: float -> fabs; int -> select(x < 0, 0 - x, x), which
-                    // reproduces `i64::abs` for the (in-range) values the engine
-                    // sees and keeps the result type equal to the input type.
+                    // `abs`: float -> fabs; int -> select(x < 0, 0 - x, x), with i64::MIN
+                    // saturated to i64::MAX (its negation overflows) so the result is never a
+                    // negative "absolute value" and matches the interpreter's `saturating_abs`.
                     Abs => match vt {
                         ScalarTy::F64 => (self.b.ins().fabs(v), ScalarTy::F64),
                         ScalarTy::I64 => {
@@ -222,7 +222,17 @@ impl Codegen<'_, '_> {
                                 v,
                                 zero,
                             );
-                            (self.b.ins().select(is_neg, neg, v), ScalarTy::I64)
+                            let abs = self.b.ins().select(is_neg, neg, v);
+                            // saturate: abs(i64::MIN) wraps back to i64::MIN (still < 0) — map
+                            // that one value to i64::MAX to match `i64::saturating_abs`.
+                            let i64_min = self.b.ins().iconst(types::I64, i64::MIN);
+                            let i64_max = self.b.ins().iconst(types::I64, i64::MAX);
+                            let is_min = self.b.ins().icmp(
+                                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                                v,
+                                i64_min,
+                            );
+                            (self.b.ins().select(is_min, i64_max, abs), ScalarTy::I64)
                         }
                         ScalarTy::Bool | ScalarTy::Date32 | ScalarTy::TsUs => {
                             unreachable!("validated in analyze")
@@ -413,71 +423,73 @@ impl Codegen<'_, '_> {
 
     fn emit_cmp(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value, is_float: bool) -> Value {
         use bc_expr::BinaryOp::*;
-        use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let cc = match op {
+            Eq => IntCC::Equal,
+            Ne => IntCC::NotEqual,
+            Lt => IntCC::SignedLessThan,
+            Le => IntCC::SignedLessThanOrEqual,
+            Gt => IntCC::SignedGreaterThan,
+            Ge => IntCC::SignedGreaterThanOrEqual,
+            _ => unreachable!(),
+        };
         let raw = if is_float {
-            // Total ordering, matching the interpreter (Arrow `cmp`) and DuckDB:
-            // NaN equals NaN and sorts greater than every non-NaN value. Plain IEEE
-            // `fcmp` gives the wrong answer on NaN (e.g. `NaN == NaN` is false,
-            // `NaN > 2` is false), so build the total-order result from IEEE
-            // compares plus explicit NaN tests. For NaN-free inputs every NaN test
-            // is 0 and this collapses to the bare IEEE compare, so the common path
-            // is unchanged. `fcmp(Unordered, v, v)` is 1 iff `v` is NaN.
-            let a_nan = self.b.ins().fcmp(FloatCC::Unordered, l, l);
-            let b_nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
-            let a_ord = self.b.ins().bxor_imm(a_nan, 1); // l is not NaN
-            let b_ord = self.b.ins().bxor_imm(b_nan, 1); // r is not NaN
-            let both_nan = self.b.ins().band(a_nan, b_nan);
-            match op {
-                // equal iff IEEE-equal OR both NaN.
-                Eq => {
-                    let feq = self.b.ins().fcmp(FloatCC::Equal, l, r);
-                    self.b.ins().bor(feq, both_nan)
-                }
-                Ne => {
-                    let feq = self.b.ins().fcmp(FloatCC::Equal, l, r);
-                    let eq = self.b.ins().bor(feq, both_nan);
-                    self.b.ins().bxor_imm(eq, 1)
-                }
-                // l < r iff l is non-NaN AND (r is NaN OR IEEE l < r).
-                Lt => {
-                    let lt = self.b.ins().fcmp(FloatCC::LessThan, l, r);
-                    let rhs = self.b.ins().bor(b_nan, lt);
-                    self.b.ins().band(a_ord, rhs)
-                }
-                Le => {
-                    let le = self.b.ins().fcmp(FloatCC::LessThanOrEqual, l, r);
-                    let rhs = self.b.ins().bor(b_nan, le);
-                    let main = self.b.ins().band(a_ord, rhs);
-                    self.b.ins().bor(main, both_nan)
-                }
-                // l > r iff r is non-NaN AND (l is NaN OR IEEE l > r).
-                Gt => {
-                    let gt = self.b.ins().fcmp(FloatCC::GreaterThan, l, r);
-                    let rhs = self.b.ins().bor(a_nan, gt);
-                    self.b.ins().band(b_ord, rhs)
-                }
-                Ge => {
-                    let ge = self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r);
-                    let rhs = self.b.ins().bor(a_nan, ge);
-                    let main = self.b.ins().band(b_ord, rhs);
-                    self.b.ins().bor(main, both_nan)
-                }
-                _ => unreachable!(),
-            }
+            // The interpreter canonicalizes float operands (`bc_arrow::canon_f64`) and then
+            // compares with Arrow's `cmp` kernel, i.e. `f64::total_cmp`'s monotonic i64 key.
+            // Reproduce exactly that — canonicalize, then key, then a signed integer compare
+            // — so the JIT stays bit-for-bit identical to the interpreter on `-0.0`, every
+            // NaN sign/payload, and the infinities. Comparing the *raw* bits (as this did
+            // before) is what made `-0.0 != 0.0` and split NaN by payload.
+            let lk = canon_total_order_key(self.b, l);
+            let rk = canon_total_order_key(self.b, r);
+            self.b.ins().icmp(cc, lk, rk)
         } else {
-            let cc = match op {
-                Eq => IntCC::Equal,
-                Ne => IntCC::NotEqual,
-                Lt => IntCC::SignedLessThan,
-                Le => IntCC::SignedLessThanOrEqual,
-                Gt => IntCC::SignedGreaterThan,
-                Ge => IntCC::SignedGreaterThanOrEqual,
-                _ => unreachable!(),
-            };
             self.b.ins().icmp(cc, l, r)
         };
-        // `icmp`/`fcmp` yield an i8 boolean already in 0/1 form for the result
-        // store; mask to be safe and match the `out: *mut u8` ABI.
+        // `icmp` yields an i8 boolean already in 0/1 form for the result store;
+        // mask to be safe and match the `out: *mut u8` ABI.
         self.b.ins().band_imm(raw, 1)
     }
+}
+
+/// The `i64` key that ranks an `f64` the way the engine's float identity says.
+///
+/// Two steps, matching what the interpreter's comparison path does with the same two:
+///
+/// 1. **Canonicalize** (`bc_arrow::canon_f64`): fold `-0.0` into `0.0` and every NaN
+///    bit-pattern into one quiet NaN, so the two zeros are one value and all NaNs are one
+///    value — SQL's answer, and the one `GROUP BY`/`DISTINCT`/join keys already give.
+/// 2. **Key** it with the monotonic map [`f64::total_cmp`] uses
+///    (`bits ^ (((bits >> 63) as u64) >> 1)`), so a signed integer compare of two keys is
+///    `canon(a).total_cmp(&canon(b))` — which `bc_arrow::float_ident` proves equals
+///    `float_total_cmp(a, b)`.
+///
+/// Keying the *raw* bits (as this did before) is a different relation: it splits `-0.0`
+/// from `0.0`, ranks a negative NaN below `-inf`, and calls two NaNs equal only when their
+/// payloads match. Used by the scalar path; `simd::emit_cmp` reproduces it lane-wise.
+pub(crate) fn canon_total_order_key(b: &mut FunctionBuilder, v: Value) -> Value {
+    use cranelift_codegen::ir::condcodes::FloatCC;
+
+    let bits = b.ins().bitcast(types::I64, MemFlags::new(), v);
+    let zero_f = b.ins().f64const(0.0);
+    // `Equal` is an *ordered* compare: true for `+0.0` and `-0.0`, false for NaN.
+    let is_zero = b.ins().fcmp(FloatCC::Equal, v, zero_f);
+    // A value is unordered with itself exactly when it is NaN — any sign, any payload.
+    let is_nan = b.ins().fcmp(FloatCC::Unordered, v, v);
+    let zero_bits = b.ins().iconst(types::I64, 0);
+    let nan_bits = b
+        .ins()
+        .iconst(types::I64, bc_arrow::CANONICAL_NAN_BITS_F64 as i64);
+    let bits = b.ins().select(is_zero, zero_bits, bits);
+    let bits = b.ins().select(is_nan, nan_bits, bits);
+    total_order_key_of_bits(b, bits)
+}
+
+/// The monotonic `i64` key [`f64::total_cmp`] uses, over already-canonical `f64` bits.
+pub(crate) fn total_order_key_of_bits(b: &mut FunctionBuilder, bits: Value) -> Value {
+    // Arithmetic shift: all-ones when the sign bit is set, all-zeros otherwise.
+    let sign = b.ins().sshr_imm(bits, 63);
+    // Logical shift by 1: 0x7fff_ffff_ffff_ffff for negatives, 0 for non-negatives.
+    let mask = b.ins().ushr_imm(sign, 1);
+    b.ins().bxor(bits, mask)
 }

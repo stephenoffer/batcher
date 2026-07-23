@@ -10,6 +10,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _tables(duck):
@@ -21,8 +22,6 @@ def _tables(duck):
 
 
 def test_eq_constraint_on_dim_key(duck):
-    from conftest import assert_same
-
     fact, dim = _tables(duck)
     out = fact.join(dim.filter(bt.col("dept_id") == 10), on="dept_id").collect()
     expected = duck.sql(
@@ -32,8 +31,6 @@ def test_eq_constraint_on_dim_key(duck):
 
 
 def test_range_constraint_on_fact_key(duck):
-    from conftest import assert_same
-
     fact, dim = _tables(duck)
     out = fact.filter(bt.col("dept_id") >= 20).join(dim, on="dept_id").collect()
     expected = duck.sql(
@@ -44,8 +41,6 @@ def test_range_constraint_on_fact_key(duck):
 
 def test_left_join_constraint_not_transferred(duck):
     """A left join must keep its unmatched left rows — inference must not fire."""
-    from conftest import assert_same
-
     fact, dim = _tables(duck)
     out = fact.join(dim.filter(bt.col("dept_id") == 10), on="dept_id", how="left").collect()
     expected = duck.sql(

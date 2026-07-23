@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -22,16 +23,12 @@ def _long():
 
 
 def test_pivot_sum_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_long()).pivot(index=["idx"], on="k", values="v").collect()
     duck.register("t", _long())
     assert_same(out, duck.sql("PIVOT t ON k USING sum(v) GROUP BY idx"))
 
 
 def test_pivot_explicit_columns(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_long())
         .pivot(index=["idx"], on="k", values="v", columns=["x", "y"])
@@ -42,8 +39,6 @@ def test_pivot_explicit_columns(duck):
 
 
 def test_pivot_count(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_long()).pivot(index=["idx"], on="k", values="v", aggregate="count").collect()
     )

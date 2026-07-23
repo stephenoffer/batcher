@@ -10,14 +10,13 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
 
 
 def test_dt_strftime(duck):
-    from conftest import assert_same
-
     d = pa.array(["2024-02-15", "2023-12-31", None]).cast(pa.date32())
     t = pa.table({"d": d})
     duck.register("t", t)
@@ -32,8 +31,6 @@ def test_dt_strftime(duck):
 
 
 def test_bitwise_ops(duck):
-    from conftest import assert_same
-
     t = pa.table({"a": pa.array([12, 7, 255], pa.int64()), "b": pa.array([10, 3, 1], pa.int64())})
     duck.register("t", t)
     out = bt.from_arrow(t).select(

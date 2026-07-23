@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.io.source import Source
 
 if TYPE_CHECKING:
@@ -77,8 +78,16 @@ def collect_source_stats(
         # stats out of the shared cache (it self-memoizes). File identities are data-stable.
         stable = getattr(s, "stable_stats_identity", True)
         ident = _source_identity(s)
-        if stable and ident and ident in _SOURCE_STATS_CACHE:
-            out.append(_SOURCE_STATS_CACHE[ident])
+        # The memo key carries the source's content *version*, not just its identity.
+        # Keyed on identity alone it survives the path being rewritten — and this memo
+        # holds zone maps, so a stale entry prunes against bounds the data no longer has
+        # and returns wrong rows rather than a slow plan. `invalidate_source_stats` covers
+        # Batcher's own writes; nothing covered an external writer, which is the ordinary
+        # case (the upstream job, a Spark run, a compaction). A source that cannot supply
+        # a version cheaply keeps the identity-only key it had before.
+        key = _cache_key(s, ident)
+        if stable and key and key in _SOURCE_STATS_CACHE:
+            out.append(_SOURCE_STATS_CACHE[key])
             continue
         narrowed = _resident_subset_stats(s, need_columns) if need_columns is not None else None
         if narrowed is not None:
@@ -90,8 +99,8 @@ def collect_source_stats(
         if stats is None and hub is not None:
             cached = load_source_stats(hub, ident)
             stats = replace(cached, exact_rows=False) if cached is not None else None
-        if stable and ident:
-            _SOURCE_STATS_CACHE[ident] = stats
+        if stable and key:
+            _SOURCE_STATS_CACHE[key] = stats
         out.append(stats)
     return out
 
@@ -128,24 +137,39 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
 
 
 def column_bounds_needed(plan: LogicalPlan) -> set[str]:
-    """The column names whose min/max bounds the plan could consume, from its predicates.
+    """The column names whose min/max bounds the plan could consume — predicates *and* join keys.
 
-    Only a `Filter` (zone-map pruning + range selectivity) reads a source's column bounds
-    on the execution path; a plain group-by / aggregate / sort / join never does (join
-    ordering uses NDV, learned separately). So the needed set is the union of every filter
-    predicate's referenced columns — empty for a filter-free plan (skip the scan entirely),
-    and just the predicate columns for a filter over a wide relation. Computing a column
-    the optimizer does not read only wastes work; omitting one only forgoes pruning (never
-    changes a result), so a predicate-columns superset is exactly right.
+    Two consumers read a source's column bounds on the execution path:
+
+    * a `Filter`, for zone-map pruning and range selectivity — the union of its predicate's
+      referenced columns; and
+    * a **`Join`**, for the disjointness proof. If the two sides' key ranges do not overlap,
+      no pair can be equal and an inner/semi join emits nothing — provable from four numbers,
+      with neither side read (`join_disjoint_keys_to_empty`, `no_match_join_to_preserved_side`).
+
+    The join half used to be missing, and the omission was self-concealing: the rules were
+    written, tested, and correct, but the bounds they needed were never *fetched*, so on a real
+    query they had nothing to reason about and a join whose key ranges provably cannot overlap
+    ran a full shuffle. A rule that cannot see is indistinguishable from a rule that is absent.
+
+    Computing a column the optimizer does not read only wastes a little footer work; omitting
+    one only forgoes pruning (it never changes a result), so a superset is exactly right.
     """
     from batcher.plan.expr_ir import referenced_columns
-    from batcher.plan.logical import Filter
+    from batcher.plan.logical import AsofJoin, Filter, Join
     from batcher.plan.visitor import walk
 
     needed: set[str] = set()
     for node in walk(plan):
         if isinstance(node, Filter):
             needed |= referenced_columns(node.predicate)
+        elif isinstance(node, Join):
+            needed |= set(node.left_keys) | set(node.right_keys)
+        elif isinstance(node, AsofJoin):
+            # The `on` key is an ordering column (a range bound prunes the right side), and the
+            # `by` keys are equi-keys like a hash join's.
+            needed |= {node.left_on, node.right_on}
+            needed |= set(node.left_by) | set(node.right_by)
     return needed
 
 
@@ -156,8 +180,29 @@ def invalidate_source_stats(path: str, fmt: str) -> None:
     and some terminals are answered from statistics without executing — so serving an
     entry that describes a *previous* version of a path yields a wrong answer, not a slow
     plan. Every copy-on-write pattern (`write.merge`, `ds.scd.*`) rewrites a path it reads.
+
+    The cache is keyed by the source's `identity()`, which for a lakehouse table carries a
+    version suffix (``delta:/t@7``) — so popping the bare ``fmt:path`` matched nothing and
+    this never once fired for one. Every key *for this path* is dropped instead, whatever
+    version it names.
     """
-    _SOURCE_STATS_CACHE.pop(f"{fmt}:{path}", None)
+    prefix = f"{fmt}:{path}"
+    for key in [k for k in _SOURCE_STATS_CACHE if k == prefix or k.startswith(prefix + "@")]:
+        _SOURCE_STATS_CACHE.pop(key, None)
+
+
+def _cache_key(source: Source, identity: str) -> str | None:
+    """The memo key for `source`: its identity qualified by its content version."""
+    if not identity:
+        return None
+    version_fn = getattr(source, "stats_version", None)
+    if version_fn is None:
+        return identity
+    try:
+        version = version_fn()
+    except Exception:  # a source that cannot version itself keeps the identity-only key
+        return identity
+    return identity if version is None else f"{identity}@{version}"
 
 
 def _source_identity(source: Source) -> str:
@@ -205,8 +250,7 @@ def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:
     """A per-column membership bloom for each indexable (int/text) column — the
     data-skipping index `zonemap_prune_filter` consults for equality/`IN`. Built in
     Rust over the result already in memory; unindexable columns yield no entry."""
-    import batcher._native as nat
-
+    nat = engine()
     batches = table.to_batches()
     out: dict[str, bytes] = {}
     for i, name in enumerate(cols):

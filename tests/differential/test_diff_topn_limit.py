@@ -14,7 +14,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.topn_limit
-from conftest import assert_same
+from _harness import assert_same
 
 
 def _tbl(n=5):

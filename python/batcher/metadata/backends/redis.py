@@ -13,9 +13,15 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 
-from batcher.metadata.store import Key
+from batcher._internal.errors import ConfigError, MissingDependencyError
+from batcher.metadata.store import Key, require_uri
 
 __all__ = ["RedisBackend"]
+
+#: URI schemes `redis.Redis.from_url` accepts. Checked up front because `from_url`
+#: answers a wrong scheme with an opaque failure, and because the mistake a user
+#: actually makes — a bare ``host:port`` — is one this can name precisely.
+_SCHEMES = ("redis://", "rediss://", "unix://")
 
 
 def _encode_key(key: Key) -> str:
@@ -26,17 +32,38 @@ class RedisBackend:
     """A `MetadataBackend` backed by a Redis server (one hash per table)."""
 
     def __init__(self, uri: str | None, *, namespace: str = "batcher:meta") -> None:
-        if not uri:
-            raise ValueError("redis metadata backend requires a uri (e.g. redis://host:6379/0)")
+        """Connect to a Redis server.
+
+        Args:
+            uri: A ``redis://``, ``rediss://``, or ``unix://`` URL.
+            namespace: Key prefix for every hash this backend owns.
+
+        Raises:
+            ConfigError: If `uri` is missing or is not a Redis URL.
+            MissingDependencyError: If the ``redis`` package is not installed.
+        """
+        uri = require_uri("redis", uri, example="redis://localhost:6379/0")
+        if not uri.startswith(_SCHEMES):
+            raise ConfigError(
+                f"{uri!r} is not a Redis URL.",
+                available=_SCHEMES,
+                available_label="Supported schemes",
+                hint="A bare host:port needs the scheme, e.g. 'redis://localhost:6379/0'.",
+            )
         try:
             import redis
-        except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without redis
-            raise ValueError(
-                "the redis metadata backend requires the 'redis' package (pip install redis)"
+        except ImportError as exc:  # pragma: no cover - exercised only without redis
+            raise MissingDependencyError.of(
+                feature="The redis metadata backend", provides="redis-py", extra="redis"
             ) from exc
 
+        self._uri = uri
         self._redis = redis.Redis.from_url(uri)
         self._ns = namespace
+
+    def __repr__(self) -> str:
+        """Name the server and namespace, so a misrouted store is visible when printed."""
+        return f"RedisBackend(uri={self._uri!r}, namespace={self._ns!r})"
 
     def _hash(self, table: str) -> str:
         return f"{self._ns}:{table}"

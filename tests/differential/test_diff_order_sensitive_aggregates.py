@@ -18,11 +18,11 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 from batcher.kyber.optimizer import optimize_logical
 from batcher.plan.logical import Sort
 from batcher.plan.visitor import walk
-from conftest import assert_same
 
 
 def _table() -> pa.Table:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pyarrow as pa
 import pytest
 
@@ -97,24 +99,40 @@ def test_unknown_function_error_names_it():
 
 
 @pytest.mark.unit
-def test_value_window_explicit_frame_rejected():
+def test_value_window_explicit_frame_accepted():
+    # An explicit frame on LAST_VALUE is now honored (frame-aware value functions):
+    # the query must translate to a plan carrying that frame, not raise. The running
+    # semantics are checked against DuckDB in test_diff_sqlwin_value_frame.py.
     s = bt.Session()
     s.register("t", bt.from_pydict({"t": [1, 2, 3], "x": [5, 6, 7]}))
-    with pytest.raises(NotImplementedError, match="FIRST_VALUE / LAST_VALUE"):
-        s.sql(
-            "SELECT LAST_VALUE(x) OVER "
-            "(ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM t"
-        )
+    ds = s.sql(
+        "SELECT LAST_VALUE(x) OVER "
+        "(ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM t"
+    )
+    assert "window" in json.dumps(ds._plan.to_ir())
 
 
 @pytest.mark.unit
-def test_residual_join_ambiguous_column_rejected():
+def test_residual_join_on_column_present_on_both_sides_resolves_qualifiers():
+    """`a.v < b.v` — a residual comparing a column that exists on *both* sides.
+
+    The two `v`s must resolve to *distinct* post-join columns (the translator qualifies
+    them as `a__v` / `b__v`); collapsing them to one would compare `v` with itself —
+    always-false for `<` — and silently return the wrong rows. This once raised
+    `NotImplementedError`; it is now supported, and the *semantics* are pinned against
+    DuckDB in tests/differential/test_diff_left_join_residual.py.
+    """
     s = bt.Session()
     s.register("a", bt.from_pydict({"k": [1, 2], "v": [10, 20]}))
     s.register("b", bt.from_pydict({"k": [1, 2], "v": [15, 25]}))
-    # `a.v < b.v` would lose its qualifiers post-join (both are `v`) — reject it.
-    with pytest.raises(NotImplementedError, match="present on both sides"):
-        s.sql("SELECT a.k AS k FROM a JOIN b ON a.k = b.k AND a.v < b.v")
+    ds = s.sql("SELECT a.k AS k FROM a JOIN b ON a.k = b.k AND a.v < b.v")
+    pred = ds._plan.input.predicate.to_ir()
+    assert pred["op"] == "lt"
+    # Distinct columns, each sourced from its own side of the join.
+    assert pred["left"]["name"] != pred["right"]["name"]
+    output = ds._plan.input.input.to_ir()["output"]
+    sides = {o["side"]: o["name"] for o in output if o["name"] != "k"}
+    assert sides == {"left": pred["left"]["name"], "right": pred["right"]["name"]}
 
 
 @pytest.mark.unit

@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -75,8 +76,6 @@ def tables(duck):
     ],
 )
 def test_sql_extended_vs_duckdb(duck, tables, query):
-    from conftest import assert_same
-
     emp, other = tables
     out = bt.sql(query, emp=emp, other=other).collect()
     assert_same(out, duck.sql(query))
@@ -92,8 +91,6 @@ def test_sql_extended_vs_duckdb(duck, tables, query):
     ],
 )
 def test_like_interior_wildcards_vs_duckdb(duck, tables, query):
-    from conftest import assert_same
-
     emp, other = tables
     assert_same(bt.sql(query, emp=emp, other=other).collect(), duck.sql(query))
 
@@ -106,8 +103,6 @@ def test_like_interior_wildcards_vs_duckdb(duck, tables, query):
     ],
 )
 def test_except_intersect_vs_duckdb(duck, tables, q):
-    from conftest import assert_same
-
     emp, other = tables
     duck.register("emp", emp)
     duck.register("other", other)

@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -29,8 +30,6 @@ def t(duck):
 
 
 def test_dayname_monthname_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(d=col("ts").dt.dayname(), m=col("ts").dt.monthname()).collect()
     expected = duck.sql("SELECT dayname(ts) d, monthname(ts) m FROM t")
     assert_same(out, expected)

@@ -17,7 +17,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
@@ -27,13 +27,9 @@ __all__ = ["ExcelSource"]
 
 def _require_calamine() -> Any:
     """Import and return the `python_calamine` module or raise `BackendError`."""
-    try:
-        import python_calamine
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Excel support requires python-calamine: pip install 'batcher-engine[excel]'"
-        ) from exc
-    return python_calamine
+    return require(
+        "python_calamine", feature="Excel support", provides="python-calamine", extra="excel"
+    )
 
 
 def _rows(fh: IO[Any], sheet: str | int) -> list[list[Any]]:
@@ -71,9 +67,16 @@ class ExcelSource(FileSource):
 
     __slots__ = ("_sheet",)
 
-    def __init__(self, path: str, *, sheet: str | int = 0) -> None:
-        super().__init__(path)
+    def __init__(self, path: str, *, sheet: str | int = 0, **kwargs: Any) -> None:
+        # Forward the base options: without this, `on_error="skip"` and `schema_mode`
+        # were accepted by the reader and silently did nothing.
+        super().__init__(path, **kwargs)
         self._sheet = sheet
+
+    def _reader_kwargs(self) -> dict[str, object]:
+        # Without the `sheet`, a worker rebuilding the reader falls back to sheet 0 and silently
+        # reads a different worksheet than single-node requested. Carry it to the worker.
+        return {**super()._reader_kwargs(), "sheet": self._sheet}
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         header, columns = _to_columns(_rows(fh, self._sheet))

@@ -1,72 +1,135 @@
 # Machine learning
 
-Run your models where your data already lives. The `ml` accessor hands your Python
-functions and models whole Arrow batches instead of one row at a time, and the
-scheduler places that work on GPUs and across worker actors for you. From there the
-pages cover the common jobs: batch inference and embeddings, feature preprocessing,
-decoding images and audio, serving models, LLM generation, and loading training data.
+Run your models where the data already is.
 
-::::{grid} 1 2 3 4
+Most ML pipelines pay a tax at the seam: a query engine produces rows, something
+converts them, and a separate system runs the model. Batcher removes the seam. The `ml`
+accessor hands your Python functions and models whole Arrow batches rather than one row
+at a time, and it places that work on GPUs and across worker actors for you. The same
+`Dataset` you filtered and joined is the one the model reads.
+
+That has a practical consequence worth stating up front. Because inference is an
+operator rather than a separate job, it streams. A batch-scoring run over more data than
+memory is the ordinary case, not something you build around.
+
+::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} {octicon}`cpu;1.1em` Inference
+:::{grid-item-card} {octicon}`cpu;1.1em` Run a model
 :link: inference
 :link-type: doc
-Run a model over Arrow batches.
+Batched inference over Arrow, on CPU or GPU.
 :::
 
-:::{grid-item-card} {octicon}`filter;1.1em` Preprocessors
+:::{grid-item-card} {octicon}`filter;1.1em` Prepare the data
 :link: preprocessors
 :link-type: doc
-Feature transforms over batches.
+Feature transforms, media decode, tokenization.
 :::
 
-:::{grid-item-card} {octicon}`image;1.1em` Multimodal
-:link: multimodal
+:::{grid-item-card} {octicon}`search;1.1em` Embeddings and retrieval
+:link: embeddings
 :link-type: doc
-Decode images, audio, and video.
+Encode, index, search, and generate.
 :::
 
-:::{grid-item-card} {octicon}`server;1.1em` Serving
-:link: serving
+:::{grid-item-card} {octicon}`workflow;1.1em` Feed a training loop
+:link: distributed-training
 :link-type: doc
-Stand models up behind the engine.
-:::
-
-:::{grid-item-card} {octicon}`comment-discussion;1.1em` LLM generation
-:link: llm
-:link-type: doc
-Batched text generation.
-:::
-
-:::{grid-item-card} {octicon}`package;1.1em` PyTorch
-:link: pytorch
-:link-type: doc
-Hand batches straight to Torch.
-:::
-
-:::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
-:link: streaming
-:link-type: doc
-Inference over live streams.
-:::
-
-:::{grid-item-card} {octicon}`zap;1.1em` GPU execution
-:link: gpu
-:link-type: doc
-Place work on GPUs and actors.
+Sharding that is balanced, resumable, and elastic.
 :::
 ::::
 
+## Run a model over data
+
+Start here. `ds.ml.predict` and its siblings take a callable or a model object and run it
+over batches, reusing one loaded model across the whole scan rather than reloading it per
+call. Everything else in this section is about where that work runs and how it is fed.
+
+- {doc}`inference`: the core loop, batch-first UDFs, and model reuse.
+- {doc}`gpu`: placing work on devices, sizing batches, and keeping the GPU busy.
+- {doc}`batch-scoring`: the offline scoring job end to end.
+- {doc}`pytorch`: handing batches straight to Torch with zero copies.
+- {doc}`streaming`: the same operators against an unbounded source.
+
+## Prepare the data
+
+Models rarely read raw columns. These pages cover the transforms that sit between a
+source and a model, all of which run as ordinary operators, so they stream and they
+distribute like everything else.
+
+- {doc}`preprocessors`: scalers, encoders, imputers, binning, and composition.
+- {doc}`multimodal`: decoding images, audio, and video into tensor columns.
+- {doc}`tokenization`: tokenizing as a pipeline stage, and packing sequences.
+
+## Embeddings, retrieval, and generation
+
+Vectors are first-class columns rather than a bolted-on index, which is what lets one
+pipeline chunk a corpus, embed it, retrieve against it, and call a model on the result
+without leaving the engine.
+
+- {doc}`embeddings`: encoding a text or image column into vectors at scale.
+- {doc}`vector-search`: brute-force search in-engine, or an approximate index.
+- {doc}`rag`: chunk, embed, retrieve, generate, as one pipeline.
+- {doc}`llm`: batched text generation, and turning generated strings into typed columns.
+
+## Serve and train
+
+The two ends of the lifecycle. Serving covers reaching a model that lives elsewhere;
+training covers feeding a loop that lives elsewhere. Both keep the data plane in Batcher.
+
+- {doc}`serving`: standing models up behind the engine.
+- {doc}`model-serving-patterns`: running in-process against calling a served model.
+- {doc}`distributed-training`: balanced, resumable, elastic sharding across ranks.
+- {doc}`data-loaders`: which loader to use, and what each one guarantees.
+
+## See also
+
+:::{seealso}
+- {doc}`../user-guide/index`: the relational half of the pipeline that feeds all of this.
+- {doc}`../user-guide/udfs`: batch UDFs generally, of which model inference is one case.
+- {doc}`../api/ml`: the reference for the `.ml` accessor and the `batcher.ml` package.
+- {doc}`../examples/ml/index`: runnable recipes for the workloads above.
+- {doc}`../deep-dives/gpu-execution`: how device work is actually scheduled.
+- {doc}`../benchmarks/index`: the measured throughput behind the claims here.
+:::
+
 ```{toctree}
 :hidden:
+:caption: Run a model
 
 inference
-preprocessors
-multimodal
-serving
-llm
+gpu
+batch-scoring
 pytorch
 streaming
-gpu
+```
+
+```{toctree}
+:hidden:
+:caption: Prepare the data
+
+preprocessors
+multimodal
+tokenization
+```
+
+```{toctree}
+:hidden:
+:caption: Embeddings and retrieval
+
+embeddings
+vector-search
+rag
+llm
+```
+
+```{toctree}
+:hidden:
+:caption: Serve and train
+
+serving
+model-serving-patterns
+distributed-training
+data-loaders
 ```

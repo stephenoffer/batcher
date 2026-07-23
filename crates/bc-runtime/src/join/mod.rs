@@ -25,13 +25,14 @@ use rayon::prelude::*;
 use crate::error::RuntimeError;
 
 mod asof;
+mod build;
 mod radix;
 mod sort_merge;
 mod stream;
 
 pub use asof::asof_join_indices;
 pub use sort_merge::sort_merge_join_indices;
-pub use stream::BroadcastProbe;
+pub use stream::{streaming_supported, BroadcastProbe};
 
 /// False-positive rate for the probe-side runtime bloom (see [`use_probe_bloom_with`]).
 /// At 1% a bloom costs ~1.2 bytes/key — far less than the ~9 bytes/entry chained
@@ -145,6 +146,28 @@ impl IndexBuf {
         self.idx.len()
     }
 
+    /// Append another buffer's indices, preserving its NULL sentinels.
+    ///
+    /// Used to concatenate per-partition pieces **in partition order**, which is what makes
+    /// the parallel radix join emit byte-identical rows to the sequential one.
+    fn extend(&mut self, other: IndexBuf) {
+        self.idx.extend_from_slice(&other.idx);
+        self.any_null |= other.any_null;
+    }
+
+    /// Sort the buffered indices ascending.
+    ///
+    /// Only meaningful for a side whose partner is all-NULL — a semi/anti join — where the
+    /// pairing carries nothing to preserve and the row order is the *only* information in the
+    /// output. Asserted, so it cannot be reached for a join whose pairs matter.
+    fn sort_ascending(&mut self) {
+        debug_assert!(
+            !self.any_null,
+            "sorting a side whose partner carries real indices would break the pairing"
+        );
+        self.idx.sort_unstable();
+    }
+
     /// The Arrow column. No null buffer is built unless a NULL was actually pushed.
     pub(crate) fn finish(self) -> UInt32Array {
         if !self.any_null {
@@ -217,6 +240,24 @@ pub(crate) fn hash_join_indices_impl(
     use_bloom: bool,
     bloom_fp_rate: f64,
 ) -> Result<JoinIndices, RuntimeError> {
+    // Canonicalize float keys before ANY key handling below.
+    //
+    // `crate::keys` is documented as the one canonical form every hash path derives key
+    // identity from "so they cannot disagree" — and the shuffle, the window, and all three
+    // aggregate paths already do. The join did not, so it encoded its keys through
+    // `RowConverter` raw: `-0.0` and `0.0` produce different row bytes and never match,
+    // even though `=`, `GROUP BY`, and the shuffle all treat them as one value. A join on a
+    // float key therefore silently DROPPED matching rows (`0.0 ⋈ -0.0` returned nothing),
+    // and NaN keys — which the aggregate path folds to one canonical quiet NaN — likewise
+    // failed to match themselves. Canonicalizing here, at the entry, puts the join on the
+    // same key identity as every other operator, which is the invariant `keys.rs` exists to
+    // hold. A key set with no float column is returned unchanged (`None`), so the integer
+    // fast paths below are untouched.
+    let l_canon = crate::keys::canonicalize_float_keys(left_keys);
+    let r_canon = crate::keys::canonicalize_float_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_canon.as_deref().unwrap_or(right_keys);
+
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
     let left_null = null_mask(left_keys, left_rows);
@@ -445,17 +486,95 @@ impl JoinKeys for I64x2Keys<'_> {
 /// sharing it; `next` threads the rest (`u32::MAX` terminates). Null-key build rows
 /// are never inserted (NULL ≠ NULL), so a present chain head is always a real match.
 struct JoinTable {
-    heads: HashTable<u32>,
+    /// Heads sharded by hash (see [`build::shard_of`]) — one shard for a small build, so the
+    /// common small table is exactly the flat one it always was. A key's shard is a function of
+    /// its hash alone, so a chain never spans shards and the build parallelizes with no
+    /// synchronization; `next` stays a single absolute-indexed chain either way.
+    heads: Vec<HashTable<u32>>,
     next: Vec<u32>,
+    /// Whether no build key repeats — so every chain has length exactly 1.
+    ///
+    /// True for every join to a primary/unique key, which is most of them (`o_orderkey`,
+    /// `p_partkey`, every dimension table). The chain walk in [`Self::probe_range`] then loads
+    /// `next[r]` once per *emitted row* purely to read the `u32::MAX` that ends the loop — a
+    /// random access into a multi-megabyte array, one per output row, whose answer is known in
+    /// advance. Knowing the build is unique lets the probe skip that load entirely, and lets
+    /// [`build::build_sharded`] skip allocating `next` at all.
+    ///
+    /// Result-invariant: a length-1 chain emits the same single `(i, r)` pair either way.
+    unique: bool,
     state: ahash::RandomState,
     bloom: Option<BloomFilter>,
+    /// Runtime verdict on whether the probe-side bloom is *earning* its lookup.
+    ///
+    /// The bloom's value is its **rejection rate**, which no planner-side row count can
+    /// predict: a foreign-key join where every probe row matches (TPC-H `lineitem ⋈ orders`)
+    /// rejects nothing, so the per-row `contains_hash` is a pure random-access cache miss on
+    /// top of the hash lookup it was meant to save. [`use_probe_bloom_with`] can only see
+    /// build/probe *sizes*, and the streaming executor cannot even see the probe count
+    /// (it passes `usize::MAX`), so on that path the bloom is switched on unconditionally.
+    ///
+    /// So measure it instead: [`Self::probe_range`] counts rejections over the first
+    /// [`BLOOM_TRIAL_ROWS`] probe rows and latches the bloom off when the rate is below
+    /// [`BLOOM_MIN_REJECT_RATE`]. This never changes a result — a bloom hit is not a match,
+    /// only a "maybe", so skipping the filter just runs the authoritative hash lookup that
+    /// follows it. Morsel-granular (decided per range, never per row), so the counters cost
+    /// two relaxed atomics per morsel rather than two per row, and every tier — sequential,
+    /// morsel-parallel, and distributed — adapts independently on what it actually sees.
+    bloom_trial: BloomTrial,
+}
+
+/// Probe rows to observe before ruling on the bloom. One morsel-ish sample: long enough that
+/// the rate is not noise, short enough that a useless bloom is abandoned almost immediately.
+const BLOOM_TRIAL_ROWS: u64 = 1 << 16;
+
+/// Rejection rate below which the probe-side bloom costs more than it saves. A rejected row
+/// saves one hash-table probe; a passed row pays one bloom lookup for nothing. Both are random
+/// accesses of the same order, so the filter needs to reject a real fraction to break even —
+/// well under half. Set conservatively: only an obviously-useless bloom is switched off.
+const BLOOM_MIN_REJECT_RATE: f64 = 0.10;
+
+/// Rejection accounting for [`JoinTable::bloom_trial`]. Shared across the worker threads that
+/// probe one broadcast table, so both counters are atomics; they are touched once per probed
+/// range, not per row.
+#[derive(Debug, Default)]
+struct BloomTrial {
+    seen: std::sync::atomic::AtomicU64,
+    rejected: std::sync::atomic::AtomicU64,
+}
+
+impl BloomTrial {
+    /// Whether the bloom is still worth consulting: during the trial always, afterwards only
+    /// if it rejected enough of the sample to pay for itself.
+    #[inline]
+    fn worth_consulting(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let seen = self.seen.load(Relaxed);
+        if seen < BLOOM_TRIAL_ROWS {
+            return true;
+        }
+        (self.rejected.load(Relaxed) as f64) >= (seen as f64) * BLOOM_MIN_REJECT_RATE
+    }
+
+    /// Fold one probed range's tally in. Called once per range.
+    #[inline]
+    fn observe(&self, seen: u64, rejected: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.seen.fetch_add(seen, Relaxed);
+        self.rejected.fetch_add(rejected, Relaxed);
+    }
 }
 
 impl JoinTable {
     /// Build the chained hash table over the right (build) side. The optional probe
     /// bloom is populated in this same pass (no extra hashing) — see
     /// [`use_probe_bloom_with`].
-    fn build<K: JoinKeys>(
+    ///
+    /// Past [`build::PARALLEL_BUILD_MIN_ROWS`] the heads are sharded and built across every
+    /// core: the build loop was the join's sequential prefix and, on a large build, its
+    /// dominant cost (10.7 ms serial against a 6.0 ms parallel probe, measured on TPC-H q5).
+    /// The result is bit-identical either way — see [`build`].
+    fn build<K: JoinKeys + Sync>(
         keys: &K,
         right_rows: usize,
         right_null: &[bool],
@@ -463,10 +582,26 @@ impl JoinTable {
         bloom_fp_rate: f64,
     ) -> Self {
         let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+        let bloom = use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
+        let shards = build::shard_count(right_rows);
+        if shards > 1 {
+            let (heads, next, bloom, unique) =
+                build::build_sharded(keys, &state, right_rows, right_null, shards, bloom);
+            return Self {
+                heads,
+                next,
+                unique,
+                state,
+                bloom,
+                bloom_trial: BloomTrial::default(),
+            };
+        }
+
         let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
         let mut next: Vec<u32> = vec![u32::MAX; right_rows];
-        let mut bloom =
-            use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
+        let mut bloom = bloom;
+        // Set on the first repeated key — the serial mirror of `build_sharded`'s chain check.
+        let mut unique = true;
         for (i, &is_null) in right_null.iter().enumerate() {
             if is_null {
                 continue;
@@ -485,6 +620,7 @@ impl JoinTable {
                 Entry::Occupied(mut e) => {
                     next[i] = *e.get();
                     *e.get_mut() = i as u32;
+                    unique = false;
                 }
                 Entry::Vacant(e) => {
                     e.insert(i as u32);
@@ -492,27 +628,43 @@ impl JoinTable {
             }
         }
         Self {
-            heads,
+            heads: vec![heads],
             next,
+            unique,
             state,
             bloom,
+            bloom_trial: BloomTrial::default(),
         }
     }
 
     /// The chain head for probe (left) row `l` — `None` for a null key, a bloom miss,
     /// or no match; otherwise a real right-row index (`is_some()` ⇒ ≥1 match).
+    /// The bloom is supplied by the caller rather than read from `self`, so a probe loop can
+    /// hoist the "is this bloom worth consulting" decision out of the row loop and tally what
+    /// it rejected. `rejected` counts the rows this bloom short-circuited.
     #[inline]
-    fn head_for<K: JoinKeys>(&self, keys: &K, l: usize, is_null: bool) -> Option<u32> {
+    fn head_for<K: JoinKeys>(
+        &self,
+        keys: &K,
+        l: usize,
+        is_null: bool,
+        bloom: Option<&BloomFilter>,
+        rejected: &mut u64,
+    ) -> Option<u32> {
         if is_null {
             return None;
         }
         let hash = keys.hash_left(&self.state, l);
         // A bloom miss is definitive (no false negatives): the key is not on the build
         // side, so the chain is provably empty — skip the hash-table lookup.
-        if self.bloom.as_ref().is_some_and(|b| !b.contains_hash(hash)) {
+        if bloom.is_some_and(|b| !b.contains_hash(hash)) {
+            *rejected += 1;
             return None;
         }
-        self.heads
+        // The build put this key in exactly one shard, chosen from its hash — so the probe
+        // finds it there without any coordination. One shard (the small-build case) reduces to
+        // the flat lookup this always was.
+        self.heads[build::shard_of(hash, self.heads.len())]
             .find(hash, |&h| keys.right_eq_left(h as usize, l))
             .copied()
     }
@@ -527,15 +679,28 @@ impl JoinTable {
         &self,
         keys: &K,
         range: std::ops::Range<usize>,
-        left_null: &[bool],
+        left_null: Option<&[bool]>,
         join_type: JoinType,
         left_out: &mut IndexBuf,
         right_out: &mut IndexBuf,
         mut right_matched: Option<&mut [bool]>,
     ) {
         let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
+        // Decide once per range whether to consult the bloom, then tally what it rejected so
+        // the next range can re-decide. `None` here is exactly the "no bloom" path.
+        let bloom = self
+            .bloom
+            .as_ref()
+            .filter(|_| self.bloom_trial.worth_consulting());
+        let mut rejected = 0u64;
+        let seen = range.len() as u64;
         for i in range {
-            let head = self.head_for(keys, i, left_null[i]);
+            // `None` ⇒ no key column had a null, so no row is null-keyed — the check is skipped
+            // entirely and the caller never allocated the mask. The `Option` is loop-invariant,
+            // so this is a predicted null-pointer test, not the 16 KB per-morsel mask a foreign-key
+            // probe (its key never null) used to allocate and zero for nothing.
+            let is_null = left_null.is_some_and(|m| m[i]);
+            let head = self.head_for(keys, i, is_null, bloom, &mut rejected);
             match join_type {
                 JoinType::Semi => {
                     if head.is_some() {
@@ -550,6 +715,16 @@ impl JoinTable {
                     }
                 }
                 _ => match head {
+                    // Unique build key ⇒ the chain is exactly one row, so emit it and skip the
+                    // `next[r]` load that would only confirm the end. Same `(i, r)` pair, same
+                    // order, one fewer random multi-megabyte access per emitted row.
+                    Some(r) if self.unique => {
+                        if let Some(rm) = right_matched.as_deref_mut() {
+                            rm[r as usize] = true;
+                        }
+                        left_out.push(i as u32);
+                        right_out.push(r);
+                    }
                     Some(mut r) => {
                         // Walk the chain of right rows sharing this key.
                         loop {
@@ -573,6 +748,11 @@ impl JoinTable {
                     }
                 },
             }
+        }
+        // Only meaningful while the bloom was actually consulted; once it is latched off the
+        // rate is frozen at whatever the trial measured.
+        if bloom.is_some() {
+            self.bloom_trial.observe(seen, rejected);
         }
     }
 }
@@ -614,6 +794,27 @@ const RADIX_PART_ROWS: usize = 1 << 15;
 /// without the partition vectors themselves thrashing cache on the scatter.
 const RADIX_MAX_PARTS: usize = 1 << 12;
 
+/// Total rows (build + probe) below which joining the radix partitions concurrently costs
+/// more than it saves.
+///
+/// The per-partition join is already cache-resident by construction, so the only thing
+/// parallelism buys is core count; below this the rayon fan-out plus the per-partition
+/// `IndexBuf` allocations and the final concatenation dominate. Above it the partition loop
+/// is pure independent work and scales with cores.
+const RADIX_PARALLEL_MIN_ROWS: usize = 1 << 18;
+
+/// Whether [`radix_join_scalar`] should join its partitions concurrently.
+///
+/// Needs real work (`RADIX_PARALLEL_MIN_ROWS`), more than one partition to spread, and more
+/// than one core to spread them over. Nested inside an outer `par_iter` (the materializing
+/// executor's partitioned join) this simply finds no idle workers and runs inline, so it
+/// cannot oversubscribe.
+fn radix_parallel_worthwhile(build_rows: usize, probe_rows: usize, parts: usize) -> bool {
+    parts > 1
+        && build_rows.saturating_add(probe_rows) >= RADIX_PARALLEL_MIN_ROWS
+        && rayon::current_num_threads() > 1
+}
+
 /// Cache-radix hash join over a `Copy` key witness (the integer fast paths), left-driven
 /// join types only.
 ///
@@ -641,22 +842,46 @@ fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
         build_key, probe_key, build_rows, probe_rows, build_null, probe_null,
     );
 
-    // One table, reused per partition (each partition's build rows are disjoint).
-    let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
     let mut left_out = IndexBuf::with_capacity(probe_rows);
     let mut right_out = IndexBuf::with_capacity(probe_rows);
-    for (b, probe) in build_parts.iter().zip(&probe_parts) {
-        join_partition_into(
-            b,
-            probe,
-            &state,
-            join_type,
-            &mut heads,
-            &mut left_out,
-            &mut right_out,
-        );
+
+    if radix_parallel_worthwhile(build_rows, probe_rows, build_parts.len()) {
+        // Partitions are independent (equal keys co-partition), so each can be joined on its
+        // own core. Concatenating the pieces **in partition order** reproduces the sequential
+        // loop's appends exactly — same rows, same order — so this is a scheduling change
+        // only, and the semi/anti row-order contract below is untouched.
+        let pieces: Vec<(IndexBuf, IndexBuf)> = build_parts
+            .par_iter()
+            .zip(probe_parts.par_iter())
+            .map(|(b, probe)| {
+                let mut heads: HashTable<u32> = HashTable::with_capacity(b.len());
+                let mut l = IndexBuf::with_capacity(probe.len());
+                let mut r = IndexBuf::with_capacity(probe.len());
+                join_partition_into(b, probe, &state, join_type, &mut heads, &mut l, &mut r);
+                (l, r)
+            })
+            .collect();
+        for (l, r) in pieces {
+            left_out.extend(l);
+            right_out.extend(r);
+        }
+    } else {
+        // One table, reused per partition (each partition's build rows are disjoint).
+        let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
+        for (b, probe) in build_parts.iter().zip(&probe_parts) {
+            join_partition_into(
+                b,
+                probe,
+                &state,
+                join_type,
+                &mut heads,
+                &mut left_out,
+                &mut right_out,
+            );
+        }
     }
     emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
+    restore_probe_order(join_type, &mut left_out);
 
     JoinIndices::from_bufs(left_out, right_out)
 }
@@ -807,6 +1032,24 @@ fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
     }
 }
 
+/// Put a semi/anti join's output back in **probe-row order**.
+///
+/// A semi/anti join emits a *subset of the probe side* and no build column, so its row order is
+/// the only information in the result — and the flat path emits it in probe-row order, because it
+/// scans the probe in order. The radix path instead emits partition by partition (and
+/// `emit_null_probe_unmatched` appends the null-key rows last), so without this the *same query*
+/// answers in a different order once the build crosses `RADIX_MIN_BUILD_ROWS` — `SELECT … WHERE
+/// EXISTS (…) LIMIT 10` would return different rows for a bigger build side, which is a data-size
+/// dependency no user can see coming.
+///
+/// Cheap by construction: the output holds at most one index per probe row, and only the semi/anti
+/// shapes reach it (an inner/outer join's pairs must keep their emitted order).
+fn restore_probe_order(join_type: JoinType, left_out: &mut IndexBuf) {
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        left_out.sort_ascending();
+    }
+}
+
 /// Emit the null-key probe rows a `Left`/`Anti` join keeps as unmatched (they are excluded
 /// from the partitions since a null key matches nothing).
 fn emit_null_probe_unmatched(
@@ -828,7 +1071,7 @@ fn emit_null_probe_unmatched(
 /// The single-table hash join (no radix): build one chain table over the whole right
 /// side and probe the whole left. The correctness oracle and the small-build fast path.
 #[allow(clippy::too_many_arguments)]
-fn build_probe_flat<K: JoinKeys>(
+fn build_probe_flat<K: JoinKeys + Sync>(
     keys: &K,
     left_rows: usize,
     right_rows: usize,
@@ -850,7 +1093,7 @@ fn build_probe_flat<K: JoinKeys>(
     table.probe_range(
         keys,
         0..left_rows,
-        left_null,
+        Some(left_null),
         join_type,
         &mut left_out,
         &mut right_out,
@@ -900,6 +1143,24 @@ pub fn broadcast_hash_join_indices(
         ),
         "broadcast probe is left-driven only; Right/Full run single-pass"
     );
+    // Canonicalize float keys before ANY key handling below.
+    //
+    // `crate::keys` is documented as the one canonical form every hash path derives key
+    // identity from "so they cannot disagree" — and the shuffle, the window, and all three
+    // aggregate paths already do. The join did not, so it encoded its keys through
+    // `RowConverter` raw: `-0.0` and `0.0` produce different row bytes and never match,
+    // even though `=`, `GROUP BY`, and the shuffle all treat them as one value. A join on a
+    // float key therefore silently DROPPED matching rows (`0.0 ⋈ -0.0` returned nothing),
+    // and NaN keys — which the aggregate path folds to one canonical quiet NaN — likewise
+    // failed to match themselves. Canonicalizing here, at the entry, puts the join on the
+    // same key identity as every other operator, which is the invariant `keys.rs` exists to
+    // hold. A key set with no float column is returned unchanged (`None`), so the integer
+    // fast paths below are untouched.
+    let l_canon = crate::keys::canonicalize_float_keys(left_keys);
+    let r_canon = crate::keys::canonicalize_float_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_canon.as_deref().unwrap_or(right_keys);
+
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
     let left_null = null_mask(left_keys, left_rows);
@@ -928,7 +1189,7 @@ pub fn broadcast_hash_join_indices(
                     table.probe_range(
                         &$keys,
                         r.clone(),
-                        &left_null,
+                        Some(&left_null),
                         join_type,
                         &mut left_out,
                         &mut right_out,
@@ -1013,6 +1274,109 @@ mod tests {
 
     fn keys(v: &[i64]) -> Vec<ArrayRef> {
         vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
+    }
+
+    /// Build a table over `build` and probe it with `probe` in `chunk`-row ranges — the way a
+    /// morsel-at-a-time executor does, which is what drives [`BloomTrial`]'s per-range verdict.
+    fn probe_in_chunks(
+        build: &[i64],
+        probe: &[i64],
+        chunk: usize,
+    ) -> (Vec<(u32, Option<u32>)>, JoinTable) {
+        let bk = keys(build);
+        let pk = keys(probe);
+        let bnull = vec![false; build.len()];
+        let pnull = vec![false; probe.len()];
+        let k = I64Keys::try_new(&pk, &bk).expect("i64 keys");
+        // `use_bloom = true`: this is about the runtime verdict, not the size heuristic.
+        let table = JoinTable::build(
+            &I64Keys::try_new(&bk, &bk).expect("i64 keys"),
+            build.len(),
+            &bnull,
+            true,
+            BLOOM_FP_RATE,
+        );
+        let mut pairs = Vec::new();
+        for start in (0..probe.len()).step_by(chunk) {
+            let end = (start + chunk).min(probe.len());
+            let mut l = IndexBuf::with_capacity(end - start);
+            let mut r = IndexBuf::with_capacity(end - start);
+            table.probe_range(
+                &k,
+                start..end,
+                Some(&pnull),
+                JoinType::Inner,
+                &mut l,
+                &mut r,
+                None,
+            );
+            let (la, ra) = (l.finish(), r.finish());
+            for i in 0..la.len() {
+                pairs.push((
+                    la.value(i),
+                    if ra.is_null(i) {
+                        None
+                    } else {
+                        Some(ra.value(i))
+                    },
+                ));
+            }
+        }
+        (pairs, table)
+    }
+
+    /// The bloom is a pure short-circuit, so latching it off mid-probe must not change a single
+    /// emitted row. Probed in chunks well past [`BLOOM_TRIAL_ROWS`] so the verdict actually flips
+    /// part-way through — exactly the window a wrong implementation would corrupt.
+    #[test]
+    fn latching_the_bloom_off_midway_emits_the_same_rows() {
+        // Every probe key matches — the shape that makes the bloom useless (TPC-H lineitem⋈orders).
+        let build: Vec<i64> = (0..40_000).collect();
+        let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
+            .map(|i| i % 40_000)
+            .collect();
+
+        let (chunked, table) = probe_in_chunks(&build, &probe, 8_192);
+        assert!(
+            !table.bloom_trial.worth_consulting(),
+            "a bloom that rejected nothing over 3x the trial must have been latched off",
+        );
+
+        // The oracle: one range, so the verdict never flips and the bloom is consulted throughout.
+        let (whole, _) = probe_in_chunks(&build, &probe, probe.len());
+        assert_eq!(
+            chunked, whole,
+            "latching the bloom off must not change the emitted pairs",
+        );
+        assert_eq!(
+            chunked.len(),
+            probe.len(),
+            "every probe row has exactly one match",
+        );
+    }
+
+    /// The other direction, and the reason the filter exists: a genuinely selective join must
+    /// *keep* its bloom. Without this, "switch the bloom off" would read as a free win and would
+    /// silently cost every selective probe its short-circuit.
+    #[test]
+    fn a_selective_bloom_is_kept() {
+        let build: Vec<i64> = (0..40_000).collect();
+        // 1 probe row in 50 can match; the rest fall far outside the build's key range.
+        let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
+            .map(|i| {
+                if i % 50 == 0 {
+                    i % 40_000
+                } else {
+                    10_000_000 + i
+                }
+            })
+            .collect();
+
+        let (_, table) = probe_in_chunks(&build, &probe, 8_192);
+        assert!(
+            table.bloom_trial.worth_consulting(),
+            "a bloom rejecting ~98% of probe rows must stay engaged",
+        );
     }
 
     /// An inner join emits no NULL index, so `finish` must build no null buffer — that is
@@ -1613,6 +1977,164 @@ mod tests {
             let h2 = hash_join_indices(&some, &empty, jt).unwrap();
             let s2 = sort_merge_join_indices(&some, &empty, jt).unwrap();
             assert_eq!(sorted_pairs(&h2), sorted_pairs(&s2), "empty-right {jt:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hunt_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int64Array};
+
+    fn i64_col(v: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+
+    /// Reconstruct the join output of a single-i64 join as a sorted multiset of *value*
+    /// pairs, so two strategies that pick different rows in a duplicate group still compare
+    /// equal iff they emit the same logical relation.
+    fn vpairs1(
+        idx: &JoinIndices,
+        left: &[Option<i64>],
+        right: &[Option<i64>],
+    ) -> Vec<(Option<i64>, Option<i64>)> {
+        let mut out: Vec<_> = (0..idx.left.len())
+            .map(|k| {
+                let l = idx
+                    .left
+                    .is_valid(k)
+                    .then(|| left[idx.left.value(k) as usize])
+                    .flatten();
+                let r = idx
+                    .right
+                    .is_valid(k)
+                    .then(|| right[idx.right.value(k) as usize])
+                    .flatten();
+                (l, r)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn vpairs2(
+        idx: &JoinIndices,
+        la: &[Option<i64>],
+        lb: &[Option<i64>],
+        ra: &[Option<i64>],
+        rb: &[Option<i64>],
+    ) -> Vec<((Option<i64>, Option<i64>), (Option<i64>, Option<i64>))> {
+        let mut out: Vec<_> = (0..idx.left.len())
+            .map(|k| {
+                let l = if idx.left.is_valid(k) {
+                    let i = idx.left.value(k) as usize;
+                    (la[i], lb[i])
+                } else {
+                    (None, None)
+                };
+                let r = if idx.right.is_valid(k) {
+                    let i = idx.right.value(k) as usize;
+                    (ra[i], rb[i])
+                } else {
+                    (None, None)
+                };
+                (l, r)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The TWO-column i64 key at RADIX scale (build past `RADIX_MIN_BUILD_ROWS`) must agree
+    /// with the independent sort-merge strategy for every left-driven join type — the tuple
+    /// radix path is only ever exercised on tiny inputs elsewhere.
+    #[test]
+    fn two_col_radix_at_scale_matches_sort_merge() {
+        let build_rows = RADIX_MIN_BUILD_ROWS + 5_000;
+        let ra: Vec<Option<i64>> = (0..build_rows as i64)
+            .map(|k| Some(if k % 40 == 0 { 3 } else { k % 5000 }))
+            .collect();
+        let rb: Vec<Option<i64>> = (0..build_rows as i64).map(|k| Some(k % 7)).collect();
+        let la: Vec<Option<i64>> = (0..25_000i64)
+            .map(|i| match i % 6 {
+                0 => None,
+                _ => Some((i * 3) % 5000),
+            })
+            .collect();
+        let lb: Vec<Option<i64>> = (0..25_000i64).map(|i| Some(i % 7)).collect();
+        let left = vec![i64_col(&la), i64_col(&lb)];
+        let right = vec![i64_col(&ra), i64_col(&rb)];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let h = hash_join_indices(&left, &right, jt).unwrap(); // tuple radix path
+            let s = sort_merge_join_indices(&left, &right, jt).unwrap(); // independent
+            assert_eq!(
+                vpairs2(&h, &la, &lb, &ra, &rb),
+                vpairs2(&s, &la, &lb, &ra, &rb),
+                "two-col radix != sort-merge for {jt:?}"
+            );
+        }
+    }
+
+    /// Build-side symmetry: Kyber may build either side. `hash_join(L, R, t)` must produce the
+    /// same value relation as `hash_join(R, L, swap(t))` with the two index columns swapped,
+    /// for every join type. An asymmetry here means the optimizer's build-side choice silently
+    /// changes the answer.
+    #[test]
+    fn build_side_symmetry_all_join_types() {
+        let lv: Vec<Option<i64>> = vec![
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            Some(3),
+            Some(5),
+            Some(2),
+            None,
+        ];
+        let rv: Vec<Option<i64>> = vec![Some(2), Some(2), Some(3), Some(4), None, Some(1), Some(1)];
+        let left = vec![i64_col(&lv)];
+        let right = vec![i64_col(&rv)];
+        let swap = |t: JoinType| match t {
+            JoinType::Left => JoinType::Right,
+            JoinType::Right => JoinType::Left,
+            other => other,
+        };
+        // Semi/Anti are inherently one-sided (left-only output), so symmetry is defined only
+        // for the two-sided flavors.
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+        ] {
+            let direct = hash_join_indices(&left, &right, jt).unwrap();
+            let flipped = hash_join_indices(&right, &left, swap(jt)).unwrap();
+            // `flipped` has (left=right-rows, right=left-rows); swap the reconstruction args.
+            let a = vpairs1(&direct, &lv, &rv);
+            let mut b: Vec<_> = (0..flipped.left.len())
+                .map(|k| {
+                    let r = flipped
+                        .left
+                        .is_valid(k)
+                        .then(|| rv[flipped.left.value(k) as usize])
+                        .flatten();
+                    let l = flipped
+                        .right
+                        .is_valid(k)
+                        .then(|| lv[flipped.right.value(k) as usize])
+                        .flatten();
+                    (l, r)
+                })
+                .collect();
+            b.sort();
+            assert_eq!(a, b, "build-side asymmetry for {jt:?}");
         }
     }
 }

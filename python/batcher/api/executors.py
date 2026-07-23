@@ -78,9 +78,12 @@ class UdfExecutor:
     """
 
     def execute(self, plan: LogicalPlan, sources: list[Source], ctx: ExecutionContext) -> pa.Table:
-        from batcher import core
+        from batcher import core, kyber
 
-        batches = core.execute_with_udfs(plan, sources)
+        # Kyber decides which columns each source must supply; Core executes with them. A UDF
+        # that declared `input_columns` prunes the scan to those (plus what the plan above
+        # needs); an undeclared one still reads everything, because the `fn` is a black box.
+        batches = core.execute_with_udfs(plan, sources, kyber.required_columns_per_source(plan))
         schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
         collect_source_metadata(ctx.hub, sources)
@@ -165,6 +168,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     * **`accelerator_type`** — pins GPU actors to a device model when requested.
     """
     from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime.accelerators import cluster_gpu_memory_gb
     from batcher.ml.gpu import (
         actors_per_gpu_from_learned_vram,
         gpu_feedback_key,
@@ -185,12 +189,31 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     accelerator_type = next(
         (n.accelerator_type for n in stages if getattr(n, "accelerator_type", None)), None
     )
+    # Custom accelerator resources (TPU / neuron_cores / HPU / an on-prem resource), taken
+    # from the first stage that names any — the same first-wins rule as `accelerator_type`.
+    resources = next((tuple(n.resources) for n in stages if getattr(n, "resources", ())), ())
+    # Auto-pin a large-model GPU stage the user left unpinned to a device class that fits it, so
+    # a heterogeneous cluster never schedules it onto a GPU too small to hold the model (an OOM on
+    # load). A no-op on a homogeneous cluster, when every device fits, or when the user pinned a
+    # type. GPU only — a custom-accelerator stage is placed by its `resources`, not a GPU model.
+    if accelerator_type is None and requested_gpus > 0 and model_gb > 0:
+        from batcher.dist.executors.ray_runtime.accelerators import recommend_accelerator_type
+
+        accelerator_type = recommend_accelerator_type(model_gb)
 
     # Cold-start GPU request: VRAM-pack a small model onto a fraction when we know both
     # the model size and the GPU's VRAM (auto-detected); otherwise honor the declared
     # count. A GPU-less driver can't detect VRAM, so packing is skipped (safe).
+    #
+    # The CLUSTER's binding (smallest) device first, and only then this process's own. A
+    # single fraction is applied to every actor in the fleet, so deriving it from the driver's
+    # device is an OOM on any mixed fleet: a 0.25 computed against an 80 GB A100 packs four
+    # actors onto a 16 GB T4. The cluster figure is the smallest device precisely so the
+    # fraction is valid on every node the actor might land on.
     base_gpus = requested_gpus
-    vram = gpu_vram_gb() if model_gb > 0 and requested_gpus >= 1.0 else None
+    vram = None
+    if model_gb > 0 and requested_gpus >= 1.0:
+        vram = cluster_gpu_memory_gb() or gpu_vram_gb()
     if vram:
         base_gpus = recommend_gpu_fraction(model_gb, vram)
     key = gpu_feedback_key(plan)
@@ -230,6 +253,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         n_tasks=max(1, n_tasks),
         credits=cfg.flow_control.default_credits,
         accelerator_type=accelerator_type,
+        resources=resources,
         inflight_depth=inflight_depth,
     )
 

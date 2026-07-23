@@ -229,17 +229,32 @@ def test_coalesce_flattens_nested():
     assert len(inputs) == 3 and all(i["e"] != "coalesce" for i in inputs)
 
 
-def test_coalesce_truncates_after_literal():
-    node = _proj(coalesce(col("a"), bt.lit(9), col("x")))
+def test_coalesce_dedups_repeated_argument():
+    node = _proj(coalesce(col("a"), col("x"), col("a")))
     out = ba.coalesce_simplify(node, None)
     inputs = out.items[0].expr.to_ir()["inputs"]
-    assert len(inputs) == 2  # col('x') after the literal is dropped
+    # The repeated `col('a')` is only ever reached when the first one was null, so
+    # dropping it moves neither the value nor the type.
+    assert inputs == [{"e": "col", "name": "a"}, {"e": "col", "name": "x"}]
+
+
+def test_coalesce_does_not_truncate_after_literal():
+    """`coalesce_simplify` must NOT truncate the tail after a non-null literal.
+
+    A COALESCE's type is the join of its arms', so dropping the tail can *narrow* it
+    (`coalesce(5, CAST(-1 AS DOUBLE))` is a DOUBLE `5.0`, not an INT `5`). That
+    truncation is sound only under a type guard, and so belongs to
+    `coalesce_drop_nulls_after_first_non_null`. See
+    tests/differential/test_diff_kyber3_coalesce_type.py.
+    """
+    assert ba.coalesce_simplify(_proj(coalesce(col("a"), bt.lit(9), col("x"))), None) is None
 
 
 def test_coalesce_unwraps_single():
-    node = _proj(coalesce(bt.lit(9), col("x")))  # truncates to [9], unwraps to 9
+    # Dedup collapses the arms to one, which then unwraps to the bare expression.
+    node = _proj(coalesce(col("a"), col("a")))
     out = ba.coalesce_simplify(node, None)
-    assert out.items[0].expr.to_ir() == {"e": "lit", "value": {"int": 9}}
+    assert out.items[0].expr.to_ir() == {"e": "col", "name": "a"}
 
 
 def test_coalesce_idempotent():

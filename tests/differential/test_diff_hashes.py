@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -22,8 +23,6 @@ def _strings():
 
 @pytest.mark.parametrize("fn", ["md5", "sha1", "sha256"])
 def test_crypto_hash_matches_duckdb(duck, fn):
-    from conftest import assert_same
-
     duck.register("t", _strings())
     out = bt.from_arrow(_strings()).select(h=getattr(col("s").str, fn)()).collect()
     assert_same(out, duck.sql(f"SELECT {fn}(s) AS h FROM t"))

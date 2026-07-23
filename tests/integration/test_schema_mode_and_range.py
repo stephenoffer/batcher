@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from batcher._internal.errors import SchemaError
+from batcher._internal.errors import PlanError, SchemaError
 
 
 def test_schema_mode_union_reconciles_files(tmp_path):
@@ -46,6 +46,13 @@ def test_range_source():
     out = bt.range(0, 5).collect()
     assert out.to_pydict() == {"value": [0, 1, 2, 3, 4]}
     assert bt.range(1, 10, 2, name="n").to_pydict() == {"n": [1, 3, 5, 7, 9]}
+
+
+def test_range_step_zero_raises_typed_error():
+    # A zero step must raise the project's typed PlanError at the public-API edge,
+    # not leak a bare builtins ``ValueError`` (python-quality: typed errors only).
+    with pytest.raises(PlanError, match="step must be non-zero"):
+        bt.range(0, 5, 0)
 
 
 def test_date_range_source():

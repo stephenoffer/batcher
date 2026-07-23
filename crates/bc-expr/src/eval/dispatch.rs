@@ -10,7 +10,9 @@ use arrow::compute::kernels::boolean;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{is_not_null, is_null};
 
-use crate::eval::binary::{as_bool, coerce_numeric, eval_binary, try_scalar_binary};
+use crate::eval::binary::{
+    as_bool, coerce_numeric, eval_binary, try_dict_compare, try_scalar_binary,
+};
 use crate::eval::cast::cast_expr;
 use crate::eval::date::{
     eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
@@ -22,13 +24,13 @@ use crate::eval::list::{
     eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
     eval_list_position, eval_make_struct, eval_struct_field, rebuild_list, require_list,
 };
-use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform};
+use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
 use crate::eval::map::eval_map;
 use crate::eval::math::{
     eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
 };
 use crate::eval::media::{eval_audio, eval_image, eval_video};
-use crate::eval::str::eval_str;
+use crate::eval::str::{eval_str, try_dict_str};
 use crate::eval::timezone::eval_convert_timezone;
 use crate::{BinaryOp, Expr, ExprError};
 
@@ -71,6 +73,14 @@ impl Expr {
                 Ok(Arc::new(boolean::not(b)?))
             }
             Expr::Binary { op, left, right } => {
+                // Fast path: comparing a *dictionary* column to a literal compares the
+                // distinct values and gathers through the keys, never decoding the column.
+                // Checked first, because `try_scalar_binary` would `eval` the column — which
+                // decodes the dictionary at the leaf — only to then reject a non-numeric type
+                // and fall through, having already paid for the decode it was trying to avoid.
+                if let Some(out) = try_dict_compare(*op, left, right, batch)? {
+                    return Ok(out);
+                }
                 // Fast path: a numeric literal operand broadcasts as a scalar instead
                 // of materializing a full N-length array (bit-identical result).
                 if let Some(out) = try_scalar_binary(*op, left, right, batch)? {
@@ -129,6 +139,21 @@ impl Expr {
                 start,
                 length,
             } => {
+                // Fast path: a *dictionary* column applies the function to its distinct
+                // values and gathers through the keys, never decoding the column. Checked
+                // before `eval`, which decodes at the leaf — the whole point is to avoid
+                // materializing the decoded column at all.
+                if let Some(out) = try_dict_str(
+                    *func,
+                    input,
+                    batch,
+                    pattern.as_deref(),
+                    replacement.as_deref(),
+                    *start,
+                    *length,
+                )? {
+                    return Ok(out);
+                }
                 let arr = input.eval(batch)?;
                 eval_str(
                     *func,
@@ -148,13 +173,32 @@ impl Expr {
                 input,
                 width,
                 height,
+                mean,
+                std,
+                channels_first,
             } => {
                 let arr = input.eval(batch)?;
-                eval_image(*func, &arr, *width, *height)
+                eval_image(
+                    *func,
+                    &arr,
+                    *width,
+                    *height,
+                    mean.as_deref(),
+                    std.as_deref(),
+                    *channels_first,
+                )
             }
-            Expr::Audio { func, input } => {
+            Expr::Audio {
+                func,
+                input,
+                rate,
+                n_fft,
+                hop_length,
+                n_mels,
+                n_mfcc,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_audio(*func, &arr)
+                eval_audio(*func, &arr, *rate, *n_fft, *hop_length, *n_mels, *n_mfcc)
             }
             Expr::Video { func, input } => {
                 let arr = input.eval(batch)?;
@@ -189,6 +233,10 @@ impl Expr {
             Expr::ListSet { op, left, right } => {
                 let (l, r) = (left.eval(batch)?, right.eval(batch)?);
                 eval_list_set(*op, &l, &r)
+            }
+            Expr::ListZip { op, left, right } => {
+                let (l, r) = (left.eval(batch)?, right.eval(batch)?);
+                eval_list_zip(*op, &l, &r)
             }
             Expr::ListTransform { input, func } => eval_list_transform(&input.eval(batch)?, func),
             Expr::ListFilter { input, pred } => eval_list_filter(&input.eval(batch)?, pred),
@@ -302,9 +350,15 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 let list = require_list(&arr, "list.slice")?;
                 rebuild_list(list, |s, e| {
-                    let begin = (s as i64 + (*offset).max(0)).min(e as i64) as usize;
+                    // Saturating throughout: a huge `offset`/`length` (up to i64::MAX)
+                    // otherwise overflows the `+` before the `.min(e)` clamp — panicking
+                    // in debug and wrapping to a giant `usize` (capacity overflow) in
+                    // release. `list.slice(3, i64::MAX)` must clamp to the list end.
+                    let begin = (s as i64).saturating_add((*offset).max(0)).min(e as i64) as usize;
                     let end = match length {
-                        Some(l) => (begin as i64 + (*l).max(0)).min(e as i64) as usize,
+                        Some(l) => {
+                            (begin as i64).saturating_add((*l).max(0)).min(e as i64) as usize
+                        }
                         None => e,
                     };
                     (begin..end).map(|k| k as u32).collect()
@@ -318,7 +372,7 @@ impl Expr {
 mod dict_tests {
     use super::*;
     use crate::{Literal, StrFunc};
-    use arrow::array::{DictionaryArray, StringArray};
+    use arrow::array::DictionaryArray;
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 
     /// A batch with one `Dictionary<Int32, Utf8>` column `s`, plus the same column decoded

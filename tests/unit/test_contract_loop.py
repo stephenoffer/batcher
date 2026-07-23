@@ -9,6 +9,9 @@ Each test pins one invariant the loop *claims* and did not hold:
   symmetric. A relative error normalized by the estimate is bounded by 1 for *any*
   over-estimate, so it declared every over-estimate accurate and stopped re-optimizing —
   disabling the loop for exactly the case it exists to catch.
+* **Carbonite counter-offers, and the offer binds** — an infeasible verdict carries the
+  envelope the plan *would* fit in. It was dropped, so the conductor sharded the spill by a
+  fixed constant that knows nothing about the machine's budget.
 * **Carbonite's flow control must be a control law** — AIMD's multiplicative decrease is
   only a decrease for `0 < beta < 1`.
 * **Recovery must not pay for work it discards.**
@@ -108,6 +111,44 @@ def test_a_plan_that_fits_is_feasible_whatever_its_provenance():
     admission = BudgetingAdmission(available_bytes=1_000_000, soft_limit=0.85)
     verdict = admission.validate(_one_op_plan(Provenance.DEFAULT, 1024), ctx)
     assert verdict.feasible is True
+
+
+def test_the_counter_offer_binds_the_spill_sharding():
+    """An infeasible verdict's `suggested_bounds` must reach the out-of-core sharding.
+
+    This is the documented return leg of the Kyber<->Carbonite contract: admission does not
+    merely refuse a plan, it names the per-operator envelope the plan *would* fit in. Nothing
+    consumed `suggested_bounds`, so the conductor degraded the verdict to a bare `must_spill`
+    boolean and sharded by a fixed bytes-per-partition constant that knows nothing about the
+    machine's budget — producing buckets that individually still do not fit, which is exactly
+    what admission had just diagnosed. Partition count is result-invariant (mergeable
+    algebra), so this is purely a memory-safety lever.
+    """
+    from batcher.carbonite import ResourceManager
+
+    rm = ResourceManager()
+    peak = 8 << 30
+    op = PhysicalOp(
+        op_id=OpId(1),
+        kind="Aggregate",
+        backend="native",
+        algorithm="",
+        bounds=ResourceBounds(m_max_bytes=peak, c_max_credits=0, n_max_parallelism=0),
+        inputs=(),
+        properties=PlanProperties(est_rows=1e8),
+    )
+    plan = PhysicalPlan(ir={}, output_schema=None, ops=(op,))
+
+    # No counter-offer (a feasible plan) leaves the caller's own count untouched.
+    assert rm.partitions_for_bounds(plan, None) == 0
+
+    # An offer of E must shard an 8 GiB peak into ceil(8 GiB / E) buckets, so each fits.
+    for envelope_gib, expected in ((1, 8), (2, 4), (4, 2)):
+        offer = ResourceBounds(m_max_bytes=envelope_gib << 30, c_max_credits=0, n_max_parallelism=0)
+        assert rm.partitions_for_bounds(plan, offer) == expected
+    # A tighter envelope shards further, never coarser.
+    tight = ResourceBounds(m_max_bytes=256 << 20, c_max_credits=0, n_max_parallelism=0)
+    assert rm.partitions_for_bounds(plan, tight) == 32
 
 
 # --- flow control: AIMD must actually be a control law -----------------------------
@@ -246,7 +287,10 @@ def test_broadcast_crossover_learns_from_measured_timings():
         record_broadcast_timing(hub, "broadcast", mb * mib, 5.0 + 1.2 * mb)
         record_broadcast_timing(hub, "shuffle", mb * mib, 50.0 + 0.3 * mb)
 
-    learned = learned_broadcast_max_bytes(hub)
+    # The solved crossover is clamped to a band around the *default*, so pass the
+    # default explicitly: this asserts the value is learned from the timings, not
+    # that it happens to sit inside the band of whatever the config default is today.
+    learned = learned_broadcast_max_bytes(hub, default=10 * mib)
     assert learned is not None
     assert learned / mib == pytest.approx(50.0, abs=1.0)
 
@@ -267,7 +311,7 @@ def test_a_once_run_phase_visits_a_subtree_a_rule_just_created():
     freshly-created inner limit at 1.
     """
     import batcher as bt
-    from batcher.kyber.optimizer import _apply_rules
+    from batcher.kyber.optimizer.driver import _apply_rules
     from batcher.kyber.pass_base import OptimizerContext
     from batcher.kyber.rule import Phase, node_rule
     from batcher.kyber.stats import StatsEstimator
@@ -312,7 +356,7 @@ def test_fixpoint_phases_still_fuse():
     # hot path (NORMALIZE/REWRITE/PUSHDOWN/FUSION hold most of the rule set).
     import inspect
 
-    from batcher.kyber.optimizer import _run_phase
+    from batcher.kyber.optimizer.driver import _run_phase
 
     source = inspect.getsource(_run_phase)
     assert "fuse = max_iterations > 1" in source

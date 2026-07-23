@@ -44,14 +44,15 @@ pub use distinct::{distinct_batch, distinct_dense};
 pub(crate) use group::assign_groups;
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
-    finalize_histogram, finalize_median, finalize_mode, finalize_quantile, median_state,
-    merge_median,
+    finalize_histogram, finalize_list_agg, finalize_median, finalize_mode, finalize_quantile,
+    listagg_state, median_state, merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
 use stats::{
-    covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, moment_state,
+    covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, merge_covar,
+    merge_moments, moment_state,
 };
-use var::{count_non_null, finalize_mean, finalize_var, var_state};
+use var::{count_non_null, finalize_mean, finalize_var, merge_welford, var_state};
 
 /// An aggregate function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,7 +257,9 @@ pub fn partial(
     // dictionary, so the common case pays only one `data_type()` check per call.
     let decoded = decode_dict_call_inputs(calls)?;
     let calls = decoded.as_deref().unwrap_or(calls);
-    let widened = widen_mean_int_inputs(calls)?;
+    let denulled = coerce_null_call_inputs(calls)?;
+    let calls = denulled.as_deref().unwrap_or(calls);
+    let widened = widen_mean_inputs(calls)?;
     let calls = widened.as_deref().unwrap_or(calls);
     // Global aggregate (no GROUP BY): every row is one group, so each aggregate's partial
     // state is the whole-column reduction — computable with arrow's SIMD kernels and, for
@@ -327,22 +330,31 @@ fn decode_dict_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, Ru
     Ok(Some(out))
 }
 
-/// Widen every `Mean` call's Int64 input to Float64, returning a fresh call list only
-/// when some widening happened (else `None`, so the common no-`AVG(int)` path allocates
-/// nothing). See the note in [`partial`] for why AVG sums in f64 while SUM stays i64.
-fn widen_mean_int_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
-    let is_int_mean = |c: &AggCall| {
+/// Widen every `Mean` call's Int64 **or Decimal128/Decimal256** input to Float64,
+/// returning a fresh call list only when some widening happened (else `None`, so the
+/// common no-`AVG(int)` path allocates nothing). See the note in [`partial`] for why AVG
+/// sums in f64 while SUM stays i64.
+///
+/// Decimal is widened for the same reason as integers, and additionally because the
+/// downstream `sum_acc`/`finalize_mean` kernels only understand Int64/Float64 sum state —
+/// without this, `avg`/`mean` over a `Decimal128` column raised "unsupported". DuckDB
+/// returns a DOUBLE average, which Float64 matches.
+fn widen_mean_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
+    let needs_widen = |c: &AggCall| {
         c.func == AggFunc::Mean
-            && c.values
-                .as_ref()
-                .is_some_and(|v| v.data_type() == &DataType::Int64)
+            && c.values.as_ref().is_some_and(|v| {
+                matches!(
+                    v.data_type(),
+                    DataType::Int64 | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                )
+            })
     };
-    if !calls.iter().any(is_int_mean) {
+    if !calls.iter().any(needs_widen) {
         return Ok(None);
     }
     let mut out = Vec::with_capacity(calls.len());
     for c in calls {
-        let values = if is_int_mean(c) {
+        let values = if needs_widen(c) {
             Some(arrow::compute::cast(
                 c.values.as_ref().unwrap(),
                 &DataType::Float64,
@@ -352,6 +364,42 @@ fn widen_mean_int_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, Runt
         };
         out.push(AggCall::with_key(c.func, values, c.key.clone()));
     }
+    Ok(Some(out))
+}
+
+/// Coerce any `Null`-typed value/ordering input to an all-null `Int64` column, returning a
+/// fresh call list only when some coercion happened (else `None`, so the common path allocates
+/// nothing). A column that is entirely null carries Arrow's `Null` data type, which the typed
+/// accumulator kernels reject ("aggregate `sum` is not supported for column type Null") — so
+/// `SUM`/`MIN`/`MAX`/`AVG` over an all-null column *errored* where DuckDB returns NULL, and
+/// `COUNT` over it counted every row instead of 0. An all-null `Int64` array flows through
+/// every kernel correctly (sum/min/max/mean → NULL; count of non-null → 0), and the exact
+/// result type is immaterial since the value is null. Runs before [`widen_mean_inputs`] so a
+/// `Null` `AVG` input becomes `Int64` here, then Float64 there.
+fn coerce_null_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
+    let is_null =
+        |a: &Option<ArrayRef>| matches!(a.as_ref().map(|x| x.data_type()), Some(DataType::Null));
+    if !calls.iter().any(|c| is_null(&c.values) || is_null(&c.key)) {
+        return Ok(None);
+    }
+    let coerce = |a: &Option<ArrayRef>| -> Result<Option<ArrayRef>, RuntimeError> {
+        match a {
+            Some(arr) if matches!(arr.data_type(), DataType::Null) => {
+                Ok(Some(arrow::compute::cast(arr, &DataType::Int64)?))
+            }
+            other => Ok(other.clone()),
+        }
+    };
+    let out = calls
+        .iter()
+        .map(|c| {
+            Ok(AggCall::with_key(
+                c.func,
+                coerce(&c.values)?,
+                coerce(&c.key)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
     Ok(Some(out))
 }
 
@@ -414,17 +462,23 @@ fn accumulate(
                 count_non_null(v, group_ids, num_groups),
             ]
         }
-        // Variance/stddev share the (sum, sum_of_squares, count) state, all
-        // mergeable by summing — so they distribute like every other aggregate.
+        // Variance/stddev carry a Welford (mean, M2, count) state, mergeable via Chan's
+        // parallel formula (see `merge_welford`) — so they distribute like every other
+        // aggregate, but without the sum-of-squares cancellation the naive form suffered.
         AggFunc::Var | AggFunc::Stddev => {
             var_state(require(values, func)?, group_ids, num_groups, func)?
         }
-        AggFunc::Median
-        | AggFunc::Quantile(_)
-        | AggFunc::ListAgg
-        | AggFunc::Mode
-        | AggFunc::Histogram => {
+        AggFunc::Median | AggFunc::Quantile(_) | AggFunc::Mode | AggFunc::Histogram => {
             vec![median_state(require(values, func)?, group_ids, num_groups)?]
+        }
+        // `array_agg`/`list_agg` KEEPS null elements (SQL semantics), unlike the
+        // null-filtering `median_state` the others share.
+        AggFunc::ListAgg => {
+            vec![listagg_state(
+                require(values, func)?,
+                group_ids,
+                num_groups,
+            )?]
         }
         AggFunc::BoolAnd => vec![bool_acc(
             require(values, func)?,
@@ -547,7 +601,13 @@ pub fn combine_with(
     // dominates a many-group combine. Below it, and for global aggregates (no keys), the
     // serial path wins (the radix machinery is pure overhead on a small/single group).
     if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
-        let partitions = rayon::current_num_threads().clamp(2, 64);
+        // One radix partition per core so the independent group-and-merge tasks fill the
+        // pool. The old `64` ceiling left a >64-core box merging a high-cardinality combine
+        // (DISTINCT / many-group) on at most 64 cores while the extra cores idled — the
+        // combine plateaued, then regressed, past ~16 cores. Partitioning is now flat-CSR
+        // (see `combine_radix`), so more partitions cost bounded allocation, not a growing-
+        // vector storm. The 512 ceiling caps per-partition setup overhead on huge boxes.
+        let partitions = rayon::current_num_threads().clamp(2, 512);
         let (group_columns, states) =
             group::combine_radix(&group_concat, &state_concats, funcs, total_rows, partitions)?;
         return Ok(Partial {
@@ -585,8 +645,9 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             AggFunc::CountDistinct => finalize_count_distinct(&state[0]),
             AggFunc::Median => finalize_median(&state[0])?,
             AggFunc::Quantile(permille) => finalize_quantile(&state[0], permille as f64 / 1000.0)?,
-            // array_agg: the collected per-group list IS the result.
-            AggFunc::ListAgg => state[0].clone(),
+            // array_agg: the collected per-group list IS the result, except a non-null
+            // *empty* list (an aggregate over zero rows) becomes NULL to match DuckDB.
+            AggFunc::ListAgg => finalize_list_agg(&state[0])?,
             AggFunc::ApproxCountDistinct => finalize_approx_distinct(&state[0]),
             AggFunc::ApproxQuantile(permille) => {
                 finalize_approx_quantile(&state[0], permille as f64 / 1000.0)
@@ -660,6 +721,128 @@ mod tests {
     }
 
     #[test]
+    fn minmax_over_booleans_orders_false_below_true() {
+        // SQL orders `false < true`, so `min` is the AND of a group's values and `max` is the
+        // OR. Before this arm existed, `min(flag)` raised "not supported for column type
+        // Boolean" — while a Parquet footer, which *does* record an exact boolean min/max,
+        // happily answered the same query `false` from metadata. The engine and the metadata
+        // shortcut disagreed, and the shortcut was the one that looked right.
+        use arrow::array::BooleanArray;
+
+        // Two groups: g0 = [true, false, null] → min false, max true;
+        //             g1 = [true, true]        → min true,  max true.
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![0, 0, 0, 1, 1]));
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(true),
+        ]));
+        let calls = [
+            AggCall::new(AggFunc::Min, Some(values.clone())),
+            AggCall::new(AggFunc::Max, Some(values.clone())),
+            // `bool_and`/`bool_or` must give exactly the same answer — they are the same fold.
+            AggCall::new(AggFunc::BoolAnd, Some(values.clone())),
+            AggCall::new(AggFunc::BoolOr, Some(values)),
+        ];
+        let out = group_aggregate(std::slice::from_ref(&keys), &calls, 5).unwrap();
+        let group = out.group_columns[0].as_primitive::<Int64Type>();
+        let col = |i: usize| {
+            out.agg_columns[i]
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean min/max output")
+                .clone()
+        };
+        let (min, max, and, or) = (col(0), col(1), col(2), col(3));
+        for row in 0..group.len() {
+            let (want_min, want_max) = if group.value(row) == 0 {
+                (false, true)
+            } else {
+                (true, true)
+            };
+            assert_eq!(
+                min.value(row),
+                want_min,
+                "min of group {}",
+                group.value(row)
+            );
+            assert_eq!(
+                max.value(row),
+                want_max,
+                "max of group {}",
+                group.value(row)
+            );
+            assert_eq!(min.value(row), and.value(row), "min must equal bool_and");
+            assert_eq!(max.value(row), or.value(row), "max must equal bool_or");
+        }
+    }
+
+    #[test]
+    fn boolean_minmax_is_mergeable_across_partitions() {
+        // The invariant every stateful primitive owes: combining the partials of a partition
+        // must equal aggregating the whole. A boolean min/max folds with AND/OR, which are
+        // associative and commutative, so any partition order merges to the same answer.
+        use arrow::array::BooleanArray;
+
+        let whole: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(true),
+        ]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![7, 7, 7, 7]));
+
+        let single = group_aggregate(
+            std::slice::from_ref(&keys),
+            &[
+                AggCall::new(AggFunc::Min, Some(whole.clone())),
+                AggCall::new(AggFunc::Max, Some(whole)),
+            ],
+            4,
+        )
+        .unwrap();
+
+        // The same rows split across two partitions, each partially aggregated, then combined.
+        let split = |vals: Vec<Option<bool>>| -> GroupAggResult {
+            let rows = vals.len();
+            let k: ArrayRef = Arc::new(Int64Array::from(vec![7i64; rows]));
+            let v: ArrayRef = Arc::new(BooleanArray::from(vals));
+            group_aggregate(
+                std::slice::from_ref(&k),
+                &[
+                    AggCall::new(AggFunc::Min, Some(v.clone())),
+                    AggCall::new(AggFunc::Max, Some(v)),
+                ],
+                rows,
+            )
+            .unwrap()
+        };
+        let left = split(vec![Some(true), Some(false)]);
+        let right = split(vec![Some(true), Some(true)]);
+
+        // Combining two partials is the same fold over their outputs (min-of-mins, max-of-maxs).
+        let merged_keys: ArrayRef = Arc::new(Int64Array::from(vec![7i64, 7]));
+        let merge = |a: &ArrayRef, b: &ArrayRef, func: AggFunc| {
+            let values: ArrayRef = arrow::compute::concat(&[a.as_ref(), b.as_ref()]).unwrap();
+            group_aggregate(
+                std::slice::from_ref(&merged_keys),
+                &[AggCall::new(func, Some(values))],
+                2,
+            )
+            .unwrap()
+            .agg_columns[0]
+                .clone()
+        };
+        let combined_min = merge(&left.agg_columns[0], &right.agg_columns[0], AggFunc::Min);
+        let combined_max = merge(&left.agg_columns[1], &right.agg_columns[1], AggFunc::Max);
+
+        assert_eq!(combined_min.as_ref(), single.agg_columns[0].as_ref());
+        assert_eq!(combined_max.as_ref(), single.agg_columns[1].as_ref());
+    }
+
+    #[test]
     fn mean_over_int64_does_not_overflow() {
         // Two i64::MAX values sum to > i64::MAX (a SUM must error there); AVG sums in f64,
         // so it returns their mean (≈ i64::MAX) instead of overflowing. This is exactly
@@ -673,6 +856,34 @@ mod tests {
         let out = finalize(&[AggFunc::Mean], &p).expect("finalize");
         let got = out[0].as_primitive::<Float64Type>().value(0);
         assert!((got - i64::MAX as f64).abs() < 1.0, "got {got}");
+    }
+
+    #[test]
+    fn mean_over_decimal128_returns_double() {
+        use arrow::array::Decimal128Array;
+        // A Decimal128(10,2) column: raw 150/250/350 == 1.50/2.50/3.50 → mean 2.50.
+        // Before Decimal was widened, this raised "aggregate mean is not supported for
+        // column type Decimal128(..)".
+        let dec = Decimal128Array::from(vec![150i128, 250, 350])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let values: ArrayRef = Arc::new(dec);
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1i64, 1, 1]))];
+        let calls = [AggCall::new(AggFunc::Mean, Some(values))];
+        let p = partial(&keys, &calls, 3).expect("AVG(decimal) must be supported");
+        let out = finalize(&[AggFunc::Mean], &p).expect("finalize");
+        assert_eq!(out[0].data_type(), &DataType::Float64);
+        let got = out[0].as_primitive::<Float64Type>().value(0);
+        assert!((got - 2.5).abs() < 1e-9, "got {got}");
+
+        // The keyless global path widens too.
+        let dec2 = Decimal128Array::from(vec![150i128, 250, 350])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let v2: ArrayRef = Arc::new(dec2);
+        let pg = partial(&[], &[AggCall::new(AggFunc::Mean, Some(v2))], 3).expect("global");
+        let og = finalize(&[AggFunc::Mean], &pg).expect("finalize");
+        assert!((og[0].as_primitive::<Float64Type>().value(0) - 2.5).abs() < 1e-9);
     }
 
     #[test]
@@ -1256,5 +1467,48 @@ mod tests {
         let m = count_map(&whole.group_columns[0], &whole.agg_columns[0]);
         assert_eq!(m["a"], 1); // distinct non-null {1}
         assert_eq!(m["b"], 0); // all null → 0
+    }
+
+    /// The radix-parallel `combine` must equal the serial one — including float key
+    /// identity on a COMPOSITE key.
+    ///
+    /// Regression: `hash_keys` stated the float-canonicalization policy per encoder, and
+    /// its `RowConverter` fallback omitted it. Arrow's row format is deliberately
+    /// non-canonical for floats, so a group whose representative is `-0.0` in one partial
+    /// and `0.0` in another — legal, since `assign_groups` takes reps from the original
+    /// column — hashed into different radix buckets. Buckets merge by plain `concat` on
+    /// the "key-disjoint" assumption, so the two halves were never reconciled and the
+    /// query returned two groups where the oracle returns one. Only the fallback was
+    /// affected (a composite key mixing a float with a non-`is_hashable_mixed` type, here
+    /// `Date32`), and only above `RADIX_PARALLEL_THRESHOLD` — which is why `combine_with`
+    /// is called directly with a threshold of 1 rather than building a 200k-row fixture.
+    #[test]
+    fn radix_combine_preserves_float_key_identity_on_a_composite_key() {
+        use arrow::array::Date32Array;
+
+        let part_for = |f: f64| {
+            let d: ArrayRef = Arc::new(Date32Array::from(vec![19723]));
+            let fl: ArrayRef = Arc::new(Float64Array::from(vec![f]));
+            let one: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
+            partial(&[d, fl], &[AggCall::new(AggFunc::Sum, Some(one))], 1).unwrap()
+        };
+        // Same SQL group (-0.0 == 0.0), different representatives across the two partials.
+        let parts = [part_for(-0.0), part_for(0.0)];
+
+        let serial = combine_with(&parts, &[AggFunc::Sum], usize::MAX).unwrap();
+        let radix = combine_with(&parts, &[AggFunc::Sum], 1).unwrap();
+        assert_eq!(
+            serial.group_columns[0].len(),
+            1,
+            "serial combine must fold -0.0 and 0.0 into one group"
+        );
+        assert_eq!(
+            radix.group_columns[0].len(),
+            serial.group_columns[0].len(),
+            "radix combine must agree with serial on float key identity"
+        );
+        // And the counts must have merged, not split.
+        let sums = finalize(&[AggFunc::Sum], &radix).unwrap();
+        assert_eq!(sums[0].as_primitive::<Int64Type>().value(0), 2);
     }
 }

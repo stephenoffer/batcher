@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -16,8 +17,6 @@ def _data():
 
 
 def test_list_position_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = (
         bt.from_arrow(_data())

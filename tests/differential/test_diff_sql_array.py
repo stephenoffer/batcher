@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -26,8 +27,6 @@ def t(duck):
     ],
 )
 def test_array_literal(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -35,7 +34,6 @@ def test_array_dataframe_roundtrip(duck, t):
     """The Array node round-trips through the IR to the engine."""
     from batcher import col
     from batcher.plan.expr_ir import Array
-    from conftest import assert_same
 
     out = bt.from_arrow(t).select("id", a=Array([col("x"), col("y")])).collect()
     assert_same(out, duck.sql("SELECT id, [x, y] a FROM t"))

@@ -21,6 +21,7 @@ use arrow::array::{
 };
 use serde::Deserialize;
 
+mod analyze;
 mod error;
 pub use error::ExprError;
 
@@ -114,6 +115,11 @@ pub enum Expr {
 
     /// An image decode op over a binary (image-bytes) sub-expression. Decoding is
     /// library-backed (heavy), so the JIT falls back to this interpreter path.
+    ///
+    /// `mean`/`std`/`channels_first` apply only to `ToTensorF32`: per-channel
+    /// normalization `(pixel/255 - mean) / std` and NCHW-vs-NHWC layout. They carry
+    /// `#[serde(default)]`, so existing `to_tensor`/`decode`/`resize`/`dhash` IR — which
+    /// never sets them — round-trips byte-for-byte.
     Image {
         #[serde(rename = "fn")]
         func: ImageFunc,
@@ -122,14 +128,36 @@ pub enum Expr {
         width: Option<i64>,
         #[serde(default)]
         height: Option<i64>,
+        #[serde(default)]
+        mean: Option<Vec<f64>>,
+        #[serde(default)]
+        std: Option<Vec<f64>>,
+        #[serde(default)]
+        channels_first: bool,
     },
 
     /// An audio decode op over a binary (audio-bytes) sub-expression. Library-backed
     /// (symphonia), so the JIT falls back to this interpreter path (like `Image`).
+    /// `rate` is the target sample rate for `AudioFunc::Resample` (ignored otherwise).
     Audio {
         #[serde(rename = "fn")]
         func: AudioFunc,
         input: Box<Expr>,
+        #[serde(default)]
+        rate: Option<i64>,
+        /// `MelSpectrogram` only: STFT window size. `#[serde(default)]`, so the other audio
+        /// ops' IR round-trips unchanged.
+        #[serde(default)]
+        n_fft: Option<i64>,
+        /// `MelSpectrogram` only: STFT hop (stride) between frames.
+        #[serde(default)]
+        hop_length: Option<i64>,
+        /// `MelSpectrogram`/`Mfcc`: number of mel filterbank bands.
+        #[serde(default)]
+        n_mels: Option<i64>,
+        /// `Mfcc` only: number of cepstral coefficients to keep.
+        #[serde(default)]
+        n_mfcc: Option<i64>,
     },
 
     /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
@@ -179,6 +207,17 @@ pub enum Expr {
     ListSet {
         #[serde(rename = "fn")]
         op: ListSetOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+
+    /// Element-wise arithmetic between two equal-length numeric `List` columns
+    /// (`list_add`/`list_subtract`/`list_multiply`): pairs elements positionally and
+    /// returns a `List<Float64>`. The embedding-math primitive — sum two embedding
+    /// columns, subtract a centroid, weight a vector — in the data plane.
+    ListZip {
+        #[serde(rename = "fn")]
+        op: ListZipOp,
         left: Box<Expr>,
         right: Box<Expr>,
     },
@@ -351,6 +390,13 @@ pub enum ListBinaryFunc {
     CosineSimilarity,
     /// Euclidean distance `sqrt(Σ (aᵢ−bᵢ)²)` between the two vectors.
     L2Distance,
+    /// Manhattan / L1 distance `Σ |aᵢ−bᵢ|` between the two vectors — the metric some
+    /// embedding models (and sparse features) are trained under.
+    L1Distance,
+    /// Hamming distance: the number of positions where the two vectors differ. The metric
+    /// for **binary / quantized embeddings** (each element 0/1 or a small int), where it is
+    /// far cheaper than a float distance and is what a binary vector index ranks by.
+    Hamming,
     /// The fraction of positions where the two lists hold the same value. Over a pair of
     /// `minhash` signatures this is the standard unbiased estimator of the documents'
     /// Jaccard similarity; over arbitrary lists it is simply the agreement rate.
@@ -383,13 +429,52 @@ pub enum Math2Func {
 pub enum ImageFunc {
     Decode,
     ToTensor,
+    /// `to_grayscale(width, height)` → decode, resize to `(width, height)`, and convert to a
+    /// single luminance channel (Rec.601), emitted `FixedSizeList<UInt8>` of shape
+    /// `(height, width, 1)`. The color-convert step for models that take 1-channel input
+    /// (many medical / document / depth models). Null/undecodable input → null.
+    /// → FixedSizeList&lt;UInt8&gt;.
+    ToGrayscale,
+    /// `center_crop(width, height)` → decode and crop the centered `(height, width)` region,
+    /// emitted `FixedSizeList<UInt8>` in HWC (RGB8). The second half of the standard vision
+    /// inference transform (resize the short side, then center-crop to the model input); when
+    /// the image is smaller than the crop it is zero-padded, matching torchvision `CenterCrop`.
+    /// Null/undecodable input → null. → FixedSizeList&lt;UInt8&gt;.
+    CenterCrop,
+    /// `to_tensor_f32(width, height, mean, std, channels_first)` → the model-ready
+    /// float tensor: decode, resize, scale to `[0, 1]` (`pixel / 255`), then optionally
+    /// apply per-channel `(x - mean) / std`, emitted `FixedSizeList<Float32>` in HWC
+    /// (default) or CHW layout. This is the step every torch/JAX vision model needs
+    /// between `ToTensor` and the forward pass; doing it natively keeps the pipeline in
+    /// the engine instead of exiting to a per-batch Python UDF (`x/255`, `Normalize`,
+    /// `permute`). Null/undecodable input → null. → FixedSizeList&lt;Float32&gt;.
+    ToTensorF32,
     /// `resize(width, height)` → re-encoded PNG bytes at the new size (Daft
     /// `image.resize`). Null/undecodable input → null. → Binary.
     Resize,
+    /// `dhash()` → a 64-bit *difference hash*: the perceptual fingerprint that makes
+    /// image near-duplicate detection expressible. Two visually similar images differ
+    /// in few bits, so `bit_count(a ^ b)` is their Hamming distance and a threshold on
+    /// it is a similarity join. Null/undecodable input → null. → Int64 (the 64 bits
+    /// reinterpreted: the FFI boundary rejects a `u64` above `i64::MAX`).
+    Dhash,
+}
+
+/// Element-wise arithmetic between two equal-length numeric `List` columns (the `.list`
+/// vector-math methods). Wire tags are snake_case (`list_add`/`list_subtract`/`list_multiply`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListZipOp {
+    #[serde(rename = "list_add")]
+    Add,
+    #[serde(rename = "list_subtract")]
+    Subtract,
+    #[serde(rename = "list_multiply")]
+    Multiply,
 }
 
 /// Set operations between two `List` columns (the `.list` set methods). Wire tags
-/// are snake_case (`array_intersect` / `array_except`).
+/// are snake_case (`array_intersect` / `array_except` / `array_union`).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListSetOp {
@@ -402,12 +487,31 @@ pub enum ListSetOp {
 }
 
 /// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
-/// metadata into a struct; `ToWaveform` decodes to a mono `List<Float32>` signal.
+/// metadata into a struct; `ToWaveform` decodes to a mono `List<Float32>` signal;
+/// `Resample` decodes then band-limited-resamples that signal to the `rate` on the
+/// [`Expr::Audio`] node (the target sample rate), also a mono `List<Float32>`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioFunc {
     Decode,
     ToWaveform,
+    Resample,
+    /// `mel_spectrogram(rate, n_fft, hop_length, n_mels)` → the mel **power** spectrogram
+    /// that is the front end of every speech model (Whisper, wav2vec2, HuBERT): resample to
+    /// `rate`, STFT with a periodic Hann window and centered reflect padding, power spectrum
+    /// (`|.|²`), then an HTK-scale mel filterbank. Emitted as a `List<Float32>` of
+    /// `n_mels * n_frames` in row-major `(n_mels, n_frames)` order (`n_frames` follows the
+    /// clip length, so the row length varies across unequal clips — reshape by `n_mels`).
+    /// Numerically matches `torchaudio.transforms.MelSpectrogram` defaults (`power=2.0`, `norm=None`,
+    /// `mel_scale="htk"`, `center=True`, `pad_mode="reflect"`) — the log/normalization step
+    /// varies by model, so it is applied downstream, not baked in. Null/undecodable → null.
+    MelSpectrogram,
+    /// `mfcc(rate, n_fft, hop_length, n_mels, n_mfcc)` → the Mel-Frequency Cepstral
+    /// Coefficients, the classic compact speech feature: mel power spectrogram →
+    /// `AmplitudeToDB` → orthonormal DCT-II, keeping the first `n_mfcc` coefficients.
+    /// Emitted as a `List<Float32>` row-major `(n_mfcc, n_frames)`. Numerically matches
+    /// `torchaudio.transforms.MFCC` defaults. Null/undecodable → null.
+    Mfcc,
 }
 
 /// Video-decode operations for the `.video` namespace. `Decode` reads each clip's
@@ -467,18 +571,46 @@ pub enum ListFunc {
     /// 0-based index of the maximum non-null element (first on ties) → Int64;
     /// empty/null row → null.
     ArgMax,
+    /// The 0-based indices that sort each row's list **ascending** (stable; ties keep
+    /// original order) → `List<Int64>`. Null-valued positions are placed last in their
+    /// original order. `reverse` the result for a descending / top-k-first ranking — the
+    /// standard way to turn a per-row score/logit vector into ranked positions in-engine.
+    ArgSort,
     /// Euclidean (L2) norm `sqrt(Σ xᵢ²)` of the non-null elements → Float64;
     /// empty/null row → null. The vector magnitude used in similarity search.
     L2Norm,
+    /// L1 (Manhattan) norm `Σ |xᵢ|` of the non-null elements → Float64; empty/null row →
+    /// null. The scale used for L1 vector normalization (sparse / robust features).
+    L1Norm,
+    /// The maximum absolute value `max |xᵢ|` of the non-null elements → Float64; empty/null
+    /// row → null. The divisor for MaxAbs feature scaling (scales into `[-1, 1]`).
+    MaxAbs,
     /// L2-normalize each row to unit length: `xᵢ / sqrt(Σ xⱼ²)` → `List<Float64>`.
     /// A zero vector maps to all zeros (no division by zero); per-element nulls are
     /// preserved and excluded from the norm; a null/empty row stays null/empty. The
     /// standard preprocessing step before cosine/dot retrieval.
     Normalize,
+    /// Cumulative sum over each row's list → `List<Float64>` of the same length: element `i`
+    /// is `Σ_{j≤i} xⱼ`. A null element contributes 0 to the running total and stays null in
+    /// the output (the prefix continues past it). The building block for a per-row cumulative
+    /// distribution (`cumsum` then divide by the total) and prefix features.
+    CumSum,
+    /// Softmax over each row's list — `exp(xᵢ − max) / Σ exp(xⱼ − max)` → `List<Float64>`
+    /// summing to 1. The logits→probabilities step (per-row, over a vector of scores):
+    /// converts a classifier's raw output to a probability distribution in the data plane.
+    /// The `− max` shift is the standard numerically-stable form. Per-element nulls are
+    /// preserved and excluded; a null/empty row stays null/empty.
+    Softmax,
     /// Concatenate a `List<List<T>>` into a `List<T>` per row, in order (DuckDB
     /// `flatten`; Polars `list.explode`-free flatten). Null inner lists are skipped;
     /// a null outer row stays null. Element type `T` is preserved.
     Flatten,
+    /// First difference over each row's list → `List<Float64>` of the **same length**:
+    /// element `i` is `xᵢ − xᵢ₋₁`, with element 0 null (no predecessor). If either
+    /// neighbor is null the difference is null (Polars `list.diff`). The delta-feature
+    /// building block for audio (MFCC deltas) and time-series (returns / velocity);
+    /// a null/empty row stays null/empty.
+    Diff,
 }
 
 /// Unary math functions. `abs` preserves the input numeric type; the rest yield
@@ -657,6 +789,19 @@ pub enum StrFunc {
     /// Levenshtein edit distance to the literal string `pattern` (DuckDB
     /// `levenshtein` against a constant). → Int64.
     Levenshtein,
+    /// Damerau-Levenshtein (Optimal String Alignment) distance to the literal `pattern`
+    /// (DuckDB `damerau_levenshtein`): like `levenshtein` but an adjacent transposition
+    /// costs 1, so it scores a swapped-letter typo (`teh`↔`the`) as one edit. → Int64.
+    DamerauLevenshtein,
+    /// Jaro similarity to the literal string `pattern` (DuckDB `jaro_similarity`): a
+    /// `[0, 1]` fuzzy-match score based on matching characters and transpositions — the
+    /// standard metric for entity resolution / record linkage on short strings like names.
+    /// → Float64.
+    JaroSimilarity,
+    /// Jaro-Winkler similarity to the literal string `pattern` (DuckDB
+    /// `jaro_winkler_similarity`): Jaro plus a common-prefix bonus, so strings that agree
+    /// at the start (typical of names) score higher. `[0, 1]`. → Float64.
+    JaroWinklerSimilarity,
     /// American Soundex phonetic code, a 4-character key (DuckDB `soundex`). → Utf8.
     Soundex,
     /// HMAC-SHA-256 keyed by `pattern` (the key's raw UTF-8 bytes), lowercase hex.
@@ -743,6 +888,10 @@ pub struct CaseBranch {
 #[serde(rename_all = "snake_case")]
 pub enum Literal {
     Int(i64),
+    /// A float literal. JSON has no NaN/Infinity tokens, so the Python control
+    /// plane encodes a non-finite float as a name string (`"NaN"`/`"inf"`/
+    /// `"-inf"`); a finite float stays a plain JSON number. Accept both.
+    #[serde(deserialize_with = "de_float")]
     Float(f64),
     Bool(bool),
     Str(String),
@@ -770,6 +919,16 @@ pub enum BinaryOp {
     Mul,
     Div,
     Mod,
+    /// Floored division (`a // b`, wire tag `floor_div`) — the quotient rounded
+    /// toward NEGATIVE INFINITY, i.e. Python/Polars `//`, not SQL's truncating
+    /// integer division. `-7 // 3` is `-3` here, where `Div` gives `-2`.
+    ///
+    /// It is a distinct op rather than sugar over `floor(a / b)` because the
+    /// result type depends on the *input* types, which the lazy Python builder
+    /// cannot know at plan-build time: Int64 ÷ Int64 stays Int64 (exact past
+    /// 2^53, where a Float64 round-trip silently loses precision), while Float64
+    /// gives the IEEE `floor(a / b)`.
+    FloorDiv,
     // boolean
     And,
     Or,
@@ -786,6 +945,50 @@ pub enum BinaryOp {
     AddMonths,
 }
 
+/// Deserialize a float literal that may arrive as a JSON number (finite) or as a
+/// name string for a non-finite value (`"NaN"`, `"inf"`/`"+inf"`/`"Infinity"`,
+/// `"-inf"`/`"-Infinity"`). JSON cannot carry NaN/Infinity as numbers, so the
+/// control plane spells them out; every other string is parsed as an f64.
+fn de_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+    use std::fmt;
+
+    struct FloatVisitor;
+
+    impl Visitor<'_> for FloatVisitor {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a float number or a non-finite name string")
+        }
+
+        fn visit_f64<E: Error>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<f64, E> {
+            match v {
+                "NaN" | "nan" => Ok(f64::NAN),
+                "inf" | "+inf" | "Infinity" | "+Infinity" => Ok(f64::INFINITY),
+                "-inf" | "-Infinity" => Ok(f64::NEG_INFINITY),
+                other => other
+                    .parse::<f64>()
+                    .map_err(|_| E::invalid_value(Unexpected::Str(other), &self)),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(FloatVisitor)
+}
+
 impl Literal {
     /// Materialize the literal as an array of length `n`.
     ///
@@ -800,6 +1003,42 @@ impl Literal {
             Literal::Timestamp(v) => Arc::new(TimestampMicrosecondArray::from(vec![*v; n])),
             Literal::Date(v) => Arc::new(Date32Array::from(vec![*v; n])),
         }
+    }
+}
+
+#[cfg(test)]
+mod float_literal_tests {
+    use super::*;
+
+    fn lit_float(json: &str) -> f64 {
+        let e: Expr = serde_json::from_str(json).unwrap();
+        match e {
+            Expr::Lit {
+                value: Literal::Float(v),
+            } => v,
+            other => panic!("expected float literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_literal_accepts_finite_number_and_nonfinite_names() {
+        // Finite floats keep the plain-number wire form.
+        assert_eq!(lit_float(r#"{"e":"lit","value":{"float":1.5}}"#), 1.5);
+        assert_eq!(lit_float(r#"{"e":"lit","value":{"float":-0.0}}"#), 0.0);
+        // Non-finite floats arrive as name strings (JSON has no NaN/Inf tokens).
+        assert!(lit_float(r#"{"e":"lit","value":{"float":"NaN"}}"#).is_nan());
+        assert_eq!(
+            lit_float(r#"{"e":"lit","value":{"float":"inf"}}"#),
+            f64::INFINITY
+        );
+        assert_eq!(
+            lit_float(r#"{"e":"lit","value":{"float":"-inf"}}"#),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            lit_float(r#"{"e":"lit","value":{"float":"Infinity"}}"#),
+            f64::INFINITY
+        );
     }
 }
 

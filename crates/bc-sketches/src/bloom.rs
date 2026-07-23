@@ -115,7 +115,15 @@ impl BloomFilter {
         let num_bits = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
         let num_hashes = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
         let words = &bytes[12..];
-        if num_bits == 0 || num_bits % 64 != 0 || words.len() != (num_bits / 64) as usize * 8 {
+        // `num_hashes == 0` is the dangerous one: it makes `positions` empty, so
+        // `contains_hash`'s `.all()` is vacuously true and the filter matches every
+        // key — a silently unsound join filter rather than a decode error. `new()`
+        // clamps it away, so only a corrupt or foreign blob can carry it here.
+        if num_bits == 0
+            || num_hashes == 0
+            || num_bits % 64 != 0
+            || words.len() != (num_bits / 64) as usize * 8
+        {
             return None;
         }
         let bits = words
@@ -208,5 +216,21 @@ mod tests {
         let mut ok = BloomFilter::with_params(64, 0.01).to_bytes();
         ok.push(0xFF); // trailing junk → wrong word count
         assert!(BloomFilter::from_bytes(&ok).is_none());
+    }
+
+    /// Regression: `from_bytes` validated `num_bits` but not `num_hashes`. A blob
+    /// carrying `num_hashes == 0` deserialized into a filter whose `positions`
+    /// iterator is empty, so `contains_hash`'s `.all()` was vacuously true — a
+    /// join filter that matches *every* key. `new()` clamps to `max(1)`, so this
+    /// shape can only arrive from a corrupt or foreign blob over the shuffle,
+    /// which is exactly the input `from_bytes` exists to police.
+    #[test]
+    fn rejects_zero_num_hashes() {
+        let mut bytes = BloomFilter::with_params(1_000, 0.01).to_bytes();
+        bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(
+            BloomFilter::from_bytes(&bytes).is_none(),
+            "num_hashes == 0 must be rejected, not become a match-everything filter"
+        );
     }
 }

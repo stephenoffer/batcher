@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
-from batcher.api.terminal.metadata_answer._core import _metadata_answerable, _source_stats
+from batcher.api.terminal.metadata_answer._core import (
+    _has_row_limiter,
+    _metadata_answerable,
+    _source_stats,
+)
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
@@ -77,7 +81,15 @@ def is_global_aggregate(plan: LogicalPlan) -> bool:
         node = node.input
     if not isinstance(node, Aggregate) or node.group_keys:
         return False
-    return all(spec.agg.func in _METADATA_DERIVABLE_AGGS for spec in node.aggregates)
+    if not all(spec.agg.func in _METADATA_DERIVABLE_AGGS for spec in node.aggregates):
+        return False
+    # A row-limiter below the aggregate (`LIMIT`, or a `Sort` with a top-N limit) restricts
+    # *which* rows are aggregated, so no whole-relation source statistic — sum, mean, min,
+    # max, ndv — is the answer. Deriving `sum(a)` over `t LIMIT 2` from the source's total
+    # column sum silently returns the whole-column value (the moat's metadata answer
+    # disagreeing with execution). Metadata cannot see the limit's effect, so a keyless
+    # aggregate over a limited subtree must execute.
+    return not _has_row_limiter(node.input)
 
 
 def _unanswerable_over_memory(plan: LogicalPlan, sources: list[Source]) -> bool:
@@ -119,89 +131,40 @@ def _unanswerable_over_memory(plan: LogicalPlan, sources: list[Source]) -> bool:
 
 
 def _enrich_count_distinct_ndv(plan: LogicalPlan, sources: list[Source], stats: list) -> list:
-    """Fill in EXACT per-column ndv for a keyless ``COUNT(DISTINCT col)`` over a single
-    in-memory source, so ``answer_aggregate`` can derive ``count_distinct(col) = col.ndv``.
+    """Fill in the EXACT ndv / mean / sum this keyless aggregate's outputs need, so
+    ``answer_aggregate`` can derive e.g. ``count_distinct(col) = col.ndv``.
 
-    The ndv is computed lazily by the source (one distinct pass per column, cached) — only
-    the column a count-distinct references pays it, so the cheap `MIN`/`MAX`/`COUNT(*)`
+    An in-memory source computes each lazily (one pass per column, cached), so only the
+    column an aggregate actually references pays for it and the cheap `MIN`/`MAX`/`COUNT(*)`
     answers never do. The caller only reaches here for an *unfiltered* aggregate (the gate
-    skips any `Filter`), so the source's distinct count is exactly the query's answer. A
-    computed/renamed input is left alone — its `col` won't resolve on the source, so it
-    simply falls through to execution."""
-    import dataclasses
-
-    from batcher.io.source import InMemorySource
+    skips any `Filter`), so the source's whole-relation statistic is exactly the query's
+    answer. A computed/renamed input is left alone — its `col` won't resolve on the source,
+    so it simply falls through to execution.
+    """
+    from batcher.api.terminal.metadata_answer.enrich import enrich_in_memory
     from batcher.plan.expr_ir import Col
     from batcher.plan.logical import Aggregate, Project
-    from batcher.plan.stats import ColumnStat, Provenance
 
-    if len(sources) != 1 or not isinstance(sources[0], InMemorySource) or not stats or not stats[0]:
-        return stats
-    src, source_stat = sources[0], stats[0]
     node = plan
     while isinstance(node, Project):
         node = node.input
     if not isinstance(node, Aggregate):
         return stats
-    ndv_cols = {
-        spec.agg.input.name
-        for spec in node.aggregates
-        if spec.agg.func == "count_distinct" and isinstance(spec.agg.input, Col)
-    }
-    mean_cols = {
-        spec.agg.input.name
-        for spec in node.aggregates
-        if spec.agg.func == "mean" and isinstance(spec.agg.input, Col)
-    }
-    sum_cols = {
-        spec.agg.input.name
-        for spec in node.aggregates
-        if spec.agg.func == "sum" and isinstance(spec.agg.input, Col)
-    }
-    columns = dict(source_stat.columns)
-    changed = False
-    for name in ndv_cols:
-        existing = columns.get(name)
-        if existing is not None and existing.ndv is not None:
-            continue
-        ndv = src.column_ndv(name)
-        if ndv is None:
-            continue
-        columns[name] = (
-            dataclasses.replace(existing, ndv=ndv, provenance=Provenance.EXACT)
-            if existing is not None
-            else ColumnStat(ndv=ndv, provenance=Provenance.EXACT)
-        )
-        changed = True
-    for name in mean_cols:
-        existing = columns.get(name)
-        if existing is not None and existing.mean is not None:
-            continue
-        mean = src.column_mean(name)
-        if mean is None:
-            continue
-        columns[name] = (
-            dataclasses.replace(existing, mean=mean, provenance=Provenance.EXACT)
-            if existing is not None
-            else ColumnStat(mean=mean, provenance=Provenance.EXACT)
-        )
-        changed = True
-    for name in sum_cols:
-        existing = columns.get(name)
-        if existing is not None and existing.total_sum is not None:
-            continue
-        total = src.column_sum(name)
-        if total is None:
-            continue
-        columns[name] = (
-            dataclasses.replace(existing, total_sum=total, provenance=Provenance.EXACT)
-            if existing is not None
-            else ColumnStat(total_sum=total, provenance=Provenance.EXACT)
-        )
-        changed = True
-    if not changed:
-        return stats
-    return [dataclasses.replace(source_stat, columns=columns), *stats[1:]]
+
+    def inputs_of(func: str) -> set[str]:
+        return {
+            spec.agg.input.name
+            for spec in node.aggregates
+            if spec.agg.func == func and isinstance(spec.agg.input, Col)
+        }
+
+    return enrich_in_memory(
+        sources,
+        stats,
+        ndv=inputs_of("count_distinct"),
+        mean=inputs_of("mean"),
+        total=inputs_of("sum"),
+    )
 
 
 def metadata_aggregate_table(

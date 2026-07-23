@@ -13,8 +13,8 @@
 use std::collections::HashSet;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, GenericStringArray, LargeStringArray, OffsetSizeTrait,
-    RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, AsArray, Float64Array, GenericBinaryArray, GenericStringArray,
+    LargeStringArray, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -89,7 +89,25 @@ pub fn bucket_of_rows(
     if keys.is_empty() {
         return Ok(vec![0u32; rows]);
     }
+    // Canonicalize float keys FIRST, so every path below (raw hash or `RowConverter`) sees the
+    // same bits `assign_groups` groups by. Without this a `-0.0` and a `0.0` — one group to the
+    // assigner — encode differently, land on different reducers, and the query returns two
+    // groups where the single-node oracle returns one (invariant #7). See `crate::keys`.
+    let canon = crate::keys::canonicalize_float_keys(keys);
+    let keys: &[ArrayRef] = canon.as_deref().unwrap_or(keys);
     if let Some(part) = partition_int_key(keys, num_partitions) {
+        return Ok(part);
+    }
+    // Mixed Int64 / string / binary key (null-free): hash each row's raw column values
+    // directly, in parallel, instead of arrow's `RowConverter` — whose `convert_columns`
+    // encodes every row into its byte format in one *serial* pass (the parallel hash after it
+    // can't hide that). That serial encode is the whole cost of a `COUNT(DISTINCT id) GROUP BY
+    // flag` partition (a `(flag, orderkey)` shuffle over 60M rows ran at ~14% CPU / ~1s).
+    // Equal non-null rows hash identically, so they co-partition — all a shuffle/DISTINCT
+    // needs. Null-free only: a null slot's arbitrary raw bytes could split two equal
+    // null-bearing rows across buckets (fine for a join, where null keys never match, but not
+    // for a DISTINCT, where nulls compare equal); a nullable key keeps the `RowConverter`.
+    if let Some(part) = partition_mixed_key(keys, num_partitions) {
         return Ok(part);
     }
     let fields: Vec<SortField> = keys
@@ -416,6 +434,12 @@ pub fn range_partition_by_key_array(
         }
     })?;
 
+    // n_buckets buckets need at most n_buckets-1 split points; a caller that passes more
+    // would let `partition_point` (or the NaN case) return an id >= n_buckets and panic
+    // `scatter_into_buckets` with an out-of-bounds index. Clamp so an over-long boundary
+    // list degrades to fewer non-empty buckets — every row preserved and equal keys still
+    // co-located (the clamp is monotonic), no panic on a data path.
+    let last = (n_buckets - 1) as u32;
     let part_of: Vec<u32> = (0..batch.num_rows())
         .map(|i| {
             if key.is_null(i) {
@@ -428,7 +452,7 @@ pub fn range_partition_by_key_array(
                 } else {
                     boundaries.partition_point(|&b| b <= v)
                 };
-                id as u32
+                (id as u32).min(last)
             }
         })
         .collect();
@@ -492,7 +516,17 @@ pub fn range_partition_by_i64_key(
     if n_buckets == 1 {
         return Ok(vec![batch.clone()]);
     }
-    let part_of = range_part_of_i64(key_col, boundaries, n_buckets, nulls_first, descending)?;
+    let mut part_of = range_part_of_i64(key_col, boundaries, n_buckets, nulls_first, descending)?;
+    // More split points than `n_buckets-1` (boundaries sized for `workers` but fewer buckets
+    // requested) would let `partition_point` return an id == `n_buckets` and index
+    // `scatter_into_buckets` out of bounds — a panic on a data path. Clamp so an over-long
+    // boundary list degrades to fewer non-empty buckets, every row preserved and equal keys
+    // still co-located (the clamp is monotonic) — the same guard the f64
+    // [`range_partition_by_key_array`] applies.
+    let last = (n_buckets - 1) as u32;
+    for b in part_of.iter_mut() {
+        *b = (*b).min(last);
+    }
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
@@ -549,7 +583,16 @@ pub fn range_partition_by_str_key(
         return Ok(vec![batch.clone()]);
     }
     let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
-    let part_of = str_part_of(key_col, boundaries, null_bucket)?;
+    let mut part_of = str_part_of(key_col, boundaries, null_bucket)?;
+    // More split points than `n_buckets-1` would let `partition_point` return an id ==
+    // `n_buckets` and index `scatter_into_buckets` out of bounds — a panic on a data path.
+    // Clamp so an over-long boundary list degrades to fewer non-empty buckets, every row
+    // preserved and equal keys still co-located, mirroring the f64
+    // [`range_partition_by_key_array`] guard.
+    let last = (n_buckets - 1) as u32;
+    for b in part_of.iter_mut() {
+        *b = (*b).min(last);
+    }
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
@@ -644,7 +687,16 @@ pub fn salted_partition_by_keys(
         return partition_by_keys(batch, key_indices, num_partitions);
     }
     let n = batch.num_rows();
+    // Canonicalize float keys FIRST, exactly as `bucket_of_rows` does, so both the row
+    // encoding below and the Utf8 hot-key rendering see the same bits the reducer's join
+    // will group by. `RowConverter` gives `-0.0` and `0.0` distinct bytes (and each NaN
+    // payload its own), so without this a probe `-0.0` and a build `0.0` — equal under
+    // IEEE, and matched by `hash_join_indices`, which *does* canonicalize — land on
+    // different reducers and never meet. That is a silent wrong answer on a distributed
+    // float-key join, and salting engages by default once a hot key is known.
     let key_col = batch.column(key_indices[0]).clone();
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(&key_col));
+    let key_col = canon.map_or(key_col, |mut c| c.remove(0));
     let converter = RowConverter::new(vec![SortField::new(key_col.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(&key_col))?;
     // Hot membership is tested on the string rendering, matching how hot keys were
@@ -713,50 +765,140 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
 /// hash's high-entropy bits. Deterministic, so equal keys (and both join sides)
 /// always agree within a run.
 #[inline]
-/// Per-row bucket ids for a single `Int64` key, hashing native values directly (no
-/// row encoding). `None` unless every key column is `Int64` (narrow ints are normalized
-/// to `Int64` upstream, so this covers the common single- and composite-integer shuffle
-/// shapes). Null slots hash their (arbitrary) raw value; that is harmless — a null key
-/// still lands in *some* bucket consistently, and join matching rejects it separately.
+/// Per-row bucket ids for an all-`Int64` key, hashing native values directly (no row encoding).
+/// `None` unless every key column is `Int64` (narrow ints are normalized to `Int64` upstream, so
+/// this covers the common single- and composite-integer shuffle shapes).
+///
+/// Nulls are handled in-path, not bailed on. Arrow leaves the value under a null slot undefined
+/// (parquet's `pad_nulls` leaves whatever was in the buffer), so a null row must NOT be hashed by
+/// its raw value: it would scatter otherwise-identical NULL keys across every bucket (wrong for an
+/// aggregate/DISTINCT shuffle, where SQL says all NULLs are one group). Instead every null row
+/// hashes to the fixed `keys::NULL_HASH` bucket. Crucially, this keeps a *nullable* key on the raw
+/// path rather than falling back to the `RowConverter`: if it fell back while a null-free key of
+/// the same type hashed raw, the two hashes would disagree on equal *non-null* keys and split them
+/// across buckets — silently dropping inner-join matches (both join sides must take one path).
 fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
     use arrow::array::Int64Array;
     if keys.is_empty() || !keys.iter().all(|k| k.data_type() == &DataType::Int64) {
         return None;
     }
-    // Single Int64 key — hash the raw value directly (null slots hash their arbitrary raw
-    // value, harmless for a shuffle join since null keys never match).
+    // Nulls are handled here, NOT bailed on: a null row hashes to the fixed `keys::NULL_HASH`
+    // bucket (co-locating every null, so a DISTINCT/aggregate sees one NULL group), and a
+    // non-null row hashes its raw value. This is what keeps BOTH sides of a join on the raw
+    // path: if a nullable key fell back to the `RowConverter` while the other (null-free) side
+    // took this raw hash, the two hashes would disagree on equal *non-null* keys, splitting them
+    // across buckets and silently dropping inner-join matches. Same-typed keys therefore always
+    // take one identical path regardless of null presence.
+    let null_bucket = bucket_of(crate::keys::NULL_HASH, num_partitions);
+    // Single Int64 key — hash the raw value directly.
     if keys.len() == 1 {
-        let vals = keys[0].as_any().downcast_ref::<Int64Array>()?.values();
-        let hash1 = |v: &i64| bucket_of(SEED.hash_one(*v), num_partitions);
-        return Some(if vals.len() >= PAR_HASH_MIN_ROWS {
-            vals.par_iter().map(hash1).collect()
+        let arr = keys[0].as_any().downcast_ref::<Int64Array>()?;
+        let vals = arr.values();
+        let hash1 = |i: usize| -> u32 {
+            if arr.is_null(i) {
+                null_bucket
+            } else {
+                bucket_of(SEED.hash_one(vals[i]), num_partitions)
+            }
+        };
+        let n = vals.len();
+        return Some(if n >= PAR_HASH_MIN_ROWS {
+            (0..n).into_par_iter().map(hash1).collect()
         } else {
-            vals.iter().map(hash1).collect()
+            (0..n).map(hash1).collect()
         });
     }
     // Composite Int64 key (e.g. a `(part, supplier)` join / group shuffle). Fold each
     // column's raw value into one hasher per row — skips the `RowConverter` encode the
-    // general path runs. Like the single-key path, a null slot hashes its arbitrary raw
-    // value: BOTH shuffle sides are the same key type and so take this same path, so equal
-    // non-null keys still co-partition (the only invariant a join needs — null keys never
-    // match). This path is therefore used for join/group shuffles, not a null-sensitive
-    // DISTINCT (which dedups via the row-encoded `assign_groups`, where nulls compare equal).
-    let cols: Vec<&[i64]> = keys
+    // general path runs. A row with a null in ANY key column routes to the null bucket (equal
+    // null-bearing rows still co-locate; they are compared within the bucket by the assigner),
+    // so co-partitioning holds for null-free and nullable keys alike.
+    let cols: Vec<&Int64Array> = keys
         .iter()
-        .map(|k| {
-            k.as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .as_ref()
-        })
+        .map(|k| k.as_any().downcast_ref::<Int64Array>().unwrap())
         .collect();
     let n = cols[0].len();
     let hashn = |i: usize| -> u32 {
         use std::hash::{BuildHasher, Hasher};
+        if cols.iter().any(|c| c.is_null(i)) {
+            return null_bucket;
+        }
         let mut h = SEED.build_hasher();
         for c in &cols {
-            h.write_i64(c[i]);
+            h.write_i64(c.values()[i]);
+        }
+        bucket_of(h.finish(), num_partitions)
+    };
+    Some(if n >= PAR_HASH_MIN_ROWS {
+        (0..n).into_par_iter().map(hashn).collect()
+    } else {
+        (0..n).map(hashn).collect()
+    })
+}
+
+/// One key column, downcast once, exposing a per-row raw value to the hasher.
+enum MixedCol<'a> {
+    Int(&'a [i64]),
+    Str32(&'a GenericStringArray<i32>),
+    Str64(&'a GenericStringArray<i64>),
+    Bin32(&'a GenericBinaryArray<i32>),
+    Bin64(&'a GenericBinaryArray<i64>),
+}
+
+impl MixedCol<'_> {
+    #[inline]
+    fn write<H: std::hash::Hasher>(&self, h: &mut H, i: usize) {
+        match self {
+            MixedCol::Int(v) => h.write_i64(v[i]),
+            MixedCol::Str32(a) => h.write(a.value(i).as_bytes()),
+            MixedCol::Str64(a) => h.write(a.value(i).as_bytes()),
+            MixedCol::Bin32(a) => h.write(a.value(i)),
+            MixedCol::Bin64(a) => h.write(a.value(i)),
+        }
+    }
+}
+
+/// Partition a null-free composite key of `Int64` / string / binary columns by hashing each
+/// row's raw values directly — the parallel alternative to the `RowConverter` path, whose
+/// per-row byte encode runs serially. Returns `None` (caller keeps `RowConverter`) for an
+/// empty key, any nullable column, or any unsupported type.
+///
+/// Equal non-null rows fold the same bytes into the hasher in the same order, so they land in
+/// the same bucket — the co-partitioning invariant a shuffle/DISTINCT needs. Gated null-free
+/// because a null slot's arbitrary raw value could split two equal null-bearing rows across
+/// buckets, which a DISTINCT (nulls compare equal) must not do.
+fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
+    if keys.len() < 2 {
+        return None;
+    }
+    let cols: Vec<MixedCol> = keys
+        .iter()
+        .map(|k| match k.data_type() {
+            DataType::Int64 => Some(MixedCol::Int(
+                k.as_primitive::<arrow::datatypes::Int64Type>().values(),
+            )),
+            DataType::Utf8 => Some(MixedCol::Str32(k.as_string::<i32>())),
+            DataType::LargeUtf8 => Some(MixedCol::Str64(k.as_string::<i64>())),
+            DataType::Binary => Some(MixedCol::Bin32(k.as_binary::<i32>())),
+            DataType::LargeBinary => Some(MixedCol::Bin64(k.as_binary::<i64>())),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let n = keys[0].len();
+    // Nulls route to the fixed null bucket (co-locating equal null-bearing rows) and non-null
+    // rows hash raw — the same null-awareness `partition_int_key` has, so a nullable key never
+    // falls back to the `RowConverter` while a null-free key of the same shape hashes raw, which
+    // would split equal non-null keys across buckets and drop inner-join matches.
+    let null_bucket = bucket_of(crate::keys::NULL_HASH, num_partitions);
+    let any_null = keys.iter().any(|k| k.null_count() != 0);
+    let hashn = |i: usize| -> u32 {
+        use std::hash::{BuildHasher, Hasher};
+        if any_null && keys.iter().any(|k| k.is_null(i)) {
+            return null_bucket;
+        }
+        let mut h = SEED.build_hasher();
+        for c in &cols {
+            c.write(&mut h, i);
         }
         bucket_of(h.finish(), num_partitions)
     };
@@ -938,6 +1080,27 @@ mod tests {
     }
 
     #[test]
+    fn range_more_boundaries_than_buckets_does_not_panic() {
+        // A caller that passes more split points than n_buckets-1 (e.g. boundaries sized
+        // for `workers` but only `n_buckets` requested) would make `partition_point`
+        // return an id >= n_buckets and index scatter_into_buckets out of bounds. The
+        // clamp must degrade gracefully: no panic, and every row preserved.
+        let keys: Vec<Option<i64>> = vec![Some(1), Some(3), Some(5), Some(7), Some(9)];
+        let batch = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Int64Array::from(keys.clone())) as ArrayRef,
+        )])
+        .unwrap();
+        // 3 buckets but 6 boundaries — the exact p5 repro shape.
+        let parts =
+            range_partition_by_key(&batch, 0, &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0], 3, true, false)
+                .expect("must not error");
+        assert_eq!(parts.len(), 3);
+        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
+        assert_eq!(total, keys.len(), "no row may be lost or duplicated");
+    }
+
+    #[test]
     fn range_nulls_route_to_the_correct_end() {
         // Ascending: front bucket is 0. nulls_first → nulls in bucket 0; else top bucket.
         assert_eq!(
@@ -1111,6 +1274,69 @@ mod tests {
     }
 
     #[test]
+    fn salted_partition_canonicalizes_float_keys() {
+        // Regression: `salted_partition_by_keys` hashed the `RowConverter` encoding of the
+        // raw key column, skipping the `-0.0`/NaN folding every other key path applies
+        // (`bucket_of_rows`, the hash/sort-merge/asof joins, the runtime bloom). Arrow's row
+        // format gives `-0.0` and `0.0` distinct bytes, so a probe `-0.0` and a build `0.0` —
+        // equal under IEEE, and joined by the reducer, which *does* canonicalize — were
+        // routed to different reducers and never met. Two distinct NaN payloads split the
+        // same way. Salting is on by default once a hot key is known, so this was a silent
+        // wrong answer on a distributed float-key join, not an opt-in path.
+        let neg_zero = -0.0f64;
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0xfff8_0000_0000_0002);
+
+        // `7.0` is the hot key that engages salting; the ±0.0 and NaN rows ride along cold.
+        let mut probe_keys = vec![7.0f64; 12];
+        probe_keys.extend([neg_zero, nan_a]);
+        let probe = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Float64Array::from(probe_keys)) as ArrayRef,
+        )])
+        .unwrap();
+        let build = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Float64Array::from(vec![7.0, 0.0, nan_b])) as ArrayRef,
+        )])
+        .unwrap();
+
+        let n = 8usize;
+        let hot: HashSet<String> = ["7.0".to_string()].into_iter().collect();
+        let probe_parts = salted_partition_by_keys(&probe, &[0], n, &hot, 4, false).unwrap();
+        let build_parts = salted_partition_by_keys(&build, &[0], n, &hot, 4, true).unwrap();
+
+        // Count join pairs under the engine's key identity: `-0.0 == 0.0`, and NaN is equal
+        // to itself regardless of payload (what `canonicalize_float_keys` encodes).
+        fn pairs(probe: &RecordBatch, build: &RecordBatch) -> usize {
+            let f = |b: &RecordBatch| {
+                let a = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+            };
+            let (p, b) = (f(probe), f(build));
+            p.iter()
+                .map(|x| {
+                    b.iter()
+                        .filter(|y| x == *y || (x.is_nan() && y.is_nan()))
+                        .count()
+                })
+                .sum()
+        }
+
+        let global = pairs(&probe, &build);
+        let salted: usize = probe_parts
+            .iter()
+            .zip(&build_parts)
+            .map(|(p, b)| pairs(p, b))
+            .sum();
+        assert_eq!(
+            salted, global,
+            "salted float-key join must equal the unsalted join \
+             (-0.0/0.0 and distinct NaN payloads must co-partition)"
+        );
+    }
+
+    #[test]
     fn single_partition_returns_whole_batch() {
         let batch = RecordBatch::try_from_iter(vec![(
             "k",
@@ -1120,5 +1346,118 @@ mod tests {
         let parts = partition_by_keys(&batch, &[0], 1).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].num_rows(), 3);
+    }
+
+    /// The mixed (string, int) fast partition co-locates equal rows and places every row
+    /// exactly once — the invariant DISTINCT / shuffle rest on. It must agree with the
+    /// `RowConverter` path on *which rows share a bucket* (bucket ids themselves may differ;
+    /// only co-location matters).
+    #[test]
+    fn mixed_key_copartitions_equal_rows() {
+        use arrow::array::StringArray;
+        let flag = Arc::new(StringArray::from(vec!["A", "N", "A", "N", "A", "R"])) as ArrayRef;
+        let key = Arc::new(Int64Array::from(vec![10, 20, 10, 20, 11, 20])) as ArrayRef;
+        let keys = vec![flag, key];
+        // Fast path must fire (null-free, 2 cols of int+str).
+        let fast = partition_mixed_key(&keys, 8).expect("mixed fast path should apply");
+        assert_eq!(fast.len(), 6);
+        // Rows 0 and 2 are ("A",10) — identical → same bucket. Rows 1,3,5 are ("N"/"R",20):
+        // 1 and 3 are ("N",20) identical; 5 is ("R",20) distinct.
+        assert_eq!(fast[0], fast[2], "equal (A,10) rows must co-partition");
+        assert_eq!(fast[1], fast[3], "equal (N,20) rows must co-partition");
+        // Different rows may or may not collide in 8 buckets, but a full DISTINCT over the
+        // partitioned buckets must recover exactly the 4 distinct rows. Verify via the public
+        // `partition_by_keys` + per-bucket dedup that the distinct count is right.
+        let batch =
+            RecordBatch::try_from_iter(vec![("f", keys[0].clone()), ("k", keys[1].clone())])
+                .unwrap();
+        let buckets = partition_by_keys(&batch, &[0, 1], 8).unwrap();
+        let total: usize = buckets.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 6, "every row placed exactly once");
+    }
+
+    /// A nullable mixed key stays on the raw fast path (it no longer declines): null rows route
+    /// to the fixed null bucket and equal non-null rows co-partition. Declining here was the
+    /// bug — a nullable key fell back to the `RowConverter` while a null-free key of the same
+    /// type hashed raw, so equal non-null keys split across buckets and inner-join matches were
+    /// silently dropped. The raw path must fire and co-locate both the null rows and the equal
+    /// non-null rows.
+    #[test]
+    fn mixed_key_with_nulls_uses_null_aware_fast_path() {
+        use arrow::array::StringArray;
+        let flag = Arc::new(StringArray::from(vec![Some("A"), None, Some("A"), None])) as ArrayRef;
+        let key = Arc::new(Int64Array::from(vec![Some(1), None, Some(1), None])) as ArrayRef;
+        let part = partition_mixed_key(&[flag, key], 8).expect("null-aware fast path applies");
+        assert_eq!(part.len(), 4);
+        // Rows 0 and 2 are ("A",1) → same bucket. Rows 1 and 3 are (null,null) → the null bucket.
+        assert_eq!(part[0], part[2], "equal (A,1) rows co-partition");
+        assert_eq!(
+            part[1], part[3],
+            "null-bearing rows co-locate in the null bucket"
+        );
+        assert_eq!(
+            part[1],
+            bucket_of(crate::keys::NULL_HASH, 8),
+            "null rows route to the fixed null bucket"
+        );
+    }
+
+    /// Regression for the dropped-match bug: a null-BEARING key column and a null-FREE key column
+    /// of the same type must send equal non-null values to the SAME bucket. Before the fix the
+    /// null-bearing side fell back to the `RowConverter` while the null-free side hashed raw, so
+    /// equal keys split across buckets and an inner join silently lost rows.
+    #[test]
+    fn nullable_and_nullfree_int_keys_copartition() {
+        let with_null = Arc::new(Int64Array::from(vec![Some(7), None, Some(42)])) as ArrayRef;
+        let no_null = Arc::new(Int64Array::from(vec![7, 42, 99])) as ArrayRef;
+        let p_null = bucket_of_rows(&[with_null], 3, 16).unwrap();
+        let p_free = bucket_of_rows(&[no_null], 3, 16).unwrap();
+        // key 7: row 0 on the nullable side, row 0 on the null-free side.
+        assert_eq!(
+            p_null[0], p_free[0],
+            "key 7 must co-partition across both sides"
+        );
+        // key 42: row 2 on the nullable side, row 1 on the null-free side.
+        assert_eq!(
+            p_null[2], p_free[1],
+            "key 42 must co-partition across both sides"
+        );
+    }
+
+    /// Regression: the **i64** range partitioner must degrade gracefully — not panic — when
+    /// handed more split points than `n_buckets-1` (boundaries sized for `workers` but only
+    /// `n_buckets` requested), exactly like the f64 sibling. Before the clamp,
+    /// `range_part_of_i64` returned an id == `n_buckets` and indexed `scatter_into_buckets`
+    /// out of bounds. Every row must still be preserved (no loss, no dup).
+    #[test]
+    fn range_i64_more_boundaries_than_buckets_does_not_panic() {
+        let keys: Vec<i64> = vec![1, 3, 5, 7, 9];
+        let col = Arc::new(Int64Array::from(keys.clone())) as ArrayRef;
+        let batch = RecordBatch::try_from_iter(vec![("k", col.clone())]).unwrap();
+        // 3 buckets but 6 boundaries — the over-long-boundaries repro shape.
+        let parts = range_partition_by_i64_key(&batch, &col, &[2, 3, 4, 5, 6, 7], 3, true, false)
+            .expect("must not error");
+        assert_eq!(parts.len(), 3);
+        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
+        assert_eq!(total, keys.len(), "no row may be lost or duplicated");
+    }
+
+    /// Regression: the **string** range partitioner had the same missing clamp as the i64
+    /// one — more boundaries than `n_buckets-1` panicked `scatter_into_buckets`. Degrade to
+    /// fewer non-empty buckets instead, preserving every row.
+    #[test]
+    fn range_str_more_boundaries_than_buckets_does_not_panic() {
+        use arrow::array::StringArray;
+        let col = Arc::new(StringArray::from(vec!["a", "c", "e", "g", "i"])) as ArrayRef;
+        let batch = RecordBatch::try_from_iter(vec![("k", col.clone())]).unwrap();
+        let b: Vec<String> = ["b", "c", "d", "e", "f", "g"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parts =
+            range_partition_by_str_key(&batch, &col, &b, 3, true, false).expect("must not error");
+        assert_eq!(parts.len(), 3);
+        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
+        assert_eq!(total, 5, "no row may be lost or duplicated");
     }
 }

@@ -11,6 +11,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset.frame import Dataset
 from batcher.kyber.rules.extra import agg_extra as _agg_extra  # noqa: F401  (registers the rules)
@@ -34,8 +35,6 @@ def _reg(duck, table=_DATA, name="t"):
 
 
 def test_dedupe_group_keys(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = bt.from_arrow(_DATA).group_by(a=col("g"), b=col("g")).agg(s=col("x").sum()).collect()
     expected = duck.sql("SELECT g AS a, g AS b, sum(x) AS s FROM t GROUP BY g")
@@ -46,8 +45,6 @@ def test_dedupe_group_keys(duck):
 
 
 def test_drop_constant_group_key(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = bt.from_arrow(_DATA).group_by("g", c=bt.lit(5)).agg(s=col("x").sum()).collect()
     expected = duck.sql("SELECT g, 5 AS c, sum(x) AS s FROM t GROUP BY g")
@@ -58,8 +55,6 @@ def test_drop_constant_group_key(duck):
 
 
 def test_min_max_of_group_key_with_null_group(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = (
         bt.from_arrow(_DATA)
@@ -75,8 +70,6 @@ def test_min_max_of_group_key_with_null_group(duck):
 
 
 def test_count_distinct_of_group_key_null_group(duck):
-    from conftest import assert_same
-
     _reg(duck)
     # The NULL group must yield COUNT(DISTINCT g) = 0.
     out = bt.from_arrow(_DATA).group_by("g").agg(n=col("g").n_unique()).collect()
@@ -88,8 +81,6 @@ def test_count_distinct_of_group_key_null_group(duck):
 
 
 def test_count_of_group_key_null_group(duck):
-    from conftest import assert_same
-
     _reg(duck)
     # NULL group -> COUNT(g) = 0; others -> the group's row count.
     out = bt.from_arrow(_DATA).group_by("g").agg(c=col("g").count(), n=bt.count()).collect()
@@ -101,8 +92,6 @@ def test_count_of_group_key_null_group(duck):
 
 
 def test_count_constant_grouped(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = bt.from_arrow(_DATA).group_by("g").agg(c=bt.lit(1).count()).collect()
     expected = duck.sql("SELECT g, count(1) AS c FROM t GROUP BY g")
@@ -110,8 +99,6 @@ def test_count_constant_grouped(duck):
 
 
 def test_count_constant_global_empty(duck):
-    from conftest import assert_same
-
     _reg(duck, _EMPTY)
     # Global COUNT over 0 rows is 0 (the 1-row global-aggregate case).
     out = bt.from_arrow(_EMPTY).group_by().agg(c=bt.lit(1).count()).collect()
@@ -123,8 +110,6 @@ def test_count_constant_global_empty(duck):
 
 
 def test_sum_constant_grouped(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = bt.from_arrow(_DATA).group_by("g").agg(s=bt.lit(2).sum()).collect()
     expected = duck.sql("SELECT g, sum(2) AS s FROM t GROUP BY g")
@@ -135,8 +120,6 @@ def test_sum_constant_grouped(duck):
 
 
 def test_fold_constant_grouped(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = (
         bt.from_arrow(_DATA)
@@ -154,8 +137,6 @@ def test_fold_constant_grouped(duck):
 
 
 def test_drop_distinct_before_agg(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = (
         bt.from_arrow(_DATA)
@@ -175,8 +156,6 @@ def test_drop_distinct_before_agg(duck):
 
 
 def test_group_only_aggregate_is_distinct(duck):
-    from conftest import assert_same
-
     _reg(duck)
     base = bt.from_arrow(_DATA)
     agg = Aggregate(base._plan, (Projection("g", col("g")), Projection("x", col("x"))), ())
@@ -189,8 +168,6 @@ def test_group_only_aggregate_is_distinct(duck):
 
 
 def test_deduplicate_aggregate_exprs(duck):
-    from conftest import assert_same
-
     _reg(duck)
     out = (
         bt.from_arrow(_DATA)

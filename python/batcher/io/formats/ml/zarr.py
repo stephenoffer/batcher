@@ -20,29 +20,18 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
+from batcher.io.formats.ml._ndarray import schema_from_array_meta, slice_to_batch
 from batcher.io.splits import Split
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["ZarrChunkSplit", "ZarrSource"]
 
 
 def _require_zarr() -> Any:
     """Import and return the `zarr` module or raise `BackendError`."""
-    try:
-        import zarr
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("Zarr requires zarr: pip install 'batcher-engine[zarr]'") from exc
-    return zarr
-
-
-def _slice_to_batch(array: Any, projection: list[str] | None) -> pa.RecordBatch:
-    """Turn an in-memory numpy slice into an Arrow record batch."""
-    if array.ndim == 1:
-        data = {"value": array}
-    else:
-        data = {f"c{i}": array[:, i] for i in range(array.shape[1])}
-    batch = pa.RecordBatch.from_pydict({k: pa.array(v) for k, v in data.items()})
-    return batch.select(projection) if projection is not None else batch
+    return require("zarr", feature="Zarr", provides="zarr", extra="zarr")
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +47,10 @@ class ZarrChunkSplit:
         return zarr.open(self.path, mode="r")[self.start : self.stop]
 
     def schema(self) -> pa.Schema:
-        return _slice_to_batch(self._array(), None).schema
+        return slice_to_batch(self._array(), None).schema
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return [_slice_to_batch(self._array(), projection)]
+        return [slice_to_batch(self._array(), projection)]
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         yield from self.read(projection)
@@ -94,7 +83,7 @@ class ZarrSource:
             raise BackendError(f"failed to open Zarr array {self._path!r}: {exc}") from exc
 
     def schema(self) -> pa.Schema:
-        return _slice_to_batch(self._array()[0:1], None).schema
+        return schema_from_array_meta(self._array())
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         batches: list[pa.RecordBatch] = []
@@ -108,6 +97,24 @@ class ZarrSource:
 
     def row_count(self) -> int | None:
         return int(self._array().shape[0])
+
+    def statistics(self) -> SourceStatistics | None:
+        """Exact row count and chunk count from the array's stored metadata — no data read.
+
+        A Zarr array records its shape and chunk grid in ``.zarray`` metadata, so both
+        the leading-axis row count (exact) and the number of leading-axis chunks (the
+        granularity `splits` prunes and reads at) are free. No per-column bounds are
+        advertised — Zarr v2 metadata carries no min/max, and an exact-looking guessed
+        bound is worse than none.
+        """
+        try:
+            array = self._array()
+            n = int(array.shape[0])
+            chunk = int(array.chunks[0]) or n or 1
+        except Exception:
+            return None
+        groups = -(-n // chunk) if n else 0  # ceil, matching `splits` block count
+        return SourceStatistics(row_count=n, exact_rows=True, row_group_count=groups)
 
     def identity(self) -> str:
         return f"zarr:{self._path}"

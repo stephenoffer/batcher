@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, core, count
 from batcher.api.adaptive import execute_adaptive
 
@@ -39,8 +40,6 @@ def _rows(t):
 
 
 def test_adaptive_matches_normal_and_duckdb(duck, tables):
-    from conftest import assert_same
-
     fact, dim = tables
     q = _multistage(fact, dim)
     assert _rows(q.collect(adaptive=True)) == _rows(q.collect())
@@ -65,8 +64,6 @@ def test_adaptive_uses_exact_cardinalities(tables):
 
 
 def test_adaptive_join_over_two_aggregates(duck):
-    from conftest import assert_same
-
     rng = np.random.default_rng(1)
     a = pa.table(
         {

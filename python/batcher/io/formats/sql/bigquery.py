@@ -22,6 +22,7 @@ explicit client; nothing credential-bearing is logged.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -47,6 +48,19 @@ def _read_client() -> Any:
     return storage.BigQueryReadClient()
 
 
+def _close_client(client: Any) -> None:
+    """Release a read client's gRPC channel, if this client version exposes a close.
+
+    Each `_read_client` opens a gRPC channel with its own connection and background threads.
+    A split that opens one per read and never closes it leaks a channel per split, which on a
+    worker fanned out across many streams is a steadily growing thread and socket count rather
+    than a single visible failure. `close` is guarded because it is not part of the hand-written
+    `BigQueryReadClient` surface we can verify here — an absent close leaves the prior behavior."""
+    close = getattr(client, "close", None)
+    if close is not None:
+        close()
+
+
 @dataclass(frozen=True, slots=True)
 class _BigQueryStreamSplit:
     """One Storage Read API stream, fetched as Arrow on a worker.
@@ -60,10 +74,28 @@ class _BigQueryStreamSplit:
 
     def _table(self) -> pa.Table:
         client = _read_client()
-        reader = client.read_rows(self.stream_name)
-        return reader.to_arrow()
+        try:
+            reader = client.read_rows(self.stream_name)
+            return reader.to_arrow()
+        finally:
+            _close_client(client)
 
     def schema(self) -> pa.Schema:
+        """This stream's column types, from its first page rather than the whole stream.
+
+        This was ``self._table().schema``, which reads the stream to exhaustion through the
+        Storage Read API — a real, billed transfer of a result that is then discarded — to
+        learn column names the first page already carries. `BigQuerySource.schema` normally
+        takes the session's own ``arrow_schema`` instead, so this is the fallback for a client
+        version that omits it; a fallback that downloads a whole stream is the case that hurts.
+
+        `closing` matters here: this abandons the generator after its first page, and without
+        it the ``finally`` that releases the gRPC channel would only run at collection.
+        """
+        with closing(self.iter_batches()) as batches:
+            for batch in batches:
+                return batch.schema
+        # An empty stream yields no page to read a schema off; only then pay for the read.
         return self._table().schema
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
@@ -73,10 +105,14 @@ class _BigQueryStreamSplit:
         return table.to_batches()
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        """Stream this read stream page by page, releasing the client when the caller stops."""
         client = _read_client()
-        for page in client.read_rows(self.stream_name).rows().pages:
-            batch = page.to_arrow()
-            yield batch.select(projection) if projection is not None else batch
+        try:
+            for page in client.read_rows(self.stream_name).rows().pages:
+                batch = page.to_arrow()
+                yield batch.select(projection) if projection is not None else batch
+        finally:
+            _close_client(client)
 
     def row_count(self) -> int | None:
         return None
@@ -164,8 +200,17 @@ class BigQuerySource:
             return f"({self.row_restriction}) AND ({pushed})"
         return pushed or self.row_restriction
 
-    def _create_session(self, predicate: dict | None = None) -> tuple[Any, list[str]]:
-        """ONE create_read_session call → (session, stream names)."""
+    def _create_session(
+        self, predicate: dict | None = None, projection: list[str] | None = None
+    ) -> tuple[Any, list[str]]:
+        """ONE create_read_session call → (session, stream names).
+
+        `predicate` and `projection` are applied **here**, when the session is created, because
+        that is the only place BigQuery accepts them: a read session fixes its `row_restriction`
+        and `selected_fields` up front, and every stream it vends is already filtered and
+        projected. A predicate that arrives later, at `Split.read`, cannot be pushed at all —
+        the bytes are already on the wire. That is why `splits()` takes them.
+        """
         storage = require_module(_STORAGE_MODULE, extra=_EXTRA)
         types = require_module(f"{_STORAGE_MODULE}.types", extra=_EXTRA)
         client = storage.BigQueryReadClient()
@@ -174,8 +219,11 @@ class BigQuerySource:
             *self._table_ref(predicate).split(".")
         )
         read_options = types.ReadSession.TableReadOptions()
-        if self.selected_fields:
-            read_options.selected_fields.extend(self.selected_fields)
+        # The constructor's `selected_fields` is the user's own column pin; Kyber's pushed
+        # projection narrows it further. Either alone is a valid selection.
+        fields = self.selected_fields or projection
+        if fields:
+            read_options.selected_fields.extend(fields)
         row_restriction = self._row_restriction(predicate)
         if row_restriction:
             read_options.row_restriction = row_restriction
@@ -184,21 +232,50 @@ class BigQuerySource:
             data_format=types.DataFormat.ARROW,
             read_options=read_options,
         )
-        session = client.create_read_session(
-            parent=f"projects/{self.project}",
-            read_session=session,
-            max_stream_count=self.max_streams,
-        )
+        try:
+            session = client.create_read_session(
+                parent=f"projects/{self.project}",
+                read_session=session,
+                max_stream_count=self.max_streams,
+            )
+        finally:
+            # The session outlives the client that created it — it is a server-side object
+            # addressed by the stream names we return — so the channel can be released here
+            # rather than held open for the lifetime of the source.
+            _close_client(client)
         return session, [s.name for s in session.streams]
 
     def schema(self) -> pa.Schema:
-        return self.splits()[0].schema()
+        """The relation's columns, taken from the read session itself.
+
+        `create_read_session` returns the Arrow schema of the relation in its response —
+        before a single stream is read. This used to ignore that and instead take
+        `splits()[0].schema()`, which opens stream 0 and *downloads it in full* through the
+        Storage Read API to look at its column names. On a partitioned table that is a
+        real, billed transfer of a result the caller then discards, on top of the session
+        the read itself will create.
+
+        It also indexed `splits()[0]` unguarded: BigQuery vends **zero** streams for an
+        empty table, so reading the schema of a table with no rows raised `IndexError`.
+        That is a legitimate table, and an empty relation still has columns.
+
+        Falls back to the stream read only if a client version omits `arrow_schema`.
+        """
+        session, streams = self._create_session()
+        serialized = getattr(getattr(session, "arrow_schema", None), "serialized_schema", None)
+        if serialized:
+            return pa.ipc.read_schema(pa.py_buffer(serialized))
+        if not streams:
+            raise BackendError(
+                f"BigQuery returned no read streams and no schema for {self._table_ref(None)!r}"
+            )
+        return _BigQueryStreamSplit(streams[0], 0).schema()
 
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
         out: list[pa.RecordBatch] = []
-        _session, streams = self._create_session(predicate)
+        _session, streams = self._create_session(predicate, projection)
         for i, name in enumerate(streams):
             out.extend(_BigQueryStreamSplit(name, i).read(projection))
         return out
@@ -206,7 +283,7 @@ class BigQuerySource:
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        _session, streams = self._create_session(predicate)
+        _session, streams = self._create_session(predicate, projection)
         for i, name in enumerate(streams):
             yield from _BigQueryStreamSplit(name, i).iter_batches(projection)
 
@@ -216,6 +293,19 @@ class BigQuerySource:
     def identity(self) -> str:
         return f"bigquery:{self.project}:{self.query or self.table}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        _session, streams = self._create_session()
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature; BQ splits by stream)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
+        """One split per Storage Read API stream, filtered and projected server-side.
+
+        The pushdown is baked into the read session, so each stream already carries only the
+        rows and columns the query wants — the worker never sees the rest. Without it, `splits()`
+        created an *unfiltered* session and every worker streamed the whole table across the
+        network for the engine's `Filter` to discard. On a TB table that is the difference
+        between a scan and a bill.
+        """
+        _session, streams = self._create_session(predicate, projection)
         return [_BigQueryStreamSplit(name, i) for i, name in enumerate(streams)]

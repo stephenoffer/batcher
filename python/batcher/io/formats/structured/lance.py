@@ -21,6 +21,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.manifest import WrittenFile
 from batcher.io.splits import Split
@@ -36,11 +37,7 @@ __all__ = [
 
 def _require_lance() -> Any:
     """Import and return the `lance` module or raise `BackendError`."""
-    try:
-        import lance
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("Lance requires pylance: pip install 'batcher-engine[lance]'") from exc
-    return lance
+    return require("lance", feature="Lance", provides="pylance", extra="lance")
 
 
 def lance_vector_search(

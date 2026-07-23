@@ -223,6 +223,28 @@ pub struct DiskSpillStore {
     bytes_per_partition: Vec<u64>,
 }
 
+/// Restrict a spill directory to its owner (`0o700` on Unix); best-effort elsewhere.
+///
+/// Spilled data is the query's *actual rows* — the same bytes the caller may have taken
+/// care to encrypt in flight — written to a shared scratch path such as `/tmp`. Created
+/// with the default mode it is world-readable, so any other local user on the node can
+/// read a spilled join or aggregate. Restricting the directory is the single choke point:
+/// without search permission on it, the `part-*.arrow` files inside are unreachable
+/// regardless of their own mode.
+///
+/// Best-effort by design — a filesystem that cannot represent Unix modes (or a Windows
+/// host) must not fail the query over a hardening step, and the spill path is otherwise
+/// platform-neutral.
+fn restrict_to_owner(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 impl DiskSpillStore {
     /// Create `partitions` empty, **uncompressed** spill files under a private
     /// subdirectory of `root` — the historical path, byte-for-byte unchanged.
@@ -247,6 +269,7 @@ impl DiskSpillStore {
         let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = root.join(format!("bc-spill-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
+        restrict_to_owner(&dir);
         let n = partitions.max(1);
         let paths = (0..n)
             .map(|i| dir.join(format!("part-{i}.arrow")))
@@ -569,12 +592,22 @@ fn route_salted(
         return Ok(vec![(0, packed.clone())]);
     }
     let group_cols = &packed.columns()[..n_keys];
-    let fields: Vec<SortField> = group_cols
+    // Canonicalize float keys BEFORE hashing so `-0.0`/`0.0` (and every NaN bit pattern) route
+    // to the SAME partition — arrow's row encoding is not canonical for floats, so without this
+    // two partials that stored the same SQL group as `-0.0` vs `0.0` (each `partial` keeps its
+    // first-seen value, which can differ per morsel) would land in different partitions and be
+    // finalized as two groups, disagreeing with the in-memory `combine` (which canonicalizes
+    // when it re-groups). Routing decides only *co-location*; the output group value is still
+    // `take`n from the original column below, so the representative the query returns is
+    // unchanged. Identity (no realloc) when no key is Float64.
+    let canon = crate::keys::canonicalize_float_keys(group_cols);
+    let encode_cols: &[ArrayRef] = canon.as_deref().unwrap_or(group_cols);
+    let fields: Vec<SortField> = encode_cols
         .iter()
         .map(|a| SortField::new(a.data_type().clone()))
         .collect();
     let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(group_cols)?;
+    let rows = converter.convert_columns(encode_cols)?;
 
     // Fixed seeds so the same key routes identically across every chunk.
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
@@ -916,6 +949,40 @@ mod tests {
     }
 
     #[test]
+    fn float_key_signed_zero_merges_across_spill_partitions() {
+        use arrow::array::Float64Array;
+        // Two partials for the SAME SQL group, but one stored its float key as `-0.0` and the
+        // other as `0.0` (each `partial` takes the first-seen value, which can differ per
+        // morsel). `combine` merges them (it canonicalizes float keys), so the spilling path
+        // MUST too — otherwise `-0.0` and `0.0` route to different hash partitions and the
+        // group is finalized twice, disagreeing with the in-memory oracle.
+        let k1: ArrayRef = Arc::new(Float64Array::from(vec![-0.0f64]));
+        let k2: ArrayRef = Arc::new(Float64Array::from(vec![0.0f64]));
+        let v1: ArrayRef = Arc::new(Float64Array::from(vec![10.0f64]));
+        let v2: ArrayRef = Arc::new(Float64Array::from(vec![5.0f64]));
+        let mk = |v: &ArrayRef| vec![AggCall::new(AggFunc::Sum, Some(v.clone()))];
+        let p1 = partial(std::slice::from_ref(&k1), &mk(&v1), 1).unwrap();
+        let p2 = partial(std::slice::from_ref(&k2), &mk(&v2), 1).unwrap();
+
+        // Many partitions so `-0.0` and `0.0` (which hash differently under a non-canonical
+        // float row encoding) land in different partitions if not canonicalized first.
+        let mut store = MemSpillStore::new(16);
+        let got = combine_finalize_spilling([p1, p2], &[AggFunc::Sum], &mut store, 0).unwrap();
+        assert_eq!(
+            got.group_columns[0].len(),
+            1,
+            "-0.0 and 0.0 must be ONE group after spilling, got {} groups",
+            got.group_columns[0].len()
+        );
+        let sum = got.agg_columns[0]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sum, 15.0, "the merged group's sum must be 10 + 5");
+    }
+
+    #[test]
     fn single_partition_equals_oracle() {
         // P=1 degenerates to plain combine+finalize — a useful sanity floor.
         let keys = strs(&["x", "y", "x", "y", "z"]);
@@ -927,5 +994,19 @@ mod tests {
         let mut store = MemSpillStore::new(1);
         let got = spilled(&keys, &vals, 3, &mut store);
         assert_eq!(want, to_map(&got.group_columns[0], &got.agg_columns));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spill_directory_is_not_readable_by_other_local_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Spilled data is the query's actual rows, written to a shared scratch path.
+        // Created with the default mode it is world-readable, so a co-tenant on the node
+        // could read a spilled join or aggregate straight off disk.
+        let root = std::env::temp_dir();
+        let store = DiskSpillStore::new(root, 2).unwrap();
+        let mode = std::fs::metadata(&store.dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "spill dir mode was {:o}", mode & 0o777);
     }
 }

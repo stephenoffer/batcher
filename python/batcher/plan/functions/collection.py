@@ -65,10 +65,14 @@ def named_struct(*args: object) -> Expr:
     if not args or len(args) % 2 != 0:
         raise PlanError("named_struct() requires an even number of name, value arguments")
     fields: list[tuple[str, Expr]] = []
+    seen: set[str] = set()
     for i in range(0, len(args), 2):
         name = args[i]
         if not isinstance(name, str):
             raise PlanError(f"named_struct field name must be a string, got {name!r}")
+        if name in seen:
+            raise PlanError(f"named_struct() has a duplicate field name {name!r}")
+        seen.add(name)
         fields.append((name, _wrap(args[i + 1])))  # type: ignore[arg-type]
     return MakeStruct(fields)
 

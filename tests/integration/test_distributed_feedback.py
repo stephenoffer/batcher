@@ -164,7 +164,7 @@ def test_distributed_adaptive_records_a_flip(monkeypatch):
     could not learn from the very shapes that most need it. Forcing a wildly wrong estimate
     makes a flip mandatory *if* the check runs at all.
     """
-    import batcher.api.adaptive as adaptive
+    from batcher.api.adaptive import staging as adaptive
 
     monkeypatch.setattr(adaptive, "_estimate_rows", lambda *a, **k: 999_999_999)
     recorded: dict[str, bool] = {}

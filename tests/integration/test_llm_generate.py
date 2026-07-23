@@ -135,16 +135,24 @@ def test_generate_routed_groups_by_adapter_preserves_order():
     calls = []
 
     class _LLM:
+        """Accepts a per-prompt list of adapters, as a co-batching-capable vLLM does."""
+
         def generate(self, requests, params, lora_request=None):
             calls.append(lora_request)
-            return [_Out(f"{r['prompt']}|{lora_request}", 1, 2) for r in requests]
+            loras = (
+                lora_request if isinstance(lora_request, list) else [lora_request] * len(requests)
+            )
+            paired = zip(requests, loras, strict=True)
+            return [_Out(f"{r['prompt']}|{lora}", 1, 2) for r, lora in paired]
 
     prompts = [{"prompt": "a", "adapter": "x"}, {"prompt": "b"}, {"prompt": "c", "adapter": "x"}]
     table = {None: "BASE", "x": "LORAX"}
-    texts, usage = _generate_routed(_LLM(), None, prompts, table)
-    assert texts == ["a|LORAX", "b|BASE", "c|LORAX"]  # output order preserved across groups
+    texts, usage, _reasons = _generate_routed(_LLM(), None, prompts, table)
+    # Every row still gets its own adapter and its own slot, in input order — but the
+    # adapters now go down in ONE scheduler step rather than one call per group.
+    assert texts == ["a|LORAX", "b|BASE", "c|LORAX"]
     assert usage == [(1, 2), (1, 2), (1, 2)]
-    assert sorted(str(c) for c in calls) == ["BASE", "LORAX"]  # one generate per adapter group
+    assert calls == [["LORAX", "BASE", "LORAX"]]
 
 
 def test_llm_generate_routes_adapter_per_row():

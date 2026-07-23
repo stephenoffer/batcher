@@ -13,15 +13,31 @@ within the size budget; the conductor calls these on its single-node and UDF pat
 
 from __future__ import annotations
 
+import random
+
 import pyarrow as pa
 
+from batcher._internal.logging import get_logger
 from batcher.config import active_config
 from batcher.io.source import Source, iter_source
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
 from batcher.plan.logical import Aggregate, Filter, Join, LogicalPlan
+from batcher.plan.source_stats import source_stats_key
 from batcher.plan.visitor import walk
 
-__all__ = ["collect_source_metadata", "learn_column_stats", "ndv_columns", "seed_column_ndv"]
+__all__ = [
+    "collect_source_metadata",
+    "learn_column_stats",
+    "learnable_columns",
+    "ndv_columns",
+    "seed_column_ndv",
+]
+
+_log = get_logger("metadata")
+
+# Picks each sampled batch's window offset (`_sketch_sample`). Seeded, so a run's learned
+# statistics — and therefore the plans they steer — are reproducible.
+_rng = random.Random(0x5EED)
 
 
 # Row cap for the driver-side column-stat sample (≈ a couple of Parquet row-groups).
@@ -112,12 +128,19 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
     from batcher import kyber
 
     try:
-        known = set(kyber.load_learned_stats(hub).get(kyber.NDV_KEY, {}))
-        resolved = [
-            _stats_sample(src) for src in sources if any(c not in known for c in src.schema().names)
-        ]
-        if resolved:
-            learn_column_stats(hub, resolved)
+        learned = kyber.load_learned_stats(hub)
+        sampled: list[list[pa.RecordBatch]] = []
+        keep: list[Source] = []
+        for src in sources:
+            source_key = source_stats_key(src)
+            if source_key is None:
+                continue
+            known = set(kyber.columns_for(learned, kyber.NDV_KEY, source_key))
+            if any(c not in known for c in src.schema().names):
+                sampled.append(_stats_sample(src))
+                keep.append(src)
+        if sampled:
+            learn_column_stats(hub, sampled, keep)
     except Exception:  # pragma: no cover - learning must never break execution
         pass
 
@@ -203,70 +226,218 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
 
     try:
         wanted = ndv_columns(plan) if plan is not None else None
-        known = set(kyber.load_learned_stats(hub).get(kyber.NDV_KEY, {}))
+        learned = kyber.load_learned_stats(hub)
         max_cells = active_config().optimizer.ndv_sketch_max_cells
-        ndv_all: dict[str, float] = {}
         for src in sources:
             if not getattr(src, "resident", False):
                 continue
+            source_key = source_stats_key(src)
+            if source_key is None:
+                continue  # an unkeyable source: its stats cannot be told apart from another's
+            # "Already measured" is a question about *this* source, not about any column
+            # anywhere: a column named `id` measured on another table says nothing here.
+            known = set(kyber.columns_for(learned, kyber.NDV_KEY, source_key))
             cols = [
-                c
-                for c in src.schema().names
-                if c not in known and c not in ndv_all and (wanted is None or c in wanted)
+                c for c in src.schema().names if c not in known and (wanted is None or c in wanted)
             ]
             rows = src.row_count() or 0
             if not cols or rows * len(cols) > max_cells:
                 continue
-            ndv_all.update(core.column_ndv(src.read(projection=cols), cols))
-        if ndv_all:
-            kyber.record_column_stats(hub, ndv_all, {})
+            ndv = core.column_ndv(src.read(projection=cols), cols)
+            if ndv:
+                kyber.record_column_stats(hub, ndv, {}, source_key=source_key)
     except Exception:  # pragma: no cover - learning must never break execution
         pass
 
 
-def learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
+def learnable_columns(plan: LogicalPlan) -> set[str]:
+    """The columns whose measured statistics a later plan of this shape could actually read.
+
+    The union of the two things the estimator consults: `ndv_columns` (join keys, group
+    keys, equality predicates — the distinct counts) and the columns any `Filter` mentions
+    (the quantile grids and most-common-values, which drive range and equality selectivity).
+    A column outside that union has no consumer; sketching it is pure loss.
+    """
+    from batcher.api.source_stats import column_bounds_needed
+
+    return ndv_columns(plan) | column_bounds_needed(plan)
+
+
+# How many rows the *expensive* sketches (KLL quantiles, Misra-Gries most-common-values)
+# read, however large the input is. See `_sketch_sample`.
+#
+# 262,144 rows keeps a quantile grid well inside the KLL's own ~1% rank error and resolves a
+# most-common-value down to a fraction of a percent — far finer than the 5% floor that
+# decides whether a key is hot. Doubling it would buy accuracy neither consumer can use.
+_SKETCH_SAMPLE_ROWS = 262_144
+
+
+def _sketch_sample(batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+    """A bounded, order-stratified sample of `batches` — for the sketches too costly to run
+    over everything.
+
+    The three learned statistics do not cost the same. HyperLogLog reads a cell in ~4 ns, so
+    distinct counts are measured over every row. The KLL quantile sketch and the Misra-Gries
+    most-common-value summary cost ~56 ns a cell between them, and running *those* over the
+    whole input is what made the first run of a 3 ms query take 140 ms — the engine paying
+    forty times a query's cost to learn statistics for the next one. They are estimators
+    fitted to a distribution, and a sample identifies that distribution as well as a census
+    does: at 262,144 rows the sampling error sits below the sketches' own approximation
+    error, so this loses nothing they could have told us. It is what `ANALYZE` does in every
+    database that has one.
+
+    The sample is **stratified by batch and taken as a random window within each**: every
+    batch contributes in proportion to its size, so a column sorted across the input (a date,
+    a key) is still covered end to end, and the window's random offset keeps a sorted batch
+    from always donating its own low values. Both are zero-copy `slice`s — no row is read in
+    Python, and the cost does not grow with the input.
+
+    Args:
+        batches: The scanned batches to sample.
+
+    Returns:
+        Zero-copy slices totalling at most `_SKETCH_SAMPLE_ROWS` rows — `batches` itself when
+        it is already that small.
+    """
+    total = sum(b.num_rows for b in batches)
+    if total <= _SKETCH_SAMPLE_ROWS:
+        return batches
+    fraction = _SKETCH_SAMPLE_ROWS / total
+    out: list[pa.RecordBatch] = []
+    for batch in batches:
+        take = max(1, int(batch.num_rows * fraction))
+        offset = _rng.randrange(batch.num_rows - take + 1) if batch.num_rows > take else 0
+        out.append(batch.slice(offset, take))
+    return out
+
+
+def learn_column_stats(
+    hub,
+    resolved: list[list[pa.RecordBatch]],
+    sources: list[Source] | None = None,
+    plan: LogicalPlan | None = None,
+    complete_scan: list[bool] | None = None,
+) -> None:
     """Measure per-column ndv/quantiles from the just-scanned input and record them.
 
-    Gated to columns not already known, so the O(rows) sketch build happens at most
-    once per column — a bounded, one-time cost that sharpens every later plan. Core
-    measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
+    `resolved[i]` are the batches scanned from `sources[i]`, and each source's statistics
+    are recorded **under that source's identity** — because a column name alone does not
+    identify a column, and an unqualified `{name: stat}` map lets one table's `id` answer
+    for another's on every join and group-by estimate in the process. A source that cannot
+    key itself is skipped rather than merged into the global namespace.
+
+    Core measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
     failure here never affects the query result.
+
+    ## Only the columns something will read, and never unboundedly
+
+    The sketch is an **O(rows x columns)** pass — HLL, KLL and Misra-Gries over every value —
+    and it used to run over *every column of the source*, for every query, whether or not any
+    of it could ever be consulted. On a plain ``read_parquet(dir).collect()`` — 20M rows, 16
+    columns, no join, no group-by, no filter, and therefore not one statistic the estimator
+    can use — it cost **22.9 seconds on top of a 0.73-second read**. The query paid 30x its
+    own cost to learn things nothing would ever ask for.
+
+    So it is bounded exactly the way the pre-optimize `seed_column_ndv` already bounds
+    itself, and for the same stated reason: *computing a column the optimizer does not read
+    only wastes work.*
+
+    * `plan` restricts the sketch to `learnable_columns` — the join keys, group keys and
+      filter columns an estimator actually consults. A filter-free, join-free scan learns
+      nothing, because there is nothing to learn.
+    * `ndv_sketch_max_cells` caps the total work, so one enormous column cannot turn a
+      cheap query into an expensive one. The pre-pass has always honored this cap; this one
+      did not, which is why it had no ceiling at all.
+    * **The costly sketches read a sample, not the whole input** (`_sketch_sample`). Bounding
+      the *columns* still left the pass reading every *row* of them: the KLL and Misra-Gries
+      sketches cost ~56 ns a cell against HyperLogLog's ~4, so a cold 3 ms `filter`+`group_by`
+      over 1M rows spent **114 ms** in this function — 38x the query, to inform the next one.
+      Distinct counts still read every row (HLL is cheap, and distinct-count is the one
+      statistic a sample genuinely cannot give you); quantiles, byte widths and
+      most-common-values are fitted to a bounded sample, which is what `ANALYZE` does
+      everywhere else and what their own error bars already assume.
+
+    Passing `plan=None` keeps the old learn-everything behavior, for the caller that hands
+    in an already-bounded *sample* (`collect_source_metadata`) rather than a whole scan.
 
     The "already measured" marker is the *average byte width*, not the distinct count:
     `column_statistics` records one for every column it touches (numeric or not), whereas
     `ndv` alone is also written by the cheaper pre-optimize `seed_column_ndv`. Gating on
     `ndv` would let that seeding suppress this pass, losing the quantile grids and
-    most-common-values it is the only source of.
+    most-common-values it is the only source of. A column left unsketched stays unmarked, so
+    the first query that *can* use it is the one that measures it.
     """
     if hub is None:
         return
     from batcher import core, kyber
 
     try:
-        known = set(kyber.load_learned_stats(hub).get(kyber.AVG_BYTES_KEY, {}))
+        learned = kyber.load_learned_stats(hub)
         min_frac = active_config().optimizer.cardinality.mcv_min_fraction
-        ndv_all: dict[str, float] = {}
-        quant_all: dict[str, dict[str, list[float]]] = {}
-        bytes_all: dict[str, float] = {}
-        mcv_all: dict[str, dict[str, float]] = {}
-        for batches in resolved:
+        max_cells = active_config().optimizer.ndv_sketch_max_cells
+        wanted = learnable_columns(plan) if plan is not None else None
+        if wanted is not None and not wanted:
+            return  # nothing in this plan consults a column statistic
+        for i, batches in enumerate(resolved):
             if not batches:
                 continue
-            cols = [c for c in batches[0].schema.names if c not in known]
+            source = sources[i] if sources is not None and i < len(sources) else None
+            source_key = source_stats_key(source) if source is not None else None
+            if source_key is None:
+                continue  # unkeyable: cannot be told apart from another source's columns
+            known = set(kyber.columns_for(learned, kyber.AVG_BYTES_KEY, source_key))
+            cols = [
+                c
+                for c in batches[0].schema.names
+                if c not in known and (wanted is None or c in wanted)
+            ]
             if not cols:
                 continue
-            ndv, quants, avg_bytes = core.column_statistics(batches, cols)
-            ndv_all.update(ndv)
-            quant_all.update(quants)
-            bytes_all.update(avg_bytes)
-            total = sum(b.num_rows for b in batches)
-            # MCV clears `min_frac` only on low-cardinality columns (ndv ≲ 1/min_frac);
-            # skip the per-row Misra-Gries scan on keys/high-ndv columns (always empty).
-            mcv_cols = [c for c in cols if ndv.get(c, 1e18) <= 1.0 / min_frac]
-            for col_name, hits in core.heavy_hitters(batches, mcv_cols, min_frac).items():
+            rows = sum(b.num_rows for b in batches)
+            if rows * len(cols) > max_cells:
+                continue  # too big to sketch cheaply; a worse plan beats a 20x slower query
+            # A distinct count is the one measured statistic a *partial* scan gets **wrong**,
+            # not merely approximate. A quantile grid or an MCV from a sample is still a valid
+            # description of the whole column's distribution — sampling preserves shape. But an
+            # ndv from a subset of the rows counts only the distinct values in that subset: a
+            # `filter(id < 100).collect()` that scanned 100 of a table's 2,000,000 rows would
+            # record `ndv=100` under the *source's* key, and `approx_n_unique("id")` — which
+            # reads exactly that record — would then answer 100 for the whole table. So the ndv
+            # is recorded only when this query scanned the source *whole* (no predicate pushed,
+            # every row read); a filtered or limited scan still contributes quantiles and MCVs.
+            saw_whole = complete_scan is None or (i < len(complete_scan) and complete_scan[i])
+            # Distinct counts read every row; the quantile/MCV sketches read a bounded
+            # sample. See `_sketch_sample` — one is ~4 ns a cell, the others ~56.
+            ndv = core.column_ndv(batches, cols) if saw_whole else {}
+            sample = _sketch_sample(batches)
+            total = sum(b.num_rows for b in sample)
+            _sample_ndv, quants, avg_bytes = core.column_statistics(sample, cols)
+            mcv: dict[str, dict[str, float]] = {}
+            # Heavy hitters are measured on **every** column being sketched, not only
+            # low-cardinality ones.
+            #
+            # This used to skip any column with `ndv > 1/min_frac` (20), reasoning that a
+            # high-cardinality column cannot hold a value above the frequency floor. That is
+            # only true under *uniformity* — which is the one assumption an MCV exists to
+            # correct. A column of a million distinct keys can still have a single value at
+            # 30% of rows (a sentinel, a default account, one whale customer), and
+            # Misra-Gries finds it in the same pass. Measured: 1,000 distinct `cust_id`s with
+            # key 7 at 47.5% of rows was excluded by the gate, so `cust_id = 7` estimated at
+            # `1/ndv` = 0.001 against a true 0.5 — a ~500x under-estimate on the most skewed
+            # key in the table, which is exactly the key a join is about to be built on. The
+            # gate suppressed skew precisely where skew matters, leaving join-key skew
+            # structurally unmeasurable (`kyber.hot_join_values` reads this).
+            # Over the sample, and against the sample's row count: an MCV is a *fraction*
+            # of rows, and a uniform sample preserves a value's frequency.
+            for col_name, hits in core.heavy_hitters(sample, cols, min_frac).items():
                 if total > 0 and hits:
-                    mcv_all[col_name] = {str(v): n / total for v, n in hits}
-        if ndv_all or quant_all or bytes_all or mcv_all:
-            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all, mcv_all)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+                    mcv[col_name] = {str(v): n / total for v, n in hits}
+            if ndv or quants or avg_bytes or mcv:
+                kyber.record_column_stats(hub, ndv, quants, avg_bytes, mcv, source_key=source_key)
+    except Exception:  # learning must never break execution — but it must not vanish either
+        # This `except` is load-bearing (a measurement failure must never fail a query), but
+        # a bare `pass` also swallows a *bug*: an `AttributeError` on this function's first
+        # line silently made the entire post-run column learner a no-op, so quantiles, MCVs
+        # and byte widths were never recorded at all. A swallowed exception that is never
+        # logged is indistinguishable from a code path that works.
+        _log.debug("column-statistics learning failed; plans fall back to priors", exc_info=True)

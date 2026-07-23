@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.config import active_config
+from batcher.kyber.ols import fit_ols, ols_update
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -28,67 +29,75 @@ if TYPE_CHECKING:
 __all__ = ["learned_gpu_min_rows", "record_backend_timing"]
 
 _NS = "gpu_backend_xover"
-# Trust the fit only after enough spread-out samples per backend — single-run timings are noisy,
-# so a handful of points can swing the intercept wildly. This keeps the (already well-chosen)
-# config default in charge until there is real evidence, and the loop stays conservative.
-_MIN_SAMPLES = 8
-# And even then, clamp the learned crossover to a band around the config default, so one bad
-# early fit can only nudge the threshold within a bounded range, never send it to an absurd value.
+# Clamp the learned crossover to a band around the config default, so one bad early fit can
+# only nudge the threshold within a bounded range, never send it to an absurd value. (The
+# sample-count and spread gates that decide whether a fit is usable at all live in `kyber.ols`.)
 _BAND = 8.0  # learned ∈ [default / _BAND, default * _BAND]
 
 
-def record_backend_timing(hub: MetadataHub | None, backend: str, rows: int, wall_ms: float) -> None:
-    """Fold one (rows, wall_ms) observation for `backend` ("gpu"/"cpu") into its OLS statistics."""
+def _bucket(backend: str, accelerator_type: str | None) -> str:
+    """The storage bucket for a backend's OLS statistics, per device model where known.
+
+    A GPU timing is only comparable to another timing from the *same* device: an H100 and a T4
+    differ by roughly an order of magnitude in per-row cost, so pooling them fits one line
+    through two unrelated point-clouds and converges on a crossover right for neither — while
+    still *overriding* the config default, so the learned value is actively worse than no
+    learning at all. Splitting the bucket per model is what makes more data help rather than hurt.
+
+    The CPU bucket stays pooled. Heterogeneous CPUs have the same issue in principle, but the
+    spread across a fleet's cores is far narrower than across GPU generations, and there is no
+    equivalent per-node CPU model label to key on. Unkeyed GPU timings (a mixed fleet, an
+    unlabelled node) also stay in the shared bucket, which is exactly the behavior before this.
+    """
+    return f"{backend}:{accelerator_type}" if backend == "gpu" and accelerator_type else backend
+
+
+def record_backend_timing(
+    hub: MetadataHub | None,
+    backend: str,
+    rows: int,
+    wall_ms: float,
+    accelerator_type: str | None = None,
+) -> None:
+    """Fold one (rows, wall_ms) observation for `backend` ("gpu"/"cpu") into its OLS statistics.
+
+    `accelerator_type` buckets a GPU observation by device model so unlike devices don't share
+    one regression; `None` keeps the pooled bucket."""
     if hub is None or rows <= 0 or wall_ms <= 0.0 or backend not in ("gpu", "cpu"):
         return
     try:
-        s = hub.get_keyed_param(_NS, backend) or {}
-        x, y = float(rows), float(wall_ms)
-        hub.put_keyed_param(
-            _NS,
-            backend,
-            {
-                "n": int(s.get("n", 0)) + 1,
-                "sx": float(s.get("sx", 0.0)) + x,
-                "sy": float(s.get("sy", 0.0)) + y,
-                "sxx": float(s.get("sxx", 0.0)) + x * x,
-                "sxy": float(s.get("sxy", 0.0)) + x * y,
-                # track the row-count spread so the fit is only trusted once the samples
-                # actually span a range (two runs at the same size can't fix a slope).
-                "xmin": min(float(s.get("xmin", x)), x),
-                "xmax": max(float(s.get("xmax", x)), x),
-            },
-        )
+        key = _bucket(backend, accelerator_type)
+        s = hub.get_keyed_param(_NS, key) or {}
+        hub.put_keyed_param(_NS, key, ols_update(s, float(rows), float(wall_ms)))
     except Exception:  # pragma: no cover - learning must never break a query
         return
 
 
-def _fit(s: dict) -> tuple[float, float] | None:
-    """`(intercept_ms, slope_ms_per_row)` from a backend's OLS sufficient statistics, or `None`
-    when there aren't enough spread-out samples to identify a line."""
-    n = int(s.get("n", 0))
-    if n < _MIN_SAMPLES or float(s.get("xmax", 0.0)) <= float(s.get("xmin", 0.0)):
-        return None
-    sx, sy, sxx, sxy = s.get("sx", 0.0), s.get("sy", 0.0), s.get("sxx", 0.0), s.get("sxy", 0.0)
-    denom = n * sxx - sx * sx
-    if denom <= 0.0:
-        return None
-    slope = (n * sxy - sx * sy) / denom
-    intercept = (sy - slope * sx) / n
-    return intercept, slope
+# `(intercept_ms, slope_ms_per_row)` for a backend, or None when the samples are too few or
+# too clustered to identify a line. Shared with the broadcast/sort-merge crossovers, which
+# fold the same statistics — the two copies of this fit had already diverged once.
+_fit = fit_ols
 
 
-def learned_gpu_min_rows(hub: MetadataHub | None) -> int | None:
+def learned_gpu_min_rows(
+    hub: MetadataHub | None, accelerator_type: str | None = None
+) -> int | None:
     """The measured GPU/CPU crossover row count, or `None` when not yet learnable.
 
     Solves `a_gpu + b_gpu·x == a_cpu + b_cpu·x`. A crossover exists only when the GPU is cheaper
     per row (`b_gpu < b_cpu`) yet has higher fixed cost (`a_gpu > a_cpu`) — the expected regime;
     any other shape (GPU dominates everywhere, or never wins) means "no useful threshold from the
-    data", so we defer to the config default. The result is clamped to a sane band."""
+    data", so we defer to the config default. The result is clamped to a sane band.
+
+    `accelerator_type` selects this device model's own samples, falling back to the pooled bucket
+    when that model has none yet — so a fleet whose device is newly identified keeps using what it
+    already learned instead of going cold."""
     if hub is None:
         return None
     try:
-        gpu = _fit(hub.get_keyed_param(_NS, "gpu") or {})
+        gpu = _fit(hub.get_keyed_param(_NS, _bucket("gpu", accelerator_type)) or {})
+        if gpu is None and accelerator_type:
+            gpu = _fit(hub.get_keyed_param(_NS, "gpu") or {})
         cpu = _fit(hub.get_keyed_param(_NS, "cpu") or {})
     except Exception:  # pragma: no cover
         return None

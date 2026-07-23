@@ -54,7 +54,7 @@ class _Remote:
 
 class _FakeActor:
     def __init__(self) -> None:
-        self.run = _Remote(lambda part: [f"out-{part}"])
+        self.run = _Remote(lambda part, idx=0: [f"out-{part}"])
         self.gpu_stats = _Remote(lambda: 0.4)
 
 
@@ -127,7 +127,7 @@ def test_drive_pool_depth_gt1_ordering(monkeypatch):
             return cls
 
         @classmethod
-        def remote(cls, plan0):
+        def remote(cls, plan0, write_spec=None):
             return _FakeActor()
 
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)
@@ -153,7 +153,7 @@ def test_drive_pool_reclaims_all_refs_of_a_dead_actor(monkeypatch):
             self.run = _Remote(self._run)
             self.gpu_stats = _Remote(lambda: 0.3)
 
-        def _run(self, part):
+        def _run(self, part, idx=0):
             runs[part] += 1
             if self.idx == 0:  # the first actor is preempted: every in-flight call dies
                 raise RayError("actor 0 preempted")
@@ -165,7 +165,7 @@ def test_drive_pool_reclaims_all_refs_of_a_dead_actor(monkeypatch):
             return cls
 
         @classmethod
-        def remote(cls, plan0):
+        def remote(cls, plan0, write_spec=None):
             a = _PoisonActor(len(spawned))
             spawned.append(a)
             return a
@@ -189,7 +189,7 @@ def test_drive_pool_reraises_deterministic_error_at_depth(monkeypatch):
 
     class _BugActor:
         def __init__(self) -> None:
-            self.run = _Remote(lambda part: _raise(RayTaskError("UDF bug")))
+            self.run = _Remote(lambda part, idx=0: _raise(RayTaskError("UDF bug")))
             self.gpu_stats = _Remote(lambda: None)
 
     class _FakeMapActor:
@@ -198,7 +198,7 @@ def test_drive_pool_reraises_deterministic_error_at_depth(monkeypatch):
             return cls
 
         @classmethod
-        def remote(cls, plan0):
+        def remote(cls, plan0, write_spec=None):
             return _BugActor()
 
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)

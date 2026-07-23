@@ -52,9 +52,19 @@ def test_conjunction_backoff_is_order_independent_and_damped():
 
 
 def test_disjunction_inclusion_exclusion():
-    ds = bt.from_pydict({"x": list(range(100))}).filter((col("x") == lit(5)) | (col("x") == lit(6)))
-    # 0.1 + 0.1 - 0.1*0.1 = 0.19
+    # Two *different* columns are combined by the independent-union rule 1 - (1-a)(1-b):
+    # 0.1 + 0.1 - 0.1*0.1 = 0.19. (Same-column equalities instead *sum*, since they select
+    # disjoint values — see test_disjunction_same_column_sums.)
+    data = {"x": list(range(100)), "y": list(range(100))}
+    ds = bt.from_pydict(data).filter((col("x") == lit(5)) | (col("y") == lit(6)))
     assert abs(_rows(ds) - 19.0) < 1e-9
+
+
+def test_disjunction_same_column_sums():
+    # `x = 5 OR x = 6` cannot both hold, so the union is the sum 0.1 + 0.1 = 0.2 — the same
+    # as `x IN (5, 6)`, not the inclusion-exclusion 0.19 that assumes independent events.
+    ds = bt.from_pydict({"x": list(range(100))}).filter((col("x") == lit(5)) | (col("x") == lit(6)))
+    assert abs(_rows(ds) - 20.0) < 1e-9
 
 
 def test_negation_complements():
@@ -158,3 +168,71 @@ def test_composite_join_key_damps_combined_ndv():
     assert abs(_rows(ds, learned=learned) - (200 * 50) / damped) < 1e-6
     # Without ndv on the keys, still falls back to the larger side.
     assert _rows(ds) == 200.0
+
+
+# --- a fractional sample must not shrink an unknown-size input into a real estimate ---
+
+
+def test_fractional_sample_of_known_input_scales():
+    from batcher.plan.logical import Sample
+
+    base = bt.from_pydict({"a": list(range(100))})
+    node = Sample(input=base._plan, n=None, fraction=0.25, seed=0)
+    est = CardinalityEstimator(base._sources)
+    assert est.estimate(node).rows == 25.0
+
+
+def test_fractional_sample_of_unknown_input_stays_a_placeholder():
+    # Scaling the `unknown_rows` placeholder down by the fraction would drop it below the
+    # threshold, letting admission budget a guess and wrongly reject a small query.
+    from batcher.config import active_config
+    from batcher.kyber.stats import StatsEstimator
+    from batcher.plan.logical import Sample
+
+    unknown = active_config().optimizer.cardinality.unknown_rows
+
+    class _Uncountable:  # no row_count → the estimator's unknown placeholder
+        pass
+
+    base = bt.from_pydict({"a": [1, 2, 3]})
+    node = Sample(input=base._plan, n=None, fraction=0.1, seed=0)
+    est = StatsEstimator([_Uncountable()])
+    assert est.estimate(node).rows >= unknown
+
+
+def test_fixed_count_sample_is_a_real_bound_over_unknown_input():
+    from batcher.kyber.stats import StatsEstimator
+    from batcher.plan.logical import Sample
+
+    class _Uncountable:
+        pass
+
+    base = bt.from_pydict({"a": [1, 2, 3]})
+    node = Sample(input=base._plan, n=7, fraction=None, seed=0)
+    est = StatsEstimator([_Uncountable()])
+    assert est.estimate(node).rows == 7.0
+
+
+# --- partial group-key ndv: the measured keys still floor the group count ----------
+
+
+def test_partial_group_key_ndv_floors_the_estimate():
+    # GROUP BY (a, b) where only `a` has a measured ndv (600 over 1000 rows). Adding `b` can
+    # only add groups, so the estimate must be at least `a`'s 600 — not the blunt 0.1·rows.
+    ds = bt.from_pydict({"a": list(range(1000)), "b": list(range(1000))})
+    ds = ds.group_by("a", "b").agg(c=col("a").count())
+    learned = {"__column_ndv__": {"a": 600.0}}  # only `a` measured
+    assert _rows(ds, learned=learned) >= 600.0
+
+
+def test_partial_distinct_ndv_floors_the_estimate():
+    # A DISTINCT over (a, b) with only `a` measured is floored the same way.
+    from batcher.config import active_config
+    from batcher.kyber.stats import StatsEstimator
+    from batcher.plan.logical import Distinct
+
+    ds = bt.from_pydict({"a": list(range(1000)), "b": list(range(1000))})
+    node = Distinct(input=ds._plan)
+    learned = {"__column_ndv__": {"a": 600.0}}
+    est = StatsEstimator(ds._sources, learned, active_config().optimizer.cardinality)
+    assert est.estimate(node).rows >= 600.0

@@ -146,3 +146,133 @@ def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
     q = ds.group_by("k").agg(s=bt.col("v").sum())
     gpu_backend.record_cpu_crossover(q._plan, q._sources, hub, wall_ms=5.0)
     assert hub.get_keyed_param(_NS, "cpu") is None  # nothing recorded on a CPU-only cluster
+
+
+# --- the OLS fit needs a *relative* spread, not merely a non-zero one ---------------
+
+
+def _stats(base, spread, n=8, slope=1e-5, icept=100.0, noise=0.0):
+    import random
+
+    random.seed(0)
+    xs = [base + spread * i / (n - 1) for i in range(n)]
+    ys = [icept + slope * x + random.uniform(-noise, noise) for x in xs]
+    return {
+        "n": n,
+        "sx": sum(xs),
+        "sy": sum(ys),
+        "sxx": sum(x * x for x in xs),
+        "sxy": sum(x * y for x, y in zip(xs, ys, strict=True)),
+        "xmin": min(xs),
+        "xmax": max(xs),
+    }
+
+
+def test_tightly_clustered_samples_cannot_identify_a_line():
+    """`n*sxx - sx*sx` is the unstable form; clustered x makes the difference float noise.
+
+    Eight runs at ~10M rows spread over 3 rows, with ±0.5ms of ordinary jitter on a 100ms
+    measurement, previously fit an intercept of 954,873 (true 100) and a sign-flipped slope —
+    and that intercept is the whole numerator of the learned crossover. The absolute
+    `xmax > xmin` gate passed it; a relative one must not.
+    """
+    from batcher.kyber.gpu.adaptive import _fit
+
+    assert _fit(_stats(1e7, 3, noise=0.5)) is None
+    assert _fit(_stats(1e8, 10, noise=1.0)) is None
+    assert _fit(_stats(1e7, 3)) is None  # even noiseless, 3 rows of spread identifies nothing
+
+
+def test_genuinely_spread_samples_still_fit_exactly():
+    from batcher.kyber.gpu.adaptive import _fit
+
+    fit = _fit(_stats(1e6, 7e6))
+    assert fit is not None
+    intercept, slope = fit
+    assert intercept == pytest.approx(100.0)
+    assert slope == pytest.approx(1e-5)
+
+
+def test_every_ols_crossover_shares_the_spread_guard():
+    """The broadcast / sort-merge crossovers must reject a cluster too, not just the GPU one.
+
+    `gpu/adaptive.py` and `learned_tuning/crossover.py` fold *identical* OLS sufficient
+    statistics, and their `_fit` bodies were copies. The relative-spread guard was added
+    here after the measured failure above and never reached the other copy, so the same
+    garbage fit stayed live on the path feeding `learned_broadcast_max_bytes` and
+    `learned_sort_merge_min_rows` — consumed by `kyber/rules/selection.py`, where a bad
+    intercept flips join strategy. Both now resolve to the one `kyber.ols.fit_ols`.
+    """
+    from batcher.kyber.gpu.adaptive import _fit as gpu_fit
+    from batcher.kyber.learned_tuning.crossover import _fit as crossover_fit
+    from batcher.kyber.ols import fit_ols
+
+    assert gpu_fit is fit_ols and crossover_fit is fit_ols
+    # The exact case the guard was written for: unidentifiable from either entry point.
+    assert crossover_fit(_stats(1e7, 3, noise=0.5)) is None
+    assert crossover_fit(_stats(1e7, 3)) is None
+    # ...while a genuinely spread sample still fits exactly, so the guard is not over-eager.
+    assert crossover_fit(_stats(1e6, 7e6)) == pytest.approx((100.0, 1e-5))
+
+
+def test_unlike_devices_do_not_share_one_regression():
+    """The regression: keying only by backend folded an H100's and a T4's timings into a single
+    OLS line, converging on a crossover right for neither — and because the learned value
+    *overrides* the config default, that pooled fit is worse than not learning at all.
+
+    Two fleets with genuinely different crossovers must therefore learn different thresholds
+    from the same hub."""
+    hub = _hub()
+    for rows in _SAMPLE_ROWS:
+        record_backend_timing(hub, "cpu", rows, _cpu_ms(rows))
+        # A fast device: low fixed cost, so it pays off early.
+        record_backend_timing(hub, "gpu", rows, 500.0 + 1.0e-5 * rows, "NVIDIA_H100")
+        # A slow one: heavy fixed cost, so it only pays off much later.
+        record_backend_timing(hub, "gpu", rows, 9000.0 + 3.0e-4 * rows, "NVIDIA_TESLA_T4")
+
+    fast = learned_gpu_min_rows(hub, "NVIDIA_H100")
+    slow = learned_gpu_min_rows(hub, "NVIDIA_TESLA_T4")
+    assert fast is not None and slow is not None
+    assert fast < slow  # the faster device crosses over at fewer rows
+
+
+def test_a_newly_identified_device_falls_back_to_what_was_already_learned():
+    """Bucketing per device must not throw away history: a fleet whose device only just became
+    identifiable should keep using the pooled samples until it has its own."""
+    hub = _hub()
+    for rows in _SAMPLE_ROWS:
+        record_backend_timing(hub, "cpu", rows, _cpu_ms(rows))
+        record_backend_timing(hub, "gpu", rows, _gpu_ms(rows))  # pooled, untagged
+    pooled = learned_gpu_min_rows(hub)
+    assert pooled is not None
+    assert learned_gpu_min_rows(hub, "NVIDIA_A100") == pooled
+
+
+def test_a_mixed_fleet_keeps_the_pooled_bucket(monkeypatch):
+    """There is no honest per-device answer when the models differ, so `cluster_accelerator_type`
+    reports `None` and the learner behaves exactly as it did before — rather than attaching one
+    device's timing to another's bucket."""
+    from batcher.dist.executors.ray_runtime import accelerators, scaling
+
+    monkeypatch.setattr(
+        scaling,
+        "node_classes",
+        lambda: [
+            {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_A100"},
+            {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_TESLA_T4"},
+        ],
+    )
+    import ray
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    assert accelerators.cluster_accelerator_type() is None
+    # A homogeneous fleet does resolve to its single model.
+    monkeypatch.setattr(
+        scaling,
+        "node_classes",
+        lambda: [
+            {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_A100"},
+            {"cpus": 8.0, "gpus": 8.0, "accelerator_type": "NVIDIA_A100"},
+        ],
+    )
+    assert accelerators.cluster_accelerator_type() == "NVIDIA_A100"

@@ -1,35 +1,37 @@
 # Adaptive re-optimization
 
-This is the idea that sets Batcher apart. The optimizer (Kyber) does not optimize
-once and commit. At **pipeline breakers** — sort, aggregate, join build — the engine
-has just *measured* the data it produced: real row counts, real memory, real
-timings. It feeds those numbers back and re-plans the rest of the query on them
-instead of the static estimates it started with.
+Kyber, the optimizer, doesn't plan once and commit. A *pipeline breaker* is an operator
+that must materialize before the next one starts, such as a sort, an aggregate, or a
+join build. At each one the engine has already *measured* the data it produced: real row
+counts, real memory, real timings. It feeds those numbers back and re-plans the rest of
+the query on them, rather than on the static estimates it started with.
 
-That matters because the classic way a query goes wrong is a bad estimate: a filter
-expected to cut 90% of rows that cuts 5%, or a join whose "small" side turns out
-huge. A static optimizer commits to the plan built from those guesses and runs it to
-the end — which is how jobs stall or run out of memory. Batcher corrects mid-flight.
+The classic way a query goes wrong is a bad estimate. A filter expected to cut 90% of
+rows cuts 5%. A join's "small" side turns out huge. A static optimizer commits to the
+plan built from those guesses and runs it to the end, which is how jobs stall or run
+out of memory. Batcher corrects mid-flight.
 
-For comparison: DuckDB's optimizer is static (it plans once, before execution);
-Spark AQE re-plans, but only at stage boundaries. Continuous re-optimization *inside*
-a running query is what neither can retrofit, and it is the reason a query that
-starts on a bad estimate can still finish fast and within memory.
+For comparison, DuckDB plans once, before execution. Spark AQE re-plans at stage
+boundaries, and so does Batcher: it's the same mechanism at the same granularity, with
+the difference that Batcher does it single-node too. The loop also stays off below
+20,000,000 input rows, so most queries never reach it.
 
-`explain()` shows the plan the optimizer chose, and `stats()` reports the measured
-per-operator rows, time, and peak memory that feed the next decision — the same
-signal the engine uses to re-plan.
+The half with no equivalent elsewhere is what happens between runs. Batcher records what
+each query actually did into a sketch-backed store, so the next run plans against
+measured history rather than estimates alone.
+
+![Two feedback loops. Within one query, Batcher plans, executes a stage to a pipeline breaker, measures the real cardinalities, and re-plans the remaining stages, which is stage-boundary re-optimization at Spark AQE's granularity and gated off below 20 million input rows. Across runs, it records what happened as sketches into the MetadataHub so the next run plans better.](../../_static/diagrams/adaptive_loop.svg)
 
 ## A bad estimate, corrected
 
-Suppose a filter is *expected* to keep most rows but actually keeps a handful. A
-static plan, built for the large estimate, might pick a hash join sized for millions
-of rows and thrash. Batcher runs the filter, measures that only a few rows survived,
-and re-plans the join — often switching to a broadcast — before it starts.
+Suppose a filter is *expected* to keep most rows but actually keeps a handful. A static
+plan, built for the large estimate, might pick a hash join sized for millions of rows
+and thrash. Batcher runs the filter, measures that only a few rows survived, and
+re-plans the join before it starts, often switching to a broadcast.
 
-You can see the measured side of that loop. `stats()` runs the query and reports each
-operator's real row counts, time, and peak memory — the same numbers the optimizer
-feeds back into its next decision:
+The measured half of that loop is visible to you. `stats()` runs the query and reports
+what each operator really did: row counts, time, peak memory. Those are the same numbers
+the engine feeds back into its next planning decision.
 
 ```python
 import batcher as bt
@@ -41,5 +43,5 @@ print(plan.stats().rows)   # rows the query actually produced
 # 3
 ```
 
-`explain()` shows the plan the optimizer chose without running it; `stats()` shows
-what actually happened. Together they are how you watch the adaptive loop at work.
+`explain()` shows the plan Kyber chose, without running it. `stats()` shows what
+actually happened.

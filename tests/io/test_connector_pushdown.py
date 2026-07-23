@@ -20,9 +20,11 @@ from batcher.io.formats.nosql.mongo import MongoSource
 from batcher.io.formats.sql.bigquery import BigQuerySource
 from batcher.io.formats.sql.clickhouse import ClickHouseSource
 from batcher.io.formats.sql.connectorx import ConnectorXSource
+from batcher.io.formats.sql.databricks import DatabricksSource
 from batcher.io.formats.sql.odbc import ODBCSource
 from batcher.io.formats.sql.snowflake import SnowflakeSource
 from batcher.io.predicate import to_iceberg_expression, to_mongo_filter
+from batcher.io.source.read import plan_splits
 
 pytestmark = pytest.mark.unit
 
@@ -31,10 +33,30 @@ _PUSHDOWN_SOURCES = [
     BigQuerySource,
     ClickHouseSource,
     ConnectorXSource,
+    DatabricksSource,
     IcebergSource,
     MongoSource,
     ODBCSource,
     SnowflakeSource,
+]
+
+# The SQL sources whose splits must carry the pushdown *in their own query*, with a
+# kwargs recipe that constructs one without contacting a server. A split is what a
+# worker rebuilds its reader from, so a predicate left outside the split's SQL never
+# reaches the server at all.
+_SQL_SPLIT_SOURCES = [
+    (ClickHouseSource, {"query": "SELECT * FROM t", "host": "h", "client_kwargs": {}}),
+    (ConnectorXSource, {"query": "SELECT * FROM t", "conn_uri": "postgresql://h/db"}),
+    (ODBCSource, {"query": "SELECT * FROM t", "dsn": "d"}),
+    (
+        DatabricksSource,
+        {
+            "query": "SELECT * FROM t",
+            "server_hostname": "h",
+            "http_path": "/sql/1.0/warehouses/abc",
+            "access_token": "tok",
+        },
+    ),
 ]
 
 
@@ -88,3 +110,72 @@ def test_source_supports_predicate(source_cls):
 def test_source_read_accepts_predicate(source_cls):
     params = inspect.signature(source_cls.read).parameters
     assert "predicate" in params
+
+
+# --- the pushdown must live IN the split's own SQL -----------------------------
+# `plan_splits` inspects the `splits` signature and only forwards `predicate=` /
+# `projection=` when the source *declares* them. A source that omits a parameter is
+# therefore silently planned without it: the worker rebuilds an unfiltered,
+# unprojected read, the whole relation crosses the wire, and the engine's `Filter`
+# discards the rows afterwards. Correct results, unbounded cost — so these assert on
+# the SQL the split actually carries, not on the source's own `read()`.
+
+
+@pytest.mark.parametrize(
+    ("source_cls", "kwargs"), _SQL_SPLIT_SOURCES, ids=lambda v: getattr(v, "__name__", "")
+)
+def test_split_sql_carries_pushdown(source_cls, kwargs):
+    predicate = (bt.col("x") > 5).to_ir()
+    splits = plan_splits(source_cls(**kwargs), predicate=predicate, projection=["x", "y"])
+    assert len(splits) == 1
+    sql = splits[0].query
+    # The predicate reached the split's SQL, so the *server* does the filtering.
+    assert "WHERE" in sql
+    assert "x > 5" in sql
+    # ...and so does the column pruning.
+    assert "SELECT x, y" in sql
+
+
+def test_databricks_warehouse_split_carries_where():
+    """A Databricks warehouse split must filter on the warehouse, not after Cloud Fetch.
+
+    Regression: `DatabricksSource.splits` took no `projection` and called
+    `_warehouse_split()` with no predicate, so it was the one SQL connector still
+    rebuilding an unfiltered read on every distributed worker.
+    """
+    source = DatabricksSource(
+        query="SELECT * FROM sales",
+        server_hostname="h",
+        http_path="/sql/1.0/warehouses/abc",
+        access_token="tok",
+    )
+    splits = plan_splits(source, predicate=(bt.col("amount") > 100).to_ir())
+    assert len(splits) == 1
+    assert "WHERE amount > 100" in splits[0].query
+
+
+def test_databricks_splits_declares_projection():
+    """`plan_splits` forwards `projection=` only to a `splits` that declares it."""
+    assert "projection" in inspect.signature(DatabricksSource.splits).parameters
+
+
+def test_databricks_lakehouse_delegates_to_delta(monkeypatch):
+    """The lakehouse branch keeps delegating to Delta, which prunes files by predicate.
+
+    Delta splits are data files whose columns are pruned from the footer on the worker,
+    so `projection` is deliberately not forwarded — only `predicate` is.
+    """
+    seen = {}
+
+    class _FakeDelta:
+        def splits(self, target_size=None, predicate=None):
+            seen["target_size"] = target_size
+            seen["predicate"] = predicate
+            return ["delta-split"]
+
+    source = DatabricksSource(table="c.s.t", workspace="https://w", token="tok")
+    monkeypatch.setattr(DatabricksSource, "_delta_source", lambda self: _FakeDelta())
+
+    predicate = (bt.col("x") > 5).to_ir()
+    assert plan_splits(source, predicate=predicate, projection=["x"]) == ["delta-split"]
+    assert seen["predicate"] == predicate

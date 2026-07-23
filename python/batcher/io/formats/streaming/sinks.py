@@ -79,6 +79,31 @@ class ConsoleStreamSink:
 _MEMORY: dict[str, list[pa.Table]] = {}
 
 
+def _check_memory_sink_size(name: str) -> None:
+    """Raise a clear `ResourceError` if a named in-memory sink has outgrown the cap.
+
+    In `append`/`update` mode this sink retains every micro-batch for the lifetime of
+    the process, and `close()` frees nothing — so an unbounded stream written to it
+    grows until the box dies, having looked healthy for hours. It is a debugging sink
+    (the Spark `memory` sink is documented the same way), so the honest failure is an
+    actionable error naming the sink, not a silent OOM. The cap is the same
+    `memory.streaming_state_max_bytes` envelope that bounds watermark-held state.
+    """
+    from batcher.config import active_config
+
+    cap = active_config().memory.streaming_state_budget_bytes()
+    held = sum(t.nbytes for t in _MEMORY.get(name, ()))
+    if held > cap:
+        from batcher._internal.errors import ResourceError
+
+        raise ResourceError(
+            f"in-memory streaming sink {name!r} reached {held} bytes (cap {cap}): it "
+            "retains every micro-batch in append/update mode and never evicts. Use a "
+            "durable sink (parquet/delta) for an unbounded stream, switch to "
+            "outputMode='complete', or raise memory.streaming_state_max_bytes."
+        )
+
+
 def memory_table(name: str) -> pa.Table:
     """Return the accumulated table for a named in-memory streaming sink.
 
@@ -110,6 +135,7 @@ class MemoryStreamSink:
             _MEMORY[self._name] = [table]
         else:
             _MEMORY[self._name].append(table)
+            _check_memory_sink_size(self._name)
         return None
 
     def close(self) -> None:
@@ -193,15 +219,33 @@ class FileStreamSink:
 
 
 class DeltaStreamSink:
-    """Append each micro-batch to a Delta table in one transactional commit.
+    """Append each micro-batch to a Delta table as exactly one idempotent transaction.
 
-    Reuses the existing transactional `delta` sink (`mode="append"`), so each
-    micro-batch is an atomic Delta version — the sink token is the written manifest
-    digest the commit-log records.
+    Two properties the log must have, and how they are obtained:
+
+    **Exactly one transaction per micro-batch.** Each batch gets a fresh `delta` sink
+    that writes its data file and commits it, so the version history is a one-to-one
+    record of the micro-batches — never one commit per worker, and never a commit per
+    file.
+
+    **Exactly-once under replay.** The engine records a micro-batch's source offset
+    *before* processing it, so a crash between processing and committing leaves a batch
+    the next run replays. A plain append would then write those rows a second time.
+    Instead every commit carries a Delta ``txn`` action — ``(app_id, batch_id)`` — and
+    the sink checks the log for it first: a replayed batch finds its own transaction
+    already recorded, writes nothing, and commits nothing. That check is what turns the
+    engine's at-least-once replay into end-to-end exactly-once, and it is why the log
+    ends up with exactly one transaction per micro-batch no matter how often one was
+    retried.
+
+    `app_id` must be *stable across restarts* or the idempotency check would never find
+    the previous run's transactions. It is the query name when one was given, and
+    otherwise derived from the destination table — stable either way.
     """
 
-    def __init__(self, uri: str, **opts: Any) -> None:
+    def __init__(self, uri: str, *, query_name: str | None = None, **opts: Any) -> None:
         self._uri = uri
+        self._app_id = query_name or f"batcher-stream:{uri.rstrip('/')}"
         opts.setdefault("mode", "append")
         self._opts = opts
 
@@ -212,12 +256,13 @@ class DeltaStreamSink:
         from batcher.io.formats import SINKS
         from batcher.io.manifest import WriteManifest
 
-        # A fresh sink per micro-batch makes each batch its own atomic Delta
-        # transaction (the sink stages in `_pending` and is not reusable across
-        # commits). The committed table version is the sink token.
-        sink = SINKS.get("delta")(**self._opts)
+        sink = SINKS.get("delta")(app_id=self._app_id, txn_version=batch_id, **self._opts)
+        # Check *before* writing: a replayed batch must not even leave an orphan data
+        # file behind, let alone commit one.
+        if sink.is_committed(self._uri):
+            return f"delta:{batch_id}:already-committed"
         written = sink.write(table, self._uri)
-        sink.commit(WriteManifest((written,)), self._uri)
+        sink.commit(WriteManifest((written,), schema=table.schema), self._uri)
         return f"delta:{batch_id}:{written.rows}"
 
     def close(self) -> None:

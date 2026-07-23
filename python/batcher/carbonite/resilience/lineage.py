@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["ShuffleLineage"]
+__all__ = ["ShuffleLineage", "SourcePlacement"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,3 +32,45 @@ class ShuffleLineage:
     def reincarnate(self) -> ShuffleLineage:
         """The lineage for a fresh recompute attempt (the next epoch)."""
         return ShuffleLineage(self.stage, self.src_partition, self.epoch + 1)
+
+
+class SourcePlacement:
+    """Which worker currently holds each shuffle source's latest map output.
+
+    The other half of the recovery coordinate `ShuffleLineage` carries: lineage says
+    *what* to regenerate and at which epoch, this says *where* the current copy lives.
+
+    It exists because the two are trivially equal until they aren't. On a clean run
+    source `s` is published by worker `s`, so a recovery loop can use one number for
+    both — and every such loop did. After a single recompute relocates `s` to a
+    survivor, the source id and its host diverge permanently, and code that still
+    conflates them marks the *original* (already-dead) worker on the next failure while
+    the genuinely dead host keeps looking alive. The recovery budget then drains
+    re-picking a host that cannot answer, and the stage fails with `ResourceError`
+    despite survivors being available. Keeping the mapping explicit is what makes the
+    second failure of a relocated source recoverable.
+    """
+
+    __slots__ = ("_hosts", "_workers")
+
+    def __init__(self, workers: int) -> None:
+        self._workers = workers
+        # Only relocated sources are stored; an absent entry means "still on its own
+        # worker", so a clean run allocates nothing and behaves exactly as before.
+        self._hosts: dict[int, int] = {}
+
+    def host_of(self, src: int) -> int:
+        """The worker holding `src`'s latest output — `src` itself until it moves."""
+        return self._hosts.get(src, src)
+
+    def sources_on(self, host: int) -> set[int]:
+        """The sources whose latest output lives on `host` — what its death loses.
+
+        A dead worker loses the map output it was holding, but which source that is
+        depends on the current placement rather than on the host id.
+        """
+        return {s for s in range(self._workers) if self.host_of(s) == host}
+
+    def relocate(self, src: int, host: int) -> None:
+        """Record that `src` was recomputed onto `host`."""
+        self._hosts[src] = host

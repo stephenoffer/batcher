@@ -12,10 +12,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from batcher.api.io_namespace._discovery import (
+    PathLike,
+    namespace_dir,
+    namespace_repr,
+    unknown_attribute,
+)
 from batcher.api.session import read as _read
 from batcher.api.session import read_table as _read_table
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from batcher.api.dataset import Dataset
 
 __all__ = ["Reader", "read"]
@@ -34,7 +42,9 @@ class Reader:
     ``bt.read(path)`` infers the format from the URI scheme or file extension;
     ``bt.read.<format>(...)`` is the explicit, discoverable spelling. File/object
     formats take a path; catalog/SQL/NoSQL/streaming sources take their own
-    connector arguments.
+    connector arguments. A path may be a string, a `pathlib.Path`, or a list of
+    either. Every file format also accepts ``columns=`` and ``n_rows=`` (spelled
+    ``usecols=``/``nrows=`` if you come from pandas), whatever else it takes.
 
     Examples:
         .. doctest::
@@ -48,12 +58,33 @@ class Reader:
 
     __slots__ = ()
 
-    def __call__(self, path: str, *, format: str | None = None, **opts: Any) -> Dataset:
+    def __repr__(self) -> str:
+        """List the formats this namespace reads, grouped by family."""
+        return namespace_repr(self, "bt.read")
+
+    def __dir__(self) -> list[str]:
+        """Every format method, so tab-completion shows the readable formats."""
+        return namespace_dir(self)
+
+    def __getattr__(self, name: str) -> Any:
+        """Answer a misspelled format with a suggestion instead of a bare `AttributeError`.
+
+        Only ever reached on a miss, so it cannot shadow a real method. A `_`-prefixed
+        name still raises `AttributeError` — `copy`, `pickle`, and IPython probe for those
+        and require a miss to look like a miss.
+        """
+        raise unknown_attribute(self, "bt.read", name)
+
+    def __call__(
+        self, path: PathLike | Sequence[PathLike], *, format: str | None = None, **opts: Any
+    ) -> Dataset:
         r"""Read a file/object-store dataset, dispatching on `format` or the path.
 
         With no `format`, it is inferred from the URI scheme (``delta://``…) or the
         file extension. ``bt.read("s3://b/*.parquet")`` → Parquet;
-        ``bt.read("data/", format="csv")``.
+        ``bt.read("data/", format="csv")``. `path` may be a string, a `pathlib.Path`,
+        or a list of either — a list is read as one relation, its format taken from
+        the first entry.
 
         Examples:
             .. doctest::
@@ -89,7 +120,7 @@ class Reader:
         return _read_table(format, *args, **opts)
 
     # --- File / object-store formats (path-addressed) ----------------------
-    def parquet(self, path: str, **opts: Any) -> Dataset:
+    def parquet(self, path: PathLike, **opts: Any) -> Dataset:
         """Read a Parquet file, directory, or glob (e.g. ``d/*.parquet``).
 
         Kyber pushes column projection and row-group predicates into the read, so a
@@ -114,7 +145,7 @@ class Reader:
         """
         return _read(path, format="parquet", **opts)
 
-    def parquet_dataset(self, path: str, **opts: Any) -> Dataset:
+    def parquet_dataset(self, path: PathLike, **opts: Any) -> Dataset:
         """Read a (Hive-)partitioned Parquet dataset directory.
 
         Partition columns are recovered from the directory layout, and projection plus
@@ -143,16 +174,26 @@ class Reader:
         """
         return _read(path, format="parquet_dataset", **opts)
 
-    def csv(self, path: str, **opts: Any) -> Dataset:
+    def csv(self, path: PathLike, **opts: Any) -> Dataset:
         r"""Read a CSV file, directory, or glob (e.g. ``d/*.csv``).
 
         The header row and column types are auto-inferred; column projection is pushed
         into the read and a single large file is split into newline-aligned byte ranges
         for parallel parsing.
 
+        Types are inferred from the file's **first block**, which is what pyarrow's
+        streaming reader commits to and what DuckDB and Polars sample. A column that is
+        integral for a million rows and then holds ``"N/A"`` was therefore inferred wrong,
+        and the read fails with a message naming this. Pass ``schema=`` to declare the
+        types when inference cannot reach them — every read path (whole-file, streaming,
+        and each byte-range split) is pinned to the advertised schema, so they cannot
+        disagree with it or with each other.
+
         Args:
             path: A CSV file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source.
+            opts: Format-specific reader options forwarded to the source — notably
+                ``schema`` (a `pyarrow.Schema` declaring the column types) and
+                ``on_error``.
 
         Returns:
             A lazy `Dataset` over the CSV source.
@@ -168,7 +209,7 @@ class Reader:
         """
         return _read(path, format="csv", **opts)
 
-    def json(self, path: str, **opts: Any) -> Dataset:
+    def json(self, path: PathLike, **opts: Any) -> Dataset:
         r"""Read newline-delimited JSON: a file, directory, or glob.
 
         One JSON object per line; column types are inferred from the records.
@@ -191,7 +232,7 @@ class Reader:
         """
         return _read(path, format="json", **opts)
 
-    def orc(self, path: str, **opts: Any) -> Dataset:
+    def orc(self, path: PathLike, **opts: Any) -> Dataset:
         """Read ORC file(s) — file, directory, or glob — with column projection pushed in.
 
         Args:
@@ -213,7 +254,7 @@ class Reader:
         """
         return _read(path, format="orc", **opts)
 
-    def arrow(self, path: str, **opts: Any) -> Dataset:
+    def arrow(self, path: PathLike, **opts: Any) -> Dataset:
         """Read Arrow/Feather IPC file(s) — file, directory, or glob — zero-copy into the engine.
 
         Args:
@@ -235,7 +276,7 @@ class Reader:
         """
         return _read(path, format="arrow", **opts)
 
-    def avro(self, path: str, **opts: Any) -> Dataset:
+    def avro(self, path: PathLike, **opts: Any) -> Dataset:
         """Read Avro file(s): a file, directory, or glob.
 
         Needs the optional extra: ``pip install 'batcher-engine[avro]'``.
@@ -255,7 +296,7 @@ class Reader:
         """
         return _read(path, format="avro", **opts)
 
-    def lance(self, path: str, **opts: Any) -> Dataset:
+    def lance(self, path: PathLike, **opts: Any) -> Dataset:
         """Read a Lance dataset (columnar ML format) by directory path.
 
         Needs the optional extra: ``pip install 'batcher-engine[lance]'``.
@@ -275,7 +316,7 @@ class Reader:
         """
         return _read(path, format="lance", **opts)
 
-    def excel(self, path: str, **opts: Any) -> Dataset:
+    def excel(self, path: PathLike, **opts: Any) -> Dataset:
         """Read Excel workbook(s) — a file, directory, or glob — via python-calamine.
 
         Needs the optional extra: ``pip install 'batcher-engine[excel]'``.
@@ -295,7 +336,7 @@ class Reader:
         """
         return _read(path, format="excel", **opts)
 
-    def xml(self, path: str, **opts: Any) -> Dataset:
+    def xml(self, path: PathLike, **opts: Any) -> Dataset:
         """Read XML file(s) — a file, directory, or glob — into columnar rows.
 
         Needs the optional extra: ``pip install 'batcher-engine[xml]'``.
@@ -315,7 +356,7 @@ class Reader:
         """
         return _read(path, format="xml", **opts)
 
-    def logs(self, path: str, **opts: Any) -> Dataset:
+    def logs(self, path: PathLike, **opts: Any) -> Dataset:
         """Read line-delimited log file(s) as rows, one raw line per row by default.
 
         Pass ``pattern=`` to extract fields with a grok pattern instead.
@@ -339,7 +380,7 @@ class Reader:
         """
         return _read(path, format="logs", **opts)
 
-    def text(self, path: str, **opts: Any) -> Dataset:
+    def text(self, path: PathLike, **opts: Any) -> Dataset:
         r"""Read text file(s) as rows, one row per line by default.
 
         Args:
@@ -361,7 +402,7 @@ class Reader:
         """
         return _read(path, format="text", **opts)
 
-    def binary(self, path: str, **opts: Any) -> Dataset:
+    def binary(self, path: PathLike, **opts: Any) -> Dataset:
         """Read whole files as ``{uri, bytes, size, mime}`` rows.
 
         The entry point for custom/multimodal decoding of arbitrary file(s).
@@ -384,7 +425,7 @@ class Reader:
         """
         return _read(path, format="binary", **opts)
 
-    def documents(self, path: str, **opts: Any) -> Dataset:
+    def documents(self, path: PathLike, **opts: Any) -> Dataset:
         """Read PDF document(s) — a file, directory, or glob — as extracted text rows.
 
         Needs the optional extra: ``pip install 'batcher-engine[pdf]'``.
@@ -404,7 +445,7 @@ class Reader:
         """
         return _read(path, format="documents", **opts)
 
-    def numpy(self, path: str, **opts: Any) -> Dataset:
+    def numpy(self, path: PathLike, **opts: Any) -> Dataset:
         """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows.
 
         Args:
@@ -425,7 +466,106 @@ class Reader:
         """
         return _read(path, format="numpy", **opts)
 
-    def webdataset(self, path: str, **opts: Any) -> Dataset:
+    def point_cloud(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read LiDAR / point-cloud file(s) — ``.pcd`` / ``.ply`` / raw ``.bin`` — as points.
+
+        The native robotics / autonomous-driving point-cloud formats, with no third-party
+        dependency. Each file is one frame; every point becomes a row with a column per
+        field (``x``/``y``/``z``/``intensity``/…) plus a ``frame`` column naming the source
+        file — so region cropping, ground-plane removal, and voxel binning are native
+        operators, and a directory of sweeps stays separable via ``group_by("frame")``.
+
+        Args:
+            path: a point-cloud file, directory, or glob.
+            opts: ``columns`` (field names for a raw ``.bin`` layout, default
+                ``("x", "y", "z", "intensity")``), ``dtype`` (``.bin`` element type),
+                and ``frame_column`` (the appended source-file column; ``None`` to omit).
+
+        Returns:
+            A lazy `Dataset` of point rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, tempfile, os, numpy as np
+                >>> p = os.path.join(tempfile.mkdtemp(), "sweep.bin")
+                >>> np.array([[1, 2, 3, 0.5]], dtype=np.float32).tofile(p)
+                >>> bt.read.point_cloud(p, frame_column=None).to_pydict()
+                {'x': [1.0], 'y': [2.0], 'z': [3.0], 'intensity': [0.5]}
+        """
+        return _read(path, format="point_cloud", **opts)
+
+    def mcap(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read MCAP robot / vehicle log(s) — the ROS 2 and ADAS recording format — as messages.
+
+        One log multiplexes every sensor as timestamped messages on named topics, so a row
+        is a *message*: ``{topic, log_time, publish_time, sequence, schema_name,
+        message_encoding, data}``. Payloads stay encoded in ``data``, so a query that wants
+        ``/gps`` never pays to deserialize ``/camera``.
+
+        The container is indexed, which this reader exploits: ``row_count`` and the
+        ``log_time`` bounds come from the summary without reading a message, and a filter on
+        ``topic`` or ``log_time`` is pushed into the reader as a seek. Naming `topics` up
+        front does the same thing explicitly.
+
+        The multi-sensor idiom follows: filter to the topics you want, then `join_asof` them
+        on ``log_time`` to align sensors sampled at different rates.
+
+        Args:
+            path: an ``.mcap`` file, directory, or glob.
+            opts: ``topics`` (restrict the read to these topic names) and ``on_error``
+                (``"raise"``, or ``"skip"`` to drop an unreadable log and carry on).
+
+        Returns:
+            A lazy `Dataset` of message rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> from batcher import col  # doctest: +SKIP
+                >>> log = bt.read.mcap("s3://drives/2026-07-18/")  # doctest: +SKIP
+                >>> imu = log.filter(col("topic") == "/imu")  # doctest: +SKIP
+                >>> lidar = log.filter(col("topic") == "/lidar/top")  # doctest: +SKIP
+                >>> # Align the 100 Hz IMU onto each 10 Hz LiDAR sweep.
+                >>> aligned = lidar.join_asof(imu, on="log_time")  # doctest: +SKIP
+        """
+        return _read(path, format="mcap", **opts)
+
+    def mdf(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read ASAM MDF4 (``.mf4``) vehicle measurement(s) — CAN/LIN and sensor channels.
+
+        MDF is what automotive OEMs and test fleets log to. A file holds several *channel
+        groups*, each with its own sampling raster, so this reads **long format** — one row
+        per signal sample, ``{signal, timestamp, value, unit}`` — giving one schema for the
+        whole file however many rasters it has. Widening it into one table would mean
+        resampling (inventing data) or nulls at every raster boundary; resampling stays an
+        explicit choice you make.
+
+        ``timestamp`` is absolute, so a measurement as-of joins against an MCAP log from the
+        same drive. ``value`` is ``float64``; non-numeric diagnostic channels are skipped and
+        `signals()` lists what is actually readable.
+
+        Args:
+            path: an ``.mf4`` file, directory, or glob.
+            opts: ``signals`` (restrict to these channel names — the usual case, since a
+                measurement carries thousands) and ``on_error``.
+
+        Returns:
+            A lazy `Dataset` of signal samples.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> from batcher import col  # doctest: +SKIP
+                >>> speed = ["VehicleSpeed"]
+                >>> m = bt.read.mdf("s3://fleet/drive.mf4", signals=speed)  # doctest: +SKIP
+                >>> hard_braking = m.filter(col("value") < 5.0)  # doctest: +SKIP
+        """
+        return _read(path, format="mdf", **opts)
+
+    def webdataset(self, path: PathLike, **opts: Any) -> Dataset:
         """Read WebDataset ``.tar`` shard(s), grouping each sample's member files into one row.
 
         Args:
@@ -443,7 +583,30 @@ class Reader:
         """
         return _read(path, format="webdataset", **opts)
 
-    def hdf5(self, path: str, **opts: Any) -> Dataset:
+    def tfrecord(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read TFRecord file(s) — the Waymo Open Dataset / TFDS / RLDS container format.
+
+        Each length-prefixed, CRC-checked record becomes a row in a ``record`` binary
+        column (the raw serialized payload — commonly a ``tf.train.Example`` protobuf);
+        decode it downstream with a `map_batches`. CRC verification uses ``crc32c`` when
+        installed. Reads records with no TensorFlow dependency.
+
+        Args:
+            path: a ``.tfrecord``/``.tfrecords`` file, directory, or glob.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` with one row per record.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.tfrecord("gs://waymo_open_dataset/*.tfrecord")  # doctest: +SKIP
+        """
+        return _read(path, format="tfrecord", **opts)
+
+    def hdf5(self, path: PathLike, **opts: Any) -> Dataset:
         """Read HDF5 file(s) — a file, directory, or glob — with datasets as columns.
 
         Needs the optional extra: ``pip install 'batcher-engine[hdf5]'``.
@@ -463,7 +626,7 @@ class Reader:
         """
         return _read(path, format="hdf5", **opts)
 
-    def zarr(self, path: str, **opts: Any) -> Dataset:
+    def zarr(self, path: PathLike, **opts: Any) -> Dataset:
         """Read a Zarr store (chunked n-dimensional arrays) by path.
 
         Needs the optional extra: ``pip install 'batcher-engine[zarr]'``.
@@ -485,7 +648,12 @@ class Reader:
 
     # --- Multimodal --------------------------------------------------------
     def images(
-        self, path: str, *, decode: bool = False, size: tuple[int, int] | None = None, **opts: Any
+        self,
+        path: PathLike,
+        *,
+        decode: bool = False,
+        size: tuple[int, int] | None = None,
+        **opts: Any,
     ) -> Dataset:
         """List image file(s) as ``{uri, bytes, size, mime}`` + header-metadata rows.
 
@@ -514,7 +682,12 @@ class Reader:
         return _decode(ds, "image_tensor_dataset", size=size) if (decode or size) else ds
 
     def audio(
-        self, path: str, *, decode: bool = False, sample_rate: int | None = None, **opts: Any
+        self,
+        path: PathLike,
+        *,
+        decode: bool = False,
+        sample_rate: int | None = None,
+        **opts: Any,
     ) -> Dataset:
         """List audio file(s) + header-metadata rows.
 
@@ -544,7 +717,7 @@ class Reader:
 
     def video(
         self,
-        path: str,
+        path: PathLike,
         *,
         decode: bool = False,
         size: tuple[int, int] | None = None,
@@ -718,15 +891,55 @@ class Reader:
         return _read_table("delta_sharing", url, **opts)
 
     # --- SQL / warehouses --------------------------------------------------
-    def sql(self, query: str | None = None, **opts: Any) -> Dataset:
-        """Read any ADBC/FlightSQL database in a single submission.
+    def sql(
+        self,
+        query: str | None = None,
+        *,
+        uri: str | None = None,
+        connection: Any = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read any SQL database from a standard connection URI, in a single submission.
 
-        Supply a SQL ``query`` positionally or ``table=`` to read a whole table; the
-        connection is given via ``uri=`` / driver options.
+        The URI vocabulary is SQLAlchemy's — the same string that works in
+        ``sqlalchemy.create_engine``, pandas' ``read_sql``, or an existing
+        ``$DATABASE_URL`` — and Batcher routes it to whichever backend can serve it:
+        ADBC for databases with an Arrow-native driver (PostgreSQL, SQLite, DuckDB,
+        Snowflake, BigQuery, FlightSQL), ConnectorX for the rest (MySQL, SQL Server,
+        Oracle, Redshift, Trino). You do not choose the backend; the scheme does.
+
+        Kyber pushes the projection and the filter into the SQL that is actually
+        submitted, so the database does the work and only the surviving rows and columns
+        cross the wire. `schema()` costs nothing — it uses a zero-row probe rather than
+        running your query a second time.
+
+        Pass ``password="env:PGPASSWORD"`` rather than embedding a password in the URI:
+        the reference is what travels to workers, and it becomes a secret only where the
+        connection is opened. For a database with no Arrow-native driver at all, use
+        ``bt.read.table("dbapi", module="psycopg", ...)``.
+
+        A single query is a single stream, however large the table. To extract in
+        parallel, name an indexed numeric column and its approximate range —
+        ``partition_on="id", lower_bound=1, upper_bound=1_000_000, num_partitions=8`` —
+        and the read becomes that many independent queries, one per worker. The spelling
+        is Spark's JDBC reader's, and so are the semantics: **the bounds are cut points,
+        not filters.** Rows outside them are still read (the first partition is unbounded
+        below, the last unbounded above, and NULL keys ride in the first), so approximate
+        bounds cost skew rather than rows.
+
+        You can also hand it a connection you already have, exactly as
+        ``pandas.read_sql(query, con)`` does — a PEP 249 connection or a SQLAlchemy
+        ``Engine``/``Connection``, which is unwrapped for you. That reads through the
+        DB-API path, so it stays on this process and cannot be partitioned; `uri=` is
+        what scales out.
 
         Args:
             query: SQL text to execute, or ``None`` when reading via ``table=``.
-            opts: Connection (``uri=``) and driver options passed as keywords.
+            uri: A connection URI, e.g. ``"postgresql://user@host:5432/mydb"``.
+            connection: An already-open PEP 249 connection or SQLAlchemy handle.
+                Mutually exclusive with `uri`.
+            opts: Further options — ``table=``, ``password=``, the partitioning
+                keywords above, or any driver-specific keyword.
 
         Returns:
             A lazy `Dataset` over the query or table result.
@@ -739,8 +952,49 @@ class Reader:
                 ...     "SELECT * FROM events WHERE country = 'US'",
                 ...     uri="postgresql://localhost:5432/app",
                 ... )
+
+                >>> ds = bt.read.sql(  # doctest: +SKIP
+                ...     "SELECT * FROM orders",
+                ...     uri="postgresql://svc@warehouse:5432/shop",
+                ...     password="env:PGPASSWORD",
+                ... )
         """
-        return _read_table("adbc", query, **opts)
+        # Bound by name, not positionally: `ADBCSource`'s first field is `driver`, so a
+        # positional `query` silently became the driver name. Same bug as `bigquery` below.
+        if connection is not None:
+            if uri is not None:
+                from batcher._internal.errors import BackendError
+
+                raise BackendError(
+                    "pass either uri= or connection=, not both: they name two different "
+                    "databases with no way to tell which you meant."
+                )
+            # `pandas.read_sql(query, con)` spelled here. A live connection can only be
+            # used by this process, so it goes to the DB-API source, which reads on one
+            # worker and refuses to be partitioned.
+            return _read_table("dbapi", query=query, connection=connection, **opts)
+        if uri is not None:
+            from batcher.io.formats.sql.uri import parse_uri
+
+            if parse_uri(uri).backend == "connectorx":
+                # ConnectorX takes credentials *inside* its URI, so it gets the original
+                # string rather than the password-stripped one `parse_uri` returns. It has
+                # no separate password channel, and silently dropping one would leave the
+                # user with an unauthenticated connection attempt and no idea why.
+                if "password" in opts:
+                    from batcher._internal.errors import BackendError
+
+                    raise BackendError(
+                        f"the {parse_uri(uri).scheme!r} backend has no separate password "
+                        "channel: embed the credential in the URI "
+                        "(mysql://user:pw@host/db), or keep the whole URI in a secret and "
+                        "pass the reference directly to the backend — "
+                        "bt.read.table('connectorx', query=..., conn_uri='env:MYSQL_URL'). "
+                        "The reference cannot go in uri= here, which must be a real URI."
+                    )
+                return _read_table("connectorx", query=query, conn_uri=uri, **opts)
+            return _read_table("adbc", query=query, uri=uri, **opts)
+        return _read_table("adbc", query=query, **opts)
 
     def snowflake(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a Snowflake SQL query, fetching result chunks in parallel as Arrow.
@@ -804,10 +1058,16 @@ class Reader:
 
                 >>> import batcher as bt
                 >>> ds = bt.read.bigquery(  # doctest: +SKIP
-                ...     "SELECT * FROM `project.dataset.events`"
+                ...     "SELECT * FROM `project.dataset.events`", project="my-project"
                 ... )
         """
-        return _read_table("bigquery", query, **opts)
+        # Bind `query` by name. `BigQuerySource`'s first field is `project`, so passing it
+        # positionally sent the SQL text into `project` — and a caller who also passed
+        # `project=` (as they must) got "multiple values for argument 'project'" instead of
+        # a query.
+        if query is not None:
+            opts["query"] = query
+        return _read_table("bigquery", **opts)
 
     def clickhouse(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a ClickHouse SQL query over the Arrow-native interface.
@@ -1051,7 +1311,7 @@ class Reader:
             "eventhubs", topic, connection_str=connection_str, consumer_group=consumer_group, **opts
         )
 
-    def files_incremental(self, path: str, file_format: str, **opts: Any) -> Dataset:
+    def files_incremental(self, path: PathLike, file_format: str, **opts: Any) -> Dataset:
         """Incrementally discover and read newly arrived files under `path`.
 
         A Databricks Auto Loader analog: tracks already-seen files across runs.

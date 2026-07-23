@@ -14,13 +14,12 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 
 @pytest.mark.parametrize("morsel_rows", [1, 3, 16])
 def test_filter_project_tiny_morsels_vs_duckdb(duck, morsel_rows):
-    from conftest import assert_same
-
     t = pa.table({"x": list(range(64)), "y": [i * 10 for i in range(64)]})
     duck.register("t", t)
 
@@ -34,8 +33,6 @@ def test_filter_project_tiny_morsels_vs_duckdb(duck, morsel_rows):
 @pytest.mark.parametrize("morsel_rows", [1, 4, 16])
 def test_group_by_tiny_morsels_vs_duckdb(duck, morsel_rows):
     """Tiny morsels force many partial aggregates to combine — the mergeable path."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "dept": ["eng", "sales", "eng", "ops", "sales", "eng", "ops", "eng"],

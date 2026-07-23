@@ -89,10 +89,13 @@ use crate::compile::{compile, compile_simd};
 use crate::kleene::{is_null_propagating, needs_kleene};
 
 mod analyze;
+mod cache;
 mod compile;
 mod emit;
 mod kleene;
 mod simd;
+
+pub use crate::cache::compile_expr_cached;
 
 /// Errors surfaced by the JIT backend. `Unsupported` is the signal for the
 /// caller to fall back to the interpreter; the rest are genuine failures.
@@ -1040,6 +1043,107 @@ mod tests {
             let expr = bin(op, col("a"), col("b"));
             // assert_parity already checks the JIT equals the interpreter oracle.
             assert_parity(&expr, &batch);
+        }
+    }
+
+    /// The interpreter canonicalizes float operands (`bc_arrow::canon_f64` — `-0.0` folds
+    /// into `0.0`, every NaN sign/payload folds into one) and then compares with Arrow's
+    /// `cmp` kernel, i.e. `f64::total_cmp`. This pins the JIT to that same relation on the
+    /// scalar emitter and the SIMD emitter at every pinned width, over the values where the
+    /// alternatives visibly differ:
+    ///   * `-0.0` vs `0.0` — one value (keying the *raw* bits splits them);
+    ///   * a *negative* NaN vs a finite — greatest (the raw-bit order ranks it below `-inf`);
+    ///   * two NaNs of differing sign/payload — equal (raw-bit equality calls them distinct).
+    ///
+    /// It asserts *parity against the interpreter oracle*, not hardcoded answers, so it is
+    /// the guard that the two tiers cannot drift apart — whatever the semantics are.
+    #[test]
+    fn float_comparison_canonical_order_signed_zero_and_nan_signs() {
+        use arrow::array::BooleanArray;
+        use bc_arrow::SimdOverride;
+
+        let pnan = f64::NAN; // 0x7ff8_0000_0000_0000, positive
+        let nnan = f64::from_bits(0xfff8_0000_0000_0007); // negative NaN, payload 7
+        let pnan2 = f64::from_bits(0x7ff8_0000_0000_0001); // positive NaN, payload 1
+                                                           // Column pairs spanning the interesting orderings: signed zeros, both NaN
+                                                           // signs against finite values, and NaN-vs-NaN of equal / differing bits.
+        let a = vec![
+            -0.0,
+            0.0,
+            nnan,
+            pnan,
+            nnan,
+            pnan,
+            nnan,
+            0.0,
+            f64::NEG_INFINITY,
+            pnan2,
+        ];
+        // Last pair: two *positive* NaNs of differing payload — canonicalization folds them
+        // to one value, so `=` is true / `<`,`>` false, and the JIT must agree with the oracle.
+        let b = vec![0.0, -0.0, 1.0, 1.0, pnan, nnan, nnan, pnan, nnan, pnan];
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(a)),
+                Arc::new(Float64Array::from(b)),
+            ],
+        )
+        .unwrap();
+
+        // Every emitter the dispatch can pick: forced scalar, and each vector width.
+        let plans = [
+            SimdOverride {
+                force_scalar: true,
+                ..Default::default()
+            },
+            SimdOverride {
+                lanes: 2,
+                unroll: 1,
+                force_scalar: false,
+            },
+            SimdOverride {
+                lanes: 4,
+                unroll: 2,
+                force_scalar: false,
+            },
+            SimdOverride {
+                lanes: 8,
+                unroll: 1,
+                force_scalar: false,
+            },
+        ];
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ] {
+            for (l, r) in [("a", "b"), ("b", "a")] {
+                let expr = bin(op, col(l), col(r));
+                let oracle = expr.eval(&batch).unwrap();
+                let want = oracle.as_any().downcast_ref::<BooleanArray>().unwrap();
+                for over in plans {
+                    let compiled =
+                        compile_expr_with(&expr, &batch, over).expect("float comparison compiles");
+                    let got = compiled.eval(&batch).unwrap();
+                    let got = got.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    for i in 0..batch.num_rows() {
+                        assert_eq!(
+                            got.value(i),
+                            want.value(i),
+                            "op={op:?} {l} vs {r} row {i} simd={over:?}: JIT must match \
+                             the interpreter's total-order float comparison"
+                        );
+                    }
+                }
+            }
         }
     }
 

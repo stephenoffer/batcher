@@ -6,6 +6,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -21,8 +22,6 @@ def _t(duck, name="t"):
 
 
 def test_collapse_adjacent_windows(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w1")
     out = (
         ds.window(partition_by=["g"], order_by=["v"], functions={"r": "row_number"})
@@ -39,8 +38,6 @@ def test_collapse_adjacent_windows(duck):
 
 
 def test_push_filter_through_window(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w2")
     out = (
         ds.window(partition_by=["g"], order_by=["v"], functions={"r": "row_number"})
@@ -59,8 +56,6 @@ def test_push_filter_through_window(duck):
 
 
 def test_push_filter_through_window_mixed_predicate(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w3")
     # g (partition) is pushable; v (non-partition) stays above — result must be unchanged.
     out = (
@@ -80,32 +75,24 @@ def test_push_filter_through_window_mixed_predicate(duck):
 
 
 def test_distinct_over_scalar_aggregate(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w4")
     out = ds.agg(s=col("v").sum()).distinct().collect()
     assert_same(out, duck.sql("SELECT DISTINCT (SELECT sum(v) FROM w4) AS s"))
 
 
 def test_rename_into_aggregate(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w5")
     out = ds.rename({"v": "val"}).group_by("g").agg(s=col("val").sum()).collect()
     assert_same(out, duck.sql("SELECT g, sum(v) s FROM w5 GROUP BY g"))
 
 
 def test_nested_cast(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w6")
     out = ds.with_columns(c=col("g").cast("int64").cast("int64")).select("g", "c").collect()
     assert_same(out, duck.sql("SELECT g, CAST(CAST(g AS BIGINT) AS BIGINT) c FROM w6"))
 
 
 def test_or_to_in_range(duck):
-    from conftest import assert_same
-
     ds = _t(duck, "w7")
     # In-range and absent members; result must match plain IN semantics.
     out = ds.filter(col("v").is_in([20, 50, 999])).select("g", "v").collect()
@@ -113,8 +100,6 @@ def test_or_to_in_range(duck):
 
 
 def test_join_to_semijoin_with_fanout(duck):
-    from conftest import assert_same
-
     emp = pa.table(
         {"id": pa.array([1, 2, 3, 4], pa.int64()), "dept": pa.array([10, 20, 10, 30], pa.int64())}
     )
@@ -139,8 +124,6 @@ def test_join_to_semijoin_with_fanout(duck):
 
 
 def test_transitive_predicate_inference(duck):
-    from conftest import assert_same
-
     a = pa.table(
         {"k": pa.array([1, 2, 3, 4], pa.int64()), "av": pa.array([10, 20, 30, 40], pa.int64())}
     )
@@ -169,8 +152,6 @@ def test_transitive_predicate_inference(duck):
 
 
 def test_pre_aggregation_through_join(duck):
-    from conftest import assert_same
-
     fact = pa.table(
         {
             "k": pa.array([1, 1, 1, 2, 2, 3], pa.int64()),

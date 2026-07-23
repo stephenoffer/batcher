@@ -7,9 +7,9 @@ streaming/unknown operators fall back to the global budget in the data plane.
 from __future__ import annotations
 
 import batcher as bt
+from batcher.kyber.annotate import annotate_ops
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
-from batcher.kyber.annotate import annotate_ops
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
 from batcher.plan.resource import ResourceBounds

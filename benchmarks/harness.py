@@ -334,7 +334,12 @@ def compare(
                 ok, msg = rowsets_match(ref_rows, to_rowset(out, classes))
             result.engines[engine].correct = ok
             if not ok:
-                mismatches.append(f"{engine} != {ref_engine}: {msg}")
+                # `msg` comes from `rowsets_match(ref, other)` and reads "<ref> vs <other>",
+                # so the names must lead with `ref_engine` too. Written the other way round
+                # this line reported every mismatch with the two engines' values SWAPPED —
+                # which is how "Daft computes q6 wrong" got recorded as Batcher's bug and back
+                # again. A diff that names the wrong culprit is worse than no diff.
+                mismatches.append(f"{ref_engine} != {engine}: {msg}")
         if mismatches:
             result.status = "FAILED"
             result.note = " ; ".join(mismatches)

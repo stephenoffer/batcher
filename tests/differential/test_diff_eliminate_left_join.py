@@ -7,12 +7,11 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 def test_left_join_to_groupby_unused(duck):
-    from conftest import assert_same
-
     fact = pa.table({"k": [1, 2, 2, 3, 9], "v": [10, 20, 30, 40, 50]})
     dimraw = pa.table({"k": [1, 1, 2, 2, 3], "p": [5, 6, 7, 8, 9]})
     duck.register("fact", fact)
@@ -28,8 +27,6 @@ def test_left_join_to_groupby_unused(duck):
 
 
 def test_left_join_distinct_unused(duck):
-    from conftest import assert_same
-
     fact = pa.table({"k": [1, 2, 2, 5], "v": [1, 2, 3, 4]})
     dimraw = pa.table({"k": [1, 1, 2, 3]})
     duck.register("f2", fact)
@@ -43,8 +40,6 @@ def test_left_join_distinct_unused(duck):
 
 
 def test_derived_projection_over_eliminated_join(duck):
-    from conftest import assert_same
-
     fact = pa.table({"k": [1, 2, 3], "v": [10, 20, 30]})
     dimraw = pa.table({"k": [1, 2, 2, 3], "p": [1, 2, 3, 4]})
     duck.register("f3", fact)

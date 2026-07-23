@@ -32,8 +32,8 @@ def test_credit_ceiling_shrinks_for_wide_learned_rows():
     from batcher.carbonite.memory.learned import LearnedMemoryModel
     from batcher.carbonite.policies import (
         StaticCreditFlowControl,
-        _learned_channel_morsel_bytes,
         credit_ceiling,
+        learned_channel_morsel_bytes,
     )
 
     cfg = Config().replace(
@@ -50,7 +50,7 @@ def test_credit_ceiling_shrinks_for_wide_learned_rows():
         _spill_per_row={},
     )
     ctx = ResourceContext(config=cfg, memory_model=wide_model)
-    eff = _learned_channel_morsel_bytes(ctx)
+    eff = learned_channel_morsel_bytes(ctx)
     assert eff is not None and eff > cfg.execution.morsel_bytes
     assert credit_ceiling(cfg, eff) < narrow
     # The static policy grants the tighter window for the wide-row channel.
@@ -59,10 +59,26 @@ def test_credit_ceiling_shrinks_for_wide_learned_rows():
     assert wide_grant < narrow_grant
 
 
-def test_aimd_grows_additively_when_uncongested():
+def test_aimd_slow_starts_then_grows_additively():
+    # Before the first congestion the window is in slow-start and DOUBLES each headroom
+    # round (TCP slow-start) so it fills the bandwidth-delay product in log2 rounds; the
+    # first congestion exits slow-start into additive-increase (congestion avoidance).
     a = _aimd(default_credits=4, aimd_alpha=1)
-    assert a.observe(congested=False) == 5
-    assert a.observe(congested=False) == 6
+    assert a.observe(congested=False) == 8  # slow-start: 4 -> 8
+    assert a.observe(congested=False) == 16  # slow-start: 8 -> 16
+    assert a.observe(congested=True) == 8  # congestion: cut, and leave slow-start
+    assert a.observe(congested=False) == 9  # now additive: +alpha per round
+    assert a.observe(congested=False) == 10
+
+
+def test_aimd_warm_started_channel_skips_slow_start():
+    # A recurring shuffle warm-starts at a learned window that already reflects prior
+    # congestion; it must NOT slow-start (exponential ramp would overshoot that value).
+    a = AIMDFlowControl(
+        Config().replace(flow_control=FlowControlConfig(default_credits=4, aimd_alpha=1)),
+        initial_window=10,
+    )
+    assert a.observe(congested=False) == 11  # additive from the warm start, not 20
 
 
 def test_aimd_shrinks_multiplicatively_on_congestion():
@@ -83,9 +99,9 @@ def test_aimd_stays_within_band():
 
 def test_aimd_grant_ignores_request_and_returns_window():
     a = _aimd(default_credits=4)
-    a.observe(congested=False)  # window -> 5
+    a.observe(congested=False)  # slow-start: window -> 8
     rm = ResourceManager(flow_control=a)
-    assert rm.grant_credits(999) == 5  # AIMD owns the window, not the request
+    assert rm.grant_credits(999) == 8  # AIMD owns the window, not the request
 
 
 def test_unset_request_falls_back_to_default_window():
@@ -107,10 +123,16 @@ def test_oversized_request_is_clamped_to_ceiling():
 
 def test_window_is_config_driven():
     # The window tracks config, not a hardcoded constant — the single source of truth.
-    cfg = Config().replace(flow_control=FlowControlConfig(default_credits=16))
+    # Explicit factor + a generous byte budget so the count ceiling (not the byte cap)
+    # is what this asserts, independent of the shipped defaults.
+    cfg = Config().replace(
+        flow_control=FlowControlConfig(
+            default_credits=12, credit_ceiling_factor=8, credit_byte_budget=1 << 40
+        )
+    )
     with config_context(cfg):
-        assert ResourceManager().grant_credits(0) == 16
-        assert ResourceManager().grant_credits(10_000) == 16 * 16
+        assert ResourceManager().grant_credits(0) == 12
+        assert ResourceManager().grant_credits(10_000) == 12 * 8
 
 
 def test_grant_never_returns_zero():

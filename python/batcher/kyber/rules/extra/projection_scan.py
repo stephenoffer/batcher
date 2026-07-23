@@ -30,6 +30,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import Cast, Col, Expr, IsNotNull, IsNull, Not
+from batcher.plan.expr_ir.walk import column_occurrence_counts
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
     split_conjuncts,
@@ -228,20 +229,6 @@ def fold_nested_sample_same_seed(node: Sample, _ctx: OptimizerContext) -> Logica
 # --- projection/expression cleanups the merge/fold rules decline -------------
 
 
-def _occurrence_counts(exprs: list[Expr]) -> dict[str, int]:
-    """How many times each column name occurs across `exprs` (occurrences, not distinct)."""
-    counts: dict[str, int] = {}
-
-    def tally(e: Expr) -> Expr:
-        if isinstance(e, Col):
-            counts[e.name] = counts.get(e.name, 0) + 1
-        return e
-
-    for ex in exprs:
-        transform_expr_up(ex, tally)
-    return counts
-
-
 @rule(name="merge_projection_renames", phase=Phase.NORMALIZE, matches=(Project,))
 def merge_projection_renames(node: Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Project(Project(x))` → one `Project(x)` even when a *renamed* inner column is
@@ -257,7 +244,7 @@ def merge_projection_renames(node: Project, _ctx: OptimizerContext) -> LogicalPl
     inner = node.input
     if not isinstance(inner, Project):
         return None
-    counts = _occurrence_counts([it.expr for it in node.items])
+    counts = column_occurrence_counts([it.expr for it in node.items])
     multi = [it for it in inner.items if counts.get(it.alias, 0) > 1]
     if not multi:
         return None  # the ≤1-reference case is `merge_projections`' job

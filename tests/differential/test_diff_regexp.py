@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -17,8 +18,6 @@ def t(duck):
 
 
 def test_regexp_matches_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -32,16 +31,12 @@ def test_regexp_matches_vs_duckdb(duck, t):
 
 
 def test_regexp_replace_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     # Replacement without backreferences (DuckDB \1 vs regex $1 differ).
     out = bt.from_arrow(t).select(r=col("s").str.regexp_replace(r"\d+", "#")).collect()
     assert_same(out, duck.sql(r"SELECT regexp_replace(s, '\d+', '#') r FROM t"))
 
 
 def test_regexp_extract_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(

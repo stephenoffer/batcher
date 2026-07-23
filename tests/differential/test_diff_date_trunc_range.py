@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -40,8 +41,6 @@ _ALIGNED = {
 
 @pytest.mark.parametrize("unit", list(_ALIGNED))
 def test_date_trunc_eq_filter_vs_duckdb(duck, t, unit):
-    from conftest import assert_same
-
     lit = _ALIGNED[unit]
     out = bt.from_arrow(t).filter(col("ts").dt.truncate(unit) == lit).collect()
     expected = duck.sql(
@@ -53,8 +52,6 @@ def test_date_trunc_eq_filter_vs_duckdb(duck, t, unit):
 def test_unaligned_literal_still_matches_duckdb(duck, t):
     # A month literal on the 15th is unaligned: the rewrite must not fire, and the
     # (empty) result must still equal DuckDB's.
-    from conftest import assert_same
-
     lit = dt.datetime(2021, 6, 15)
     out = bt.from_arrow(t).filter(col("ts").dt.truncate("month") == lit).collect()
     expected = duck.sql(
@@ -65,8 +62,6 @@ def test_unaligned_literal_still_matches_duckdb(duck, t):
 
 def test_date_column_day_trunc_vs_duckdb(duck):
     # A DATE column (not timestamp): day-trunc equality rewrites to a date range.
-    from conftest import assert_same
-
     dates = [dt.date(2020, 1, 1) + dt.timedelta(days=i * 11) for i in range(40)]
     tbl = pa.table({"d": pa.array(dates, type=pa.date32()), "v": list(range(40))})
     duck.register("dt_tbl", tbl)

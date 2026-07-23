@@ -24,11 +24,14 @@ import tempfile
 import pyarrow as pa
 import pyarrow.fs as pafs
 
+from batcher.io.filesystem import resolve_filesystem
+
 __all__ = [
     "BLOB_URI_COLUMN",
     "default_blob_root",
     "materialize_and_drop_handle",
     "offload_blob_bytes",
+    "read_blob_bytes",
 ]
 
 # The default name of the URI-handle column an offload produces / a materialize reads.
@@ -44,8 +47,6 @@ def materialize_and_drop_handle(
     payload back in `into`, the temporary handle column gone), so an offload→breaker→
     materialize rewrite is schema-transparent end to end.
     """
-    from batcher.io.formats.multimodal.media import read_blob_bytes
-
     out = read_blob_bytes(batch, uri_col=uri_col, into=into)
     if uri_col in out.schema.names:
         out = out.drop_columns([uri_col])
@@ -115,3 +116,51 @@ def offload_blob_bytes(
 def _handle(root: str, digest: str) -> str:
     """The URI handle stored in the column — what `read_blob_bytes` reads back."""
     return f"{root.rstrip('/')}/{digest}"
+
+
+def read_blob_bytes(
+    batch: pa.RecordBatch, *, uri_col: str = "uri", into: str = "bytes"
+) -> pa.RecordBatch:
+    """Materialize file payloads for a batch of reference handles.
+
+    Reads each row's `uri_col` file and writes its bytes into the `into` column
+    (replacing it if present, else appending). Intended to run inside `map_batches`
+    *after* filtering/sampling reference-mode handles, so only the surviving rows'
+    payloads are ever read — and with a small ``batch_size``, only a few payloads
+    are resident at once. The bytes land in a `large_binary` column, so a batch of
+    GB-scale payloads cannot overflow 32-bit offsets.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher import col  # doctest: +SKIP
+            >>> from batcher.io import read_blob_bytes  # doctest: +SKIP
+            >>> ds = bt.read.video("s3://clips/", materialize_bytes=False)  # doctest: +SKIP
+            >>> big = ds.filter(col("size") < 500_000_000)  # doctest: +SKIP
+            >>> # ... metadata pruned first, so only surviving payloads are read.
+            >>> decoded = big.map_batches(read_blob_bytes, batch_size=4)  # doctest: +SKIP
+
+    Args:
+        batch: A batch of reference handles, one row per file.
+        uri_col: Column holding each row's file URI.
+        into: Column the payload bytes are written to.
+
+    Returns:
+        `batch` with `into` holding each row's file contents (null where the URI
+        is null).
+    """
+    uris = batch.column(uri_col).to_pylist()
+    blobs: list[bytes | None] = []
+    for u in uris:
+        if u is None:
+            blobs.append(None)
+            continue
+        with resolve_filesystem(u).open(u) as fh:
+            blobs.append(fh.read())
+    # `large_binary` (64-bit offsets) so a batch of GB payloads can't overflow the
+    # 2 GB limit of 32-bit `binary` — the whole point is large per-row payloads.
+    arr = pa.array(blobs, pa.large_binary())
+    if into in batch.schema.names:
+        return batch.set_column(batch.schema.get_field_index(into), into, arr)
+    return batch.append_column(into, arr)

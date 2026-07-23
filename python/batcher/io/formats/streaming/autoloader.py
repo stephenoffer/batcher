@@ -20,6 +20,16 @@ How it works:
 ``iter_batches()`` performs **one** discovery pass and yields the new files'
 batches; a streaming driver calls it repeatedly to keep ingesting. The schema is
 the schema of the chosen file format (sampled from the first available file).
+
+**A discovered file is not a processed file.** Discovery used to mark a file seen the
+moment it was *listed* — before a single row of it had been read, let alone written to a
+sink or committed. A query that died mid-epoch therefore came back to a store that already
+claimed those files, skipped them forever, and silently dropped the data; and because the
+source exposed no `seek`, no checkpoint could recover it. The durable store now records
+only what has been **published**: discovery holds new files as *pending*, and `confirm()`
+promotes them once the epoch that read them is committed. A crash leaves them unconfirmed,
+so the next pass finds them again and the sink's per-epoch transaction makes the replay
+idempotent — data loss traded for a replay that cannot double-write.
 """
 
 from __future__ import annotations
@@ -59,8 +69,20 @@ class IncrementalFileSource:
     """
 
     bounded = False  # the directory grows over time — an unbounded stream
+    #: A pass's new files are independent work units, so a micro-batch can be fanned
+    #: across the cluster one file per worker (see `dist.streaming.microbatch`).
+    partitionable = True
 
-    __slots__ = ("_format", "_fs", "_path", "_schema_cache", "_state_dir", "_suffix")
+    __slots__ = (
+        "_completed",
+        "_format",
+        "_fs",
+        "_path",
+        "_pending",
+        "_schema_cache",
+        "_state_dir",
+        "_suffix",
+    )
 
     def __init__(
         self,
@@ -76,6 +98,13 @@ class IncrementalFileSource:
         self._suffix = suffix if suffix is not None else _DEFAULT_SUFFIX.get(format, "")
         self._fs = resolve_filesystem(path)
         self._schema_cache: pa.Schema | None = None
+        # Files handed out by `discover()` whose epoch has not been published yet. They
+        # are withheld from later passes (so one run does not re-read them) but are *not*
+        # in the durable store, so a crash before the commit re-offers them.
+        self._pending: list[str] = []
+        # The subset of `_pending` whose every row has been emitted — what `confirm()`
+        # promotes to the durable store.
+        self._completed: list[str] = []
 
     # ---- discovery --------------------------------------------------------
     def _store(self) -> SeenStore:
@@ -99,17 +128,53 @@ class IncrementalFileSource:
         return [f for f in files if f > max_seen]
 
     def discover(self) -> list[str]:
-        """Return the list of new (unseen) files for the current pass.
+        """Return the new (unseen, not-yet-pending) files for the current pass.
 
-        Pure of side effects on the store except marking — exposed so a driver
-        can introspect what a pass found. Marks each returned file as seen.
+        Records them as *pending* — withheld from subsequent passes in this run, but not
+        yet durable. `confirm()` makes them durable once their epoch is published; until
+        then a restart re-offers them (see the module docstring).
         """
         with self._store() as store:
             candidates = self._list_candidates(store)
-            new_files = store.unseen(candidates)
-            for f in new_files:
+            held = set(self._pending)
+            new_files = [f for f in store.unseen(candidates) if f not in held]
+        self._pending.extend(new_files)
+        return new_files
+
+    def complete(self, files: list[str]) -> None:
+        """Mark `files` fully read — eligible to be confirmed once their epoch publishes.
+
+        A file is only safe to remember when *every* row of it has been emitted. Confirming
+        at discovery (or part-way through a large file) is what loses data: the store would
+        claim rows the sink never saw.
+        """
+        self._completed.extend(f for f in files if f not in self._completed)
+
+    def confirm(self) -> None:
+        """Durably mark the fully-read files as seen — their epoch is now published."""
+        if not self._completed:
+            return
+        with self._store() as store:
+            for f in self._completed:
                 store.mark(f, size=_safe_size(self._fs, f), mtime=_safe_mtime(f))
-            return new_files
+        done = set(self._completed)
+        self._pending = [f for f in self._pending if f not in done]
+        self._completed.clear()
+
+    def snapshot_position(self) -> dict:
+        """The files fully read but not yet durably confirmed (the write-ahead position)."""
+        return {"pending": list(self._completed)}
+
+    def seek(self, position: dict) -> None:
+        """Resume from a checkpointed position: its files were published, so confirm them.
+
+        Recovery restores the position of the last *committed* epoch. Those files reached
+        the sink, so they are durably seen — anything the previous run had merely
+        discovered stays unconfirmed and is picked up again.
+        """
+        self._completed = [str(f) for f in position.get("pending", [])]
+        self.confirm()
+        self._pending.clear()
 
     # ---- Source protocol --------------------------------------------------
     def schema(self) -> pa.Schema:
@@ -129,10 +194,21 @@ class IncrementalFileSource:
         return list(self.iter_batches(projection))
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        """Run one discovery pass; yield the new files' batches via the file reader."""
+        """Run one discovery pass; yield the new files' batches via the file reader.
+
+        A file is marked *complete* only after its final batch has been yielded, so a
+        `confirm()` between micro-batches can never promote a file whose rows are still
+        in flight.
+        """
         for path in self.discover():
             reader = SOURCES.get(self._format)(path)
             yield from reader.iter_batches(projection)
+            self.complete([path])
+        # Reaching here means the consumer drained the pass: under the streaming engine
+        # every batch yielded has been published (a publish precedes the next pull), and a
+        # direct reader has all the rows in hand. Either way the pass is durable. A crash
+        # part-way never gets here, which is exactly why the files stay replayable.
+        self.confirm()
 
     def row_count(self) -> int | None:
         return None  # the watched directory grows over time.
@@ -141,7 +217,12 @@ class IncrementalFileSource:
         return f"files_incremental:{self._format}:{self._path}"
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        """One :class:`FileSplit` per new file (locator-only, picklable)."""
+        """One :class:`FileSplit` per new file (locator-only, picklable).
+
+        The distributed streaming path fans these across the cluster, one worker per file,
+        and publishes the whole pass as a single transaction — so the epoch's files are
+        confirmed together or not at all.
+        """
         return [FileSplit(self._format, path) for path in self.discover()]
 
 

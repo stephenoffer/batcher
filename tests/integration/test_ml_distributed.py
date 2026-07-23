@@ -56,16 +56,18 @@ def test_map_resources_extracts_gpu_and_pool():
         num_gpus=2.0,
         concurrency=4,
     )
-    num_gpus, wants_pool, concurrency, accelerator_type = _map_resources(plan)
+    num_gpus, wants_pool, concurrency, accelerator_type, resources = _map_resources(plan)
     assert num_gpus == 2.0
     assert wants_pool is True
     assert concurrency == 4
     assert accelerator_type is None
+    # No custom accelerator requested — a GPU stage asks for `num_gpus`, not a named resource.
+    assert resources == {}
 
 
 def test_class_udf_implies_pool_without_explicit_concurrency():
     plan = MapBatches(input=bt.from_pydict({"x": [1]})._plan, fn=_TaggingModel)
-    _gpus, wants_pool, concurrency, _accel = _map_resources(plan)
+    _gpus, wants_pool, concurrency, _accel, _res = _map_resources(plan)
     assert wants_pool is True  # a factory UDF forces the build-once actor pool
     assert concurrency is None  # sized to the worker count at run time
 

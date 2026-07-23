@@ -22,7 +22,42 @@ from dataclasses import dataclass, field
 
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
-__all__ = ["SourceStatistics"]
+__all__ = ["SourceStatistics", "source_stats_key"]
+
+
+def source_stats_key(source: object) -> str | None:
+    """The key a source's *statistics* are stored under, or `None` if it has none.
+
+    A statistic must be attributed to the source it was measured from — a bare column name
+    identifies nothing, since two tables both have an `id` — so every learned column
+    statistic is qualified by this key. It is the same discipline the plan cache applies
+    (`kyber.plan_cache._source_keys`), and for the same reason:
+
+      - A source with a **data-stable** identity (a file path, a table URI) is keyed by it,
+        so what one run measures the next run reads back.
+      - A source whose identity is only *shape*-based — in-memory batches, keyed by schema
+        and row count — is keyed by **object identity** instead. Its `identity()` is
+        documented to collide across different relations of the same shape, and keying
+        statistics on it would re-create the very collision this exists to prevent. Such
+        data has no cross-run life anyway, so a process-local key loses nothing.
+      - A source that cannot key itself at all gets `None`: its statistics are simply not
+        learned, which is strictly better than filing them where another table reads them.
+
+    Args:
+        source: A bound input source.
+
+    Returns:
+        The stable key to qualify this source's statistics with, or `None`.
+    """
+    identity = getattr(source, "identity", None)
+    if not callable(identity):
+        return None
+    if not getattr(source, "stable_stats_identity", True):
+        return f"obj:{id(source)}"
+    try:
+        return f"id:{identity()}"
+    except Exception:  # pragma: no cover - a source that cannot key itself
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +80,22 @@ class SourceStatistics:
     sorted_by: tuple[str, ...] = ()
     partition_keys: tuple[str, ...] = ()
     exact_rows: bool = True
+    # How many physical blocks the source is stored in (Parquet row groups, ORC
+    # stripes) — the granularity a zone-map prune actually skips at, so a shortcut
+    # can report what a scan *would* have read without reading it.
+    row_group_count: int | None = None
+    # Whether this source's float min/max bounds account for NaN.
+    #
+    # This is the difference between a bound that can answer `max(f)` and one that
+    # cannot. SQL's total order — the one our own `ORDER BY` uses — makes NaN the
+    # *greatest* value, but the Parquet spec omits NaN from column statistics, so a
+    # footer's `max` is the largest **non-NaN** value and answering `max(f)` from it
+    # silently disagrees with executing the query. A source that computes its own
+    # bounds over the real values (an immutable in-memory relation) records NaN as
+    # the max and may say so here; a footer-derived one leaves this False and every
+    # float value-fact falls back to execution. Never set it unless the bounds were
+    # produced by an ordering that ranks NaN highest.
+    bounds_include_nan: bool = False
 
     def is_empty(self) -> bool:
         """True iff the source is known to contain zero rows."""

@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
+from batcher.plan.expr_ir.core import Expr, IntoExpr, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
@@ -221,11 +221,13 @@ class WindowExpr(Expr):
         Lets a value-function constructor read fluently:
         ``lag(col("x"), 2).over(partition_by=["g"], order_by=["t"])``. Returns a new
         `WindowExpr`; the original is unchanged."""
+        from batcher.plan.expr_ir.core import normalize_key_list
+
         return WindowExpr(
             self.func,
             self.input,
-            list(partition_by),
-            list(order_by),
+            normalize_key_list(partition_by),
+            normalize_key_list(order_by),
             frame if frame is not None else self.frame,
             self.offset,
         )
@@ -251,7 +253,7 @@ def lag(expr: IntoExpr, n: int = 1) -> WindowExpr:
             >>> ds.with_columns(r=bt.lag(bt.col("x")).over(order_by=["x"])).select("r").to_pydict()
             {'r': [None, 10, 20]}
     """
-    return WindowExpr("lag", _wrap(expr), [], [], None, int(n))
+    return WindowExpr("lag", _col_or_expr(expr), [], [], None, int(n))
 
 
 def lead(expr: IntoExpr, n: int = 1) -> WindowExpr:
@@ -274,7 +276,7 @@ def lead(expr: IntoExpr, n: int = 1) -> WindowExpr:
             >>> ds.with_columns(r=bt.lead(bt.col("x")).over(order_by=["x"])).select("r").to_pydict()
             {'r': [20, 30, None]}
     """
-    return WindowExpr("lead", _wrap(expr), [], [], None, int(n))
+    return WindowExpr("lead", _col_or_expr(expr), [], [], None, int(n))
 
 
 def first_value(expr: IntoExpr) -> WindowExpr:
@@ -299,7 +301,7 @@ def first_value(expr: IntoExpr) -> WindowExpr:
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [10, 10, 10]}
     """
-    return WindowExpr("first_value", _wrap(expr), [], [], None)
+    return WindowExpr("first_value", _col_or_expr(expr), [], [], None)
 
 
 def last_value(expr: IntoExpr) -> WindowExpr:
@@ -325,7 +327,7 @@ def last_value(expr: IntoExpr) -> WindowExpr:
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [30, 30, 30]}
     """
-    return WindowExpr("last_value", _wrap(expr), [], [], None)
+    return WindowExpr("last_value", _col_or_expr(expr), [], [], None)
 
 
 def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
@@ -360,7 +362,7 @@ def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
         from batcher._internal.errors import PlanError
 
         raise PlanError(f"nth_value(n) requires n >= 1, got {n}")
-    return WindowExpr("nth_value", _wrap(expr), [], [], None, int(n))
+    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, int(n))
 
 
 def row_number() -> WindowExpr:

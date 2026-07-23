@@ -302,10 +302,25 @@ table.docutils thead th {
 }
 table.docutils td, table.docutils th { border-color: var(--color-background-border); }
 
-/* ---- Diagrams: frame the white PNGs ----------------------------------- */
+/* ---- Diagrams ---------------------------------------------------------
+   The diagrams are SVG and carry their own `prefers-color-scheme` block, so they
+   restyle to the page instead of sitting on it. The frame therefore uses the theme's
+   own surface color; forcing #ffffff here (as this rule used to) turned every diagram
+   into a glaring white slab in dark mode. Raster images still get a white mat, since
+   a PNG cannot adapt. */
 
-article img[src*="_images/"],
 article img[src*="/diagrams/"] {
+  display: block;
+  margin: 1.6rem auto;
+  max-width: 100%;
+  background: var(--color-background-secondary);
+  padding: 1rem 1.25rem;
+  border-radius: 14px;
+  border: 1px solid var(--color-background-border);
+  box-shadow: 0 8px 26px -14px rgba(15, 23, 42, 0.4);
+}
+
+article img[src*="_images/"]:not([src$=".svg"]) {
   display: block;
   margin: 1.6rem auto;
   max-width: 100%;

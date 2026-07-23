@@ -1,0 +1,74 @@
+"""`errors` — the typed exception hierarchy, and the machinery that makes it readable.
+
+Two modules, one import path. `hierarchy` holds the exception classes themselves;
+`suggest` holds the "did you mean ...?" engine and the canonical unknown-name message
+shape that every layer of the engine formats its lookup failures through.
+
+They are split because they answer different questions — *what* failed versus *how to
+say so* — and joined here because ``from batcher._internal.errors import PlanError`` is
+the import the whole tree already writes, and a package split must never move a name.
+"""
+
+from __future__ import annotations
+
+from batcher._internal.errors.hierarchy import (
+    AccessDeniedError,
+    BackendError,
+    BackpressureAbort,
+    BatcherError,
+    ColumnNotFoundError,
+    CommitError,
+    CompileError,
+    ConfigError,
+    DataQualityError,
+    ExecutionError,
+    FatalShuffleError,
+    FormatError,
+    IOError,
+    MissingDependencyError,
+    OptimizationError,
+    PerformanceWarning,
+    PlanError,
+    ResourceError,
+    RetryableShuffleError,
+    SchemaError,
+    SecurityWarning,
+    TransportError,
+    unknown_value,
+)
+from batcher._internal.errors.suggest import (
+    candidate_list,
+    did_you_mean,
+    suggestion,
+    unknown_message,
+)
+
+__all__ = [
+    "AccessDeniedError",
+    "BackendError",
+    "BackpressureAbort",
+    "BatcherError",
+    "ColumnNotFoundError",
+    "CommitError",
+    "CompileError",
+    "ConfigError",
+    "DataQualityError",
+    "ExecutionError",
+    "FatalShuffleError",
+    "FormatError",
+    "IOError",
+    "MissingDependencyError",
+    "OptimizationError",
+    "PerformanceWarning",
+    "PlanError",
+    "ResourceError",
+    "RetryableShuffleError",
+    "SchemaError",
+    "SecurityWarning",
+    "TransportError",
+    "candidate_list",
+    "did_you_mean",
+    "suggestion",
+    "unknown_message",
+    "unknown_value",
+]

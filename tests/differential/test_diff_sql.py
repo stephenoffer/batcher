@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -45,8 +46,6 @@ def tables(duck):
     ],
 )
 def test_sql_vs_duckdb(duck, tables, query):
-    from conftest import assert_same
-
     emp, dept = tables
     out = bt.sql(query, emp=emp, dept=dept).collect()
     assert_same(out, duck.sql(query))
@@ -70,8 +69,6 @@ def test_sql_vs_duckdb(duck, tables, query):
 )
 def test_self_join_vs_duckdb(duck, tables, query):
     """Self-joins (same table aliased twice) are disambiguated and match DuckDB."""
-    from conftest import assert_same
-
     emp, dept = tables
     out = bt.sql(query, emp=emp, dept=dept).collect()
     assert_same(out, duck.sql(query))
@@ -91,8 +88,6 @@ def test_self_join_vs_duckdb(duck, tables, query):
 )
 def test_decimal_literal_arithmetic_vs_duckdb(duck, query):
     """SQL decimal literals fold with exact (Decimal) semantics, matching DuckDB."""
-    from conftest import assert_same
-
     disc = pa.table(
         {
             "d": pa.array([0.04, 0.05, 0.06, 0.07, 0.08, 0.05, 0.06, 0.07], type=pa.float64()),

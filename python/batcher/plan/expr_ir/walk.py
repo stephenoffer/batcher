@@ -8,8 +8,13 @@ classes from `core` and `namespaces`.
 
 from __future__ import annotations
 
+import dataclasses
+
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.audio import AudioFunc
 from batcher.plan.expr_ir.core import (
+    AggExpr,
+    Aliased,
     Binary,
     Cast,
     Coalesce,
@@ -40,12 +45,14 @@ from batcher.plan.expr_ir.namespaces import (
     ListSimhash,
     ListSlice,
     ListTransform,
+    ListZip,
     MapFunc,
     Strftime,
     StrFunc,
     Strptime,
     StructField,
 )
+from batcher.plan.expr_ir.node_base import IRNode, child_fields
 from batcher.plan.expr_ir.nodes import (
     Array,
     Case,
@@ -61,6 +68,37 @@ from batcher.plan.expr_ir.nodes import (
 from batcher.plan.expr_ir.video import VideoFunc
 
 
+def column_occurrence_counts(exprs: list[Expr]) -> dict[str, int]:
+    """How many times each column name *occurs* across `exprs` — occurrences, not distinct.
+
+    The counting sibling of `referenced_columns`: the projection rules need to know whether
+    merging two projections would evaluate a column twice, which a set cannot tell them. It
+    lives here because two Kyber rules had each written it out (`_col_ref_counts` and
+    `_occurrence_counts` — same body, different names), and a shared walk belongs with the
+    other shared walks.
+
+    Args:
+        exprs: The expressions to count column references across.
+
+    Returns:
+        Column name to the number of times it is referenced.
+    """
+    # Deferred: `expr_rewrite` imports this package, so a module-level import would close an
+    # `expr_ir -> expr_rewrite -> expr_ir` cycle.
+    from batcher.plan.expr_rewrite import transform_expr_up
+
+    counts: dict[str, int] = {}
+
+    def tally(expr: Expr) -> Expr:
+        if isinstance(expr, Col):
+            counts[expr.name] = counts.get(expr.name, 0) + 1
+        return expr
+
+    for expr in exprs:
+        transform_expr_up(expr, tally)
+    return counts
+
+
 def referenced_columns(expr: Expr) -> set[str]:
     """The set of input column names an expression reads.
 
@@ -71,6 +109,15 @@ def referenced_columns(expr: Expr) -> set[str]:
     so sharing the cached set is safe. `Expr` sets no `__slots__`, so every node has a
     `__dict__` to cache in.
     """
+    if isinstance(expr, AggExpr):
+        # An aggregate reached a scalar-expression context (select/with_columns/filter).
+        # `group_by().agg()` splits aggregate leaves out before building those, so one
+        # arriving here escaped that path — reject it clearly (it also has no `__dict__`
+        # to memoize into, being `__slots__`-based).
+        raise PlanError(
+            "an aggregate expression (e.g. col('x').sum()) can only be used inside "
+            "group_by().agg(); it cannot appear in select/with_columns/filter"
+        )
     cached = expr.__dict__.get("_c_refcols")
     if cached is not None:
         return cached
@@ -82,6 +129,11 @@ def referenced_columns(expr: Expr) -> set[str]:
 def _referenced_columns_impl(expr: Expr) -> set[str]:
     if isinstance(expr, Col):
         return {expr.name}
+    if isinstance(expr, Aliased):
+        # A mid-expression alias (``(col("x").alias("y") + 1)``) is transparent — it
+        # reads whatever its wrapped expression reads. Missing this arm pruned the
+        # underlying column and failed the query with "unknown column".
+        return referenced_columns(expr.inner)
     if isinstance(expr, Binary):
         return referenced_columns(expr.left) | referenced_columns(expr.right)
     if isinstance(
@@ -93,8 +145,10 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
             IsNull,
             IsNotNull,
             IsNan,
+            IsInf,
             StrFunc,
             Strftime,
+            Strptime,
             ConvertTimezone,
             DateFunc,
             DateOffset,
@@ -140,7 +194,7 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
             | referenced_columns(expr.stop)
             | referenced_columns(expr.step)
         )
-    if isinstance(expr, (NullIf, Math2Expr, ListBinary, ListSet)):
+    if isinstance(expr, (NullIf, Math2Expr, ListBinary, ListSet, ListZip)):
         return referenced_columns(expr.left) | referenced_columns(expr.right)
     if isinstance(expr, Case):
         cols = referenced_columns(expr.otherwise)
@@ -159,6 +213,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
     """
     if isinstance(expr, Col):
         return Col(mapping.get(expr.name, expr.name))
+    if isinstance(expr, Aliased):
+        return Aliased(remap_columns(expr.inner, mapping), expr.name)
     if isinstance(expr, Binary):
         return Binary(
             expr.op, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
@@ -190,10 +246,23 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return DateFunc(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, ImageFunc):
         return ImageFunc(
-            expr.fn, remap_columns(expr.input, mapping), width=expr.width, height=expr.height
+            expr.fn,
+            remap_columns(expr.input, mapping),
+            width=expr.width,
+            height=expr.height,
+            mean=expr.mean,
+            std=expr.std,
+            channels_first=expr.channels_first,
         )
     if isinstance(expr, AudioFunc):
-        return AudioFunc(expr.fn, remap_columns(expr.input, mapping))
+        return AudioFunc(
+            expr.fn,
+            remap_columns(expr.input, mapping),
+            rate=expr.rate,
+            n_fft=expr.n_fft,
+            hop_length=expr.hop_length,
+            n_mels=expr.n_mels,
+        )
     if isinstance(expr, VideoFunc):
         return VideoFunc(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, DateTrunc):
@@ -246,6 +315,10 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return ListSet(
             expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
         )
+    if isinstance(expr, ListZip):
+        return ListZip(
+            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
+        )
     if isinstance(expr, Array):
         return Array([remap_columns(e, mapping) for e in expr.elements])
     if isinstance(expr, MakeStruct):
@@ -276,3 +349,122 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
             remap_columns(expr.otherwise, mapping),
         )
     return expr  # literals unchanged
+
+
+# --- Aggregate-expression splitting -----------------------------------------------
+# `group_by().agg()` accepts a whole expression *over* aggregates (``sum(x)/sum(y)``).
+# The engine has no operator that evaluates arithmetic inside an aggregate, so the
+# control plane lowers such an expression to two operators it already runs correctly on
+# one core, many cores, and many machines: an Aggregate that computes each distinct
+# aggregate *leaf* into a hidden column, and a Project that recomputes the surrounding
+# scalar expression over those columns. These helpers own the leaf-extraction rewrite;
+# because the aggregate stays the standard mergeable primitive and the projection is a
+# stateless map, the split is identical single-node and distributed.
+
+# The prefix for a hidden aggregate column. Double-underscored and namespaced so it
+# cannot collide with a user column, group key, or output alias.
+_HIDDEN_AGG_PREFIX = "__batcher_agg_"
+
+
+def contains_aggregate(expr: object) -> bool:
+    """True if `expr` is, or transitively contains, an `AggExpr` leaf."""
+    if isinstance(expr, AggExpr):
+        return True
+    # `Case` and `MakeStruct` carry their sub-expressions in irregular fields (paired
+    # branches; named fields) declared without the `child`/`children` factories, so
+    # `child_fields` cannot see them — walk those shapes explicitly, or an aggregate
+    # inside a CASE / struct(...) would be invisible here and wrongly rejected by
+    # `group_by().agg()` as "not an expression over aggregates".
+    if isinstance(expr, Case):
+        return contains_aggregate(expr.otherwise) or any(
+            contains_aggregate(cond) or contains_aggregate(then) for cond, then in expr.branches
+        )
+    if isinstance(expr, MakeStruct):
+        return any(contains_aggregate(value) for _name, value in expr.fields)
+    if isinstance(expr, IRNode):
+        for name, is_list in child_fields(expr):
+            value = getattr(expr, name)
+            if is_list:
+                if any(contains_aggregate(v) for v in value):
+                    return True
+            elif contains_aggregate(value):
+                return True
+    return False
+
+
+class AggregateLeafRegistry:
+    """Collects the distinct `AggExpr` leaves of the composite specs into hidden columns.
+
+    Deduplicates by the leaf's source-like ``repr`` so an aggregate written twice is
+    computed once. Insertion order is preserved for a stable, testable plan shape.
+    """
+
+    def __init__(self) -> None:
+        self._by_key: dict[str, tuple[str, AggExpr]] = {}
+
+    def intern(self, agg: AggExpr) -> str:
+        """Register `agg`, returning the hidden column name that will hold its result."""
+        key = repr(agg)
+        existing = self._by_key.get(key)
+        if existing is not None:
+            return existing[0]
+        name = f"{_HIDDEN_AGG_PREFIX}{len(self._by_key)}"
+        self._by_key[key] = (name, agg)
+        return name
+
+    def leaves(self) -> list[tuple[str, AggExpr]]:
+        """The ``(hidden_name, aggregate)`` pairs to add to the Aggregate, in order."""
+        return list(self._by_key.values())
+
+
+def _reject_nested_aggregate(agg: AggExpr) -> None:
+    """An aggregate of an aggregate (``sum(x).mean()``) has no meaning — reject it early."""
+    for part in (agg.input, agg.input2):
+        if part is not None and contains_aggregate(part):
+            raise PlanError(
+                "an aggregate cannot be nested inside another aggregate "
+                f"(in {agg!r}); aggregate the inner value in a prior group_by()"
+            )
+
+
+def split_aggregate_leaves(expr: Expr | AggExpr, registry: AggregateLeafRegistry) -> Expr:
+    """Return `expr` with each `AggExpr` leaf replaced by a `Col` to its hidden column.
+
+    Registers every leaf into `registry`; the caller adds those to an Aggregate and wraps
+    it in a Project that evaluates the returned expression. A bare aggregate collapses to a
+    single column reference; a scalar-only expression is returned unchanged.
+    """
+    if isinstance(expr, AggExpr):
+        _reject_nested_aggregate(expr)
+        return Col(registry.intern(expr))
+    # `Case`/`MakeStruct` hide their sub-expressions from `child_fields` (see
+    # `contains_aggregate`), so `dataclasses.replace` below would never reach the
+    # aggregate leaves inside them — rebuild those shapes explicitly, splitting each
+    # sub-expression, so a leaf inside a CASE / struct(...) is hoisted like any other.
+    if isinstance(expr, Case):
+        return Case(
+            [
+                (split_aggregate_leaves(cond, registry), split_aggregate_leaves(then, registry))
+                for cond, then in expr.branches
+            ],
+            split_aggregate_leaves(expr.otherwise, registry),
+        )
+    if isinstance(expr, MakeStruct):
+        return MakeStruct(
+            [(name, split_aggregate_leaves(value, registry)) for name, value in expr.fields]
+        )
+    if isinstance(expr, IRNode):
+        updates = {}
+        for name, is_list in child_fields(expr):
+            value = getattr(expr, name)
+            if is_list:
+                updates[name] = [split_aggregate_leaves(v, registry) for v in value]
+            else:
+                updates[name] = split_aggregate_leaves(value, registry)
+        if not updates:
+            return expr
+        return dataclasses.replace(expr, **updates)
+    # Hand-written leaf nodes (Col, Lit, ...) carry no aggregate children; an aggregate
+    # hidden in an unsupported node surfaces as a clear error when `referenced_columns`
+    # or `AggExpr.to_ir()` reaches it.
+    return expr

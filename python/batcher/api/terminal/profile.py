@@ -12,7 +12,7 @@ from __future__ import annotations
 from batcher._internal.errors import BackendError
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.profile import Decision, QueryProfile
+from batcher.plan.profile import Decision, OpProfile, QueryProfile
 
 __all__ = [
     "admission_decision",
@@ -151,12 +151,61 @@ def _io_throughput_decisions(sources: list[Source], hub) -> list:
     return out
 
 
+def _logical_op_profiles(plan: LogicalPlan, depth: int = 0) -> list[OpProfile]:
+    """Planned-only `OpProfile`s from the un-lowered LOGICAL plan tree, pre-order.
+
+    The seam a UDF plan takes: a `map_batches`/inference pipeline has no engine IR (its
+    `to_ir()` deliberately raises), so the estimate/measure join `build_op_profiles`
+    performs off the lowered IR cannot run. This walks the logical tree via
+    `batcher.plan.visitor.children`, naming each operator by its node type, so `explain()`
+    still renders a readable operator tree — `MapBatches` included — instead of crashing.
+    The `op_id` is the pre-order index, matching the ordering `walk_ir` would assign.
+    """
+    from batcher.plan.visitor import children
+
+    out = [OpProfile(op_id=0, kind=type(plan).__name__, depth=depth)]
+    for child in children(plan):
+        for op in _logical_op_profiles(child, depth + 1):
+            out.append(OpProfile(op_id=len(out), kind=op.kind, depth=op.depth))
+    return out
+
+
+def _udf_planned_profile(plan: LogicalPlan, sources: list[Source], hub) -> QueryProfile:
+    """A planned-only `QueryProfile` for a plan carrying a Python UDF (`map_batches`).
+
+    Such a plan cannot be lowered to engine IR, so it is shown un-optimized: the logical
+    tree, named by node type, with a `Decision` header stating the plan is un-lowered and
+    thus unestimated. An honest partial plan beats the `NotImplementedError` the lowering
+    path would raise — reading the plan is step one of debugging a batch-inference query.
+    """
+    note = Decision(
+        subsystem="core",
+        category="explain",
+        summary=(
+            "plan contains a map_batches/UDF stage shown un-lowered "
+            "(no engine IR, so no optimized tree or row estimates)"
+        ),
+    )
+    return QueryProfile(
+        ops=tuple(_logical_op_profiles(plan)),
+        decisions=(note, *_io_throughput_decisions(sources, hub)),
+        logical_ir=None,
+        optimized_ir=None,
+    )
+
+
 def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
-    """A planned-only `QueryProfile`: Kyber's optimized tree, estimates, and decisions."""
+    """A planned-only `QueryProfile`: Kyber's optimized tree, estimates, and decisions.
+
+    A plan carrying a `map_batches`/inference UDF has no engine IR to lower or optimize, so
+    it renders the un-lowered logical tree (`_udf_planned_profile`) instead of crashing.
+    """
     from batcher import core, kyber
     from batcher.plan.profile import build_op_profiles
 
     hub = core.default_hub()
+    if core.has_map_batches(plan):
+        return _udf_planned_profile(plan, sources, hub)
     opt, decisions = kyber.optimize_traced(plan, sources=sources, hub=hub)
     return QueryProfile(
         ops=build_op_profiles(opt.ir, opt.ops, None),
@@ -205,7 +254,11 @@ def run_profiled(
             "portion instead."
         )
     collector = ProfileCollector()
-    distributed = _resolve_distributed("auto")
+    # Pass plan + sources so the size-aware "auto" decision matches `collect()`. Resolving
+    # with neither hit `resolve_distributed`'s `sources is None -> True` fall-through, forcing
+    # every profiled run to distribute on a multi-node cluster — measuring a path a small
+    # query runs single-node, the opposite of "reflects reality".
+    distributed = _resolve_distributed("auto", plan, sources)
     ctx = core.ExecutionContext(columns=columns, hub=core.default_hub(), profile=collector)
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)

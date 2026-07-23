@@ -1,9 +1,9 @@
 # Troubleshooting
 
-This page collects the errors you are most likely to hit and how to fix them
-against the current API. Most stem from one of three things: referencing a column
-that does not exist, passing a string where an expression is expected, or calling a
-method that lives in a different place than you remembered.
+The errors below are the ones you are most likely to hit. Nearly all of them come
+from the same few causes: a column that does not exist, a string passed where an
+expression belongs, or a method that lives somewhere other than where you remembered
+it.
 
 ```python
 import batcher as bt
@@ -13,8 +13,8 @@ ds = bt.from_pydict({"x": [1, 2, 3], "y": [10, 20, 30]})
 
 ## Nothing happened when I called a transformation
 
-A Dataset is lazy. Transformations build a plan and return a new Dataset; they do no
-work. If you expected output, call a terminal operation.
+A Dataset is lazy. Transformations build a plan and return a new Dataset without doing
+any work. If you expected output, call a terminal operation.
 
 ```python
 filtered = ds.filter(bt.col("x") > 1)  # builds a plan, runs nothing
@@ -64,23 +64,23 @@ print(ok.to_pydict())
 
 To filter with SQL syntax instead, use {py:obj}`bt.sql <batcher.sql>`.
 
-## Aggregates are keyword arguments
+## The keyword to `agg` is the output name
 
-`agg` takes named aggregates as keywords (`out_name=agg_expr`). Passing an
-aggregate positionally fails, and there is no `.alias()` on an aggregate; the
-keyword is the output name.
+A positional aggregate is *self-naming*: it keeps the source column's name. Pass a keyword
+when you want to choose the output name, which is usually what you want, because the
+self-named column shadows the input it was computed from.
 
 ```python
-try:
-    ds.group_by("x").agg(bt.col("y").sum())
-except Exception as exc:
-    print(type(exc).__name__, "-", exc)
-# TypeError - GroupBy.agg() takes 1 positional argument but 2 were given
+selfnamed = ds.group_by("x").agg(bt.col("y").sum())
+print(selfnamed.sort("x").to_pydict())
+# {'x': [1, 2, 3], 'y': [10, 20, 30]}
 
-ok = ds.group_by("x").agg(total=bt.col("y").sum())
-print(ok.sort("x").to_pydict())
+named = ds.group_by("x").agg(total=bt.col("y").sum())
+print(named.sort("x").to_pydict())
 # {'x': [1, 2, 3], 'total': [10, 20, 30]}
 ```
+
+There is no `.alias()` on an aggregate. The keyword is the output name.
 
 ## Boolean operators need parentheses
 
@@ -98,15 +98,18 @@ bt.col("y")) < 30` and will not do what you want.
 
 ## I cannot find a method I expected
 
-The surface is deliberately small and some operations live in a specific place:
+The surface is deliberately small, and a few operations sit somewhere other than where
+you might reach first:
 
-- There is no `ds.sql(...)` method. Use the top-level {py:obj}`bt.sql(query, table=ds) <batcher.sql>`.
-- There is no dataset-level `.cast`, `.fill_null`, or `.drop_nulls`. Cast and
-  fill nulls on an expression: `ds.with_columns(x=bt.col("x").cast("Float64"))`,
-  `ds.with_columns(x=bt.col("x").fill_null(0))`.
-- There is no `.unique()`; use `.distinct()`.
-- `collect()` returns a pyarrow Table. To get a pandas DataFrame, call
-  `.to_pandas()` on that Table, not on the Dataset.
+- `collect()` returns a pyarrow Table. To get a pandas DataFrame, call `.to_pandas()` on
+  that Table, not on the Dataset.
+- `distinct()` and `unique()` are the same operator under two names, so use whichever
+  spelling your background makes natural.
+- `ds.sql(query)` binds the current dataset as the table `self`. The top-level
+  {py:obj}`bt.sql <batcher.sql>` is what you want when a query names more than one table.
+- `ds.cast`, `ds.fill_null`, and `ds.drop_nulls` work over whole columns. When you want
+  the same thing on one derived value, the expression methods do it:
+  `ds.with_columns(x=bt.col("x").cast("float64"))`.
 
 ```python
 table = ds.collect()
@@ -114,12 +117,50 @@ print(type(table).__module__, type(table).__name__)
 # pyarrow.lib Table
 ```
 
+## Catching errors by type
+
+Every Batcher failure subclasses `bt.BatcherError`, so one `except` catches them all
+without importing anything internal:
+
+```python
+try:
+    ds.select("nope").to_pydict()
+except bt.BatcherError as exc:
+    print(type(exc).__name__, "-", exc)
+# PlanError - projection 'nope' references unknown column(s) ['nope']; available: ['x', 'y']
+```
+
+Catch a narrower type when you want to react differently. The catchable types are all
+reachable as `bt.<Name>`:
+
+| Type | Catch it for | Also a |
+|------|--------------|--------|
+| `bt.PlanError` | an invalid plan or schema, raised eagerly at build time | `ValueError` |
+| `bt.ColumnNotFoundError` | a reference to a column that isn't there (carries `.column`) | `KeyError` |
+| `bt.ConfigError` | an out-of-range or inconsistent configuration value | `ValueError` |
+| `bt.MissingDependencyError` | an optional extra that isn't installed (carries `.install`) | `ImportError` |
+| `bt.AccessDeniedError` | a governed table or column the principal can't read | `PermissionError` |
+| `bt.ExecutionError` | an operator failing at runtime in the engine | |
+| `bt.OptimizationError` | the optimizer failing to produce a physical plan | |
+| `bt.CompileError` | JIT compilation failing (the interpreter still runs) | |
+| `bt.ResourceError` | the resource manager unable to grant memory or credit | |
+| `bt.IOError` | a source or sink failing to read, write, list, or open | |
+| `bt.FormatError` | an unknown format, or a file malformed for its format | |
+| `bt.CommitError` | an atomic write commit failing (a concurrent-writer conflict) | |
+| `bt.SchemaError` | schemas that can't be reconciled across files or against an expected one | |
+| `bt.DataQualityError` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
+| `bt.BackendError` | a specific execution backend failing | |
+| `bt.TransportError` | the distributed data plane (shared memory / Flight) failing | |
+
+Because several also subclass a builtin, existing `except ValueError` /
+`except ImportError` handlers keep working unchanged.
+
 ## A large query runs out of memory
 
 Stateful operators hold state in memory by default. Pass `spill=True` to let
-aggregation, join, and sort spill to disk under pressure, and `distributed=True`
-with `num_workers=` to spread the work across machines. Both are off by default
-because they add overhead that only pays off at scale.
+aggregation, join and sort spill to disk under pressure, and `distributed=True` with
+`num_workers=` to spread the work across machines. Both are off by default. They add
+overhead that only pays for itself on a big job.
 
 ```python
 # docs: skip
@@ -128,9 +169,10 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 
 ## See also
 
-- [Performance and memory](performance.md): caching, spill tuning, and reading a
-  query plan.
-- [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing
-  task, shuffle, and node failures.
-- [Configuration options](../configuration/options.md): every tunable and its
-  default.
+- [Performance and memory](performance.md): caching, spill tuning, reading a query
+  plan.
+- [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing a
+  failed task, shuffle, or node.
+- [Configuration options](../configuration/options.md): every tunable and its default.
+- [Agent skills](../agents/index.md): `debug-a-batcher-query` is the triage tree a
+  coding agent follows, organized by symptom, with the bisect procedure against DuckDB.

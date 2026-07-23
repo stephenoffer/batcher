@@ -11,6 +11,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 _SCHEMA = pa.schema([("dept", pa.string()), ("salary", pa.int64()), ("bonus", pa.float64())])
@@ -40,8 +41,6 @@ def test_empty_dataset_constructs_and_collects():
 
 
 def test_empty_filter_project_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _empty()
     duck.register("t", t)
     out = bt.from_arrow(t).filter(col("salary") > 100).select("dept", net=col("salary")).collect()
@@ -50,8 +49,6 @@ def test_empty_filter_project_vs_duckdb(duck):
 
 
 def test_empty_group_by_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _empty()
     duck.register("t", t)
     out = bt.from_arrow(t).group_by("dept").agg(total=col("salary").sum(), n=count()).collect()
@@ -60,8 +57,6 @@ def test_empty_group_by_vs_duckdb(duck):
 
 
 def test_empty_global_aggregate_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _empty()
     duck.register("t", t)
     # A global aggregate over no rows yields one row (NULL sum, 0 count) in both engines.
@@ -71,8 +66,6 @@ def test_empty_global_aggregate_vs_duckdb(duck):
 
 
 def test_empty_distinct_sort_limit_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _empty()
     duck.register("t", t)
     out = bt.from_arrow(t).select("dept", "salary").distinct().sort("salary").limit(5).collect()

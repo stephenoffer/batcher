@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import batcher as bt
 from batcher import col
-from batcher.kyber.optimizer import Optimizer, _applicable
+from batcher.kyber.optimizer import Optimizer
+from batcher.kyber.optimizer.driver import _applicable
 from batcher.kyber.registry import DEFAULT_REGISTRY, RuleRegistry, register_builtin_rules
 from batcher.kyber.rule import Phase, RuleCategory, node_rule
 from batcher.plan.logical import Filter, Join, Scan, Window
@@ -152,7 +153,7 @@ def test_empty_rule_set_is_identity():
 def test_fused_node_rules_equal_sequential():
     """A run of node-local rules applied in one bottom-up pass yields the same plan
     as running each rule's own `transform_up` in sequence."""
-    from batcher.kyber.optimizer import _apply_node_rules
+    from batcher.kyber.optimizer.driver import _apply_node_rules
 
     emp, _ = _emp_dept()
     plan = emp.filter(col("id") > 1).filter(col("id") < 9).filter(col("name") > "a")._plan
@@ -216,7 +217,7 @@ def test_noop_phase_returns_same_object_via_optimizer():
 def test_run_phase_identity_fixpoint_no_to_ir_on_stable_plan(monkeypatch):
     # On a no-op phase, the driver must break on `updated is plan` WITHOUT serializing
     # to IR (the fallback path). Use a single node rule that never fires.
-    from batcher.kyber.optimizer import _run_phase
+    from batcher.kyber.optimizer.driver import _run_phase
     from batcher.kyber.rule import Phase, node_rule
     from batcher.plan.logical import Filter
 

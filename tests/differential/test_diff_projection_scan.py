@@ -6,8 +6,8 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.projection_scan
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 
 def _data() -> pa.Table:

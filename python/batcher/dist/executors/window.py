@@ -17,6 +17,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import _apply_above, _partition_source
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import (
@@ -112,7 +113,7 @@ def _distributed_window(
 def _map_task(map_ir, pk_indices_json, part_path, n_reducers, work_dir, mapper_id, engine_config):
     import os as _os
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
     from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc

@@ -1,14 +1,9 @@
 """ML data plane — actor-pool batch inference, training ingest, and preprocessing.
 
-The native-pipeline foundation lives in the Rust `bc-udf` crate; this package is the
-control-plane orchestration (model-once-per-worker pools, dynamic batching) over
-whole Arrow batches.
-
-It also re-exports the sklearn-style `Preprocessor` family (scalers, encoders,
-imputers, binning, tokenization): `fit` learns state with one mergeable aggregate
-over the engine and `transform` is a lazy `Expr` projection, so feature engineering
-never touches a row in Python. Fit on the train split, transform both splits —
-`ds.ml.train_test_split` produces them.
+Control-plane orchestration (model-once-per-worker pools, dynamic batching) over whole
+Arrow batches; the native-pipeline foundation lives in the Rust `bc-udf` crate. Also
+re-exports the sklearn-style `Preprocessor` family, whose `fit` learns state with one
+mergeable aggregate and whose `transform` is a lazy `Expr` projection.
 """
 
 from __future__ import annotations
@@ -44,10 +39,12 @@ from batcher.ml.preprocessors import (
     Normalizer,
     OneHotEncoder,
     OrdinalEncoder,
+    PolynomialFeatures,
     Preprocessor,
     RobustScaler,
     SimpleImputer,
     StandardScaler,
+    TargetEncoder,
     Tokenizer,
 )
 from batcher.ml.serving import (
@@ -81,6 +78,7 @@ __all__ = [
     "Normalizer",
     "OneHotEncoder",
     "OrdinalEncoder",
+    "PolynomialFeatures",
     "Preprocessor",
     "ResumableSampler",
     "RobustScaler",
@@ -88,6 +86,7 @@ __all__ = [
     "SimpleImputer",
     "Stage",
     "StandardScaler",
+    "TargetEncoder",
     "Tokenizer",
     "Worker",
     "WorkerFactory",

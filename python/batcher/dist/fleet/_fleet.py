@@ -29,14 +29,18 @@ import threading
 
 from batcher._internal.errors import ResourceError
 from batcher._internal.hardware import available_cpu_count
+from batcher.dist.fleet.plan_id import active_query_scopes, adopt_plan_id, query_shuffle_scope
 
 __all__ = [
     "ShuffleFleet",
     "acquire_fleet",
     "current_fleet",
     "maybe_spawn_query_fleet",
+    "release_fleet",
     "release_session_fleet",
+    "release_session_lease",
     "reset_fleet",
+    "session_fleet_lease",
     "set_fleet",
 ]
 
@@ -77,6 +81,16 @@ def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: 
         addr_refs = [a.addr.remote() for a in actors]
         timeout = max(1.0, active_config().distributed.placement_timeout_s)
         ready, pending = ray.wait(addr_refs, num_returns=len(addr_refs), timeout=timeout)
+        if pending:
+            # A fleet asks for one worker per node holding that node's cores, i.e. the
+            # cluster's *whole* CPU capacity (`_even_cpu_share`). So it is placeable only
+            # when the cluster is genuinely idle — and the most common reason it isn't is
+            # a fleet that was torn down microseconds ago, whose actors Ray has not yet
+            # reaped. Degrading immediately turns that transient into a *cached* 1-2 worker
+            # fleet that then serves the rest of the session (measured: an 8-worker
+            # distributed join left running on 2 workers, 0.6 s -> 16 s). Give the
+            # reclamation one more placement window before accepting a smaller fleet.
+            ready, pending = ray.wait(addr_refs, num_returns=len(addr_refs), timeout=timeout)
         if pending:
             ready_set = set(ready)
             for a, ref in zip(actors, addr_refs, strict=True):
@@ -157,6 +171,13 @@ class ShuffleFleet:
 _SESSION_LOCK = threading.RLock()
 _SESSION: ShuffleFleet | None = None
 _SESSION_TIMER: threading.Timer | None = None
+# Outstanding borrows of the session fleet. The idle timer may only fire when this is
+# zero: "idle" means *no operator is using the fleet*, not "N seconds since someone
+# acquired it". Armed at acquire time, the timer would `ray.kill` the actors out from
+# under any query that ran longer than `session_fleet_idle_s` (30s by default) — which
+# is every large distributed join, and which surfaced as a mid-query `ActorDiedError`
+# ("killed by ray.kill") from the shuffle's own recovery path.
+_SESSION_LEASES = 0
 
 
 def _session_fleet_alive(fleet: ShuffleFleet) -> bool:
@@ -184,26 +205,132 @@ def _arm_idle_release(idle_s: float) -> None:
     _SESSION_TIMER.start()
 
 
-def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> ShuffleFleet:
-    """Get the warm session fleet, spawning (or respawning a dead one) as needed.
+def _regrant_fleet(fleet: ShuffleFleet, credits: int, cfg_json: str) -> None:
+    """Re-grant a reused fleet's workers for the query about to borrow it.
 
-    The cached fleet's worker count wins for the whole session (a borrowing operator
-    fans out over the actors that exist), so a later query with a different data-driven
-    `workers` reuses the warm fleet instead of churning a new placement group. A fleet
-    whose actors died (preemption) is torn down and respawned transparently.
+    A worker is built from the grant of whichever query *spawned* it — its credit window
+    (1 credit = 1 in-flight batch) and the `EngineConfig` its every local `execute_plan`
+    runs under (memory budget, morsel size, parallelism). Reusing the fleet without
+    re-granting therefore runs every later query in the session under the *first* query's
+    budget. Measured on the 9-node cluster, TPC-H sf10 (`lineitem ⋈ orders`, group-by):
+
+        fleet spawned by the join   : credits=64, memory_budget=372 MB ->  0.6 s
+        fleet spawned by a COUNT(*) : credits=1,  memory_budget=1 MB   ->  3.2 s
+
+    Same plan, same data, same 8 live actors — the join simply inherited the count's grant,
+    so its Flight exchange held one batch in flight at a time against a 1 MB budget. Any
+    cheap query poisoned every expensive query after it.
+
+    Re-granting is two attribute writes per worker. Respawning instead would be the obvious
+    alternative and is the wrong one: a fleet asks for one worker per node holding that
+    node's cores — the cluster's entire CPU capacity — so a respawn issued while the fleet
+    it replaces is still being reaped cannot be placed, and the spawn silently degrades to
+    the 1-2 workers it *can* place (measured: the same join at 16 s on a 2-worker fleet).
     """
-    global _SESSION
-    from batcher.config import active_config
+    import ray
+
+    ray.get([a.set_grant.remote(credits, cfg_json) for a in fleet.actors])
+    fleet.credits = credits
+    fleet.cfg_json = cfg_json
+
+
+def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> ShuffleFleet:
+    """Get the warm session fleet, spawning (or respawning it) as needed.
+
+    A cached fleet wide enough for this query is reused — that is the whole point of the
+    session fleet, and what turns a ~3 s warm query into ~1 s (a spawn is a placement group
+    + N actors + N Flight servers) — but it is **re-granted** first, so it runs under *this*
+    query's credits and `EngineConfig` rather than the spawning query's (`_regrant_fleet`,
+    which is where the 5x regression that motivated this lives).
+
+    Only a fleet that is too **narrow** is torn down and respawned: that is the one thing a
+    re-grant cannot fix. A fleet still in use (leased) is never torn down — the borrower is
+    mid-shuffle over its actors — so it is reused as-is and the next uncontended acquire
+    resizes it.
+
+    Re-granting is skipped while a **second query** holds the fleet: the in-place rewrite
+    would retune workers a concurrent query is already shuffling over — the poisoning
+    `_regrant_fleet` prevents between queries, now mid-flight. The arriving query runs
+    under the incumbent's grant: a scheduling degradation, never a wrong answer.
+
+    A fleet whose actors died (preemption) is torn down and respawned transparently.
+
+    Takes a **lease** on the fleet: the idle timer is cancelled for as long as any
+    operator holds one, and re-armed only by the matching `release_session_lease`. The
+    borrower MUST release it (the Flight operators do so via `release_fleet`).
+    """
+    global _SESSION, _SESSION_LEASES, _SESSION_TIMER
 
     with _SESSION_LOCK:
+        # In use ⇒ not idle. Stop any pending teardown before handing the fleet out.
+        if _SESSION_TIMER is not None:
+            _SESSION_TIMER.cancel()
+            _SESSION_TIMER = None
         if _SESSION is not None and not _session_fleet_alive(_SESSION):
+            with contextlib.suppress(Exception):
+                _SESSION.cleanup()
+            _SESSION = None
+        # Too narrow for this query, and nobody is mid-shuffle over it → respawn wider.
+        if _SESSION is not None and _SESSION_LEASES == 0 and len(_SESSION.actors) < workers:
             with contextlib.suppress(Exception):
                 _SESSION.cleanup()
             _SESSION = None
         if _SESSION is None:
             _SESSION = ShuffleFleet.spawn(workers, credits, cfg_json)
-        _arm_idle_release(active_config().distributed.session_fleet_idle_s)
+        elif active_query_scopes() <= 1 and (_SESSION.credits, _SESSION.cfg_json) != (
+            credits,
+            cfg_json,
+        ):
+            # Wide enough, but granted for someone else's query. Re-grant, don't respawn —
+            # and only when no concurrent pipeline is shuffling over these same workers.
+            with contextlib.suppress(Exception):
+                _regrant_fleet(_SESSION, credits, cfg_json)
+        _SESSION_LEASES += 1
         return _SESSION
+
+
+def release_session_lease() -> None:
+    """Drop one borrow of the session fleet; re-arm the idle timer when the last one goes."""
+    global _SESSION_LEASES
+    from batcher.config import active_config
+
+    with _SESSION_LOCK:
+        if _SESSION_LEASES > 0:
+            _SESSION_LEASES -= 1
+        if _SESSION_LEASES == 0 and _SESSION is not None:
+            _arm_idle_release(active_config().distributed.session_fleet_idle_s)
+
+
+@contextlib.contextmanager
+def session_fleet_lease():
+    """Hold the session fleet for the lifetime of one distributed query.
+
+    The per-operator lease (`acquire_fleet` / `release_fleet`) protects the fleet only
+    while an operator is *running*. A staged query also needs it alive **between** stages:
+    an intermediate left partitioned on the workers (a `FlightMaterializedSource`) is read
+    in place by the next stage, so tearing the fleet down in the gap destroys the
+    intermediate. This query-scoped lease holds the floor above zero for the whole run, so
+    the idle timer can only fire once the query — not merely one operator — is done.
+
+    Leasing before the fleet exists is fine and intended: the counter gates teardown, and
+    the first operator to need a fleet spawns it under the already-held lease.
+
+    This is also where the query's shuffle **plan id** is minted: the one scope that means
+    "one query", and while the fleet under it may be shared with other pipelines, the id
+    must not be.
+    """
+    global _SESSION_LEASES, _SESSION_TIMER
+
+    with _SESSION_LOCK:
+        if _SESSION_TIMER is not None:
+            _SESSION_TIMER.cancel()
+            _SESSION_TIMER = None
+        _SESSION_LEASES += 1
+    try:
+        with query_shuffle_scope():  # the fence, and the one place a query is counted
+            yield
+    finally:
+        release_session_lease()
 
 
 def release_session_fleet() -> None:
@@ -211,13 +338,16 @@ def release_session_fleet() -> None:
 
     Called by the idle timer, and available to a caller that wants to free the cluster
     immediately (e.g. before handing it to another engine). A no-op when no fleet is
-    cached.
+    cached, and — critically — when the fleet is still leased: killing the actors under a
+    running query is what a naive time-since-acquire timer used to do.
     """
     global _SESSION, _SESSION_TIMER
     with _SESSION_LOCK:
         if _SESSION_TIMER is not None:
             _SESSION_TIMER.cancel()
             _SESSION_TIMER = None
+        if _SESSION_LEASES > 0:
+            return  # an operator is still shuffling over it — never kill mid-query
         if _SESSION is not None:
             with contextlib.suppress(Exception):
                 _SESSION.cleanup()
@@ -240,24 +370,43 @@ def acquire_fleet(workers: int, credits: int, cfg_json: str):
     """
     fleet = current_fleet()
     if fleet is not None:
-        # Re-assert the borrowed fleet's plan id on the driver, so this operator's
-        # tree-combine tickets fence to the same query the workers were spawned for.
-        from batcher.dist.flight_worker import set_current_plan_id
-
-        set_current_plan_id(fleet.plan_id)
+        # Re-assert this operator's plan id on the driver, so its tree-combine tickets
+        # fence to the same query the workers are publishing under. Prefer the id minted
+        # for *this query* over the fleet's spawn-time one: a shared fleet's id is common
+        # to every pipeline borrowing it, which is exactly the collision we are avoiding.
+        adopt_plan_id(fleet.plan_id)
         return fleet.actors, fleet.pg, fleet.addrs, fleet.workers, False
 
     from batcher.config import active_config
 
     if active_config().distributed.reuse_session_fleet:
-        from batcher.dist.flight_worker import set_current_plan_id
-
         session = _acquire_session_fleet(workers, credits, cfg_json)
-        set_current_plan_id(session.plan_id)
+        adopt_plan_id(session.plan_id)
         return session.actors, session.pg, session.addrs, session.workers, False
 
     actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json)
     return actors, pg, addrs, workers, True
+
+
+def release_fleet(actors, pg, owns: bool) -> None:
+    """The teardown paired with `acquire_fleet` — every Flight operator's ``finally``.
+
+    Mirrors the three acquisition paths: a transient fleet (``owns``) is killed and its
+    placement group released; a borrowed **query** fleet is left alone (the adaptive loop
+    owns its lifetime); a borrowed **session** fleet has its lease dropped, which re-arms
+    the idle timer only once no operator is still using it.
+    """
+    if owns:
+        import ray
+
+        from batcher.dist.executors.ray_runtime import release_placement
+
+        for a in actors:
+            with contextlib.suppress(Exception):
+                ray.kill(a)
+        release_placement(pg)
+    elif current_fleet() is None:
+        release_session_lease()  # borrowed the session fleet — hand the lease back
 
 
 def current_fleet() -> ShuffleFleet | None:
@@ -311,9 +460,17 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
             return None
         from batcher.dist.flight_aggregate import _shuffle_credits
 
-        # An adaptive query fleet reserves its own placement group; free any warm
-        # session fleet first so its held bundles can't deadlock the new gang request.
+        # A fleet reserves the cluster's whole CPU capacity, so two cannot both be placed,
+        # and the release below is a NO-OP while another pipeline holds the warm fleet —
+        # spawning anyway contends with the reservation that pipeline is running on and
+        # degrades to the 1-2 workers it can place (measured: a join 0.6 s -> 16 s). Share
+        # instead; `None` is the documented borrow path, and this query's lease keeps the
+        # fleet alive across its stages. The test is the query count, not whether the
+        # release took: the caller holds this query's own lease already, so the release
+        # always no-ops and cannot see a concurrent holder. >1 means someone else does.
         release_session_fleet()
+        if active_query_scopes() > 1:
+            return None
         return ShuffleFleet.spawn(workers, _shuffle_credits(), engine_config_json())
     finally:
         release_autoscale()

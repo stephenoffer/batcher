@@ -12,6 +12,13 @@
 //! against *that* machine's secrets, so a distributed query never ships a resolved key
 //! over the wire. A bare value with no scheme prefix is treated as an inline literal —
 //! the dev-convenience path the Python layer warns about.
+//!
+//! The scheme table itself lives in `bc-secrets`, which adds a TTL cache (this is a
+//! per-batch call path — an uncached lookup re-read the environment or the filesystem for
+//! every array) and the `cmd:` backend that reaches Vault / AWS Secrets Manager / GCP
+//! Secret Manager / Azure Key Vault through an operator-configured helper program, with
+//! no cloud SDK linked into the engine. This function keeps ownership of the error type
+//! so the message a user sees still names the function they called.
 
 use std::borrow::Cow;
 
@@ -22,29 +29,23 @@ use crate::ExprError;
 /// * `env:NAME` — the value of environment variable `NAME`.
 /// * `file:PATH` — the contents of `PATH`, with surrounding whitespace trimmed (so a
 ///   trailing newline in a mounted secret file is not part of the key).
+/// * `cmd:NAME` — stdout of the operator-configured `BATCHER_SECRET_COMMAND` run with
+///   `NAME`; the bridge to Vault / KMS / Secret Manager without an SDK in the engine.
 /// * anything else — returned unchanged (an inline literal).
 ///
 /// The error names the *reference* (`env:NAME` / `file:PATH`), never the resolved value:
 /// the reference is not secret and is exactly what an operator needs to debug a
 /// misconfiguration, whereas the key must never reach a log.
 pub(super) fn resolve_key<'a>(func: &'static str, raw: &'a str) -> Result<Cow<'a, str>, ExprError> {
-    if let Some(name) = raw.strip_prefix("env:") {
-        std::env::var(name)
-            .map(Cow::Owned)
-            .map_err(|_| ExprError::KeyRefUnresolved {
-                func,
-                reference: format!("env:{name}"),
-            })
-    } else if let Some(path) = raw.strip_prefix("file:") {
-        std::fs::read_to_string(path)
-            .map(|s| Cow::Owned(s.trim().to_string()))
-            .map_err(|_| ExprError::KeyRefUnresolved {
-                func,
-                reference: format!("file:{path}"),
-            })
-    } else {
-        Ok(Cow::Borrowed(raw))
+    if !bc_secrets::is_reference(raw) {
+        return Ok(Cow::Borrowed(raw)); // an inline literal
     }
+    bc_secrets::resolve(raw)
+        .map(Cow::Owned)
+        .map_err(|_| ExprError::KeyRefUnresolved {
+            func,
+            reference: raw.to_string(),
+        })
 }
 
 #[cfg(test)]

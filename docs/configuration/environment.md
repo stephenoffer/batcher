@@ -23,8 +23,7 @@ segment. Names are uppercased section and field names.
 | `BATCHER_PID_KP` | `config.pid.kp` |
 | `BATCHER_METADATA_BACKEND` | `config.metadata.backend` |
 
-Values are coerced to the field's type. Integers and floats are parsed directly;
-booleans accept `1`, `true`, `yes`, or `on` (case-insensitive) as true.
+Values are coerced to the field's type. Integers and floats are parsed directly. Booleans accept `1`, `true`, `yes`, or `on`, case-insensitively, as true.
 
 ```bash
 # docs: skip
@@ -86,14 +85,14 @@ cfg = Config.from_file("/etc/batcher/config.json")
 
 ## Precedence
 
-The two layers here sit in the middle of the resolution order (highest first):
+The two layers here sit in the middle of the resolution order, highest first:
 
-1. `config_context(...)`
-2. `set_config(...)`
-3. `BATCHER_*` environment variables
-4. `BATCHER_CONFIG_FILE` JSON
-5. Built-in defaults
+1. `config_context(...)`.
+1. `set_config(...)`.
+1. `BATCHER_*` environment variables.
+1. `BATCHER_CONFIG_FILE` JSON.
+1. Built-in defaults.
 
 So a `BATCHER_*` variable overrides a value set in `BATCHER_CONFIG_FILE`, and a
-runtime `set_config` or `config_context` overrides both. See
-[index](index.md) for the runtime entry points.
+runtime `set_config` or `config_context` overrides both. See {doc}`index` for the
+runtime entry points and {doc}`options` for every field a variable can name.

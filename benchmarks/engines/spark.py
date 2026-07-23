@@ -30,7 +30,7 @@ from functools import lru_cache
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .base import Engine, SqlRunner
+from .base import Engine, Rename, SqlRunner, sql_projection
 
 # Driver heap for local mode. Must be set before the JVM launches, so it goes through
 # `PYSPARK_SUBMIT_ARGS` rather than a `SparkConf` entry (which the driver reads too late).
@@ -161,10 +161,12 @@ class SparkEngine(Engine):
             _register_parquet(spark, name, tbl)
         return lambda query: _to_arrow(spark.sql(query))
 
-    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+    def sql_runner_scan(self, uris: dict[str, str], rename: Rename | None = None) -> SqlRunner:
         spark = _session()
         for name, uri in uris.items():
-            spark.read.parquet(_s3a(uri)).createOrReplaceTempView(name)
+            spark.read.parquet(_s3a(uri)).createOrReplaceTempView(f"__raw_{name}")
+            cols = sql_projection((rename or {}).get(name))
+            spark.sql(f"SELECT {cols} FROM __raw_{name}").createOrReplaceTempView(name)
         return lambda query: _to_arrow(spark.sql(query))
 
     def scan_sql_runner(self, glob: str) -> SqlRunner:

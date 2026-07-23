@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -27,8 +28,6 @@ def t(duck):
     ],
 )
 def test_list_ops(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -42,7 +41,45 @@ def test_list_ops(duck, t, q):
     ],
 )
 def test_list_reductions(duck, t, q):
-    from conftest import assert_same
-
     # assert_same tolerates int/Decimal vs float (list reductions cast to float).
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.fixture
+def vt(duck):
+    tbl = pa.table(
+        {
+            "id": [1, 2, 3],
+            "a": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            "b": [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+        }
+    )
+    duck.register("vt", tbl)
+    return tbl
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
+        # Two-column vector functions, using DuckDB's canonical `list_*` spellings so the
+        # same SQL runs on both engines — this is the SQL-level vector-search surface.
+        "SELECT id, list_cosine_similarity(a, b) s FROM vt",
+        "SELECT id, list_distance(a, b) s FROM vt",
+        "SELECT id, list_dot_product(a, b) s FROM vt",
+        # Against a query-vector array literal, the RAG retrieval shape.
+        "SELECT id, list_cosine_similarity(a, [1.0, 0.0]) s FROM vt",
+        "SELECT id, list_distance(a, [1.0, 0.0]) s FROM vt ORDER BY s ASC",
+    ],
+)
+def test_sql_vector_functions_match_duckdb(duck, vt, q):
+    assert_same(bt.sql(q, vt=vt).collect(), duck.sql(q))
+
+
+def test_sql_vector_search_top_k():
+    # The end-to-end ML-in-SQL retrieval query: rank rows by similarity to a query vector.
+    tbl = pa.table({"id": [1, 2, 3], "emb": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]})
+    out = bt.sql(
+        "SELECT id FROM docs ORDER BY list_cosine_similarity(emb, [1.0, 0.0]) DESC LIMIT 2",
+        docs=tbl,
+    ).to_pydict()
+    assert out["id"] == [1, 3]

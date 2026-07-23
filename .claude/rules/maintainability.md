@@ -86,9 +86,12 @@ each other; `api` wires them.
 
 - New optimizer rule → `kyber/rules/<family>.py`, registered via `@rule`.
 - New scalar/agg/window function → `plan/functions/<family>.py`, surfaced through the
-  `api/functions.py` façade; or a `.str`/`.dt`/… accessor in `plan/expr/namespaces.py`.
-- New IO format → `io/formats/<fmt>.py`, registered as a `SourceFormat`/`SinkFormat`.
-- New relational operator → Rust `bc-runtime` (mergeable) + `plan/nodes/` + the IR tag.
+  `api/functions.py` façade; or a `.str`/`.dt`/… accessor in `plan/expr_ir/namespaces/`.
+- New IO format → `io/formats/<category>/<fmt>.py` (the nine category packages:
+  `structured`, `semistructured`, `unstructured`, `multimodal`, `lakehouse`, `sql`,
+  `nosql`, `streaming`, `ml`), registered as a `SourceFormat`/`SinkFormat`. See the
+  `add-an-io-format-or-connector` skill.
+- New relational operator → Rust `bc-runtime` (mergeable) + `plan/logical/` + the IR tag.
 - New execution tier (morsel/JIT/LLVM/GPU) → a `core` `Executor` strategy, not new
   call-site branching.
 - New adaptive/resource decision → a `carbonite` policy.
@@ -102,6 +105,6 @@ concrete implementation beats a premature framework.
 
 ## Gate before done
 
-`just lint-structure` clean (or the file explicitly allowlisted with a reason), the
-pre-commit hook installed (`just install-hooks`), plus the existing gates in
-`python-quality.md` / `testing.md`.
+The canonical gate matrix is in `CLAUDE.md` — run the rows your change touches. Structure
+delta: `just lint-structure` clean **or** the file allowlisted with a one-line reason, and
+`just map` + `just lint-guardrails` after any move so the index and the guidance stay true.

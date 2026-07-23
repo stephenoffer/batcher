@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -90,8 +91,6 @@ def test_describe_custom_percentiles(duck):
 
 
 def test_null_count_lazy_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _t())
     out = bt.from_arrow(_t()).null_count().collect()
     assert_same(
@@ -111,3 +110,66 @@ def test_describe_empty_input():
     # mean/std/min/max over no rows are undefined (null), not NaN.
     mean_x = _stat(d, "mean", "x")
     assert mean_x is None or math.isnan(mean_x)
+
+
+def test_corr_matrix_matches_duckdb(duck):
+    """Every cell of `corr_matrix` equals DuckDB's `corr(a, b)` for that pair, and the
+    matrix is symmetric with a unit diagonal."""
+    t = pa.table(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "b": [2.0, 4.0, 6.0, 8.0, 10.0],  # perfectly correlated with a
+            "c": [5.0, 3.0, 4.0, 1.0, 2.0],  # something noisier
+            "label": ["p", "q", "r", "s", "t"],  # non-numeric, must be skipped
+        }
+    )
+    duck.register("m", t)
+    got = bt.from_arrow(t).corr_matrix().to_pydict()
+    cols = got["column"]
+    assert cols == ["a", "b", "c"]  # 'label' skipped
+    for i, a in enumerate(cols):
+        for b in cols:
+            expected = duck.sql(f"SELECT corr({a}, {b}) FROM m").fetchone()[0]
+            cell = got[b][i]
+            if expected is None:
+                assert cell is None
+            else:
+                assert cell == pytest.approx(expected)
+    # Symmetry + unit diagonal.
+    for i, a in enumerate(cols):
+        assert got[a][i] == pytest.approx(1.0)
+        for j, b in enumerate(cols):
+            assert got[b][i] == pytest.approx(got[a][j])
+
+
+def test_corr_matrix_rejects_non_numeric_and_unknown(duck):
+    from batcher._internal.errors import PlanError
+
+    ds = bt.from_arrow(pa.table({"a": [1, 2, 3], "s": ["x", "y", "z"]}))
+    with pytest.raises(PlanError):
+        ds.corr_matrix(["s"])
+    with pytest.raises(PlanError):
+        ds.corr_matrix(["nope"])
+
+
+def test_cov_matrix_matches_duckdb(duck):
+    """Every cell of `cov_matrix` equals DuckDB's `covar_samp(a, b)`; the diagonal is the
+    sample variance and the matrix is symmetric."""
+    t = pa.table(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "b": [2.0, 4.0, 6.0, 8.0, 10.0],
+            "c": [5.0, 3.0, 4.0, 1.0, 2.0],
+        }
+    )
+    duck.register("cv", t)
+    got = bt.from_arrow(t).cov_matrix().to_pydict()
+    cols = got["column"]
+    for i, a in enumerate(cols):
+        for b in cols:
+            expected = duck.sql(f"SELECT covar_samp({a}, {b}) FROM cv").fetchone()[0]
+            assert got[b][i] == pytest.approx(expected)
+    # Diagonal is the sample variance.
+    for i, a in enumerate(cols):
+        var = duck.sql(f"SELECT var_samp({a}) FROM cv").fetchone()[0]
+        assert got[a][i] == pytest.approx(var)

@@ -20,6 +20,8 @@ import functools
 import os
 import time
 
+from _ray_env import init_ray
+
 print = functools.partial(print, flush=True)
 
 
@@ -29,23 +31,6 @@ def _cfg() -> dict:
         "iters": int(os.environ.get("BENCH_UTIL_ITERS", "150")),
         "warmup": int(os.environ.get("BENCH_UTIL_WARMUP", "20")),
     }
-
-
-def _init() -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env={"pip": None}, logging_level="ERROR", log_to_driver=False
-        )
 
 
 def _run_inference(batch: int, iters: int, warmup: int, overlap: bool) -> dict:
@@ -110,7 +95,7 @@ def _run_inference(batch: int, iters: int, warmup: int, overlap: bool) -> dict:
 
 def main() -> int:
     cfg = _cfg()
-    _init()
+    init_ray()
     import ray
 
     print(f"model=resnet50(fp16)  batch={cfg['batch']}  iters={cfg['iters']}\n")

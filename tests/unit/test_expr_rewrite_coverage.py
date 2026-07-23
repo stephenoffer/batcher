@@ -19,8 +19,8 @@ import inspect
 import pytest
 
 import batcher as bt
-from batcher.plan import expr_rewrite
 from batcher.plan.expr_ir import func_nodes
+from batcher.plan.expr_rewrite import traverse as expr_rewrite
 
 pytestmark = pytest.mark.unit
 

@@ -2,10 +2,10 @@
 
 Column work is expressed with `Expr` values built from
 {py:obj}`bt.col(...) <batcher.col>` and {py:obj}`bt.lit(...) <batcher.lit>`. An
-expression is a *description* of a computation, not a Python loop. When the plan
-executes, the expression is evaluated in the Rust data plane over whole Arrow
-batches — vectorized, and compiled to machine code where possible — never row by row
-in Python.
+expression is a *description* of a computation. It isn't a Python loop. When the plan
+executes, the Rust data plane evaluates that expression over whole Arrow batches:
+vectorized, compiled to machine code where possible. No part of it walks the rows in
+Python.
 
 ```python
 import batcher as bt
@@ -17,17 +17,17 @@ print(ds.select(scaled=total).to_pydict())
 # {'scaled': [10, 20, 30, 40]}
 ```
 
-This is why there are no per-row Python callbacks in the hot path: the control plane
-never touches a tuple. Operators (`+`, `==`, `&`), methods (`.sum()`, `.cast(...)`),
-and the accessor namespaces (`.str`, `.dt`, `.list`) all build up the same `Expr`
-tree that the engine evaluates.
+That is why the hot path has no per-row Python callbacks in it. The control plane never
+touches a tuple. Operators such as `+`, `==`, and `&`, methods such as `.sum()` and
+`.cast(...)`, and the accessor namespaces `.str`, `.dt`, and `.list` all build up the
+same `Expr` tree, and the engine evaluates it.
 
-The one place user Python sees data is `map_batches`, which hands you a whole Arrow
-batch (not a row) so the work still happens in bulk, off the per-row path.
+The one place your Python sees data is `map_batches`, and even there it hands you a
+whole Arrow batch rather than a row, so the work stays in bulk.
 
 ## Conditionals and reuse
 
-Because an expression is a value, you build it once and reuse it — in `select`,
+An expression is a value, so you build it once and reuse it in `select`,
 `with_columns`, `filter`, or an aggregate. Conditionals read like SQL's `CASE WHEN`:
 
 ```python

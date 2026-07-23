@@ -16,6 +16,7 @@ import batcher as bt
 # Importing the module registers its @rule decorators into the default registry, so the
 # full Optimizer that `.collect()` runs will apply them.
 import batcher.kyber.rules.extra.predicate_infer
+from _harness import assert_same
 from batcher import col
 from batcher.plan.expr_ir import InList
 
@@ -41,112 +42,80 @@ def _multi(duck):
 
 
 def test_tighten_bounds(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") > 3) & (col("a") > 1))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a > 3 AND a > 1"))
 
 
 def test_range_contradiction_empty(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") > 5) & (col("a") < 3))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a > 5 AND a < 3"))
 
 
 def test_equality_contradiction_empty(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") == 1) & (col("a") == 2))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a = 1 AND a = 2"))
 
 
 def test_eq_vs_range_contradiction(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") == 1) & (col("a") > 5))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a = 1 AND a > 5"))
 
 
 def test_eq_neq_contradiction(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") == 5) & (col("a") != 5))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a = 5 AND a <> 5"))
 
 
 def test_bound_dominated_neq(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") > 5) & (col("a") != 3))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a > 5 AND a <> 3"))
 
 
 def test_redundant_is_not_null_with_nulls(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter((col("a") > 3) & col("a").is_not_null())
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a > 3 AND a IS NOT NULL"))
 
 
 def test_in_list_refined_by_comparison(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (1, 3, 5, 8)) & (col("a") > 3))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (1, 3, 5, 8) AND a > 3"))
 
 
 def test_in_list_refined_by_equality(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (1, 3, 5)) & (col("a") == 5))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (1, 3, 5) AND a = 5"))
 
 
 def test_in_list_equality_absent_is_empty(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (1, 3, 5)) & (col("a") == 7))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (1, 3, 5) AND a = 7"))
 
 
 def test_in_list_refined_by_neq(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (1, 3, 5)) & (col("a") != 3))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (1, 3, 5) AND a <> 3"))
 
 
 def test_intersect_in_lists(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (1, 3, 5)) & InList(col("a"), (3, 5, 8)))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (1, 3, 5) AND a IN (3, 5, 8)"))
 
 
 def test_intersect_in_lists_disjoint_is_empty(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (1, 3)) & InList(col("a"), (5, 8)))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (1, 3) AND a IN (5, 8)"))
 
 
 def test_singleton_in_list(duck):
-    from conftest import assert_same
-
     ds = _t(duck).filter(InList(col("a"), (5,)))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a IN (5)"))
 
 
 def test_transitive_comparison_chain(duck):
-    from conftest import assert_same
-
     ds = _multi(duck).filter((col("a") < col("b")) & (col("b") < col("c")))
     assert_same(ds.collect(), duck.sql("SELECT * FROM m WHERE a < b AND b < c"))
 
 
 def test_empty_input_stays_empty(duck):
-    from conftest import assert_same
-
     ds = _t(duck, rows=[]).filter((col("a") > 3) & (col("a") > 1))
     assert_same(ds.collect(), duck.sql("SELECT * FROM t WHERE a > 3 AND a > 1"))

@@ -58,6 +58,7 @@ from batcher.dist.executors.ray_runtime import (
     topology_scope,
     worker_node_memory_bytes,
 )
+from batcher.dist.fleet.plan_id import with_query_shuffle_scope
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import (
@@ -74,9 +75,26 @@ from batcher.plan.logical import (
 )
 from batcher.plan.resource import SchedulingEnvelope
 
-__all__ = ["execute_distributed"]
+__all__ = ["execute_distributed", "resolve_worker_fanout"]
 
 
+def resolve_worker_fanout(num_workers: int | None) -> int:
+    """The worker fan-out for a distributed stage the caller did not size explicitly.
+
+    `execute_distributed` derives its fan-out from the live cluster (`_cluster_fill_workers`
+    — enough workers to fill every node's cores). Paths that bypass it and drive Ray tasks
+    directly — notably the distributed **write** — must not invent their own constant: a
+    hard-coded fan-out uses 4 workers on a 100-node cluster, stranding 96 nodes. This is
+    that same sizing, exposed for those callers. An explicit `num_workers` always wins.
+    """
+    if num_workers is not None:
+        return max(1, num_workers)
+    _ensure_ray(available_cpu_count())
+    fill = _cluster_fill_workers()
+    return fill[0] if fill is not None else available_cpu_count()
+
+
+@with_query_shuffle_scope
 def execute_distributed(
     plan: LogicalPlan,
     sources: list[Source],
@@ -119,8 +137,14 @@ def execute_distributed(
     # one-off big job doesn't pin the cluster scaled-up), clamp the fan-out to
     # schedulable capacity, and pick the transport from the resulting topology.
     num_cpus, num_gpus = (envelope.num_cpus, envelope.num_gpus) if envelope else (1.0, 0.0)
+    accel = tuple(envelope.resources) if envelope else ()
     token = set_scheduling_envelope(envelope)
-    request_autoscale(math.ceil(workers * num_cpus), workers * num_gpus)
+    request_autoscale(
+        math.ceil(workers * num_cpus),
+        workers * num_gpus,
+        # Scale the per-task accelerator ask by the fan-out, as the GPU floor is.
+        tuple((name, amount * workers) for name, amount in accel),
+    )
     try:
         _ensure_ray(workers)
         # Wait (bounded, growth-detected) for the autoscaler to bring the cluster toward
@@ -282,6 +306,26 @@ def _even_cpu_share(workers: int) -> float:
         return 1.0
 
 
+def _max_workers_per_node(workers: int, num_cpus: float) -> int:
+    """The most workers any one node will host, given a `num_cpus`-sized uniform grant.
+
+    Mirrors how the fan-out is actually placed: a node with `c` cores takes `floor(c / num_cpus)`
+    workers, which is the same slicing `_cluster_fill_workers` uses to *choose* the fan-out. Any
+    memory budget derived from this is therefore valid on the node that packs the most workers,
+    rather than on an imaginary average node that may host none of them.
+
+    Falls back to the fleet average (`ceil(workers / nodes)`) when the topology is unreadable —
+    the historical behavior, and the best available guess when node sizes are unknown.
+    """
+    try:
+        node_cpus = _worker_node_cpus()
+        if node_cpus and num_cpus > 0:
+            return max(1, max(int(c // num_cpus) for c in node_cpus))
+    except Exception:
+        pass
+    return max(1, math.ceil(workers / max(1, alive_node_count())))
+
+
 def _size_worker_memory(
     envelope: SchedulingEnvelope | None, workers: int, num_cpus: float
 ) -> SchedulingEnvelope | None:
@@ -293,12 +337,18 @@ def _size_worker_memory(
     RAM. The budget is `min(node_mem * soft_limit / workers_per_node, Carbonite's estimate)`
     — Carbonite's tighter data-driven estimate still wins, but an unset (unbounded) or
     driver-oversized grant is clamped to what the worker machine can actually hold.
+
+    `workers_per_node` is the **most** any single node hosts, not the fleet average. The two
+    diverge exactly on the clusters this sizing exists for: `_cluster_fill_workers` gives a node
+    with k times the smallest node's cores k workers *on purpose*, so a 128-core node beside
+    three 32-core ones hosts 4 workers while the average is 2. Dividing the (already smallest)
+    node RAM by the average then hands each of those 4 workers twice the memory its node can
+    honour — an OOM on the busiest node in the fleet, and only on heterogeneous ones.
     """
     node_mem = worker_node_memory_bytes()
     if node_mem <= 0:
         return envelope
-    nodes = max(1, alive_node_count())
-    per_node_workers = max(1, math.ceil(workers / nodes))
+    per_node_workers = _max_workers_per_node(workers, num_cpus)
     from batcher.config import active_config
 
     budget = int(node_mem * active_config().memory.soft_limit / per_node_workers)
@@ -383,21 +433,38 @@ def _join_sides_are_map_only(join) -> bool:
 
 
 def _fusable_join_aggregate(agg: Aggregate) -> bool:
-    """Whether `agg` is an aggregate over an inner join, grouped by (a superset of) the
-    join key — so it can be distributed by reusing the join's co-partitioning.
+    """Whether `agg` can be distributed by reusing the join's co-partitioning — no shuffle.
 
-    Requires the join key to appear among the group keys as a plain column: then every
-    group shares one key value, lands in one co-partitioned bucket, and each reducer's
-    per-bucket aggregate is complete (no cross-bucket combine needed, so any aggregate
-    — even a non-mergeable one — is correct).
+    **This is exchange elimination, and it is decided by the physical-property layer.** The
+    shuffle join co-partitions both sides by the join key, so its output is hash-partitioned
+    by that key (`kyber.properties.hash_partitioned_on`). An aggregate whose group keys are a
+    *superset* of it therefore has every group entirely inside one bucket: each reducer joins
+    *and* aggregates its own bucket, the union of the reducer outputs is the complete result,
+    and no second shuffle is needed. Because no cross-bucket combine is needed, even a
+    non-mergeable aggregate is correct here.
+
+    Kyber owns the question "what distribution does this relation already have"; `dist`
+    schedules against the answer rather than re-deriving it, so the two cannot drift.
     """
+    from batcher.kyber.properties import PhysicalProperties, hash_partitioned_on, satisfies
+
     j = agg.input
-    if not isinstance(j, Join) or j.join_type != "inner":
+    if not isinstance(j, Join) or not _join_sides_are_map_only(j):
         return False
-    if not _join_sides_are_map_only(j):
+    group_cols = tuple(gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col))
+    if not group_cols:
         return False
-    group_cols = {gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col)}
-    return bool(j.left_keys) and set(j.left_keys) <= group_cols
+    partitioned_on = hash_partitioned_on(j)
+    if not partitioned_on:
+        return False  # nothing guaranteed (an outer join, or no equi-key): must re-shuffle
+    # The group keys must *cover* the partitioning, so no group straddles two buckets: the
+    # delivered partitioning must be a subset of the required grouping (see `satisfies` — the
+    # containment runs the opposite way from ordering). Arguments in the natural
+    # (delivered, required) order.
+    return satisfies(
+        PhysicalProperties(hash_partitioned_on=partitioned_on),
+        PhysicalProperties(hash_partitioned_on=group_cols),
+    )
 
 
 def _aggregate_over_join(agg: Aggregate) -> bool:
@@ -670,10 +737,14 @@ def _dispatch(
     #
     # This is exact, not a sample: the global first `k + n` rows are a prefix of the
     # source, so every one of them lies in some partition's own first `k + n` rows; and
-    # `_distributed_map` assembles partition results **by index** (`gather_map_results`
-    # is index-addressed), so their concatenation is the source's row order and
-    # `slice(k, n)` selects precisely the rows the single-node engine returns. Only
-    # `workers x (k + n)` rows ever reach the driver, never the whole source.
+    # `_distributed_map` (with `preserve_order`) assembles partition results **by index**
+    # over contiguous, source-ordered split runs, so their concatenation is the source's
+    # row order and `slice(k, n)` selects precisely the rows the single-node engine returns.
+    # `preserve_order` is required: the default load-balanced (`_balance`) split assignment
+    # puts non-adjacent splits in one partition, so a partition's own first `k + n` rows
+    # interleave rows from different parts of the source and the slice returns a different
+    # row set than single-node. Only `workers x (k + n)` rows ever reach the driver, never
+    # the whole source.
     #
     # `hub=None`: the per-worker plan is truncated, so its row count must not be learned
     # as the source's cardinality. A `map_batches` prefix returned above, so the pipeline
@@ -688,16 +759,19 @@ def _dispatch(
                 from batcher.dist.executors.map import _distributed_map
 
                 per_worker = Limit(input=base, n=offset + n, offset=0)
-                table = _distributed_map(per_worker, sources, workers, None)
+                table = _distributed_map(per_worker, sources, workers, None, preserve_order=True)
                 table = table.slice(offset, n)
                 return table if not above else _apply_above(above, table)
 
     # `with_row_index` — a single global counter, so a per-partition run would restart it at
     # zero on every worker. Instead run the (row-wise) input distributed and number the rows
-    # on the driver: `_distributed_map` assembles partitions BY INDEX, so their concatenation
-    # is the source's own row order and the counter lands on exactly the rows single-node
-    # numbers. `with_random` (position-keyed hash) and `tail` (row index + filter) both lower
-    # to `RowId`, so all three distribute through this one path.
+    # on the driver: `_distributed_map` (with `preserve_order`) assembles partitions BY INDEX
+    # over contiguous, source-ordered split runs, so their concatenation is the source's own
+    # row order and the counter lands on exactly the rows single-node numbers. Without
+    # `preserve_order` the default `_balance` split assignment scrambles that order, so row
+    # `i` of the source gets a different index than single-node. `with_random` (position-keyed
+    # hash) and `tail` (row index + filter) both lower to `RowId`, so all three distribute
+    # through this one path.
     rowid_split = _split_at(plan, RowId)
     if rowid_split is not None:
         above, rowid = rowid_split
@@ -706,7 +780,7 @@ def _dispatch(
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
-                table = _distributed_map(rowid.input, sources, workers, None)
+                table = _distributed_map(rowid.input, sources, workers, None, preserve_order=True)
                 index = pa.array(
                     range(rowid.offset, rowid.offset + table.num_rows), type=pa.int64()
                 )
@@ -801,7 +875,11 @@ def _dispatch(
             if transport == "flight":
                 from batcher.dist.flight_join import execute_join_flight
 
-                return execute_join_flight(above, join, sources, workers)
+                # `materialize=False` (an intermediate stage of a multi-join query) keeps
+                # each reducer's joined bucket on its worker and returns a
+                # `FlightMaterializedSource` the next stage reads in place — no driver
+                # round-trip per join, which is what makes a 3+-table query scale.
+                return execute_join_flight(above, join, sources, workers, materialize=materialize)
             from batcher.dist.executors.join import _distributed_join
 
             return _distributed_join(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -27,8 +28,6 @@ def _emp_dept_region():
 
 
 def test_three_way_join_on_keys_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept, region = _emp_dept_region()
     for name, t in [("emp", emp), ("dept", dept), ("region", region)]:
         duck.register(name, t)
@@ -43,8 +42,6 @@ def test_three_way_join_on_keys_vs_duckdb(duck):
 
 
 def test_three_way_join_with_filter_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept, region = _emp_dept_region()
     for name, t in [("emp", emp), ("dept", dept), ("region", region)]:
         duck.register(name, t)
@@ -63,8 +60,6 @@ def test_three_way_join_with_filter_vs_duckdb(duck):
 
 
 def test_three_way_join_distinct_key_names_vs_duckdb(duck):
-    from conftest import assert_same
-
     # Distinct key names (left_on/right_on), disjoint schemas.
     orders = pa.table(
         {"order_id": [1, 2, 3, 4, 5], "cust": [1, 2, 1, 3, 2], "amt": [9, 8, 7, 6, 5]}
@@ -91,8 +86,6 @@ def test_three_way_join_distinct_key_names_vs_duckdb(duck):
 
 
 def test_four_way_join_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept, region = _emp_dept_region()
     grade = pa.table({"region_id": [1, 2], "grade": ["A", "B"]})
     for name, t in [("emp", emp), ("dept", dept), ("region", region), ("grade", grade)]:

@@ -11,12 +11,27 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from batcher.api.io_namespace._discovery import (
+    PathLike,
+    namespace_dir,
+    namespace_repr,
+    unknown_attribute,
+)
+from batcher.api.io_namespace._write_opts import (
+    MODE_AWARE_SINKS as _MODE_AWARE_SINKS,
+)
+from batcher.api.io_namespace._write_opts import (
+    normalize_partition_by,
+    normalize_save_mode,
+    reject_row_index,
+)
 from batcher.api.session import read as _read
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from batcher.api.dataset import Dataset
+    from batcher.api.merge import MergeBuilder
     from batcher.api.streaming import StreamingQuery
     from batcher.io.manifest import WriteManifest
     from batcher.plan.streaming import Trigger
@@ -24,14 +39,98 @@ if TYPE_CHECKING:
 __all__ = ["Writer"]
 
 
-# Save modes (Spark `SaveMode` parity). `append` is only meaningful for the
-# transactional lakehouse sinks, which consume `mode` as a constructor option; the
-# file sinks always overwrite, so for them `mode` only drives the existence gate.
-_SAVE_MODES = ("overwrite", "error", "ignore", "append")
-_MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi"})
-# Sinks with a native transactional MERGE; others fall back to a copy-on-write
-# file merge (`api.merge.compose_file_merge`).
-_MERGE_NATIVE_SINKS = frozenset({"delta"})
+def _prune_stale_after_overwrite(path: str, fmt: str, manifest: WriteManifest) -> None:
+    """Delete files a prior write left under `path` that this overwrite did not rewrite.
+
+    A file sink writes ``part-NNNNN`` (and Hive ``col=v/…``) files whose *names* depend
+    on the shard/chunk count and partition values of the current data — not the previous
+    write's. So overwriting a 5-file output with a 2-file one, or a ``{a, b}``-partitioned
+    table with an ``{a}``-only one, leaves the extra ``part-`` files / ``col=b`` directory
+    in place, and the next read unions the stale rows back in (silent data corruption). A
+    plain overwrite must *replace* the output, so any surviving file this write did not
+    produce is deleted after the (atomic, hence complete) write commits.
+
+    Runs only for the plain file sinks (`FileSink`): the lakehouse/warehouse sinks manage
+    their own overwrite through a transaction log or a target table. Fails safe — if the
+    manifest's own files are not all found in the listing (a path-normalization mismatch),
+    nothing is deleted rather than risk removing a live file.
+    """
+    import contextlib
+    import os.path
+
+    from batcher._internal.errors import IOError as _IOError
+    from batcher.io.base.sink import FileSink
+    from batcher.io.filesystem import resolve_filesystem
+    from batcher.io.sink import SINKS
+
+    sink_cls = SINKS.get(fmt)
+    if not (isinstance(sink_cls, type) and issubclass(sink_cls, FileSink)):
+        return
+    keep = {f.path for f in manifest.files}
+    # A single-file write (`<path>` is the file itself) is replaced atomically in place —
+    # there is no sibling directory of parts to prune.
+    if not keep or keep == {path}:
+        return
+    # The format extension to list by, read from the files this write actually produced
+    # (a sink's `suffix` can be an instance property — e.g. a per-write token — so it is
+    # not reliably readable off the class). All shards of one write share the extension.
+    suffixes = tuple(
+        {os.path.splitext(f.path)[1] for f in manifest.files if os.path.splitext(f.path)[1]}
+    )
+    if not suffixes:
+        return
+    fs = resolve_filesystem(path)
+
+    def _walk(directory: str) -> list[str]:
+        found: list[str] = []
+        # A directory with no matching data files (e.g. a partition root) raises.
+        with contextlib.suppress(OSError, ValueError, _IOError):
+            found.extend(fs.expand(directory, suffix=suffixes))
+        for sub in fs.list_dirs(directory):
+            found.extend(_walk(sub))
+        return found
+
+    existing = set(_walk(path))
+    if not keep.issubset(existing):
+        return  # listing did not surface our own files — do not risk a wrong deletion
+    for stale in existing - keep:
+        fs.remove(stale)
+
+
+def _undistributable_stream_reason(plan: Any) -> str | None:
+    """Why the cluster cannot fold this streaming plan with single-node semantics, or None.
+
+    A top-level `Aggregate` over a breaker-free input is exactly the shape the mergeable
+    algebra covers: each worker runs `partial` on its share of the epoch and the driver
+    `combine`s the partials into the running state. Anything else is **refused rather than run
+    with different semantics than the single-node path** — which is invariant #7
+    (single-node == distributed), and is not a slogan: the one shape that slipped through this
+    gate silently returned a different answer on a cluster than on one box.
+    """
+    from batcher.plan.logical import Aggregate, is_streamable
+
+    if not isinstance(plan, Aggregate) or not is_streamable(plan.input):
+        return (
+            "distributed streaming supports a stateless pipeline or a top-level "
+            "streaming aggregation; this plan has another pipeline breaker "
+            "(sort / join / window) — restructure it, or omit distributed."
+        )
+    if plan.watermark is not None:
+        # The shape that slipped through. A watermarked aggregate is an `Aggregate` over a
+        # streamable input, so the old gate waved it past — and `dist/` implements no
+        # watermark at all (no window eviction, no late-row drop, no append mode). It
+        # degraded to an unbounded complete-mode aggregate that re-emits the whole running
+        # result every epoch and grows state forever: the same query, single-node vs
+        # distributed, produced different results with no error and no warning.
+        return (
+            "distributed streaming does not implement event-time watermarks: the distributed "
+            "runner has no window eviction, no late-row drop, and no append output mode, so a "
+            "watermarked aggregation would silently degrade to an unbounded complete-mode "
+            "aggregate and return a different result than the same query run single-node. Run "
+            "it with distributed=False, or drop the watermark to accept complete-mode "
+            "semantics."
+        )
+    return None
 
 
 class Writer:
@@ -58,14 +157,32 @@ class Writer:
         """Bind the write namespace to the `Dataset` whose result it writes."""
         self._ds = ds
 
+    def __repr__(self) -> str:
+        """List the formats this namespace writes, grouped by family."""
+        return namespace_repr(self, "ds.write")
+
+    def __dir__(self) -> list[str]:
+        """Every format method, so tab-completion shows the writable formats."""
+        return namespace_dir(self)
+
+    def __getattr__(self, name: str) -> Any:
+        """Answer a misspelled format with a suggestion instead of a bare `AttributeError`.
+
+        Only ever reached on a miss, so it cannot shadow a real method. A `_`-prefixed
+        name still raises `AttributeError` — `copy`, `pickle`, and IPython probe for those
+        and require a miss to look like a miss.
+        """
+        raise unknown_attribute(self, "ds.write", name)
+
     def __call__(
         self,
-        path: str,
+        path: PathLike,
         format: str | None = None,
         *,
         mode: str = "overwrite",
         partition_by: list[str] | None = None,
-        distributed: bool = False,
+        single_file: bool = False,
+        distributed: bool | str = "auto",
         num_workers: int | None = None,
         resume: bool = False,
         max_rows_per_file: int | None = None,
@@ -75,6 +192,7 @@ class Writer:
         output_mode: str = "append",
         checkpoint: str | None = None,
         query_name: str | None = None,
+        auto_compact: bool = False,
         **opts: Any,
     ) -> WriteManifest | StreamingQuery:
         """Execute and write the result, inferring `format` from the path when omitted.
@@ -90,8 +208,20 @@ class Writer:
         * ``"overwrite"`` (default) — write, replacing any existing output.
         * ``"error"`` — raise `PlanError` if `path` already exists.
         * ``"ignore"`` — skip the write (return an empty manifest) if `path` exists.
-        * ``"append"`` — add to an existing table; only the transactional lakehouse
-          sinks (`delta`/`iceberg`/`hudi`) support it (others raise).
+        * ``"append"`` — add to an existing table; only the sinks that can add to one
+          (`delta`/`iceberg`/`hudi`/`snowflake`) support it. A file sink raises, because
+          it has nothing to append to.
+
+        Spark's own ``"errorIfExists"`` and Python's file modes (``"w"``, ``"a"``,
+        ``"x"``) are accepted as spellings of those four, so a ported job does not fail
+        on its last line. `partition_by` likewise answers to Spark's ``partitionBy=``
+        and pandas' ``partition_cols=``, and pandas' ``index=False`` is accepted and
+        dropped — Batcher has no row index, so there is nothing to suppress.
+
+        ``single_file=True`` guarantees the output is the one file at `path` rather than
+        a directory of shards: it refuses the arguments that shard (`partition_by`,
+        `max_rows_per_file`) instead of silently ignoring them, and keeps the write on
+        one worker.
 
         ``replace_where=<predicate>`` is a dynamic partition/range overwrite (Delta
         ``replaceWhere`` / the backfill pattern): atomically replace only the rows
@@ -133,12 +263,21 @@ class Writer:
         """
         from batcher._internal.errors import PlanError
         from batcher.api.terminal import _write
+        from batcher.io.base._paths import normalize_path
         from batcher.io.detect import detect_format
         from batcher.io.manifest import WriteManifest
         from batcher.io.source import is_bounded
 
-        if mode not in _SAVE_MODES:
-            raise PlanError(f"write(): unknown mode {mode!r}; use one of {list(_SAVE_MODES)}")
+        # Normalize the whole call vocabulary once, here: every typed method
+        # (`.parquet`, `.delta`, …) funnels through this call, so a spelling accepted
+        # here is accepted everywhere, and the sink below only ever sees canonical names.
+        path = normalize_path(path, what="write path")
+        mode = normalize_save_mode(mode)
+        partition_by = normalize_partition_by(opts, partition_by)
+        reject_row_index(opts)
+        if single_file:
+            self._check_single_file(partition_by, max_rows_per_file)
+            distributed = False
         fmt = detect_format(path, format)
 
         # `sort_by` clusters the output: sort rows (ascending) before writing so each
@@ -157,6 +296,7 @@ class Writer:
                 format,
                 mode=mode,
                 partition_by=partition_by,
+                single_file=single_file,
                 distributed=distributed,
                 num_workers=num_workers,
                 resume=resume,
@@ -170,8 +310,36 @@ class Writer:
 
         # Unified surface: a trigger or an unbounded source means this is a streaming
         # write — append micro-batches to `path` and return a StreamingQuery.
+        #
+        # The distributed *stream* drain stays EXPLICIT opt-in (`distributed=True`), not
+        # `"auto"`: it supports only a stateless `available_now()` backfill and raises for
+        # a checkpointed / continuous / stateful stream. Letting `"auto"` resolve it True
+        # on a cluster would turn those into errors for users who never asked to
+        # distribute. The batch path below resolves `"auto"` normally.
         if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
-            sink = self._stream_sink_for(path, fmt, opts)
+            # A path (file/Delta) sink can only *append* micro-batches. In "complete"/"update"
+            # mode a streaming aggregate re-emits its full running result every micro-batch (the
+            # sink is meant to replace/upsert it — `MemoryStreamSink` does), so an append-only path
+            # sink writes each running snapshot as another part file and readback silently
+            # **duplicates** the result across files (`streaming != batch`). Reject it — Spark's
+            # rule: file sinks support append only — rather than produce wrong data.
+            if output_mode in ("complete", "update"):
+                from batcher._internal.errors import PlanError
+
+                raise PlanError(
+                    f"streaming write to a path sink ({path!r}) supports output_mode='append' "
+                    f"only, not {output_mode!r}: a file/Delta sink appends each micro-batch, so a "
+                    f"running {output_mode!r} aggregate would be duplicated across part files. Use "
+                    "output_mode='append', a memory sink (.write.memory(name, "
+                    "output_mode='complete')), or .write.for_each_batch(fn) for a custom upsert."
+                )
+            if distributed is True:
+                drain = self._maybe_distributed_stream(
+                    path, fmt, opts, trigger, checkpoint, num_workers, query_name, output_mode
+                )
+                if drain is not None:
+                    return drain
+            sink = self._stream_sink_for(path, fmt, opts, query_name)
             return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
 
         # Resume is exactly-once only on a deterministic plan: the same input must
@@ -194,14 +362,30 @@ class Writer:
                     "materialize a stable keyed intermediate first."
                 )
 
-        # `replace_where` = dynamic partition/range overwrite (Delta `replaceWhere` /
-        # the backfill pattern): atomically replace only the rows matching the
-        # predicate, preserving the rest. Copy-on-write: keep the existing rows
-        # *outside* the range, union the new data, overwrite. Single-writer only.
+        # `replace_where` = dynamic partition/range overwrite (Delta `replaceWhere` / the
+        # backfill pattern): atomically replace only the rows matching the predicate and
+        # keep the rest.
+        #
+        # On a **Delta** table this is a scoped commit: the workers write the new
+        # partition's files and the driver retires exactly the matching partitions from the
+        # log. Nothing else is read and nothing else is rewritten, so backfilling one day of
+        # a 100 TB table costs one day. The copy-on-write path below cannot do that — it
+        # reads the *whole* table, filters out the replaced range, unions, and overwrites
+        # everything, which turns a one-day backfill into a full-table rewrite. That is what
+        # every lakehouse target used to do.
         if replace_where is not None:
             from batcher.io.filesystem import resolve_filesystem
 
-            if resolve_filesystem(path).exists(path):
+            if fmt in ("delta", "iceberg"):
+                # A lakehouse target scopes the overwrite to the predicate, inside its own
+                # transaction. Iceberg used to fall through the `exists(path)` check below —
+                # an Iceberg "path" is a catalog identifier, not a file, so the check was
+                # always False, `replace_where` was silently dropped, and the write ran as a
+                # plain overwrite that DELETED THE REST OF THE TABLE.
+                opts = dict(opts)
+                opts["replace_where"] = replace_where.to_ir()
+                mode = "overwrite"
+            elif resolve_filesystem(path).exists(path):
                 kept = _read(path, format=fmt).filter(~replace_where)
                 combined = kept.union(self._ds)
                 return combined.write(
@@ -209,13 +393,19 @@ class Writer:
                     fmt,
                     mode="overwrite",
                     partition_by=partition_by,
+                    single_file=single_file,
                     max_rows_per_file=max_rows_per_file,
                     **opts,
                 )
         if mode == "append" and fmt not in _MODE_AWARE_SINKS:
             raise PlanError(
                 f"write(): mode='append' is only supported for {sorted(_MODE_AWARE_SINKS)}, "
-                f"not {fmt!r} (use a fresh path, or 'overwrite')"
+                f"not {fmt!r}: a plain file sink has no table to add to, so appending would "
+                "mean rewriting the whole output. Either write each batch to its own path "
+                "under a directory and read the directory back as one relation "
+                f"(write(f'{{root}}/batch-{{n}}.{fmt}'), then read(root)), or use a "
+                "transactional sink — write.delta / write.iceberg / write.hudi — where "
+                "append is a real commit."
             )
         # error/ignore are a pre-write existence gate (resume has its own per-file
         # idempotence, so it is exempt).
@@ -239,19 +429,22 @@ class Writer:
         num_files: int | None = None
         target_bytes: int | None = None
         spec = self._ds._repartition
-        if spec is not None:
+        # `single_file=True` is the caller overriding the layout at the write, so a
+        # standing `repartition(num_files=...)` must not silently shard it back apart.
+        if spec is not None and not single_file:
             if spec.by and partition_by is None:
                 partition_by = list(spec.by)
             num_files = spec.num_files
             if spec.target_size_mb is not None:
                 target_bytes = int(spec.target_size_mb * 1024 * 1024)
 
-        return _write(
+        manifest = _write(
             self._ds._plan,
             self._ds._sources,
             self._ds.columns,
             path,
             fmt,
+            auto_compact=auto_compact,
             partition_by=partition_by,
             distributed=distributed,
             num_workers=num_workers,
@@ -261,6 +454,37 @@ class Writer:
             target_bytes_per_file=target_bytes,
             sink_kwargs=sink_kwargs,
         )
+        # Overwrite must REPLACE the output: drop any stale files a prior, differently
+        # shaped write left under `path` that this write did not rewrite (else the next
+        # read unions them back in). `resume` is exempt — it intentionally keeps and skips
+        # already-present files. Only the plain file sinks need this; the mode-aware sinks
+        # overwrite through their own log/table.
+        if mode == "overwrite" and not resume and fmt not in _MODE_AWARE_SINKS:
+            _prune_stale_after_overwrite(path, fmt, manifest)
+        return manifest
+
+    @staticmethod
+    def _check_single_file(partition_by: list[str] | None, max_rows_per_file: int | None) -> None:
+        """Refuse the arguments that would shard a `single_file=True` write.
+
+        Both of these produce a *directory* of ``part-*`` files, which is the one layout
+        `single_file` exists to rule out. Dropping them silently would hand back the
+        sharded output the caller just said they did not want — and the caller usually
+        wants one file because something downstream (a spreadsheet, a script, a tool that
+        takes a filename) cannot open a directory at all.
+        """
+        from batcher._internal.errors import PlanError
+
+        conflict = None
+        if partition_by:
+            conflict = "partition_by"
+        elif max_rows_per_file:
+            conflict = "max_rows_per_file"
+        if conflict is not None:
+            raise PlanError(
+                f"write(single_file=True, {conflict}=...): {conflict} writes a directory of "
+                "part files, which is what single_file rules out. Pass one or the other."
+            )
 
     # --- streaming sink targets -------------------------------------------
     def _start_stream(
@@ -284,12 +508,117 @@ class Writer:
             checkpoint=checkpoint,
         )
 
-    def _stream_sink_for(self, path: str, fmt: str, opts: dict[str, Any]) -> Any:
-        """Build the per-micro-batch `StreamSink` for a path/format streaming write."""
+    def _maybe_distributed_stream(
+        self,
+        path: str,
+        fmt: str,
+        opts: dict[str, Any],
+        trigger: Trigger | None,
+        checkpoint: str | None,
+        num_workers: int | None,
+        query_name: str | None,
+        output_mode: str = "append",
+    ) -> StreamingQuery | None:
+        """Run a `distributed=True` streaming write across the cluster, if eligible.
+
+        Two distributed shapes, one for each kind of trigger:
+
+        * a **drain** (`available_now`/`once`) over a bounded, splittable source is a
+          parallel backfill — every worker drains its own partition once (Spark's
+          `Trigger.AvailableNow`);
+        * a **continuous / processing-time** stream runs each micro-batch as a cluster-wide
+          epoch: the workers stage the epoch's data files and the driver publishes them as
+          a single transaction, so the log records one transaction per micro-batch and a
+          replayed epoch adds neither a row nor a commit.
+
+        A benign mismatch (a source with nothing to fan out) returns ``None`` so the caller
+        falls back to the single-node engine. A request we cannot honor *correctly* raises
+        `PlanError` rather than silently ignoring the flag — or, worse, quietly delivering a
+        weaker guarantee than the API implies.
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.api.streaming import _DRAIN_TRIGGER_KINDS, _is_stateless
+        from batcher.dist.executor import _is_splittable_source
+        from batcher.io.source import is_bounded
+
+        srcs = self._ds._sources
+        if len(srcs) != 1:
+            return None  # not worth (or not able to) fan out — fall back to single-node
+        source = srcs[0]
+
+        # Probing an *unbounded* source with `splits()` is not free: on an incremental file
+        # source a listing IS the discovery pass, so asking "could this be split?" would
+        # consume the very files the epoch was about to read. Unbounded sources therefore
+        # declare `partitionable` instead of being interrogated.
+        splittable = (
+            _is_splittable_source(source)
+            if is_bounded(source)
+            else getattr(source, "partitionable", False)
+        )
+        if not splittable:
+            return None
+
+        drain = trigger is not None and trigger.kind in _DRAIN_TRIGGER_KINDS
+        if drain and checkpoint is None and is_bounded(source):
+            from batcher.api.streaming import start_distributed_stream_drain
+
+            return start_distributed_stream_drain(
+                self._ds._plan,
+                srcs,
+                path,
+                fmt,
+                opts,
+                self._ds.columns,
+                num_workers=num_workers,
+                name=query_name,
+            )
+
+        if fmt in _MODE_AWARE_SINKS and fmt != "delta":
+            raise PlanError(
+                f"distributed streaming to {fmt!r} is not supported: its writer has no "
+                "transaction-id check, so a replayed micro-batch would duplicate rows "
+                "instead of being recognized as already-committed. Write to Delta for an "
+                "exactly-once distributed stream, or run single-node (distributed=False)."
+            )
+        if not _is_stateless(self._ds._plan) and trigger is not None:
+            if trigger.kind == "continuous":
+                raise PlanError(
+                    "a continuous trigger supports only stateless pipelines (filter / "
+                    "select / map_batches); a streaming aggregation needs a micro-batch "
+                    "boundary to fold — use Trigger.processing_time(...)"
+                )
+            reason = _undistributable_stream_reason(self._ds._plan)
+            if reason is not None:
+                raise PlanError(reason)
+        from batcher.api.streaming import start_distributed_stream
+        from batcher.plan.streaming import Trigger as _Trigger
+
+        return start_distributed_stream(
+            self._ds._plan,
+            srcs,
+            path,
+            fmt,
+            opts,
+            trigger=trigger or _Trigger.processing_time(0),
+            output_mode=output_mode,
+            name=query_name,
+            checkpoint=checkpoint,
+            num_workers=num_workers,
+        )
+
+    def _stream_sink_for(
+        self, path: str, fmt: str, opts: dict[str, Any], query_name: str | None = None
+    ) -> Any:
+        """Build the per-micro-batch `StreamSink` for a path/format streaming write.
+
+        `query_name` becomes the transactional sink's Delta ``txn`` application id, which
+        is what makes a restarted query's replayed micro-batch idempotent — so it has to
+        reach the sink, not just the query engine.
+        """
         from batcher.io.formats.streaming.sinks import DeltaStreamSink, FileStreamSink
 
         if fmt in _MODE_AWARE_SINKS:
-            return DeltaStreamSink(path, **opts)
+            return DeltaStreamSink(path, query_name=query_name, **opts)
         return FileStreamSink(path, fmt, **opts)
 
     def console(
@@ -446,7 +775,8 @@ class Writer:
             ForeachStreamSink(fn), trigger, output_mode, query_name, checkpoint
         )
 
-    def parquet(self, path: str, *, compression: str = "zstd", **opts: Any) -> WriteManifest:
+    # --- File / object-store formats (path-addressed) ----------------------
+    def parquet(self, path: PathLike, *, compression: str = "zstd", **opts: Any) -> WriteManifest:
         """Write as Parquet (see `__call__` for `partition_by`/`distributed`).
 
         Args:
@@ -469,7 +799,7 @@ class Writer:
         """
         return self(path, "parquet", compression=compression, **opts)
 
-    def csv(self, path: str, **opts: Any) -> WriteManifest:
+    def csv(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as CSV.
 
         Args:
@@ -491,7 +821,7 @@ class Writer:
         """
         return self(path, "csv", **opts)
 
-    def json(self, path: str, **opts: Any) -> WriteManifest:
+    def json(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as newline-delimited JSON.
 
         Args:
@@ -513,7 +843,7 @@ class Writer:
         """
         return self(path, "json", **opts)
 
-    def orc(self, path: str, **opts: Any) -> WriteManifest:
+    def orc(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as ORC.
 
         Args:
@@ -535,7 +865,7 @@ class Writer:
         """
         return self(path, "orc", **opts)
 
-    def arrow(self, path: str, **opts: Any) -> WriteManifest:
+    def arrow(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as Arrow/Feather IPC.
 
         Args:
@@ -557,7 +887,7 @@ class Writer:
         """
         return self(path, "arrow", **opts)
 
-    def avro(self, path: str, **opts: Any) -> WriteManifest:
+    def avro(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as Avro (needs ``batcher-engine[avro]``).
 
         Args:
@@ -576,7 +906,7 @@ class Writer:
         """
         return self(path, "avro", **opts)
 
-    def lance(self, path: str, **opts: Any) -> WriteManifest:
+    def lance(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write a Lance dataset (needs ``batcher-engine[lance]``).
 
         Args:
@@ -595,7 +925,7 @@ class Writer:
         """
         return self(path, "lance", **opts)
 
-    def msgpack(self, path: str, **opts: Any) -> WriteManifest:
+    def msgpack(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as MessagePack (needs ``batcher-engine[msgpack]``).
 
         Args:
@@ -614,6 +944,7 @@ class Writer:
         """
         return self(path, "msgpack", **opts)
 
+    # --- Upserts / MERGE INTO ----------------------------------------------
     def merge(
         self,
         target: str,
@@ -672,9 +1003,69 @@ class Writer:
             when_matched=when_matched,
             when_not_matched=when_not_matched,
             format=format,
-            native_sinks=_MERGE_NATIVE_SINKS,
             opts=opts,
         )
+
+    def merge_into(
+        self,
+        target: str,
+        *,
+        on: str | list[str],
+        prune: bool = True,
+        format: str | None = None,
+        **opts: Any,
+    ) -> MergeBuilder:
+        """Open a full ``MERGE INTO`` against `target`, keyed on `on` — the general form.
+
+        `merge` is the two-clause shorthand (update the matched, insert the rest). This is
+        the whole statement: any number of ordered ``WHEN`` clauses, each with its own
+        condition, each writing whichever columns it likes — including ``WHEN NOT MATCHED
+        BY SOURCE``, which acts on the target rows the change set never mentioned (how a
+        snapshot load expires departed rows, and how SCD-2 closes a version). Clauses are
+        tried in the order added; the first whose condition holds wins.
+
+        The merge rewrites only the data files whose key statistics prove they could hold
+        one of the source's keys — so an upsert costs the change set, not the table. (A
+        ``when_not_matched_by_source`` clause is *about* the untouched rows, so it forces a
+        full rewrite; see `when_not_matched_by_source`.)
+
+        Args:
+            target: Path/URI of the table to merge into.
+            on: Key column(s) matching a source row to a target row.
+            prune: Skip target files the source's keys provably cannot reach. Correctness
+                does not depend on it — turning it off only rewrites everything.
+            format: Sink format override; inferred from `target` when omitted.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `MergeBuilder`; add clauses, then call `execute`.
+
+        Examples:
+            .. doctest::
+
+                >>> import tempfile, os
+                >>> import batcher as bt
+                >>> from batcher import lit, source_col
+                >>> path = os.path.join(tempfile.mkdtemp(), "orders.parquet")
+                >>> _ = bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.parquet(path)
+                >>> changes = bt.from_pydict({"id": [2, 3], "amount": [99, 30]})
+                >>> _ = (
+                ...     changes.write.merge_into(path, on="id")
+                ...     .when_matched(source_col("amount") > lit(50))
+                ...     .delete()
+                ...     .when_matched()
+                ...     .update_all()
+                ...     .when_not_matched()
+                ...     .insert_all()
+                ...     .execute()
+                ... )
+                >>> sorted(bt.read.parquet(path).collect().to_pydict()["id"])
+                [1, 3]
+        """
+        from batcher.api.merge import MergeBuilder
+
+        keys = [on] if isinstance(on, str) else list(on)
+        return MergeBuilder(self._ds, target, keys, prune=prune, format=format, opts=opts)
 
     # --- Lakehouse / catalog ----------------------------------------------
     def delta(
@@ -683,6 +1074,8 @@ class Writer:
         *,
         mode: str = "append",
         merge_on: str | list[str] | None = None,
+        auto_compact: bool = False,
+        merge_schema: bool = False,
         **opts: Any,
     ) -> WriteManifest:
         """Write to a Delta Lake table (one transactional commit).
@@ -692,10 +1085,22 @@ class Writer:
         keys build the match predicate; pass `merge_predicate=` instead for a custom
         one. Otherwise `mode` is ``"append"`` (default) or ``"overwrite"``.
 
+        ``auto_compact=True`` bin-packs the table after the commit if it has accumulated
+        enough small files. An incremental writer leaves one small file per commit and the
+        next write cannot fix that — it only adds another — so a table nobody compacts
+        eventually costs more to *plan* than to read. The check counts the table's standing
+        small files (from the log, not by opening anything), and the compaction is the same
+        transaction `bt.compact` runs, so it never deletes a file an older version still
+        references. It runs *after* the commit, so a failed compaction cannot fail the write.
+
         Args:
             uri: Path/URI of the Delta table root.
             mode: ``"append"`` (default) or ``"overwrite"`` when not merging.
             merge_on: Key column(s) to upsert on; triggers a ``MERGE INTO``.
+            auto_compact: Bin-pack the table after the commit if small files have piled up.
+            merge_schema: Evolve the table to accept columns this write has and the table
+                does not. Off by default — an unexpected column is refused rather than
+                silently written into the files where the table cannot see it.
             opts: Additional write options (e.g. ``merge_predicate=``) forwarded to the sink.
 
         Returns:
@@ -712,7 +1117,8 @@ class Writer:
             from batcher.api.merge import merge_predicate_for
 
             opts["merge_predicate"] = merge_predicate_for(merge_on)
-        return self(uri, "delta", mode=mode, **opts)
+        opts["merge_schema"] = merge_schema
+        return self(uri, "delta", mode=mode, auto_compact=auto_compact, **opts)
 
     def iceberg(self, identifier: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
         """Write to an Iceberg table (``mode="append"|"overwrite"``).
@@ -756,11 +1162,19 @@ class Writer:
 
     # --- SQL / warehouses --------------------------------------------------
     def sql(self, table: str, **opts: Any) -> WriteManifest:
-        """Write to a database table via ADBC/FlightSQL.
+        """Bulk-ingest into a database table via ADBC/FlightSQL.
+
+        Takes the same standard connection URI as `bt.read.sql`, so a read and the write
+        that follows it are spelled the same way. Rows are ingested as Arrow, in bulk,
+        never row by row.
+
+        Pass ``password="env:PGPASSWORD"`` rather than embedding a credential in the URI.
 
         Args:
             table: Destination table name.
-            opts: Connection (``uri=``) and driver options passed as keywords.
+            opts: Connection options — ``uri=``, ``password=``, or an explicit
+                ``driver=``/``db_kwargs=`` pair — plus ``mode=`` (``"create"``,
+                ``"append"``, ``"replace"``, ``"create_append"``).
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -781,7 +1195,9 @@ class Writer:
 
         Args:
             table: Destination Snowflake table name.
-            opts: Connection credentials (account, warehouse, database, …) as keywords.
+            opts: ``connection_kwargs=`` — a dict passed to the Snowflake connector
+                (``account``, ``user``, ``warehouse``, ``database``, …) — plus
+                ``mode=`` (``"append"`` or ``"overwrite"``).
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -792,7 +1208,12 @@ class Writer:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
                 >>> ds.write.snowflake(  # doctest: +SKIP
-                ...     "ORDERS", account="acct", warehouse="WH", database="DB"
+                ...     "ORDERS",
+                ...     connection_kwargs={
+                ...         "account": "acct",
+                ...         "warehouse": "WH",
+                ...         "database": "DB",
+                ...     },
                 ... )
         """
         return self(table, "snowflake", **opts)
