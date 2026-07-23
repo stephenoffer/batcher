@@ -680,10 +680,7 @@ pub fn combine_partitioned(
 /// which has no key columns — one state row per partial.
 fn partial_rows(parts: &[Partial]) -> usize {
     match parts[0].group_columns.first() {
-        Some(_) => parts
-            .iter()
-            .map(|p| p.group_columns[0].len())
-            .sum(),
+        Some(_) => parts.iter().map(|p| p.group_columns[0].len()).sum(),
         None => parts
             .iter()
             .map(|p| {
@@ -1153,7 +1150,10 @@ mod tests {
             .collect();
 
         let merged = combine(&partials, &FUNCS).unwrap();
-        let want = to_map(&merged.group_columns[0], &finalize(&FUNCS, &merged).unwrap());
+        let want = to_map(
+            &merged.group_columns[0],
+            &finalize(&FUNCS, &merged).unwrap(),
+        );
 
         let parts = combine_partitioned(&partials, &FUNCS, 1).unwrap();
         assert!(parts.len() > 1, "the partitioned path did not engage");

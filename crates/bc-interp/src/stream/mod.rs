@@ -316,8 +316,6 @@ pub(crate) type Morsels<'a> = Box<dyn Iterator<Item = Result<RecordBatch, Interp
 /// combine only every `N` morsels.
 const AGG_FOLD_EVERY: usize = 32;
 
-
-
 /// Execute `plan` by streaming morsels through its linear runs.
 ///
 /// Returns the same rows, in the same order, as [`crate::execute`] — the sequential oracle.

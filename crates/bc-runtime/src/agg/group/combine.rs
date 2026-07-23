@@ -23,6 +23,9 @@ use crate::agg::{
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
 
+/// One merged radix partition: its group-key columns, and per aggregate its state columns.
+type MergedPartition = (Vec<ArrayRef>, Vec<Vec<ArrayRef>>);
+
 /// Parallel `combine` regroup via hash-radix partitioning. Returns the merged group-key
 /// columns and, per aggregate, its merged state columns — identical to the serial
 /// `assign_groups` + `merge_state` path (group *order* differs, which callers treat as
@@ -70,7 +73,7 @@ pub(crate) fn combine_radix_parts(
     funcs: &[AggFunc],
     total_rows: usize,
     partitions: usize,
-) -> Result<Vec<(Vec<ArrayRef>, Vec<Vec<ArrayRef>>)>, RuntimeError> {
+) -> Result<Vec<MergedPartition>, RuntimeError> {
     // Bin row indices by `hash(key) % partitions` so equal keys co-locate in one bucket.
     //
     // Hashed per partial and flattened in partial order rather than over a concatenation of
@@ -146,7 +149,7 @@ pub(crate) fn combine_radix_parts(
     // The gather reads straight from the partials through `(partial, row)` pairs, so no
     // column is ever materialized in full.
     let n_keys = parts[0].group_columns.len();
-    let per: Vec<(Vec<ArrayRef>, Vec<Vec<ArrayRef>>)> = buckets
+    let per: Vec<MergedPartition> = buckets
         .par_iter()
         .map(|idx| -> Result<_, RuntimeError> {
             let pairs: Vec<(usize, usize)> = idx

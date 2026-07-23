@@ -125,10 +125,12 @@ fn concat_strings<O: OffsetSizeTrait>(arrays: &[&dyn Array]) -> Option<GenericSt
     // A concatenated row is null exactly when its source row is; a null-free input contributes
     // all-valid. Built only when some input actually has nulls, so the common case allocates
     // no validity buffer at all (matching arrow).
-    let nulls = arrs
-        .iter()
-        .any(|a| a.null_count() > 0)
-        .then(|| NullBuffer::from_iter(arrs.iter().flat_map(|a| (0..a.len()).map(|i| a.is_valid(i)))));
+    let nulls = arrs.iter().any(|a| a.null_count() > 0).then(|| {
+        NullBuffer::from_iter(
+            arrs.iter()
+                .flat_map(|a| (0..a.len()).map(|i| a.is_valid(i))),
+        )
+    });
 
     Some(GenericStringArray::<O>::new(
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
