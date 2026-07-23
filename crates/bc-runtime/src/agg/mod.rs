@@ -403,10 +403,44 @@ fn coerce_null_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, Ru
     Ok(Some(out))
 }
 
-/// The row count above which `combine` groups in parallel (hash-radix). Below it the
-/// serial path wins — the radix machinery (per-row hash store, bucket bins, parallel
-/// dispatch) is pure overhead on a small input.
-const RADIX_PARALLEL_THRESHOLD: usize = 200_000;
+/// Partial rows each radix partition needs before the parallel regroup earns its setup.
+///
+/// The crossover is a function of rows *per partition*, not of the total: the parallel path's
+/// overhead is per-partition (a bucket list, a gather, a hash table, an output array), while
+/// the serial path's is per-row and single-threaded. Measured on a 92-core box over
+/// ClickBench `hits` (min-of-5 wall, whole query):
+///
+/// | partial rows | serial | parallel |
+/// |--------------|-------:|---------:|
+/// | 14 k (`GROUP BY RegionID`)   | 2.5 ms  | 5.2 ms |
+/// | 23 k (`GROUP BY SearchPhrase`)| 7.0 ms | 5.5 ms |
+/// | 35 k (`GROUP BY Title`)      | 16.0 ms | 12.4 ms |
+/// | 182 k (`GROUP BY URL`, filtered) | 49.3 ms | 15.1 ms |
+///
+/// The turn is just under 23 k there — `92 × 256` — and the 182 k row is why this matters: a
+/// fixed 200 k threshold left a string group-by *just* under it on the serial merge, paying
+/// 38 ms of single-threaded `assign_groups` for work the parallel path does in 5.
+const MIN_ROWS_PER_RADIX_PARTITION: usize = 256;
+
+/// Radix partitions a `combine` fans out over: one per core, so the independent
+/// group-and-merge tasks fill the pool. The 512 ceiling caps per-partition setup on huge
+/// boxes; the floor of 2 keeps the path meaningful on a single-core one.
+fn radix_partitions() -> usize {
+    rayon::current_num_threads().clamp(2, 512)
+}
+
+/// The partial-row count above which `combine` regroups in parallel (hash-radix), resolving
+/// `0` — the configured default — to the machine-derived crossover.
+///
+/// A caller may pin a number instead (`EngineConfig.radix_parallel_threshold`); that is a
+/// performance override, never a semantic one, since both paths compute the same relation.
+pub fn radix_parallel_threshold(configured: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        radix_partitions().saturating_mul(MIN_ROWS_PER_RADIX_PARTITION)
+    }
+}
 
 /// Produce the partial-state columns for one aggregate in a single scan.
 fn accumulate(
@@ -534,7 +568,7 @@ fn accumulate(
 /// `combine([p]) ≡ p`; combining is associative for all supported functions. Uses
 /// the default radix threshold; the executor calls [`combine_with`] to tune it.
 pub fn combine(parts: &[Partial], funcs: &[AggFunc]) -> Result<Partial, RuntimeError> {
-    combine_with(parts, funcs, RADIX_PARALLEL_THRESHOLD)
+    combine_with(parts, funcs, 0)
 }
 
 /// [`combine`] with a caller-supplied radix-parallel threshold (performance-only —
@@ -546,6 +580,7 @@ pub fn combine_with(
     radix_parallel_threshold: usize,
 ) -> Result<Partial, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
+    let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
 
     // A single partial is already grouped (`combine([p]) ≡ p`), so re-folding it is
     // identity for every associative reducer — skip the concat + re-encode + re-group
@@ -569,13 +604,7 @@ pub fn combine_with(
     // is pure overhead on a small/single group), and only that path needs the partials
     // concatenated at all.
     if total_rows > radix_parallel_threshold && n_keys > 0 {
-        // One radix partition per core so the independent group-and-merge tasks fill the
-        // pool. The old `64` ceiling left a >64-core box merging a high-cardinality combine
-        // (DISTINCT / many-group) on at most 64 cores while the extra cores idled — the
-        // combine plateaued, then regressed, past ~16 cores. Partitioning is now flat-CSR
-        // (see `combine_radix`), so more partitions cost bounded allocation, not a growing-
-        // vector storm. The 512 ceiling caps per-partition setup overhead on huge boxes.
-        let partitions = rayon::current_num_threads().clamp(2, 512);
+        let partitions = radix_partitions();
         let (group_columns, states) = group::combine_radix(parts, funcs, total_rows, partitions)?;
         return Ok(Partial {
             group_columns,
@@ -630,13 +659,13 @@ pub fn combine_partitioned(
     radix_parallel_threshold: usize,
 ) -> Result<Vec<Partial>, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
+    let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
     let n_keys = parts[0].group_columns.len();
     let total_rows = partial_rows(parts);
     if parts.len() == 1 || n_keys == 0 || total_rows <= radix_parallel_threshold {
         return Ok(vec![combine_with(parts, funcs, radix_parallel_threshold)?]);
     }
-    let partitions = rayon::current_num_threads().clamp(2, 512);
-    let per = group::combine_radix_parts(parts, funcs, total_rows, partitions)?;
+    let per = group::combine_radix_parts(parts, funcs, total_rows, radix_partitions())?;
     Ok(per
         .into_iter()
         .filter(|(g, _)| g.first().is_none_or(|c| !c.is_empty()))
@@ -1126,7 +1155,7 @@ mod tests {
         let merged = combine(&partials, &FUNCS).unwrap();
         let want = to_map(&merged.group_columns[0], &finalize(&FUNCS, &merged).unwrap());
 
-        let parts = combine_partitioned(&partials, &FUNCS, 0).unwrap();
+        let parts = combine_partitioned(&partials, &FUNCS, 1).unwrap();
         assert!(parts.len() > 1, "the partitioned path did not engage");
         let mut got = std::collections::BTreeMap::new();
         for p in &parts {

@@ -188,9 +188,12 @@ class ExecutionConfig:
     bloom_min_build_rows: int = 1 << 16
     # Window row count above which per-partition sorts run across cores.
     window_parallel_row_threshold: int = 1 << 15
-    # Concatenated-input row count above which aggregate `combine` regroups via
-    # parallel hash-radix partitioning.
-    radix_parallel_threshold: int = 200_000
+    # Partial-row count above which aggregate `combine` regroups via parallel hash-radix
+    # partitioning. `0` (the default) derives it from the machine: the crossover is a fixed
+    # number of rows *per partition*, so it scales with the core count rather than being one
+    # constant that is too high on a big box and too low on a small one. A positive value pins
+    # it — performance only, never a different result.
+    radix_parallel_threshold: int = 0
     # Maximum runs merged per pass in the external (spilling) sort's k-way merge.
     sort_merge_fanin: int = 16
     # A join bucket is "hot" when it exceeds this multiple of the average bucket.
