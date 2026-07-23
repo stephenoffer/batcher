@@ -14,7 +14,7 @@ mod assign;
 mod combine;
 
 pub(crate) use assign::{assign_groups, dense_budget};
-pub(super) use combine::{combine_radix, merge_state};
+pub(super) use combine::{combine_radix, combine_radix_parts, merge_state};
 
 // Same seed both halves use — bucketing is independent of the seed, but sharing it keeps
 // the paths consistent when one is checked against the other.

@@ -5,8 +5,8 @@
 //! threads with **no cross-partition merge**, turning the otherwise-serial per-group
 //! accumulate scan (which dominates a many-group combine) into a parallel one.
 
-use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
-use arrow::compute::{concat, take};
+use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::compute::interleave;
 use arrow::datatypes::{
     ArrowPrimitiveType, BinaryType, DataType, Int16Type, Int32Type, Int64Type, Int8Type,
     LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
@@ -18,7 +18,7 @@ use super::assign::assign_groups;
 use super::{NULL_HASH, SEED};
 use crate::agg::{
     accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_covar,
-    merge_distinct, merge_median, merge_moments, merge_welford, AggFunc,
+    merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
 };
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
@@ -31,14 +31,63 @@ use crate::keys::canon_f64;
 /// `group_concat` are the concatenated partial group-key columns; `state_concats[a]` are
 /// aggregate `a`'s concatenated partial-state columns; both have `total_rows` rows.
 pub(crate) fn combine_radix(
-    group_concat: &[ArrayRef],
-    state_concats: &[Vec<ArrayRef>],
+    parts: &[Partial],
     funcs: &[AggFunc],
     total_rows: usize,
     partitions: usize,
 ) -> Result<(Vec<ArrayRef>, Vec<Vec<ArrayRef>>), RuntimeError> {
+    let per = combine_radix_parts(parts, funcs, total_rows, partitions)?;
+    // Concatenate partition outputs (key-disjoint → concat == merge). Fan the per-column
+    // concats across cores — on a high-cardinality distinct/group-by these output columns
+    // are millions of rows and the concat is a second full copy that otherwise runs serial.
+    let group_columns: Vec<ArrayRef> = (0..parts[0].group_columns.len())
+        .into_par_iter()
+        .map(|k| concat_col(per.iter().map(|(g, _)| &g[k])))
+        .collect::<Result<_, _>>()?;
+    let states: Vec<Vec<ArrayRef>> = (0..funcs.len())
+        .map(|a| {
+            (0..per[0].1[a].len())
+                .map(|c| concat_col(per.iter().map(|(_, s)| &s[a][c])))
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((group_columns, states))
+}
+
+/// [`combine_radix`] **without the final concat**: the merged partitions, each a
+/// `(group_columns, per-aggregate state columns)` pair.
+///
+/// The partitions are key-disjoint by construction — that is the whole premise of the radix
+/// regroup — so their union *is* the merged relation and a caller that can emit several
+/// morsels never needs them glued together. Concatenating them costs a second full copy of
+/// the grouped output, which on a high-cardinality string key is the single largest term in
+/// the combine (ClickBench q33: 15 ms of a 42 ms combine, moving 43 MB to reproduce data the
+/// caller immediately re-morselizes). Emitting the partitions also hands the next operator
+/// `partitions` batches to work on instead of one, so a downstream sort or projection fans
+/// back out across cores.
+pub(crate) fn combine_radix_parts(
+    parts: &[Partial],
+    funcs: &[AggFunc],
+    total_rows: usize,
+    partitions: usize,
+) -> Result<Vec<(Vec<ArrayRef>, Vec<Vec<ArrayRef>>)>, RuntimeError> {
     // Bin row indices by `hash(key) % partitions` so equal keys co-locate in one bucket.
-    let hashes = hash_keys(group_concat, total_rows)?;
+    //
+    // Hashed per partial and flattened in partial order rather than over a concatenation of
+    // them, because that concatenation is a full copy of the key column and the merge never
+    // reads it as one array — the gather below addresses rows as `(partial, row)` anyway.
+    // At a high group count the copy is the merge's largest term, and its single multi-tens-of-
+    // MB allocation pays for its own page faults on top of the bytes it moves.
+    let hashes = hash_partial_keys(parts, total_rows)?;
+    // Global row `i` lives in partial `owner[i]` at `i - starts[owner[i]]` — the map back from
+    // the flattened numbering the bucketing uses to the arrays the gather reads.
+    let mut starts: Vec<u32> = Vec::with_capacity(parts.len() + 1);
+    let mut acc = 0u32;
+    for p in parts {
+        starts.push(acc);
+        acc += p.group_columns.first().map_or(0, |c| c.len()) as u32;
+    }
+    starts.push(acc);
     // Parallel stable counting-sort into the per-bucket index lists: each row-range chunk
     // bins its rows into a flat **per-chunk CSR** (histogram → prefix-sum → one scatter
     // pass), then bucket `b`'s global list is the chunks' `b`-slices concatenated in chunk
@@ -94,20 +143,35 @@ pub(crate) fn combine_radix(
 
     // Each partition groups + merges independently — its keys appear in no other
     // partition, so its merged groups are final and a plain concat is the whole result.
+    // The gather reads straight from the partials through `(partial, row)` pairs, so no
+    // column is ever materialized in full.
+    let n_keys = parts[0].group_columns.len();
     let per: Vec<(Vec<ArrayRef>, Vec<Vec<ArrayRef>>)> = buckets
         .par_iter()
         .map(|idx| -> Result<_, RuntimeError> {
-            let ti = UInt32Array::from(idx.clone());
-            let keys_p: Vec<ArrayRef> = group_concat
+            let pairs: Vec<(usize, usize)> = idx
                 .iter()
-                .map(|c| take(c.as_ref(), &ti, None))
+                .map(|&g| {
+                    let p = starts.partition_point(|&s| s <= g) - 1;
+                    (p, (g - starts[p]) as usize)
+                })
+                .collect();
+            let keys_p: Vec<ArrayRef> = (0..n_keys)
+                .map(|k| {
+                    let cols: Vec<&dyn Array> =
+                        parts.iter().map(|p| p.group_columns[k].as_ref()).collect();
+                    interleave(&cols, &pairs)
+                })
                 .collect::<Result<_, _>>()?;
             let (local_ids, n_local, group_cols_p) = assign_groups(&keys_p, idx.len())?;
             let mut states_p = Vec::with_capacity(funcs.len());
             for (a, &func) in funcs.iter().enumerate() {
-                let state_p: Vec<ArrayRef> = state_concats[a]
-                    .iter()
-                    .map(|c| take(c.as_ref(), &ti, None))
+                let state_p: Vec<ArrayRef> = (0..parts[0].states[a].len())
+                    .map(|c| {
+                        let cols: Vec<&dyn Array> =
+                            parts.iter().map(|p| p.states[a][c].as_ref()).collect();
+                        interleave(&cols, &pairs)
+                    })
                     .collect::<Result<_, _>>()?;
                 states_p.push(merge_state(func, &state_p, &local_ids, n_local)?);
             }
@@ -115,21 +179,29 @@ pub(crate) fn combine_radix(
         })
         .collect::<Result<_, _>>()?;
 
-    // Concatenate partition outputs (key-disjoint → concat == merge). Fan the per-column
-    // concats across cores — on a high-cardinality distinct/group-by these output columns
-    // are millions of rows and the concat is a second full copy that otherwise runs serial.
-    let group_columns: Vec<ArrayRef> = (0..group_concat.len())
-        .into_par_iter()
-        .map(|k| concat_col(per.iter().map(|(g, _)| &g[k])))
-        .collect::<Result<_, _>>()?;
-    let states: Vec<Vec<ArrayRef>> = (0..funcs.len())
-        .map(|a| {
-            (0..per[0].1[a].len())
-                .map(|c| concat_col(per.iter().map(|(_, s)| &s[a][c])))
-                .collect::<Result<_, _>>()
+    Ok(per)
+}
+
+/// [`hash_keys`] over the partials' key columns, flattened in partial order.
+///
+/// Equal keys must hash equally for the bucketing to co-locate them, and [`hash_keys`] is a
+/// pure function of a row's key *values* — so hashing each partial separately and laying the
+/// results end to end gives exactly the vector hashing their concatenation would, without
+/// building that concatenation. Partials are hashed across cores; each one's own hash is
+/// already internally parallel, and rayon composes the two.
+fn hash_partial_keys(parts: &[Partial], total_rows: usize) -> Result<Vec<u64>, RuntimeError> {
+    let per: Vec<Vec<u64>> = parts
+        .par_iter()
+        .map(|p| {
+            let rows = p.group_columns.first().map_or(0, |c| c.len());
+            hash_keys(&p.group_columns, rows)
         })
         .collect::<Result<_, _>>()?;
-    Ok((group_columns, states))
+    let mut out = Vec::with_capacity(total_rows);
+    for h in per {
+        out.extend_from_slice(&h);
+    }
+    Ok(out)
 }
 
 /// Per-row key hash for bucketing — a single primitive-int or byte key hashes its native
@@ -348,9 +420,14 @@ where
 }
 
 /// Concatenate a sequence of arrays (the per-partition outputs) into one.
+///
+/// Through [`crate::gather::concat_columns`], not arrow's `concat` directly: a
+/// high-cardinality group-by concatenates a string key column here twice (the partials in,
+/// the partitions out) and arrow's per-row path made those two copies the dominant cost of
+/// the whole combine.
 fn concat_col<'a>(arrs: impl Iterator<Item = &'a ArrayRef>) -> Result<ArrayRef, RuntimeError> {
     let owned: Vec<&dyn Array> = arrs.map(|a| a.as_ref()).collect();
-    Ok(concat(&owned)?)
+    crate::gather::concat_columns(&owned)
 }
 /// Merge already-partial state columns into one group via the function's
 /// associative reducer (single-pass, reusing `accumulate`). Counts/sums merge by

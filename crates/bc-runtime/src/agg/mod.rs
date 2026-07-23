@@ -559,48 +559,16 @@ pub fn combine_with(
     }
 
     let n_keys = parts[0].group_columns.len();
+    let total_rows = partial_rows(parts);
 
-    // Concatenate the group-key columns and each aggregate's state columns. On a
-    // high-cardinality combine (e.g. an all-distinct DISTINCT) each partial contributes
-    // ~its whole morsel, so this concatenation is a multi-million-row copy per column —
-    // fan the per-column concats across cores rather than running them one after another.
-    let group_concat: Vec<ArrayRef> = (0..n_keys)
-        .into_par_iter()
-        .map(|i| concat_col(parts.iter().map(|p| &p.group_columns[i])))
-        .collect::<Result<_, _>>()?;
-    // Number of partial rows to regroup. With group keys it's the key-column
-    // length; for a GLOBAL aggregate there are no key columns, so each partial
-    // contributes exactly one state row — count those instead.
-    let total_rows = match group_concat.first() {
-        Some(col) => col.len(),
-        None => parts
-            .iter()
-            .map(|p| {
-                p.states
-                    .first()
-                    .and_then(|s| s.first())
-                    .map_or(0, |c| c.len())
-            })
-            .sum(),
-    };
-
-    // Concatenate every aggregate's partial-state columns once (each func may carry
-    // several — e.g. mean's sum+count). Shared by both regroup paths below.
-    let state_concats: Vec<Vec<ArrayRef>> = (0..funcs.len())
-        .map(|a| {
-            (0..parts[0].states[a].len())
-                .map(|c| concat_col(parts.iter().map(|p| &p.states[a][c])))
-                .collect::<Result<_, _>>()
-        })
-        .collect::<Result<_, _>>()?;
-
-    // High-cardinality combine (the distinct / many-group case) regroups a large
-    // concatenation. Above the threshold, hash-radix partitions by key and groups AND
-    // merges each partition independently across threads (partitions are key-disjoint,
-    // so no cross-partition merge) — parallelizing the otherwise-serial merge scan that
-    // dominates a many-group combine. Below it, and for global aggregates (no keys), the
-    // serial path wins (the radix machinery is pure overhead on a small/single group).
-    if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
+    // High-cardinality combine (the distinct / many-group case) regroups a large relation.
+    // Above the threshold, hash-radix partitions by key and groups AND merges each partition
+    // independently across threads (partitions are key-disjoint, so no cross-partition merge)
+    // — parallelizing the otherwise-serial merge scan that dominates a many-group combine.
+    // Below it, and for global aggregates (no keys), the serial path wins (the radix machinery
+    // is pure overhead on a small/single group), and only that path needs the partials
+    // concatenated at all.
+    if total_rows > radix_parallel_threshold && n_keys > 0 {
         // One radix partition per core so the independent group-and-merge tasks fill the
         // pool. The old `64` ceiling left a >64-core box merging a high-cardinality combine
         // (DISTINCT / many-group) on at most 64 cores while the extra cores idled — the
@@ -608,14 +576,26 @@ pub fn combine_with(
         // (see `combine_radix`), so more partitions cost bounded allocation, not a growing-
         // vector storm. The 512 ceiling caps per-partition setup overhead on huge boxes.
         let partitions = rayon::current_num_threads().clamp(2, 512);
-        let (group_columns, states) =
-            group::combine_radix(&group_concat, &state_concats, funcs, total_rows, partitions)?;
+        let (group_columns, states) = group::combine_radix(parts, funcs, total_rows, partitions)?;
         return Ok(Partial {
             group_columns,
             states,
         });
     }
 
+    // The serial regroup reads its input as one array per column, so this path — and only
+    // this path — concatenates the partials.
+    let group_concat: Vec<ArrayRef> = (0..n_keys)
+        .into_par_iter()
+        .map(|i| concat_col(parts.iter().map(|p| &p.group_columns[i])))
+        .collect::<Result<_, _>>()?;
+    let state_concats: Vec<Vec<ArrayRef>> = (0..funcs.len())
+        .map(|a| {
+            (0..parts[0].states[a].len())
+                .map(|c| concat_col(parts.iter().map(|p| &p.states[a][c])))
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
     let (group_ids, num_groups, merged_group_columns) = assign_groups(&group_concat, total_rows)?;
     let mut states = Vec::with_capacity(funcs.len());
     for (a, &func) in funcs.iter().enumerate() {
@@ -630,6 +610,61 @@ pub fn combine_with(
         group_columns: merged_group_columns,
         states,
     })
+}
+
+/// [`combine`], keeping the hash-radix partitions **separate** instead of concatenating them
+/// into one `Partial`.
+///
+/// The partitions are key-disjoint, so their union is exactly the relation [`combine`]
+/// returns — a caller that can emit several morsels (every executor's aggregate tail can)
+/// gets the same rows in the same order without paying the concat, which on a
+/// high-cardinality string key is the largest single term in the merge. Returns one `Partial`
+/// per non-empty partition, in partition order.
+///
+/// Falls back to a one-element `Vec` — plain [`combine_with`] — whenever the radix regroup
+/// would not have run anyway (a small merge, a single partial, or a global aggregate with no
+/// group keys), so callers get a uniform shape and never a second semantics.
+pub fn combine_partitioned(
+    parts: &[Partial],
+    funcs: &[AggFunc],
+    radix_parallel_threshold: usize,
+) -> Result<Vec<Partial>, RuntimeError> {
+    assert!(!parts.is_empty(), "combine requires at least one partial");
+    let n_keys = parts[0].group_columns.len();
+    let total_rows = partial_rows(parts);
+    if parts.len() == 1 || n_keys == 0 || total_rows <= radix_parallel_threshold {
+        return Ok(vec![combine_with(parts, funcs, radix_parallel_threshold)?]);
+    }
+    let partitions = rayon::current_num_threads().clamp(2, 512);
+    let per = group::combine_radix_parts(parts, funcs, total_rows, partitions)?;
+    Ok(per
+        .into_iter()
+        .filter(|(g, _)| g.first().is_none_or(|c| !c.is_empty()))
+        .map(|(group_columns, states)| Partial {
+            group_columns,
+            states,
+        })
+        .collect())
+}
+
+/// Rows the partials carry between them: the key-column length, or — for a GLOBAL aggregate,
+/// which has no key columns — one state row per partial.
+fn partial_rows(parts: &[Partial]) -> usize {
+    match parts[0].group_columns.first() {
+        Some(_) => parts
+            .iter()
+            .map(|p| p.group_columns[0].len())
+            .sum(),
+        None => parts
+            .iter()
+            .map(|p| {
+                p.states
+                    .first()
+                    .and_then(|s| s.first())
+                    .map_or(0, |c| c.len())
+            })
+            .sum(),
+    }
 }
 
 /// Step 3: turn merged state into output columns.
@@ -1058,6 +1093,51 @@ mod tests {
         let whole_map = to_map(&whole.group_columns[0], &whole.agg_columns);
         let dist_map = to_map(&merged.group_columns[0], &dist_cols);
         assert_eq!(whole_map, dist_map);
+    }
+
+    /// [`combine_partitioned`] must produce the same relation as [`combine`], as the union of
+    /// its partitions — that equivalence is the whole licence for emitting them as separate
+    /// morsels instead of concatenating them.
+    ///
+    /// Two things it has to get right, and both are wrong answers rather than slow ones: the
+    /// partitions must be **key-disjoint** (a group split across two of them would finalize
+    /// twice and the query would return it twice), and every partial row must land in exactly
+    /// one (a dropped row is a missing group). The input is deliberately many small partials
+    /// over few distinct keys, so most groups genuinely span several partials, and the radix
+    /// threshold is forced to `0` so the partitioned path runs on a test-sized input.
+    #[test]
+    fn combine_partitioned_is_combine_split_by_key() {
+        let n = 4_000usize;
+        let keys: ArrayRef = Arc::new(StringArray::from(
+            (0..n).map(|i| format!("k{}", i % 97)).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64).map(|i| i % 13).collect::<Vec<_>>(),
+        ));
+
+        let chunk = 250;
+        let partials: Vec<Partial> = (0..n / chunk)
+            .map(|c| {
+                let (k, v) = (keys.slice(c * chunk, chunk), vals.slice(c * chunk, chunk));
+                partial(std::slice::from_ref(&k), &calls(&v), chunk).unwrap()
+            })
+            .collect();
+
+        let merged = combine(&partials, &FUNCS).unwrap();
+        let want = to_map(&merged.group_columns[0], &finalize(&FUNCS, &merged).unwrap());
+
+        let parts = combine_partitioned(&partials, &FUNCS, 0).unwrap();
+        assert!(parts.len() > 1, "the partitioned path did not engage");
+        let mut got = std::collections::BTreeMap::new();
+        for p in &parts {
+            for (k, row) in to_map(&p.group_columns[0], &finalize(&FUNCS, p).unwrap()) {
+                assert!(
+                    got.insert(k.clone(), row).is_none(),
+                    "group {k} appeared in two partitions — they are not key-disjoint"
+                );
+            }
+        }
+        assert_eq!(got, want);
     }
 
     #[test]

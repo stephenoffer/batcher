@@ -393,6 +393,55 @@ fn run_with_cache(
             }
             Ok(out)
         }
+        // `DISTINCT` over a shard is a *partial* dedup, so each worker runs the pipeline below the
+        // dedup and the driver dedups the union — the same `partial → combine` the aggregate arm
+        // above runs, with the empty aggregate list.
+        //
+        // The result is identical to the unsharded path, not merely equivalent. Shards are
+        // contiguous in-order row ranges, so flattening them in shard order reproduces the
+        // relation in the oracle's row order; `parallel_distinct` then sees the same rows in the
+        // same order, differing only in where the morsel boundaries fall. Its `combine` keeps
+        // first-seen order across the concatenated partials, and first-seen order over a sequence
+        // does not depend on how that sequence is cut into morsels.
+        //
+        // Peak memory is what the sequential streaming breaker already held (it `drain`s its
+        // input), so this buys the parallelism without widening the envelope.
+        RelOp::Distinct { input } => {
+            let t = std::time::Instant::now();
+            let parts: Vec<Vec<RecordBatch>> = shard_sources
+                .par_iter()
+                .map(|srcs| {
+                    let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                    build_with(input, ctx)?.collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, InterpError>>()?;
+            let batches: Vec<RecordBatch> = parts.into_iter().flatten().collect();
+            if batches.is_empty() {
+                // No shard saw a row. The oracle owns the correctly-typed empty relation.
+                return crate::execute(plan, sources);
+            }
+            let rows_in = crate::count_rows(&batches);
+            let held = crate::batch_bytes(&batches);
+            if budget > 0 && held as usize > budget {
+                return Err(InterpError::MemoryBudgetExceeded {
+                    needed: held as usize,
+                    budget,
+                    reason: "the streaming distinct does not spill",
+                });
+            }
+            let out = ops::parallel_distinct(&batches)?;
+            if let Some(m) = meter {
+                m.breaker(
+                    m.id(plan),
+                    rows_in,
+                    0,
+                    held,
+                    &out,
+                    t.elapsed().as_nanos() as u64,
+                );
+            }
+            Ok(out)
+        }
         _ => {
             let parts: Vec<Vec<RecordBatch>> = shard_sources
                 .par_iter()
@@ -542,8 +591,15 @@ fn shardable_source(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>) -
     // answer — *unless* it is the root, where each worker's `Partial` is combined rather than
     // finalized. So the root aggregate is allowed and checked through to its input; an aggregate
     // anywhere *below* is not, and `spine_is_shardable` refuses it.
+    //
+    // `Distinct` is the same shape and gets the same allowance: it is a mergeable all-column
+    // group-by with no aggregates, so a worker's shard produces a *partial* dedup that merges
+    // with the others exactly as an aggregate's `Partial` does. Without this the whole subtree
+    // under a `DISTINCT` ran on one core — and since Kyber rewrites `COUNT(DISTINCT x) GROUP BY
+    // k` into `count(*)` over `DISTINCT (k, x)`, that serialized every grouped `COUNT(DISTINCT)`
+    // (ClickBench q10/q11/q13: 22 of 25 ms was the single-threaded scan+filter below the dedup).
     let spine = match plan {
-        RelOp::Aggregate { input, .. } => input,
+        RelOp::Aggregate { input, .. } | RelOp::Distinct { input } => input,
         other => other,
     };
     if !spine_is_shardable(spine, cache, mats) {

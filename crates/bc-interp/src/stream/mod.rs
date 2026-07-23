@@ -316,6 +316,11 @@ pub(crate) type Morsels<'a> = Box<dyn Iterator<Item = Result<RecordBatch, Interp
 /// combine only every `N` morsels.
 const AGG_FOLD_EVERY: usize = 32;
 
+/// Partial rows above which the aggregate's final merge runs as a hash-radix regroup whose
+/// partitions are emitted as separate morsels. Matches `bc_runtime::agg`'s own default — the
+/// value only decides *how* the merge is scheduled, never what it computes.
+const AGG_RADIX_PARALLEL_THRESHOLD: usize = 200_000;
+
 /// Execute `plan` by streaming morsels through its linear runs.
 ///
 /// Returns the same rows, in the same order, as [`crate::execute`] — the sequential oracle.
@@ -795,6 +800,15 @@ pub(crate) fn combine_and_finalize(
     aggregates: &[bc_ir::AggregateItem],
 ) -> Result<Vec<RecordBatch>, InterpError> {
     let funcs = ops::agg_funcs(aggregates);
-    let merged = agg::combine(partials, &funcs)?;
-    finalize_partial(&merged, group_keys, aggregates)
+    // Keep the merge's hash-radix partitions as separate morsels rather than concatenating
+    // them into one. They are key-disjoint, so the rows and their order are exactly what one
+    // combined `Partial` would finalize to — but the concat is a second full copy of the
+    // grouped relation (on a high-cardinality string key, the largest term in the merge), and
+    // the next operator gets a batch per partition to fan back out over instead of one.
+    let merged = agg::combine_partitioned(partials, &funcs, AGG_RADIX_PARALLEL_THRESHOLD)?;
+    let mut out = Vec::with_capacity(merged.len());
+    for part in &merged {
+        out.extend(finalize_partial(part, group_keys, aggregates)?);
+    }
+    Ok(out)
 }
