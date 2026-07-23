@@ -21,6 +21,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher._internal.sql_errors import parse_sql
 from batcher.api.dataset import Dataset
 
 __all__ = ["Session"]
@@ -412,10 +413,9 @@ class Session:
         ):
             return hit[2]
 
-        import sqlglot
         from sqlglot import expressions as exp
 
-        ast = sqlglot.parse_one(query, read=self._dialect)
+        ast = parse_sql(query, dialect=self._dialect)
         if isinstance(ast, exp.Create):
             return self._create(ast, tables)
         if isinstance(ast, exp.Drop):

@@ -25,7 +25,13 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import AggExpr, Col, Expr, referenced_columns
 from batcher.plan.expr_ir.walk import column_occurrence_counts
-from batcher.plan.expr_rewrite import substitute_columns as _substitute_cols
+from batcher.plan.expr_rewrite import (
+    combine_conjuncts,
+    split_conjuncts,
+)
+from batcher.plan.expr_rewrite import (
+    substitute_columns as _substitute_cols,
+)
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -53,6 +59,7 @@ __all__ = [
     "eliminate_identity_project",
     "merge_projections",
     "projection_inlining_into_agg",
+    "push_filter_through_map_batches",
     "push_filter_through_project",
     "required_columns_per_source",
     "required_predicates_per_source",
@@ -88,6 +95,56 @@ def _map_batches_need(node: MapBatches, need: set[str]) -> set[str]:
     available = set(node.input.available_columns())
     # Intersect with what the input actually has: `need` may name columns the UDF *creates*.
     return (set(node.input_columns) | need) & available
+
+
+def _drop_unused_map_output(node: MapBatches, need: set[str]) -> LogicalPlan:
+    """Insert a `Project` above a `map_batches` dropping any output column nothing
+    downstream consumes — freeing a large tensor the moment its last consumer has passed.
+
+    A `map_batches` passes its input columns through, so a big image/tensor column the `fn`
+    had to READ — kept alive beneath the UDF by `input_columns` — is otherwise carried
+    through every operator *above* the UDF (a sort, a join, a write) even when nothing there
+    needs it. An image/tensor column is 5-50x the per-row size of its metadata, so dropping
+    it the moment the `fn` (its last consumer) has passed is a real I/O and memory saving.
+    The inserted projection keeps exactly the downstream-needed columns, in the UDF's own
+    output order, so no consumer above sees a reordered or missing column.
+
+    Skipped when nothing is droppable, and — conservatively — when `need` names a column
+    that is not a known output of the UDF (an `fn`-created column under an unset
+    `output_columns`, which the control plane cannot see): the projection must never omit a
+    column a consumer above still reads. A ≥1-column projection is always kept so row counts
+    (a `count(*)` above the UDF) survive.
+
+    Args:
+        node: The `MapBatches` node, already rewritten (its input pruned).
+        need: Columns the operators above the UDF consume.
+
+    Returns:
+        `node` unchanged, or a `Project` over `node` keeping only the needed columns.
+    """
+    available = node.available_columns()
+    keep = [c for c in available if c in need]
+    if len(keep) == len(available):
+        return node  # every output column is consumed — nothing to drop
+    if not keep or not need <= set(available):
+        return node  # keep ≥1 column (row count); never drop an unaccounted-for need
+    return Project(node, tuple(Projection(c, Col(c)) for c in keep))
+
+
+def _is_identity_over(items: tuple[Projection, ...], child: LogicalPlan) -> bool:
+    """True when `items` selects exactly `child`'s columns, in order, as pass-throughs.
+
+    Such a projection is a no-op over `child`. It is the shape `_drop_unused_map_output`
+    can produce beneath an existing projection, and collapsing it is what keeps the
+    projection-rewrite fixpoint from regrowing a stacked pass-through every iteration.
+    """
+    child_cols = child.available_columns()
+    if len(items) != len(child_cols):
+        return False
+    return all(
+        isinstance(it.expr, Col) and it.expr.name == c and it.alias == c
+        for it, c in zip(items, child_cols, strict=True)
+    )
 
 
 @rule(name="projection_inlining_into_agg", phase=Phase.REWRITE, matches=(Aggregate,))
@@ -205,6 +262,33 @@ def push_filter_through_project(node: Filter, _ctx: OptimizerContext) -> Logical
     return Project(Filter(inner.input, new_pred), inner.items)
 
 
+@rule(name="push_filter_through_map_batches", phase=Phase.PUSHDOWN, matches=(Filter,))
+def push_filter_through_map_batches(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Filter(MapBatches(x, fn), p)` → `MapBatches(Filter(x, p), fn)` when every column `p`
+    reads is declared `preserves_columns` on the `fn`.
+
+    A `map_batches` is opaque: `fn` returns the whole batch and the engine does not re-attach
+    untouched inputs, so `fn` may rewrite any column and a predicate cannot move below it in
+    general. A column in `preserves_columns` leaves the UDF with the same name and value, so a
+    predicate reading only preserved columns picks the same rows before the UDF as after — and
+    running it first means the (often GPU) `fn` sees only survivors: filtering 60% of the rows
+    before inference saves 60% of the work. `preserves_columns=None` (the default) or a
+    conjunct over a non-preserved column stays put; conjuncts are split so a mixed predicate
+    pushes only its preserved part.
+    """
+    mb = node.input
+    if not isinstance(mb, MapBatches) or mb.preserves_columns is None:
+        return None
+    preserved = set(mb.preserves_columns)
+    pushable, keep = [], []
+    for conj in split_conjuncts(node.predicate):
+        (pushable if referenced_columns(conj) <= preserved else keep).append(conj)
+    if not pushable:
+        return None
+    pushed = dataclasses.replace(mb, input=Filter(mb.input, combine_conjuncts(pushable)))
+    return pushed if not keep else Filter(pushed, combine_conjuncts(keep))
+
+
 def _window_child_need(node: Window, need: set[str]) -> set[str]:
     """Columns a Window's child must produce: the downstream-needed *input*
     columns plus every column the partition/order keys and function inputs read.
@@ -286,6 +370,14 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         child = _rewrite(node.input, _columns_read_by(kept))
         if child is node.input and len(kept) == len(node.items):
             return node
+        # Pruning (here, or `_drop_unused_map_output` narrowing a MapBatches child) can turn
+        # this projection into an identity over its rewritten child — it now re-selects
+        # exactly the child's columns, in order. Drop it: keeping it both wastes a pass and
+        # breaks the optimizer's idempotence, because `eliminate_identity_project` runs in
+        # NORMALIZE (before this pruning happened) and cannot catch an identity that only
+        # emerges here.
+        if _is_identity_over(kept, child):
+            return child
         return Project(child, kept)
     if isinstance(node, Aggregate):
         child_need = set()
@@ -419,7 +511,8 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         )
     if isinstance(node, MapBatches):
         child = _rewrite(node.input, _map_batches_need(node, need))
-        return node if child is node.input else dataclasses.replace(node, input=child)
+        rebuilt = node if child is node.input else dataclasses.replace(node, input=child)
+        return _drop_unused_map_output(rebuilt, need)
     if isinstance(node, WatermarkDedup):
         # The dedup emits whole rows, so everything needed above must survive — plus the
         # two column sets its *state* depends on, which nothing above it references: the

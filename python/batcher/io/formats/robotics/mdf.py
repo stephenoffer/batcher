@@ -28,6 +28,7 @@ readable, so the omission is discoverable rather than silent.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from typing import IO, Any, ClassVar
 
@@ -61,9 +62,7 @@ _NANOS_PER_SECOND = 1_000_000_000
 
 def _require_asammdf() -> Any:
     """Import and return the `asammdf.MDF` class, or raise `BackendError`."""
-    return require(
-        'asammdf', 'MDF', feature='MDF support', provides='asammdf', extra='robotics'
-    )
+    return require("asammdf", "MDF", feature="MDF support", provides="asammdf", extra="robotics")
 
 
 @SOURCES.register("mdf")
@@ -105,6 +104,26 @@ class MDFSource(FileSource):
     def schema(self) -> pa.Schema:
         """The long-format sample schema, which is fixed and needs no file access."""
         return MDF_SCHEMA
+
+    def identity(self) -> str:
+        """The stats key, made distinct per `signals` restriction.
+
+        A `signals=` restriction reads only the named channels, so it is a *different
+        relation* with a different row count from the whole measurement (`statistics()`
+        estimates over every channel). Sharing the base `format:path` key would let one
+        signal subset's cardinalities be served for another — the same silent collision the
+        MCAP source avoids for `topics`.
+
+        Returns:
+            The base file identity, suffixed with a digest of the sorted signal set when
+            `signals` is set.
+        """
+        base = super().identity()
+        if self._signals is None:
+            return base
+        digest = hashlib.sha256("\n".join(sorted(self._signals)).encode()).hexdigest()[:16]
+        sep = "&" if "#" in base else "#"
+        return f"{base}{sep}signals={digest}"
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         """Read from an open handle — the template's fallback when no path is available."""

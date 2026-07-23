@@ -120,22 +120,35 @@ class HudiFileSliceSplit:
     # log files and the historical read silently returns current data.
     as_of_instant: str | None = None
 
-    def _table(self) -> pa.Table:
+    def _slice_batches(self) -> Any:
+        """This slice's batches, as the reader hands them back — not concatenated.
+
+        Deliberately returns the reader's own iterable rather than a `pa.Table`. Wrapping
+        it was what made `iter_batches` a stream in name only (see there).
+        """
         hudi_table = _require_hudi()
         table = hudi_table(self.table_uri, options=dict(self.options))
         reader = table.create_file_group_reader_with_options()
         batch = reader.read_file_slice_by_base_file_path(self.base_file_path)
-        return pa.Table.from_batches([batch] if isinstance(batch, pa.RecordBatch) else list(batch))
+        return [batch] if isinstance(batch, pa.RecordBatch) else batch
 
-    def _read(self, projection: list[str] | None, predicate: dict | None) -> pa.Table:
-        table = self._table()
-        if predicate is not None:
-            from batcher.io.predicate import to_pyarrow_expression
+    @staticmethod
+    def _shape(
+        batch: pa.RecordBatch, expression: Any, projection: list[str] | None
+    ) -> pa.RecordBatch | None:
+        """One batch filtered and projected — the per-batch form of the old whole-table pass."""
+        if expression is not None:
+            batch = batch.filter(expression)
+        if projection is not None:
+            batch = batch.select(projection)
+        return batch if batch.num_rows else None
 
-            expression = to_pyarrow_expression(predicate)
-            if expression is not None:
-                table = table.filter(expression)
-        return table.select(projection) if projection is not None else table
+    def _expression(self, predicate: dict | None) -> Any:
+        if predicate is None:
+            return None
+        from batcher.io.predicate import to_pyarrow_expression
+
+        return to_pyarrow_expression(predicate)
 
     def schema(self) -> pa.Schema:
         return HudiSource(
@@ -145,12 +158,25 @@ class HudiFileSliceSplit:
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        return self._read(projection, predicate).to_batches()
+        return list(self.iter_batches(projection, predicate))
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        yield from self._read(projection, predicate).to_batches()
+        """Stream this file slice, holding one batch at a time.
+
+        This used to build the whole slice into a `pa.Table`, filter and project *that*, and
+        then `.to_batches()` the result — a stream in signature only. The reader's batches
+        were drained into one table before a single row could be yielded, so peak memory was
+        the decoded size of the entire data file, on the worker, per split. A slice larger
+        than the worker's memory could not be read at all — which is the one thing a
+        per-file split exists to make impossible.
+        """
+        expression = self._expression(predicate)
+        for batch in self._slice_batches():
+            shaped = self._shape(batch, expression, projection)
+            if shaped is not None:
+                yield shaped
 
     def row_count(self) -> int | None:
         return self.rows
@@ -199,20 +225,23 @@ class HudiSource:
             return table.read_snapshot_as_of(self._as_of_instant, filters)
         return table.read_snapshot(filters)
 
-    def _read_table(self, projection: list[str] | None, predicate: dict | None = None) -> pa.Table:
+    def _snapshot_batches(self, predicate: dict | None) -> Any:
+        """The snapshot's batches as hudi-rs hands them back, partition-pruned where it can.
+
+        Returns the reader's iterable rather than a materialized `pa.Table` — the
+        concatenation is what `iter_batches` must not do (see there).
+        """
         table = self._table()
         filters = _hudi_filters(predicate)
         try:
             try:
-                batches = self._snapshot(table, filters)
+                return self._snapshot(table, filters)
             except Exception:
                 # Backend rejected the pushed filters (version/format mismatch) →
                 # read unpruned; the engine's Filter still produces the right rows.
-                batches = self._snapshot(table, [])
+                return self._snapshot(table, [])
         except Exception as exc:
             raise BackendError(f"Hudi snapshot read failed for {self._table_uri!r}: {exc}") from exc
-        result = pa.Table.from_batches(batches)
-        return result.select(projection) if projection is not None else result
 
     def _file_slices(self, predicate: dict | None = None) -> list[Any]:
         """The table's file slices, partition-pruned by `predicate` where it can be.
@@ -250,12 +279,33 @@ class HudiSource:
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        return self._read_table(projection, predicate).to_batches()
+        return list(self.iter_batches(projection, predicate))
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        yield from self._read_table(projection, predicate).to_batches()
+        """Stream the snapshot, projecting each batch as it arrives.
+
+        This was ``self._read_table(...).to_batches()``: the reader's batches were
+        concatenated into one `pa.Table`, projected as a whole, and re-chunked. Nothing
+        could be yielded until every batch had been pulled, so the "streaming" entry point
+        held the entire table — for a lakehouse table, the difference between bounded and
+        unbounded memory.
+
+        The bound this path can offer is honest but partial, and worth stating: hudi-rs
+        resolves a snapshot read eagerly, so `_snapshot_batches` returns a sequence the
+        backend has already built. What this removes is Batcher's own full copy on top of
+        it — the concatenate-project-rechunk pass — and it makes the generator lazy with
+        respect to whatever the backend does hand back incrementally. The per-slice split
+        (`HudiFileSliceSplit`), which is the path a large table actually reads through,
+        streams end to end.
+
+        The predicate is deliberately *not* applied per batch here. A Hudi filter prunes
+        partitions at the timeline, not rows, and the engine's `Filter` re-checks the rows
+        regardless — re-applying it would be duplicated per-row work in the control plane.
+        """
+        for batch in self._snapshot_batches(predicate):
+            yield batch.select(projection) if projection is not None else batch
 
     def read_incremental(self, start_instant: str, end_instant: str | None = None) -> pa.Table:
         """Read rows changed between two Hudi instants as an Arrow table."""
@@ -284,9 +334,31 @@ class HudiSource:
             return None
 
     def statistics(self) -> SourceStatistics | None:
-        """Exact row count from the timeline; `None` if it cannot be read."""
+        """Exact row count **and the table's partition keys** from the timeline; no scan.
+
+        The partition keys were the missing half. Hudi states them in its table config and
+        hands them back as a schema (`get_partition_schema`), and they are exactly what
+        tells the planner that a filter on one of those columns eliminates whole file
+        slices rather than merely filtering rows — the pruning `splits()` already performs
+        but that nothing downstream was told about.
+
+        Only what the timeline actually states is reported. A table whose partition schema
+        cannot be read declares no keys rather than a guessed set: an invented partition
+        key would have the planner expect a pruning that never happens.
+        """
         rows = self.row_count()
-        return None if rows is None else SourceStatistics(row_count=rows, exact_rows=True)
+        if rows is None:
+            return None
+        return SourceStatistics(
+            row_count=rows, exact_rows=True, partition_keys=self._partition_keys()
+        )
+
+    def _partition_keys(self) -> tuple[str, ...]:
+        """The table's partition columns as the Hudi timeline declares them, or ``()``."""
+        try:
+            return tuple(self._table().get_partition_schema().names)
+        except Exception:
+            return ()
 
     def identity(self) -> str:
         ref = self._as_of_instant or "latest"

@@ -28,10 +28,15 @@ from typing import Any
 
 __all__ = [
     "DECISION",
+    "GPU",
+    "INFER",
     "LOG",
+    "PARTITION",
+    "POOL",
     "PROGRESS",
     "QUERY_END",
     "QUERY_START",
+    "SKIPPED",
     "STAGE_END",
     "STAGE_START",
     "Event",
@@ -59,6 +64,36 @@ PROGRESS = "progress"
 DECISION = "decision"
 #: A `batcher.*` log record, bridged onto the bus so the UI shows logs beside metrics.
 LOG = "log"
+
+# --- Distributed / inference observability -----------------------------------
+# A multi-hour batch-inference or distributed job needs progress the query/stage vocabulary
+# above cannot express: *which partition* of a stage finished (so "N of M" is answerable
+# while the stage runs, not only when it returns), how each GPU is loaded *right now* (not
+# only at pool teardown), how fast a worker is inferring, and how many rows were *silently*
+# dropped. These kinds carry that. Every subsystem on the distributed path publishes them;
+# `observe` folds them into live progress and cumulative metrics. Like the kinds above they
+# are plain strings because they cross the JSON boundary to the web UI verbatim.
+
+#: One distributed partition of a stage finished. Fields: ``op_id``, ``total`` (M partitions
+#: in the stage, may be None when unknown), ``rows`` (rows this partition produced). `name`
+#: is the stage/operator label. Emit one per partition as it completes.
+PARTITION = "partition"
+#: A GPU utilization / VRAM sample from one actor. Fields: ``device`` (id/name), ``actor``
+#: (actor id), ``util_pct`` (0-100), ``mem_used_bytes``, ``mem_total_bytes``. Emit on a
+#: sampling interval from inside the worker, not only when the pool tears down.
+GPU = "gpu"
+#: One inference micro-batch completed on a worker. Fields: ``rows``, ``latency_ms``,
+#: ``blocked_ms`` (time the worker waited for its next input — the pipeline-starvation
+#: signal). `name` is the stage label. This is the per-batch reading `InferencePool` already
+#: measures for its controller and otherwise discards.
+INFER = "infer"
+#: Rows/splits dropped under ``on_read_error="skip"``, aggregated to the driver. Fields:
+#: ``count`` (this increment), ``reason``, ``source`` (optional). Silent data loss at scale
+#: unless it reaches the driver, so the driver publishes the drained per-query count here.
+SKIPPED = "skipped"
+#: Actor-pool size observation. Fields: ``size`` (live actors), ``pending`` (queued tasks).
+#: `name` is the stage label. Emit on a scale-up / scale-down or on the sampling interval.
+POOL = "pool"
 
 
 @dataclass(frozen=True, slots=True)

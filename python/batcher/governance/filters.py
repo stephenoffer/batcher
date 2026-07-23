@@ -15,13 +15,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, suggestion
 from batcher.plan.expr_ir import Col, Expr, lit
 
 if TYPE_CHECKING:
     from batcher.governance.principal import Principal
 
 __all__ = ["AttributeIn", "MatchesAttribute"]
+
+
+def _check_names(kind: str, column: str, attribute: str) -> None:
+    """Reject an empty or non-string column or attribute name.
+
+    An empty column name builds ``Col("")``, which survives policy declaration and plan
+    construction and only fails at read time as an unknown column — pointing at the
+    governed scan rather than at the policy that is actually wrong.
+
+    Raises:
+        PlanError: If either name is not a non-empty string.
+    """
+    for label, value in (("column", column), ("attribute", attribute)):
+        if not isinstance(value, str) or not value:
+            raise PlanError(
+                f"{kind} needs a non-empty {label} name, but got {type(value).__name__} {value!r}.",
+                hint=f"The {label} is matched by name, so it cannot be blank.",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +61,10 @@ class MatchesAttribute:
 
     column: str
     attribute: str
+
+    def __post_init__(self) -> None:
+        """Reject an unusable column or attribute name. See `_check_names`."""
+        _check_names("MatchesAttribute", self.column, self.attribute)
 
     def __call__(self, principal: Principal) -> Expr:
         return Col(self.column) == lit(_require_attr(principal, self.attribute))
@@ -68,6 +90,22 @@ class AttributeIn:
     attribute: str
     sep: str = ","
 
+    def __post_init__(self) -> None:
+        """Reject unusable names, and a separator `str.split` cannot use.
+
+        ``sep=""`` raises a bare ``ValueError: empty separator`` from inside `split`,
+        at read time, from a policy declared somewhere else entirely.
+
+        Raises:
+            PlanError: If a name is empty, or `sep` is not a non-empty string.
+        """
+        _check_names("AttributeIn", self.column, self.attribute)
+        if not isinstance(self.sep, str) or not self.sep:
+            raise PlanError(
+                f"AttributeIn needs a non-empty separator, but got {self.sep!r}.",
+                hint="The default ',' splits an attribute like 'EU,US' into two values.",
+            )
+
     def __call__(self, principal: Principal) -> Expr:
         raw = _require_attr(principal, self.attribute)
         values = [v for v in (part.strip() for part in raw.split(self.sep)) if v]
@@ -79,12 +117,28 @@ def _require_attr(principal: Principal, name: str) -> str:
 
     A row-access policy that references an attribute the principal lacks is a
     misconfiguration; failing closed with an actionable message beats silently admitting
-    or excluding every row.
+    or excluding every row. The two ways to reach here are a typo in the policy and a
+    principal built without the attribute, so the message shows what the principal *does*
+    carry and suggests the nearest name — which distinguishes them at a glance.
     """
     try:
         return principal.attrs[name]
     except KeyError:
+        held = sorted(principal.attrs)
+        near = suggestion(name, held)
+        # Point at the likelier of the two fixes. A near-miss against an attribute the
+        # principal *does* hold is almost always a typo in the policy; with nothing
+        # close, the principal is the thing that is missing something.
+        hint = (
+            "Correct the attribute name in the policy."
+            if near
+            else f"Set it on the principal: Principal({principal.name!r}, attrs={{{name!r}: ...}})."
+        )
         raise PlanError(
-            f"row-access policy references attribute {name!r}, which principal "
-            f"{principal.name!r} does not have"
+            f"A row-access policy reads attribute {name!r}, which principal "
+            f"{principal.name!r} does not have.",
+            suggestion=near,
+            available=held,
+            available_label="Attributes it does have",
+            hint=hint,
         ) from None

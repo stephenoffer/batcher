@@ -353,6 +353,71 @@ pandas string spellings: `.strip(chars=None)` (for `trim`), `.startswith(p)` /
 `dayname`/`monthname`), `.daysinmonth()` (for `days_in_month`), `.weekofyear()` (for
 `week`), `.normalize()` and `.floor(unit)` (for `truncate`).
 
+### pandas names on `Expr`
+
+A script ported from pandas finds each operation under the name it already types. Every
+one of these delegates to the primary, so the plan is identical:
+
+| pandas spelling | Batcher primary |
+|---|---|
+| `.astype(dtype)` | `.cast(dtype)` |
+| `.isna()`, `.isnull()` | `.is_null()` |
+| `.notna()`, `.notnull()` | `.is_not_null()` |
+| `.fillna(value)` | `.fill_null(value)` |
+| `.isin(values)` | `.is_in(values)` |
+| `.nunique()` | `.n_unique()` |
+| `.rename(name)` | `.alias(name)` |
+| `.skew()`, `.kurt()` | `.skewness()`, `.kurtosis()` |
+| `.cumsum()`, `.cummax()`, `.cummin()`, `.cumcount()` | `.cum_sum()`, `.cum_max()`, `.cum_min()`, `.cum_count()` |
+| `.prod()` | `.product()` |
+| `.any()`, `.all()` | `.bool_or()`, `.bool_and()` |
+| `.log()` | `.ln()` (numpy's natural-log convention) |
+
+Cast type names are matched case-insensitively, so pandas' `.astype("Int64")` and SQL's
+`.cast("BIGINT")` spelling both resolve to the canonical `int64`.
+
+Each operator also has the pandas method form, for code that cannot emit an operator:
+`.add(o)`, `.sub(o)`, `.mul(o)`, `.truediv(o)`, `.div(o)`, `.floordiv(o)`, `.mod(o)`,
+`.eq(o)`, `.ne(o)`, `.lt(o)`, `.le(o)`, `.gt(o)`, `.ge(o)`. The boolean operators
+likewise carry `.and_(o)`, `.or_(o)`, `.not_()`, and `.xor(o)`, because Python's `and`,
+`or`, and `not` keywords cannot be overloaded.
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"x": [1, None, 3], "y": [10, 20, 30]})
+print(ds.select(
+    filled=bt.col("x").fillna(0),
+    missing=bt.col("x").isna(),
+    total=bt.col("x").add(bt.col("y")),
+).to_pydict())
+# {'filled': [1, 0, 3], 'missing': [False, True, False], 'total': [11, None, 33]}
+```
+
+### Python `str` and numpy names on the accessors
+
+On `.str`, the Python string predicates: `.isdigit()`, `.isalpha()`, `.isalnum()`, and
+`.isspace()` (for `is_numeric`/`is_alpha`/`is_alnum`/`is_space`), plus Polars'
+`.strip_prefix(p)` / `.strip_suffix(s)` (for `removeprefix`/`removesuffix`).
+
+On `.dt`, the snake_case spellings `.day_of_week()`, `.day_of_year()`, and
+`.week_of_year()` (for `dayofweek`/`dayofyear`/`weekofyear`).
+
+On `.list`, `.lengths()` (the legacy Polars name for `len`), `.element_at(i)` (the
+PySpark name for `get`), and `.argmin()` / `.argmax()` (the numpy names for
+`arg_min`/`arg_max`).
+
+Some ecosystem names are deliberately **absent**, because they mean something different
+here and a silently-wrong alias is worse than a missing one:
+
+| Absent name | Why |
+|---|---|
+| `str.find`, `str.index` | `position` is 1-based and returns 0 when absent; pandas' `find` is 0-based and returns -1. |
+| `str.substring` | `substr` is 1-based SQL. Use the 0-based `str.slice(offset, length)`. |
+| `str.islower`, `str.isupper` | `is_lower`/`is_upper` are true for an uncased string such as `"123"`; Python's are false. |
+| `str.count` | pandas' `count` is a regex count. Use `str.regexp_count(pattern)`. |
+| `str.casefold` | Python's casefold is not lowercase for non-ASCII (`"ß"` folds to `"ss"`). |
+
 ## Data science toolkit
 
 Feature engineering, profiling, and text/calendar features as expressions, so a

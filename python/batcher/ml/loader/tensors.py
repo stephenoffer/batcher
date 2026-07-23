@@ -7,6 +7,8 @@ outgrew the module limit; the seam is "convert a batch" vs "decide which batch."
 
 from __future__ import annotations
 
+import warnings
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -57,8 +59,17 @@ def column_to_tensor(array: pa.Array) -> Any | None:
     return torch.from_numpy(np.array(nd, copy=True))
 
 
-def tensorize(batch: Any, keep: list[str]) -> dict[str, Any]:
-    """One batch as a `{column: tensor}` dict, dropping the non-tensorizable columns."""
+def tensorize(batch: Any, keep: list[str], collate_fn: Any = None) -> Any:
+    """One batch as a `{column: tensor}` dict, dropping the non-tensorizable columns.
+
+    With `collate_fn` the Arrow batch is handed over untouched instead — the escape hatch for
+    the columns this cannot represent (string labels/ids, ragged sequences needing a padding
+    collate and an attention mask). Without it, a non-tensorizable column is dropped, which
+    `warn_dropped_columns` announces once per loader rather than letting a label vanish
+    silently.
+    """
+    if collate_fn is not None:
+        return collate_fn(batch)
     out = {}
     for c in keep:
         t = column_to_tensor(batch.column(c))
@@ -67,28 +78,107 @@ def tensorize(batch: Any, keep: list[str]) -> dict[str, Any]:
     return out
 
 
-def to_torch_out(
-    arrays: dict, arrays_to_torch: Any, collate_fn: Any, device: Any, pin_memory: bool = False
-) -> Any:
-    """One `{col: ndarray}` batch as the yielded output, optionally moved to `device`."""
-    out = collate_fn(arrays) if collate_fn is not None else arrays_to_torch(arrays)
-    if device is None:
-        return out
-    # Apple MPS has no 64-bit tensors; downcast so `device="auto"` works on Apple silicon.
-    is_mps = str(device).startswith("mps")
+def warn_dropped_columns(probe: Any, keep: list[str], collate_fn: Any = None) -> list[str]:
+    """Warn about the `keep` columns `tensorize` cannot convert, and return their names.
 
-    def _move(t: Any) -> Any:
+    Called once, at loader construction, on a one-row probe of the corpus. A dropped column is
+    otherwise invisible: a string ``label``/``id`` simply does not appear in the yielded dict,
+    and the training loop reads a `KeyError` — or worse, trains happily on what is left.
+    """
+    if collate_fn is not None:
+        return []  # the caller collates the raw batch; nothing is dropped
+    dropped = [c for c in keep if column_to_tensor(probe.column(c)) is None]
+    if dropped:
+        warnings.warn(
+            f"loader is dropping non-tensorizable column(s) {dropped}: they cannot become "
+            "torch tensors and will be missing from every yielded batch. Pass "
+            "`columns=` to select the columns you want, or `collate_fn=` to receive the "
+            "raw Arrow batch and collate them yourself.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return dropped
+
+
+class DeviceMover:
+    """Move a yielded batch to `device`, keeping pinned staging buffers alive until it lands.
+
+    ``t.pin_memory().to(device, non_blocking=True)`` is the standard fast host-to-device
+    recipe and, written that way, a use-after-free: the pinned staging tensor is the *source*
+    of an asynchronous DMA, and dropping the last reference to it the moment `.to()` returns
+    frees that page-locked buffer while the copy is still in flight. The destination then holds
+    whatever the allocator put there next. It is silent, load-dependent, and the background
+    prefetch thread widens the window rather than closing it.
+
+    So the staging tensors are retained here for `depth` batches, and on CUDA the copy is
+    issued on a dedicated stream whose completion event the compute stream waits on — which is
+    what actually overlaps the transfer with compute instead of merely claiming to.
+    """
+
+    __slots__ = ("_depth", "_device", "_is_mps", "_live", "_pin", "_stream")
+
+    def __init__(self, device: Any, *, pin_memory: bool = False, depth: int = 2) -> None:
+        """Bind to a target device; `depth` staging batches stay referenced in flight."""
+        self._device = device
+        self._pin = pin_memory
+        # Apple MPS has no 64-bit tensors; downcast so `device="auto"` works on Apple silicon.
+        self._is_mps = str(device).startswith("mps")
+        self._depth = max(2, depth)
+        self._live: deque = deque()
+        self._stream = _copy_stream(device) if pin_memory else None
+
+    def __call__(self, out: Any) -> Any:
+        """Move one batch (a tensor or a `{name: tensor}` dict) to the device."""
+        staging: list = []
+        event = None
+        if self._stream is not None:
+            import torch
+
+            with torch.cuda.stream(self._stream):
+                moved = self._move_all(out, staging)
+            event = torch.cuda.Event()
+            event.record(self._stream)
+            # Order the consumer's compute after the copy without blocking this thread.
+            torch.cuda.current_stream().wait_event(event)
+        else:
+            moved = self._move_all(out, staging)
+        if staging:
+            self._retain(staging, event)
+        return moved
+
+    def _move_all(self, out: Any, staging: list) -> Any:
+        if isinstance(out, dict):
+            return {k: self._move(v, staging) for k, v in out.items()}
+        return self._move(out, staging)
+
+    def _move(self, t: Any, staging: list) -> Any:
         if not hasattr(t, "to"):
             return t
-        if is_mps:
+        if self._is_mps:
             t = _mps_safe_dtype(t)
-        if pin_memory and hasattr(t, "pin_memory"):
+        if self._pin and hasattr(t, "pin_memory"):
             t = t.pin_memory()
-        return t.to(device, non_blocking=pin_memory)
+            staging.append(t)  # the DMA source — must outlive the copy
+        return t.to(self._device, non_blocking=self._pin)
 
-    if isinstance(out, dict):
-        return {k: _move(v) for k, v in out.items()}
-    return _move(out)
+    def _retain(self, staging: list, event: Any) -> None:
+        """Hold this batch's staging buffers, retiring the ones whose copy has completed."""
+        self._live.append((event, staging))
+        while len(self._live) > self._depth:
+            old_event, _ = self._live.popleft()
+            if old_event is not None:
+                old_event.synchronize()  # the copy is done; the buffers may now be freed
+
+
+def _copy_stream(device: Any) -> Any:
+    """A dedicated CUDA stream for host-to-device copies, or ``None`` off CUDA."""
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is checked by the caller
+        return None
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return None
+    return torch.cuda.Stream()
 
 
 def _mps_safe_dtype(tensor: Any) -> Any:

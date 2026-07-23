@@ -13,12 +13,24 @@ from __future__ import annotations
 
 from batcher.observe.console import ConsoleReporter
 from batcher.observe.control import ensure_sinks, start_ui, stop_ui, ui_url
+from batcher.observe.inference import InferenceProgress
+from batcher.observe.metrics import (
+    metrics_snapshot,
+    prometheus_text,
+    reset_metrics,
+    start_metrics,
+)
 from batcher.observe.store import ActivityStore
 
 __all__ = [
     "ActivityStore",
     "ConsoleReporter",
+    "InferenceProgress",
     "ensure_sinks",
+    "metrics_snapshot",
+    "prometheus_text",
+    "reset_metrics",
+    "start_metrics",
     "start_ui",
     "stop_ui",
     "ui_url",

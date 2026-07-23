@@ -679,7 +679,7 @@ impl JoinTable {
         &self,
         keys: &K,
         range: std::ops::Range<usize>,
-        left_null: &[bool],
+        left_null: Option<&[bool]>,
         join_type: JoinType,
         left_out: &mut IndexBuf,
         right_out: &mut IndexBuf,
@@ -695,7 +695,12 @@ impl JoinTable {
         let mut rejected = 0u64;
         let seen = range.len() as u64;
         for i in range {
-            let head = self.head_for(keys, i, left_null[i], bloom, &mut rejected);
+            // `None` ⇒ no key column had a null, so no row is null-keyed — the check is skipped
+            // entirely and the caller never allocated the mask. The `Option` is loop-invariant,
+            // so this is a predicted null-pointer test, not the 16 KB per-morsel mask a foreign-key
+            // probe (its key never null) used to allocate and zero for nothing.
+            let is_null = left_null.is_some_and(|m| m[i]);
+            let head = self.head_for(keys, i, is_null, bloom, &mut rejected);
             match join_type {
                 JoinType::Semi => {
                     if head.is_some() {
@@ -1088,7 +1093,7 @@ fn build_probe_flat<K: JoinKeys + Sync>(
     table.probe_range(
         keys,
         0..left_rows,
-        left_null,
+        Some(left_null),
         join_type,
         &mut left_out,
         &mut right_out,
@@ -1184,7 +1189,7 @@ pub fn broadcast_hash_join_indices(
                     table.probe_range(
                         &$keys,
                         r.clone(),
-                        &left_null,
+                        Some(&left_null),
                         join_type,
                         &mut left_out,
                         &mut right_out,
@@ -1296,12 +1301,24 @@ mod tests {
             let end = (start + chunk).min(probe.len());
             let mut l = IndexBuf::with_capacity(end - start);
             let mut r = IndexBuf::with_capacity(end - start);
-            table.probe_range(&k, start..end, &pnull, JoinType::Inner, &mut l, &mut r, None);
+            table.probe_range(
+                &k,
+                start..end,
+                Some(&pnull),
+                JoinType::Inner,
+                &mut l,
+                &mut r,
+                None,
+            );
             let (la, ra) = (l.finish(), r.finish());
             for i in 0..la.len() {
                 pairs.push((
                     la.value(i),
-                    if ra.is_null(i) { None } else { Some(ra.value(i)) },
+                    if ra.is_null(i) {
+                        None
+                    } else {
+                        Some(ra.value(i))
+                    },
                 ));
             }
         }
@@ -1315,7 +1332,9 @@ mod tests {
     fn latching_the_bloom_off_midway_emits_the_same_rows() {
         // Every probe key matches — the shape that makes the bloom useless (TPC-H lineitem⋈orders).
         let build: Vec<i64> = (0..40_000).collect();
-        let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3)).map(|i| i % 40_000).collect();
+        let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
+            .map(|i| i % 40_000)
+            .collect();
 
         let (chunked, table) = probe_in_chunks(&build, &probe, 8_192);
         assert!(
@@ -1344,7 +1363,13 @@ mod tests {
         let build: Vec<i64> = (0..40_000).collect();
         // 1 probe row in 50 can match; the rest fall far outside the build's key range.
         let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
-            .map(|i| if i % 50 == 0 { i % 40_000 } else { 10_000_000 + i })
+            .map(|i| {
+                if i % 50 == 0 {
+                    i % 40_000
+                } else {
+                    10_000_000 + i
+                }
+            })
             .collect();
 
         let (_, table) = probe_in_chunks(&build, &probe, 8_192);

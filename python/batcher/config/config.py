@@ -23,7 +23,6 @@ import os
 import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 __all__ = [
     "CardinalityConfig",
@@ -1752,8 +1751,180 @@ class Config:
         Returns:
             A new Config with the document's overrides applied over `base`.
         """
-        data = json.loads(Path(path).read_text())
+        from batcher.config.serde import read_document
+
+        data = read_document(path)
         return _resolved(_overlay_dict(base if base is not None else cls(), data))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object], base: Config | None = None) -> Config:
+        """Build a Config from a nested dict of section overrides.
+
+        The inverse of `to_dict`, and the shared implementation behind `from_file`. Keys
+        not naming a real section or field are ignored rather than raising, so a document
+        written for a newer Batcher still loads. Use `set_option` when you want an unknown
+        name to be an error.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> Config.from_dict({"execution": {"morsel_rows": 4096}}).execution.morsel_rows
+                4096
+
+        Args:
+            data: A nested dict mirroring the section structure.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new validated Config with the overrides applied over `base`.
+        """
+        return _resolved(_overlay_dict(base if base is not None else cls(), data))
+
+    @classmethod
+    def from_toml(cls, path: str | os.PathLike[str], base: Config | None = None) -> Config:
+        """Load a Config from a TOML document whose tables mirror the config sections.
+
+        Parsed with the standard library, so no extra dependency is needed. A section is a
+        TOML table: ``[execution]`` with ``morsel_rows = 4096`` under it.
+
+        Examples:
+            .. doctest::
+
+                >>> import tempfile
+                >>> from pathlib import Path
+                >>> from batcher.config import Config
+                >>> p = Path(tempfile.mkdtemp()) / "batcher.toml"
+                >>> _ = p.write_text("[execution]\\nmorsel_rows = 4096\\n")
+                >>> Config.from_toml(p).execution.morsel_rows
+                4096
+
+        Args:
+            path: The TOML document to read.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new validated Config with the document's overrides applied over `base`.
+        """
+        from batcher.config.serde import read_document
+
+        return cls.from_dict(read_document(path, fmt="toml"), base=base)
+
+    @classmethod
+    def from_yaml(cls, path: str | os.PathLike[str], base: Config | None = None) -> Config:
+        """Load a Config from a YAML document whose top-level keys mirror the sections.
+
+        Requires `pyyaml`; the error says so if it is missing rather than surfacing an
+        ImportError from inside the parser.
+
+        Examples:
+            .. doctest::
+
+                >>> import tempfile
+                >>> from pathlib import Path
+                >>> from batcher.config import Config
+                >>> p = Path(tempfile.mkdtemp()) / "batcher.yaml"
+                >>> _ = p.write_text("execution:\\n  morsel_rows: 4096\\n")
+                >>> Config.from_yaml(p).execution.morsel_rows  # doctest: +SKIP
+                4096
+
+        Args:
+            path: The YAML document to read.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new validated Config with the document's overrides applied over `base`.
+        """
+        from batcher.config.serde import read_document
+
+        return cls.from_dict(read_document(path, fmt="yaml"), base=base)
+
+    def to_dict(self, *, only_non_default: bool = False) -> dict[str, object]:
+        """Convert to a nested plain-dict, round-tripping through `from_dict`.
+
+        The round-trip is closed over *resolved* configs. `from_dict` runs the same
+        resolution step every entry point does, which auto-detects the environment (a spot
+        node, an autoscaling cluster), so reloading a config captured on one machine can
+        legitimately differ from raw defaults on another. Reloading an already-resolved
+        config is idempotent, which is the property to rely on.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> resolved = Config.from_dict(Config().to_dict())
+                >>> Config.from_dict(resolved.to_dict()) == resolved
+                True
+
+        Args:
+            only_non_default: Emit only the values differing from the built-in defaults,
+                producing the smallest document that reproduces this config.
+
+        Returns:
+            A nested dict mirroring the section structure.
+        """
+        from batcher.config.serde import config_to_dict
+
+        return config_to_dict(self, only_non_default=only_non_default)
+
+    def non_defaults(self) -> dict[str, object]:
+        """The options that differ from the built-in defaults, as a flat dotted-key dict.
+
+        The answer to "what is actually set here?" — the first thing worth printing when a
+        run behaves differently on one machine than another, because environment variables
+        and config files both land here.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config, ExecutionConfig
+                >>> Config().replace(execution=ExecutionConfig(morsel_rows=4096)).non_defaults()
+                {'execution.morsel_rows': 4096}
+
+        Returns:
+            A dict mapping dotted option path to its current value, for changed options only.
+        """
+        return self.diff(Config())
+
+    def diff(self, other: Config) -> dict[str, object]:
+        """The options where this config differs from `other`, as a flat dotted-key dict.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config, ExecutionConfig
+                >>> a = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+                >>> a.diff(Config())
+                {'execution.morsel_rows': 4096}
+                >>> Config().diff(Config())
+                {}
+
+        Args:
+            other: The config to compare against.
+
+        Returns:
+            A dict mapping dotted option path to *this* config's value, for each option
+            whose value differs.
+        """
+        from batcher.config.options import _leaves
+
+        theirs = dict(_leaves(other))
+        return {path: value for path, value in _leaves(self) if theirs.get(path) != value}
+
+    def __repr__(self) -> str:
+        """A one-line summary naming only the options that differ from the defaults.
+
+        The generated dataclass repr is 180 fields and roughly 4,500 characters, which is
+        unreadable in a traceback and useless in a notebook. This shows what was changed,
+        which is the only part that carries information; `describe_options` prints the full
+        table when you want it.
+        """
+        changed = self.non_defaults()
+        if not changed:
+            return "Config(<all defaults>)"
+        shown = ", ".join(f"{k}={v!r}" for k, v in list(changed.items())[:8])
+        more = f", +{len(changed) - 8} more" if len(changed) > 8 else ""
+        return f"Config({shown}{more})"
 
 
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})

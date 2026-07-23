@@ -328,6 +328,18 @@ class MapBatches(LogicalPlan):
     # these inputs only. Declaring a column the `fn` does not read is merely wasteful;
     # OMITTING one it does read is a correctness bug — the column gets pruned out from under it.
     input_columns: tuple[str, ...] | None = None
+    # The columns `fn` passes through UNCHANGED — same name, same value, in every output row.
+    # None = unknown, so the optimizer must assume `fn` may rewrite any column and no predicate
+    # can ever move below the UDF (the safe default). When a column is declared here, a `Filter`
+    # whose predicate reads only preserved columns is pushed *below* the UDF, so the model runs
+    # on the rows that survive the filter instead of every row — filtering 60% of the rows
+    # before GPU inference saves 60% of the GPU work. This is the mirror of `input_columns`:
+    # that field says only what `fn` READS, which cannot justify the pushdown (a column the fn
+    # reads it may still overwrite). Preservation is the stronger claim, and it is opt-in for
+    # the same reason `input_columns` is — declaring a column the `fn` actually rewrites is a
+    # WRONG ANSWER, not a slow one: rows the predicate would drop on the *rewritten* value are
+    # dropped on the *input* value instead, silently changing the result.
+    preserves_columns: tuple[str, ...] | None = None
     # Concurrent workers for the per-batch call (>1 overlaps GIL-releasing model
     # inference across cores; the GIL serializes pure-Python `fn`s).
     num_workers: int = 1

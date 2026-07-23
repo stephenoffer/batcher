@@ -265,13 +265,46 @@ class ORCSource(FileSource):
         return [ORCStripeSplit(path, i, rows) for i in range(footer.nstripes)]
 
     def statistics(self) -> SourceStatistics | None:
-        """Exact row count from the ORC footers (no data scan)."""
+        """Exact row count, on-disk size and stripe count from the ORC footers (no data scan).
+
+        `orc_statistics` mines the row count. The footer states two more facts it does not
+        carry, and both were being discarded:
+
+        - **`byte_size`** — the file's on-disk length. `kyber.shortcuts.storage.total_bytes`
+          is all-or-nothing across sources, so a single ORC input made `total_bytes()`,
+          `bytes_per_row()` and the read-time prediction in `api.terminal.profile` return
+          None for the whole query. It is read from `ORCFile.file_length`, which is the
+          compressed on-disk size those consumers document themselves as wanting.
+        - **`row_group_count`** — `nstripes`. `SourceStatistics.row_group_count` is defined
+          as "Parquet row groups, **ORC stripes**", and it is the granularity a zone-map
+          prune skips at, so reporting None left `meta.storage.row_group_count()` blind on
+          the one other format that has the concept.
+
+        Column min/max stay absent deliberately. pyarrow exposes `nstripe_statistics` as a
+        *count* of statistics blobs with no accessor for their contents, so there is nothing
+        to read — and a bound that is merely exact-looking is worse than no bound, because a
+        terminal answers from an EXACT one without executing.
+        """
+        import dataclasses
+
         from batcher.io.stats import orc_statistics
 
         try:
-            return orc_statistics(self._fs, self._files())
+            stats = self._stats_apply(orc_statistics(self._fs, self._files()))
         except Exception:
             return None
+        if stats is None:
+            return None
+        try:
+            footers = [_orc_footer(path) for path in self._files()]
+            stripes = sum(footer.nstripes for footer in footers)
+            size = sum(self._fs.size(path) for path in self._files())
+        except Exception:
+            # A footer or stat that cannot be read makes the *totals* partial, and a partial
+            # total is worse than none (both consumers sum across sources and would silently
+            # under-report). The row count from `orc_statistics` is unaffected.
+            return stats
+        return dataclasses.replace(stats, byte_size=size or None, row_group_count=stripes or None)
 
 
 @SINKS.register("orc")

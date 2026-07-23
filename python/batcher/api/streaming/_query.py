@@ -119,9 +119,17 @@ class StreamingQuery:
         self._engine = engine
 
     def __repr__(self) -> str:
-        """Show the query name and whether it is still running."""
+        """Show the query name, liveness, and the most recent micro-batch's progress."""
         state = "active" if self._engine.is_active else "stopped"
-        return f"StreamingQuery(name={self._name!r}, {state})"
+        last = self.last_progress
+        if last is None:
+            tail = "no batches yet"
+        else:
+            tail = (
+                f"batch {last.batch_id}, {last.num_input_rows} rows in "
+                f"@ {last.input_rows_per_second:.0f} rows/s"
+            )
+        return f"StreamingQuery(name={self._name!r}, {state}, {tail})"
 
     def __enter__(self) -> StreamingQuery:
         """Enter a ``with`` block; the query keeps running until the block exits."""
@@ -134,6 +142,11 @@ class StreamingQuery:
     @property
     def name(self) -> str:
         """The query's name (auto-generated if not supplied)."""
+        return self._name
+
+    @property
+    def id(self) -> str:
+        """A stable identifier for the query (its name); Spark `StreamingQuery.id` parity."""
         return self._name
 
     @property
@@ -198,3 +211,43 @@ class StreamingQuery:
                 True
         """
         return self._engine.exception
+
+    # --- Spark Structured Streaming spellings ------------------------------
+    # `ds.write(...)` returns this handle; a job ported from Spark reaches for the
+    # camelCase names. They are thin aliases of the snake_case methods above.
+    def awaitTermination(self, timeout: float | None = None) -> bool:
+        """Spark spelling of `await_termination` — block until the query stops.
+
+        Args:
+            timeout: Maximum seconds to wait; ``None`` waits indefinitely.
+
+        Returns:
+            Whether the query has stopped.
+        """
+        return self.await_termination(timeout)
+
+    def processAllAvailable(self) -> bool:
+        """Block until all currently-available data is processed (Spark parity).
+
+        Waits for the query to finish draining. This is meaningful for a draining
+        trigger (`Trigger.once` / `Trigger.available_now`); on a never-ending
+        continuous stream it blocks until the query is stopped elsewhere.
+
+        Returns:
+            Whether the query has stopped once all available data was processed.
+        """
+        return self.await_termination()
+
+    @property
+    def isActive(self) -> bool:
+        """Spark spelling of `is_active` — whether the query is still running."""
+        return self.is_active
+
+    @property
+    def lastProgress(self) -> StreamingQueryProgress | None:
+        """Spark spelling of `last_progress` — the most recent micro-batch's metrics."""
+        return self.last_progress
+
+    def recentProgress(self) -> list[StreamingQueryProgress]:
+        """Spark spelling of `recent_progress` — metrics for the most recent batches."""
+        return self.recent_progress()

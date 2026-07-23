@@ -13,6 +13,7 @@ Arrow the whole way (zero-copy from the engine into the UDF and back).
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
@@ -26,7 +27,13 @@ from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.visitor import children, with_children
 
-__all__ = ["build_udf_callable", "execute_with_udfs", "has_map_batches", "prebuild_factories"]
+__all__ = [
+    "build_udf_callable",
+    "execute_with_udfs",
+    "has_map_batches",
+    "prebuild_factories",
+    "stream_with_udfs",
+]
 
 
 def prebuild_factories(node: LogicalPlan) -> LogicalPlan:
@@ -103,26 +110,74 @@ def execute_with_udfs(
     decode. The result is identical to the staged materialization (same rows, per-batch
     contract; only the scheduling overlaps). Non-linear plans (joins/unions between maps)
     and the GPU-autobatch / multiprocessing strategies keep the materializing path.
-    """
-    from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
 
+    **This returns a list, so peak memory is the whole output** — the stage overlap is real
+    but the bounded-memory half of streaming is not available here. A caller that consumes
+    batches incrementally (a distributed map task that writes from the worker) should use
+    `stream_with_udfs` instead, which is the same execution with the materialization removed.
+    """
     projections = source_projections or {}
     cfg = engine_config or active_config().engine_config_json()
     if not has_map_batches(plan):
         return _run_whole_plan(plan, sources, projections, cfg)
-    chain = linear_map_chain(plan)
-    if chain is not None and stream_eligible(chain[1]):
+    gen = _linear_stream(plan, sources, projections)
+    if gen is not None:
         # Reconcile the streamed output to one union schema, exactly as the materializing
         # path does per stage (`_execute_node`). A UDF whose output schema DRIFTS across
         # batches (e.g. LLM structured outputs with varying fields) yields batches of
         # differing schemas; without this the final `Table.from_batches` raises on the
         # first drift, so the streaming path would crash on inputs the staged path handles.
         # The chain's output is already fully listed here, so this adds no extra buffering.
-        return reconcile_batches(
-            list(stream_linear_chain(chain[0], chain[1], sources, projections))
-        )
+        return reconcile_batches(list(gen))
     batches, _schema = _execute_node(plan, sources, projections, cfg)
     return batches
+
+
+def stream_with_udfs(
+    plan: LogicalPlan,
+    sources: list,
+    source_projections: dict[int, list[str]] | None = None,
+    engine_config: str | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Execute a `map_batches` pipeline, yielding output batches **as they are produced**.
+
+    The incremental form of `execute_with_udfs`, with the same arguments and the same rows in
+    the same order. The difference is memory: for a linear ``Scan -> map -> ... -> map`` chain
+    on the streaming path, nothing accumulates. Resident memory is the bounded prefetch windows
+    between the stages (a few morsels each), not the query's whole output — so a worker can
+    read, infer, and write a partition far larger than its RAM. `execute_with_udfs` cannot do
+    this by construction: it hands back a `list`.
+
+    A plan the streaming path can't take (a join or union between maps, a multiprocessing
+    stage, a CPU-only chain) falls back to `execute_with_udfs` and is yielded from the
+    materialized result. That is a scheduling difference only — same rows either way — but the
+    memory bound does *not* hold for it, so don't read "iterator" as "bounded" unconditionally.
+    """
+    projections = source_projections or {}
+    if has_map_batches(plan):
+        gen = _linear_stream(plan, sources, projections)
+        if gen is not None:
+            from batcher.core.udf.stream import reconcile_stream
+
+            yield from reconcile_stream(gen)
+            return
+    yield from execute_with_udfs(plan, sources, source_projections, engine_config)
+
+
+def _linear_stream(
+    plan: LogicalPlan, sources: list, projections: dict[int, list[str]]
+) -> Iterator[pa.RecordBatch] | None:
+    """The stage-overlapped batch stream for `plan`, or `None` if it isn't eligible.
+
+    The one place the streaming route is decided, so the listing caller and the streaming
+    caller can never disagree about which plans stream.
+    """
+    from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
+
+    chain = linear_map_chain(plan)
+    if chain is None or not stream_eligible(chain[1]):
+        return None
+    return stream_linear_chain(chain[0], chain[1], sources, projections)
 
 
 def _run_whole_plan(
@@ -359,7 +414,10 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
         if op.max_errored_rows > 0:
             # Dirty-data tolerance: isolate and skip corrupt rows (up to the budget) instead
             # of crashing — a single-stage inference / preprocess over messy data survives.
-            budget = [op.max_errored_rows]
+            # Shared per worker process, not per call — see `strategy.error_budget`. Rebuilding
+            # it here handed every partition (and the streaming path, independently) its own
+            # full allowance, so the effective bound scaled with parallelism.
+            budget = strat.error_budget(op)
             is_gpu = op.num_gpus > 0
 
             def _emit(b: pa.RecordBatch) -> list[pa.RecordBatch]:
@@ -395,9 +453,19 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
     hill-climbs the batch size toward the VRAM-capped throughput plateau (`ml.autobatch`),
     surviving a CUDA OOM by halving the batch — so the user never hand-tunes `batch_size`.
     Input order is preserved (a relation-level no-op vs a fixed size), and the model is
-    built once and shared across the `num_workers` dispatch slots (a GPU stage resolves to
-    one). The seed is conservative (climbs up); a future VRAM-aware seed sharpens the start.
+    built once and shared across the dispatch slots.
+
+    Two things are taken from the streaming path rather than re-invented, so the same model
+    behaves the same way whichever path a plan's shape routes it to. The **seed batch size** is
+    the model's learned VRAM-safe size (`stream._learned_gpu_cap`), not a hardcoded 256
+    that cold-started the two paths differently and discarded what the last run measured; the
+    hill-climb still moves from there. And the **dispatch width** is at least
+    `stream._GPU_SOLO_PIPELINE_DEPTH`: a GPU stage resolves to ``num_workers == 1``, which left
+    this pool with one slot and no intra-worker overlap, so the device idled through each
+    batch's host-side tensorize and copy while the streaming path overlapped exactly that. The
+    slots share one built model and one CUDA context, so this buys overlap, not a second load.
     """
+    from batcher.core.udf.stream import _GPU_SOLO_PIPELINE_DEPTH, _learned_gpu_cap
     from batcher.ml.gpu import autocast_call
     from batcher.ml.inference import InferencePool
 
@@ -409,10 +477,16 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
         coerced = _coerce_udf_result(call(batch))
         if not coerced:
             return batch.slice(0, 0)
-        merged = pa.Table.from_batches(coerced).combine_chunks().to_batches()
-        return merged[0] if merged else coerced[0]
+        # `concat_batches` keeps every row and raises a clear error on a genuine >2 GiB
+        # offset overflow, unlike `Table.from_batches(...).combine_chunks().to_batches()[0]`,
+        # which splits at the 32-bit offset limit and then silently drops all but the first
+        # batch — losing rows for large binary/string/list inference outputs.
+        return coerced[0] if len(coerced) == 1 else pa.concat_batches(coerced)
 
     pool = InferencePool(
-        lambda: worker, num_workers=op.num_workers, target_batch_rows=256, objective="throughput"
+        lambda: worker,
+        num_workers=max(op.num_workers, _GPU_SOLO_PIPELINE_DEPTH),
+        target_batch_rows=_learned_gpu_cap(op),
+        objective="throughput",
     )
     return list(pool.run(iter(batches)))

@@ -62,12 +62,24 @@ def test_the_declared_schema_survives_a_model_that_omits_a_field():
     assert got.to_pydict() == {"q": ["a", "b"], "label": ["x", "y"], "score": [1, None]}
 
 
-def test_generate_parse_json_still_drifts_which_is_why_extract_exists():
-    """Pin the contrast: the inferred-struct path really does fail here."""
+def test_generate_parse_json_unifies_a_drifting_struct_across_batches():
+    """The inferred-struct path unifies per-batch key sets instead of failing.
+
+    Two batches, two key sets: batch `a` carries `score`, batch `b` omits it. The scan
+    widens the struct to the union of the fields and nulls the absent one, so the query
+    completes. `extract` is still the right call when you want the schema *declared*
+    up front rather than inferred from whatever the model happened to return.
+    """
     engine = _keyed_engine({"a": '{"label": "x", "score": 1}', "b": '{"label": "y"}'})
     ds = bt.from_arrow(pa.table({"q": ["a", "b"]}).to_batches(max_chunksize=1))
-    with pytest.raises(Exception, match=r"incompatible types|common type"):
-        ds.ml.generate(engine, prompt_column="q", parse_json=True).to_pydict()
+    out = ds.ml.generate(engine, prompt_column="q", parse_json=True)
+    assert out.schema.field("response").type == pa.struct(
+        [("label", pa.string()), ("score", pa.int64())]
+    )
+    assert out.to_pydict()["response"] == [
+        {"label": "x", "score": 1},
+        {"label": "y", "score": None},
+    ]
 
 
 def test_an_unparseable_response_nulls_the_row_not_the_batch():

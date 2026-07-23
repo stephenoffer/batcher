@@ -37,10 +37,17 @@ _SUPPORTED_AGGS = ("sum", "count", "mean", "min", "max")
 
 @functools.lru_cache(maxsize=1)
 def gpu_available() -> bool:
-    """Whether a CUDA-capable torch is importable *and* a device is present in this process.
+    """Whether torch is importable *and* an accelerator this module can compute on is present.
 
     False on a GPU-less host (the driver), where a caller dispatches to a GPU worker or falls
     back to the CPU engine. Never raises.
+
+    The probe follows the *detected backend*, not CUDA alone. `_TORCH_DEVICE` and the scatter
+    kernel below already support `xpu` (Intel) and `mps` (Apple), but this gate asked
+    `torch.cuda.is_available()`, which is False on both — so the one function deciding whether
+    to use those devices reported "no accelerator" on hosts that had a working one, and the
+    kernel supporting them was unreachable. A backend with no torch device still returns False:
+    a TPU host has an accelerator, but not one these kernels can drive.
 
     Short-circuits on the cheap device-node check before touching torch, and memoizes the
     answer. Importing torch costs ~2 s and this is reached from the post-collect GPU-crossover
@@ -50,10 +57,19 @@ def gpu_available() -> bool:
     """
     if gpu_devices_absent():
         return False
+    device = _TORCH_DEVICE.get(accelerator_backend())
+    if device is None:
+        return False
     try:
         import torch
 
-        return bool(torch.cuda.is_available())
+        if device == "cuda":  # also ROCm, which speaks the CUDA API
+            return bool(torch.cuda.is_available())
+        if device == "xpu":
+            xpu = getattr(torch, "xpu", None)
+            return bool(xpu is not None and xpu.is_available())
+        mps = getattr(torch.backends, "mps", None)  # device == "mps"
+        return bool(mps is not None and mps.is_available())
     except Exception:
         return False
 

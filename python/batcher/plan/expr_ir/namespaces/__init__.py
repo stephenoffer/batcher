@@ -8,6 +8,7 @@ the `func_nodes` IR classes callers historically imported from this module.
 
 from __future__ import annotations
 
+from batcher.plan.expr_ir.compat.namespaces import bind_namespace_compat as _bind_namespace_compat
 from batcher.plan.expr_ir.func_nodes import (
     ConvertTimezone,
     DateFunc,
@@ -68,3 +69,8 @@ __all__ = [
     "_StructNamespace",
     "parse_offset",
 ]
+
+# The ecosystem spellings (``str.isdigit``, ``dt.day_of_week``, ``list.element_at``)
+# are attached once the accessor classes above exist. They live in `expr_ir.compat`
+# so each namespace module stays the single home of its primary surface.
+_bind_namespace_compat()

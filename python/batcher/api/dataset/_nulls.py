@@ -26,15 +26,81 @@ if TYPE_CHECKING:
 __all__ = ["build_drop_nulls", "build_fill_null", "build_fill_null_strategy"]
 
 
-def build_fill_null(ds: Dataset, value: Any | dict[str, Any]) -> Dataset:
+def _fillable_columns(ds: Dataset, value: Any, subset: list[str] | None) -> list[str]:
+    """The columns a single scalar `value` can legally fill, or a `PlanError` naming why not.
+
+    `coalesce(col, literal)` is typed in the engine: filling a string column with 0
+    is not a wide cast, it is a type error, and it used to surface as a raw
+    ``arguments need to have the same data type`` from Rust with no column named. So
+    the compatible columns are worked out here, up front, where the schema and the
+    offending value are both in hand and the message can name them.
+
+    With an explicit `subset` every named column must accept the value (the user said
+    which ones they meant). Without one, an all-column fill that matches nothing at
+    all is the mistake worth reporting; a fill that matches some columns and skips
+    incompatible ones is the pandas/Polars-shaped behaviour users expect from
+    ``fillna(0)`` on a mixed frame.
+    """
+    cols = list(ds.columns) if subset is None else list(subset)
+    unknown = set(cols) - set(ds.columns)
+    if unknown:
+        raise PlanError(f"fill_null(): unknown column(s) {sorted(unknown)}")
+
+    schema = ds._plan.available_schema()
+    if schema is None:
+        return cols  # types unknown at plan time; let the engine judge
+    arrow = schema.arrow
+    compatible = [c for c in cols if _accepts_fill(arrow, c, value)]
+    if subset is not None and len(compatible) != len(cols):
+        rejected = sorted(set(cols) - set(compatible))
+        raise PlanError(
+            f"fill_null(): column(s) {rejected} cannot be filled with {value!r} "
+            f"(incompatible types); pass a per-column mapping, e.g. "
+            f"fill_null({{'{rejected[0]}': <a matching value>}})"
+        )
+    if not compatible:
+        raise PlanError(
+            f"fill_null(): no column can be filled with {value!r}; the dataset's "
+            f"types are {[str(f.type) for f in arrow]}"
+        )
+    return compatible
+
+
+def _accepts_fill(arrow: Any, column: str, value: Any) -> bool:
+    """Whether `column`'s Arrow type can hold `value` as a null replacement."""
+    import pyarrow as pa
+
+    index = arrow.get_field_index(column)
+    if index < 0:  # pragma: no cover - guarded by the caller's unknown-column check
+        return True
+    dtype = arrow.field(index).type
+    if isinstance(value, bool):
+        return pa.types.is_boolean(dtype)
+    if isinstance(value, (int, float)):
+        return (
+            pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
+        )
+    if isinstance(value, str):
+        return pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+    return True  # an exotic literal: let the engine have the final say
+
+
+def build_fill_null(
+    ds: Dataset, value: Any | dict[str, Any], subset: list[str] | None = None
+) -> Dataset:
     """Replace nulls — one fill `value` for every column, or per-column via a dict."""
-    cols = ds.columns
     if isinstance(value, dict):
-        unknown = set(value) - set(cols)
+        if subset is not None:
+            raise PlanError(
+                "fill_null(): pass a per-column mapping or a `subset`, not both — "
+                "the mapping already names its columns"
+            )
+        unknown = set(value) - set(ds.columns)
         if unknown:
             raise PlanError(f"fill_null(): unknown column(s) {sorted(unknown)}")
         return ds.with_columns(**{c: Col(c).fill_null(value[c]) for c in value})
-    return ds.with_columns(**{c: Col(c).fill_null(value) for c in cols})
+    targets = _fillable_columns(ds, value, subset)
+    return ds.with_columns(**{c: Col(c).fill_null(value) for c in targets})
 
 
 # Strategies that lower to a whole-relation window aggregate broadcast into a coalesce.

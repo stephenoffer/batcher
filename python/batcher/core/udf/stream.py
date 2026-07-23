@@ -23,11 +23,18 @@ from concurrent.futures import ThreadPoolExecutor
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.core.udf import strategy as strat
 from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
 from batcher.core.udf.execute import build_udf_callable
+from batcher.io.schema.evolution import normalize_batch, unify_schemas
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 
-__all__ = ["linear_map_chain", "stream_eligible", "stream_linear_chain"]
+__all__ = [
+    "linear_map_chain",
+    "reconcile_stream",
+    "stream_eligible",
+    "stream_linear_chain",
+]
 
 # Bounded look-ahead between pipelined map stages: a stage may run this many morsels
 # ahead of its consumer (so a CPU stage overlaps the GPU stage draining it) while keeping
@@ -40,6 +47,9 @@ _STREAM_PREFETCH_DEPTH = max(0, int(os.environ.get("BATCHER_STREAM_PREFETCH_DEPT
 _GPU_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_PIPELINE_DEPTH", "1")))
 # In-flight forwards for a LONE GPU stage (no upstream CPU stage feeding it): default 2 so a
 # scan->GPU inference overlaps read/tensorize with the forward instead of idling the device.
+# Public because the MATERIALIZING path needs the same overlap: `execute._apply_udf_autobatch`
+# sizes its dispatch pool from it, so a solo GPU stage gets the same two in-flight forwards
+# whichever path the plan shape routes it to. One definition, not two that can drift.
 _GPU_SOLO_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_SOLO_PIPELINE_DEPTH", "2")))
 
 # Adaptive GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
@@ -331,10 +341,10 @@ def _apply_udf_stream(
         call = autocast_call(call)
     # An explicit batch_size always wins. Without one, the chunk ADAPTS to the data's row width:
     # a GPU stage sizes from a VRAM byte budget capped at the model's learned safe size
-    # (`_learned_gpu_cap`), and a CPU stage sizes from a (larger) byte budget capped at the morsel
-    # (`_cpu_batch_rows`) so a post-decode multimodal stage shrinks its transient output on wide
-    # rows. A fixed row count would OOM the device / balloon memory on wide rows and under-fill on
-    # narrow ones. OOM-halving remains the safety net if a model's activations still overflow.
+    # (`_learned_gpu_cap`), and a CPU stage sizes from a (larger) byte budget capped at the
+    # morsel (`_cpu_batch_rows`) so a post-decode multimodal stage shrinks its transient output
+    # on wide rows. A fixed row count would OOM the device / balloon memory on wide rows and
+    # under-fill on narrow ones. OOM-halving remains the safety net if activations still overflow.
     explicit: int | None = op.batch_size or None
     gpu_cap = _learned_gpu_cap(op) if is_gpu else _GPU_STREAM_BATCH_ROWS
     workers = op.num_workers if isinstance(op.num_workers, int) and op.num_workers > 1 else 1
@@ -375,7 +385,10 @@ def _apply_udf_stream(
     # Resilient per-call handling is needed for a GPU stage (survive a transient CUDA OOM by
     # halving) or when the user allowed skipping corrupt rows (`max_errored_rows`); a plain CPU
     # stage with no error budget calls directly so a real bug still fails fast.
-    budget = [op.max_errored_rows]
+    # The allowance is shared per worker process (`strategy.error_budget`), not rebuilt here:
+    # this module and `execute._apply_udf` used to build one each, so a query routed through
+    # both paths — or a streaming query calling in once per window — got several full budgets.
+    budget = strat.error_budget(op)
     resilient = is_gpu or op.max_errored_rows > 0
 
     def _emit(sub: pa.RecordBatch):
@@ -443,3 +456,22 @@ def _pipelined_emit(gen, subs_fn, emit_fn, depth: int) -> Iterator[pa.RecordBatc
                 yield from inflight.popleft().result()
         while inflight:
             yield from inflight.popleft().result()
+
+
+def reconcile_stream(gen: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+    """Yield `gen`'s batches, each normalized to the union of the schemas seen *so far*.
+
+    The incremental counterpart of `reconcile_batches`, keeping a drifting-schema UDF (LLM
+    structured outputs that gain a field) concatenable downstream with one batch resident
+    instead of the whole output. Deliberately a weaker contract than the list form: a batch
+    already yielded cannot be widened retroactively, so an early batch keeps the narrower
+    schema. A consumer needing ONE schema over the entire result must use `execute_with_udfs`
+    and pay the materialization — that guarantee is what the memory bound is traded for.
+    """
+    target: pa.Schema | None = None
+    for batch in gen:
+        if target is None:
+            target = batch.schema
+        elif not batch.schema.equals(target):
+            target = unify_schemas([target, batch.schema], mode="union")
+        yield batch if batch.schema.equals(target) else normalize_batch(batch, target)

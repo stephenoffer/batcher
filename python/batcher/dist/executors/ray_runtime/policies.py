@@ -71,6 +71,54 @@ def _is_fatal_ray_error(exc: BaseException) -> bool:
     return bool(fatal) and isinstance(exc, fatal)
 
 
+# A UDF failure whose cause is a *resource or remote-service* condition rather than a bug in
+# the UDF. These are the failure modes of large-scale GPU inference: a CUDA OOM when several
+# actors peak together, a model server returning 429/503, a socket timeout to a weight store.
+# Retrying one on a fresh worker routinely succeeds, whereas a `TypeError` in the UDF never will.
+_TRANSIENT_UDF_ERROR_MARKERS = (
+    "cuda out of memory",
+    "out of memory",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+    "nccl timeout",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "too many requests",
+    "service unavailable",
+    "temporarily unavailable",
+    "slow_down",
+    "internal server error",
+    "bad gateway",
+    "502",
+    "503",
+    "429",
+)
+
+
+def _is_transient_udf_error(exc: BaseException) -> bool:
+    """Whether a `RayTaskError` looks like a retryable resource/remote condition.
+
+    A deterministic UDF bug fails identically on every worker, so retrying it only burns
+    the budget and delays the error. A transient one — CUDA OOM under a concurrency spike,
+    a throttled model endpoint — usually succeeds on the next attempt, and failing the whole
+    job on it throws away hours of completed inference. Matching is on the message text
+    because the real cause is raised by torch / an HTTP client / a vendor SDK and arrives
+    here already wrapped in Ray's `RayTaskError`.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = f"{type(cur).__name__} {cur}".lower()
+        if any(marker in text for marker in _TRANSIENT_UDF_ERROR_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def speculation_policy():
     """Build the straggler-speculation policy from the active config.
 
@@ -295,8 +343,17 @@ def gather_map_results(
             results[idx] = ray.get(ref)
             if on_done is not None:
                 on_done(idx)
-        except RayTaskError:
-            raise  # a deterministic UDF error — resubmitting cannot help
+        except RayTaskError as exc:
+            # A deterministic UDF error fails the same way everywhere, so resubmitting cannot
+            # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
+            # network timeout also arrives as a `RayTaskError`, and those DO clear on a retry.
+            # Failing the whole job on one used to discard hours of completed inference.
+            if not _is_transient_udf_error(exc):
+                raise
+            attempts[idx] += 1
+            if attempts[idx] > policy.max_attempts:
+                raise
+            pending.appendleft(idx)
         except RayError as exc:
             # Worker / actor / node loss (preemption). Requeue at the front so the
             # survivor-resubmit keeps priority for the next free slot. A `RayError` that

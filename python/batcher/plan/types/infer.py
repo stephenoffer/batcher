@@ -75,7 +75,13 @@ _DATE_TS = frozenset({"last_day"})
 # neighbours included) report `null`.
 _LIST_INT = frozenset({"len", "n_unique", "arg_max", "arg_min"})
 _LIST_SAME = frozenset({"reverse", "sort", "unique"})
-_LIST_FLOAT_REDUCE = frozenset({"sum", "mean", "median", "product", "std", "var", "l2_norm"})
+# Genuinely float, whatever the element width (verified against the engine: an Int
+# list's mean/median/product/std/var/l2_norm all come back as `double`). `sum` is NOT
+# here: it preserves the element type (Int list → Int64, like `min`/`max`), and
+# classifying it as float made `Dataset.schema` disagree with execution.
+_LIST_FLOAT_REDUCE = frozenset({"mean", "median", "product", "std", "var", "l2_norm"})
+# Reductions that preserve the (numeric) element type: `sum` alongside `min`/`max`.
+_LIST_ELEMENT_REDUCE = frozenset({"sum", "min", "max"})
 
 _STR_STR = frozenset(
     {
@@ -277,8 +283,9 @@ def _listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
         return _as_list_type(input_t)
     if fn in _LIST_FLOAT_REDUCE:
         return pa.float64()  # always double, whatever the element width
-    if fn in ("min", "max"):
-        # Preserve the element type (already widened at the scan leaf).
+    if fn in _LIST_ELEMENT_REDUCE:
+        # `sum`/`min`/`max` preserve the element type (already widened at the scan leaf):
+        # summing/minning an Int list yields Int64, a Float list yields Float64.
         return _list_element_type(input_t)
     if fn == "normalize":
         # Rescale each element to unit L2 norm → a list of Float64.

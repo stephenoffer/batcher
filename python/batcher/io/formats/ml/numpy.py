@@ -8,7 +8,6 @@ per-row shape. ``.npz`` archives expose one column per stored array.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import IO, Any
 
 import pyarrow as pa
@@ -67,9 +66,6 @@ class NumpySource(FileSource):
         if projection is not None:
             table = table.select(projection)
         return table.to_batches()
-
-    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        yield from self.read(projection)
 
     def _file_row_count(self, path: str) -> int | None:
         from batcher.io.stats.free_counts import npy_header_rows

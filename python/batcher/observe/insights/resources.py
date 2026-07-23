@@ -31,9 +31,14 @@ def cpu_contention() -> dict[str, float]:
     try:
         import os
 
+        from batcher._internal.hardware import available_cpu_count
+
         load1, _, _ = os.getloadavg()
-        cores = os.cpu_count() or 1
-        out["load_per_core"] = load1 / cores
+        # The cores this process may actually use (cgroup quota ∧ affinity), not the host's.
+        # `os.cpu_count()` reports the whole machine, so a container limited to 4 of 64 cores
+        # divided a saturating load of 4.0 by 64 and reported 0.06 — "idle" at exactly the
+        # moment it was pegged and throttled, which is the reading this metric exists to catch.
+        out["load_per_core"] = load1 / max(1, available_cpu_count())
     except (OSError, AttributeError):
         pass
     try:

@@ -12,6 +12,7 @@ every path.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pyarrow as pa
@@ -32,7 +33,15 @@ def _resilient_call(
     `budget`, the ``max_errored_rows`` allowance) so a corrupt image / malformed record doesn't
     kill a long job — until the budget is exhausted, when it re-raises. With ``budget == 0``
     and a CPU stage this reduces to strict behavior (any error propagates), so a real bug on
-    clean data still fails fast."""
+    clean data still fails fast.
+
+    Every drop is **surfaced**, because a silently vanishing row is unrecoverable: at PB scale
+    you cannot tell afterwards which rows were skipped or how many. `budget` therefore doubles
+    as the out-parameter: ``budget[0]`` is the remaining allowance (as before) and ``budget[1]``
+    is the running drop count, appended on the first drop so existing callers keep passing a
+    one-element list unchanged. Each drop also publishes to the observability bus with the
+    running count and the error text, so a running job reports the loss as it happens rather
+    than at the end."""
     from batcher.ml.inference import _empty_cuda_cache, _is_cuda_oom
 
     try:
@@ -45,10 +54,42 @@ def _resilient_call(
             if oom or budget[0] <= 0:
                 raise  # genuine single-row over-allocation, or the error budget is spent
             budget[0] -= 1
+            _record_dropped_row(budget, exc)
             return []  # drop the one corrupt row and carry on
         mid = sub.num_rows // 2
         left = _resilient_call(call, sub.slice(0, mid), budget, is_gpu)
         return left + _resilient_call(call, sub.slice(mid), budget, is_gpu)
+
+
+#: Guards the drop counter. `_resilient_call` runs under a `ThreadPoolExecutor` on the
+#: `execute` path, so several threads can drop a row at the same instant; without this
+#: the read-modify-write would lose counts and the lazy append could run twice. Taken
+#: only on the (rare) drop path, so the clean path stays lock-free.
+_DROP_LOCK = threading.Lock()
+
+
+def _record_dropped_row(budget: list[int], exc: Exception) -> None:
+    """Count a dropped row into `budget[1]` and announce it on the event bus.
+
+    Only the exception's type and message are reported, never the row's values: the row
+    that failed is frequently the one carrying malformed or sensitive data, and an
+    observability sink is not an appropriate place to leak it.
+    """
+    from batcher._internal.events import LOG, publish
+
+    with _DROP_LOCK:
+        if len(budget) < 2:
+            budget.append(0)
+        budget[1] += 1
+        dropped = budget[1]
+        remaining = budget[0]
+    publish(
+        LOG,
+        name="map_batches",
+        dropped_rows=dropped,
+        remaining_budget=remaining,
+        error=f"{type(exc).__name__}: {exc}",
+    )
 
 
 def _formatted(fn: Any, fmt: str) -> Any:

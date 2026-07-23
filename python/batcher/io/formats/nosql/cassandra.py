@@ -27,7 +27,6 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
-from batcher.io.formats.sql._common import connection_fingerprint
 
 __all__ = ["CassandraSource"]
 
@@ -106,25 +105,27 @@ class _CassandraSourceBase(ScanSource):
         return ", ".join(cols)
 
     def _identity_suffix(self) -> str:
-        """``<cluster>:<keyspace>.<table>`` — the cluster is part of the relation's identity.
+        return f"{self._conn_kwargs['keyspace']}.{self._conn_kwargs['table']}"
 
-        ``keyspace.table`` alone made one relation out of every cluster that happens to use
-        the same schema names, which for Cassandra is the *normal* case: a keyspace named
-        for the service, replicated across prod, staging, and a local ring. `identity()` is
-        the persisted learned-statistics key, so their cardinalities were being pooled and
-        Kyber planned each one against the others' data. Silent — no error, just a worse
-        plan.
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """`_conn_kwargs` with the auth block reduced to its non-secret half.
 
-        Only the contact points and port are fingerprinted. `auth` is deliberately excluded:
-        it holds the password, and `identity()` is written to the metadata store rather than
-        merely printed. Excluding it also means rotating the password does not change the
-        key and orphan everything the optimizer has learned about the table.
+        `ScanSource.identity()` drops credentials by *key name*, and Cassandra's do not
+        have one: the password sits inside ``auth={"username", "password"}``, under a key
+        called ``auth``. So the raw password was being digested into `identity()`, which is
+        **persisted** as the learned-statistics key.
+
+        The digest is one-way, so this is not a plaintext leak — it is a stability bug.
+        Every rotation of the Cassandra password changes the key, and the table's
+        accumulated cardinalities are orphaned with nothing to indicate it; Kyber quietly
+        goes back to cold estimates. Keeping the username preserves the part that actually
+        distinguishes two connections to the same ring.
         """
-        kw = self._conn_kwargs
-        fingerprint = connection_fingerprint(
-            {"contact_points": kw["contact_points"], "port": kw["port"]}
-        )
-        return f"{fingerprint}:{kw['keyspace']}.{kw['table']}"
+        auth = self._conn_kwargs.get("auth")
+        return {
+            **self._conn_kwargs,
+            "auth": auth.get("username") if isinstance(auth, dict) else auth,
+        }
 
     def _infer_schema(self) -> pa.Schema:
         kw = self._conn_kwargs
@@ -153,8 +154,7 @@ class _CassandraSourceBase(ScanSource):
         cols = ", ".join(projection) if projection else "*"
         pk = self._pk_expr()
         stmt = (
-            f"SELECT {cols} FROM {kw['table']} "
-            f"WHERE token({pk}) >= {start} AND token({pk}) < {end}"
+            f"SELECT {cols} FROM {kw['table']} WHERE token({pk}) >= {start} AND token({pk}) < {end}"
         )
         if pushed is not None:
             stmt += f" AND {pushed} ALLOW FILTERING"

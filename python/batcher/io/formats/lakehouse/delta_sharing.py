@@ -24,6 +24,7 @@ from batcher._internal.optional import require
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["DeltaSharingFileSplit", "DeltaSharingSource"]
 
@@ -150,6 +151,27 @@ def _stats_manifest(files: list[Any]) -> pa.Table | None:
         return None  # heterogeneous stat types across files → prune nothing
 
 
+def _presigned_schema(file_url: str) -> pa.Schema:
+    """One shared file's Arrow schema, read from its Parquet footer alone.
+
+    `schema()` used to be answered by `_read_presigned(files[0].url, None).schema` — a
+    full fetch and decode of a shared data file, over the network, out of object storage,
+    to learn its column names. Every byte of it was then discarded.
+
+    The cost is not incidental. `schema()` is called at *plan* time, on every read, before
+    the query has decided whether it wants any of those columns — and a Delta Sharing file
+    is remote by construction, so this is the connector family where a materializing
+    schema lookup is most expensive. The footer states the schema exactly and pyarrow
+    fetches only the footer to read it, so the answer is identical and the transfer is a
+    few kilobytes instead of the file.
+    """
+    import pyarrow.parquet as pq
+
+    fs = resolve_filesystem(file_url)
+    with fs.open(file_url) as fh:
+        return pq.ParquetFile(fh).schema_arrow
+
+
 def _read_presigned(
     file_url: str, projection: list[str] | None, predicate: dict | None = None
 ) -> pa.Table:
@@ -197,7 +219,7 @@ class DeltaSharingSource:
         files = self._files()
         if not files:
             raise BackendError(f"Delta Sharing table {self._url!r} has no files to infer schema")
-        return _read_presigned(files[0].url, None).schema
+        return _presigned_schema(files[0].url)
 
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
@@ -221,7 +243,52 @@ class DeltaSharingSource:
             yield from _read_presigned(url, projection, predicate).to_batches()
 
     def row_count(self) -> int | None:
-        return None  # pre-signed URLs carry no guaranteed cheap count.
+        """The rows the sharing server declared, or None when it declared none.
+
+        This used to return `None` unconditionally, on the reasoning that "pre-signed URLs
+        carry no guaranteed cheap count". The URLs do not — but the `AddFile` actions
+        alongside them do: the protocol sends each file's Delta `stats` JSON, `numRecords`
+        included, and `_declared_rows` was already parsing it to size the splits. The count
+        was in hand and thrown away.
+        """
+        stats = self.statistics()
+        return None if stats is None else stats.row_count
+
+    def statistics(self) -> SourceStatistics | None:
+        """Exact row count and per-column bounds from the server's own file statistics.
+
+        This is the metadata a shared table gets for free and was not using. The sharing
+        protocol sends the same ``numRecords``/``minValues``/``maxValues``/``nullCount``
+        a local `_delta_log` carries, `_stats_manifest` already normalizes it into the
+        add-action layout, and `manifest_statistics` already aggregates that layout for
+        Delta and Iceberg. Declaring it here costs one dict walk over metadata that has
+        *already arrived over the wire* and gives the shared table the zone map its local
+        sibling has: predicates provable empty from metadata, `min()`/`max()` answered
+        without a fetch, and pruning rules that can fire at all.
+
+        **Nothing is reported unless the server stated it.** If any shared file omits
+        `numRecords`, the total is not the table's count — `pc.sum` skips nulls, so it
+        would silently under-report — and an under-reported *exact* count is not a slow
+        plan but a wrong answer, since `count()` is served straight from it without
+        executing. So a single missing count withdraws the whole statistic rather than
+        rounding it off. `bounds_include_nan` is left False: Delta statistics omit NaN, so
+        a float `max` here is the largest non-NaN value and cannot answer `max()`.
+        """
+        files = self._files()
+        if not files:
+            return None
+        declared = _declared_rows(files)
+        if len(declared) != len(files):
+            return None  # a file the server did not count: the total would understate it
+        manifest = _stats_manifest(files)
+        if manifest is None:
+            return SourceStatistics(row_count=sum(declared.values()), exact_rows=True)
+        from batcher.io.stats import manifest_statistics
+
+        stats = manifest_statistics(manifest)
+        if stats is None:
+            return SourceStatistics(row_count=sum(declared.values()), exact_rows=True)
+        return stats
 
     def identity(self) -> str:
         return f"delta_sharing:{self._url}"
@@ -263,7 +330,7 @@ class DeltaSharingFileSplit:
         self._rows = rows
 
     def schema(self) -> pa.Schema:
-        return _read_presigned(self._file_url, None).schema
+        return _presigned_schema(self._file_url)
 
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None

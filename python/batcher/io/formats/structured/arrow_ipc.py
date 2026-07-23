@@ -20,7 +20,7 @@ from batcher._internal.optional import require
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
-from batcher.io.splits import Split
+from batcher.io.splits import FileSplit, Split
 
 __all__ = ["ArrowBlockSplit", "ArrowIPCSink", "ArrowIPCSource"]
 
@@ -115,6 +115,27 @@ class ArrowIPCSource(FileSource):
         target_size: int | None,  # noqa: ARG002
         predicate: dict | None = None,  # noqa: ARG002 (no IPC block statistics to prune with)
     ) -> list[Split]:
+        # An `ArrowBlockSplit` carries only `(path, blocks)` and re-resolves the filesystem
+        # from the bare path on the worker, so it cannot carry a bring-your-own `filesystem=`
+        # or `storage_options=`: the worker would resolve its own backend from the
+        # environment and read a *different store* than the driver was configured for — a
+        # dict-carried `endpoint_override` pointing at an on-prem MinIO is exactly the case,
+        # and a wrong-store read is a different object, not a slower one.
+        #
+        # `on_error` rides the same fallback and for the same reason: the split carries no
+        # reader kwargs, so a tolerated read would rebuild a fail-fast reader on the worker
+        # and one truncated shard would abort the whole distributed query while the
+        # tolerance looked wired up.
+        #
+        # A `FileSplit` reconstructs the source through `_reader_kwargs()` and does carry
+        # them, trading sub-file block granularity for correct credentials and policy —
+        # the same trade `ParquetSource._file_splits` makes for row-group splits.
+        if (
+            self._filesystem is not None
+            or self._storage_options is not None
+            or self._errors.mode != "raise"
+        ):
+            return [FileSplit(self.format_name, path, self._reader_kwargs())]
         ipc = _require_ipc()
         with self._fs.open(path) as fh:
             n = ipc.open_file(fh).num_record_batches

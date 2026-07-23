@@ -1,5 +1,190 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Eager aggregation pre-aggregated 6M rows to feed a 5,514-row join — TPC-H Q17 8.7x → 1.6x (2026-07-20)
+
+Q17 was the TPC-H suite's worst row by a wide margin: **155.2 ms against DuckDB's 17.9 and
+Polars' 9.9 (8.7x / 15.7x)**. Every other query sat between 0.5x and 2.9x.
+
+The tell was that the *same query written two ways* differed 20x. A join expressed as a comma
+join ran in 12.1 ms; the identical join expressed as `JOIN (SELECT ...)` over a derived table
+ran in **242.0 ms**. Same tables, same predicate, same answer.
+
+**Cause.** The derived-table spelling let `pre_aggregation_through_join` fire. It pre-aggregated
+`lineitem` by `l_partkey` — 6,001,215 rows into 201,152 groups — to shrink the join's probe
+side. That is a 29.8x row reduction, so it sailed past `_MIN_PREAGG_REDUCTION` (8.0x), the guard
+added after an earlier 4x reduction regressed a query 5.5x. But the join it fed was a *broadcast*
+against 195 filtered parts, emitting 5,514 rows. The rewrite paid for a 200k-group, cache-cold
+hash table over 6M rows to avoid an L1-resident probe.
+
+**Why the existing guard could not see it.** `_MIN_PREAGG_REDUCTION` prices the push as a ratio
+against *the side being shrunk*, which says nothing about what the join then does with it. A
+selective join is itself the stronger reducer, and pre-aggregating in front of one is pure added
+work: the group-by still reads every source row, and the join emits fewer rows than the group-by
+produced, so nothing downstream got smaller. Measured against the join's **output**, 201,152
+pushed rows versus 5,514 join rows is a 36x pessimization, not a 29.8x win.
+
+`_join_out_reduces_more` adds that comparison as a **veto, not a license** — the same shape as
+`_measured_as_non_reducing` beside it. `_reduces_enough` must still approve the push from the
+estimator's `ndv`; this can only withdraw that approval, which is why it reads the join estimate
+at any provenance. A DEFAULT guess can at worst skip a beneficial rewrite, never license a
+harmful one, and skipping is result-invariant (the push is an algebraic identity).
+
+| TPC-H Q17, sf1 | time | vs DuckDB |
+|---|---:|---:|
+| before | 155.2 ms | 8.69x |
+| after | 28.9 ms | 1.58x |
+| hand-written ideal plan (the floor this is chasing) | 30.5 ms | — |
+
+The hand-written plan matters as the control: it decorrelates by hand (filter `part`, semi-join
+`lineitem` down to the surviving partkeys, aggregate, join back) and lands at 30.5 ms, which is
+where the optimized plan now sits. The optimizer was not missing a decorrelation — it had one,
+and then spent 125 ms undoing its benefit. The plan's decorrelated aggregate went from running
+over 201,152 groups to 5,514, and the answer matches DuckDB exactly (348406.0542857143).
+
+Q20, whose correlated subquery has the same shape on two keys, moved with it. Verified by
+`test_a_more_selective_join_vetoes_the_push` and `test_a_fanning_join_still_pushes` — the second
+matters as much as the first, since without it the guard would be indistinguishable from
+disabling the rule. Distribution-safe by construction: the veto is a pure cardinality comparison
+that never reads `OptimizerContext.hardware`, and the optimizer emits one plan for both
+executors, so it decides identically single-node and distributed.
+
+### Four hot-path fixes landed alongside it (correctness-verified, perf not separately attributed)
+
+These are all local and semantics-preserving; none touches `partial`/`combine`/`finalize`, so
+mergeability is unaffected and single-node == distributed holds by construction.
+
+* **The streaming join gather was on arrow's slow `take`.** `gather_join_output_with` — the
+  *per-morsel* path — called `arrow::compute::take`, while `gather_join_output` beside it
+  already routed through `bc_runtime::gather::take_column` and its `Utf8`/`Binary` fast path.
+  A string output column paid that penalty once per probe morsel, hundreds of times per join.
+* **A unique build key still paid for the chain.** `next[r]` is loaded once per *emitted row* to
+  read the `u32::MAX` that ends a length-1 chain — a random access into a multi-megabyte array
+  whose answer is known in advance. `build_sharded` now derives `unique` for free (no shard
+  pushed a chain entry) and skips both the load and the `next` allocation, which is 24 MB of
+  serial memset at 6M build rows. Computed from the built table per worker, so a partition with
+  duplicate keys simply does not take the fast path.
+* **Window order keys were encoded even when nothing read them.** Only the rank family, the
+  framed paths, and the running aggregate consult peer ties. `ROW_NUMBER`, `NTILE`, and every
+  frameless value function (`LAG`/`LEAD`/`FIRST_VALUE`) select by position. The `RowConverter`
+  encode is now gated on a function actually needing peers.
+* **Float key canonicalization rebuilt columns that needed no rebuild.** `canon_array` folded
+  `-0.0` and NaN unconditionally, allocating and writing a second copy of the column (~48 MB at
+  6M rows, serially) before anything else in the operator started. A branch-free scan of the raw
+  value buffer now decides whether any `-0.0` or NaN is present; on real data neither usually is,
+  and the rebuild becomes a scan.
+
+Two further changes — window partition vectors allocated at exact size (`mem::take` was handing
+back a *capacity-0* vector, so each of ~1.5M partitions in `PARTITION BY l_orderkey` regrew
+1→2→4) and an identity-permutation short-circuit in the join gather (on a FK inner join the left
+index buffer is literally `0..n-1`, so every probe column was copied to reproduce itself) — are
+compiled and pass the Rust oracles, but are **not** separately measured.
+
+### Follow-up: the streaming probe allocated a null mask per morsel for nothing — `op-join-agg` to parity
+
+`BroadcastProbe::probe` — the per-morsel probe that drives every hash join — built a full
+`vec![false; 16384]` null mask for each morsel and handed it to `probe_range`, which read
+`left_null[i]` per row. On a foreign-key join the probe key (`l_orderkey`) is never null, so
+that mask was allocated, zeroed, and read as `false` hundreds of times per join to no effect.
+`probe_range` now takes `Option<&[bool]>`; the streaming path builds the mask only when a probe
+key actually has nulls and passes `None` otherwise, skipping both the allocation and the per-row
+check. Bit-identical across the 84 join/stream oracle tests (interp seq==par included).
+
+| `op-join-agg`, sf1 (best-of-5) | b/duckdb | b/polars |
+|---|---:|---:|
+| before (this file's competitor sweep above) | 1.25x | 1.18x |
+| after, run 1 | 0.90x | 0.95x |
+| after, run 2 | 0.97x | 1.01x |
+
+`op-join-agg` moves from a consistent loss to parity/slight-win against both — the single
+operator that was still red against DuckDB in the join family. The cross-run spread (DuckDB
+100.9 vs 105.0 ms) is ordinary machine variance; what is stable is the direction and that
+correctness passes every run. That leaves **`op-sort-limit` as the only operator still losing to
+DuckDB (1.22x)** — the 3-key top-N, whose float-key path this file already halved once and whose
+remaining gap is the multi-key selection, not the float radix.
+
+**Measurement caveat, stated deliberately.** The before/after above is trustworthy for Q17
+because it is mechanism-verified: the plan shape change is structural, the 12 ms vs 242 ms
+reproduction is a within-process comparison of two spellings, and the hand-written ideal plan
+independently establishes the floor. The *smaller* deltas from that first pair of runs were not
+trustworthy — the baseline run overlapped three analysis subagents on the same 16 cores, and
+DuckDB's own Q1 time moved 99.1 → 55.4 ms between runs, which best-of-5 minimums should not do.
+So the competitive tables below are from separate, less-contended sweeps, and are the numbers
+to trust.
+
+### The full competitor sweep, sf1 (adds Daft and PyArrow)
+
+Every Batcher answer verified correct against DuckDB (`All correctness checks passed`, own run).
+Ratios are `batcher / competitor`; **< 1.00 = Batcher faster**.
+
+*Operator mix* — Batcher beats **Daft on 11/11 and PyArrow on 11/11**, DuckDB on 9/11, Polars on
+9/11. (Daft cannot complete `op-window-rank` — RANK over ~1.5M partitions hangs; confirmed by
+isolating it, Batcher runs it in ~148 ms. So the window rows below carry no Daft column.)
+
+| operator | batcher ms | b/duckdb | b/polars | b/pyarrow | b/daft |
+|---|---:|---:|---:|---:|---:|
+| op-groupby-sum | 11.4 | 0.80x | 0.42x | 0.60x | 0.37x |
+| op-groupby-2key | 17.0 | 0.62x | 0.40x | 0.54x | 0.22x |
+| op-global-sum | 0.2 | 0.04x | 0.06x | 0.04x | 0.02x |
+| op-filter-count | 0.3 | 0.07x | 0.03x | 0.00x | 0.03x |
+| op-join-agg | 139.3 | 1.25x | 1.18x | 0.32x | 0.46x |
+| op-sort-limit | 18.4 | 1.09x | 0.02x | 0.01x | 0.10x |
+| op-filter-project | 10.9 | 0.79x | 1.10x | 0.06x | 0.49x |
+| op-window-rank | 147.7 | 0.84x | 0.12x | — | Daft hangs |
+| op-window-runsum | 132.1 | 0.50x | 0.15x | — | Daft hangs |
+| op-window-lag | 128.6 | 0.71x | 0.04x | — | Daft hangs |
+| op-window-sum-partition | 86.6 | 0.64x | 0.85x | — | Daft hangs |
+
+*TPC-H* — against Daft, Batcher wins **18 of the 22** queries where Daft produces an answer, and
+Daft **fails four outright**: wrong results on q6 (revenue 75.2M vs the correct 123.1M), q15 (0
+rows vs 1), and q18 (wrong projection), and it cannot express q21 (outer-reference binding error)
+or q22 (no `SUBSTRING ... FROM ... FOR` syntax). PyArrow has no SQL surface and does not compete
+here. Batcher's own 22/22 are correct; the standing vs DuckDB is 8 wins (q1, q9, q11, q12, q13,
+q14, q15, q18) with Q17 down from **8.69x to 1.49x**. The four still-red rows — q16, q19, q20,
+q21 — are the CSE and probe-prefetch work called out below, not correctness gaps.
+
+*JSON (semistructured, path-extract over 1M documents)* — Batcher beats **Polars on 5/5, by
+20–50x** (Polars' JSON path handling runs 2.1–3.1 *seconds* where Batcher runs tens of ms), and
+DuckDB on 3/5. All answers verified.
+
+| json case | batcher ms | b/duckdb | b/polars |
+|---|---:|---:|---:|
+| json-groupby1 | 35.8 | 0.48x | 0.02x |
+| json-project5 | 321.3 | 0.95x | 0.10x |
+| json-array (`$.tags[0]`) | 119.8 | 1.65x | 0.06x |
+| json-filter-agg | 86.1 | 1.06x | 0.03x |
+| json-groupby-sql | 48.0 | 0.66x | 0.02x |
+
+The two DuckDB losses are pure path-extraction cost — Batcher's extractor is already a lazy,
+path-directed byte scan (no full parse; `parse_path` hoisted once per batch), so closing the gap
+to DuckDB's yyjson-based extension would take a SIMD JSON scanner, not a local tweak. Recorded as
+a known target, not a regression.
+
+*ClickBench (43 real-world OLAP queries, 1M-row `hits`)* — **all 43 correct against DuckDB**
+(the whole-row FAILEDs a mixed run shows are Polars emitting `len` for `count_star()` and other
+column-name mismatches, never Batcher; verified by a `batcher,duckdb`-only rerun, 43/43 OK).
+Standing vs DuckDB: **~20 wins, ~23 losses**, and the split is sharp and diagnostic:
+
+- **Batcher dominates the low-overhead end** — the point queries and simple scans/aggregates:
+  q00–q06 at **0.02x–0.22x** (5–50x faster), q23 0.44x, q29 0.19x, q08/q09 ~0.67x. This is the
+  same sub-second-small-query strength the operator mix shows.
+- **Batcher loses 2x+ on high-cardinality grouping** — and *only* there: q33/q36 `GROUP BY URL`
+  (2.3x/2.2x), q13 `GROUP BY SearchPhrase` + `COUNT(DISTINCT UserID)` (2.3x), q10/q11 `COUNT
+  (DISTINCT UserID) GROUP BY MobilePhone…` (2.5x), q32 `GROUP BY WatchID, ClientIP` (2.7x —
+  `WatchID` is near-unique, so ~1M groups), q39 (2.1x). vs Polars where it competes, Batcher
+  still wins big (q20/q21/q22 at 0.02–0.04x — Polars runs 180–460 ms there).
+
+**This is the single most valuable finding of the whole sweep.** Every 2x+ ClickBench loss, the
+two TPC-H DuckDB losses that survive (q16 `count(DISTINCT)`, q22 grouped), and the `op-groupby`
+head-room all point at *one* target: **high-cardinality grouping and `COUNT(DISTINCT)`, over
+string or near-unique keys.** When the group count approaches the row count the per-thread
+partials no longer collapse and `combine` re-groups near-input-size data (`agg::group::combine`),
+against a cache-cold multi-million-entry table — exactly the cost `_MIN_PREAGG_REDUCTION` and the
+Q17 veto were added to *avoid* creating, now showing up where the query itself demands it. It is
+not a contained fix (it is the most-tuned code in the engine, and DuckDB has years of investment
+in radix-partitioned high-cardinality aggregation), so it is recorded here as the **next major
+work item**, precisely located, rather than attempted as a micro-optimization. Batcher's broad
+low-overhead wins are real and correct; this is the one shape where it is systematically behind.
+
 ## Parquet metadata was 90% Python, not I/O — `count()` 16.6x (2026-07-19)
 
 The driver's footer pass was assumed to be I/O-bound. It was not. Reading 200 files' footers

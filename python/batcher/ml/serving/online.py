@@ -7,15 +7,20 @@ requests with Serve's native ``@serve.batch``. It deliberately introduces **no**
 execution engine — the same ``build`` factory feeds both the offline `InferencePool`
 and this online deployment, so a model proven in batch serves online unchanged.
 
+The coalesced batch runs in a **thread executor**, never on the replica's event loop. A
+model forward pass is a long, synchronous, GIL-releasing call; awaiting it inline would
+stall the loop for its whole duration, so every other request already queued on that
+replica would wait behind it even though Serve had capacity to accept more.
+
 Gated behind the optional ``batcher-engine[serve]`` extra; importing this module is cheap
 (Ray Serve is imported only when a deployment is built).
 """
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
-
-from batcher._internal.errors import BackendError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -56,12 +61,15 @@ def serve_deployment(
         A Ray Serve deployment class — ``serve.run(serve_deployment(...).bind())``.
 
     Raises:
-        BackendError: if Ray Serve is not installed (``pip install 'batcher-engine[serve]'``).
+        MissingDependencyError: if Ray Serve is not installed (naming ``pip install
+            'batcher-engine[serve]'``).
     """
-    try:
-        from ray import serve
-    except ImportError as exc:  # pragma: no cover - optional extra
-        raise BackendError("online serving needs: pip install 'batcher-engine[serve]'") from exc
+    # One worker: a model is rarely thread-safe and a GPU wants its calls serialized,
+    # which is exactly what `@serve.batch` already assumes. The point of the executor is
+    # to get the blocking call OFF the event loop, not to run predictions in parallel.
+    from batcher._internal.optional import require
+
+    serve = require("ray.serve", feature="online serving", provides="ray[serve]", extra="serve")
 
     factory = build
 
@@ -71,10 +79,19 @@ def serve_deployment(
             built = factory()
             # `build` may itself be a class (load-once); resolve to the callable.
             self._predict = built() if isinstance(built, type) else built
+            self._pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"batcher-serve-{name}"
+            )
 
         @serve.batch(max_batch_size=max_batch_size, batch_wait_timeout_s=batch_wait_timeout_s)
         async def _batched(self, inputs: list[Any]) -> list[Any]:
-            return list(self._predict(inputs))
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._pool, lambda: list(self._predict(inputs)))
+
+        def __del__(self) -> None:
+            pool = getattr(self, "_pool", None)
+            if pool is not None:
+                pool.shutdown(wait=False)
 
         async def __call__(self, request: Any) -> Any:
             return await self._batched(request)

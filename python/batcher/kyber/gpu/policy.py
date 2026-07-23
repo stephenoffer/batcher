@@ -87,14 +87,20 @@ def decide_gpu_backend(
     *,
     gpu_count: int,
     force: bool = False,
+    gpu_memory_gb: float | None = None,
+    accelerator_type: str | None = None,
 ) -> GpuDecision:
     """Decide whether `plan` should run on the GPU, and single-device vs sharded.
 
     `gpu_count` is the live cluster's GPU count (0 → always CPU). `force=True` (an explicit
     `backend="gpu"`) honors the user past the small-input threshold but still routes by memory —
     so even a forced request avoids a single-dispatch OOM on data larger than one GPU. The
-    memory budget per GPU is `distributed.gpu_memory_gb`; the whole-cluster budget is that times
-    `gpu_count`."""
+    memory budget per GPU is `gpu_memory_gb` when the caller could read it from the live cluster,
+    else `distributed.gpu_memory_gb`; the whole-cluster budget is that times `gpu_count`.
+
+    The distinction matters on a mixed fleet. The config fallback probes the **driver's** devices,
+    so a CPU-only head node scheduling eight A100s planned against a 12 GB T4 constant and sharded
+    (or refused outright as "exceeds all GPUs") a working set one device would have held."""
     if gpu_count < 1:
         return GpuDecision(False, False, "no GPU on the cluster")
 
@@ -115,7 +121,7 @@ def decide_gpu_backend(
     # else the config default. This is what makes the backend choice adaptive to the hardware.
     from batcher.kyber.gpu.adaptive import learned_gpu_min_rows
 
-    learned_min = learned_gpu_min_rows(hub)
+    learned_min = learned_gpu_min_rows(hub, accelerator_type)
     # `is None`, not truthiness: `learned_gpu_min_rows` clamps to `[default/8, default*8]`, so a
     # legitimately-configured small `gpu_min_rows` (the config invites retuning) can learn a 0 —
     # which `or` discarded, silently reverting to the default *and* dropping the "learned "
@@ -127,7 +133,10 @@ def decide_gpu_backend(
             False, False, f"{rows} rows < {learned}min_rows={min_rows}: CPU wins on overhead", rows
         )
 
-    one_gpu_gb = max(dc.resolved_gpu_memory_gb(), 1e-9)
+    one_gpu_gb = max(
+        gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
+        1e-9,
+    )
     if ws_gb <= one_gpu_gb:
         return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows)
     if ws_gb <= one_gpu_gb * gpu_count:
@@ -153,6 +162,9 @@ def decide_gpu_map_params(
     model_memory_gb: float,
     num_gpus: float,
     batch_size: int | None,
+    gpu_memory_gb: float | None = None,
+    *,
+    assign_num_gpus: bool = True,
 ) -> GpuMapParams:
     """Size a GPU inference stage from the model's memory footprint vs one GPU's memory.
 
@@ -163,16 +175,33 @@ def decide_gpu_map_params(
     and reserves whole GPUs for a model larger than one. The batch-size seed spends the VRAM left
     after the model on activations at `gpu_activation_bytes_per_row`, clamped — the online
     `ThroughputController` refines it from measured throughput/VRAM, but a memory-aware start
-    beats a fixed 256 (too small for a light model, an instant OOM for a heavy one)."""
+    beats a fixed 256 (too small for a light model, an instant OOM for a heavy one).
+
+    `gpu_memory_gb` is the *cluster's* binding (smallest) device, supplied by the caller when
+    the topology could report it. Without it this falls back to
+    `DistributedConfig.resolved_gpu_memory_gb()`, which probes the **local** process — and on
+    the usual topology (a CPU-only head node scheduling GPU workers) that sees no device and
+    returns a 12 GB T4 constant. Packing a fleet of A100s against a T4 wastes ~85% of each
+    device; packing a fleet of T4s against a driver's A100 OOMs every worker.
+
+    `assign_num_gpus=False` is the non-GPU accelerator path (a TPU / Trainium / Inferentia stage,
+    which carries `num_gpus == 0` plus a custom resource). There `num_gpus` is left untouched — a
+    fractional GPU request on such a stage asks for a device the cluster hasn't got, and on a
+    GPU-less accelerator fleet that pends forever — while the batch size is still seeded from the
+    device's memory (`gpu_memory_gb`, here the accelerator's HBM). Cross-chip packing is the
+    user's resource count, not a `num_gpus` fraction, so the seed budgets against one device."""
     dc = active_config().distributed
-    gpu_gb = max(dc.resolved_gpu_memory_gb(), 1e-9)
+    gpu_gb = max(
+        gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
+        1e-9,
+    )
     cap = 0.85  # leave VRAM headroom for activations + fragmentation (the guides' ~80-85%)
 
     if model_memory_gb <= 0.0:
         return GpuMapParams(num_gpus, batch_size, "model memory unknown; left as given")
 
     out_gpus = num_gpus
-    if num_gpus <= 0.0:  # user left it unset → decide the packing fraction
+    if assign_num_gpus and num_gpus <= 0.0:  # user left it unset → decide the packing fraction
         frac = model_memory_gb / (gpu_gb * cap)
         if frac <= 1.0:
             # No `next()` default: this branch is guarded by `frac <= 1.0` and `_PACK_QUANTA`
@@ -180,6 +209,10 @@ def decide_gpu_map_params(
             out_gpus = next(q for q in _PACK_QUANTA if q >= frac)
         else:
             out_gpus = float(math.ceil(frac))
+
+    # The device-memory budget the batch seed spends: the packed GPU fraction, or one whole
+    # device for a non-GPU accelerator (its cross-chip packing is the user's resource count).
+    budget_devices = out_gpus if assign_num_gpus else 1.0
 
     out_bs = batch_size
     if batch_size is None:  # seed the throughput controller from the VRAM headroom
@@ -195,7 +228,7 @@ def decide_gpu_map_params(
         # ~9k rows of activations) for a stage that by construction has no room for it. The
         # `max(..., 1)` clamp below already guarantees a legal batch size, which is all the
         # floor was there for.
-        headroom_gb = max(gpu_gb * out_gpus * cap - model_memory_gb, 0.0)
+        headroom_gb = max(gpu_gb * budget_devices * cap - model_memory_gb, 0.0)
         act = max(dc.gpu_activation_bytes_per_row, 1)
         out_bs = int(min(max(headroom_gb * 1e9 / act, 1), 65_536))
     return GpuMapParams(

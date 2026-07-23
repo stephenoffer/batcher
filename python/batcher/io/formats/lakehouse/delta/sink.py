@@ -297,8 +297,6 @@ class DeltaSink:
         is bounded — and the written files are removed afterwards, since it is the merge,
         not this write, that lands the rows in the table.
         """
-        import pyarrow.parquet as pq
-
         from batcher.io.filesystem import resolve_filesystem
 
         deltalake = require_deltalake()
@@ -306,7 +304,11 @@ class DeltaSink:
         if not paths:
             return
         fs = resolve_filesystem(path)
-        data = pa.concat_tables([pq.read_table(fs.open(p)) for p in paths])
+        # Each handle is closed as its file is read. `pq.read_table(fs.open(p))` inside a
+        # comprehension never closes any of them: the change set is one file per shard, so
+        # a wide write leaked a descriptor per shard on the driver — the single process
+        # least able to absorb it, and the one whose fd limit fails the whole commit.
+        data = pa.concat_tables([_read_change_file(fs, p) for p in paths])
         try:
             table = deltalake.DeltaTable(path, storage_options=self._storage_options)
             (
@@ -325,3 +327,11 @@ class DeltaSink:
         for p in paths:  # the merge landed the rows; these files were only the change set
             with contextlib.suppress(OSError, ValueError, NotImplementedError):
                 fs.remove(p)
+
+
+def _read_change_file(fs: Any, path: str) -> pa.Table:
+    """One merge change-set file, read with its handle closed afterwards."""
+    import pyarrow.parquet as pq
+
+    with fs.open(path) as fh:
+        return pq.read_table(fh)

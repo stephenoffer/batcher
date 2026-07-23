@@ -94,6 +94,16 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # splitting across modules forces a fragile base<->subclass import cycle — the
     # one-Expr invariant (rust-engine.md) wins over the line limit here.
     "python/batcher/plan/expr_ir/core.py": "one-Expr hierarchy; split forces a base/subclass import cycle",
+    # The one exception hierarchy (BatcherError + every subclass). It is a single
+    # cohesive contract — the subclasses are mutually referential (`.of` factories,
+    # shared `__str__`) and each is publicly exported, so the docstring gate requires a
+    # per-class `Examples:` doctest. Those mandatory examples, not logic, are what carry
+    # it past the line limit; the suggestion helpers already live in a sibling module
+    # (`suggest.py`). Splitting the exceptions across files to satisfy the counter would
+    # only scatter one contract and break `from batcher._internal.errors import <Name>`.
+    "python/batcher/_internal/errors/hierarchy.py": (
+        "one exception hierarchy; mandatory per-class doctests inflate it"
+    ),
     # The one `Expr` enum and its `serde` wire tags. `.claude/rules/rust-engine.md` and
     # crates/CLAUDE.md name this as the seam that is never cut across: the enum and its
     # tags stay in the crate's lib.rs, so the wire contract lives in exactly one place.
@@ -150,10 +160,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     "python/batcher/plan/expr_ir/namespaces/strings.py": "one bound .str accessor; per-method runnable examples push it over",
     "python/batcher/plan/expr_ir/namespaces/collections.py": "one bound .list accessor; per-method runnable examples push it over",
     "python/batcher/plan/expr_ir/namespaces/temporal.py": "one bound .dt accessor; per-method runnable examples push it over",
-    # The session/constructor surface (from_*, read, sql, range, …) is one façade;
-    # every public constructor now carries a runnable `.. doctest::` example, which is
-    # what pushes it over — the bodies stay thin.
-    "python/batcher/api/session.py": "session/constructor façade; per-constructor runnable examples push it over",
     # The IO reader/writer namespaces: one method per format/connector, each now
     # carrying a usage example (runnable for local file formats, illustrative for
     # service-backed sinks/sources). The examples, not the thin dispatch bodies, push
@@ -190,6 +196,13 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # stages, map→aggregate) and the data/compute-skew-adaptive task sizing they share.
     # `executors/` is at the 12-file dir cap, so the variants can't move to a sibling.
     "python/batcher/dist/executors/map.py": "distributed map/inference hub; scheduling variants + adaptive sizing, executors/ at 12-file cap",
+    # The worker-side scan driver: split reading, the read-through cache sized to a share
+    # of node RAM, and the `on_read_error="skip"` broken-record accounting all share the
+    # same per-worker module state (the scan cache and the skip counter), so they cannot
+    # move to a sibling without threading that state through. `executors/` is at the
+    # 12-file dir cap. Sat at 495 until the per-query `drain_skipped_splits` (the fix that
+    # makes silent PB-scale data loss observable) tipped it three lines over.
+    "python/batcher/dist/executors/scan_read.py": "worker scan driver + read-through cache + skip accounting share per-worker state; executors/ at 12-file cap",
     # The one shared Flight-shuffle worker actor: every flight_* operator (aggregate /
     # join / sort / window) drives this SAME `_FlightWorker` so they share its session
     # and lineage-recovery contract. The module docstring's whole rationale is keeping

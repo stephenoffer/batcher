@@ -31,6 +31,23 @@ __all__ = ["FileSystem", "_ArrowFileSystem", "_is_data_file", "_scheme"]
 # tiny reads into few large GETs instead of the 8 KiB `BufferedReader` default.
 _REMOTE_READ_BUFFER = 1 << 20
 
+# The characters that make a path a glob rather than a literal.
+_WILDCARDS = "*?["
+
+
+def _has_wildcard(segment: str) -> bool:
+    """Whether one path component contains a glob metacharacter."""
+    return any(ch in segment for ch in _WILDCARDS)
+
+
+def _data_files(infos: Any, matches: Any) -> list:
+    """The data files among `infos` whose path satisfies the `matches` predicate."""
+    return [
+        fi
+        for fi in infos
+        if fi.type == pafs.FileType.File and _is_data_file(fi.path) and matches(fi.path)
+    ]
+
 
 def _scheme(path: str) -> str:
     """The URI scheme of `path` (``""`` for a bare local path)."""
@@ -221,7 +238,7 @@ class _ArrowFileSystem:
         return self._listing_info.get(path)
 
     def expand(self, path: str, *, suffix: str | tuple[str, ...]) -> list[str]:
-        if any(ch in path for ch in "*?["):
+        if _has_wildcard(path):
             return self._glob(path)
         # `str.endswith` takes a tuple directly, so a multi-extension source lists the
         # directory once and keeps any matching file — not once per extension.
@@ -237,27 +254,22 @@ class _ArrowFileSystem:
             in_path = in_path.rstrip("/")
         info = self._fs.get_file_info(in_path)
         if info.type == pafs.FileType.Directory:
-            sel = pafs.FileSelector(in_path, recursive=False)
-            matched = [
-                fi
-                for fi in self._fs.get_file_info(sel)
-                if fi.type == pafs.FileType.File
-                and fi.path.endswith(suffixes)
-                and _is_data_file(fi.path)
-            ]
+
+            def _list(recursive: bool) -> list:
+                sel = pafs.FileSelector(in_path, recursive=recursive)
+                return _data_files(self._fs.get_file_info(sel), lambda p: p.endswith(suffixes))
+
+            # Flat listing first: it is the common layout and stays one cheap LIST. Only when
+            # it finds nothing — where this used to raise outright — descend. A Hive tree
+            # (`out/p=a/part-0.parquet`) or a nested media corpus (`videos/2024/01/…`) keeps
+            # every data file one or more levels down, so a non-recursive read of a directory
+            # Batcher itself wrote with `partition_by=` failed with "no .parquet files found".
+            matched = _list(recursive=False) or _list(recursive=True)
             if not matched:
                 raise IOError(f"no {'/'.join(suffixes)} files found in directory {path!r}")
             matched.sort(key=lambda fi: fi.path)
-            # The listing already carries each file's size and mtime; remember them so a
-            # caller that needs to know whether a file changed (`stats_version`, which
-            # keeps a metadata memo from outliving the file it describes) reads them from
-            # here instead of issuing a stat — one HEAD per file on an object store, for
-            # information this call already fetched.
-            for fi in matched:
-                self._listing_info[self._uri(fi.path)] = (
-                    int(fi.size or 0),
-                    int(fi.mtime_ns or 0),
-                )
+            # Remember each file's size/mtime so `stats_version` need not stat them all.
+            self._record_listing(matched)
             return [self._uri(fi.path) for fi in matched]
         if info.type == pafs.FileType.NotFound:
             raise IOError(f"path {path!r} does not exist")
@@ -272,61 +284,110 @@ class _ArrowFileSystem:
         fast = self._glob_prefix_scoped(pattern, in_pat)
         if fast is not None:
             return fast
-        # The directory portion before the first wildcard is the listing root.
+        # `**` keeps the flat list-the-subtree-then-match-the-path strategy, because that is
+        # what `**` means; everything else walks the pattern per component (`_walk_glob`).
+        infos = self._recursive_glob(in_pat) if "**" in in_pat else self._walk_glob(in_pat)
+        if not infos:
+            raise IOError(f"glob {pattern!r} matched no files")
+        infos.sort(key=lambda fi: fi.path)
+        # Record what the listing already told us, as the directory branch does. Withholding
+        # it made `file_identity` stat every matched file — three times per query, each its
+        # own pool task; on a 2,000-file read that storm outweighed the Parquet read itself
+        # (820ms -> 513ms; vs DuckDB 6.6x -> 3.8x, vs Polars 3.2x -> 1.8x). It was withheld
+        # because entries outlive the listing on a cached filesystem, so a file overwritten
+        # after the glob kept reporting its old `(size, mtime)`. `atomic_writer`/`remove`
+        # now drop a path's entry as they write it, closing the case that produces it: this
+        # process overwriting its own deterministically-named output. An overwrite by
+        # another process needs a stat, and the directory branch has that same exposure.
+        self._record_listing(infos)
+        return [self._uri(fi.path) for fi in infos]
+
+    def _recursive_glob(self, in_pat: str) -> list:
+        """Every file under the pattern's literal root whose *full path* matches `in_pat`.
+
+        `**` crosses directory boundaries, so the subtree is listed and the whole path
+        matched — `fnmatch`'s `*` crosses `/` too, which is exactly right here."""
         base = in_pat
         for i, ch in enumerate(in_pat):
-            if ch in "*?[":
+            if ch in _WILDCARDS:
                 base = self._parent_dir(in_pat[:i])
                 break
-        recursive = "**" in in_pat
-        sel = pafs.FileSelector(base or ".", recursive=recursive, allow_not_found=True)
-        matches = sorted(
-            fi.path
-            for fi in self._fs.get_file_info(sel)
-            if fi.type == pafs.FileType.File
-            and _is_data_file(fi.path)
-            and fnmatch.fnmatch(fi.path, in_pat)
+        sel = pafs.FileSelector(base or ".", recursive=True, allow_not_found=True)
+        return _data_files(self._fs.get_file_info(sel), lambda p: fnmatch.fnmatch(p, in_pat))
+
+    def _walk_glob(self, in_pat: str) -> list:
+        """Match `in_pat` component by component, listing only the directories that match.
+
+        Fixes two faults in the previous single-listing-plus-`fnmatch` approach. **A wildcard
+        in a directory component matched nothing**: the old code listed the parent of the
+        *first* wildcard non-recursively, so ``data/*/part.parquet`` saw only ``data``'s
+        direct children — the partition *directories*, never the files — and raised "matched
+        no files" on the most common layout there is. And **it over-listed**: per-component
+        walking turns ``data/date=*/hour=*/*.parquet`` into one LIST of ``data`` plus one per
+        *matching* partition, not a flat listing of everything beneath it filtered in Python.
+
+        Each component matches a path *segment*, so `*` does not cross `/`.
+        """
+        segments = in_pat.split("/")
+        # Leading literal components are the listing root: never listed, just joined.
+        first_wild = next(
+            (i for i, s in enumerate(segments) if _has_wildcard(s)), len(segments) - 1
         )
-        if not matches:
-            raise IOError(f"glob {pattern!r} matched no files")
-        # DELIBERATELY does not populate `self._listing_info`, unlike the directory branch
-        # above — do not "fix" this by copying that loop down here. It was tried and
-        # reverted, and the reasons are the useful part:
-        #
-        # The win is real and large. This listing already carries every file's size and
-        # mtime, and dropping them makes `file_identity` stat each file instead — three
-        # times per query, each dispatched as its own thread-pool task. Profiling a
-        # 2,000-small-file read showed that stat storm as the single largest cost in the
-        # query, larger than the Parquet read itself; recording them here took it from
-        # 820ms to 513ms (DuckDB 3.8x -> and Polars 1.8x, from 6.6x/3.2x).
-        #
-        # It is also wrong as written. These entries outlive the listing on a long-lived
-        # filesystem object, so a file overwritten *after* the glob still reports its old
-        # (size, mtime) and `file_identity` calls it unchanged — reintroducing the exact
-        # stale-metadata hit that module exists to prevent. Caught by
-        # `test_iceberg_count_is_not_answered_from_a_stale_summary`, which fails with the
-        # loop and passes without it. The directory branch is safe from this only because
-        # of how its callers re-list; a glob's path list is cached, so the re-listing that
-        # would refresh these entries never happens.
-        #
-        # A correct version scopes the cache to the listing's lifetime — a generation stamp
-        # that `file_identity` checks — rather than moving the loop. See
-        # `docs/internals/ray_pitfall_parity.md` G5.
-        return [self._uri(m) for m in matches]
+        roots = ["/".join(segments[:first_wild])]
+        for segment in segments[first_wild:-1]:
+            if not _has_wildcard(segment):
+                roots = [f"{root}/{segment}" if root else segment for root in roots]
+                continue
+            roots = [d for root in roots for d in self._match_dirs(root, segment)]
+            if not roots:
+                return []
+        leaf = segments[-1]
+
+        def matches(path: str) -> bool:
+            return fnmatch.fnmatch(posixpath.basename(path), leaf)
+
+        return [fi for root in roots for fi in _data_files(self._list_dir(root), matches)]
+
+    def _list_dir(self, in_path: str) -> list:
+        """One non-recursive listing of `in_path`, empty rather than raising if absent."""
+        sel = pafs.FileSelector(in_path or ".", recursive=False, allow_not_found=True)
+        return list(self._fs.get_file_info(sel))
+
+    def _match_dirs(self, root: str, seg: str) -> list[str]:
+        """`root`'s immediate subdirectories whose name matches the glob component `seg`."""
+        dirs = (fi for fi in self._list_dir(root) if fi.type == pafs.FileType.Directory)
+        return [fi.path for fi in dirs if fnmatch.fnmatch(posixpath.basename(fi.path), seg)]
+
+    def _record_listing(self, infos: list) -> None:
+        """Remember each listed file's `(size, mtime_ns)` so a caller need not stat it — the
+        listing already fetched both, and re-asking is one HEAD per file (`listing_info`)."""
+        for fi in infos:
+            self._listing_info[self._uri(fi.path)] = (int(fi.size or 0), int(fi.mtime_ns or 0))
+
+    def _forget_listing(self, path: str) -> None:
+        """Drop `path`'s listing entry, because this filesystem is about to write it.
+
+        Otherwise a source that listed a directory then overwrote a file in it keeps
+        answering `listing_info` with the pre-overwrite `(size, mtime)`, and every cache
+        keyed on that identity (`io.stats.file_identity`) serves the *previous* file's
+        footer, row count, and zone maps for the new bytes.
+        """
+        self._listing_info.pop(path, None)
 
     def _glob_prefix_scoped(self, pattern: str, in_pat: str) -> list[str] | None:
         """A prefix-scoped remote glob via fsspec, or ``None`` to fall back to pyarrow.
 
-        Returns matched URIs only when fsspec is installed for the scheme *and* found files,
-        so an empty/errored probe never masks the pyarrow listing (which owns the empty-is-
-        error and credential-failure semantics). Local/backendless schemes return ``None``.
+        Returns URIs only when fsspec is installed for the scheme *and* found files, so an
+        empty/errored probe never masks the pyarrow listing (which owns the empty-is-error
+        and credential-failure semantics). Local/backendless schemes return ``None``.
         """
         scheme = _scheme(pattern)
         if scheme in ("", "file"):
             return None  # local globbing is already a cheap single-directory listing.
         # Only worth it when the *filename* has a literal prefix before its wildcard
-        # (``dir/PREFIX*.ext``) — that prefix scopes the LIST; a bare ``dir/*.ext`` lists
-        # the whole directory either way, so skip fsspec and let pyarrow do it.
+        # (``dir/PREFIX*.ext``): that prefix narrows the LIST below the directory, which is
+        # the one thing `_walk_glob`'s per-component listing cannot do. For a bare
+        # ``dir/*.ext`` the two issue the same single LIST, so skip fsspec.
         last = in_pat.rsplit("/", 1)[-1]
         first_wild = min((last.find(c) for c in "*?[" if c in last), default=len(last))
         if first_wild <= 0:
@@ -387,6 +448,9 @@ class _ArrowFileSystem:
 
     @contextlib.contextmanager
     def atomic_writer(self, path: str) -> Iterator[IO[Any]]:
+        # This filesystem is about to change `path`, so anything a previous listing recorded
+        # about it is now stale — see `_forget_listing`.
+        self._forget_listing(path)
         dest = self._p(path)
         # Ensure the parent directory exists (pyarrow's output stream does not create
         # it). Cheap and idempotent; a no-op marker on object stores.
@@ -429,6 +493,7 @@ class _ArrowFileSystem:
         return [self._uri(d) for d in dirs]
 
     def remove(self, path: str) -> None:
+        self._forget_listing(path)
         in_path = self._p(path)
         if self._fs.get_file_info(in_path).type != pafs.FileType.NotFound:
             with contextlib.suppress(FileNotFoundError):

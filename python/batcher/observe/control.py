@@ -111,21 +111,55 @@ def start_ui(*, port: int = 4040, host: str = "127.0.0.1", open_browser: bool = 
 
     Returns:
         The URL the dashboard is reachable at, e.g. ``http://127.0.0.1:4040``.
+
+    Raises:
+        OSError: If neither `port` nor any of the following ports could be bound.
     """
     global _server
     with _lock:
         if _server is not None:
             return _server.url
-        server = UIServer(ActivityStore(), host=host, port=port)
-        url = server.start()
+        server, url, fallback = _bind(host, port)
         _server = server
     # Logging is what tells a user in a terminal where the dashboard actually went — which
-    # matters most in the `port=0` case, where they did not choose the number.
+    # matters most in the `port=0` case, where they did not choose the number, and in the
+    # fallback case, where the number they chose is not the one they got.
     ensure_configured()
-    get_logger("observe").warning("Batcher UI listening on %s", url)
+    log = get_logger("observe")
+    if fallback:
+        log.warning("Batcher UI: port %d was busy, listening on %s instead", port, url)
+    else:
+        log.warning("Batcher UI listening on %s", url)
     if open_browser:
         webbrowser.open(url)
     return url
+
+
+#: How many consecutive ports to try after the requested one before giving up. A dashboard
+#: is a convenience, so a busy port should move it rather than fail the call — but silently
+#: scanning a wide range would be its own surprise, so the walk is short and logged.
+_PORT_FALLBACK_TRIES = 20
+
+
+def _bind(host: str, port: int) -> tuple[UIServer, str, bool]:
+    """Bind the dashboard, walking forward from `port` if it is already taken.
+
+    Returns the started server, its URL, and whether a fallback port was used. `port=0`
+    already means "any free port" to the OS, so it is never walked.
+    """
+    last: OSError | None = None
+    tries = 1 if port == 0 else _PORT_FALLBACK_TRIES
+    for offset in range(tries):
+        server = UIServer(ActivityStore(), host=host, port=port + offset)
+        try:
+            return server, server.start(), offset > 0
+        except OSError as exc:
+            last = exc
+    msg = (
+        f"could not start the Batcher UI: ports {port}-{port + tries - 1} on {host} are all "
+        f"in use. Pass a different port, or port=0 to let the OS choose one."
+    )
+    raise OSError(msg) from last
 
 
 def stop_ui() -> None:

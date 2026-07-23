@@ -33,6 +33,31 @@ def _split_key_ext(member_name: str) -> tuple[str, str]:
     return (f"{directory}/{key}" if directory else key), ext
 
 
+def _shard_extensions(fh: IO[bytes]) -> list[str]:
+    """The distinct member extensions of a tar shard, in first-seen order.
+
+    Reads only the tar's member *headers* — never a member's payload — so it is what
+    `schema()` uses: the column set (``__key__`` plus one column per extension) is fully
+    determined by the member names, and pulling every sample's bytes just to learn it
+    is exactly the "materialize the file to read its schema" bug. For a shard of images
+    that is the whole shard resident to answer a metadata question.
+    """
+    extensions: list[str] = []
+    with tarfile.open(fileobj=fh, mode="r|*") as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            _key, ext = _split_key_ext(member.name)
+            if ext not in extensions:
+                extensions.append(ext)
+    return extensions
+
+
+def _shard_schema(extensions: list[str]) -> pa.Schema:
+    """The Arrow schema of a WebDataset shard: ``__key__`` (string) + one binary per ext."""
+    return pa.schema([("__key__", pa.string()), *((ext, pa.binary()) for ext in extensions)])
+
+
 def _read_shard(fh: IO[bytes]) -> tuple[list[str], dict[str, list[bytes | None]]]:
     """Group a tar shard's members into ``__key__`` rows and ``<ext>`` columns."""
     samples: dict[str, dict[str, bytes]] = {}
@@ -71,11 +96,15 @@ class WebDatasetSource(FileSource):
     __slots__ = ()
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
-        return self._read_file(fh, None)[0].schema
+        # Determined by member names alone — do not extract any payload (see `_shard_extensions`).
+        return _shard_schema(_shard_extensions(fh))
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         keys, columns = _read_shard(fh)
         data: dict[str, Any] = {"__key__": keys}
         data.update(columns)
-        batch = pa.RecordBatch.from_pydict(data)
+        # Build against the explicit schema rather than inferring: an empty shard, or an
+        # extension whose values are all absent, would otherwise infer a `null` column that
+        # disagrees with the `binary` schema `schema()` reports from the member names.
+        batch = pa.RecordBatch.from_pydict(data, schema=_shard_schema(list(columns)))
         return [batch.select(projection) if projection is not None else batch]

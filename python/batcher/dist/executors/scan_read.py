@@ -96,7 +96,12 @@ def _scan_cache_siblings() -> int:
                         return cpus
     except Exception:
         pass
-    return max(1, os.cpu_count() or 1)
+    # The cgroup/affinity-aware count, not `os.cpu_count()`'s host total. A worker container
+    # limited to 4 of a host's 64 cores runs ~4 sibling processes, not 64, so dividing the RAM
+    # budget by the host count shrinks each process's cache ~16x below its real share.
+    from batcher._internal.hardware import available_cpu_count
+
+    return max(1, available_cpu_count())
 
 
 def _default_scan_cache_cap() -> int:
@@ -128,12 +133,28 @@ _SKIPPED_LOCK = threading.Lock()
 
 
 def skipped_splits() -> int:
-    """The number of splits this worker skipped under ``on_read_error="skip"``.
+    """Cumulative count of splits this worker skipped under ``on_read_error="skip"``.
 
     Non-zero means the scan dropped unreadable data (a corrupt file / row-group) rather
-    than failing — the count makes that data loss observable instead of silent.
+    than failing. It is a worker-process total, so on a persistent fleet worker it answers
+    "how much has this process ever skipped", not "how much did my query skip" — use
+    `drain_skipped_splits` for the per-query figure.
     """
     return _SKIPPED_SPLITS
+
+
+def drain_skipped_splits() -> int:
+    """Return this worker's skip count and reset it to zero — the per-query reading.
+
+    A fleet worker outlives the query that ran on it, so a cumulative counter cannot answer
+    "did MY job lose data", the only question that matters when a petabyte-scale scan
+    quietly drops a corrupt shard. Draining per task lets the driver sum one number per
+    partition and report the job's true loss.
+    """
+    global _SKIPPED_SPLITS
+    with _SKIPPED_LOCK:
+        total, _SKIPPED_SPLITS = _SKIPPED_SPLITS, 0
+    return total
 
 
 def _record_skipped(split, exc: Exception) -> None:

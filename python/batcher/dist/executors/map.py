@@ -26,7 +26,8 @@ from collections import deque
 
 import pyarrow as pa
 
-from batcher._internal.hardware import available_cpu_count
+from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
+from batcher._internal.logging import get_logger
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
@@ -34,7 +35,14 @@ from batcher.dist.executors.partition_io import (
     source_pushdown,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import _ensure_ray, engine_config_json
+from batcher.dist.executors.ray_runtime import (
+    _ensure_ray,
+    create_worker_placement,
+    current_envelope,
+    engine_config_json,
+    placement_actor_options,
+    release_placement,
+)
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import LogicalPlan, MapBatches
@@ -48,8 +56,15 @@ _MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125"))
 # plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
 _MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
 # Hard ceiling on the per-actor submit-ahead depth (partitions an inference actor keeps in
-# flight). Matches `ml.gpu._INFLIGHT_DEPTH_MAX`; kept local to avoid an ml import in `dist`.
-_MAP_INFLIGHT_MAX = 16
+# flight). Single source in the neutral `_internal.hardware`, shared with the ML autobatcher
+# — `dist` cannot import `ml`, so the constant lives below both rather than being pasted twice.
+_MAP_INFLIGHT_MAX = INFERENCE_INFLIGHT_DEPTH_MAX
+# Bound on the pool-wide liveness probe. Unchanged in value from the old per-actor
+# `ray.get(timeout=10)`, but now paid ONCE for the whole pool rather than per actor (see
+# `_healthy_actors`), so a 200-actor pool costs 10s of worst-case probing, not 2000s.
+_POOL_PROBE_TIMEOUT_S = 10.0
+
+_log = get_logger("dist")
 
 __all__ = ["release_inference_pools", "resident_inference_pools", "stream_distributed_map"]
 
@@ -182,14 +197,30 @@ def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict
 
 def _healthy_actors(pool: list) -> list:
     """Drop actors that are no longer alive (a cheap liveness ping), keeping the survivors —
-    so a warm pool reused after a preemption doesn't dispatch to a dead actor."""
+    so a warm pool reused after a preemption doesn't dispatch to a dead actor.
+
+    The probes are issued together and awaited in **one** bounded `ray.wait`, not one
+    blocking `ray.get(timeout=...)` per actor. Serially, a pool that lost a node paid the
+    full timeout for every dead actor before any work started — 200 actors x 10s = up to
+    2000s of dead time on exactly the recovery path that most needs to be fast. Concurrently
+    it is one timeout for the whole pool regardless of size. An actor whose probe is still
+    unresolved when the wait expires is treated as dead, which is the same verdict the serial
+    version reached, just reached once.
+    """
     import ray
 
-    alive = []
+    if not pool:
+        return []
     probes = {a: a.gpu_stats.remote() for a in pool}
+    refs = list(probes.values())
+    ready, _ = ray.wait(refs, num_returns=len(refs), timeout=_POOL_PROBE_TIMEOUT_S)
+    resolved = set(map(id, ready))
+    alive = []
     for actor, ref in probes.items():
         try:
-            ray.get(ref, timeout=10)
+            if id(ref) not in resolved:
+                raise TimeoutError("liveness probe did not resolve")
+            ray.get(ref)  # already resolved — surfaces a dead-actor error without blocking
             alive.append(actor)
         except Exception:  # dead / unreachable — drop it (a replacement is spawned to size)
             with contextlib.suppress(Exception):
@@ -241,7 +272,7 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
             if actor is None:
                 break
             idx = pending.popleft()
-            inflight[actor.run.remote(parts[idx])] = (actor, idx)
+            inflight[actor.run.remote(parts[idx], idx)] = (actor, idx)
             slots[actor] -= 1
 
     _assign()
@@ -265,6 +296,39 @@ def _run_resident_pool(plan0, partitions, opts, size, registry):
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
     vram = [v for v in (_drain_gpu_vram(a) for a in actors) if v is not None]
     return results, (max(samples) if samples else None), (max(vram) if vram else None)
+
+
+def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
+    """Run `partitions` through the query-resident pool for `plan0`, healing a lost pool.
+
+    The `resident_inference_pools()` scope reuses one model-loaded pool across a query's
+    stages and repeated terminals. That pool had no preemption recovery: a GPU node lost
+    mid-run (after the pool was cached, so past any liveness check) raised `RayError` and
+    failed the whole query — exactly the multi-hour inference job the scope exists to keep
+    fed. On a loss, evict the dead pool from the scope and re-run on a fresh recovering
+    per-call pool; the scope rebuilds its resident pool on the next call. Symmetric to
+    `_run_warm_pool` for the session-warm registry. Returns
+    ``(ordered_results, peak_gpu_util, peak_vram)``."""
+    from ray.exceptions import RayError
+
+    from batcher.dist.executors.ray_runtime import recovery_policy
+
+    try:
+        return _run_resident_pool(plan0, partitions, opts, hi, scope)
+    except RayError:
+        _evict_scoped_pool(plan0, scope)
+        return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
+
+
+def _evict_scoped_pool(plan0, scope) -> None:
+    """Drop (and kill) the resident pool for `plan0` from a `resident_inference_pools` scope."""
+    import ray
+
+    sig = _pipeline_signature(plan0)
+    for actor in scope.pop(sig, []):
+        with contextlib.suppress(Exception):
+            ray.kill(actor)
+    _unpin_pool_keys([sig])
 
 
 def _run_warm_pool(plan0, partitions, opts, lo, hi):
@@ -359,8 +423,14 @@ def _distributed_map(
     hub=None,
     *,
     preserve_order: bool = False,
-) -> pa.Table:
+    write_spec: dict | None = None,
+):
     """Run a linear map/inference pipeline across Ray workers, one partition each.
+
+    With `write_spec` each worker writes its own output shard to the sink and returns only
+    `WrittenFile` locators, so the function returns a merged `WriteManifest` instead of a
+    `pa.Table` and the post-inference result never lands on the driver. Without it the
+    per-partition batches are gathered and concatenated as before.
 
     When a `hub` is supplied and the pipeline used a GPU actor pool, the measured
     GPU utilization is recorded so the next run's `num_gpus` request can adapt.
@@ -407,7 +477,7 @@ def _distributed_map(
             from batcher.ml.gpu import gpu_aware_pool_default
 
             default_pool = gpu_aware_pool_default(
-                num_gpus, workers, len(partitions), accelerator_type
+                num_gpus, workers, len(partitions), accelerator_type, resources=resources
             )
             lo = hi = _resolve_pool_size(concurrency, len(partitions), default_pool)
             # A recurring inference pipeline that has consistently served fewer partitions than
@@ -430,8 +500,15 @@ def _distributed_map(
 
         scope = _INFERENCE_POOLS.get()
         warm = active_config().distributed.warm_inference_pools
-        if scope is not None:
-            results, gpu_util, gpu_vram = _run_resident_pool(plan0, partitions, opts, hi, scope)
+        if write_spec is not None:
+            # A writing stage builds its actors with the sink bound in, so it cannot borrow a
+            # pool from the session-warm / resident registries (those actors were built to
+            # RETURN batches). Use the per-call pool, which also carries preemption recovery.
+            results, gpu_util, gpu_vram = _drive_actor_pool(
+                plan0, partitions, opts, lo, hi, recovery_policy(), write_spec
+            )
+        elif scope is not None:
+            results, gpu_util, gpu_vram = _run_scoped_pool(plan0, partitions, opts, lo, hi, scope)
         elif warm:
             results, gpu_util, gpu_vram = _run_warm_pool(plan0, partitions, opts, lo, hi)
         else:
@@ -464,10 +541,17 @@ def _distributed_map(
             # thrashing 16 cores, and the session config (morsel size, memory budget)
             # silently ignored on every distributed scan.
             return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
-                plan0, partitions[idx], workers, engine_config_json(shares[idx])
+                plan0, partitions[idx], workers, engine_config_json(shares[idx]), write_spec, idx
             )
 
         results = gather_map_results(_launch, len(partitions))
+
+    if write_spec is not None:
+        # Only locators came back. Merging them is a commutative concat, so partition order
+        # does not matter and a recomputed shard replaces its own deterministic file.
+        from batcher.io.manifest import WriteManifest
+
+        return WriteManifest(tuple(f for shard in results if shard for f in shard))
 
     batches: list[pa.RecordBatch] = []
     for r in results:
@@ -883,7 +967,7 @@ def _autoscale_action(
     return "hold"
 
 
-def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
+def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write_spec=None):
     """Stream partitions through an actor pool that scales in ``[min_size, max_size]``
     and **replaces an actor lost to preemption**, reassigning its partition.
 
@@ -910,14 +994,60 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
     import ray
     from ray.exceptions import RayError, RayTaskError
 
-    def _spawn():
-        cls = _MapActor.options(**opts) if opts else _MapActor
-        return cls.remote(plan0)
-
     parts = list(partitions)
     depth = max(1, min(_actor_inflight_depth(), len(parts) or 1))
     hi = max(1, min(max_size, len(parts)))
     lo = max(1, min(min_size, hi))
+
+    # Gang-schedule the pool. Sized to `hi` (the autoscaling ceiling) so growing the pool
+    # never has to find capacity that was not reserved up front; a bundle sits idle until
+    # the pool scales into it. Without this an inference pool acquired its GPUs one actor
+    # at a time and could HALF-PLACE AND STALL — some actors running, the rest pending
+    # forever on a cluster that will never free the remainder. It is also the only way a
+    # `gpu_collective` stage reaches STRICT_PACK: the strategy is resolved inside
+    # `create_worker_placement`, so a path that never called it could not express NCCL
+    # co-location at all.
+    env = current_envelope()
+    # Reserving the group is an optimization, never a correctness requirement: the pool
+    # runs correctly under default scheduling. So a reservation that times out (returns
+    # None) or outright fails (raises — no placement API, a Ray version without it) must
+    # degrade to default scheduling rather than take the whole stage down with it.
+    try:
+        pg = create_worker_placement(hi, env)
+        reason = "the cluster could not satisfy the reservation in time"
+    except Exception as exc:  # placement is best-effort; never fail the stage on it
+        pg = None
+        reason = f"placement was unavailable ({type(exc).__name__}: {exc})"
+    if pg is None and hi > 1:
+        # Not fatal, but a real capacity signal, and it silently forfeits gang scheduling.
+        # Degrading without a word is how a stalled or badly-placed GPU pool becomes
+        # unexplainable after the fact.
+        _log.warning(
+            "placement group for %d inference actors was not granted (%s); falling back "
+            "to default scheduling: no gang scheduling, actors may place unevenly",
+            hi,
+            reason,
+        )
+    free_bundles = deque(range(hi)) if pg is not None else deque()
+    bundle_of: dict = {}
+
+    def _spawn():
+        actor_opts = opts
+        bundle = free_bundles.popleft() if free_bundles else None
+        if pg is not None and bundle is not None:
+            actor_opts = placement_actor_options(pg, bundle, opts)
+        cls = _MapActor.options(**actor_opts) if actor_opts else _MapActor
+        actor = cls.remote(plan0, write_spec)
+        if bundle is not None:
+            bundle_of[actor] = bundle
+        return actor
+
+    def _release_bundle(actor) -> None:
+        """Return a dead/reaped actor's bundle so its replacement reuses the reservation."""
+        bundle = bundle_of.pop(actor, None)
+        if bundle is not None:
+            free_bundles.append(bundle)
+
     actors = [_spawn() for _ in range(lo)]
     slots = dict.fromkeys(actors, depth)  # free in-flight slots per actor
     pending = deque(range(len(parts)))  # partition indices awaiting assignment
@@ -933,7 +1063,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
             if actor is None:
                 break
             idx = pending.popleft()
-            inflight[actor.run.remote(parts[idx])] = (actor, idx)
+            inflight[actor.run.remote(parts[idx], idx)] = (actor, idx)
             slots[actor] -= 1
 
     try:
@@ -953,6 +1083,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
                 peak_vram = _max_opt(peak_vram, _drain_gpu_vram(victim))
                 actors.remove(victim)
                 slots.pop(victim, None)
+                _release_bundle(victim)
                 ray.kill(victim)
             if not inflight:
                 continue
@@ -962,8 +1093,20 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
             try:
                 results[idx] = ray.get(ref)
                 slots[actor] += 1  # the producing actor has a slot free again
-            except RayTaskError:
-                raise  # a deterministic UDF error — resubmitting cannot help
+            except RayTaskError as exc:
+                # Deterministic UDF errors surface immediately, but a transient one (CUDA OOM
+                # under a concurrency spike, a throttled model endpoint) clears on a retry —
+                # and killing a multi-hour inference job on one discards every completed
+                # partition. Charged to the same per-partition attempt budget as a preemption.
+                from batcher.dist.executors.ray_runtime.policies import _is_transient_udf_error
+
+                if not _is_transient_udf_error(exc):
+                    raise
+                attempts[idx] += 1
+                if attempts[idx] > policy.max_attempts:
+                    raise
+                slots[actor] += 1
+                pending.appendleft(idx)
             except RayError:
                 # The actor was lost (preemption). Drop it and reclaim EVERY partition it
                 # had in flight — with depth>1 one death orphans up to `depth` of them —
@@ -975,6 +1118,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
                 if actor in actors:
                     actors.remove(actor)
                 slots.pop(actor, None)
+                _release_bundle(actor)
                 for i in orphaned:
                     attempts[i] += 1
                     if attempts[i] > policy.max_attempts:
@@ -991,6 +1135,9 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
     finally:
         for a in actors:
             ray.kill(a)
+        # The placement group is a cluster-wide reservation; leaking it strands the pool's
+        # GPUs for the life of the job.
+        release_placement(pg)
 
 
 def _drain_gpu_stat(actor) -> float | None:
@@ -1071,15 +1218,16 @@ class _MapActor:
     It also samples GPU utilization while running so the scheduler can adapt the
     `num_gpus` request on the next run (the feedback half of GPU scheduling)."""
 
-    def __init__(self, plan0: LogicalPlan) -> None:
+    def __init__(self, plan0: LogicalPlan, write_spec: dict | None = None) -> None:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
         self._plan = _with_inference_workers(_prebuild_factories(plan0))
+        self._write_spec = write_spec
         self._gpu_util_max: float | None = None
         self._gpu_vram_max: float | None = None
 
-    def run(self, partition: dict):
+    def run(self, partition: dict, idx: int = 0):
         from batcher import core
         from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
 
@@ -1094,7 +1242,13 @@ class _MapActor:
         # Sample GPU load + VRAM right after the forward pass (None on a GPU-less host).
         self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
-            return None
+            return [] if self._write_spec is not None else None
+        # Writing stage: this actor writes its own inference output straight to the sink and
+        # returns only `WrittenFile` locators. That is what keeps a batch-inference job whose
+        # RESULT is larger than the driver (a 2B-row embedding write) from OOMing the driver
+        # — the post-inference rows never leave the worker that produced them.
+        if self._write_spec is not None:
+            return _write_udf_output(out, self._write_spec, idx)
         return out
 
     def run_split(self, addr: str, ticket):
@@ -1179,19 +1333,46 @@ def _with_map_workers(plan, n: int):
     return plan
 
 
-def _map_udf_task(plan0, partition, workers: int = 1, cfg_json: str | None = None):
+def _write_udf_output(batches: list, write_spec: dict, idx: int) -> list:
+    """Write one worker's UDF output to the sink, returning only `WrittenFile` locators.
+
+    Shared by the actor-pool path (`_MapActor.run`) and the stateless-task path
+    (`_map_udf_task`) so a distributed inference write has exactly one write semantics.
+    The shard name is deterministic (`part-{idx}`), so a partition recomputed after a
+    preemption overwrites its own partial file rather than orphaning it.
+    """
+    from batcher.io.sink import SINKS
+
+    table = pa.Table.from_batches(batches)
+    sink = SINKS.get(write_spec["fmt"])(**(write_spec.get("sink_kwargs") or {}))
+    return sink.write_partitioned(
+        table, write_spec["path"], partition_by=write_spec.get("partition_by"), file_index=idx
+    )
+
+
+def _map_udf_task(
+    plan0,
+    partition,
+    workers: int = 1,
+    cfg_json: str | None = None,
+    write_spec: dict | None = None,
+    idx: int = 0,
+):
     from batcher import core
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.source import InMemorySource
 
     rows = read_partition_descriptor(partition)
     if not rows:
-        return None
+        return [] if write_spec is not None else None
     out = core.execute_with_udfs(
         _with_map_workers(plan0, workers), [InMemorySource(rows)], engine_config=cfg_json
     )
     if not out or sum(b.num_rows for b in out) == 0:
-        return None
+        return [] if write_spec is not None else None
+    # Write in place so the post-UDF rows never travel back through the driver.
+    if write_spec is not None:
+        return _write_udf_output(out, write_spec, idx)
     return out
 
 

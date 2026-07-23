@@ -14,6 +14,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher._internal.sql_errors import parse_sql
 from batcher._sql.parser import (
     clauses,
     expressions,
@@ -38,11 +39,12 @@ def sql(
     functions: dict[str, Any] | None = None,
     **tables: Dataset | pa.Table,
 ) -> Dataset:
-    """Parse `query` in `dialect` and translate it against the named tables/functions."""
-    import sqlglot
+    """Parse `query` in `dialect` and translate it against the named tables/functions.
 
-    ast = sqlglot.parse_one(query, read=dialect)
-    return translate_ast(ast, functions=functions, **tables)
+    A parse failure is re-raised as `PlanError` with a plain-text message; see
+    `batcher._internal.sql_errors.parse_sql`.
+    """
+    return translate_ast(parse_sql(query, dialect=dialect), functions=functions, **tables)
 
 
 def translate_ast(
@@ -285,9 +287,18 @@ class _Translator:
             # of the query as text. Re-parse it, render the *planned* tree (no
             # execution), and hand it back as a one-row relation like DuckDB's EXPLAIN.
             return self._explain(node)
-        raise NotImplementedError(
-            f"only SELECT / UNION / INTERSECT / EXCEPT / VALUES statements are supported, "
-            f"got {type(node).__name__}"
+        # A semicolon-separated script parses as one Block. Saying "got Block" tells a
+        # user nothing about what they typed, so name the actual cause.
+        if type(node).__name__ == "Block":
+            raise PlanError(
+                "bt.sql() runs one statement; this query has several separated by ';'. "
+                "Call it once per statement, keeping each result as a Dataset."
+            )
+        raise PlanError(
+            f"cannot translate a {type(node).__name__} statement into a relation; the "
+            "query translator handles SELECT / UNION / INTERSECT / EXCEPT / VALUES and "
+            "EXPLAIN. (CREATE/DROP and the DML statements are dispatched before this "
+            "point, so reaching here means the statement form is not supported at all.)"
         )
 
     def _explain(self, node) -> Dataset:

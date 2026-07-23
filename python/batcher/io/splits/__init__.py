@@ -17,7 +17,13 @@ dataset fragment index in `parquet`.
 from __future__ import annotations
 
 from batcher.io.splits.base import Split, WholeSourceSplit
-from batcher.io.splits.file import FileSplit, IpcFileSplit, LineRangeSplit, read_aligned_range
+from batcher.io.splits.file import (
+    FileSplit,
+    IpcFileSplit,
+    LineRangeSplit,
+    NormalizedFileSplit,
+    read_aligned_range,
+)
 from batcher.io.splits.parquet import (
     RowGroupSplit,
     fragment_index,
@@ -29,6 +35,7 @@ __all__ = [
     "FileSplit",
     "IpcFileSplit",
     "LineRangeSplit",
+    "NormalizedFileSplit",
     "RowGroupSplit",
     "Split",
     "WholeSourceSplit",

@@ -1,4 +1,10 @@
-"""Top-level expression constructors re-exported for the public API."""
+"""Top-level expression constructors re-exported for the public API.
+
+`concat_str` is the string-building `concat` under the name the ecosystem gives it
+(``pl.concat_str``). The bare `concat` at the top level is the *frame* concatenation
+`bt.concat([ds1, ds2])`, which is what ``pd.concat``/``pl.concat`` mean, and it
+dispatches to this one when handed expressions instead of datasets.
+"""
 
 from __future__ import annotations
 
@@ -95,6 +101,9 @@ from batcher.plan.functions import (
     width_bucket,
     window,
 )
+from batcher.plan.functions import (
+    concat as concat_str,
+)
 from batcher.plan.functions.aggregate import (
     array_agg,
     bit_and,
@@ -177,6 +186,7 @@ __all__ = [
     "coalesce",
     "col",
     "concat",
+    "concat_str",
     "concat_ws",
     "contains",
     "corr",

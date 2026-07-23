@@ -1310,11 +1310,7 @@ mod tests {
         // to itself regardless of payload (what `canonicalize_float_keys` encodes).
         fn pairs(probe: &RecordBatch, build: &RecordBatch) -> usize {
             let f = |b: &RecordBatch| {
-                let a = b
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap();
+                let a = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
                 (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
             };
             let (p, b) = (f(probe), f(build));

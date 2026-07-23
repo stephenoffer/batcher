@@ -33,7 +33,7 @@ def test_torch_device_maps_backend():
     assert torch_device("cpu") == "cpu"
 
 
-@pytest.mark.parametrize("backend", ["hpu", "neuron", "something_new"])
+@pytest.mark.parametrize("backend", ["ipu", "rdna_future", "something_new"])
 def test_unknown_backend_degrades_to_cpu_rather_than_raising(backend):
     """This was a bare dict lookup, so an unrecognized name raised `KeyError`.
 
@@ -42,6 +42,15 @@ def test_unknown_backend_degrades_to_cpu_rather_than_raising(backend):
     is an optimization, so an unknown device must fall back to CPU rather than abort a job
     that would have run correctly."""
     assert torch_device(backend) == "cpu"
+
+
+@pytest.mark.parametrize(
+    ("backend", "device"), [("neuron", "xla"), ("hpu", "hpu"), ("tpu", "xla")]
+)
+def test_non_gpu_accelerator_backends_map_to_their_device(backend, device):
+    """Trainium/Inferentia (neuron) and Gaudi (hpu) are now recognized backends, so they map to
+    their real torch device string instead of degrading to CPU."""
+    assert torch_device(backend) == device
 
 
 def test_vram_overhead_per_vendor():
@@ -63,8 +72,9 @@ def test_max_actors_uses_explicit_overhead():
 
 
 def test_recommend_gpu_fraction_floor():
-    # A tiny model packs many actors but the fraction is floored at 0.25 (<= 4/GPU).
-    assert recommend_gpu_fraction(0.1, 80.0) == 0.25
+    # A tiny model packs many actors: the fraction floor is 0.05 (up to 20/GPU), lowered
+    # from 0.25 so a small embedding model stops stranding most of a GPU's VRAM.
+    assert recommend_gpu_fraction(0.1, 80.0) == 0.05
     # A model that fills the GPU gets a whole device.
     assert recommend_gpu_fraction(40.0, 48.0) == 1.0
 

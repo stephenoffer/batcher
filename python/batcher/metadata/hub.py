@@ -28,8 +28,9 @@ import json
 import threading
 from typing import Any
 
+from batcher._internal.errors import ConfigError
 from batcher._internal.logging import get_logger
-from batcher.metadata.store import MetadataBackend
+from batcher.metadata.store import MetadataBackend, check_backend
 from batcher.plan.feedback import OperatorFeedback
 
 __all__ = ["MetadataHub"]
@@ -80,11 +81,61 @@ def _row_of(feedback: OperatorFeedback) -> dict[str, Any]:
     return {name: getattr(feedback, name) for name in _FEEDBACK_FIELDS}
 
 
+def _check_namespace(namespace: str) -> None:
+    """Reject a namespace that cannot address a stored entry.
+
+    The store's keys are tuples the backends JSON-encode, so a non-string namespace
+    writes under one spelling and reads back under another — a silent "the learning
+    loop never persists anything", not an error.
+    """
+    if not isinstance(namespace, str) or not namespace:
+        raise ConfigError(
+            f"A learned-parameter namespace must be a non-empty string, but got "
+            f"{type(namespace).__name__} {namespace!r}.",
+            hint="Namespaces are dotted names, e.g. 'kyber.cardinality'.",
+        )
+
+
+def _encoded(where: str, value: Any) -> bytes:
+    """`value` as JSON bytes, or a typed error naming the entry that could not encode.
+
+    `json.dumps` reports only the offending *type*, which in a map of learned stats is
+    never enough to find the entry. Naming the namespace (and, for a dict, the key)
+    turns a dead end into a one-line fix.
+    """
+    try:
+        return json.dumps(value).encode()
+    except TypeError as exc:
+        culprit = ""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                try:
+                    json.dumps(item)
+                except TypeError:
+                    culprit = f" (entry {key!r} has type {type(item).__name__})"
+                    break
+        raise ConfigError(
+            f"Learned parameters for {where!r} are not JSON-serializable{culprit}: {exc}.",
+            hint="Learned stats are stored as JSON, so use only str/int/float/bool/list/dict.",
+        ) from exc
+
+
 class MetadataHub:
     """Reads learned state and absorbs execution feedback."""
 
     def __init__(self, backend: MetadataBackend) -> None:
-        self._backend = backend
+        """Wrap a persistence backend.
+
+        Args:
+            backend: Where learned state is stored. Validated here, not on first use:
+                the hub is a process singleton read from several call sites, so a
+                malformed backend would otherwise surface as an `AttributeError` inside
+                whichever query happened to read learned stats first.
+
+        Raises:
+            ConfigError: If `backend` does not implement `MetadataBackend`.
+        """
+        self._backend = check_backend(backend)
         self._seq = 0
         # Parsed-read cache for the learned-parameter tables. `_params_generation` bumps
         # only on a *whole-blob* `save_params` (which the per-key view merges underneath
@@ -120,6 +171,17 @@ class MetadataHub:
         # a wrong answer, it is a plan that quietly stops improving. `record` runs once per
         # operator per query, so serializing it costs nothing on the hot path.
         self._lock = threading.Lock()
+
+    def __repr__(self) -> str:
+        """Name the backend and how much has been learned.
+
+        "Is my learned-stats store actually being written to?" is the question a user
+        prints a hub to answer, and an address answers none of it.
+        """
+        return (
+            f"MetadataHub(backend={self._backend!r}, recorded={self._seq}, "
+            f"signed={self._signed_appends})"
+        )
 
     # --- FeedbackSink ------------------------------------------------------
     def record(self, feedback: OperatorFeedback) -> None:
@@ -173,7 +235,24 @@ class MetadataHub:
         return self._seq
 
     def operator_history(self, op_id: int) -> list[dict[str, Any]]:
-        """All recorded feedback for an operator id, oldest first."""
+        """All recorded feedback for an operator id, oldest first.
+
+        Args:
+            op_id: The operator's plan-local id.
+
+        Returns:
+            The recorded rows, oldest first. Empty when nothing was recorded.
+
+        Raises:
+            ConfigError: If `op_id` is not an integer. The store's keys are typed, so a
+                string id matches nothing and would otherwise read as "never recorded".
+        """
+        if not isinstance(op_id, int) or isinstance(op_id, bool):
+            raise ConfigError(
+                f"operator_history needs an integer op_id, but got "
+                f"{type(op_id).__name__} {op_id!r}.",
+                hint="Operator ids are the plan-local integers on a PhysicalPlan's ops.",
+            )
         out = [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
         return out
 
@@ -254,11 +333,36 @@ class MetadataHub:
 
     # --- learned parameters ------------------------------------------------
     def load_params(self, namespace: str) -> dict[str, Any]:
+        """Every learned parameter under `namespace`, or an empty dict.
+
+        Args:
+            namespace: The learning loop's name, e.g. ``"kyber.calibration"``.
+
+        Returns:
+            The stored parameters.
+
+        Raises:
+            ConfigError: If `namespace` is not a non-empty string.
+        """
+        _check_namespace(namespace)
         raw = self._backend.get(_LEARNED_PARAMS, (namespace,))
         return json.loads(raw) if raw else {}
 
     def save_params(self, namespace: str, params: dict[str, Any]) -> None:
-        self._backend.put(_LEARNED_PARAMS, (namespace,), json.dumps(params).encode())
+        """Replace every learned parameter under `namespace`.
+
+        Args:
+            namespace: The learning loop's name.
+            params: The parameters to store. Must be JSON-serializable — the store
+                holds opaque bytes so that any backend can serve it.
+
+        Raises:
+            ConfigError: If `namespace` is invalid, or `params` is not serializable.
+                The offending key is named, because a `TypeError` reading "Object of
+                type X is not JSON serializable" does not say *which* entry it was.
+        """
+        _check_namespace(namespace)
+        self._backend.put(_LEARNED_PARAMS, (namespace,), _encoded(namespace, params))
         # A whole-blob write is the one thing the per-key view cannot patch in place: it
         # is the *legacy* layer that view merges underneath its own entries.
         self._params_generation += 1
@@ -301,9 +405,28 @@ class MetadataHub:
         return self.load_keyed_params(namespace).get(key)
 
     def put_keyed_param(self, namespace: str, key: str, value: Any) -> None:
+        """Store one learned entry under `(namespace, key)`.
+
+        Args:
+            namespace: The learning loop's name.
+            key: The entry's name within the namespace.
+            value: A JSON-serializable value.
+
+        Raises:
+            ConfigError: If `namespace` or `key` is not a non-empty string, or `value`
+                is not serializable. A non-string key would round-trip through JSON as
+                a string and silently stop matching the key it was written under.
+        """
+        _check_namespace(namespace)
+        if not isinstance(key, str) or not key:
+            raise ConfigError(
+                f"A learned-parameter key must be a non-empty string, but got "
+                f"{type(key).__name__} {key!r} in namespace {namespace!r}.",
+                hint="Keys round-trip through JSON, so only strings survive unchanged.",
+            )
         if self._unchanged(namespace, key, value):
             return
-        blob = json.dumps(value).encode()
+        blob = _encoded(f"{namespace}.{key}", value)
         self._backend.put(_LEARNED_PARAMS, (namespace, key), blob)
         self._keyed_stored.setdefault(namespace, set()).add(key)
         # Patch the parsed view rather than invalidating it: this write *is* the new value

@@ -401,6 +401,167 @@ def test_dbapi_is_registered() -> None:
     assert SOURCES.get("dbapi") is DBAPISource
 
 
+# --- 3b. an already-open connection, the way pandas.read_sql takes one -----------
+
+
+def test_dbapi_reads_from_an_already_open_connection(db) -> None:
+    """``pandas.read_sql(query, con)`` takes a live connection; so should this."""
+    conn = sqlite3.connect(db)
+    try:
+        source = DBAPISource(connection=conn, table="ev")
+        assert pa.Table.from_batches(source.read()).column("id").to_pylist() == [1, 2, 3, 4]
+    finally:
+        conn.close()
+
+
+def test_a_borrowed_connection_is_never_closed_by_batcher(db) -> None:
+    """The caller still owns it, and will keep using it after the read returns.
+
+    Closing a borrowed handle is the kind of bug that surfaces far from its cause: the
+    user's *next* query fails on a connection Batcher shut while they weren't looking.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        DBAPISource(connection=conn, table="ev").read()
+        # Still usable — this raises ProgrammingError if the connection was closed.
+        assert conn.execute("SELECT COUNT(*) FROM ev").fetchone()[0] == 4
+    finally:
+        conn.close()
+
+
+def test_a_borrowed_connection_still_resolves_types_and_pushes_down(db) -> None:
+    """No module name was given, so the driver is recovered from the connection's class."""
+    conn = sqlite3.connect(db)
+    try:
+        source = DBAPISource(connection=conn, table="ev")
+        assert source.schema().names == ["id", "country", "amt"]
+        rows = pa.Table.from_batches(source.read(predicate=_COUNTRY_IS_US))
+        assert rows.column("id").to_pylist() == [1, 3]
+    finally:
+        conn.close()
+
+
+def test_a_borrowed_connection_cannot_be_partitioned(db) -> None:
+    """A live connection belongs to this process; N workers cannot each use it."""
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(BackendError, match="partition_on"):
+            DBAPISource(
+                connection=conn,
+                table="ev",
+                partition_on="id",
+                lower_bound=1,
+                upper_bound=4,
+                num_partitions=4,
+            )
+    finally:
+        conn.close()
+
+
+def test_dbapi_requires_a_module_or_a_connection() -> None:
+    with pytest.raises(BackendError, match="connection="):
+        DBAPISource(table="ev")
+
+
+class _FakeEngine:
+    """Mimics ``sqlalchemy.Engine``: no ``cursor()``, but `raw_connection()`."""
+
+    def __init__(self, raw) -> None:
+        self._raw = raw
+
+    def raw_connection(self):
+        return self._raw
+
+
+class _FakeSAConnection:
+    """Mimics ``sqlalchemy.Connection``: exposes the DBAPI handle as `.connection`."""
+
+    def __init__(self, raw) -> None:
+        self.connection = raw
+
+
+@pytest.mark.parametrize(
+    "wrap", [lambda c: c, _FakeEngine, _FakeSAConnection], ids=["dbapi", "engine", "sa-connection"]
+)
+def test_a_sqlalchemy_handle_is_unwrapped_to_its_dbapi_connection(db, wrap) -> None:
+    """`pandas.read_sql` takes an Engine, so users reach for one here too.
+
+    Neither a SQLAlchemy `Engine` nor a `Connection` is a DBAPI connection, so passing
+    one through raised `AttributeError: no attribute 'cursor'` from deep inside a read,
+    naming a method the user never called. SQLAlchemy exposes the real connection on
+    both, so unwrapping is exact rather than a guess — and duck-typed, so SQLAlchemy
+    never has to be installed.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        source = DBAPISource(connection=wrap(conn), table="ev")
+        assert source.schema().names == ["id", "country", "amt"]
+        assert pa.Table.from_batches(source.read()).num_rows == 4
+    finally:
+        conn.close()
+
+
+def test_unwrapping_does_not_call_a_callable_connection(db) -> None:
+    """A DBAPI connection can itself be callable, so "call it if callable" was wrong.
+
+    `sqlite3.Connection.__call__` compiles a statement, so testing callability before
+    testing for a cursor invoked the user's connection with no arguments and raised a
+    `TypeError` from inside the unwrapper.
+    """
+    from batcher.io.formats.sql.dbapi import _as_dbapi_connection
+
+    conn = sqlite3.connect(db)
+    try:
+        assert callable(conn), "precondition: this connection type is callable"
+        assert _as_dbapi_connection(_FakeSAConnection(conn)) is conn
+    finally:
+        conn.close()
+
+
+def test_public_read_sql_accepts_a_connection_like_pandas(db) -> None:
+    """``bt.read.sql(query, connection=con)`` mirrors ``pandas.read_sql(query, con)``.
+
+    One entry point covers both spellings rather than forking the surface: `uri=` when
+    Batcher should open (and can distribute) the connection, `connection=` when the
+    caller already has one.
+    """
+    import batcher as bt
+
+    conn = sqlite3.connect(db)
+    try:
+        rows = bt.read.sql("SELECT id FROM ev WHERE country = 'US'", connection=conn).collect()
+        assert rows.column("id").to_pylist() == [1, 3]
+    finally:
+        conn.close()
+
+
+def test_public_read_sql_refuses_both_a_uri_and_a_connection(db) -> None:
+    """They name two different databases and there is no way to tell which was meant."""
+    import batcher as bt
+
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(BackendError, match="not both"):
+            bt.read.sql("SELECT 1", uri="postgresql://h/db", connection=conn)
+    finally:
+        conn.close()
+
+
+def test_a_non_connection_is_rejected_by_name() -> None:
+    from batcher.io.formats.sql.dbapi import _as_dbapi_connection
+
+    with pytest.raises(BackendError, match="no cursor"):
+        _as_dbapi_connection("postgresql://not-a-connection")
+
+
+def test_a_borrowed_connection_is_absent_from_repr(db) -> None:
+    conn = sqlite3.connect(db)
+    try:
+        assert "Connection" not in repr(DBAPISource(connection=conn, table="ev"))
+    finally:
+        conn.close()
+
+
 # --- 4. bulk parallel range partitioning ---------------------------------------
 
 
@@ -596,7 +757,7 @@ def _partition_split(monkeypatch, log: list[str]):
     from batcher.io.formats.sql.adbc import _ADBCPartitionSplit
 
     monkeypatch.setattr(
-        "batcher.io.formats.sql.adbc._connect",
+        "batcher.io.formats.sql.adbc.source._connect",
         lambda driver, db_kwargs, conn_kwargs: _PartitionConn(log),
     )
     return _ADBCPartitionSplit("d", {}, None, b"desc-0", 0)

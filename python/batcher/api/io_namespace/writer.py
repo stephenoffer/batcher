@@ -11,6 +11,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from batcher.api.io_namespace._discovery import (
+    PathLike,
+    namespace_dir,
+    namespace_repr,
+    unknown_attribute,
+)
+from batcher.api.io_namespace._write_opts import (
+    MODE_AWARE_SINKS as _MODE_AWARE_SINKS,
+)
+from batcher.api.io_namespace._write_opts import (
+    normalize_partition_by,
+    normalize_save_mode,
+    reject_row_index,
+)
 from batcher.api.session import read as _read
 
 if TYPE_CHECKING:
@@ -23,20 +37,6 @@ if TYPE_CHECKING:
     from batcher.plan.streaming import Trigger
 
 __all__ = ["Writer"]
-
-
-# Save modes (Spark `SaveMode` parity). `append` is only meaningful for the sinks that
-# can add to an existing target — the transactional lakehouse tables and the warehouse
-# tables — which consume `mode` as a constructor option; the file sinks always overwrite,
-# so for them `mode` only drives the existence gate.
-#
-# A sink that honors `mode` MUST be listed here. `snowflake` was not, and the result was
-# the worst of both: `mode="append"` was rejected even though `SnowflakeSink` implements
-# it, and `mode="overwrite"` passed the gate but never reached the sink, so the write
-# quietly appended instead. A save mode that silently does the opposite of what it says is
-# a data-corruption bug, not a missing feature.
-_SAVE_MODES = ("overwrite", "error", "ignore", "append")
-_MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi", "snowflake"})
 
 
 def _prune_stale_after_overwrite(path: str, fmt: str, manifest: WriteManifest) -> None:
@@ -157,13 +157,31 @@ class Writer:
         """Bind the write namespace to the `Dataset` whose result it writes."""
         self._ds = ds
 
+    def __repr__(self) -> str:
+        """List the formats this namespace writes, grouped by family."""
+        return namespace_repr(self, "ds.write")
+
+    def __dir__(self) -> list[str]:
+        """Every format method, so tab-completion shows the writable formats."""
+        return namespace_dir(self)
+
+    def __getattr__(self, name: str) -> Any:
+        """Answer a misspelled format with a suggestion instead of a bare `AttributeError`.
+
+        Only ever reached on a miss, so it cannot shadow a real method. A `_`-prefixed
+        name still raises `AttributeError` — `copy`, `pickle`, and IPython probe for those
+        and require a miss to look like a miss.
+        """
+        raise unknown_attribute(self, "ds.write", name)
+
     def __call__(
         self,
-        path: str,
+        path: PathLike,
         format: str | None = None,
         *,
         mode: str = "overwrite",
         partition_by: list[str] | None = None,
+        single_file: bool = False,
         distributed: bool | str = "auto",
         num_workers: int | None = None,
         resume: bool = False,
@@ -193,6 +211,17 @@ class Writer:
         * ``"append"`` — add to an existing table; only the sinks that can add to one
           (`delta`/`iceberg`/`hudi`/`snowflake`) support it. A file sink raises, because
           it has nothing to append to.
+
+        Spark's own ``"errorIfExists"`` and Python's file modes (``"w"``, ``"a"``,
+        ``"x"``) are accepted as spellings of those four, so a ported job does not fail
+        on its last line. `partition_by` likewise answers to Spark's ``partitionBy=``
+        and pandas' ``partition_cols=``, and pandas' ``index=False`` is accepted and
+        dropped — Batcher has no row index, so there is nothing to suppress.
+
+        ``single_file=True`` guarantees the output is the one file at `path` rather than
+        a directory of shards: it refuses the arguments that shard (`partition_by`,
+        `max_rows_per_file`) instead of silently ignoring them, and keeps the write on
+        one worker.
 
         ``replace_where=<predicate>`` is a dynamic partition/range overwrite (Delta
         ``replaceWhere`` / the backfill pattern): atomically replace only the rows
@@ -234,12 +263,21 @@ class Writer:
         """
         from batcher._internal.errors import PlanError
         from batcher.api.terminal import _write
+        from batcher.io.base._paths import normalize_path
         from batcher.io.detect import detect_format
         from batcher.io.manifest import WriteManifest
         from batcher.io.source import is_bounded
 
-        if mode not in _SAVE_MODES:
-            raise PlanError(f"write(): unknown mode {mode!r}; use one of {list(_SAVE_MODES)}")
+        # Normalize the whole call vocabulary once, here: every typed method
+        # (`.parquet`, `.delta`, …) funnels through this call, so a spelling accepted
+        # here is accepted everywhere, and the sink below only ever sees canonical names.
+        path = normalize_path(path, what="write path")
+        mode = normalize_save_mode(mode)
+        partition_by = normalize_partition_by(opts, partition_by)
+        reject_row_index(opts)
+        if single_file:
+            self._check_single_file(partition_by, max_rows_per_file)
+            distributed = False
         fmt = detect_format(path, format)
 
         # `sort_by` clusters the output: sort rows (ascending) before writing so each
@@ -258,6 +296,7 @@ class Writer:
                 format,
                 mode=mode,
                 partition_by=partition_by,
+                single_file=single_file,
                 distributed=distributed,
                 num_workers=num_workers,
                 resume=resume,
@@ -354,13 +393,19 @@ class Writer:
                     fmt,
                     mode="overwrite",
                     partition_by=partition_by,
+                    single_file=single_file,
                     max_rows_per_file=max_rows_per_file,
                     **opts,
                 )
         if mode == "append" and fmt not in _MODE_AWARE_SINKS:
             raise PlanError(
                 f"write(): mode='append' is only supported for {sorted(_MODE_AWARE_SINKS)}, "
-                f"not {fmt!r} (use a fresh path, or 'overwrite')"
+                f"not {fmt!r}: a plain file sink has no table to add to, so appending would "
+                "mean rewriting the whole output. Either write each batch to its own path "
+                "under a directory and read the directory back as one relation "
+                f"(write(f'{{root}}/batch-{{n}}.{fmt}'), then read(root)), or use a "
+                "transactional sink — write.delta / write.iceberg / write.hudi — where "
+                "append is a real commit."
             )
         # error/ignore are a pre-write existence gate (resume has its own per-file
         # idempotence, so it is exempt).
@@ -384,7 +429,9 @@ class Writer:
         num_files: int | None = None
         target_bytes: int | None = None
         spec = self._ds._repartition
-        if spec is not None:
+        # `single_file=True` is the caller overriding the layout at the write, so a
+        # standing `repartition(num_files=...)` must not silently shard it back apart.
+        if spec is not None and not single_file:
             if spec.by and partition_by is None:
                 partition_by = list(spec.by)
             num_files = spec.num_files
@@ -415,6 +462,29 @@ class Writer:
         if mode == "overwrite" and not resume and fmt not in _MODE_AWARE_SINKS:
             _prune_stale_after_overwrite(path, fmt, manifest)
         return manifest
+
+    @staticmethod
+    def _check_single_file(partition_by: list[str] | None, max_rows_per_file: int | None) -> None:
+        """Refuse the arguments that would shard a `single_file=True` write.
+
+        Both of these produce a *directory* of ``part-*`` files, which is the one layout
+        `single_file` exists to rule out. Dropping them silently would hand back the
+        sharded output the caller just said they did not want — and the caller usually
+        wants one file because something downstream (a spreadsheet, a script, a tool that
+        takes a filename) cannot open a directory at all.
+        """
+        from batcher._internal.errors import PlanError
+
+        conflict = None
+        if partition_by:
+            conflict = "partition_by"
+        elif max_rows_per_file:
+            conflict = "max_rows_per_file"
+        if conflict is not None:
+            raise PlanError(
+                f"write(single_file=True, {conflict}=...): {conflict} writes a directory of "
+                "part files, which is what single_file rules out. Pass one or the other."
+            )
 
     # --- streaming sink targets -------------------------------------------
     def _start_stream(
@@ -705,7 +775,8 @@ class Writer:
             ForeachStreamSink(fn), trigger, output_mode, query_name, checkpoint
         )
 
-    def parquet(self, path: str, *, compression: str = "zstd", **opts: Any) -> WriteManifest:
+    # --- File / object-store formats (path-addressed) ----------------------
+    def parquet(self, path: PathLike, *, compression: str = "zstd", **opts: Any) -> WriteManifest:
         """Write as Parquet (see `__call__` for `partition_by`/`distributed`).
 
         Args:
@@ -728,7 +799,7 @@ class Writer:
         """
         return self(path, "parquet", compression=compression, **opts)
 
-    def csv(self, path: str, **opts: Any) -> WriteManifest:
+    def csv(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as CSV.
 
         Args:
@@ -750,7 +821,7 @@ class Writer:
         """
         return self(path, "csv", **opts)
 
-    def json(self, path: str, **opts: Any) -> WriteManifest:
+    def json(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as newline-delimited JSON.
 
         Args:
@@ -772,7 +843,7 @@ class Writer:
         """
         return self(path, "json", **opts)
 
-    def orc(self, path: str, **opts: Any) -> WriteManifest:
+    def orc(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as ORC.
 
         Args:
@@ -794,7 +865,7 @@ class Writer:
         """
         return self(path, "orc", **opts)
 
-    def arrow(self, path: str, **opts: Any) -> WriteManifest:
+    def arrow(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as Arrow/Feather IPC.
 
         Args:
@@ -816,7 +887,7 @@ class Writer:
         """
         return self(path, "arrow", **opts)
 
-    def avro(self, path: str, **opts: Any) -> WriteManifest:
+    def avro(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as Avro (needs ``batcher-engine[avro]``).
 
         Args:
@@ -835,7 +906,7 @@ class Writer:
         """
         return self(path, "avro", **opts)
 
-    def lance(self, path: str, **opts: Any) -> WriteManifest:
+    def lance(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write a Lance dataset (needs ``batcher-engine[lance]``).
 
         Args:
@@ -854,7 +925,7 @@ class Writer:
         """
         return self(path, "lance", **opts)
 
-    def msgpack(self, path: str, **opts: Any) -> WriteManifest:
+    def msgpack(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as MessagePack (needs ``batcher-engine[msgpack]``).
 
         Args:
@@ -873,6 +944,7 @@ class Writer:
         """
         return self(path, "msgpack", **opts)
 
+    # --- Upserts / MERGE INTO ----------------------------------------------
     def merge(
         self,
         target: str,

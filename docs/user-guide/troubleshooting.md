@@ -117,6 +117,44 @@ print(type(table).__module__, type(table).__name__)
 # pyarrow.lib Table
 ```
 
+## Catching errors by type
+
+Every Batcher failure subclasses `bt.BatcherError`, so one `except` catches them all
+without importing anything internal:
+
+```python
+try:
+    ds.select("nope").to_pydict()
+except bt.BatcherError as exc:
+    print(type(exc).__name__, "-", exc)
+# PlanError - projection 'nope' references unknown column(s) ['nope']; available: ['x', 'y']
+```
+
+Catch a narrower type when you want to react differently. The catchable types are all
+reachable as `bt.<Name>`:
+
+| Type | Catch it for | Also a |
+|------|--------------|--------|
+| `bt.PlanError` | an invalid plan or schema, raised eagerly at build time | `ValueError` |
+| `bt.ColumnNotFoundError` | a reference to a column that isn't there (carries `.column`) | `KeyError` |
+| `bt.ConfigError` | an out-of-range or inconsistent configuration value | `ValueError` |
+| `bt.MissingDependencyError` | an optional extra that isn't installed (carries `.install`) | `ImportError` |
+| `bt.AccessDeniedError` | a governed table or column the principal can't read | `PermissionError` |
+| `bt.ExecutionError` | an operator failing at runtime in the engine | |
+| `bt.OptimizationError` | the optimizer failing to produce a physical plan | |
+| `bt.CompileError` | JIT compilation failing (the interpreter still runs) | |
+| `bt.ResourceError` | the resource manager unable to grant memory or credit | |
+| `bt.IOError` | a source or sink failing to read, write, list, or open | |
+| `bt.FormatError` | an unknown format, or a file malformed for its format | |
+| `bt.CommitError` | an atomic write commit failing (a concurrent-writer conflict) | |
+| `bt.SchemaError` | schemas that can't be reconciled across files or against an expected one | |
+| `bt.DataQualityError` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
+| `bt.BackendError` | a specific execution backend failing | |
+| `bt.TransportError` | the distributed data plane (shared memory / Flight) failing | |
+
+Because several also subclass a builtin, existing `except ValueError` /
+`except ImportError` handlers keep working unchanged.
+
 ## A large query runs out of memory
 
 Stateful operators hold state in memory by default. Pass `spill=True` to let

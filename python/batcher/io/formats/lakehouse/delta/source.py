@@ -13,7 +13,7 @@ the version the driver planned against.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
@@ -44,7 +44,12 @@ class DeltaFileSplit:
 
     table_uri: str
     file_path: str
-    storage_options: dict[str, str] | None
+    # `repr=False`: these are the cloud credentials (``aws_secret_access_key``, a SAS
+    # token, a vended Unity Catalog credential). A split's generated `repr` is rendered
+    # into worker task logs and into every traceback that crosses the FFI or Ray boundary,
+    # so leaving it on publishes the secret to wherever those are collected. The locators
+    # above stay visible — redaction must not cost debuggability.
+    storage_options: dict[str, str] | None = field(repr=False)
     version: int | None
     rows: int | None = None
 

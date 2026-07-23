@@ -16,7 +16,7 @@ from batcher._internal.errors import BackendError
 from batcher.io.catalog import CatalogSpec, resolve_catalog
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.lakehouse._arrow import engine_schema, normalize_engine_types
-from batcher.io.formats.lakehouse.iceberg._common import _require_pyiceberg
+from batcher.io.formats.lakehouse.iceberg._common import _catalog_key, _require_pyiceberg
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
 
@@ -474,14 +474,3 @@ class IcebergTableSplit:
 
     def identity(self) -> str:
         return f"iceberg:{self._identifier}:{self._data_file_path()}"
-
-
-def _catalog_key(spec: Any) -> str:
-    """A stable key for a catalog spec, so two catalogs never share a cache entry."""
-    if spec is None:
-        return "default"
-    if isinstance(spec, str):
-        return spec
-    if isinstance(spec, dict):
-        return ";".join(f"{k}={v}" for k, v in sorted(spec.items()))
-    return str(spec)

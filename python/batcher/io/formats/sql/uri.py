@@ -176,7 +176,9 @@ class ParsedURI:
     username: str | None = None
     password: str | None = field(default=None, repr=False)
     database: str | None = None
-    options: dict[str, str] = field(default_factory=dict)
+    # `repr=False`: a query string is ordinary connection options most of the time,
+    # but nothing stops a URI carrying `?password=` or `?token=` there.
+    options: dict[str, str] = field(default_factory=dict, repr=False)
 
     def db_kwargs(self) -> dict[str, Any]:
         """The driver connection kwargs for this URI, minus the password.

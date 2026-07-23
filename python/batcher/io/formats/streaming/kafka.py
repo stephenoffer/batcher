@@ -174,3 +174,16 @@ class KafkaSource(BrokerSource):
         """
         if self._consumer is not None:
             self._consumer.commit(asynchronous=False)
+
+    def close(self) -> None:
+        """Close the consumer, leaving the group cleanly and releasing its threads.
+
+        `Consumer.close()` also triggers a final offset commit and a graceful group leave, so
+        skipping it does more than leak a socket and a poll thread: the group waits out
+        `session.timeout.ms` before rebalancing, stalling the partitions this consumer held.
+        `BrokerSource.iter_batches` calls this from a `finally`, so it runs even when a
+        consumer abandons the generator mid-stream.
+        """
+        if self._consumer is not None:
+            self._consumer.close()
+            self._consumer = None

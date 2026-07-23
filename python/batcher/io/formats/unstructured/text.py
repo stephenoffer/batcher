@@ -170,7 +170,15 @@ class TextSource:
         return None
 
     def identity(self) -> str:
-        return f"text:{self._mode}:{self._path}"
+        # `encoding` decides how bytes become text, so the same path read as utf-8 vs
+        # latin-1 is a different relation: different characters, and a different line
+        # count in line mode when a byte decodes to a line break in one encoding but not
+        # the other. Omitting it collided their identities. Kept off the key for the
+        # utf-8 default so the common identity is unchanged.
+        base = f"text:{self._mode}:{self._path}"
+        if self._encoding.lower().replace("-", "") != "utf8":
+            return f"{base}#enc={self._encoding}"
+        return base
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         return [

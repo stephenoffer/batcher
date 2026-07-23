@@ -66,6 +66,102 @@ split, because every `bt.read.*` is already lazy. It returns a `Dataset` plan an
 no I/O until a terminal op, with the projection and predicate pushdown `scan_*` gives
 you. There is one spelling per format, and it's the lazy one.
 
+If your fingers already type `pd.read_csv`, keep typing it. Every common format also
+has a top-level shorthand under the ecosystem-standard name, and each one is the same
+lazy reader as its `bt.read.*` twin:
+
+| Shorthand | Same as | Reads |
+|-----------|---------|-------|
+| `bt.read_csv(p)` | `bt.read.csv(p)` | CSV files, directories, globs |
+| `bt.read_parquet(p)` | `bt.read.parquet(p)` | Parquet |
+| `bt.read_json(p)` / `bt.read_ndjson(p)` | `bt.read.json(p)` | newline-delimited JSON |
+| `bt.read_ipc(p)` | `bt.read.arrow(p)` | Arrow IPC / Feather |
+| `bt.read_orc(p)` | `bt.read.orc(p)` | ORC |
+| `bt.read_avro(p)` | `bt.read.avro(p)` | Avro |
+| `bt.read_excel(p)` | `bt.read.excel(p)` | Excel workbooks |
+| `bt.read_delta(p)` | `bt.read.delta(p)` | Delta Lake tables |
+| `bt.read_iceberg(t)` | `bt.read.iceberg(t)` | Iceberg tables |
+| `bt.read_database(q, uri=...)` | `bt.read.sql(q, uri=...)` | any SQL database |
+
+For a source that isn't a file at all, `bt.read_table(name, ...)` constructs any
+registered connector by name, which is the escape hatch behind all of the above.
+
+## Getting data in from another library
+
+Whatever object you're holding, there's a constructor for it. The names follow pandas
+and Polars, so `from_dict` and `from_dicts` mean what they mean there:
+
+| You have | Call |
+|----------|------|
+| A `{column: values}` dict | `bt.from_pydict(d)`, or `bt.from_dict(d)` |
+| A list of row dicts | `bt.from_pylist(rows)`, or `bt.from_dicts(rows)` |
+| A list of row tuples | `bt.from_records(rows, columns=[...])` |
+| A generator or any iterable | `bt.from_iter(gen)` |
+| A pandas or Polars frame | `bt.from_pandas(df)` / `bt.from_polars(df)` |
+| A DuckDB relation or connection | `bt.from_duckdb(rel)` |
+| An Arrow table, or anything Arrow-exporting | `bt.from_arrow(t)` |
+| Something whose type you don't know | `bt.from_any(obj)` |
+
+`bt.from_any` is the one to reach for in migration code and glue: it dispatches on the
+type and routes to the right constructor, so a script that accepts "a frame" from a
+caller doesn't have to branch. `bt.sql` uses it for every bound table, which is why
+you can pass a pandas frame or a plain dict straight into a query:
+
+```python
+import batcher as bt
+
+print(bt.sql("SELECT x * 2 AS y FROM t", t={"x": [1, 2, 3]}).to_pydict())
+# {'y': [2, 4, 6]}
+```
+
+## Concatenating and generating
+
+`bt.concat` means frame concatenation, exactly as `pd.concat` and `pl.concat` do, and
+takes Polars' `how` vocabulary. The string-building `concat` keeps its own explicit
+name, `bt.concat_str`:
+
+```python
+import batcher as bt
+
+a = bt.from_pydict({"x": [1, 2]})
+b = bt.from_pydict({"x": [3, 4]})
+print(bt.concat([a, b]).to_pydict())
+# {'x': [1, 2, 3, 4]}
+
+wide = bt.concat([bt.from_pydict({"x": [1]}), bt.from_pydict({"y": ["a"]})], how="diagonal")
+print(wide.to_pydict())
+# {'x': [1, None], 'y': [None, 'a']}
+
+ds = bt.from_pydict({"first": ["ada"], "last": ["lovelace"]})
+print(ds.select(name=bt.concat_str(bt.col("first"), bt.lit(" "), bt.col("last"))).to_pydict())
+# {'name': ['ada lovelace']}
+```
+
+`how` is `"vertical"` (the default), `"vertical_relaxed"` to deduplicate,
+`"diagonal"` to stack over the union of the columns, or `"horizontal"` to place frames
+side by side by row position.
+
+`bt.range` follows `builtins.range`, single-argument form included, and `bt.date_range`
+follows `pandas.date_range` and `polars.date_range`:
+
+```python
+import batcher as bt
+
+print(bt.range(5).to_pydict())
+# {'value': [0, 1, 2, 3, 4]}
+print(bt.date_range("2024-01-01", periods=3, interval="1mo").count())
+# 3
+```
+
+Pass `end=` or `periods=`, the stride as `interval=` (Polars) or `freq=` (pandas), and
+`closed=` to drop an endpoint the way pandas' `inclusive=` does.
+
+## Reporting a problem
+
+`bt.show_versions()` prints the Batcher version, the compiled engine version, Python,
+the platform, and which optional backends are installed. `bt.versions()` returns the
+same information as a dict.
+
 ## Transforming
 
 Transformations chain off a `Dataset` and return a new one, so a whole pipeline reads
@@ -259,6 +355,97 @@ for out in llm_generate(
     template="Answer concisely. Q: {question}",
 ):
     ...
+```
+
+## Names and arguments that carry over unchanged
+
+Batcher accepts the spelling you already type for a long list of operations, so a
+ported script usually needs fewer edits than the tables above suggest. Each alias is a
+real method that delegates to the Batcher primary, not a shim, so it returns the same
+plan and the same result.
+
+| You type | Batcher primary |
+|---|---|
+| `ds.to_dicts()` | `ds.to_pylist()` |
+| `ds.to_dict()` | `ds.to_pydict()` |
+| `ds.drop_duplicates()` | `ds.distinct()` |
+| `ds.with_row_count()` | `ds.with_row_index()` |
+| `ds.vstack(other)` / `ds.append(other)` | `ds.union(other)` |
+| `ds.difference(other)` | `ds.except_(other)` |
+| `ds.persist()` | `ds.cache()` |
+| `ds.coalesce(n)` | `ds.repartition(n)` |
+| `ds.transform(fn)` | `ds.pipe(fn)` |
+| `ds.fillna(v)` / `ds.dropna()` | `ds.fill_null(v)` / `ds.drop_nulls()` |
+| `ds.groupby(...)` / `ds.merge(...)` | `ds.group_by(...)` / `ds.join(...)` |
+| `ds.sort_values(...)` / `ds.nlargest(...)` | `ds.sort(...)` / `ds.top_k(...)` |
+| `gb.nunique()` / `gb.size()` | `gb.n_unique()` / `gb.len()` |
+| `ds.query("x > 2")` | `ds.filter(bt.col("x") > 2)` |
+| `ds.to_parquet(p)` / `ds.to_csv(p)` / `ds.to_json(p)` | `ds.write.parquet(p)` and friends |
+| `ds.first()` / `ds.last()` / `ds.item()` | terminal row accessors |
+| `ds.width` / `ds.height` / `ds.empty` | `len(ds.columns)` / `ds.count()` / `ds.is_empty()` |
+| `ds.info()` / `ds.glimpse()` / `ds.memory_usage()` | schema-and-count summaries |
+| `ds.iter_rows()` / `ds.iter_slices()` | `ds.iter_batches()` |
+| `ds.lazy()` / `ds.copy()` | identity — a `Dataset` is already lazy and immutable |
+
+Argument names carry over too. `ds.sort()` takes `by=` and `ascending=` alongside
+`descending=`, and `na_position=` alongside `nulls_first=`. `ds.sample()` reads a
+positional `int` as a row count and a `float` as a fraction, and accepts `frac=` and
+`random_state=`. `ds.melt()` takes `id_vars=`, `value_vars=`, and `var_name=`.
+`ds.select_dtypes()` accepts a Python type, a dtype name, or a list of either, and an
+`exclude=` argument. `ds.rename()` accepts a function applied to every column name.
+
+Two shorthands have no pandas equivalent but save the parenthesizing that `&`
+otherwise needs. Several predicates are ANDed, and a keyword is an equality test:
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"status": ["paid", "open", "paid"], "amount": [10, 20, 30]})
+print(ds.filter(bt.col("amount") > 5, status="paid").to_pydict())
+# {'status': ['paid', 'paid'], 'amount': [10, 30]}
+```
+
+`ds.group_by(...).agg()` also takes the pandas dict spec, where a list of reducers
+suffixes the output names the way pandas does when it flattens:
+
+```python
+print(ds.group_by("status").agg({"amount": ["min", "max"]}).sort("status").to_pydict())
+# {'status': ['open', 'paid'], 'amount_min': [20, 10], 'amount_max': [20, 30]}
+```
+
+## What Batcher deliberately does not have
+
+Some familiar APIs are absent by design rather than by omission, and knowing which is
+which saves you looking for a workaround that doesn't exist. Batcher tells you at the
+point of use: every one of these raises an `AttributeError` naming the reason and the
+replacement, so you can discover the mapping from a traceback instead of this table.
+
+| Absent | Why | Instead |
+|---|---|---|
+| `df.set_index`, `df.reset_index`, `df.loc`, `df.iloc` | A relation is an unordered multiset with no row index, as in SQL. | `ds.filter(...)`, `ds.select(...)`, `ds.sort(...)`, `ds.with_row_index()` |
+| `df.iterrows`, `df.itertuples`, `df.applymap` | Per-row Python never runs on the hot path. | `ds.iter_rows(named=True)` at the end of a pipeline; expressions or `ds.map_batches()` inside one |
+| `df.apply` | Its per-row and per-column meanings don't survive a columnar engine. | `ds.with_columns(y=expr)` or `ds.map_batches(fn)` |
+| `df.T`, `df.transpose` | Transposing needs a materialized, single-typed frame. | `ds.to_pandas().T`, or `ds.unpivot()` / `ds.pivot()` |
+| `df.shift`, `df.diff`, `df.cumsum`, `df.rolling` | Each needs a row order the relation doesn't carry. | `ds.window(order_by=[...], functions={...})` |
+| `df.resample` | Time bucketing is a grouping. | `ds.group_by(bucket=bt.col("t").dt.truncate("1h")).agg(...)` |
+| Looping over a `GroupBy` | It materializes one frame per key in Python and caps the job at one machine. | `.agg(...)`, or `.window(partition_by=[...])` to keep every row |
+
+Column attribute access (`df.amount`) is absent for a subtler reason: a column named
+`filter` or `join` would shadow a method, which is a real source of pandas bugs. Use
+`ds["amount"]` for the expression, or `bt.col("amount")` to build one.
+
+## Checking a port
+
+`ds.equals(other)` compares *results*, not plans, so it answers the only question that
+matters after a migration. Row order is ignored by default, because a relation is
+unordered; pass `ordered=True` after a `sort` when the emitted order is part of the
+contract.
+
+```python
+ported = ds.filter(status="paid")
+expected = ds.filter(bt.col("status") == "paid")
+print(ported.equals(expected))
+# True
 ```
 
 ## Porting with a coding agent

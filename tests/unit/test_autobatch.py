@@ -62,9 +62,10 @@ def test_recovers_and_regrows_after_vram_backoff():
 
 
 def test_small_model_packs_many_actors_per_gpu():
-    # all-MiniLM (~0.08 GB) on an A10G (24 GB): packs many; fraction floored at 0.25.
+    # all-MiniLM (~0.08 GB) on an A10G (24 GB): packs many; fraction floored at 0.05
+    # (lowered from 0.25 so a tiny model can reach ~20 actors/GPU instead of stranding VRAM).
     assert max_actors_per_gpu(0.08, 24.0) >= 4
-    assert recommend_gpu_fraction(0.08, 24.0) == 0.25
+    assert recommend_gpu_fraction(0.08, 24.0) == 0.05
 
 
 def test_large_model_gets_whole_gpu():
@@ -82,7 +83,7 @@ def test_context_overhead_reduces_density():
 def test_packing_always_at_least_one_and_bounded():
     assert max_actors_per_gpu(0.0, 24.0) == 1  # unknown size → whole GPU
     assert max_actors_per_gpu(100.0, 24.0) == 1  # too big → still 1 (no zero)
-    assert 0.25 <= recommend_gpu_fraction(1.0, 24.0) <= 1.0
+    assert 0.05 <= recommend_gpu_fraction(1.0, 24.0) <= 1.0
 
 
 # --- predictive VRAM guard (correctness audit: no multiplicative overshoot) ---

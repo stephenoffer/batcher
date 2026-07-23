@@ -14,7 +14,7 @@ credentials) are stored verbatim and never logged.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import contextmanager, suppress
 from typing import Any
 
 import pyarrow as pa
@@ -27,7 +27,6 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
-from batcher.io.formats.sql._common import connection_fingerprint
 
 __all__ = ["CouchbaseSource"]
 
@@ -40,6 +39,24 @@ _Window = tuple[int, int]
 # this astronomically large limit — larger than any real result — so it reaches the end while
 # still applying its offset. No dataset approaches 2**63 rows, so this never truncates.
 _UNBOUNDED_LIMIT = (1 << 63) - 1
+
+
+@contextmanager
+def _closing_cluster(cluster: Any) -> Iterator[Any]:
+    """Yield `cluster`, closing it afterwards if this SDK build has a `close()`.
+
+    The Columnar SDK documents `Cluster.close()`, but the driver is an optional extra we
+    cannot import here to confirm it, and older builds managed the connection purely by
+    refcount. A bare `contextlib.closing` therefore risks raising `AttributeError` from
+    inside the teardown — which would *replace* whatever real exception the body raised,
+    turning a clear database error into a confusing one. Closing when we can, and leaving
+    it to the collector when we cannot, keeps the leak fix without that hazard.
+    """
+    try:
+        yield cluster
+    finally:
+        with suppress(AttributeError):
+            cluster.close()
 
 
 @SOURCES.register("couchbase")
@@ -98,28 +115,17 @@ class CouchbaseSource(ScanSource):
         return f"`{kw['database']}`.`{kw['scope']}`.`{kw['collection']}`"
 
     def _identity_suffix(self) -> str:
-        """``<cluster>:<db>.<scope>.<collection>`` — the cluster identifies the relation.
-
-        The three-part analytics path is a *name*, not an address: the same
-        ``database.scope.collection`` exists on every Couchbase cluster the deployment
-        runs. Keyed on it alone, `identity()` — the persisted learned-statistics key —
-        pooled their statistics, and Kyber planned one cluster's data using another's
-        cardinalities with no error to show for it.
-
-        `connstr` and `username` are fingerprinted; `password` is not, and would be dropped
-        by `connection_fingerprint` anyway. That is deliberate on both counts: the key is
-        written to the metadata store, and a rotated password must not orphan the table's
-        accumulated statistics.
-        """
         kw = self._conn_kwargs
-        fingerprint = connection_fingerprint(
-            {"connstr": kw["connstr"], "username": kw["username"]}
-        )
-        return f"{fingerprint}:{kw['database']}.{kw['scope']}.{kw['collection']}"
+        # No `_fingerprint_material` override is needed here, and that is worth stating
+        # rather than leaving to be rediscovered: Couchbase keeps its credential in a field
+        # literally named ``password``, which is exactly what `connection_fingerprint`
+        # drops by name. The connector's own connstr/username stay in the digest, so two
+        # clusters sharing this collection path remain distinct relations.
+        return f"{kw['database']}.{kw['scope']}.{kw['collection']}"
 
     def _infer_schema(self) -> pa.Schema:
         stmt = f"SELECT VALUE c FROM {self._from_clause()} c LIMIT 1"
-        with closing(self._cluster()) as cluster:
+        with _closing_cluster(self._cluster()) as cluster:
             rows = list(cluster.execute_query(stmt).rows())
         if not rows:
             return pa.schema([])
@@ -151,7 +157,7 @@ class CouchbaseSource(ScanSource):
             # on *both* paths — on success it was simply never closed, and on the exception
             # this method exists to swallow it was dropped mid-flight. Sizing the offset
             # windows is a routine step of every parallel read, so the leak recurred per read.
-            with closing(self._cluster()) as cluster:
+            with _closing_cluster(self._cluster()) as cluster:
                 rows = list(cluster.execute_query(stmt).rows())
         except Exception:  # a count that fails must not fail the read — fall back to serial
             return None
@@ -201,7 +207,7 @@ class CouchbaseSource(ScanSource):
         # the iteration is required (closing early would kill the stream mid-read), so it is
         # closed when the generator finishes *or is closed*, which is what `closing` around
         # the yields buys over a bare call.
-        with closing(self._cluster()) as cluster:
+        with _closing_cluster(self._cluster()) as cluster:
             rows = (
                 row if isinstance(row, dict) else dict(row)
                 for row in cluster.execute_query(stmt).rows()

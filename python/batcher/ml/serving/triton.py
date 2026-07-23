@@ -29,6 +29,9 @@ def triton_client(
     output_columns: Sequence[str],
     protocol: str = "http",
     model_version: str = "",
+    max_batch_size: int | None = None,
+    pipeline_depth: int = 1,
+    retries: int = 2,
 ) -> type:
     """A `map_batches` class UDF running each batch through a Triton model.
 
@@ -53,6 +56,12 @@ def triton_client(
         output_columns: the model's output tensor names (appended to each batch).
         protocol: ``"http"`` or ``"grpc"``.
         model_version: optional model version (default: server-chosen).
+        max_batch_size: the model's configured Triton batch window. A larger Arrow batch
+            is split into requests of at most this many rows.
+        pipeline_depth: how many requests to keep in flight, so Triton is not idle while
+            the client encodes and decodes. Results stay in input order.
+        retries: retry attempts, with jittered backoff, for a transient Triton failure
+            (a restarting server, a dropped connection).
 
     Returns:
         A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
@@ -63,7 +72,14 @@ def triton_client(
     def connect() -> _TritonServingClient:
         return _TritonServingClient(url, model, list(output_columns), protocol, model_version)
 
-    return serving_udf(connect, input_columns=input_columns, output_columns=output_columns)
+    return serving_udf(
+        connect,
+        input_columns=input_columns,
+        output_columns=output_columns,
+        max_batch_size=max_batch_size,
+        pipeline_depth=pipeline_depth,
+        retries=retries,
+    )
 
 
 class _TritonServingClient:
@@ -78,12 +94,29 @@ class _TritonServingClient:
             else:
                 import tritonclient.http as tc
         except ImportError as exc:  # pragma: no cover - optional extra
-            raise BackendError("Triton needs: pip install 'batcher-engine[triton]'") from exc
+            from batcher._internal.errors import MissingDependencyError
+
+            raise MissingDependencyError.of(
+                feature="Triton serving", provides="tritonclient", extra="triton"
+            ) from exc
         self._tc = tc
         self._client = tc.InferenceServerClient(url=url)
         self._model = model
         self._outputs = outputs
         self._version = version
+
+    def warmup(self) -> None:
+        """Check the model is loaded and serving, before the first real batch.
+
+        `serving_udf` calls this once per worker under its retry, so a worker starting
+        while Triton is still loading waits for it instead of failing the job — and a
+        genuinely absent model is reported now, not after the read stage has run.
+        """
+        ready = getattr(self._client, "is_model_ready", None)
+        if ready is None:  # pragma: no cover - older tritonclient without the probe
+            return
+        if not ready(self._model, model_version=self._version):
+            raise BackendError(f"triton model {self._model!r} is not ready")
 
     def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         infer_inputs = []

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, suggestion
 from batcher.plan.expr_ir import Col, Expr, lit, when
 
 if TYPE_CHECKING:
@@ -47,13 +47,27 @@ def cdc_stored_columns(
     chosen = list(source_columns) if columns is None else list(columns)
     unknown = [c for c in chosen if c not in source_columns]
     if unknown:
-        raise PlanError(f"apply_changes(): unknown column(s) {unknown} in the change feed")
+        hint = suggestion(unknown[0], source_columns)
+        raise PlanError(
+            f"apply_changes(): unknown column(s) {unknown} in the change feed."
+            + (f" {hint}" if hint else "")
+        )
+    if sequence_by not in source_columns:
+        hint = suggestion(sequence_by, source_columns)
+        raise PlanError(
+            f"apply_changes(): sequence_by column {sequence_by!r} is not in the change feed."
+            + (f" {hint}" if hint else "")
+            + f" Feed columns: {sorted(source_columns)}"
+        )
+    missing_keys = [c for c in keys if c not in source_columns]
+    if missing_keys:
+        hint = suggestion(missing_keys[0], source_columns)
+        raise PlanError(
+            f"apply_changes(): key column(s) {missing_keys} are not in the change feed."
+            + (f" {hint}" if hint else "")
+        )
     # `dict.fromkeys` dedupes while preserving first-seen order.
-    stored = list(dict.fromkeys([*keys, *chosen, sequence_by]))
-    missing = [c for c in (*keys, sequence_by) if c not in source_columns]
-    if missing:
-        raise PlanError(f"apply_changes(): change feed is missing column(s) {missing}")
-    return stored
+    return list(dict.fromkeys([*keys, *chosen, sequence_by]))
 
 
 def _latest_per_key(changes: Dataset, keys: list[str], sequence_by: str) -> Dataset:

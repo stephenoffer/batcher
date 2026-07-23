@@ -93,6 +93,17 @@ class EventHubsSource(BrokerSource):
         client = self._client()
         return sorted(int(pid) for pid in client.get_partition_ids())
 
+    def close(self) -> None:
+        """Close the consumer client, releasing its AMQP connection and background threads.
+
+        `BrokerSource.iter_batches` calls this from a `finally`, so it runs even when a
+        consumer abandons the generator mid-stream — previously the AMQP link stayed open
+        until garbage collection, which for a reference cycle never happens.
+        """
+        if self._client_obj is not None:
+            self._client_obj.close()
+            self._client_obj = None
+
     def _poll(self) -> list[BrokerMessage] | None:
         client = self._client()
         messages: list[BrokerMessage] = []

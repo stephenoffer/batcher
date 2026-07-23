@@ -24,6 +24,12 @@ Each of these builds a `Dataset` from data you already hold in the process:
 | `bt.from_pandas(df)` / `bt.from_polars(df)` / `bt.from_numpy(...)` | framework adapters |
 | `bt.from_spark(...)` / `bt.from_dask(...)` / `bt.from_ray_dataset(...)` | distributed-frame adapters |
 | `bt.from_torch(...)` / `bt.from_tf(...)` / `bt.from_huggingface(...)` | framework adapters |
+| `bt.from_duckdb(rel)` | DuckDB relation, or a connection plus a query |
+| `bt.from_dict(d)` / `bt.from_dicts(rows)` / `bt.from_records(rows, columns=...)` | pandas/Polars-spelled aliases |
+| `bt.from_iter(iterable)` | any Python iterable or generator, one row per item |
+| `bt.from_any(obj)` | dispatches on the type of whatever you hold |
+| `bt.concat(frames, how="vertical")` | stack datasets (`vertical`/`vertical_relaxed`/`diagonal`/`horizontal`) |
+| `bt.range(stop)` / `bt.date_range(start, end, interval=...)` | generated ranges |
 
 ## Readers
 
@@ -37,6 +43,8 @@ All readers take a local or cloud path and return a Dataset. `bt.read` infers th
 | `bt.read.lance`, `bt.read.delta`, `bt.read.iceberg`, `bt.read.hudi` | lakehouse tables |
 | `bt.read.images`, `bt.read.audio`, `bt.read.video` | multimodal |
 | `bt.read.sql`, `bt.read.snowflake`, `bt.read.bigquery`, `bt.read.kafka` | external systems |
+
+The pandas and Polars spellings work too, as top-level shorthands for the same lazy readers: `bt.read_csv`, `bt.read_parquet`, `bt.read_json`, `bt.read_ndjson`, `bt.read_ipc`, `bt.read_orc`, `bt.read_avro`, `bt.read_excel`, `bt.read_delta`, `bt.read_iceberg`, and `bt.read_database`. `bt.read_table(name, ...)` constructs any registered connector by name.
 
 ## Dataset transformations
 

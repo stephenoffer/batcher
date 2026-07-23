@@ -189,7 +189,7 @@ def test_adbc_single_query_submission(monkeypatch) -> None:
     def _fake_connect(driver, db_kwargs, conn_kwargs):
         return _SpyConn(log)
 
-    monkeypatch.setattr("batcher.io.formats.sql.adbc._connect", _fake_connect)
+    monkeypatch.setattr("batcher.io.formats.sql.adbc.source._connect", _fake_connect)
     src = ADBCSource(driver="d", db_kwargs={}, query="SELECT * FROM t")
     rows = pa.Table.from_batches(src.read())
     assert rows.num_rows == 2
@@ -205,7 +205,7 @@ def test_adbc_flightsql_partitions_single_submission(monkeypatch) -> None:
     def _fake_connect(driver, db_kwargs, conn_kwargs):
         return _SpyConn(log)
 
-    monkeypatch.setattr("batcher.io.formats.sql.adbc._connect", _fake_connect)
+    monkeypatch.setattr("batcher.io.formats.sql.adbc.source._connect", _fake_connect)
     src = ADBCSource(driver="d", db_kwargs={}, query="SELECT 1", partition=True)
     splits = src.splits()
     assert len(splits) == 2

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
+from batcher.governance._validate import reject_bare_string
 from batcher.plan.expr_ir import Expr, referenced_columns
 from batcher.plan.logical import (
     Aggregate,
@@ -88,7 +89,19 @@ def column_lineage(plan: LogicalPlan, tables: Sequence[str]) -> LineageMap:
         A mapping from output column name to the set of ``(table, column)`` origins whose
         *values* flow into it. A column built only from literals (``lit(1)``) or generated
         (``with_row_index``) maps to the empty set — it has no origin.
+
+    Raises:
+        PlanError: If `tables` is a bare string. It is indexed by a `Scan`'s
+            ``source_id``, so a string yields one *character* per table name — and the
+            result is a plausible-looking lineage map naming tables that do not exist,
+            which is worse than an error in the one analysis a compliance review trusts.
     """
+    reject_bare_string(
+        tables,
+        what="column_lineage(tables=...)",
+        param="tables",
+        reads_as="one table per character",
+    )
     return _lineage(plan, tables)
 
 

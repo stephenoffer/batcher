@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from batcher._internal.errors import PlanError
 
 
 @pytest.fixture
@@ -80,11 +81,14 @@ def test_unpivot_several_columns(duck):
 def test_pivot_with_a_non_aggregate_rejects(t):
     """PIVOT's expression must be an aggregate — a bare column cannot widen.
 
-    sqlglot rejects this at parse time, before the translator sees it, so the assertion is
-    simply that it fails loudly. The translator keeps its own check anyway: it runs on the
-    parsed AST and must not assume the parser is the only caller.
-    """
-    import sqlglot.errors
+    sqlglot rejects this at parse time, before the translator sees it. The assertion is
+    that it fails loudly *as a Batcher error*: a parse failure is wrapped in `PlanError`
+    so a caller catches one exception type for every plan-time problem rather than
+    importing sqlglot to name its own. This test previously accepted the bare
+    `sqlglot.errors.ParseError`, which is the leak that wrapping closes.
 
-    with pytest.raises((NotImplementedError, sqlglot.errors.ParseError), match=r"[Aa]ggregat"):
+    The translator keeps its own check anyway: it runs on the parsed AST and must not
+    assume the parser is the only caller, hence `NotImplementedError` is still allowed.
+    """
+    with pytest.raises((NotImplementedError, PlanError), match=r"[Aa]ggregat"):
         bt.sql("SELECT * FROM t PIVOT (v FOR k IN ('a'))", t=t).collect()

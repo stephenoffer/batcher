@@ -184,20 +184,18 @@ class MediaSource:
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         """Read every file-batch (the bounded-source / `collect()` path).
 
-        `read()` returns all batches, so every payload is resident regardless — which
-        lets it fetch *all* files in one wide concurrent wave (a single thread pool) and
-        then slice them into `batch_files`-sized batches, rather than spinning a fresh
-        pool and blocking on a serial read per file-batch. That removes the per-chunk pool
-        churn + cross-chunk serialization that held image/clip ingest well under the raw
-        parallel-read rate. `iter_batches` keeps its per-chunk streaming for the
-        bounded-memory (larger-than-RAM) consumer, where reading everything up front would
-        defeat the point.
+        `read()` returns all batches at once, so it fetches *all* files in one wide
+        concurrent wave (a single thread pool) and slices them into `batch_files`-sized
+        batches — removing the per-chunk pool churn + cross-chunk serialization of a fresh
+        pool per file-batch that held image/clip ingest under the raw parallel-read rate.
+        `iter_batches` keeps its per-chunk streaming for the larger-than-RAM consumer.
         """
         files = self._files()
         chunks = self._chunks()
         if len(chunks) <= 1:
             return list(self.iter_batches(projection))
-        reads = self._read_chunk(files)  # one concurrent wave over every file
+        # one concurrent wave over every file, header-only when `bytes` is projected away
+        reads = self._read_chunk(files, self._effective_materialize(projection))
         out: list[pa.RecordBatch] = []
         start = 0
         for chunk in chunks:
@@ -208,16 +206,26 @@ class MediaSource:
         return out
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        materialize = self._effective_materialize(projection)
         for chunk in self._chunks():
-            batch = self._build_batch(chunk)
+            batch = self._build_batch(chunk, materialize)
             yield batch.select(projection) if projection is not None else batch
+
+    def _effective_materialize(self, projection: list[str] | None) -> bool:
+        """Whether the ``bytes`` payload must actually be read for this projection.
+
+        A projection that drops ``bytes`` (``select("uri", "width")``) needs no payload, so
+        the read collapses to header-only — otherwise every payload is fetched then thrown
+        away by the ``.select``, making a metadata query over GB videos a full download.
+        """
+        return self._materialize_bytes and (projection is None or "bytes" in projection)
 
     def row_count(self) -> int | None:
         """The number of media files — known from listing, without reading data."""
         return len(self._files())
 
     def identity(self) -> str:
-        return f"{self.format_name}:{self._path}"
+        return f"{self.format_name}:{self._path}{'' if self._with_meta else ':nometa'}"
 
     def statistics(self) -> SourceStatistics:
         """Row count, total bytes and a `size` zone map — all from the listing.
@@ -288,14 +296,14 @@ class MediaSource:
         ]
 
     # ---- batch assembly ---------------------------------------------------
-    def _build_batch(self, chunk: list[str]) -> pa.RecordBatch:
+    def _build_batch(self, chunk: list[str], materialize: bool) -> pa.RecordBatch:
         """Assemble one Arrow `RecordBatch` from a chunk of files (no decode).
 
-        In reference mode (`materialize_bytes=False`) the ``bytes`` column is null
-        and only the header + size are touched per file — so a chunk of GB videos
-        costs kilobytes, not gigabytes.
+        `materialize` False (reference mode, or a projection that drops ``bytes``) leaves
+        the ``bytes`` column null and touches only the header + size — so a chunk of GB
+        videos costs kilobytes, not gigabytes.
         """
-        return self._assemble(chunk, self._read_chunk(chunk))
+        return self._assemble(chunk, self._read_chunk(chunk, materialize))
 
     def _assemble(
         self, chunk: list[str], reads: list[tuple[bytes, bytes | None, int]]
@@ -335,16 +343,23 @@ class MediaSource:
             names.append(name)
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
-    def _read_chunk(self, chunk: list[str]) -> list[tuple[bytes, bytes | None, int]]:
+    def _read_chunk(
+        self, chunk: list[str], materialize: bool
+    ) -> list[tuple[bytes, bytes | None, int]]:
         """Read every file in ``chunk`` concurrently, preserving order.
 
         Each media file is one object-store round trip; the read releases the GIL, so a
         serial per-file loop leaves a many-file scan latency-bound on a single connection
         (the ingest bottleneck for a directory of many small images/clips). The pool is
         capped so a large chunk does not open an unbounded number of connections at once.
+        `materialize` chooses full-payload vs header-only reads (False in reference mode or
+        when a projection drops ``bytes``).
         """
+        from functools import partial
+
+        read = partial(self._read_payload_safe, materialize=materialize)
         if len(chunk) <= 1:
-            return [self._read_payload_safe(chunk[0])] if chunk else []
+            return [read(chunk[0])] if chunk else []
         from concurrent.futures import ThreadPoolExecutor
 
         # Latency-bound tiny-file reads scale with concurrency well past core count; cap
@@ -352,12 +367,14 @@ class MediaSource:
         # are thread-safe under fan-out — unlike a footer *parse*, which is not).
         workers = min(len(chunk), max(8, available_cpu_count() * 2), 64)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(self._read_payload_safe, chunk))  # order preserved
+            return list(pool.map(read, chunk))  # order preserved
 
-    def _read_payload_safe(self, path: str) -> tuple[bytes, bytes | None, int] | None:
+    def _read_payload_safe(
+        self, path: str, materialize: bool
+    ) -> tuple[bytes, bytes | None, int] | None:
         """`_read_payload`, honoring `on_error` — None marks a file to drop."""
         try:
-            return self._read_payload(path)
+            return self._read_payload(path, materialize)
         except Exception as exc:
             if not self._errors.tolerate(path, exc, format_name=self.format_name):
                 raise
@@ -381,14 +398,14 @@ class MediaSource:
         """
         return self._errors.skipped()
 
-    def _read_payload(self, path: str) -> tuple[bytes, bytes | None, int]:
+    def _read_payload(self, path: str, materialize: bool) -> tuple[bytes, bytes | None, int]:
         """Return ``(header_bytes, payload_or_None, size)`` for one file.
 
-        Full mode reads the whole file (header == payload, size == len). Reference
-        mode reads only a header chunk (for MIME + metadata) and stats the size,
-        leaving the payload `None` — so no GB payload is ever resident.
+        With `materialize` the whole file is read (header == payload, size == len); without
+        it only a header chunk is read and the size is a stat, leaving the payload `None` —
+        so no GB payload is ever resident.
         """
-        if self._materialize_bytes:
+        if materialize:
             with self._fs.open(path) as fh:
                 data = fh.read()
             return data, data, len(data)

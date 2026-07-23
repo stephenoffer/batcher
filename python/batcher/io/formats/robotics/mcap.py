@@ -27,6 +27,7 @@ time-alignment step every perception and ADAS pipeline starts with.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from typing import IO, Any, ClassVar
 
@@ -68,7 +69,11 @@ _MESSAGES_PER_BATCH = 8_192
 def _require_mcap() -> Any:
     """Import and return the `mcap` reader factory, or raise `BackendError`."""
     return require(
-        'mcap.reader', 'make_reader', feature='MCAP support', provides='the mcap package', extra='robotics'
+        "mcap.reader",
+        "make_reader",
+        feature="MCAP support",
+        provides="the mcap package",
+        extra="robotics",
     )
 
 
@@ -113,6 +118,27 @@ class MCAPSource(FileSource):
     def schema(self) -> pa.Schema:
         """The message schema, which is fixed and needs no file access."""
         return MCAP_SCHEMA
+
+    def identity(self) -> str:
+        """The stats key, made distinct per `topics` restriction.
+
+        A `topics=` restriction is a *different relation* from the whole log — it has a
+        different row count and different `log_time` bounds (`statistics()` already reports
+        the restricted count), so it MUST get its own key. Without this, a source pinned to
+        ``/gps`` and one pinned to ``/lidar`` share the base `format:path` key and Kyber
+        hands one topic's cardinalities to the other — the same class of silent collision
+        the SQL sources fold their connection into `connection_fingerprint` to avoid.
+
+        Returns:
+            The base file identity, suffixed with a digest of the sorted topic set when
+            `topics` is set.
+        """
+        base = super().identity()
+        if self._topics is None:
+            return base
+        digest = hashlib.sha256("\n".join(sorted(self._topics)).encode()).hexdigest()[:16]
+        sep = "&" if "#" in base else "#"
+        return f"{base}{sep}topics={digest}"
 
     # ---- reading ----------------------------------------------------------
     def read(

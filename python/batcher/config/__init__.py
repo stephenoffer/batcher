@@ -25,6 +25,23 @@ from batcher.config.config import (
     config_context,
     set_config,
 )
+from batcher.config.logs import (
+    disable_logging,
+    enable_logging,
+    get_logger,
+    set_log_level,
+    set_progress,
+    set_verbosity,
+)
+from batcher.config.options import (
+    describe_options,
+    get_option,
+    option_context,
+    option_names,
+    reset_option,
+    set_option,
+)
+from batcher.config.serde import config_to_dict, env_var_names
 
 __all__ = [
     "CardinalityConfig",
@@ -42,5 +59,19 @@ __all__ = [
     "ShuffleTlsConfig",
     "active_config",
     "config_context",
+    "config_to_dict",
+    "describe_options",
+    "disable_logging",
+    "enable_logging",
+    "env_var_names",
+    "get_logger",
+    "get_option",
+    "option_context",
+    "option_names",
+    "reset_option",
     "set_config",
+    "set_log_level",
+    "set_option",
+    "set_progress",
+    "set_verbosity",
 ]

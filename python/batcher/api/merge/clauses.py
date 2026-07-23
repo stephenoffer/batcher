@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, suggestion
 from batcher.plan.expr_ir import Col, Expr
 
 if TYPE_CHECKING:
@@ -65,6 +65,25 @@ _ACTIONS = {
     NOT_MATCHED: ("insert",),
     NOT_MATCHED_BY_SOURCE: ("update", "delete"),
 }
+
+# The SQL clause label and the builder methods legal for each population — used to
+# reject an impossible combination (an insert on a matched clause, a delete on a
+# not-matched clause) at build time with a message that names the fix.
+CLAUSE_LABEL = {
+    MATCHED: "WHEN MATCHED",
+    NOT_MATCHED: "WHEN NOT MATCHED",
+    NOT_MATCHED_BY_SOURCE: "WHEN NOT MATCHED BY SOURCE",
+}
+CLAUSE_METHODS = {
+    MATCHED: "update(), update_all(), or delete()",
+    NOT_MATCHED: "insert() or insert_all()",
+    NOT_MATCHED_BY_SOURCE: "update(), update_all(), or delete()",
+}
+
+
+def legal_actions(kind: str) -> tuple[str, ...]:
+    """The actions a clause of population `kind` may take (``"update"``/``"delete"``/...)."""
+    return _ACTIONS.get(kind, ())
 
 
 def source_name(column: str) -> str:
@@ -153,9 +172,11 @@ def validate_clause(clause: MergeClause, target_columns: list[str]) -> None:
 
     for column in clause.values or {}:
         if column not in target_columns:
+            hint = suggestion(column, target_columns)
             raise PlanError(
-                f"merge(): {clause.kind} clause writes unknown target column {column!r} "
-                f"(target columns: {target_columns})"
+                f"merge(): {clause.kind} clause writes unknown target column {column!r}."
+                + (f" {hint}" if hint else "")
+                + f" Target columns: {target_columns}"
             )
 
     referenced = _referenced(clause)

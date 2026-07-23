@@ -538,6 +538,48 @@ print(out.to_pydict())
 # {'clean': ['ANN'], 'padded': ['0007']}
 ```
 
+An expression carries the pandas names as well, so a ported column computation runs
+without a find-and-replace pass: `astype`, `isna`, `isnull`, `notna`, `notnull`,
+`fillna`, `isin`, `nunique`, `rename`, `skew`, `kurt`, `prod`, `any`, `all`, `log`
+(numpy's natural logarithm), and the cumulative `cumsum`, `cummax`, `cummin`,
+`cumcount`. Each operator has its pandas method form too (`add`,
+`sub`, `mul`, `truediv`, `div`, `floordiv`, `mod`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`),
+along with `and_`, `or_`, `not_`, and `xor` for the boolean operators that Python's
+keywords can't express.
+
+```python
+sales = bt.from_pydict({"units": [2, None, 5], "price": [10, 20, 30]})
+print(sales.select(
+    revenue=bt.col("units").fillna(0).mul(bt.col("price")),
+    missing=bt.col("units").isna(),
+).to_pydict())
+# {'revenue': [20, 0, 150], 'missing': [False, True, False]}
+```
+
+The typed accessors follow the same rule. `.str` answers to Python's own string
+predicates `isdigit`, `isalpha`, `isalnum`, and `isspace`, and to Polars'
+`strip_prefix` / `strip_suffix`. `.dt` takes the snake_case `day_of_week`,
+`day_of_year`, and `week_of_year`. `.list` takes `lengths`, PySpark's `element_at`, and
+numpy's `argmin` / `argmax`.
+
+```python
+records = bt.from_pydict({"code": ["123", "a1"], "tags": [[3, 1, 2], [5]]})
+print(records.select(
+    numeric=bt.col("code").str.isdigit(),
+    n=bt.col("tags").list.lengths(),
+    smallest=bt.col("tags").list.argmin(),
+    second=bt.col("tags").list.element_at(1),
+).to_pydict())
+# {'numeric': [True, False], 'n': [3, 1], 'smallest': [1, 0], 'second': [1, None]}
+```
+
+A few ecosystem names are deliberately missing, because they don't mean the same thing
+here. `str.find` and `str.index` are absent because `position` is 1-based and returns 0
+when the substring is absent, where pandas returns a 0-based index and -1. `str.islower`
+and `str.isupper` are absent because Batcher's `is_lower` / `is_upper` are true for a
+string with no cased characters, where Python's are false. Use `str.slice` rather than a
+`substring` alias, and `str.regexp_count` for pandas' regex `count`.
+
 ## Feature engineering for data science
 
 The expression layer carries the transforms a model pipeline needs, so feature

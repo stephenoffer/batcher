@@ -84,6 +84,42 @@ def test_map_stage_options(num_gpus, accel, resources, expected):
     assert _gpu_options(num_gpus, accel, resources) == expected
 
 
+def test_custom_resources_are_reserved_in_the_placement_bundle():
+    """The regression: a bundle reserves by resource, so a `TPU`/`neuron_cores` request that
+    lived only in `.options()` reserved nothing. The gang was then placed on nodes that
+    satisfied CPU alone, and every task afterwards demanded an accelerator its own bundle
+    never held — pending forever on a CPU node rather than failing."""
+    from batcher.dist.executors.ray_runtime.scheduling import _bundle
+
+    bundle = _bundle(SchedulingEnvelope(num_cpus=2.0, resources=(("TPU", 4.0),)), node_class={})
+    assert bundle == {"CPU": 2.0, "TPU": 4.0}
+
+
+def test_gpu_and_cpu_bundles_are_unchanged():
+    """Added reach, not a behavior change: the GPU and CPU bundles must be byte-identical."""
+    from batcher.dist.executors.ray_runtime.scheduling import _bundle
+
+    assert _bundle(SchedulingEnvelope(num_gpus=1.0), node_class={}) == {"CPU": 1.0, "GPU": 1.0}
+    assert _bundle(SchedulingEnvelope(), node_class={}) == {"CPU": 1.0}
+
+
+def test_a_resources_only_stage_forces_distribution():
+    """The regression: `distributed="auto"` looked only at `num_gpus`, so a TPU/Trainium
+    stage — which carries `num_gpus == 0` plus a custom resource — was invisible to the
+    predicate and got routed by input size alone, running on the CPU-only driver and never
+    reaching the accelerator nodes it asked for."""
+    import batcher as bt
+    from batcher.api.terminal.routing import _plan_has_gpu_stage
+
+    tpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, resources={"TPU": 4})
+    assert _plan_has_gpu_stage(tpu._plan) is True
+    # The GPU and plain-CPU verdicts are unchanged.
+    gpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, num_gpus=1)
+    assert _plan_has_gpu_stage(gpu._plan) is True
+    cpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b)
+    assert _plan_has_gpu_stage(cpu._plan) is False
+
+
 def test_public_api_threads_resources_to_the_plan():
     import batcher as bt
 
@@ -160,3 +196,23 @@ def test_out_of_memory_is_recognized_across_accelerators(message, is_oom):
     from batcher.ml.inference import _is_cuda_oom
 
     assert _is_cuda_oom(RuntimeError(message)) is is_oom
+
+
+def test_a_non_gpu_accelerator_stage_is_costed_as_inference():
+    """The regression: the inference cost factor gated on `num_gpus > 0`, so a TPU/Trainium
+    stage — `num_gpus == 0` plus a custom resource — was costed as a trivial column map, the
+    cheapest node in the plan. Kyber then had no reason to push a filter below it, losing the
+    optimization on exactly the hardware whose forward pass is most expensive."""
+    import batcher as bt
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.cost import CostModel
+
+    base = bt.from_pydict({"x": list(range(100))})
+    model = CostModel(CardinalityEstimator(base._sources))
+    plain = base.ml.map_batches(lambda b: b)._plan
+    tpu = base.ml.map_batches(lambda b: b, resources={"TPU": 4}, model_memory_gb=8.0)._plan
+    gpu = base.ml.map_batches(lambda b: b, num_gpus=1, model_memory_gb=8.0)._plan
+
+    assert model.op_cost(tpu).cpu > model.op_cost(plain).cpu
+    # And it is costed the same as the equivalent GPU stage — the device differs, not the work.
+    assert model.op_cost(tpu).cpu == model.op_cost(gpu).cpu

@@ -467,6 +467,6 @@ class ParquetSource(FileSource):
         from batcher.io.stats import parquet_statistics
 
         try:
-            return parquet_statistics(self._fs, self._files(), self.schema())
+            return self._stats_apply(parquet_statistics(self._fs, self._files(), self.schema()))
         except Exception:
             return None

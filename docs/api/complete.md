@@ -15,20 +15,38 @@ register SQL functions or sessions.
    :nosignatures:
 
    from_pydict
+   from_dict
    from_pylist
+   from_dicts
+   from_records
    from_items
+   from_iter
    from_arrow
    from_batches
    from_numpy
    from_pandas
    from_polars
+   from_duckdb
    from_spark
    from_dask
    from_huggingface
    from_torch
    from_tf
    from_ray_dataset
+   from_any
    read
+   read_table
+   read_csv
+   read_parquet
+   read_json
+   read_ndjson
+   read_ipc
+   read_orc
+   read_avro
+   read_excel
+   read_delta
+   read_iceberg
+   read_database
    read_memory
    sql
    streams
@@ -38,6 +56,8 @@ register SQL functions or sessions.
    compact
    vacuum
    engine_version
+   versions
+   show_versions
    start_ui
    stop_ui
    ui_url
@@ -117,6 +137,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    nanvl
    width_bucket
    concat
+   concat_str
    concat_ws
    format_string
    mask
@@ -250,6 +271,52 @@ Read and override the engine tunables. See the [configuration guide](configurati
 
 ```{eval-rst}
 .. autofunction:: batcher.config.active_config
+```
+
+### Options by name
+
+Address any tunable by its dotted path, in the style of `pandas.set_option` and
+`spark.conf.set`. See the [configuration guide](../configuration/index.md).
+
+```{eval-rst}
+.. autofunction:: batcher.config.get_option
+.. autofunction:: batcher.config.set_option
+.. autofunction:: batcher.config.reset_option
+.. autofunction:: batcher.config.option_context
+.. autofunction:: batcher.config.option_names
+.. autofunction:: batcher.config.describe_options
+```
+
+### Serialization
+
+```{eval-rst}
+.. autofunction:: batcher.config.config_to_dict
+.. autofunction:: batcher.config.env_var_names
+```
+
+### Logging and verbosity
+
+One-line switches over `ObservabilityConfig`. See
+[observability](../user-guide/observability.md).
+
+```{eval-rst}
+.. autofunction:: batcher.config.set_log_level
+.. autofunction:: batcher.config.enable_logging
+.. autofunction:: batcher.config.disable_logging
+.. autofunction:: batcher.config.set_verbosity
+.. autofunction:: batcher.config.set_progress
+.. autofunction:: batcher.config.get_logger
+```
+
+### Metrics export
+
+Process-wide counters as plain data, for Prometheus, OpenTelemetry, or a log line.
+
+```{eval-rst}
+.. autofunction:: batcher.observe.metrics_snapshot
+.. autofunction:: batcher.observe.prometheus_text
+.. autofunction:: batcher.observe.start_metrics
+.. autofunction:: batcher.observe.reset_metrics
 ```
 
 ## Dataset

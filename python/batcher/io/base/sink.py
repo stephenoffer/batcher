@@ -9,6 +9,7 @@ The `Sink` protocol itself lives in `io.sink`; this base structurally satisfies 
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,7 @@ from typing import IO, Any, ClassVar
 import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
+from batcher.io.base._paths import normalize_path
 from batcher.io.filesystem import FileSystem, resolve_filesystem
 from batcher.io.manifest import WriteManifest, WrittenFile
 
@@ -93,6 +95,18 @@ class FileSink(ABC):
             path, filesystem=self._filesystem, storage_options=self._storage_options
         )
 
+    @staticmethod
+    def _dest(path: Any) -> str:
+        """The destination as a plain string URI, from a `Path`/`os.PathLike`/``~`` value.
+
+        Writers take a destination from the same vocabulary readers take a source from, so
+        the coercion is the same one (`io.base._paths.normalize_path`) rather than a second
+        set of rules. Applied at each public entry point, because the path is not only
+        resolved to a filesystem — it is also recorded in the returned `WrittenFile`, and a
+        manifest holding a `PosixPath` breaks the commit that reads it back.
+        """
+        return normalize_path(path, what="the write destination")
+
     def write(self, table: pa.Table, path: str, *, resume: bool = False) -> WrittenFile:
         """Write the whole table to a single file at `path`, atomically.
 
@@ -120,6 +134,7 @@ class FileSink(ABC):
         Returns:
             The file that was written, with its row count and size on storage.
         """
+        path = self._dest(path)
         fs = self._resolve(path)
         if resume and fs.exists(path):
             return WrittenFile(path=path, rows=table.num_rows, bytes=_safe_size(fs, path))
@@ -165,6 +180,7 @@ class FileSink(ABC):
         """
         from itertools import chain
 
+        path = self._dest(path)
         fs = self._resolve(path)
         if resume and fs.exists(path):
             # Atomic writes ⇒ an existing file is a complete one; skip the redone work.
@@ -247,6 +263,7 @@ class FileSink(ABC):
         Returns:
             One entry per file this shard wrote.
         """
+        path = self._dest(path)
         fs = self._resolve(path)
         if not partition_by:
             fs.mkdirs(path, exist_ok=True)
@@ -315,11 +332,21 @@ class FileSink(ABC):
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(_write_chunk, chunks))  # order preserved
 
-    def commit(self, manifest: WriteManifest, path: str) -> None:  # noqa: B027 (intentional no-op default)
-        """Finalize a write — a no-op here, since file sinks publish on write.
+    def commit(self, manifest: WriteManifest, path: str) -> None:
+        """Finalize a write by publishing a `_SUCCESS` completion marker.
+
+        A file sink publishes each data file as it is written, so there is nothing to make
+        visible at commit time. What was missing is a way to tell a *complete* output
+        directory from a half-written one: a distributed write that died at 90% leaves a
+        directory of valid Parquet files that reads back cleanly and silently short. The
+        marker is written only after every shard's manifest has been merged, so its presence
+        means the write finished. Readers skip `_`-prefixed files, so it never joins the data.
+
+        Best-effort: a sink whose filesystem rejects the marker still has its data committed,
+        so a marker failure must not fail an otherwise successful write.
 
         Transactional (lakehouse) sinks override this to commit the manifest's files
-        atomically into a transaction log.
+        atomically into a transaction log instead.
 
         Examples:
             .. doctest::
@@ -331,6 +358,28 @@ class FileSink(ABC):
             manifest: Every file the write produced, merged across shards.
             path: The write's destination root.
         """
+        if not self._is_directory_write(manifest, path):
+            return
+        # Suppressed narrowly: a filesystem that rejects the marker (read-only mount, missing
+        # PUT permission) must not fail a write whose data is already durable. A broader
+        # `except Exception` here would also swallow a bug in this method itself.
+        with contextlib.suppress(OSError):
+            fs = self._resolve(path)
+            # `atomic_writer` publishes via a temp file + rename, so a marker is never
+            # observed half-written — a reader either sees a complete write or no marker.
+            with fs.atomic_writer(f"{path.rstrip('/')}/_SUCCESS") as out:
+                out.write(b"")
+
+    @staticmethod
+    def _is_directory_write(manifest: WriteManifest, path: str) -> bool:
+        """Whether `path` is a directory of data files rather than a single output file.
+
+        A plain single-node `write.parquet("out.parquet")` produces one file *at* `path`, and
+        `path/_SUCCESS` would be a nonsense location inside it. A partitioned or sharded write
+        produces files *under* `path`, which is where a completion marker belongs.
+        """
+        root = path.rstrip("/")
+        return bool(manifest.files) and all(f.path.rstrip("/") != root for f in manifest.files)
 
     @staticmethod
     def _hive_partition(

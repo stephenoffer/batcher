@@ -96,6 +96,14 @@ class KinesisSource(BrokerSource):
         the rest. Reading only the first page looked like it worked — it just silently
         skipped every shard past the hundredth, which on a large stream is most of the
         data. Note that `StreamName` and `NextToken` are mutually exclusive in the API.
+
+        The result is cached for the life of the source. That is correct across a
+        *restart* — a fresh source re-lists, and `_shard_map` keys everything on stable
+        shard numbers so a reshard is handled (see `_shard_map`). It does mean a shard
+        created **mid-run**, without a restart, is not discovered until the next planning
+        cycle; a continuous consumer that must pick up splits live needs a periodic
+        re-list, which is a driver-timed change left for when there is a live stream to
+        validate it against.
         """
         if self._shard_ids is None:
             client = self._client()
@@ -111,28 +119,53 @@ class KinesisSource(BrokerSource):
             self._shard_ids = shard_ids
         return self._shard_ids
 
+    def _shard_map(self) -> dict[int, str]:
+        """The stream's shards keyed by their **stable** shard number, not list position.
+
+        This is the whole of the reshard-correctness fix. A checkpoint is
+        ``{partition: sequence_number}``, and a Kinesis sequence number is only valid
+        against the shard that produced it. When `partition` was the shard's *position*
+        in `list_shards`, a reshard — a split or merge, the routine event partitioning
+        exists to handle — shifted every position, so a sequence checkpointed for
+        position 2 was replayed against whatever shard now sat at position 2:
+        ``AFTER_SEQUENCE_NUMBER`` with a foreign sequence, silently skipping or
+        re-reading records across the restart.
+
+        A Kinesis ShardId is ``shardId-`` followed by a zero-padded, monotonically
+        assigned number that never moves once created, so parsing it gives an identity
+        that survives a reshard. A non-standard id (a test stub, a future format) falls
+        back to a deterministic `sha256` — stable across processes, unlike `hash()`.
+        """
+        return {_shard_number(shard_id): shard_id for shard_id in self._shards()}
+
     def _discover_partitions(self) -> list[int]:
         if self._partitions is not None:
             return list(self._partitions)
-        return list(range(len(self._shards())))
+        return sorted(self._shard_map())
 
-    def _active_shards(self) -> list[str]:
-        shards = self._shards()
-        if self._partitions is None:
-            return shards
-        return [shards[i] for i in self._partitions if i < len(shards)]
+    def _active_shards(self) -> list[tuple[int, str]]:
+        """``(shard_number, shard_id)`` for the shards this reader should poll.
 
-    def _iterator(self, shard_id: str, shard_index: int) -> str:
+        A requested partition whose shard is no longer in the stream is dropped — but
+        that is not the silent loss the old positional code risked: a shard absent from
+        ``list_shards`` has been closed by a reshard, its records already drained through
+        its children, which appear under their own new numbers.
+        """
+        shard_map = self._shard_map()
+        numbers = self._partitions if self._partitions is not None else sorted(shard_map)
+        return [(n, shard_map[n]) for n in numbers if n in shard_map]
+
+    def _iterator(self, shard_id: str, shard_number: int) -> str:
         """A shard iterator, resuming after a checkpointed sequence when present.
 
         On recovery ``seek`` records the raw sequence number in ``_resume_from``
-        (keyed by shard index); the iterator is then obtained with
+        (keyed by the stable shard number); the iterator is then obtained with
         ``AFTER_SEQUENCE_NUMBER`` so no record is replayed or skipped. Otherwise
         the configured ``iterator_type`` (``TRIM_HORIZON`` / ``LATEST``) applies.
         """
         if shard_id not in self._iterators:
             client = self._client()
-            resume = self._resume_from.get(shard_index)
+            resume = self._resume_from.get(shard_number)
             if resume is not None:
                 resp = client.get_shard_iterator(
                     StreamName=self.topic,
@@ -152,9 +185,9 @@ class KinesisSource(BrokerSource):
     def _poll(self) -> list[BrokerMessage] | None:
         client = self._client()
         messages: list[BrokerMessage] = []
-        for shard_index, shard_id in enumerate(self._active_shards()):
+        for shard_number, shard_id in self._active_shards():
             resp = client.get_records(
-                ShardIterator=self._iterator(shard_id, shard_index),
+                ShardIterator=self._iterator(shard_id, shard_number),
                 Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
             )
             next_iter = resp.get("NextShardIterator")
@@ -165,7 +198,7 @@ class KinesisSource(BrokerSource):
                 messages.append(
                     BrokerMessage(
                         value=rec["Data"],
-                        partition=shard_index,
+                        partition=shard_number,
                         offset=_seq_to_offset(rec["SequenceNumber"]),
                         # The raw sequence is the resume token (the int64 offset is a
                         # lossy hash); `AFTER_SEQUENCE_NUMBER` needs the exact string.
@@ -176,6 +209,22 @@ class KinesisSource(BrokerSource):
                     )
                 )
         return messages
+
+
+def _shard_number(shard_id: str) -> int:
+    """The stable numeric identity of a Kinesis shard, from its ShardId.
+
+    A ShardId is ``shardId-`` followed by a zero-padded number assigned once and never
+    reused, so the number is a durable partition key — unlike the shard's position in a
+    `list_shards` response, which a reshard reorders. A ShardId that does not fit the
+    format (a test stub, a hypothetical future scheme) falls back to a deterministic
+    `sha256`: stable across processes and workers, which `hash()` is not, so a checkpoint
+    still round-trips to the same shard after a restart.
+    """
+    _, _, suffix = shard_id.partition("shardId-")
+    if suffix.isdigit():
+        return int(suffix)
+    return int.from_bytes(hashlib.sha256(shard_id.encode("utf-8")).digest()[:8], "big") % (1 << 63)
 
 
 def _seq_to_offset(sequence_number: str) -> int:

@@ -246,7 +246,11 @@ def test_broker_split_is_picklable():
     )
     restored = pickle.loads(pickle.dumps(split))
     assert restored.partition == 3
-    assert restored.identity() == "kafka:t:p3"
+    # The identity now carries a connection fingerprint too, so the same topic name on two
+    # clusters is two relations rather than one shared statistics key. Asserted as a prefix
+    # plus round-trip stability — see `test_streaming_connector_audit.py` for the contract.
+    assert restored.identity().startswith("kafka:t:p3:")
+    assert restored.identity() == split.identity()
 
 
 # --------------------------------------------------------------------------

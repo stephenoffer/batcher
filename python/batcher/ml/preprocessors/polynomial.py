@@ -17,7 +17,7 @@ from operator import mul
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor
+from batcher.ml.preprocessors.base import Preprocessor, columns_arg
 from batcher.plan.expr_ir import Expr, col, lit
 
 if TYPE_CHECKING:
@@ -26,6 +26,12 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["PolynomialFeatures"]
+
+# The default ceiling on how many terms an expansion may add. Every term is a separate
+# projection the engine evaluates over every row, so the term count is the width of the
+# output *and* the per-row work. 1,000 is generous — it admits degree 2 over 44 columns
+# and degree 3 over 17 — while still catching the combinatorial blowups.
+MAX_TERMS = 1000
 
 
 def _poly_name(combo: tuple[str, ...]) -> str:
@@ -60,19 +66,24 @@ class PolynomialFeatures(Preprocessor):
         degree: the maximum total degree of the added terms (must be ≥ 2).
         interaction_only: keep only distinct-factor cross terms (drop pure powers) when True.
         include_bias: add a constant ``bias`` column of 1.0 when True.
+        max_terms: the ceiling on how many terms the expansion may add. The term count is
+            combinatorial in ``degree`` and the column count (degree 3 over 20 columns is
+            1,540 new columns), so this fails an accidental explosion instead of silently
+            building it.
     """
 
-    __slots__ = ("columns", "degree", "include_bias", "interaction_only")
+    __slots__ = ("columns", "degree", "include_bias", "interaction_only", "max_terms")
 
     def __init__(
         self,
-        columns: Sequence[str],
+        columns: str | Sequence[str],
         *,
         degree: int = 2,
         interaction_only: bool = False,
         include_bias: bool = False,
+        max_terms: int = MAX_TERMS,
     ) -> None:
-        self.columns = list(columns)
+        self.columns = columns_arg(columns, what="PolynomialFeatures")
         if not self.columns:
             raise PlanError("PolynomialFeatures requires at least one column")
         if degree < 2:
@@ -82,6 +93,7 @@ class PolynomialFeatures(Preprocessor):
         self.degree = degree
         self.interaction_only = interaction_only
         self.include_bias = include_bias
+        self.max_terms = max_terms
 
     def transform(self, ds: Dataset) -> Dataset:
         """Add the degree-2..`degree` product terms of the fitted columns.
@@ -103,14 +115,28 @@ class PolynomialFeatures(Preprocessor):
 
         Returns:
             A new lazy `Dataset` with the interaction/power columns added.
+
+        Raises:
+            PlanError: If the expansion would add more than `max_terms` terms.
         """
         self._require_fitted()
+        combos = [
+            combo
+            for total_degree in range(2, self.degree + 1)
+            for combo in combinations_with_replacement(self.columns, total_degree)
+            if not (self.interaction_only and len(set(combo)) != len(combo))
+        ]
+        if len(combos) > self.max_terms:
+            raise PlanError(
+                f"PolynomialFeatures: degree={self.degree} over {len(self.columns)} columns "
+                f"expands to {len(combos)} terms, above max_terms={self.max_terms}. Each term "
+                f"is another projection evaluated over every row. Lower the degree, pass "
+                f"interaction_only=True, expand fewer columns, or raise max_terms to accept "
+                f"the cost."
+            )
         new: dict[str, Expr] = {}
         if self.include_bias:
             new["bias"] = lit(1.0)
-        for total_degree in range(2, self.degree + 1):
-            for combo in combinations_with_replacement(self.columns, total_degree):
-                if self.interaction_only and len(set(combo)) != len(combo):
-                    continue
-                new[_poly_name(combo)] = reduce(mul, (col(c) for c in combo))
+        for combo in combos:
+            new[_poly_name(combo)] = reduce(mul, (col(c) for c in combo))
         return ds.with_columns(**new)

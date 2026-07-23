@@ -116,13 +116,23 @@ def _learned_size(plan: LogicalPlan | None) -> float | None:
 
 
 def _plan_has_gpu_stage(plan: LogicalPlan) -> bool:
-    """Whether any `map_batches` stage requests a GPU (so the query must distribute to
-    reach the cluster's accelerators, whatever its input size)."""
+    """Whether any `map_batches` stage requests an accelerator (so the query must distribute
+    to reach the cluster's accelerators, whatever its input size).
+
+    Both request forms count. Ray reports NVIDIA/AMD/Intel/MetaX as the `GPU` resource, which
+    is `num_gpus`; every other accelerator — `TPU`, `neuron_cores` (Trainium/Inferentia),
+    `HPU` (Gaudi), `NPU` — is a *custom* resource and carries `num_gpus == 0`. Checking only
+    `num_gpus` therefore made exactly the non-CUDA accelerators invisible here, so a TPU or
+    Trainium stage was routed by input size alone and ran locally on the CPU-only driver,
+    never reaching the accelerator nodes it asked for.
+    """
     from batcher.plan.logical import MapBatches
 
     node: LogicalPlan | None = plan
     while node is not None:
-        if isinstance(node, MapBatches) and getattr(node, "num_gpus", 0) > 0:
+        if isinstance(node, MapBatches) and (
+            getattr(node, "num_gpus", 0) > 0 or getattr(node, "resources", ())
+        ):
             return True
         node = getattr(node, "input", None)
     return False

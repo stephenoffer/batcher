@@ -22,7 +22,6 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import PartitionSpec, ScanSource, require_driver
-from batcher.io.formats.sql._common import connection_fingerprint
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.plan.source_stats import SourceStatistics
 
@@ -150,21 +149,25 @@ class MongoSource(ScanSource):
         return None if rows is None else SourceStatistics(row_count=rows, exact_rows=True)
 
     def _identity_suffix(self) -> str:
-        """``<connection>:<db>.<collection>`` — the server is part of the relation's identity.
+        return f"{self._conn_kwargs['database']}.{self._conn_kwargs['collection']}"
 
-        Keyed on ``database.collection`` alone, the same collection name on **production**
-        and on **staging** was one relation: `identity()` is the key learned statistics are
-        stored under, so Kyber applied the billion-document collection's cardinalities to
-        the thousand-document one and picked a plan for data that was not there. Nothing
-        errors — it is a silently worse plan, which is the hardest kind of bug to see.
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """`_conn_kwargs` with the URI's password masked before it is fingerprinted.
 
-        The URI is masked before it is fingerprinted (`redact_mongo_uri`), and the digest is
-        `sha256` rather than `hash()` so the key is stable across processes; a per-run key
-        would make the stats loop look alive while never reusing anything.
+        `ScanSource.identity()` fingerprints the connection so that the same
+        ``database.collection`` on production and on staging are different relations. It
+        drops credentials it can recognize *by key name*, which a Mongo URI defeats: the
+        password lives inside ``mongodb://user:pw@host/db``, in a field named ``uri``.
+
+        Left unmasked, the raw password is digested into `identity()` — the key learned
+        statistics are **persisted** under. Two consequences, both silent. The digest is
+        one-way so the secret does not read back out, but every credential rotation
+        produces a *different key*, orphaning everything Kyber has learned about the
+        collection and returning it to cold estimates on whatever schedule the security
+        team rotates on. Masking the password (and keeping the username, which genuinely
+        identifies the connection) makes the key stable across rotations.
         """
-        kw = self._conn_kwargs
-        fingerprint = connection_fingerprint({"uri": redact_mongo_uri(kw["uri"])})
-        return f"{fingerprint}:{kw['database']}.{kw['collection']}"
+        return {**self._conn_kwargs, "uri": redact_mongo_uri(self._conn_kwargs.get("uri"))}
 
     def _infer_schema(self) -> pa.Schema:
         require_driver("pymongoarrow", "mongo")

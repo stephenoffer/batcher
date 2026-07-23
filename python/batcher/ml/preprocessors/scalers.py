@@ -15,7 +15,7 @@ import operator
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, fit_aggregate
+from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
 from batcher.plan.expr_ir import col, when
 
 if TYPE_CHECKING:
@@ -26,11 +26,9 @@ if TYPE_CHECKING:
 __all__ = ["MaxAbsScaler", "MinMaxScaler", "Normalizer", "RobustScaler", "StandardScaler"]
 
 
-def _check_columns(columns: Sequence[str]) -> list[str]:
-    cols = list(columns)
-    if not cols:
-        raise PlanError("a scaler requires at least one column")
-    return cols
+def _check_columns(columns: str | Sequence[str]) -> list[str]:
+    """Normalize a scaler's `columns`, accepting a single name or a sequence."""
+    return columns_arg(columns, what="a scaler")
 
 
 class StandardScaler(Preprocessor):
@@ -62,7 +60,7 @@ class StandardScaler(Preprocessor):
     __slots__ = ("columns", "mean_", "scale_", "with_mean", "with_std")
 
     def __init__(
-        self, columns: Sequence[str], *, with_mean: bool = True, with_std: bool = True
+        self, columns: str | Sequence[str], *, with_mean: bool = True, with_std: bool = True
     ) -> None:
         self.columns = _check_columns(columns)
         self.with_mean = with_mean
@@ -176,7 +174,7 @@ class MinMaxScaler(Preprocessor):
     __slots__ = ("columns", "data_max_", "data_min_", "feature_range")
 
     def __init__(
-        self, columns: Sequence[str], *, feature_range: tuple[float, float] = (0.0, 1.0)
+        self, columns: str | Sequence[str], *, feature_range: tuple[float, float] = (0.0, 1.0)
     ) -> None:
         self.columns = _check_columns(columns)
         lo, hi = feature_range
@@ -271,7 +269,7 @@ class MaxAbsScaler(Preprocessor):
 
     __slots__ = ("columns", "max_abs_")
 
-    def __init__(self, columns: Sequence[str]) -> None:
+    def __init__(self, columns: str | Sequence[str]) -> None:
         self.columns = _check_columns(columns)
         self.max_abs_: dict[str, float] = {}
 
@@ -358,7 +356,7 @@ class RobustScaler(Preprocessor):
     __slots__ = ("center_", "columns", "iqr_", "quantile_range")
 
     def __init__(
-        self, columns: Sequence[str], *, quantile_range: tuple[float, float] = (25.0, 75.0)
+        self, columns: str | Sequence[str], *, quantile_range: tuple[float, float] = (25.0, 75.0)
     ) -> None:
         self.columns = _check_columns(columns)
         lo, hi = quantile_range
@@ -459,7 +457,7 @@ class Normalizer(Preprocessor):
 
     __slots__ = ("columns", "norm")
 
-    def __init__(self, columns: Sequence[str], *, norm: str = "l2") -> None:
+    def __init__(self, columns: str | Sequence[str], *, norm: str = "l2") -> None:
         self.columns = _check_columns(columns)
         if norm not in ("l1", "l2", "max"):
             raise PlanError(f"norm must be 'l1', 'l2', or 'max', got {norm!r}")

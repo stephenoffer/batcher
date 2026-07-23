@@ -6,9 +6,21 @@ server, a KServe v2-style REST shim). Requests retry with exponential backoff on
 transient failures (connection errors, 429, 5xx) — serving endpoints are flaky at
 scale. For LLM HTTP endpoints, see `batcher.ml.llm.http_engine`.
 
-JSON is fine for scalar/text features; for **tensor** inputs (decoded images,
-embeddings) it is slow and bloated — use `batcher.ml.serving.triton_client`, which
-sends binary tensors. This adapter warns (once) if asked to JSON-encode a tensor.
+JSON is fine for scalar/text features. For **tensor** inputs (decoded images,
+embeddings) nested JSON lists are slow and bloated, and building them costs an
+``O(rows x dims)`` walk through Python objects — the one thing a control plane must
+never do. So a tensor is sent as a compact **binary envelope** instead:
+
+.. code-block:: json
+
+    {"__tensor__": true, "dtype": "<f4", "shape": [3, 4], "data": "<base64>"}
+
+The bytes come straight from the array buffer, so encoding is a C-level `tobytes` plus
+a base64 pass, not a per-element conversion. The same envelope is decoded on the way
+back, so a server may reply in binary too. `tensor_encoding` selects the policy:
+``"auto"`` (binary for rank > 1, plain lists otherwise), ``"binary"``, or ``"json"``
+for the legacy nested-list shape — which still warns, because it is still slow. A
+server that speaks neither wants `batcher.ml.serving.triton_client`.
 """
 
 from __future__ import annotations
@@ -17,7 +29,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import BackendError
-from batcher.ml.serving.base import serving_udf
+from batcher.ml.serving.base import _jittered_backoff, serving_udf
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -25,6 +37,11 @@ if TYPE_CHECKING:
     import numpy as np
 
 __all__ = ["http_client", "post_json"]
+
+#: Marker key identifying a binary tensor envelope in the request/response JSON.
+_TENSOR_KEY = "__tensor__"
+
+_ENCODINGS = ("auto", "binary", "json")
 
 
 def post_json(
@@ -38,8 +55,8 @@ def post_json(
 ) -> dict[str, Any]:
     """POST `payload` as JSON to `url` and return the parsed JSON response.
 
-    Retries up to `retries` times with exponential backoff on connection errors and
-    retryable HTTP status codes (408/425/429/5xx); other 4xx errors fail immediately
+    Retries up to `retries` times with jittered exponential backoff on connection errors
+    and retryable HTTP status codes (408/425/429/5xx); other 4xx errors fail immediately
     (a bad request won't get better by retrying). Raises `BackendError` on exhaustion.
     """
     import json
@@ -60,8 +77,46 @@ def post_json(
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             last = exc
         if attempt < retries:
-            time.sleep(backoff * (2**attempt))
+            time.sleep(_jittered_backoff(backoff, attempt))
     raise BackendError(f"inference endpoint {url} failed after {retries + 1} attempts: {last}")
+
+
+def _encode_value(arr: np.ndarray, encoding: str) -> Any:
+    """One input array → its JSON payload: a binary envelope, or a plain nested list.
+
+    The binary path is ``tobytes`` + base64, both C-level passes over the buffer. The
+    ``tolist`` path it replaces built one Python object per element, which for a batch
+    of decoded images is millions of allocations in the control plane per request.
+    """
+    if encoding == "json" or (encoding == "auto" and getattr(arr, "ndim", 1) <= 1):
+        return arr.tolist()
+    import base64
+
+    import numpy as np
+
+    contiguous = np.ascontiguousarray(arr)
+    return {
+        _TENSOR_KEY: True,
+        "dtype": contiguous.dtype.str,
+        "shape": list(contiguous.shape),
+        "data": base64.b64encode(contiguous.tobytes()).decode("ascii"),
+    }
+
+
+def _decode_value(value: Any) -> np.ndarray:
+    """One response value → NumPy, unwrapping a binary envelope if the server sent one.
+
+    Detection is by shape (``dtype``/``shape``/``data``) rather than the marker key, so
+    a server that emits the envelope without the marker still round-trips.
+    """
+    import numpy as np
+
+    if isinstance(value, dict) and {"dtype", "shape", "data"} <= set(value):
+        import base64
+
+        raw = base64.b64decode(value["data"])
+        return np.frombuffer(raw, dtype=np.dtype(value["dtype"])).reshape(value["shape"])
+    return np.asarray(value)
 
 
 def http_client(
@@ -72,6 +127,7 @@ def http_client(
     headers: dict[str, str] | None = None,
     timeout: float = 30.0,
     retries: int = 3,
+    tensor_encoding: str = "auto",
 ) -> type:
     """A `map_batches` class UDF posting each batch to a JSON inference endpoint.
 
@@ -93,32 +149,54 @@ def http_client(
         headers: optional HTTP headers (e.g. an auth token).
         timeout: per-request timeout in seconds.
         retries: retry attempts with backoff on transient failures.
+        tensor_encoding: how multi-dimensional inputs are sent. ``"auto"`` uses the
+            binary envelope for rank > 1 and plain lists otherwise, ``"binary"`` always
+            uses the envelope, and ``"json"`` keeps the legacy nested-list shape (and
+            warns, because it costs an ``O(rows x dims)`` Python conversion).
 
     Returns:
         A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
+
+    Raises:
+        BackendError: if `tensor_encoding` is not one of ``auto``/``binary``/``json``.
     """
+    if tensor_encoding not in _ENCODINGS:
+        raise BackendError(
+            f"tensor_encoding must be one of {list(_ENCODINGS)}, got {tensor_encoding!r}"
+        )
 
     def connect() -> _HttpServingClient:
-        return _HttpServingClient(url, headers or {}, timeout, retries)
+        return _HttpServingClient(url, headers or {}, timeout, retries, tensor_encoding)
 
-    return serving_udf(connect, input_columns=input_columns, output_columns=output_columns)
+    # `retries=0` here: `post_json` already owns the HTTP retry (it can distinguish a
+    # retryable status from a fatal 4xx, which the generic wrapper cannot). Letting both
+    # layers retry would multiply the attempts and the tail latency.
+    return serving_udf(
+        connect, input_columns=input_columns, output_columns=output_columns, retries=0
+    )
 
 
 class _HttpServingClient:
     """Posts columnar JSON to a REST endpoint (with retry) and parses the response."""
 
-    def __init__(self, url: str, headers: dict[str, str], timeout: float, retries: int) -> None:
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        retries: int,
+        tensor_encoding: str = "auto",
+    ) -> None:
         self._url = url
         self._headers = {"Content-Type": "application/json", **headers}
         self._timeout = timeout
         self._retries = retries
+        self._encoding = tensor_encoding
         self._warned_tensor = False
 
     def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, Any]:
-        import numpy as np
-
-        self._warn_on_tensor_inputs(inputs)
-        payload = {name: arr.tolist() for name, arr in inputs.items()}
+        self._warn_on_json_tensor_inputs(inputs)
+        payload = {name: _encode_value(arr, self._encoding) for name, arr in inputs.items()}
         body = post_json(
             self._url,
             payload,
@@ -126,10 +204,16 @@ class _HttpServingClient:
             timeout=self._timeout,
             retries=self._retries,
         )
-        return {name: np.asarray(values) for name, values in body.items()}
+        return {name: _decode_value(values) for name, values in body.items()}
 
-    def _warn_on_tensor_inputs(self, inputs: dict[str, np.ndarray]) -> None:
-        if self._warned_tensor:
+    def _warn_on_json_tensor_inputs(self, inputs: dict[str, np.ndarray]) -> None:
+        """Warn only when a tensor is *actually* JSON-encoded — i.e. under ``"json"``.
+
+        The warning used to fire and then do the slow thing anyway. Now the default
+        (`"auto"`) sends binary and says nothing; the warning is reserved for the
+        opt-in legacy encoding, where it is advice the caller can act on.
+        """
+        if self._warned_tensor or self._encoding != "json":
             return
         if any(getattr(arr, "ndim", 1) > 1 for arr in inputs.values()):
             import warnings
@@ -137,9 +221,10 @@ class _HttpServingClient:
             from batcher._internal.errors import PerformanceWarning
 
             warnings.warn(
-                "http_client is JSON-encoding a multi-dimensional (tensor) input; this "
-                "is slow and bloated. Use batcher.ml.serving.triton_client for binary "
-                "tensor transport.",
+                "http_client is JSON-encoding a multi-dimensional (tensor) input because "
+                "tensor_encoding='json'; this is slow and bloated. Use the default "
+                "tensor_encoding='auto' for binary transport, or "
+                "batcher.ml.serving.triton_client.",
                 PerformanceWarning,
                 stacklevel=3,
             )

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import DataQualityError
+from batcher._internal.errors import DataQualityError, PlanError
 from batcher.plan.expr_ir import Col, Expr, count, lit, when
 
 if TYPE_CHECKING:
@@ -191,7 +191,7 @@ class DatasetDQ:
                 {'id': [1, 3]}
         """
         if not cols:
-            raise ValueError("not_null() requires at least one column")
+            raise PlanError("not_null() requires at least one column, e.g. not_null('id')")
         valid = reduce(lambda a, b: a & b, (Col(c).is_not_null() for c in cols))
         return self._add(RowConstraint(f"not_null({', '.join(cols)})", valid))
 
@@ -214,7 +214,7 @@ class DatasetDQ:
         """
         key_list = [keys] if isinstance(keys, str) else list(keys)
         if not key_list:
-            raise ValueError("unique() requires at least one key column")
+            raise PlanError("unique() requires at least one key column, e.g. unique('id')")
         return self._add(UniqueConstraint(f"unique({', '.join(key_list)})", tuple(key_list)))
 
     def in_range(self, column: str, low: Any, high: Any) -> DatasetDQ:
@@ -236,6 +236,10 @@ class DatasetDQ:
                 >>> ds.dq.in_range("x", 0, 10).drop().to_pydict()
                 {'x': [1, 2]}
         """
+        if low > high:
+            raise PlanError(
+                f"in_range({column!r}): low ({low!r}) > high ({high!r}) — swap the arguments?"
+            )
         c = Col(column)
         return self._add(
             RowConstraint(f"in_range({column}, {low}, {high})", c.is_null() | c.between(low, high))
@@ -354,7 +358,6 @@ class DatasetDQ:
         ref = references.select(*ref_cols).distinct()
         return self._ds.join(ref, left_on=cols, right_on=ref_cols, how="anti")
 
-    # --- terminals ---------------------------------------------------------
     def validate(self) -> ValidationReport:
         """Execute the checks and return per-constraint violation counts (no raise).
 
@@ -411,7 +414,9 @@ class DatasetDQ:
         report = self.validate()
         if not report.ok:
             raise DataQualityError(
-                f"data-quality check failed: {report}", violations=report.violations
+                f"data-quality check failed: {report}. Use .drop() to keep only valid rows, "
+                "or .quarantine() to route violating rows aside.",
+                violations=report.violations,
             )
         return self._ds
 

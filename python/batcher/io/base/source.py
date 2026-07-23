@@ -20,11 +20,15 @@ from typing import IO, Any, ClassVar, TypeVar
 
 import pyarrow as pa
 
+from batcher._internal.errors import FormatError, IOError, SchemaError, unknown_value
 from batcher._internal.hardware import available_cpu_count
 from batcher.io._backend import _scheme
+from batcher.io.base._options import BASE_SOURCE_ALIASES, BASE_SOURCE_OPTIONS
+from batcher.io.base._paths import normalize_source_path
 from batcher.io.base._readahead import ordered_readahead
 from batcher.io.base._tolerance import ErrorPolicy
 from batcher.io.base._transient import with_retry
+from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.splits import FileSplit, Split
 from batcher.io.stats.file_identity import files_version
@@ -76,6 +80,52 @@ _READ_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_READ_RETRY_ATTEMPTS", 
 # matters more than the base here: a wide scan retries hundreds of files at once, and
 # without decorrelation a single throttle turns into a synchronized stampede.
 _READ_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_READ_RETRY_BACKOFF_S", "0.5")))
+# File count past which `splits()` stops reading a footer per file to plan sub-file splits.
+# The footer sweep is the driver's serial prologue to a distributed scan: it is worth ~100ms
+# of object-store latency per file (pooled, but still O(files) requests), which is a good
+# trade at a hundred files and a catastrophic one at a million — the whole cluster idles
+# while the driver GETs metadata it will only use to subdivide files that are already far
+# more numerous than the workers. Whole-file splits need no footer and give the same rows.
+# Env-overridable for a workload whose files are few but enormous.
+_MAX_FOOTER_PLAN_FILES = max(1, int(os.environ.get("BATCHER_MAX_FOOTER_PLAN_FILES", "10000")))
+
+
+def _resolve_base_aliases(
+    aliases: dict[str, Any],
+    columns: list[str] | None,
+    n_rows: int | None,
+    format_name: str,
+) -> tuple[list[str] | None, int | None]:
+    """Fold `usecols`/`nrows` into `columns`/`n_rows`, rejecting anything else by name.
+
+    Args:
+        aliases: The leftover keywords the caller passed.
+        columns: The `columns` value already bound, if any.
+        n_rows: The `n_rows` value already bound, if any.
+        format_name: The format being constructed, for the error message.
+
+    Returns:
+        The resolved ``(columns, n_rows)`` pair.
+    """
+    bound = {"columns": columns, "n_rows": n_rows}
+    for key, value in aliases.items():
+        target = BASE_SOURCE_ALIASES.get(key)
+        if target is None:
+            raise unknown_value(
+                FormatError,
+                f"{format_name or 'reader'} option",
+                key,
+                (*BASE_SOURCE_OPTIONS, *BASE_SOURCE_ALIASES),
+                label="Accepted options",
+                hint="pandas and Polars spellings are accepted where the option exists.",
+            )
+        if bound[target] is not None:
+            raise FormatError(
+                f"{format_name}: {key!r} and {target!r} are two spellings of the same "
+                f"option, and you passed both. Pass one of them."
+            )
+        bound[target] = value
+    return bound["columns"], bound["n_rows"]
 
 
 class FileSource(ABC):
@@ -98,10 +148,12 @@ class FileSource(ABC):
     format_name: ClassVar[str] = ""
 
     __slots__ = (
+        "_columns",
         "_errors",
         "_files_cache",
         "_filesystem",
         "_fs",
+        "_n_rows",
         "_path",
         "_pinned",
         "_schema_cache",
@@ -111,17 +163,35 @@ class FileSource(ABC):
 
     def __init__(
         self,
-        path: str,
+        path: Any,
         *,
         schema_mode: str = "strict",
         files: list[str] | None = None,
         on_error: str = "raise",
         filesystem: object = None,
         storage_options: dict[str, str] | None = None,
+        columns: list[str] | None = None,
+        n_rows: int | None = None,
+        **aliases: Any,
     ) -> None:
+        # A format with no `__init__` of its own (Parquet, ORC, Arrow, Avro …) is
+        # constructed straight through this signature, so the base spellings of the base
+        # options have to resolve here or they would work only on the formats that happen
+        # to run their keywords through an `OptionSpec` first. Anything else is a typo and
+        # gets the same suggestion it would get from a format's own spec — it is not
+        # swallowed, which is the whole risk of a `**kwargs` catch-all.
+        if aliases:
+            columns, n_rows = _resolve_base_aliases(aliases, columns, n_rows, self.format_name)
         # `on_error` decides whether one unreadable file aborts the whole read; the
         # policy object also keeps the audit trail `corrupt_files()` exposes.
         self._errors = ErrorPolicy(on_error)
+        # One place turns a `pathlib.Path` / `os.PathLike` / ``~`` shorthand / list of
+        # files into the plain string URI everything below assumes. Doing it here rather
+        # than per format is what makes `Path` work for *every* reader instead of the
+        # handful that remembered to call `str()`.
+        path, listed = normalize_source_path(path)
+        if listed is not None and files is None:
+            files = listed
         self._path = path
         # Bring-your-own filesystem / credentials; threaded to workers via `_reader_kwargs`.
         # `storage_options` (a plain dict) is the portable choice — see `resolve_filesystem`.
@@ -144,6 +214,16 @@ class FileSource(ABC):
         # assumed for all. "union"/"latest" reconcile differing per-file schemas
         # (`io.schema_evolution`); each file's batches are normalized to the result.
         self._schema_mode = schema_mode
+        # `columns` (pandas `usecols`, Polars `columns`) and `n_rows` (pandas `nrows`,
+        # Polars `n_rows`) are format-agnostic — they restrict *which* columns and *how
+        # many* rows the relation has, whatever encodes it — so they live here rather
+        # than being reimplemented per format. They narrow the source itself: `schema()`
+        # reports the projected schema and `row_count()` the capped count, so the plan
+        # the engine builds already reflects them.
+        self._columns = list(columns) if columns is not None else None
+        if n_rows is not None and n_rows < 0:
+            raise ValueError(f"n_rows must be >= 0, got {n_rows}")
+        self._n_rows = n_rows
 
     # ---- shared, do-not-override ------------------------------------------
     def _files(self) -> list[str]:
@@ -173,8 +253,33 @@ class FileSource(ABC):
             n_files, max(by_core, _REMOTE_READ_CONCURRENCY) if self._is_remote() else by_core
         )
 
+    def _open(self, path: str) -> Any:
+        """Open `path`, transparently decompressing a ``.gz``/``.zst``/``.bz2``/… file.
+
+        A text format compressed on disk is still that format — ``events.csv.gz`` is a
+        CSV — and every engine users come from reads it without being told. The suffix
+        already decides the *format* (`detect.compression_for_path`), so decoding the
+        stream here means no reader implements compression itself, and a format that
+        gains a compressed variant needs no change at all.
+
+        Formats whose container does its own compression (Parquet, ORC, Avro) never carry
+        such a suffix, so they take the plain handle exactly as before.
+        """
+        fh = self._fs.open(path)
+        codec = compression_for_path(path)
+        if codec is None:
+            return fh
+        try:
+            return pa.CompressedInputStream(fh, codec)
+        except (pa.ArrowNotImplementedError, ValueError) as exc:
+            raise IOError(
+                f"cannot decompress {path!r}: pyarrow has no {codec!r} codec here. "
+                f"Decompress the file first, or rename it so the suffix does not claim "
+                f"{codec!r} compression."
+            ) from exc
+
     def _file_schema(self, path: str) -> pa.Schema:
-        with self._fs.open(path) as fh:
+        with self._open(path) as fh:
             return self._read_schema(fh)
 
     def schema(self) -> pa.Schema:
@@ -194,22 +299,82 @@ class FileSource(ABC):
             The Arrow schema every batch this source produces conforms to.
         """
         if self._schema_cache is None:
-            files = self._files()
-            if self._schema_mode == "strict":
-                self._schema_cache = self._file_schema(files[0])
-            else:
-                from batcher.io.schema import unify_schemas
-
-                # Schema evolution reads every file's schema; read them concurrently (each a
-                # GIL-releasing metadata round trip) so a many-file unify isn't serialized.
-                if len(files) <= 1:
-                    schemas = [self._file_schema(f) for f in files]
-                else:
-                    cap = min(_FOOTER_READ_CONCURRENCY, len(files))
-                    with ThreadPoolExecutor(max_workers=cap) as pool:
-                        schemas = list(pool.map(self._file_schema, files))
-                self._schema_cache = unify_schemas(schemas, self._schema_mode)
+            self._schema_cache = self._select(self._read_full_schema())
         return self._schema_cache
+
+    def _effective_projection(self, projection: list[str] | None) -> list[str] | None:
+        """The columns to actually read: the engine's pushed projection, else `columns=`.
+
+        `schema()` already reports only `columns=`, so anything the engine pushes is a
+        subset of it and simply wins. When the engine pushes nothing, `columns=` is the
+        projection — which is what makes it a real pushdown rather than a post-read
+        `.select`, so a columnar format never decodes what was excluded.
+        """
+        return projection if projection is not None else self._columns
+
+    def _select(self, schema: pa.Schema) -> pa.Schema:
+        """Narrow `schema` to `columns=`, naming an unknown column against what exists."""
+        if self._columns is None:
+            return schema
+        missing = [c for c in self._columns if c not in schema.names]
+        if missing:
+            raise unknown_value(
+                SchemaError,
+                "column",
+                missing[0],
+                schema.names,
+                label="Columns in this source",
+                hint="columns= (usecols=) selects from the columns the files actually hold.",
+            )
+        return pa.schema([schema.field(c) for c in self._columns])
+
+    def _cap(self, batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+        """Yield at most `n_rows` rows, stopping the read as soon as the cap is met.
+
+        Truncating here rather than slicing a materialized result is the whole point:
+        ``n_rows=10`` over a 200 GB directory must read one batch, not all of it. The
+        final batch is sliced so the cap is exact.
+        """
+        if self._n_rows is None:
+            yield from batches
+            return
+        remaining = self._n_rows
+        for batch in batches:
+            if remaining <= 0:
+                return
+            yield batch if batch.num_rows <= remaining else batch.slice(0, remaining)
+            remaining -= batch.num_rows
+
+    def _stats_apply(self, stats: Any) -> Any:
+        """Footer statistics as they describe *this* source, or None once `n_rows` caps it.
+
+        A cap truncates the relation, and truncation invalidates every footer statistic at
+        once: the row count is too high, and the per-column min/max bounds describe rows the
+        capped source will never return, so Kyber could prune a file that holds the only
+        rows inside the cap or answer a `MIN` from a row that was cut. There is no cheap way
+        to recompute bounds for "the first n rows", and a capped read is bounded and
+        therefore fast regardless — so the honest answer is to advertise nothing.
+
+        A format with footer statistics calls this on its way out of `statistics()`.
+        """
+        return None if self._n_rows is not None else stats
+
+    def _read_full_schema(self) -> pa.Schema:
+        """The source's schema before `columns=` narrows it."""
+        files = self._files()
+        if self._schema_mode == "strict":
+            return self._file_schema(files[0])
+        from batcher.io.schema import unify_schemas
+
+        # Schema evolution reads every file's schema; read them concurrently (each a
+        # GIL-releasing metadata round trip) so a many-file unify isn't serialized.
+        if len(files) <= 1:
+            schemas = [self._file_schema(f) for f in files]
+        else:
+            cap = min(_FOOTER_READ_CONCURRENCY, len(files))
+            with ThreadPoolExecutor(max_workers=cap) as pool:
+                schemas = list(pool.map(self._file_schema, files))
+        return unify_schemas(schemas, self._schema_mode)
 
     def _read_by_path(
         self,
@@ -242,7 +407,13 @@ class FileSource(ABC):
         Returns:
             Every batch of every file, in file order.
         """
+        # A capped read is a *bounded* read, so it goes down the streaming path and stops
+        # as soon as the cap is met. Reading every file concurrently and slicing the result
+        # would satisfy `n_rows` while reading the whole directory to answer `n_rows=10`.
+        if self._n_rows is not None:
+            return list(self._cap(self.iter_batches(projection)))
         files = self._files()
+        projection = self._effective_projection(projection)
 
         def _read_one(f: str) -> list[pa.RecordBatch]:
             def _once() -> list[pa.RecordBatch]:
@@ -250,7 +421,7 @@ class FileSource(ABC):
                 batches = self._read_by_path(f, proj)
                 if batches is not None:
                     return list(self._normalize(batches, projection))
-                with self._fs.open(f) as fh:
+                with self._open(f) as fh:
                     return list(self._normalize(self._read_file(fh, proj), projection))
 
             try:
@@ -297,6 +468,11 @@ class FileSource(ABC):
         Returns:
             An iterator over every file's batches, in file order.
         """
+        yield from self._cap(self._iter_uncapped(projection))
+
+    def _iter_uncapped(self, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """`iter_batches` without the `n_rows` cap, which `_cap` applies around it."""
+        projection = self._effective_projection(projection)
         files = self._files()
         if len(files) <= 1:
             for f in files:
@@ -466,7 +642,13 @@ class FileSource(ABC):
         else:
             with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
                 counts = list(pool.map(self._file_row_count, files))
-        return None if any(c is None for c in counts) else sum(counts)  # type: ignore[misc]
+        if any(c is None for c in counts):
+            return None
+        total: int = sum(counts)  # type: ignore[arg-type]
+        # A capped source really does have that many rows, and the optimizer sizes joins
+        # and the worker fan-out from this number — reporting the uncapped total would
+        # plan a `n_rows=100` read as though it were the whole table.
+        return total if self._n_rows is None else min(total, self._n_rows)
 
     def stats_version(self) -> str | None:
         """A token that changes whenever this source's files could have changed.
@@ -516,17 +698,31 @@ class FileSource(ABC):
             A stable identifier for this source.
         """
         base = f"{self.format_name}:{self._path}"
-        if self._pinned is None:
+        # Everything that makes this a *different relation* from the plain path has to be in
+        # the key, for exactly the reason the pinned-files case spells out above. `columns`
+        # and `n_rows` both do: they change the schema and the row count the optimizer
+        # caches. Leaving `n_rows` out let a `n_rows=5` read persist "5 rows" under the
+        # directory's key, and the next full read of the same path planned against it and
+        # answered `count()` as 5 — the cache handing back the wrong relation's statistics.
+        parts = []
+        if self._pinned is not None:
+            parts.append("\n".join(self._pinned))
+        if self._columns is not None:
+            parts.append("cols=" + ",".join(self._columns))
+        if self._n_rows is not None:
+            parts.append(f"n_rows={self._n_rows}")
+        if not parts:
             return base
-        digest = hashlib.sha256("\n".join(self._pinned).encode()).hexdigest()[:16]
+        digest = hashlib.sha256(" || ".join(parts).encode()).hexdigest()[:16]
         return f"{base}#{digest}"
 
     def splits(self, target_size: int | None = None, predicate: dict | None = None) -> list[Split]:
         """Independently-readable slices — one per file, or finer where the format allows.
 
         Parquet subdivides into row-group runs; line-delimited text into byte ranges.
-        A schema-evolving read emits a single `WholeSourceSplit`, since a per-file split
-        rebuilds a reader that knows nothing of the unified schema.
+        A schema-evolving read emits one `NormalizedFileSplit` per file, each carrying the
+        unified schema so a worker reshapes its own file to it. A capped (`n_rows`) read
+        stays a single `WholeSourceSplit`, since the cap is a whole-source property.
 
         Examples:
             .. doctest::
@@ -545,16 +741,38 @@ class FileSource(ABC):
         Returns:
             The splits covering the source exactly once.
         """
-        # Per-file splits each reconstruct a single-file reader with no knowledge of
-        # the unified schema, so in a non-strict (schema-evolving) read they would
-        # skip normalization and produce mismatched batches. Read such a source as a
-        # single whole-source split — correct (the unification happens in `read`),
-        # at the cost of per-file parallelism for evolving reads.
-        if self._schema_mode != "strict":
+        # `n_rows` is a property of the SOURCE, not of any one file, so it cannot be
+        # distributed across independent splits: each split would honor the cap on its own
+        # and the union would return `n_rows x len(splits)` rows. A capped read is bounded
+        # and therefore small by construction, so reading it as one split costs nothing.
+        if self._n_rows is not None:
             from batcher.io.splits import WholeSourceSplit
 
             return [WholeSourceSplit(self)]
         files = self._files()
+        # A schema-evolving read gets one normalized split PER FILE, each carrying the
+        # unified schema the driver already computed. It used to get a single
+        # `WholeSourceSplit`, on the correct reasoning that a plain `FileSplit` rebuilds a
+        # reader that knows nothing of the unification — but the price was that a
+        # schema-evolving dataset of any size ran as exactly one task on one worker.
+        # `NormalizedFileSplit` carries the target schema instead, so each worker reshapes
+        # its own file to it: same result, back to one task per file.
+        if self._schema_mode != "strict":
+            from batcher.io.splits import NormalizedFileSplit
+
+            target = self.schema()
+            kwargs = self._reader_kwargs()
+            return [NormalizedFileSplit(self.format_name, f, target, kwargs) for f in files]
+        # Above this many files, planning sub-file splits is itself the bottleneck: each
+        # `_file_splits` reads a footer, and a million-file corpus means a million metadata
+        # GETs on the DRIVER before a single task launches. Past the threshold, fall back to
+        # one whole-file split per file, which needs no footer at all — there is already
+        # ample parallelism at that file count, so sub-file granularity buys nothing.
+        # A `predicate` suspends this: footer statistics let `_file_splits` drop row-groups
+        # (often whole files) at plan time, which is worth the sweep precisely because the
+        # dataset is large. `target_size` likewise means the caller asked for sized splits.
+        if len(files) > _MAX_FOOTER_PLAN_FILES and predicate is None and target_size is None:
+            return [FileSplit(self.format_name, f, self._reader_kwargs()) for f in files]
         # `_file_splits` reads each file's footer (a ~100ms object-store round trip for
         # Parquet); over a many-file dataset that serial loop dominates a distributed
         # query's driver phase (TPC-H sf100: 100 files ≈ 12s of otherwise-idle driver
@@ -600,7 +818,7 @@ class FileSource(ABC):
         """Read one file's batches from an open handle, honoring `projection`."""
 
     def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
-        with self._fs.open(path) as fh:
+        with self._open(path) as fh:
             yield from self._read_file(fh, projection)
 
     def _file_row_count(self, path: str) -> int | None:  # noqa: ARG002 (default: unknown)
@@ -638,6 +856,12 @@ class FileSource(ABC):
             extra["filesystem"] = self._filesystem
         if self._errors.mode != "raise":
             extra["on_error"] = self._errors.mode
+        # `columns` narrows the relation itself, so a worker that rebuilds this reader
+        # without it produces batches wider than the schema the plan was built against.
+        # `n_rows` is deliberately NOT carried: a capped source never splits (see
+        # `splits`), so a worker must never re-apply the cap to a slice of the data.
+        if self._columns is not None:
+            extra["columns"] = self._columns
         return extra
 
     def _file_splits(

@@ -213,3 +213,66 @@ def test_every_ols_crossover_shares_the_spread_guard():
     assert crossover_fit(_stats(1e7, 3)) is None
     # ...while a genuinely spread sample still fits exactly, so the guard is not over-eager.
     assert crossover_fit(_stats(1e6, 7e6)) == pytest.approx((100.0, 1e-5))
+
+
+def test_unlike_devices_do_not_share_one_regression():
+    """The regression: keying only by backend folded an H100's and a T4's timings into a single
+    OLS line, converging on a crossover right for neither — and because the learned value
+    *overrides* the config default, that pooled fit is worse than not learning at all.
+
+    Two fleets with genuinely different crossovers must therefore learn different thresholds
+    from the same hub."""
+    hub = _hub()
+    for rows in _SAMPLE_ROWS:
+        record_backend_timing(hub, "cpu", rows, _cpu_ms(rows))
+        # A fast device: low fixed cost, so it pays off early.
+        record_backend_timing(hub, "gpu", rows, 500.0 + 1.0e-5 * rows, "NVIDIA_H100")
+        # A slow one: heavy fixed cost, so it only pays off much later.
+        record_backend_timing(hub, "gpu", rows, 9000.0 + 3.0e-4 * rows, "NVIDIA_TESLA_T4")
+
+    fast = learned_gpu_min_rows(hub, "NVIDIA_H100")
+    slow = learned_gpu_min_rows(hub, "NVIDIA_TESLA_T4")
+    assert fast is not None and slow is not None
+    assert fast < slow  # the faster device crosses over at fewer rows
+
+
+def test_a_newly_identified_device_falls_back_to_what_was_already_learned():
+    """Bucketing per device must not throw away history: a fleet whose device only just became
+    identifiable should keep using the pooled samples until it has its own."""
+    hub = _hub()
+    for rows in _SAMPLE_ROWS:
+        record_backend_timing(hub, "cpu", rows, _cpu_ms(rows))
+        record_backend_timing(hub, "gpu", rows, _gpu_ms(rows))  # pooled, untagged
+    pooled = learned_gpu_min_rows(hub)
+    assert pooled is not None
+    assert learned_gpu_min_rows(hub, "NVIDIA_A100") == pooled
+
+
+def test_a_mixed_fleet_keeps_the_pooled_bucket(monkeypatch):
+    """There is no honest per-device answer when the models differ, so `cluster_accelerator_type`
+    reports `None` and the learner behaves exactly as it did before — rather than attaching one
+    device's timing to another's bucket."""
+    from batcher.dist.executors.ray_runtime import accelerators, scaling
+
+    monkeypatch.setattr(
+        scaling,
+        "node_classes",
+        lambda: [
+            {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_A100"},
+            {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_TESLA_T4"},
+        ],
+    )
+    import ray
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    assert accelerators.cluster_accelerator_type() is None
+    # A homogeneous fleet does resolve to its single model.
+    monkeypatch.setattr(
+        scaling,
+        "node_classes",
+        lambda: [
+            {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_A100"},
+            {"cpus": 8.0, "gpus": 8.0, "accelerator_type": "NVIDIA_A100"},
+        ],
+    )
+    assert accelerators.cluster_accelerator_type() == "NVIDIA_A100"

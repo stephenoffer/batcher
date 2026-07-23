@@ -33,15 +33,37 @@ __all__ = ["size_gpu_map_batches"]
     category=RuleCategory.SELECTION,
 )
 def size_gpu_map_batches(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan | None:
-    """Fill `num_gpus` / `batch_size` on a GPU `map_batches` from its model footprint."""
+    """Fill `num_gpus` / `batch_size` on an accelerator `map_batches` from its model footprint."""
     assert isinstance(node, MapBatches)
     if node.model_memory_gb <= 0.0:
-        return None  # not a declared GPU model → nothing to size
+        return None  # not a declared accelerator model → nothing to size
     if node.num_gpus > 0.0 and node.batch_size is not None:
         return None  # user pinned both → honor them
     from batcher.kyber.gpu.policy import decide_gpu_map_params
 
-    params = decide_gpu_map_params(node.model_memory_gb, node.num_gpus, node.batch_size)
+    # A stage that requests a *custom* accelerator resource (TPU / Trainium / Inferentia / Gaudi)
+    # carries `num_gpus == 0` and must keep it: assigning a GPU fraction would request a device
+    # the accelerator fleet hasn't got, and on a GPU-less fleet that gang never schedules. Its
+    # batch size is still worth seeding — from the accelerator's own HBM, recovered from the pinned
+    # `accelerator_type`. A GPU stage sizes against the cluster's binding VRAM as before.
+    is_non_gpu_accel = node.num_gpus <= 0.0 and bool(node.resources)
+    if is_non_gpu_accel:
+        from batcher._internal.accelerators import accelerator_memory_bytes
+
+        device_gb = accelerator_memory_bytes(node.accelerator_type) / (1 << 30) or None
+    else:
+        # The cluster's binding (smallest) device when the topology could report it, else `None`
+        # → the policy's local probe. Sizing against `ctx.hardware` rather than the driver's own
+        # devices is the point of threading a profile into the optimizer: the driver is routinely
+        # a CPU-only head node whose probe finds nothing.
+        device_gb = ctx.hardware.gpu_memory_bytes / (1 << 30) or None
+    params = decide_gpu_map_params(
+        node.model_memory_gb,
+        node.num_gpus,
+        node.batch_size,
+        gpu_memory_gb=device_gb,
+        assign_num_gpus=not is_non_gpu_accel,
+    )
     if params.num_gpus == node.num_gpus and params.batch_size == node.batch_size:
         return None
     ctx.notes.setdefault("gpu_resource_sizing", []).append(params.reason)

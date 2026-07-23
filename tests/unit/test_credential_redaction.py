@@ -46,6 +46,14 @@ _SECRET_HINTS = (
     # *persisted* to the stats store rather than merely printed.
     "connection_string",
     "dsn",
+    # `BrokerSplit.options` is the dict carrying every broker credential
+    # (`sasl.password`, `sasl_plain_password`, connection strings, SAS tokens) and
+    # matched none of the hints above, so the streaming connectors were unscanned.
+    "options",
+    # `storage_options` carries object-store credentials (`aws_secret_access_key`, SAS
+    # tokens) through every lakehouse reader and its splits. It matched nothing above
+    # either, which is why three separate lakehouse leaks survived this scan.
+    "storage_options",
 )
 
 # Fields whose name matches a hint but which hold no secret. `resume_token` is a stream
@@ -53,6 +61,12 @@ _SECRET_HINTS = (
 # would cost real debuggability for no security gain.
 _NOT_SECRETS = {
     ("BrokerMessage", "resume_token"),
+    # `options` is a deliberately broad hint — it had to be, because the broker and
+    # lakehouse connectors bury credentials in dicts under exactly that name. It
+    # therefore also catches fields that merely share the word. These carry a *parse*
+    # vocabulary (delimiter, quoting, null/boolean tokens), never a credential, and
+    # redacting them would cost real debuggability on the split that most needs it.
+    ("CSVRangeSplit", "options"),
 }
 
 

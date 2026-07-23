@@ -18,7 +18,13 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from batcher.io.source import Source
 
-__all__ = ["FileSplit", "IpcFileSplit", "LineRangeSplit", "read_aligned_range"]
+__all__ = [
+    "FileSplit",
+    "IpcFileSplit",
+    "LineRangeSplit",
+    "NormalizedFileSplit",
+    "read_aligned_range",
+]
 
 
 def read_aligned_range(path: str, start: int, end: int) -> bytes:
@@ -203,6 +209,120 @@ class FileSplit:
                 >>> from batcher.io import FileSplit  # doctest: +SKIP
                 >>> FileSplit("csv", "events.csv").identity()  # doctest: +SKIP
                 'csv:events.csv'
+
+        Returns:
+            A key that distinguishes this file from its siblings.
+        """
+        return f"{self.format_name}:{self.path}"
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedFileSplit:
+    """One whole file, reshaped on the worker to a schema unified across all of them.
+
+    The split a **schema-evolving** read (`schema_mode="union"`/`"latest"`) advertises, one
+    per file. Without it such a read collapses to a single `WholeSourceSplit` — because a
+    plain `FileSplit` rebuilds a single-file reader that knows only its own file's schema,
+    so it would skip normalization and emit batches that will not concatenate with its
+    siblings'. That correctness argument is right, but the consequence was that a
+    schema-evolving dataset of any size became exactly **one task**, on one worker, however
+    large the cluster: the read lost all parallelism precisely where it is most needed.
+
+    Carrying the driver-computed unified schema on the split resolves it. The driver already
+    unified every file's schema to answer `schema()`, so shipping the result costs nothing
+    extra, and each worker then normalizes its own file to that target — adding missing
+    columns as nulls and casting promoted types — exactly as the whole-source read does. The
+    result is identical; only the number of tasks it takes changes.
+    """
+
+    format_name: str
+    path: str
+    target: pa.Schema
+    kwargs: dict[str, object] = field(default_factory=dict)
+
+    def _reader(self) -> Source:
+        from batcher.io.formats.base import SOURCES
+
+        return SOURCES.get(self.format_name)(self.path, **self.kwargs)
+
+    def _target(self, projection: list[str] | None) -> pa.Schema:
+        if projection is None:
+            return self.target
+        return pa.schema([self.target.field(c) for c in projection])
+
+    def _file_projection(self, projection: list[str] | None) -> list[str] | None:
+        """`projection` narrowed to the columns this file actually has.
+
+        A file predating a column addition simply does not hold it; asking its reader for
+        that column is an error, so the request is trimmed here and `normalize_batch` fills
+        the column back in with nulls.
+        """
+        if projection is None:
+            return None
+        present = set(self._reader().schema().names)
+        return [c for c in projection if c in present]
+
+    def schema(self) -> pa.Schema:
+        """The unified schema this split's batches conform to, narrowed by `projection`.
+
+        Returns:
+            The Arrow schema every batch this split produces conforms to.
+        """
+        return self.target
+
+    def _normalized(
+        self, batches: Iterator[pa.RecordBatch], projection: list[str] | None
+    ) -> Iterator[pa.RecordBatch]:
+        from batcher.io.schema import normalize_batch
+
+        target = self._target(projection)
+        for batch in batches:
+            yield normalize_batch(batch, target)
+
+    def read(
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,  # noqa: ARG002 (the engine re-checks it regardless)
+    ) -> list[pa.RecordBatch]:
+        """Read the whole file and reshape it to the unified schema.
+
+        Args:
+            projection: Columns to read. All columns when omitted.
+            predicate: Ignored; the engine's `Filter` re-checks every row regardless.
+
+        Returns:
+            The file's batches, conforming to the unified schema.
+        """
+        reader = self._reader()
+        batches = reader.read(self._file_projection(projection))
+        return list(self._normalized(iter(batches), projection))
+
+    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        """Stream the file, reshaping each batch to the unified schema.
+
+        Args:
+            projection: Columns to read. All columns when omitted.
+
+        Returns:
+            An iterator over the file's normalized batches.
+        """
+        reader = self._reader()
+        yield from self._normalized(
+            iter(reader.iter_batches(self._file_projection(projection))), projection
+        )
+
+    def row_count(self) -> int | None:
+        """The file's row count when the format knows it cheaply, else None.
+
+        Normalization only reshapes columns, so it never changes the row count.
+
+        Returns:
+            The row count, or None when counting would cost a data scan.
+        """
+        return self._reader().row_count()
+
+    def identity(self) -> str:
+        """The ``format:path`` key naming this file.
 
         Returns:
             A key that distinguishes this file from its siblings.

@@ -47,17 +47,27 @@ class Chain(Preprocessor):
             [-1.234, -0.309, 0.0, 1.543]
     """
 
-    __slots__ = ("steps",)
+    __slots__ = ("cache", "steps")
 
-    def __init__(self, *steps: Preprocessor) -> None:
+    def __init__(self, *steps: Preprocessor, cache: bool = True) -> None:
         """Build a chain from `steps`, applied left to right.
 
         Args:
             *steps: The preprocessors to run in order. At least one is required.
+            cache: Materialize the fit input once instead of re-executing the upstream
+                plan for every step. Each step's `fit` runs its own aggregate, so an
+                N-step chain otherwise costs N full scans of the source. Set it False
+                when the training split is too large to hold in driver memory, and pay
+                the rescans instead.
 
         Raises:
             PlanError: If no steps are given, or a step is not a `Preprocessor`.
         """
+        # Accept both spellings: Chain(a, b) and Chain([a, b]) — the latter matches
+        # scikit-learn's make_pipeline([...]) habit and is what a user reaches for when
+        # the steps are already in a list.
+        if len(steps) == 1 and isinstance(steps[0], (list, tuple)):
+            steps = tuple(steps[0])
         if not steps:
             raise PlanError("Chain() requires at least one preprocessor")
         for step in steps:
@@ -66,6 +76,20 @@ class Chain(Preprocessor):
                     f"Chain() steps must be Preprocessor instances, got {type(step).__name__}"
                 )
         self.steps = list(steps)
+        self.cache = cache
+
+    def _fit_input(self, ds: Dataset) -> Dataset:
+        """The dataset the steps fit against — materialized once when `cache` is set.
+
+        Every step's `fit` is a terminal aggregate, and the result cache is keyed on the
+        whole plan, so a lazy handle is re-executed from the source once per step. Reading
+        the input into memory once turns those N source scans into one.
+        """
+        if not self.cache or len(self.steps) < 2:
+            return ds
+        from batcher.api.session import from_arrow
+
+        return from_arrow(ds.collect())
 
     def __len__(self) -> int:
         """How many steps the chain holds.
@@ -143,7 +167,7 @@ class Chain(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        current = ds
+        current = self._fit_input(ds)
         for step in self.steps:
             step.fit(current)
             current = step.transform(current)
@@ -201,7 +225,7 @@ class Chain(Preprocessor):
         Returns:
             A new lazy `Dataset` with every step fitted and applied.
         """
-        current = ds
+        current = self._fit_input(ds)
         for step in self.steps:
             current = step.fit_transform(current)
         self._fitted = True

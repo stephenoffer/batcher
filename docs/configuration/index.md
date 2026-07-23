@@ -55,12 +55,104 @@ print(result)
 # {'x': [1, 2, 3]}
 ```
 
+## Setting one option by name
+
+Building a whole `Config` to change one number is a lot of ceremony. Every tunable also has a dotted name, and `set_option` / `get_option` address it directly. This is the same API shape as `pandas.set_option` and `spark.conf.set`, and it goes through the same validation as `set_config`.
+
+```python
+from batcher.config import get_option, reset_option, set_option
+
+set_option("execution.morsel_rows", 4096)
+print(get_option("execution.morsel_rows"))
+# 4096
+
+reset_option("execution.morsel_rows")
+print(get_option("execution.morsel_rows"))
+# 16384
+```
+
+A trailing segment works too when it is unambiguous, so `get_option("morsel_rows")` finds `execution.morsel_rows`. Misspell a name and the error suggests the closest real ones rather than failing silently.
+
+`option_context` is the scoped form. It restores the previous values on exit, including when the block raises, and it nests:
+
+```python
+from batcher.config import get_option, option_context
+
+with option_context("execution.morsel_rows", 1024, "optimizer.build_bloom_index", True):
+    print(get_option("execution.morsel_rows"))
+# 1024
+
+print(get_option("execution.morsel_rows"))
+# 16384
+```
+
+`reset_option` takes a glob, so `reset_option("execution.*")` clears a section and `reset_option()` on its own resets everything.
+
+To find an option without reading the source, search the names. `option_names` returns the matching paths and `describe_options` prints them with their current values, flagging anything that differs from the default:
+
+```python
+from batcher.config import describe_options, option_names
+
+print(len(option_names()) > 50)
+# True
+
+print("memory.spill_dir" in describe_options("spill"))
+# True
+```
+
+Finally, `Config.non_defaults()` answers "what is actually set here?" when a job behaves differently on two machines. Its `repr` shows the same thing, so printing a config is useful rather than a wall of 180 fields.
+
+```python
+import dataclasses
+from batcher import Config
+
+cfg = Config()
+cfg = cfg.replace(execution=dataclasses.replace(cfg.execution, morsel_rows=4096))
+print(cfg.non_defaults())
+# {'execution.morsel_rows': 4096}
+```
+
 ## Loading from the environment or a file
 
 `Config.from_env()` overlays `BATCHER_*` environment variables onto a base config.
-`Config.from_file(path)` overlays a JSON document. Both return a new `Config` and
-leave their input untouched. See {doc}`environment` for variable naming
-and the file format.
+`Config.from_file(path)` overlays a document, choosing the parser from the suffix:
+JSON, TOML, or YAML. `Config.from_toml` and `Config.from_yaml` force a format when
+the filename doesn't carry one. All of them return a new `Config` and leave their
+input untouched. See {doc}`environment` for variable naming and the file format.
+
+`env_var_names()` prints the mapping the other direction, from every environment
+variable to the option it sets, which is what you want when writing a deployment
+manifest:
+
+```python
+from batcher.config import env_var_names
+
+print(env_var_names()["BATCHER_EXECUTION_MORSEL_ROWS"])
+# execution.morsel_rows
+```
+
+`Config.from_dict` and `Config.to_dict` are the in-memory pair. `to_dict` produces
+plain JSON-encodable data, so a config travels as part of a job manifest, and
+`only_non_default=True` emits the smallest document that reproduces it. The
+standalone `config_to_dict` function does the same for callers that would rather not
+reach through the object.
+
+```python
+from batcher import Config
+from batcher.config import config_to_dict
+
+resolved = Config.from_dict(Config().to_dict())
+print(Config.from_dict(resolved.to_dict()) == resolved)
+# True
+
+print(config_to_dict(Config())["execution"]["morsel_rows"])
+# 16384
+```
+
+`from_dict` re-runs the same environment resolution every entry point does, which
+auto-detects a spot node or an autoscaling cluster. That means a config captured on
+one machine can legitimately differ from raw defaults when reloaded on another.
+Reloading an already-resolved config is idempotent, which is the property to rely on.
 
 ## Precedence
 

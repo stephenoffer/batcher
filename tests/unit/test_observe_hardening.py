@@ -480,3 +480,18 @@ def test_verbose_actually_shows_more_than_normal(bus, tmp_path):
     assert "plan admitted" in verbose and "join build side" in verbose
     assert "run phase" not in verbose  # per-phase timing is a DEBUG concern
     assert "run phase" in debug  # ...and debug adds it
+
+
+def test_load_per_core_uses_the_cores_this_process_may_use(monkeypatch):
+    """The regression: `load_per_core` divided by `os.cpu_count()`, the *host's* cores. A
+    container limited to 4 of 64 divided a saturating load of 4.0 by 64 and reported 0.06 —
+    "idle" at exactly the moment it was pegged and throttled, which is the contention this
+    metric exists to surface."""
+    import os as _os
+
+    from batcher.observe.insights import resources
+
+    monkeypatch.setattr(_os, "getloadavg", lambda: (4.0, 4.0, 4.0))
+    monkeypatch.setattr(_os, "cpu_count", lambda: 64)
+    monkeypatch.setattr("batcher._internal.hardware.available_cpu_count", lambda: 4, raising=True)
+    assert resources.cpu_contention()["load_per_core"] == 1.0

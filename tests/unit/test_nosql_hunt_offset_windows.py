@@ -80,10 +80,16 @@ class _FakeCouchbaseResult:
 class _FakeCluster:
     def __init__(self, log: list[str]) -> None:
         self._log = log
+        self.closed = 0
 
     def execute_query(self, stmt: str) -> _FakeCouchbaseResult:
         self._log.append(stmt)
         return _FakeCouchbaseResult()
+
+    def close(self) -> None:
+        # Modeled because the source now closes its cluster; a fake without `close()`
+        # would make the leak fix untestable and quietly assert the old behavior.
+        self.closed += 1
 
 
 def test_couchbase_tail_window_keeps_offset(monkeypatch: pytest.MonkeyPatch) -> None:

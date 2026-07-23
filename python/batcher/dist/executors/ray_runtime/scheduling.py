@@ -164,6 +164,14 @@ def _bundle(env: SchedulingEnvelope | None, node_class: dict | None = None) -> d
         bundle["GPU"] = env.num_gpus
     if env and env.memory_bytes > 0:
         bundle["memory"] = int(env.memory_bytes)
+    # Custom accelerator resources belong in the bundle for the same reason the node-class
+    # selector below does: a bundle reserves by resource, so a `TPU`/`neuron_cores`/`HPU`
+    # request that lives only in `.options()` reserves nothing. The gang would then be
+    # placed on whatever nodes satisfied CPU alone, and each task would afterwards demand
+    # an accelerator its own bundle never held — pending forever on a CPU node, or
+    # oversubscribing the one accelerator node the group happened to land on.
+    if env and env.resources:
+        bundle.update(dict(env.resources))
     # A PG bundle is matched by resource, so the CPU-only restriction must live in the
     # bundle (not just `.options`) for the gang to land on CPU-only nodes.
     extra = _fleet_node_class_resources(env) if node_class is None else node_class

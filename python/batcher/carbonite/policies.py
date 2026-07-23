@@ -407,6 +407,41 @@ class DefaultSchedulingPolicy:
     by the manager from its flow-control policy.
     """
 
+    @staticmethod
+    def gpu_envelope(*, num_gpus: float, n_tasks: int, gpu_count: int) -> SchedulingEnvelope:
+        """Budget a GPU map/inference stage against the GPUs that actually exist.
+
+        The relational `envelope` below is the CPU shuffle grant and correctly requests no
+        GPU. This closes the gap that GPU demand previously reached Ray *only* as the raw
+        `map_batches(num_gpus=)` tag, so Carbonite — the layer that decides feasibility —
+        never saw it, and an infeasible request hung instead of erroring. The grant is
+        clamped to inventory: `gpu_count / num_gpus` tasks can hold a GPU at once, and a
+        cluster reporting no GPUs gets no GPU grant (the stage runs on CPU rather than
+        pending forever). Fractional `num_gpus` is preserved — packing four 0.25-GPU
+        actors onto one device is the point of a fractional request.
+
+        There is deliberately no VRAM envelope yet: the analogue of the RAM grant needs a
+        `gpu_memory_bytes` field on `SchedulingEnvelope` in the neutral `plan` layer, and
+        that contract change belongs in the same commit as its consumer.
+
+        Args:
+            num_gpus: GPUs requested per task, fractional allowed.
+            n_tasks: The desired worker fan-out before GPU clamping.
+            gpu_count: GPU devices the cluster/host reports.
+
+        Returns:
+            A `SchedulingEnvelope` whose GPU grant is feasible against the inventory.
+        """
+        if num_gpus <= 0 or gpu_count <= 0:
+            # No GPU visible (or none asked for): grant none. Asking for a GPU the
+            # cluster does not have makes the task permanently unschedulable.
+            return SchedulingEnvelope(num_gpus=0.0, n_tasks=max(1, n_tasks))
+        concurrent = max(1, int(gpu_count / num_gpus))
+        return SchedulingEnvelope(
+            num_gpus=num_gpus,
+            n_tasks=max(1, min(n_tasks, concurrent)),
+        )
+
     def envelope(
         self,
         plan: PhysicalPlan,

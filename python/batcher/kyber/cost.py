@@ -205,8 +205,14 @@ class CostModel:
             # trivial column map, and scales with model size. Costing it as the
             # bottleneck it is makes Kyber prefer to filter/sample *before* inference
             # (predicate pushdown below a map stage) — the key win for AI pipelines.
+            # Any accelerator, not just a GPU. Ray reports NVIDIA/AMD/Intel/MetaX as the `GPU`
+            # resource; a TPU, Trainium, or Gaudi stage carries `num_gpus == 0` plus a custom
+            # resource instead. Gating on `num_gpus` alone therefore costed those stages as a
+            # *trivial column map* — the cheapest node in the plan — so Kyber had no reason to
+            # push a filter below them, losing exactly the optimization this factor exists to
+            # produce on precisely the hardware whose forward pass is most expensive.
             factor = 1.0
-            if node.num_gpus > 0:
+            if node.num_gpus > 0 or getattr(node, "resources", ()):
                 factor = _GPU_INFERENCE_FACTOR * (1.0 + node.model_memory_gb)
             return Cost(cpu=c.map_row * out_rows * factor)
 

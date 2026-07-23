@@ -23,7 +23,9 @@ import pyarrow as pa
 from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.formats.base import SOURCES
+from batcher.io.formats.ml._ndarray import schema_from_array_meta, slice_to_batch
 from batcher.io.splits import Split
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["HDF5SliceSplit", "HDF5Source"]
 
@@ -31,16 +33,6 @@ __all__ = ["HDF5SliceSplit", "HDF5Source"]
 def _require_h5py() -> Any:
     """Import and return the `h5py` module or raise `BackendError`."""
     return require("h5py", feature="HDF5", provides="h5py", extra="hdf5")
-
-
-def _slice_to_batch(array: Any, projection: list[str] | None) -> pa.RecordBatch:
-    """Turn an in-memory numpy slice into an Arrow record batch."""
-    if array.ndim == 1:
-        data = {"value": array}
-    else:
-        data = {f"c{i}": array[:, i] for i in range(array.shape[1])}
-    batch = pa.RecordBatch.from_pydict({k: pa.array(v) for k, v in data.items()})
-    return batch.select(projection) if projection is not None else batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +50,10 @@ class HDF5SliceSplit:
             return handle[self.dataset][self.start : self.stop]
 
     def schema(self) -> pa.Schema:
-        return _slice_to_batch(self._array(), None).schema
+        return slice_to_batch(self._array(), None).schema
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return [_slice_to_batch(self._array(), projection)]
+        return [slice_to_batch(self._array(), projection)]
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         yield from self.read(projection)
@@ -96,8 +88,20 @@ class HDF5Source:
     def schema(self) -> pa.Schema:
         h5py = _require_h5py()
         with h5py.File(self._path, "r") as handle:
-            head = handle[self._dataset][0:1]
-        return _slice_to_batch(head, None).schema
+            return schema_from_array_meta(handle[self._dataset])
+
+    def statistics(self) -> SourceStatistics | None:
+        """Exact leading-axis row count from the dataset's stored shape — no data read.
+
+        An HDF5 dataset records its shape in metadata, so the row count is exact and
+        free; Kyber may size joins and answer `count()` from it. No per-column bounds
+        are advertised — h5py datasets carry no min/max in their metadata, and an
+        exact-looking-but-guessed bound is worse than none.
+        """
+        try:
+            return SourceStatistics(row_count=self._length(), exact_rows=True)
+        except Exception:
+            return None
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         batches: list[pa.RecordBatch] = []

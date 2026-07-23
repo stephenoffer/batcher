@@ -23,6 +23,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.ir_tags import ExprTag
 from batcher.plan.types import CAST_DTYPES
 
@@ -155,8 +156,7 @@ class Expr:
         """Element-wise inequality (``a != b``), yielding a boolean expression."""
         return Binary("ne", self, _wrap(other))
 
-    # Expr is used for plan building, not as a dict key; make that explicit.
-    __hash__ = None  # type: ignore[assignment]
+    # `Expr` stays unhashable (see `__hash__` below, which raises with the reason).
 
     def __repr__(self) -> str:
         """A source-like rendering of the expression, e.g. ``(col('x') + lit(1))``."""
@@ -388,8 +388,118 @@ class Expr:
         """
         raise TypeError(
             "a batcher expression is not iterable; wrap it in a list "
-            "(e.g. over(partition_by=[col('g')]), not over(partition_by=col('g')))"
+            "(e.g. over(partition_by=[col('g')]), not over(partition_by=col('g'))). "
+            "For a row-wise minimum/maximum across columns use min_horizontal(a, b) / "
+            "max_horizontal(a, b); for a column aggregate use .min() / .max()"
         )
+
+    def __len__(self) -> NoReturn:
+        """Refuse `len`: an expression describes a column, it does not hold one yet.
+
+        Nothing is materialized until a terminal op, so an expression has no row
+        count to report. The row count of the *result* is ``ds.count()``; the length
+        of a string or list value is ``.str.len()`` / ``.list.len()``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> len(bt.col("x"))
+                Traceback (most recent call last):
+                    ...
+                TypeError: a batcher expression has no len()...
+
+        Raises:
+            TypeError: Always — naming the three things `len` is usually reaching for.
+        """
+        raise TypeError(
+            "a batcher expression has no len(): it describes a column, it does not hold "
+            "one. Use .str.len() for string length, .list.len() for list length, or "
+            "ds.count() for the number of rows in the result"
+        )
+
+    def __contains__(self, item: object) -> NoReturn:
+        """Refuse ``x in expr``: the membership operators are `is_in` and `str.contains`.
+
+        Python coerces the result of ``in`` to a bool, so it could never return an
+        expression. Without this, ``1 in col("x")`` falls through to `__iter__` and
+        raises a confusing "not iterable" message for what is really a membership test.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> 1 in bt.col("x")
+                Traceback (most recent call last):
+                    ...
+                TypeError: `in` cannot be used on a batcher expression...
+
+        Args:
+            item: The value the caller tried to test for membership.
+
+        Raises:
+            TypeError: Always — naming `is_in` / `str.contains` / `list.contains`.
+        """
+        raise TypeError(
+            "`in` cannot be used on a batcher expression (Python forces the result to a "
+            "bool). Use col('x').is_in([...]) to test the value against a set, "
+            "col('s').str.contains(...) for substring search, or "
+            "col('l').list.contains(...) for list membership"
+        )
+
+    def __hash__(self) -> NoReturn:
+        """Refuse hashing: ``==`` builds an expression, so equality-based lookup is a trap.
+
+        A hash-based container compares candidates with ``==``, which here returns a
+        *predicate* rather than a bool — so a set or dict keyed on expressions would
+        silently misbehave. Batcher raises instead, matching pandas and Polars, whose
+        expression/series types are likewise unhashable. Key on the column name, or on
+        ``to_ir()`` for a structural key.
+
+        Raises:
+            TypeError: Always — naming the two workable keys.
+        """
+        raise TypeError(
+            "a batcher expression is not hashable, because `==` builds a predicate "
+            "instead of comparing. Key on the column name, or on repr(expr) / "
+            "str(expr.to_ir()) for a structural key"
+        )
+
+    def __divmod__(self, other: IntoExpr) -> tuple[Expr, Expr]:
+        """``divmod(a, b)`` — the ``(a // b, a % b)`` pair, as Python defines it.
+
+        Args:
+            other: The divisor value or expression.
+
+        Returns:
+            A ``(quotient, remainder)`` tuple of expressions.
+        """
+        return self // other, self % other
+
+    def __rdivmod__(self, other: IntoExpr) -> tuple[Expr, Expr]:
+        """Reflected `divmod` so ``divmod(scalar, expr)`` works.
+
+        Args:
+            other: The dividend value or expression.
+
+        Returns:
+            A ``(quotient, remainder)`` tuple of expressions.
+        """
+        return _wrap(other) // self, _wrap(other) % self
+
+    def __matmul__(self, other: IntoExpr) -> Expr:
+        """``a @ b`` — the dot product of two list (embedding) columns.
+
+        The numpy spelling of :meth:`_ListNamespace.dot`, which is what an embedding
+        similarity reads as: ``col("emb") @ col("query")``.
+
+        Args:
+            other: The other list column.
+
+        Returns:
+            A Float64 expression of the per-row dot product.
+        """
+        return self.list.dot(other)
 
     # --- bitwise integer operators (distinct from the boolean `&`/`|`) ------
     def bitwise_and(self, other: IntoExpr) -> Expr:
@@ -566,13 +676,18 @@ class Expr:
         return self._cast(dtype, try_cast=True)
 
     def _cast(self, dtype: str, *, try_cast: bool) -> Cast:
-        if dtype not in CAST_DTYPES:
+        # Type names are matched case-insensitively: pandas spells these `"Int64"` /
+        # `"Float64"` and SQL `"BIGINT"`, and a case mismatch is a typo the user cannot
+        # see. The IR always carries the canonical lowercase name, so the wire contract
+        # is unaffected.
+        canonical = dtype.lower() if isinstance(dtype, str) else dtype
+        if canonical not in CAST_DTYPES:
             import difflib
 
-            hint = difflib.get_close_matches(dtype, sorted(CAST_DTYPES), n=2, cutoff=0.5)
+            hint = difflib.get_close_matches(canonical, sorted(CAST_DTYPES), n=2, cutoff=0.5)
             suffix = f"; did you mean {' or '.join(map(repr, hint))}?" if hint else ""
             raise PlanError(f"unknown cast dtype {dtype!r}; valid: {sorted(CAST_DTYPES)}{suffix}")
-        return Cast(self, dtype, try_cast=try_cast)
+        return Cast(self, canonical, try_cast=try_cast)
 
     def is_null(self) -> IsNull:
         """True where the value is NULL (SQL ``IS NULL``).
@@ -2817,7 +2932,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").kurtosis()).to_pydict()
-                {'g': ['a'], 'r': [3.152000000000008]}
+                {'g': ['a'], 'r': [3.152000000000001]}
         """
         return AggExpr("kurtosis", self)
 
@@ -4417,3 +4532,10 @@ class Coalesce(IRNode):
 
     tag = ExprTag.COALESCE
     inputs: list[Expr] = children()
+
+
+# The pandas-compatible spellings (``isna``, ``fillna``, ``add``, …) are defined in
+# `expr_ir.compat` and attached here, so this module stays the one-`Expr` hierarchy
+# rather than carrying a second, parallel copy of its own surface. The import is at
+# the bottom because `compat` names `Expr` only under `TYPE_CHECKING`.
+_bind_compat_methods(Expr)

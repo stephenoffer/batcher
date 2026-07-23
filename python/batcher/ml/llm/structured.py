@@ -121,7 +121,7 @@ def _coerce(value: object, arrow_type: pa.DataType) -> object | None:
                 str(value).strip().lower()
             )
         if pa.types.is_integer(arrow_type):
-            return int(float(value)) if not isinstance(value, bool) else None
+            return _coerce_integer(value)
         if pa.types.is_floating(arrow_type):
             return float(value) if not isinstance(value, bool) else None
         if pa.types.is_string(arrow_type):
@@ -129,6 +129,47 @@ def _coerce(value: object, arrow_type: pa.DataType) -> object | None:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def _coerce_integer(value: object) -> int | None:
+    """Coerce `value` to an int, or null when the narrowing would be **lossy**.
+
+    ``int(float("3.9"))`` is 3, which is indistinguishable from a model that genuinely
+    answered 3 — a wrong number in a column that looks healthy. Only an exactly integral
+    value converts; anything else degrades to null like any other uncoercible value, so
+    the failures stay countable. An `int` is taken directly rather than through `float`,
+    which would silently round past 2**53.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)  # exact, and keeps precision beyond 2**53
+        except ValueError:
+            pass
+        value = float(text)
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    return None
+
+
+def _apply_instruction(requests: list, suffix: str) -> list:
+    """Append `suffix` to the text of every request, string or dict.
+
+    A dict request (a vision or per-row-LoRA row) carries its text under ``"prompt"``.
+    Skipping those dropped the "reply with JSON" / "answer with one label" instruction
+    for exactly the rows that need it most, and the model was never told what to emit.
+    """
+    out = []
+    for request in requests:
+        if isinstance(request, dict):
+            out.append({**request, "prompt": f"{request['prompt']}{suffix}"})
+        else:
+            out.append(f"{request}{suffix}")
+    return out
 
 
 def _extract_batch(
@@ -139,16 +180,22 @@ def _extract_batch(
     prompt_column: str | None,
     template: str | None,
     instruct: bool,
+    adapter_column: str | None = None,
 ) -> pa.RecordBatch:
     """One batch through the engine, appending one typed column per declared field."""
     import pyarrow as pa
 
-    from batcher.ml.llm.generate import _build_requests
+    from batcher.ml.llm.requests import GenerateSpec, _build_requests
 
-    requests = _build_requests(template, prompt_column, None, None, batch)
+    spec = GenerateSpec(
+        prompt_column=prompt_column or "",
+        template=template,
+        adapter_column=adapter_column,
+    )
+    requests = _build_requests(spec, batch)
     if instruct:
         suffix = "\n\n" + _EXTRACT_INSTRUCTION.format(keys=", ".join(fields))
-        requests = [r + suffix if isinstance(r, str) else r for r in requests]
+        requests = _apply_instruction(requests, suffix)
 
     parsed: list[dict] = []
     for out in engine(requests):
@@ -176,6 +223,7 @@ def llm_extract_udf(
     prompt_column: str | None = None,
     template: str | None = None,
     instruct: bool = True,
+    adapter_column: str | None = None,
 ) -> type:
     """A load-once class UDF appending one **typed** column per `schema` field.
 
@@ -187,6 +235,9 @@ def llm_extract_udf(
         instruct: Append a "reply with JSON having exactly these keys" instruction to
             each prompt. Turn it off when the engine already constrains decoding
             (``guided_json``) or the template says it itself.
+        adapter_column: Optional column naming the **LoRA adapter** to use per row, so
+            one engine serves many fine-tuned extractors. Pair with
+            ``vllm_engine(lora_paths={name: path})``; a null uses the base model.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus one
@@ -208,6 +259,7 @@ def llm_extract_udf(
                 prompt_column=prompt_column,
                 template=template,
                 instruct=instruct,
+                adapter_column=adapter_column,
             )
 
     return _LlmExtract
@@ -227,9 +279,18 @@ def _match_label(output: str, lookup: dict[str, str]) -> str | None:
     text = output.strip().strip(".\"'` \n").lower()
     if text in lookup:
         return lookup[text]
-    # The label may sit inside a short sentence ("The sentiment is positive.").
-    hits = {canonical for key, canonical in lookup.items() if key in text}
-    return hits.pop() if len(hits) == 1 else None
+    # The label may sit inside a short sentence ("The sentiment is positive."). When the
+    # declared labels nest ("positive" inside "very positive"), a correct answer matches
+    # both keys; a plain uniqueness test called that ambiguous and nulled the row. The
+    # longest matching key is the specific one the model actually said, so prefer it —
+    # and only fall back to null when two *equally long* labels both appear, which is
+    # genuine ambiguity ("could be positive, could be negative").
+    hits = [key for key in lookup if key in text]
+    if not hits:
+        return None
+    longest = max(len(key) for key in hits)
+    finalists = {lookup[key] for key in hits if len(key) == longest}
+    return finalists.pop() if len(finalists) == 1 else None
 
 
 def llm_classify_udf(
@@ -240,6 +301,7 @@ def llm_classify_udf(
     output_column: str = "label",
     template: str | None = None,
     instruct: bool = True,
+    adapter_column: str | None = None,
 ) -> type:
     """A load-once class UDF appending a label column constrained to `labels`.
 
@@ -254,6 +316,9 @@ def llm_classify_udf(
         output_column: Name of the appended label column.
         template: A ``str.format`` template over the row's columns.
         instruct: Append the "answer with one of these labels" instruction to each prompt.
+        adapter_column: Optional column naming the **LoRA adapter** to use per row, so
+            one engine serves many fine-tuned classifiers. Pair with
+            ``vllm_engine(lora_paths={name: path})``; a null uses the base model.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus the label.
@@ -274,17 +339,53 @@ def llm_classify_udf(
             self._engine = engine_factory()
 
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-            import pyarrow as pa
-
-            from batcher.ml.llm.generate import _build_requests
-
-            requests = _build_requests(template, prompt_column, None, None, batch)
-            if instruct:
-                suffix = "\n\n" + _CLASSIFY_INSTRUCTION.format(labels=", ".join(labels))
-                requests = [r + suffix if isinstance(r, str) else r for r in requests]
-            resolved = [_match_label(o, lookup) for o in self._engine(requests)]
-            arrays = [batch.column(i) for i in range(batch.num_columns)]
-            arrays.append(pa.array(resolved, type=pa.string()))
-            return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, output_column])
+            return _classify_batch(
+                self._engine,
+                batch,
+                labels=labels,
+                lookup=lookup,
+                prompt_column=prompt_column,
+                output_column=output_column,
+                template=template,
+                instruct=instruct,
+                adapter_column=adapter_column,
+            )
 
     return _LlmClassify
+
+
+def _classify_batch(
+    engine: Engine,
+    batch: pa.RecordBatch,
+    *,
+    labels: list[str],
+    lookup: dict[str, str],
+    prompt_column: str | None,
+    output_column: str,
+    template: str | None,
+    instruct: bool,
+    adapter_column: str | None = None,
+) -> pa.RecordBatch:
+    """One batch through the engine, appending the label column resolved against `lookup`.
+
+    A module-level function rather than a closure body so the request construction —
+    including the instruction suffix that dict requests used to lose — is reachable from
+    a test without standing up the whole UDF.
+    """
+    import pyarrow as pa
+
+    from batcher.ml.llm.requests import GenerateSpec, _build_requests
+
+    spec = GenerateSpec(
+        prompt_column=prompt_column or "",
+        template=template,
+        adapter_column=adapter_column,
+    )
+    requests = _build_requests(spec, batch)
+    if instruct:
+        suffix = "\n\n" + _CLASSIFY_INSTRUCTION.format(labels=", ".join(labels))
+        requests = _apply_instruction(requests, suffix)
+    resolved = [_match_label(o, lookup) for o in engine(requests)]
+    arrays = [batch.column(i) for i in range(batch.num_columns)]
+    arrays.append(pa.array(resolved, type=pa.string()))
+    return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, output_column])

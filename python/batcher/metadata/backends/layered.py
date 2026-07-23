@@ -13,12 +13,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 from batcher.metadata.backends.in_process import InProcessBackend
-from batcher.metadata.store import Key
+from batcher.metadata.store import Key, MetadataBackend, check_backend
 
 __all__ = ["LayeredBackend"]
 
 
-def _durable_from_uri(uri: str | None):
+def _durable_from_uri(uri: str | None) -> MetadataBackend:
     """Build the durable shared store from a uri scheme (`redis://` → Redis, else
     object storage)."""
     if uri and uri.startswith(("redis://", "rediss://", "unix://")):
@@ -33,13 +33,42 @@ def _durable_from_uri(uri: str | None):
 class LayeredBackend:
     """A `MetadataBackend` caching a durable shared backend behind a local dict."""
 
-    def __init__(self, shared, cache=None) -> None:
-        self._shared = shared
-        self._cache = cache if cache is not None else InProcessBackend()
+    def __init__(self, shared: MetadataBackend, cache: MetadataBackend | None = None) -> None:
+        """Layer a local cache over a durable shared store.
+
+        Args:
+            shared: The durable, cluster-visible backend. Checked here rather than on
+                first read: this class delegates every call, so a non-backend passed in
+                surfaces as an `AttributeError` from inside an unrelated query.
+            cache: The local cache. Defaults to a fresh `InProcessBackend`.
+
+        Raises:
+            ConfigError: If either argument does not implement `MetadataBackend`.
+        """
+        self._shared = check_backend(shared, role="shared store")
+        self._cache = (
+            check_backend(cache, role="cache") if cache is not None else InProcessBackend()
+        )
+
+    def __repr__(self) -> str:
+        """Name both layers, since "which store am I actually reading" is the whole question."""
+        return f"LayeredBackend(shared={self._shared!r}, cache={self._cache!r})"
 
     @classmethod
     def from_uri(cls, uri: str | None) -> LayeredBackend:
-        """Build a layered cache over the shared store the `uri` scheme selects."""
+        """Build a layered cache over the shared store the `uri` scheme selects.
+
+        Args:
+            uri: A ``redis://`` URL for the Redis store, otherwise an fsspec object
+                storage root.
+
+        Returns:
+            A `LayeredBackend` over the selected durable store.
+
+        Raises:
+            ConfigError: If `uri` is missing — neither shared store has a default,
+                because guessing one would silently make cross-driver learning local.
+        """
         return cls(_durable_from_uri(uri))
 
     def get(self, table: str, key: Key) -> bytes | None:

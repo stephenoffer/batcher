@@ -8,16 +8,42 @@ sql, …) are addressed by their explicit `read_*` functions, not by extension.
 from __future__ import annotations
 
 import os
+from typing import Any
 
-from batcher._internal.errors import FormatError
+from batcher._internal.errors import FormatError, unknown_value
 
-__all__ = ["DATA_SUFFIXES", "detect_format", "format_for_extension"]
+__all__ = [
+    "COMPRESSION_SUFFIXES",
+    "DATA_SUFFIXES",
+    "compression_for_path",
+    "detect_format",
+    "format_for_extension",
+]
+
+#: Compression suffixes that wrap another format rather than being one. ``events.csv.gz``
+#: is a CSV, and every engine users come from treats it that way, so the suffix is stripped
+#: before the format is read off the name — and reported separately by
+#: `compression_for_path` so the reader can decompress the stream.
+COMPRESSION_SUFFIXES: dict[str, str] = {
+    ".gz": "gzip",
+    ".gzip": "gzip",
+    ".bz2": "bz2",
+    ".zst": "zstd",
+    ".zstd": "zstd",
+    ".xz": "lzma",
+    ".lzma": "lzma",
+    ".lz4": "lz4",
+    ".br": "brotli",
+}
 
 _EXT_TO_FORMAT: dict[str, str] = {
     ".parquet": "parquet",
     ".pq": "parquet",
+    ".parq": "parquet",
     ".csv": "csv",
     ".tsv": "csv",
+    ".tab": "csv",
+    ".psv": "csv",
     ".json": "json",
     ".ndjson": "json",
     ".jsonl": "json",
@@ -47,6 +73,10 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".zarr": "zarr",
     ".pcd": "point_cloud",
     ".ply": "point_cloud",
+    ".mcap": "mcap",
+    ".mf4": "mdf",
+    ".arrows": "arrow",
+    ".lnc": "lance",
 }
 
 # URI schemes that name a source type directly (e.g. delta://, iceberg://).
@@ -63,9 +93,41 @@ def _scheme(path: str) -> str:
 
 
 def _ext(path: str) -> str:
+    """The format-bearing extension of `path`, with any compression suffix stripped.
+
+    ``events.csv.gz`` is a CSV: the ``.gz`` says how the bytes are packed, not what they
+    mean. Taking `splitext` alone reported ``.gz``, so every compressed file — the shape
+    an export pipeline produces by default — failed detection and had to name `format=`.
+    """
     # Strip a trailing slash (directory) and any glob suffix before taking the ext.
     base = path.rstrip("/").split("*", 1)[0]
-    return os.path.splitext(base)[1].lower()
+    stem, ext = os.path.splitext(base)
+    if ext.lower() in COMPRESSION_SUFFIXES:
+        ext = os.path.splitext(stem)[1]
+    return ext.lower()
+
+
+def compression_for_path(path: str) -> str | None:
+    """The compression codec named by `path`'s suffix, or None if it names none.
+
+    Args:
+        path: A file path or URI.
+
+    Returns:
+        A `pyarrow.CompressedInputStream` codec name (``"gzip"``, ``"zstd"``, …), or
+        None when the path carries no compression suffix.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.detect import compression_for_path
+            >>> compression_for_path("events.csv.gz")
+            'gzip'
+            >>> compression_for_path("events.csv") is None
+            True
+    """
+    base = path.rstrip("/").split("*", 1)[0].split("?", 1)[0]
+    return COMPRESSION_SUFFIXES.get(os.path.splitext(base)[1].lower())
 
 
 #: A transactional table announces itself by the metadata directory at its root. Detecting
@@ -97,15 +159,66 @@ def _table_at(path: str) -> str | None:
     return None
 
 
-def detect_format(path: str, explicit: str | None = None) -> str:
+def _registered_sources() -> tuple[str, ...]:
+    """Every registered source name, for a suggestion or an alternatives list.
+
+    Imported lazily: `io.formats` imports every format module, and `detect` is imported
+    from inside that graph, so a module-level import would be circular.
+    """
+    from batcher.io.formats.base import SOURCES
+
+    return tuple(sorted(SOURCES.names()))
+
+
+def _validate_explicit(explicit: str) -> str:
+    """Check an explicitly-named format against the registry, suggesting a near miss.
+
+    Without this the name travelled to `SOURCES.get`, whose registry-level error names no
+    format vocabulary a user thinks in and offers no suggestion — so ``format="parquett"``
+    read as a bare "unknown source" rather than the one-character typo it is.
+    """
+    if explicit in _registered_sources():
+        return explicit
+    raise unknown_value(
+        FormatError,
+        "format",
+        explicit,
+        _registered_sources(),
+        hint="omit format= to infer it from the path's extension or URI scheme.",
+    )
+
+
+def detect_format(path: Any, explicit: str | None = None) -> str:
     """Resolve the format name for `path`, preferring an `explicit` override.
 
     Order: explicit → URI scheme (delta/iceberg/…) → a table's metadata directory
-    (``_delta_log`` / ``metadata`` / ``.hoodie``) → file extension. Raises `FormatError`
-    if the format cannot be inferred.
+    (``_delta_log`` / ``metadata`` / ``.hoodie``) → file extension, with any compression
+    suffix stripped so ``events.csv.gz`` resolves as CSV. Raises `FormatError` if the
+    format cannot be inferred, naming what it *could* have inferred.
+
+    Args:
+        path: The path, URI, `pathlib.Path`, or list of paths to infer from.
+        explicit: A format name that overrides inference. Checked against the registry.
+
+    Returns:
+        The registered source name to read `path` with.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.detect import detect_format
+            >>> detect_format("s3://bucket/events.csv.gz")
+            'csv'
+            >>> detect_format("data/", explicit="parquet")
+            'parquet'
     """
     if explicit:
-        return explicit
+        return _validate_explicit(explicit)
+    from batcher.io.base._paths import normalize_source_path
+
+    # A list of files is one relation; the first names the format they all share.
+    root, files = normalize_source_path(path)
+    path = files[0] if files else root
     scheme = _scheme(path)
     if scheme in _SCHEME_TO_FORMAT:
         return _SCHEME_TO_FORMAT[scheme]
@@ -115,9 +228,20 @@ def detect_format(path: str, explicit: str | None = None) -> str:
     ext = _ext(path)
     if ext in _EXT_TO_FORMAT:
         return _EXT_TO_FORMAT[ext]
-    raise FormatError(
-        f"could not infer a format for {path!r}; pass format=... "
-        f"(e.g. read({path!r}, format='parquet'))"
+    # Suggest over the *extensions*, not the format names: the user wrote a filename, so
+    # ``.parquett`` should point at ``.parquet`` rather than at a format vocabulary they
+    # never typed. A directory or extension-less path gets no suggestion and the plain
+    # "name the format" instruction, which is the only fix available to it.
+    raise unknown_value(
+        FormatError,
+        "file extension",
+        ext or path,
+        tuple(_EXT_TO_FORMAT),
+        label="Recognized extensions",
+        hint=(
+            f"pass format= to name it explicitly, e.g. read({path!r}, format='parquet'). "
+            "A directory or extension-less path always needs format=."
+        ),
     )
 
 

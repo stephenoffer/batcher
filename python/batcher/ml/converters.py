@@ -12,11 +12,26 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.optional import require
+
 if TYPE_CHECKING:
     import numpy as np
     import pyarrow as pa
 
-__all__ = ["arrays_to_torch", "to_numpy_batches", "to_tf_dataset", "to_torch_iterable"]
+__all__ = [
+    "arrays_to_torch",
+    "to_numpy_batches",
+    "to_tf",
+    "to_tf_dataset",
+    "to_torch",
+    "to_torch_dataloader",
+    "to_torch_iterable",
+]
+
+
+def _require_torch() -> Any:
+    """Import ``torch`` or raise a `MissingDependencyError` naming the install command."""
+    return require("torch", feature="PyTorch conversion", provides="torch", extra="torch")
 
 
 def _worker_stride() -> tuple[int, int]:
@@ -65,7 +80,7 @@ def arrays_to_torch(arrays: dict[str, np.ndarray], *, zero_copy: bool = False) -
     Returns:
         A `{column: torch.Tensor}` dict over the numeric columns. Requires `torch`.
     """
-    import torch
+    torch = _require_torch()
 
     def _convert(array: np.ndarray) -> Any:
         if zero_copy:
@@ -170,9 +185,16 @@ def to_torch_iterable(
         A `torch.utils.data.IterableDataset` yielding one tensor dict per batch.
 
     Raises:
-        ImportError: if `torch` is not installed.
+        MissingDependencyError: if `torch` is not installed (naming ``pip install
+            'batcher-engine[torch]'``).
     """
-    from torch.utils.data import IterableDataset
+    IterableDataset = require(
+        "torch.utils.data",
+        "IterableDataset",
+        feature="PyTorch conversion",
+        provides="torch",
+        extra="torch",
+    )
 
     source = batches
     select = columns
@@ -213,21 +235,36 @@ def to_tf_dataset(
         A ``tf.data.Dataset`` yielding one `{column: tensor}` dict per batch.
 
     Raises:
-        ImportError: if `tensorflow` is not installed.
+        MissingDependencyError: if `tensorflow` is not installed (naming ``pip install
+            'batcher-engine[tensorflow]'``).
     """
-    import tensorflow as tf
+    tf = require(
+        "tensorflow", feature="TensorFlow conversion", provides="tensorflow", extra="tensorflow"
+    )
 
-    source = batches
-    select = columns
+    def _numeric(arrays: dict[str, Any]) -> dict[str, Any]:
+        return {n: a for n, a in arrays.items() if a.dtype.kind in "biuf"}
+
+    # ONE iterator, advanced exactly once for the signature probe and then resumed by the
+    # generator. Probing with a second `to_numpy_batches(...)` pass consumed batch 0 out of
+    # the one-shot source (`ds.iter_batches()`) and `from_generator` re-entered the
+    # already-advanced iterator, so every TF training run silently lost its first batch.
+    remaining = iter(to_numpy_batches(batches, columns=columns))
+    first_arrays = next(remaining, None)
+    if first_arrays is None:
+        return tf.data.Dataset.from_tensor_slices({})
+    first = _numeric(first_arrays)
 
     def _gen() -> Iterator[dict[str, Any]]:
-        for arrays in to_numpy_batches(source, columns=select):
-            yield {n: a for n, a in arrays.items() if a.dtype.kind in "biuf"}
+        # `first` is replayed only on the first pass; the source is one-shot, so a second
+        # pass (tf.data re-entering for another epoch) correctly yields nothing.
+        if not consumed:
+            consumed.append(True)
+            yield first
+            for arrays in remaining:
+                yield _numeric(arrays)
 
-    # Probe the first batch to derive the output signature (column names + dtypes).
-    first = next(_gen(), None)
-    if first is None:
-        return tf.data.Dataset.from_tensor_slices({})
+    consumed: list[bool] = []
     # The row axis is dynamic (``None``); every trailing axis is fixed by the column's
     # per-row shape. A feature/embedding column (`(n, W)`) or an image/tensor column
     # (`(n, H, W, C)`) must keep those inner dims, or `from_generator` rejects the yielded
@@ -238,3 +275,100 @@ def to_tf_dataset(
         for name, arr in first.items()
     }
     return tf.data.Dataset.from_generator(_gen, output_signature=sig)
+
+
+def to_torch_dataloader(
+    batches: Iterable[pa.RecordBatch],
+    *,
+    columns: Sequence[str] | None = None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    **dataloader_kwargs: Any,
+) -> Any:
+    """Wrap Arrow batches as a ready-to-iterate ``torch.utils.data.DataLoader``.
+
+    The batching is done here (one Arrow batch is one training batch), so the returned
+    loader is built with ``batch_size=None`` and simply streams the ready
+    ``{column: tensor}`` dicts. ``num_workers`` and ``pin_memory`` are the standard
+    PyTorch knobs and pass straight through; with ``num_workers > 0`` the Arrow shards
+    are split across worker processes (each yields a disjoint slice, so an epoch sees
+    every batch exactly once). Requires `torch`.
+
+    Args:
+        batches: an iterable of `pyarrow.RecordBatch`.
+        columns: optional subset of column names to keep (default: all).
+        num_workers: PyTorch DataLoader worker processes (0 loads in the main process).
+        pin_memory: page-lock host buffers for faster host-to-device copies.
+        **dataloader_kwargs: further ``DataLoader`` keyword arguments (e.g.
+            ``persistent_workers``), forwarded unchanged.
+
+    Returns:
+        A ``torch.utils.data.DataLoader`` yielding one ``{column: torch.Tensor}`` batch
+        per Arrow batch.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import to_torch_dataloader  # doctest: +SKIP
+            >>> ds = bt.from_pydict({"x": [1, 2, 3]})  # doctest: +SKIP
+            >>> loader = to_torch_dataloader(ds.iter_batches(), num_workers=2)  # doctest: +SKIP
+    """
+    from torch.utils.data import DataLoader
+
+    iterable = to_torch_iterable(batches, columns=columns)
+    return DataLoader(
+        iterable,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        **dataloader_kwargs,
+    )
+
+
+def to_torch(
+    batches: Iterable[pa.RecordBatch],
+    *,
+    columns: Sequence[str] | None = None,
+) -> Any:
+    """Alias of `to_torch_iterable` under the shorter ``to_torch`` name.
+
+    Args:
+        batches: an iterable of `pyarrow.RecordBatch`.
+        columns: optional subset of column names to keep (default: all).
+
+    Returns:
+        A `torch.utils.data.IterableDataset` yielding one tensor dict per batch.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import to_torch  # doctest: +SKIP
+            >>> loader = to_torch(bt.from_pydict({"x": [1]}).iter_batches())  # doctest: +SKIP
+    """
+    return to_torch_iterable(batches, columns=columns)
+
+
+def to_tf(
+    batches: Iterable[pa.RecordBatch],
+    *,
+    columns: Sequence[str] | None = None,
+) -> Any:
+    """Alias of `to_tf_dataset` under the shorter ``to_tf`` name.
+
+    Args:
+        batches: an iterable of `pyarrow.RecordBatch`.
+        columns: optional subset of column names to keep (default: all).
+
+    Returns:
+        A ``tf.data.Dataset`` yielding one `{column: tensor}` dict per batch.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import to_tf  # doctest: +SKIP
+            >>> tf_ds = to_tf(bt.from_pydict({"x": [1]}).iter_batches())  # doctest: +SKIP
+    """
+    return to_tf_dataset(batches, columns=columns)

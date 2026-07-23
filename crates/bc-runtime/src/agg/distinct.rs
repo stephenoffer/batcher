@@ -554,7 +554,11 @@ mod scratch_timing {
 
         let t = Instant::now();
         let st = distinct_state(&values, &gids, 1).unwrap();
-        println!("distinct_state(num_groups=1): {:?} -> len {}", t.elapsed(), st.len());
+        println!(
+            "distinct_state(num_groups=1): {:?} -> len {}",
+            t.elapsed(),
+            st.len()
+        );
 
         // sub-parts
         let grp: ArrayRef = Arc::new(Int64Array::from(vec![0i64; n]));
@@ -564,12 +568,20 @@ mod scratch_timing {
             values.as_any().downcast_ref::<Int64Array>().unwrap(),
             n,
         );
-        println!("  par_dedup_pairs: {:?} -> {} distinct", t.elapsed(), dg.len());
+        println!(
+            "  par_dedup_pairs: {:?} -> {} distinct",
+            t.elapsed(),
+            dg.len()
+        );
 
         let dvals: ArrayRef = Arc::new(Int64Array::from(dv));
         let t = Instant::now();
         let l = bucket_values_into_list(&Int64Array::from(dg), &dvals, 1).unwrap();
-        println!("  bucket_values_into_list: {:?} -> {}", t.elapsed(), l.len());
+        println!(
+            "  bucket_values_into_list: {:?} -> {}",
+            t.elapsed(),
+            l.len()
+        );
 
         let t = Instant::now();
         let m = merge_distinct(&st, &[0u32], 1).unwrap();
@@ -609,7 +621,11 @@ mod scratch_timing {
             .par_iter()
             .map(|b| {
                 let v: ArrayRef = b.column(0).clone();
-                partial(&[], &[AggCall::new(AggFunc::CountDistinct, Some(v))], b.num_rows())
+                partial(
+                    &[],
+                    &[AggCall::new(AggFunc::CountDistinct, Some(v))],
+                    b.num_rows(),
+                )
             })
             .collect::<Result<_, _>>()
             .unwrap();

@@ -96,7 +96,7 @@ def test_common_cases_take_the_fast_path():
 # uninferred `list.sum` makes `Dataset.schema` lie about the whole relation, not just the
 # reduced column.
 _LIST_REDUCTIONS = {
-    "sum": "double",
+    "sum": "int64",  # preserves the (int) element type, like min/max — verified below
     "mean": "double",
     "median": "double",
     "product": "double",

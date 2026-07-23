@@ -24,6 +24,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
+from batcher._internal.errors import PlanError
+from batcher.governance._validate import (
+    check_callable,
+    column_set,
+    policy_name,
+    reject_bare_string,
+)
 from batcher.governance.policy import ColumnMask, Grant, MaskFn, PredicateFn, RowFilter, TagMask
 from batcher.governance.principal import Principal
 
@@ -88,9 +95,17 @@ class SecurityCatalog:
 
         Returns:
             This catalog, for chaining.
+
+        Raises:
+            PlanError: If `role` or `on` is not a non-empty string, or `select` is a
+                bare string rather than a sequence of column names.
         """
         self._grants.append(
-            Grant(role=role, table=on, columns=None if select is None else frozenset(select))
+            Grant(
+                role=policy_name(role, "role name"),
+                table=policy_name(on, "table name"),
+                columns=column_set(select),
+            )
         )
         return self
 
@@ -118,7 +133,13 @@ class SecurityCatalog:
 
         Returns:
             This catalog, for chaining.
+
+        Raises:
+            PlanError: If `table` or `column` is not a non-empty string, or `mask` is
+                not callable.
         """
+        table, column = policy_name(table, "table name"), policy_name(column, "column name")
+        check_callable(mask, "mask_column(mask=...)", "mask(column_expression) -> expression")
         self._masks[table, column] = ColumnMask(table, column, mask, frozenset(exempt))
         return self
 
@@ -147,8 +168,21 @@ class SecurityCatalog:
 
         Returns:
             This catalog, for chaining.
+
+        Raises:
+            PlanError: If `table` or `column` is not a non-empty string, or no tag was
+                given — ``tag(table, column)`` with no tags reads as a classification
+                but stores nothing, so a later `mask_tag` governs nothing.
         """
-        self._tags.setdefault((table, column), set()).update(tags)
+        table, column = policy_name(table, "table name"), policy_name(column, "column name")
+        if not tags:
+            raise PlanError(
+                f"tag({table!r}, {column!r}) was given no tags.",
+                hint="Pass at least one, e.g. catalog.tag(table, column, 'pii').",
+            )
+        self._tags.setdefault((table, column), set()).update(
+            policy_name(t, "tag name") for t in tags
+        )
         return self
 
     def mask_tag(self, tag: str, mask: MaskFn, *, exempt: Iterable[str] = ()) -> SecurityCatalog:
@@ -172,7 +206,12 @@ class SecurityCatalog:
 
         Returns:
             This catalog, for chaining.
+
+        Raises:
+            PlanError: If `tag` is not a non-empty string, or `mask` is not callable.
         """
+        tag = policy_name(tag, "tag name")
+        check_callable(mask, "mask_tag(mask=...)", "mask(column_expression) -> expression")
         self._tag_masks[tag] = TagMask(tag, mask, frozenset(exempt))
         return self
 
@@ -209,11 +248,45 @@ class SecurityCatalog:
 
         Returns:
             This catalog, for chaining.
+
+        Raises:
+            PlanError: If `table` or `name` is not a non-empty string, or `predicate`
+                is not callable.
         """
-        self._row_filters.append(RowFilter(table, predicate, name, frozenset(exempt)))
+        table = policy_name(table, "table name")
+        check_callable(
+            predicate, "filter_rows(predicate=...)", "predicate(principal) -> expression"
+        )
+        self._row_filters.append(
+            RowFilter(table, predicate, policy_name(name, "row-filter name"), frozenset(exempt))
+        )
         return self
 
+    def __repr__(self) -> str:
+        """Count what is declared, per policy kind.
+
+        "Did my policy actually get installed?" is the question a catalog is printed to
+        answer, and the default `object.__repr__` — an address — answers none of it.
+        """
+        return (
+            f"SecurityCatalog(grants={len(self._grants)}, masks={len(self._masks)}, "
+            f"tags={len(self._tags)}, tag_masks={len(self._tag_masks)}, "
+            f"row_filters={len(self._row_filters)})"
+        )
+
     # --- resolution --------------------------------------------------------
+    def _any_policy(self) -> bool:
+        """Whether this catalog declares anything at all.
+
+        `enforce` needs it to decide whether an unnameable source is benign (nothing is
+        governed, so nothing was skipped) or a policy that may silently not have applied.
+        Private because "is my catalog empty" is not a question a user's code should
+        branch on — `governs(table)` is the public, per-table answer.
+        """
+        return bool(
+            self._grants or self._masks or self._tags or self._tag_masks or self._row_filters
+        )
+
     def governs(self, table: str) -> bool:
         """Whether any policy in this catalog mentions `table`.
 
@@ -267,7 +340,23 @@ class SecurityCatalog:
         Returns:
             The visible columns, preserving `columns`' order. Every column when the
             table carries no grant; otherwise the union of the principal's roles' grants.
+
+        Raises:
+            PlanError: If `columns` is a bare string, which would be read as one column
+                per character, or `principal` is not a `Principal`.
         """
+        reject_bare_string(
+            columns,
+            what="visible_columns(columns=...)",
+            param="columns",
+            reads_as="one column per character",
+        )
+        if not isinstance(principal, Principal):
+            raise PlanError(
+                f"visible_columns needs a Principal, but got "
+                f"{type(principal).__name__} {principal!r}.",
+                hint='Build one with bt.Principal("name", roles=[...]).',
+            )
         grants = [g for g in self._grants if g.table == table]
         if not grants:
             return list(columns)

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
@@ -64,7 +64,10 @@ class DeltaSnapshot:
 
     table_uri: str
     version: int
-    storage_options: dict[str, str] | None
+    # `repr=False`: the cloud credentials, same as on `DeltaFileSplit`. A snapshot is the
+    # object every metadata path holds, so it is the one most likely to appear in a
+    # traceback frame — and a generated `repr` puts the secret access key in the log.
+    storage_options: dict[str, str] | None = field(repr=False)
     _schema: pa.Schema
     _add_actions: pa.Table
     _partition_columns: list[str]

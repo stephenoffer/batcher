@@ -19,6 +19,13 @@ from batcher.core.udf.execute import (
     execute_with_udfs,
     has_map_batches,
     prebuild_factories,
+    stream_with_udfs,
 )
 
-__all__ = ["build_udf_callable", "execute_with_udfs", "has_map_batches", "prebuild_factories"]
+__all__ = [
+    "build_udf_callable",
+    "execute_with_udfs",
+    "has_map_batches",
+    "prebuild_factories",
+    "stream_with_udfs",
+]

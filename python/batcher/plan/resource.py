@@ -42,8 +42,13 @@ class HardwareProfile:
     * `cpu_cores`         — usable cores per worker (cgroup-quota aware, not host count).
     * `memory_bytes`      — usable RAM per worker (host RAM ∧ cgroup limit).
     * `l3_cache_bytes`    — last-level cache per cache domain; the broadcast-residency bound.
-    * `gpu_count`         — GPUs available to one worker (`0` on a CPU-only host).
-    * `gpu_memory_bytes`  — usable VRAM of the *smallest* visible GPU.
+    * `gpu_count`         — GPU **devices** reachable by the plan (`0` on a CPU-only host):
+                            this machine's devices single-node, the cluster's device total
+                            distributed. Devices, never GPU-bearing *nodes* — it is consumed
+                            as a multiplier for the whole-fleet VRAM budget
+                            (`one_gpu_bytes * gpu_count`), which counting nodes would
+                            under-state eightfold on an 8-GPU box.
+    * `gpu_memory_bytes`  — usable VRAM of the *smallest* visible GPU; `0` when unknown.
     * `worker_count`      — workers the plan will run across (`1` single-node); lets Kyber
                             reason about total vs per-node budgets on a cluster.
     """
@@ -96,9 +101,9 @@ class HardwareProfile:
 
         The caller passes the *binding* node's figures (smallest GPU VRAM, representative
         worker RAM/cores) so a plan sized against this profile is valid on every node it may
-        land on. `l3_cache_bytes` is usually left `0` for a cluster — the driver's cache says
-        nothing about a remote worker's — which keeps cache-sized thresholds at their default
-        rather than guessing from the wrong machine.
+        land on. `l3_cache_bytes` is the binding worker's cache when the caller could probe the
+        workers for it (Ray's topology omits cache), and `0` when it couldn't — which keeps a
+        cache-sized threshold at its default rather than guessing from the driver's machine.
         """
         return cls(
             cpu_cores=max(0, cpu_cores),

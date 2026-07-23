@@ -96,6 +96,26 @@ class DeltaStreamSource:
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         return list(self.iter_batches(projection))
 
+    def _shape(self, batch: pa.RecordBatch, projection: list[str] | None) -> pa.RecordBatch | None:
+        """One change-feed batch normalized, filtered to appends, and projected.
+
+        The per-batch form of what used to be a whole-window pass. Append mode keeps only
+        `insert` changes and presents the table's own schema; `change_feed=True` passes the
+        CDC columns through. A batch left empty by the filter is dropped rather than
+        yielded — a zero-row batch is not a change.
+        """
+        import pyarrow.compute as pc
+
+        table = normalize_engine_types(pa.Table.from_batches([batch]))
+        if not self._cdf:
+            change_type = pc.cast(table.column("_change_type"), pa.string())
+            table = table.filter(pc.equal(change_type, "insert")).drop(list(_CDF_META))
+        if projection is not None:
+            table = table.select(projection)
+        if table.num_rows == 0:
+            return None
+        return table.combine_chunks().to_batches()[0]
+
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         latest = self._latest_version()
         start = self._cursor + 1
@@ -103,23 +123,23 @@ class DeltaStreamSource:
             return  # no new commits since the last pass
         try:
             reader = self._delta_table().load_cdf(starting_version=start, ending_version=latest)
-            table = normalize_engine_types(pa.RecordBatchReader.from_stream(reader).read_all())
+            batches = pa.RecordBatchReader.from_stream(reader)
         except Exception as exc:
             raise BackendError(
                 f"failed to read Delta change feed for {self._table_uri!r} "
                 f"(is delta.enableChangeDataFeed set?): {exc}"
             ) from exc
-        if not self._cdf:
-            # Append mode: keep insert changes, present the table's own schema.
-            import pyarrow.compute as pc
-
-            change_type = pc.cast(table.column("_change_type"), pa.string())
-            table = table.filter(pc.equal(change_type, "insert")).drop(list(_CDF_META))
-        if table.num_rows == 0:
-            self._cursor = latest  # nothing to deliver, so the window is genuinely done
-            return
-        out = table.select(projection) if projection is not None else table
-        yield from out.to_batches()
+        # Streamed batch by batch. This used to be `.read_all()` — the entire change-feed
+        # window built into one table, filtered and projected whole, and only then
+        # re-chunked into the batches it yielded. A window is *every commit since the last
+        # pass*, so on a first run (`starting_version=0`) it is the table's whole history,
+        # and on a resumed one it is however much accumulated while the query was down —
+        # exactly the cases where memory is already tight. An unbounded source whose
+        # micro-batch peak is the size of its backlog is not a stream.
+        for batch in batches:
+            shaped = self._shape(batch, projection)
+            if shaped is not None:
+                yield shaped
         # Advance ONLY after every batch has been handed to the consumer.
         #
         # This used to run before the first `yield`, which turned the cursor into a promise

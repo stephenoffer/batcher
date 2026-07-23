@@ -133,7 +133,36 @@ set_config(active_config().replace(
 ## Logs
 
 All engine logs live under the `batcher.*` logger hierarchy, one logger per subsystem, such
-as `batcher.kyber`, `batcher.carbonite`, and `batcher.core`. One config controls all of them:
+as `batcher.kyber`, `batcher.carbonite`, and `batcher.core`. Batcher owns that hierarchy and
+nothing else, so your application's own `logging` setup keeps working untouched.
+
+For the common cases there are one-line switches. `set_log_level` takes a level name, a
+`logging` constant, or a verbosity preset, and applies immediately rather than at the next
+query. `enable_logging` turns the console handler on, optionally writing a rotating file as
+well, and `disable_logging` silences the console without disturbing your own configuration.
+
+```python
+from batcher.config import disable_logging, enable_logging, set_log_level
+
+set_log_level("debug")
+enable_logging("info", log_file="/tmp/batcher.log")
+disable_logging()
+```
+
+`set_verbosity` moves the whole ladder, log level and progress bar together, and
+`set_progress` controls the bar alone. Reach for `get_logger` when you want to attach a
+handler or set a level on one subsystem with plain stdlib calls:
+
+```python
+from batcher.config import get_logger, set_progress, set_verbosity
+
+set_verbosity("verbose")
+set_progress(False)
+print(get_logger("kyber").name)
+# batcher.kyber
+```
+
+For anything these don't cover, one config controls all of them:
 
 ```python
 set_config(active_config().replace(
@@ -256,6 +285,55 @@ set_config(active_config().replace(
 
 Turning it off with `event_log=False` removes the per-query write. That is worth doing only
 if you run many small queries and nothing consumes the documents.
+
+## Metrics
+
+The event bus is the right tool when you want every detail of one query. When you want a
+handful of numbers scraped every fifteen seconds forever, use the counters instead.
+`metrics_snapshot` returns them as a nested dict of plain numbers, with no Batcher types in
+it and nothing to close:
+
+```python
+from batcher.observe import metrics_snapshot
+
+snap = metrics_snapshot()
+print(sorted(snap))
+# ['bytes', 'logs', 'operators', 'queries', 'rows', 'spills', 'uptime_seconds']
+```
+
+Counters are cumulative from the moment collection starts, the convention every metrics
+backend expects, so a scrape loop differences successive snapshots to get rates. Collecting
+costs a few integer adds per event.
+
+The first snapshot starts collection, which means it reports only what happened after it.
+Call `start_metrics()` once during startup when the first scrape should also cover the
+queries that ran before it:
+
+```python
+from batcher.observe import start_metrics
+
+start_metrics()
+```
+
+Collection is opt-in rather than always-on for a reason. Attaching any sink to the event
+bus tells the engine that per-query profiles are being consumed, so it assembles one on
+every query. A process that exports no metrics shouldn't pay that on the sub-second path.
+
+`prometheus_text` renders the same numbers in the Prometheus text exposition format. Serve
+it from the `/metrics` endpoint your application already has and Batcher joins whatever you
+scrape today. Batcher runs no HTTP server for this and pulls in no client library:
+
+```python
+from batcher.observe import prometheus_text
+
+print("batcher_queries_total" in prometheus_text())
+# True
+```
+
+Series are prefixed `batcher_`, counters carry the conventional `_total` suffix, and query
+duration is a real histogram with `_bucket`, `_sum`, and `_count` series. OpenTelemetry and
+StatsD users can map the same dict onto their own instruments. `reset_metrics` zeroes the
+counters, for tests and for a service that would rather report per-interval numbers itself.
 
 ## OpenTelemetry
 

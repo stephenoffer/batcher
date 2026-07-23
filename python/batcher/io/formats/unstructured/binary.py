@@ -133,6 +133,13 @@ class BinarySource:
         return len(self._files())
 
     def identity(self) -> str:
+        # `suffix` selects *which files* the path expands to, so two sources on the same path
+        # with different suffixes are different relations (a corpus of `.jpg` vs `.png` has a
+        # different row count and different blobs). Omitting it collided their stats under one
+        # key. Kept off the key in the default (match-all) case so the common identity is
+        # unchanged.
+        if self._suffix:
+            return f"binary:{self._path}#suffix={self._suffix}"
         return f"binary:{self._path}"
 
     def splits(self, target_size: int | None = None) -> list[Split]:

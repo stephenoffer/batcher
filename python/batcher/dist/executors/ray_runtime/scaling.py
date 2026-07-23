@@ -13,6 +13,11 @@ import contextvars
 import math
 import threading
 
+from batcher._internal.accelerators import (
+    accelerator_units,
+    binding_gpu_memory_bytes,
+    is_accelerator_node,
+)
 from batcher.config import active_config
 from batcher.plan.resource import HardwareProfile
 
@@ -190,7 +195,7 @@ def worker_node_memory_bytes() -> int:
 
 
 def node_classes() -> list[dict]:
-    """Per-alive-node resource class: ``{"cpus", "gpus", "accelerator_type"}``.
+    """Per-alive-node resource class: ``{"cpus", "gpus", "accelerators", "accelerator_type"}``.
 
     The explicit cluster-heterogeneity model the scheduler lacked: a node is a "GPU
     node" when it exposes a `GPU` resource, a "CPU-only node" otherwise. The accelerator
@@ -212,6 +217,9 @@ def node_classes() -> list[dict]:
                 {
                     "cpus": cpus,
                     "gpus": float(res.get("GPU", 0.0)),
+                    # Non-GPU accelerators (TPU / Trainium / Gaudi / NPU) Ray doesn't count as
+                    # `GPU`; lets the CPU-fleet isolation treat a TPU node as an accelerator node.
+                    "accelerators": accelerator_units(res),
                     "accelerator_type": labels.get("ray.io/accelerator-type"),
                 }
             )
@@ -227,10 +235,14 @@ def cluster_hardware_profile() -> HardwareProfile | None:
     *workers*, not the driver — which may be a fat head node next to small workers. Every
     field is the **binding** (weakest) worker so a plan sized against it is valid on every
     node it might land on: cores from the smallest worker, RAM from `worker_node_memory_bytes`
-    (already the minimum), GPU VRAM left `0` (Ray advertises GPU *count*, not bytes, so the
-    per-device budget stays with `OptimizerConfig.resolved_gpu_memory_gb`). `l3_cache_bytes`
-    is left `0` — the driver's cache says nothing about a worker's — so a cache-sized threshold
-    keeps its default rather than guessing from the wrong machine.
+    (already the minimum), VRAM from the smallest device model any GPU node advertises, and L3
+    cache from the smallest-cache node shape (probed from the workers — Ray's topology omits it,
+    so this used to be `0` and every cluster query fell back to the config broadcast threshold).
+
+    `gpu_count` is the cluster's **device** total, not the number of GPU-bearing nodes. Those
+    differ on any multi-GPU node, and the figure is consumed as a device count (a whole-cluster
+    VRAM budget is `one_gpu_gb * gpu_count`), so reporting nodes under-counted an 8-GPU box
+    eightfold and refused work the cluster could hold.
 
     Returns `None` when the topology is unreadable (Ray down), so the caller falls back to the
     single-node local profile rather than a fabricated one.
@@ -240,29 +252,36 @@ def cluster_hardware_profile() -> HardwareProfile | None:
         return None
     worker_count = len(classes)
     min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
-    gpu_nodes = sum(1 for c in classes if c["gpus"] > 0)
+    gpu_devices = int(sum(c["gpus"] for c in classes))
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_l3_cache_bytes
+
     return HardwareProfile.for_cluster(
         cpu_cores=min_cores,
         memory_bytes=worker_node_memory_bytes(),
         worker_count=worker_count,
-        gpu_count=gpu_nodes,
+        gpu_count=gpu_devices,
+        gpu_memory_bytes=binding_gpu_memory_bytes(classes),
+        # The binding worker's L3, probed from the workers themselves — Ray's topology omits
+        # cache, so this was left `0` and every cluster query fell back to the config broadcast
+        # threshold. Cached per topology and best-effort, so an unprobeable cluster is unchanged.
+        l3_cache_bytes=cluster_l3_cache_bytes(),
     )
 
 
 def cpu_only_can_host(workers: int, num_cpus: float) -> bool:
     """Whether the cluster's **CPU-only** nodes alone can host `workers` x `num_cpus` cores.
 
-    The gate for keeping a relational (CPU) fleet off GPU nodes on a heterogeneous
+    The gate for keeping a relational (CPU) fleet off accelerator nodes on a heterogeneous
     cluster: only restrict the fleet to CPU-only nodes when those nodes have the capacity
     to run it — otherwise the restriction would under-provision (or fail to place) the
     query, so the fleet is left free to use every node (today's behavior). Returns False
-    on a homogeneous cluster (no GPU nodes ⇒ nothing to keep off ⇒ no restriction needed)
-    or unreadable topology.
+    on a homogeneous cluster (no accelerator nodes ⇒ nothing to keep off) or unreadable
+    topology. Accelerator = GPU or custom accelerator (see `is_accelerator_node`).
     """
     classes = node_classes()
-    if not classes or not any(c["gpus"] > 0 for c in classes):
-        return False  # homogeneous / GPU-less → no restriction (use all nodes)
-    cpu_only_cores = sum(c["cpus"] for c in classes if c["gpus"] <= 0)
+    if not classes or not any(is_accelerator_node(c) for c in classes):
+        return False  # homogeneous / accelerator-less → no restriction (use all nodes)
+    cpu_only_cores = sum(c["cpus"] for c in classes if not is_accelerator_node(c))
     return cpu_only_cores >= workers * max(num_cpus, 1e-9)
 
 
@@ -324,6 +343,11 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     capacity = int(avail_cpus / num_cpus)
     if num_gpus > 0:
         capacity = min(capacity, int(topo["gpus"] / num_gpus))
+    # ...and by what a single node can *host* (see `capacity.placeable_workers`).
+    from batcher.dist.executors.ray_runtime.capacity import placeable_workers
+
+    fits = placeable_workers(num_cpus, num_gpus)
+    capacity = capacity if fits is None else min(capacity, fits)
     if avail_cpus <= 0 or workers <= capacity:
         return workers
     # The query scope already asked the autoscaler for these resources
@@ -336,6 +360,9 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     fit = int(avail_now / num_cpus)
     if num_gpus > 0:
         fit = min(fit, int(float(cluster_topology()["gpus"]) / num_gpus))
+    # Re-read after the wait: the grown cluster's shape decides what fits, not its totals.
+    fits_now = placeable_workers(num_cpus, num_gpus)
+    fit = fit if fits_now is None else min(fit, fits_now)
     return max(1, min(workers, fit))
 
 

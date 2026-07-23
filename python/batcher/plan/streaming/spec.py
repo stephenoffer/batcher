@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Final, Literal
+
+from batcher._internal.errors import PlanError, suggestion
 
 __all__ = [
     "OutputMode",
@@ -50,26 +53,66 @@ _UNIT_SECONDS: Final[dict[str, float]] = {
 
 _INTERVAL_RE: Final[re.Pattern[str]] = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*")
 
+_TRIGGER_KINDS: Final = ("processing_time", "once", "available_now", "continuous")
 
-def parse_interval_seconds(interval: float | int | str) -> float:
-    """Parse a trigger interval to seconds.
 
-    Accepts a number (already seconds) or a Spark-style string such as
-    ``"5 seconds"``, ``"1 minute"``, ``"500 milliseconds"``, ``"100ms"``. Raises
-    `ValueError` for an unrecognized unit or a non-positive duration.
+def parse_interval_seconds(interval: float | int | str | timedelta) -> float:
+    """Parse a trigger/lateness interval to seconds.
+
+    Accepts a `datetime.timedelta`, a number already in seconds, or a Spark-style
+    string such as ``"5 seconds"``, ``"1 minute"``, ``"500 milliseconds"``, or
+    ``"100ms"``. Raises `PlanError` (a `ValueError`) for an unrecognized unit, an
+    unparseable string, an unsupported type, or a negative duration.
+
+    Examples:
+        .. doctest::
+
+            >>> import datetime
+            >>> from batcher.plan.streaming import parse_interval_seconds
+            >>> parse_interval_seconds("2 minutes")
+            120.0
+            >>> parse_interval_seconds(datetime.timedelta(seconds=5))
+            5.0
+
+    Args:
+        interval: A `timedelta`, seconds as a number, or a Spark-style duration string.
+
+    Returns:
+        The duration in seconds as a float.
+
+    Raises:
+        PlanError: If the interval is not parseable, uses an unknown unit, is a type
+            other than number/str/timedelta, or is negative.
     """
-    if isinstance(interval, (int, float)):
+    if isinstance(interval, timedelta):
+        seconds = interval.total_seconds()
+    elif isinstance(interval, bool):
+        # `bool` is an `int` subclass; a boolean interval is always a mistake.
+        raise PlanError(
+            f"interval must be a number, a string like '5 seconds', or a timedelta, "
+            f"not a bool ({interval!r})"
+        )
+    elif isinstance(interval, (int, float)):
         seconds = float(interval)
-    else:
+    elif isinstance(interval, str):
         match = _INTERVAL_RE.fullmatch(interval)
         if match is None:
-            raise ValueError(f"cannot parse interval {interval!r} (try '5 seconds', '100ms')")
+            raise PlanError(
+                f"cannot parse interval {interval!r}; use a number of seconds or a string "
+                "like '5 seconds', '1 minute', or '100ms'"
+            )
         value, unit = match.group(1), match.group(2).lower()
         if unit not in _UNIT_SECONDS:
-            raise ValueError(f"unknown interval unit {unit!r} in {interval!r}")
+            hint = suggestion(unit, _UNIT_SECONDS) or "use 'ms', 's', 'm', or 'h'"
+            raise PlanError(f"unknown interval unit {unit!r} in {interval!r}. {hint}")
         seconds = float(value) * _UNIT_SECONDS[unit]
+    else:
+        raise PlanError(
+            f"interval must be a number, a string like '5 seconds', or a timedelta, "
+            f"not {type(interval).__name__} ({interval!r})"
+        )
     if seconds < 0:
-        raise ValueError(f"interval must be non-negative, got {seconds}")
+        raise PlanError(f"interval must be non-negative, got {seconds}")
     return seconds
 
 
@@ -103,8 +146,17 @@ class Trigger:
     kind: Literal["processing_time", "once", "available_now", "continuous"]
     interval_seconds: float | None = None
 
+    def __post_init__(self) -> None:
+        """Reject an unknown trigger kind (a typo in a raw construction)."""
+        if self.kind not in _TRIGGER_KINDS:
+            hint = suggestion(str(self.kind), _TRIGGER_KINDS)
+            raise PlanError(
+                f"unknown Trigger kind {self.kind!r}; build via Trigger.processing_time(), "
+                ".once(), .available_now(), or .continuous()." + (f" {hint}" if hint else "")
+            )
+
     @classmethod
-    def processing_time(cls, interval: float | int | str) -> Trigger:
+    def processing_time(cls, interval: float | int | str | timedelta) -> Trigger:
         """Fire a micro-batch every `interval` (seconds, or a string like '5 seconds').
 
         Examples:
@@ -156,7 +208,7 @@ class Trigger:
         return cls("available_now", None)
 
     @classmethod
-    def continuous(cls, interval: float | int | str) -> Trigger:
+    def continuous(cls, interval: float | int | str | timedelta) -> Trigger:
         """Continuous processing, committing a checkpoint epoch every `interval`.
 
         Examples:
@@ -175,6 +227,80 @@ class Trigger:
             the interval.
         """
         return cls("continuous", parse_interval_seconds(interval))
+
+    # Spark/Scala capitalized spellings, so a `Trigger.ProcessingTime("5 seconds")`
+    # ported straight from a Spark job keeps working. Thin aliases of the snake_case
+    # factories above — the concept is identical, so these are real aliases, not errors.
+    @classmethod
+    def ProcessingTime(cls, interval: float | int | str | timedelta) -> Trigger:
+        """Spark spelling of `processing_time` — fire a micro-batch every `interval`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.ProcessingTime("5 seconds")
+                Trigger(kind='processing_time', interval_seconds=5.0)
+
+        Args:
+            interval: The wall-clock cadence, as seconds or a Spark-style string.
+
+        Returns:
+            A trigger that fires on the given fixed interval.
+        """
+        return cls.processing_time(interval)
+
+    @classmethod
+    def Once(cls) -> Trigger:
+        """Spark spelling of `once` — process one micro-batch of available data, then stop.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.Once()
+                Trigger(kind='once', interval_seconds=None)
+
+        Returns:
+            A trigger that processes a single micro-batch and then stops.
+        """
+        return cls.once()
+
+    @classmethod
+    def AvailableNow(cls) -> Trigger:
+        """Spark spelling of `available_now` — drain all available data, then stop.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.AvailableNow()
+                Trigger(kind='available_now', interval_seconds=None)
+
+        Returns:
+            A trigger that drains all available data, then stops.
+        """
+        return cls.available_now()
+
+    @classmethod
+    def Continuous(cls, interval: float | int | str | timedelta) -> Trigger:
+        """Spark spelling of `continuous` — run micro-batches back-to-back.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.Continuous("1 second")
+                Trigger(kind='continuous', interval_seconds=1.0)
+
+        Args:
+            interval: The checkpoint-epoch cadence, as seconds or a Spark-style string.
+
+        Returns:
+            A trigger that runs micro-batches back-to-back, committing an epoch on
+            the interval.
+        """
+        return cls.continuous(interval)
 
 
 class OutputMode:
@@ -207,7 +333,11 @@ class OutputMode:
 
     @classmethod
     def validate(cls, mode: str) -> str:
-        """Return `mode` if recognized, else raise `ValueError`.
+        """Return `mode` if it is a recognized (lowercase) output mode, else raise.
+
+        Modes are canonical lowercase (``"append"``); Spark's ``"Append"`` is rejected
+        with a suggestion rather than silently normalized, because downstream sink
+        guards match the exact string.
 
         Examples:
             .. doctest::
@@ -217,17 +347,26 @@ class OutputMode:
                 'complete'
 
         Args:
-            mode: The output mode to check, one of ``APPEND``, ``COMPLETE``,
-                ``UPDATE``.
+            mode: The output mode to check, one of ``APPEND``, ``COMPLETE``, ``UPDATE``.
 
         Returns:
             The `mode` string unchanged, once validated.
 
         Raises:
-            ValueError: If `mode` is not a recognized output mode.
+            PlanError: If `mode` is not a recognized output mode. The message suggests
+                the closest valid mode.
         """
+        if not isinstance(mode, str):
+            raise PlanError(
+                f"output_mode must be a string, not {type(mode).__name__} ({mode!r}); "
+                f"use one of {sorted(cls._ALL)}"
+            )
         if mode not in cls._ALL:
-            raise ValueError(f"unknown output_mode {mode!r}; use one of {sorted(cls._ALL)}")
+            hint = suggestion(mode, cls._ALL)
+            raise PlanError(
+                f"unknown output_mode {mode!r}; use one of {sorted(cls._ALL)}."
+                + (f" {hint}" if hint else "")
+            )
         return mode
 
 
@@ -246,6 +385,13 @@ class StreamingQueryProgress:
         """Throughput for this micro-batch (rows / second), 0 if it took no time."""
         return self.num_input_rows / (self.duration_ms / 1000.0) if self.duration_ms else 0.0
 
+    def __str__(self) -> str:
+        """A one-line human summary: batch id, rows in/out, duration, throughput."""
+        return (
+            f"batch {self.batch_id}: {self.num_input_rows} in -> {self.num_output_rows} out "
+            f"in {self.duration_ms:.0f}ms ({self.input_rows_per_second:.0f} rows/s)"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class StreamingQueryStatus:
@@ -256,6 +402,11 @@ class StreamingQueryStatus:
     is_trigger_active: bool
     message: str
     batches_processed: int
+
+    def __str__(self) -> str:
+        """A one-line human summary: liveness, the status message, and batches processed."""
+        state = "active" if self.is_active else "stopped"
+        return f"[{state}] {self.message} ({self.batches_processed} batches processed)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,3 +422,35 @@ class Watermark:
 
     time_col: str
     lateness_micros: int
+
+    @classmethod
+    def of(cls, time_col: str, delay: float | int | str | timedelta) -> Watermark:
+        """Build a watermark from a human delay (Spark ``withWatermark(col, "10 minutes")``).
+
+        Spark takes the allowed lateness as a duration string; this accepts the same,
+        plus a `timedelta` or seconds, and converts to the internal microseconds.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.streaming.spec import Watermark
+                >>> Watermark.of("event_time", "10 minutes").lateness_micros
+                600000000
+
+        Args:
+            time_col: The event-time column the watermark advances on.
+            delay: The allowed lateness, as a duration string (``"10 minutes"``), a
+                `timedelta`, or seconds.
+
+        Returns:
+            A `Watermark` with `lateness_micros` derived from `delay`.
+        """
+        if not time_col:
+            raise PlanError("Watermark.of(): time_col must be a non-empty event-time column name")
+        micros = round(parse_interval_seconds(delay) * 1_000_000)
+        return cls(time_col, micros)
+
+    @property
+    def lateness_seconds(self) -> float:
+        """The allowed lateness in seconds (the microseconds, humanized)."""
+        return self.lateness_micros / 1_000_000

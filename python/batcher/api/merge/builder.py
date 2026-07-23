@@ -21,12 +21,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, suggestion
 from batcher.api.merge.clauses import (
+    CLAUSE_LABEL,
+    CLAUSE_METHODS,
     MATCHED,
     NOT_MATCHED,
     NOT_MATCHED_BY_SOURCE,
     MergeClause,
+    legal_actions,
 )
 
 if TYPE_CHECKING:
@@ -51,13 +54,16 @@ def simple_clauses(when_matched: str, when_not_matched: str) -> list[MergeClause
     survive untouched — which is what an upsert means.
     """
     if when_matched not in _WHEN_MATCHED:
+        hint = suggestion(when_matched, _WHEN_MATCHED)
         raise PlanError(
-            f"merge(): when_matched must be one of {_WHEN_MATCHED}, got {when_matched!r}"
+            f"merge(): when_matched must be one of {_WHEN_MATCHED}, got {when_matched!r}."
+            + (f" {hint}" if hint else "")
         )
     if when_not_matched not in _WHEN_NOT_MATCHED:
+        hint = suggestion(when_not_matched, _WHEN_NOT_MATCHED)
         raise PlanError(
             f"merge(): when_not_matched must be one of {_WHEN_NOT_MATCHED}, "
-            f"got {when_not_matched!r}"
+            f"got {when_not_matched!r}." + (f" {hint}" if hint else "")
         )
     clauses = [MergeClause(kind=MATCHED, action=when_matched)]
     if when_not_matched == "insert":
@@ -159,7 +165,35 @@ class MergeWhen:
         """
         return self._add("insert", None)
 
+    # Delta/Spark spellings (`whenMatchedUpdateAll` / `whenNotMatchedInsertAll`), so a
+    # merge ported from Delta keeps reading. Thin aliases of the snake_case actions.
+    def updateAll(self) -> MergeBuilder:
+        """Delta spelling of `update_all` (``UPDATE SET *``).
+
+        Returns:
+            The builder, so clauses chain.
+        """
+        return self.update_all()
+
+    def insertAll(self) -> MergeBuilder:
+        """Delta spelling of `insert_all` (``INSERT *``).
+
+        Returns:
+            The builder, so clauses chain.
+        """
+        return self.insert_all()
+
+    def __repr__(self) -> str:
+        """Show which population this clause targets."""
+        guard = "" if self._condition is None else " (guarded)"
+        return f"MergeWhen({CLAUSE_LABEL.get(self._kind, self._kind)}{guard})"
+
     def _add(self, action: str, values: dict[str, Expr] | None) -> MergeBuilder:
+        if action not in legal_actions(self._kind):
+            raise PlanError(
+                f"merge(): a {CLAUSE_LABEL.get(self._kind, self._kind)} clause cannot "
+                f"{action}(); use {CLAUSE_METHODS.get(self._kind, '?')}"
+            )
         clause = MergeClause(
             kind=self._kind, action=action, condition=self._condition, values=values
         )
@@ -205,6 +239,11 @@ class MergeBuilder:
         format: str | None = None,
         opts: dict[str, Any] | None = None,
     ) -> None:
+        if not keys:
+            raise PlanError(
+                "merge_into(): needs at least one key column to match rows on — "
+                "pass on='id' (or on=['a', 'b'] for a composite key)"
+            )
         self._source = source
         self._target = target
         self._keys = keys
@@ -212,6 +251,14 @@ class MergeBuilder:
         self._prune = prune
         self._format = format
         self._opts = opts or {}
+
+    def __repr__(self) -> str:
+        """Show the target, the merge keys, and the clauses added so far."""
+        if not self._clauses:
+            clauses = "no clauses yet"
+        else:
+            clauses = ", ".join(f"{c.kind}:{c.action}" for c in self._clauses)
+        return f"MergeBuilder(target={self._target!r}, on={self._keys}, [{clauses}])"
 
     def when_matched(self, condition: Expr | None = None) -> MergeWhen:
         """Clause for rows whose key exists in **both** sides (``WHEN MATCHED``).
@@ -262,7 +309,16 @@ class MergeBuilder:
 
         Returns:
             A `WriteManifest` of the data files the merge wrote.
+
+        Raises:
+            PlanError: If no ``when_*`` clause was added — a clauseless merge would
+                touch nothing, which is almost always a forgotten clause.
         """
+        if not self._clauses:
+            raise PlanError(
+                "merge_into(): no clauses were added, so the merge would do nothing. Add "
+                "at least one, e.g. .when_matched().update_all().when_not_matched().insert_all()"
+            )
         from batcher.api.merge.execute import run_merge
 
         return run_merge(

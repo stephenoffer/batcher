@@ -62,7 +62,7 @@ def ingest_log(monkeypatch):
     """Records every `adbc_ingest` the sink issues, with its disposition."""
     log: list[tuple[str, int, str | None]] = []
     monkeypatch.setattr(
-        "batcher.io.formats.sql.adbc._connect",
+        "batcher.io.formats.sql.adbc.source._connect",
         lambda driver, db_kwargs, conn_kwargs: _Conn(log),
     )
     return log

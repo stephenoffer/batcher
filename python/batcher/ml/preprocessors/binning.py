@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, fit_aggregate
+from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
 from batcher.plan.expr_ir import col, when
 
 if TYPE_CHECKING:
@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["KBinsDiscretizer"]
+
+# The ceiling on `n_bins`. A quantile fit builds one sketch per inner edge and the
+# transform builds one CASE arm per inner edge, so an unbounded `n_bins` is an unbounded
+# fit cost and an unbounded plan. 256 covers every realistic discretization.
+MAX_BINS = 256
 
 
 class KBinsDiscretizer(Preprocessor):
@@ -47,13 +52,17 @@ class KBinsDiscretizer(Preprocessor):
     __slots__ = ("columns", "edges_", "n_bins", "strategy")
 
     def __init__(
-        self, columns: Sequence[str], *, n_bins: int = 5, strategy: str = "quantile"
+        self, columns: str | Sequence[str], *, n_bins: int = 5, strategy: str = "quantile"
     ) -> None:
-        self.columns = list(columns)
-        if not self.columns:
-            raise PlanError("KBinsDiscretizer requires at least one column")
+        self.columns = columns_arg(columns, what="KBinsDiscretizer")
         if n_bins < 2:
             raise PlanError(f"n_bins must be >= 2, got {n_bins}")
+        if n_bins > MAX_BINS:
+            raise PlanError(
+                f"n_bins must be <= {MAX_BINS}, got {n_bins}. Each bin edge is a CASE arm in "
+                f"the transform, and on the 'quantile' strategy also its own sketch in the "
+                f"fit, so both the plan and the fit cost grow with n_bins."
+            )
         if strategy not in ("quantile", "uniform"):
             raise PlanError(f"strategy must be 'quantile' or 'uniform', got {strategy!r}")
         self.n_bins = n_bins

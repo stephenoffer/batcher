@@ -14,8 +14,14 @@ from batcher._internal.errors import SchemaError
 from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
+from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.formats.structured._csv_options import (
+    CSVReadOptions,
+    resolve_read_options,
+    resolve_write_options,
+)
 from batcher.io.splits import FileSplit, Split, read_aligned_range
 
 __all__ = ["CSVRangeSplit", "CSVSink", "CSVSource"]
@@ -42,6 +48,16 @@ class CSVRangeSplit:
     # split alone: without it the range re-infers from its own bytes, and a range that
     # happens to hold only integers disagrees with the source and with its sibling ranges.
     declared_schema: pa.Schema | None = None
+    # The source's parse/convert vocabulary (delimiter, quoting, null/boolean tokens),
+    # carried for exactly the reason `declared_schema` is: a worker rebuilds the parse from
+    # the split alone. A range that re-parses a semicolon-separated file with the default
+    # comma does not fail — it produces one wide string column per row, silently, on the
+    # distributed path only. Only options that leave rows and byte offsets alone appear
+    # here; `CSVReadOptions.range_safe` is what keeps the rest from ever reaching a range.
+    options: dict[str, Any] | None = None
+
+    def _options(self) -> CSVReadOptions:
+        return resolve_read_options(self.options or {})
 
     def _header(self) -> bytes:
         fs = resolve_filesystem(self.path)
@@ -66,16 +82,30 @@ class CSVRangeSplit:
         # string parses it as string — the ranges of one file disagree with each other
         # and with the source schema. Pinning `column_types` makes every range parse to
         # the same schema the source advertises.
-        convert = pacsv.ConvertOptions(column_types=schema)
-        table = pacsv.read_csv(io.BytesIO(data), convert_options=convert)
-        return table.select(projection) if projection is not None else table
+        #
+        # The projection is pushed into the parse (`include_columns`) rather than applied
+        # with `.select` afterwards, matching `CSVSource._read_file`. Selecting afterwards
+        # still *converts* every column of every row — on a wide table that is nearly the
+        # whole cost of the read, paid on the distributed path (this split IS the
+        # distributed CSV read) to build columns that are immediately discarded. Pinning
+        # `column_types` to the projected subset keeps each range agreeing with the source
+        # schema on the columns it actually produces.
+        types = {field.name: field.type for field in schema}
+        if projection is not None:
+            types = {name: t for name, t in types.items() if name in set(projection)}
+        options = self._options()
+        return pacsv.read_csv(
+            io.BytesIO(data),
+            parse_options=options.parse_options(),
+            convert_options=options.convert_options(column_types=types, include_columns=projection),
+        )
 
     def schema(self) -> pa.Schema:
         if self.declared_schema is not None:
             return self.declared_schema
         from batcher.io.formats.base import SOURCES
 
-        return SOURCES.get("csv")(self.path).schema()
+        return SOURCES.get("csv")(self.path, **(self.options or {})).schema()
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         return self._table(projection).to_batches()
@@ -141,11 +171,24 @@ class CSVSource(FileSource):
     suffix = ".csv"
     format_name = "csv"
 
-    __slots__ = ("_declared_schema",)
+    __slots__ = ("_options",)
 
-    def __init__(self, path: str, *, schema: pa.Schema | None = None, **kwargs: Any) -> None:
-        super().__init__(path, **kwargs)
-        self._declared_schema = schema
+    def __init__(self, path: str, **kwargs: Any) -> None:
+        # The base owns the source-wide keywords (paths, filesystem, credentials, error
+        # tolerance); everything else is CSV vocabulary. The split is read from the base
+        # signature rather than restated here so a keyword added to `FileSource` reaches it
+        # instead of being rejected as an unknown CSV option.
+        import inspect
+
+        from batcher.io.base._options import split_base_options
+
+        base = set(inspect.signature(FileSource.__init__).parameters) - {"self", "path"}
+        # `split_base_options` folds the base *aliases* in before splitting, so `usecols`
+        # is recognized as the base's `columns` rather than mistaken for CSV vocabulary
+        # and handed to the CSV option builder, which has no such field.
+        base_kwargs, own = split_base_options(kwargs, base)
+        super().__init__(path, **base_kwargs)
+        self._options = resolve_read_options(own)
 
     def schema(self) -> pa.Schema:
         """The declared schema when one was given, else the one inferred from the file.
@@ -167,27 +210,50 @@ class CSVSource(FileSource):
         Returns:
             The schema every read path of this source will produce.
         """
-        return self._declared_schema if self._declared_schema is not None else super().schema()
+        if self._options.declared_schema is not None:
+            return self._options.declared_schema
+        # `dtype=`/`schema_overrides=`/`parse_dates=[...]` are per-column overrides laid over
+        # inference, so they are applied *here*, on the one schema every read path pins to —
+        # never inside a read path, which is how the three of them would drift apart again.
+        return self._options.resolve_schema(super().schema())
 
     def _reader_kwargs(self) -> dict[str, object]:
-        """A declared schema changes how a split parses, so a worker must rebuild it."""
-        base = super()._reader_kwargs()
-        return (
-            {**base, "schema": self._declared_schema} if self._declared_schema is not None else base
-        )
+        """Every option that changes what a parse produces, so a worker rebuilds it exactly.
+
+        The resolved schema rides along rather than the caller's `dtype` overrides: a worker
+        holds one file, so re-deriving the schema there would re-infer from that file's rows
+        and could disagree with the schema the plan was built against.
+        """
+        return {**super()._reader_kwargs(), **self._options.as_kwargs(), "schema": self.schema()}
 
     def _convert_options(self, projection: list[str] | None) -> Any:
-        """Parse options pinning the advertised column types (and the projection).
+        """Convert options pinning the advertised column types (and the projection).
 
         Pinning is what makes the read paths agree with `schema()` and with each other.
         Without it pyarrow re-infers per read, over a different amount of data each time.
         """
-        import pyarrow.csv as pacsv
-
         types = {field.name: field.type for field in self.schema()}
         if projection is not None:
             types = {name: t for name, t in types.items() if name in set(projection)}
-        return pacsv.ConvertOptions(include_columns=projection, column_types=types)
+        return self._options.convert_options(column_types=types, include_columns=projection)
+
+    def _parse_kwargs(self, projection: list[str] | None, *, pin_types: bool) -> dict[str, Any]:
+        """The pyarrow option objects shared by schema inference and every read path.
+
+        There is one builder because there must be one answer. Inference is the only caller
+        that does not pin column types — it is the thing deciding them — but it must see the
+        identical delimiter, quoting, header framing and null vocabulary, or the schema it
+        commits to describes a different parse than the one that later runs.
+        """
+        return {
+            "read_options": self._options.read_options(),
+            "parse_options": self._options.parse_options(),
+            "convert_options": (
+                self._convert_options(projection)
+                if pin_types
+                else self._options.convert_options(include_columns=projection)
+            ),
+        }
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         import pyarrow.csv as pacsv
@@ -197,7 +263,7 @@ class CSVSource(FileSource):
         # runs during planning, so reading a multi-GB CSV end-to-end here would read it once
         # for the schema and again for the data. First-block inference is what pyarrow's own
         # streaming read commits to (and what DuckDB/Polars sample), so the schema matches.
-        return pacsv.open_csv(fh).schema
+        return pacsv.open_csv(fh, **self._parse_kwargs(None, pin_types=False)).schema
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         import pyarrow.csv as pacsv
@@ -207,7 +273,7 @@ class CSVSource(FileSource):
         # disagree with `schema()` — it used to re-infer over the whole file and return a
         # widened type the engine had not planned for.
         with _mismatch_reported(self):
-            table = pacsv.read_csv(fh, convert_options=self._convert_options(projection))
+            table = pacsv.read_csv(fh, **self._parse_kwargs(projection, pin_types=True))
         return table.to_batches()
 
     def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
@@ -220,8 +286,9 @@ class CSVSource(FileSource):
         """
         import pyarrow.csv as pacsv
 
-        with self._fs.open(path) as fh:
-            reader = pacsv.open_csv(fh, convert_options=self._convert_options(projection))
+        # `_open` rather than `_fs.open`, so `events.csv.gz` streams here too.
+        with self._open(path) as fh:
+            reader = pacsv.open_csv(fh, **self._parse_kwargs(projection, pin_types=True))
             with _mismatch_reported(self):
                 yield from reader
 
@@ -234,14 +301,31 @@ class CSVSource(FileSource):
         # Default byte-range split size (so one huge file fans across workers instead
         # of reading on a single node) is the configured `ExecutionConfig.split_bytes`.
         chunk = target_size or active_config().execution.split_bytes
+        # A byte range is only meaningful over the bytes that are actually on disk, and only
+        # when the file's row framing is uniform across ranges. A compressed file has neither
+        # (an offset into the gzip stream is not an offset into the CSV), and options such as
+        # `skip_rows` or a headerless file would be re-applied to every range — dropping or
+        # inventing rows, silently, on the distributed path alone. Both cases read as one
+        # whole-file split instead: slower for one huge file, never wrong.
+        if compression_for_path(path) is not None or not self._options.range_safe:
+            return [FileSplit(self.format_name, path, self._reader_kwargs())]
         try:
             size = self._fs.size(path)
         except (OSError, ValueError):
-            return [FileSplit(self.format_name, path)]
+            # `_reader_kwargs()` here too, not just on the sized branch below. A file whose
+            # size cannot be read is exactly the object-store/BYO-backend case that most
+            # needs the caller's `filesystem=`/`storage_options=` and its `on_error` policy
+            # carried to the worker — dropping them rebuilt a reader that resolves its own
+            # backend from the environment and fails fast on a read the caller declared
+            # tolerant.
+            return [FileSplit(self.format_name, path, self._reader_kwargs())]
         if size <= chunk:
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
+        # The advertised schema, not the caller's raw `schema=`, so every range is pinned to
+        # the same types the plan was built against even when they came from inference.
+        schema, options = self.schema(), self._options.range_kwargs()
         return [
-            CSVRangeSplit(path, start, min(start + chunk, size), self._declared_schema)
+            CSVRangeSplit(path, start, min(start + chunk, size), schema, options)
             for start in range(0, size, chunk)
         ]
 
@@ -266,7 +350,14 @@ class CSVSink(FileSink):
     suffix = ".csv"
     format_name = "csv"
 
-    __slots__ = ()
+    __slots__ = ("_options",)
+
+    def __init__(self, **kwargs: Any) -> None:
+        import inspect
+
+        base = set(inspect.signature(FileSink.__init__).parameters) - {"self"}
+        super().__init__(**{k: v for k, v in kwargs.items() if k in base})
+        self._options = resolve_write_options({k: v for k, v in kwargs.items() if k not in base})
 
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
         import pyarrow.csv as pacsv
@@ -276,10 +367,12 @@ class CSVSink(FileSink):
         # engine that shards its write. But CSV is just row-wise text, so encode row
         # ranges CONCURRENTLY (pyarrow's CSV encoder releases the GIL) into in-memory
         # buffers — only the first carries the header — and write them back to back.
+        table = self._options.apply_nulls(table)
         n = table.num_rows
         workers = min(n // _CSV_PARALLEL_MIN_ROWS, available_cpu_count())
         if workers <= 1:
-            pacsv.write_csv(table, fh)
+            options = self._options.write_options(include_header=True)
+            pacsv.write_csv(table, fh, write_options=options)
             return
         rows = -(-n // workers)  # ceil
         slices = [(i, table.slice(off, rows)) for i, off in enumerate(range(0, n, rows))]
@@ -287,7 +380,11 @@ class CSVSink(FileSink):
         def _encode(item: tuple[int, pa.Table]) -> pa.Buffer:
             idx, chunk = item
             sink = pa.BufferOutputStream()
-            pacsv.write_csv(chunk, sink, write_options=pacsv.WriteOptions(include_header=idx == 0))
+            # `include_header=idx == 0` is the chunk's turn; `write_options` ANDs it with the
+            # caller's `header=`, so `header=False` suppresses it on the first chunk too.
+            pacsv.write_csv(
+                chunk, sink, write_options=self._options.write_options(include_header=idx == 0)
+            )
             return sink.getvalue()
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -345,8 +442,12 @@ class CSVSink(FileSink):
         def _encode(item: tuple[int, pa.RecordBatch]) -> pa.Buffer:
             idx, batch = item
             sink = pa.BufferOutputStream()
+            # `idx` counts batches across the WHOLE stream, not within a window, so exactly
+            # one chunk is ever offered the header; `write_options` then honors `header=`.
             pacsv.write_csv(
-                pa.table(batch), sink, write_options=pacsv.WriteOptions(include_header=idx == 0)
+                self._options.apply_nulls(pa.table(batch)),
+                sink,
+                write_options=self._options.write_options(include_header=idx == 0),
             )
             return sink.getvalue()
 
@@ -377,10 +478,17 @@ class CSVSink(FileSink):
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
         import pyarrow.csv as pacsv
 
-        return pacsv.CSVWriter(fh, schema)
+        # The writer is opened against the schema `apply_nulls` will actually hand it — an
+        # all-string one when `null_value=` is set — or every appended batch would be
+        # rejected for not matching the schema the writer was opened with.
+        return pacsv.CSVWriter(
+            fh,
+            self._options.null_schema(schema),
+            write_options=self._options.write_options(include_header=True),
+        )
 
     def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
-        writer.write(batch)
+        writer.write(self._options.apply_nulls(pa.table(batch)))
 
     def _close_stream_writer(self, writer: Any) -> None:
         writer.close()

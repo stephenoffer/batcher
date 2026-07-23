@@ -526,24 +526,28 @@ def _write(
     # node). Plans with a breaker (aggregate/join/sort) reduce the result first,
     # so the collect-then-write path below is fine for them.
     #
-    # `map_batches`/UDF pipelines are EXCLUDED here even though `is_streamable` calls them
-    # streamable: this path ships the plan as JSON IR to `nat.execute_plan`, which cannot run a
-    # Python UDF (and `MapBatches.to_ir()` raises outright). They fall through to the
-    # `_collect(distributed=True)` path below, which runs the UDF on the workers via the
-    # UDF-aware distributed map and then re-shards the result with `_distributed_write` — correct,
-    # if it does land the (post-inference) result on the driver, exactly as collect already does.
-    from batcher import core
-
-    if distributed and len(sources) == 1 and is_streamable(plan) and not core.has_map_batches(plan):
+    # `map_batches`/UDF pipelines go through here TOO. `_distributed_write_plan` routes them to
+    # the UDF-aware distributed map with the sink bound into each worker, so a batch-inference
+    # job writes its output from the worker that produced it. Excluding them here (as this path
+    # used to) sent them down `_collect(distributed=True)`, which lands the whole post-inference
+    # result on the driver — an unconditional OOM on any job whose output exceeds one node.
+    if distributed and len(sources) == 1 and is_streamable(plan):
         from batcher.dist import resolve_worker_fanout
         from batcher.dist.executors.write import _distributed_write_plan
 
+        out_schema = _schema(plan, sources, columns)
         manifest = _distributed_write_plan(
             plan, sources, path, fmt, sink_kwargs, partition_by, resolve_worker_fanout(num_workers)
         )
-        return _commit(
-            sink, manifest, path, fmt, _schema(plan, sources, columns), auto_compact=auto_compact
-        )
+        # Every shard produced zero rows (a filter that matched nothing). Each worker
+        # correctly wrote no file, but the single-node path writes ONE empty file, so
+        # without this the distributed result is an absent path where single-node leaves a
+        # readable empty table — a `distributed != single-node` divergence that surfaces
+        # downstream as "path does not exist" rather than an empty read.
+        if not manifest.files and out_schema is not None:
+            empty = pa.Table.from_batches([], schema=out_schema)
+            manifest = WriteManifest(tuple(sink.write_partitioned(empty, path, file_index=0)))
+        return _commit(sink, manifest, path, fmt, out_schema, auto_compact=auto_compact)
 
     # An unbounded source reaching the materialize path below would never finish.
     # The streaming distributed write above handles breaker-free shapes; otherwise

@@ -306,6 +306,26 @@ def _even_cpu_share(workers: int) -> float:
         return 1.0
 
 
+def _max_workers_per_node(workers: int, num_cpus: float) -> int:
+    """The most workers any one node will host, given a `num_cpus`-sized uniform grant.
+
+    Mirrors how the fan-out is actually placed: a node with `c` cores takes `floor(c / num_cpus)`
+    workers, which is the same slicing `_cluster_fill_workers` uses to *choose* the fan-out. Any
+    memory budget derived from this is therefore valid on the node that packs the most workers,
+    rather than on an imaginary average node that may host none of them.
+
+    Falls back to the fleet average (`ceil(workers / nodes)`) when the topology is unreadable —
+    the historical behavior, and the best available guess when node sizes are unknown.
+    """
+    try:
+        node_cpus = _worker_node_cpus()
+        if node_cpus and num_cpus > 0:
+            return max(1, max(int(c // num_cpus) for c in node_cpus))
+    except Exception:
+        pass
+    return max(1, math.ceil(workers / max(1, alive_node_count())))
+
+
 def _size_worker_memory(
     envelope: SchedulingEnvelope | None, workers: int, num_cpus: float
 ) -> SchedulingEnvelope | None:
@@ -317,12 +337,18 @@ def _size_worker_memory(
     RAM. The budget is `min(node_mem * soft_limit / workers_per_node, Carbonite's estimate)`
     — Carbonite's tighter data-driven estimate still wins, but an unset (unbounded) or
     driver-oversized grant is clamped to what the worker machine can actually hold.
+
+    `workers_per_node` is the **most** any single node hosts, not the fleet average. The two
+    diverge exactly on the clusters this sizing exists for: `_cluster_fill_workers` gives a node
+    with k times the smallest node's cores k workers *on purpose*, so a 128-core node beside
+    three 32-core ones hosts 4 workers while the average is 2. Dividing the (already smallest)
+    node RAM by the average then hands each of those 4 workers twice the memory its node can
+    honour — an OOM on the busiest node in the fleet, and only on heterogeneous ones.
     """
     node_mem = worker_node_memory_bytes()
     if node_mem <= 0:
         return envelope
-    nodes = max(1, alive_node_count())
-    per_node_workers = max(1, math.ceil(workers / nodes))
+    per_node_workers = _max_workers_per_node(workers, num_cpus)
     from batcher.config import active_config
 
     budget = int(node_mem * active_config().memory.soft_limit / per_node_workers)

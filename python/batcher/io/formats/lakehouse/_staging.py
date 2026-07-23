@@ -105,14 +105,20 @@ def stage_stream(
             empty = schema.empty_table() if schema is not None else pa.table({})
             pq.write_table(empty, fh, compression=compression)
         else:
-            writer = pq.ParquetWriter(fh, first.schema, compression=compression)
             from itertools import chain
 
-            for batch in chain([first], it):
-                if batch.num_rows:
-                    writer.write_batch(batch)
-                    rows += batch.num_rows
-            writer.close()
+            # `closing`, not a bare `close()` at the end: the writer was closed only on the
+            # success path, so a shard that raised partway — a preempted worker, an OOM, a
+            # batch that fails to encode — left it open. That leaks the writer's buffers and
+            # the file handle once per failed shard, and the `atomic_writer` context then
+            # exits around a file still being written to.
+            with contextlib.closing(
+                pq.ParquetWriter(fh, first.schema, compression=compression)
+            ) as writer:
+                for batch in chain([first], it):
+                    if batch.num_rows:
+                        writer.write_batch(batch)
+                        rows += batch.num_rows
     return WrittenFile(path=name, rows=rows, bytes=_safe_size(fs, name))
 
 

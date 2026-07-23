@@ -17,6 +17,7 @@ import os
 import sys
 
 __all__ = [
+    "INFERENCE_INFLIGHT_DEPTH_MAX",
     "available_cpu_count",
     "cgroup_v2_dirs",
     "cpu_contention",
@@ -25,6 +26,14 @@ __all__ = [
     "l3_cache_bytes",
     "machine_memory_bytes",
 ]
+
+# Hard ceiling on how many partitions an inference actor keeps in flight at once (submit-ahead
+# depth), and the mirror ceiling on the intra-worker autobatch pipeline. One home in a neutral
+# layer both the ML autobatcher (`ml.gpu`, layer 6) and the distributed actor pool (`dist`,
+# layer 4) import, rather than two copies that drift — `dist` cannot import `ml`, so a shared
+# copy was the ONLY correct way to share this, and it used to be pasted instead. Past ~16
+# in-flight the GPU is already saturated and deeper submit-ahead only grows resident memory.
+INFERENCE_INFLIGHT_DEPTH_MAX = 16
 
 
 def _affinity_count() -> int | None:
@@ -331,37 +340,38 @@ def gpu_devices_absent() -> bool:
 
 
 def accelerator_backend() -> str:
-    """The accelerator this host can compute on: ``cuda``/``rocm``/``xpu``/``mps``/``tpu``/``cpu``.
+    """The accelerator this host can compute on: ``cuda``/``rocm``/``xpu``/``mps``/``tpu``/
+    ``neuron``/``hpu``/``cpu``.
 
-    A hardware *fact*, which is why it lives here rather than in `ml.gpu`: the executor
-    (`core`) needs it to pick a device for the relational GPU kernels, and `core` may not
-    import the user-facing `ml` package. `ml.gpu.detect_backend` is a re-export of this,
-    so there is exactly one detector rather than two that can disagree — the split this
-    module maintains is inventory-vs-policy, and "what device is here" is inventory.
-
-    Detected via torch, the most portable probe: ROCm reports through the CUDA API with
-    ``torch.version.hip`` set; Intel GPUs via ``torch.xpu``; Apple via MPS; Cloud TPUs via
-    ``torch_xla``. Falls back to ``cpu`` when torch is absent or no accelerator is present.
+    A hardware *fact*, so it lives here (the executor picks a device without importing `ml`);
+    `ml.gpu.detect_backend` re-exports it. Detected via torch where one exists (ROCm through
+    the CUDA API with ``torch.version.hip``; Intel ``torch.xpu``; Apple MPS; Cloud TPU
+    ``torch_xla``) and via device nodes for Trainium/Inferentia (``neuron``) and Gaudi
+    (``hpu``), whose frameworks are expensive to import. Naming the specific backend rather
+    than ``cpu`` lets such a host self-identify for diagnostics and `torch_device`.
     """
     if gpu_devices_absent() and not _tpu_available():
-        # The cheap negative first: `torch.cuda.is_available()` costs a ~2 s import on a
-        # host that has nothing to find.
-        return "cpu"
+        return "cpu"  # cheap negative first: `torch.cuda.is_available()` costs a ~2 s import
     try:
         import torch
+
+        if torch.cuda.is_available():
+            return "rocm" if getattr(torch.version, "hip", None) else "cuda"
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and xpu.is_available():
+            return "xpu"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
     except ImportError:
-        return "cpu"
-    if torch.cuda.is_available():
-        return "rocm" if getattr(torch.version, "hip", None) else "cuda"
-    xpu = getattr(torch, "xpu", None)
-    if xpu is not None and xpu.is_available():
-        return "xpu"
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return "mps"
+        pass  # no torch → fall through to the device-node accelerators
+    from batcher._internal.accelerators import has_gaudi_device, has_neuron_device
+
     if _tpu_available():
         return "tpu"
-    return "cpu"
+    if has_neuron_device():
+        return "neuron"
+    return "hpu" if has_gaudi_device() else "cpu"
 
 
 def _tpu_available() -> bool:

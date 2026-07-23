@@ -30,6 +30,27 @@ def _typed_null(of: Expr) -> Expr:
     return nullif(of, of)
 
 
+def _require_keys(method: str, keys: str | list[str]) -> list[str]:
+    """Normalize `keys` to a non-empty list, or raise a `PlanError` naming the method."""
+    key_list = [keys] if isinstance(keys, str) else list(keys)
+    if not key_list:
+        raise PlanError(
+            f"{method}(): needs at least one natural key column — "
+            "pass keys='id' (or keys=['a', 'b'] for a composite key)"
+        )
+    return key_list
+
+
+def _require_track(method: str, track: list[str]) -> list[str]:
+    """Require a non-empty `track` list, or raise a `PlanError` naming the method."""
+    if not track:
+        raise PlanError(
+            f"{method}(): needs at least one attribute column to track in `track` — "
+            "these are the columns whose change makes a new version (e.g. track=['city'])"
+        )
+    return list(track)
+
+
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
     from batcher.io.manifest import WriteManifest
@@ -88,7 +109,8 @@ class DatasetSCD:
                 >>> bt.read.parquet(target).sort("id").to_pydict()
                 {'id': [1, 2], 'city': ['NYC', 'SF']}
         """
-        return self._ds.write.merge(target, on=keys, when_matched="update", **opts)
+        key_list = _require_keys("type1", keys)
+        return self._ds.write.merge(target, on=key_list, when_matched="update", **opts)
 
     def type2(
         self,
@@ -145,7 +167,8 @@ class DatasetSCD:
         from batcher.io.detect import detect_format
         from batcher.io.filesystem import resolve_filesystem
 
-        key_list = [keys] if isinstance(keys, str) else list(keys)
+        key_list = _require_keys("type2", keys)
+        track = _require_track("type2", track)
         fmt = detect_format(target, format)
         incoming = self._ds.select(*key_list, *track)
 
@@ -230,7 +253,8 @@ class DatasetSCD:
         from batcher.io.detect import detect_format
         from batcher.io.filesystem import resolve_filesystem
 
-        key_list = [keys] if isinstance(keys, str) else list(keys)
+        key_list = _require_keys("type3", keys)
+        track = _require_track("type3", track)
         fmt = detect_format(target, format)
         incoming = self._ds.select(*key_list, *track)
         if not resolve_filesystem(target).exists(target):
@@ -360,9 +384,12 @@ class DatasetSCD:
         from batcher.io.detect import detect_format
         from batcher.io.filesystem import resolve_filesystem
 
-        key_list = [keys] if isinstance(keys, str) else list(keys)
-        if not key_list:
-            raise PlanError("apply_changes() requires at least one key column")
+        key_list = _require_keys("apply_changes", keys)
+        if not sequence_by:
+            raise PlanError(
+                "apply_changes(): needs a `sequence_by` column that orders changes for a "
+                "key (a log offset, commit timestamp, or version)"
+            )
         fmt = detect_format(target, format)
         stored = cdc_stored_columns(self._ds.columns, key_list, sequence_by, columns)
 

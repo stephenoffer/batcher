@@ -15,6 +15,11 @@ class InProcessBackend:
     def __init__(self) -> None:
         self._tables: dict[str, dict[Key, bytes]] = {}
 
+    def __repr__(self) -> str:
+        """Summarize what is stored, per table — the question asked when learning looks cold."""
+        held = ", ".join(f"{t}={len(rows)}" for t, rows in sorted(self._tables.items()))
+        return f"InProcessBackend({held or 'empty'})"
+
     def get(self, table: str, key: Key) -> bytes | None:
         return self._tables.get(table, {}).get(key)
 

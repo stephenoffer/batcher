@@ -12,10 +12,12 @@ batches, not the whole stream.
 
 The result is exactly the sequentially-composed stages (each stage preserves order;
 the queues are FIFO), so this is a faster *scheduling* of the same computation — the
-seq == pipelined contract the rest of the engine also holds. Each `Stage` carries a
-`num_gpus` hint the distributed scheduler uses to place CPU stages on CPU workers and
-GPU stages on GPU actors; the multi-node placement + Arrow-Flight hand-off layer on
-top of this same shape, and is exercised on cluster/GPU hardware.
+seq == pipelined contract the rest of the engine also holds. The multi-node placement +
+Arrow-Flight hand-off layer (`dist/streaming/pipeline.py`) mirrors this same shape.
+
+Shutdown is **deterministic**: no worker thread outlives `run_pipeline`, whether the
+consumer drains the iterator, abandons it mid-stream, or a stage raises. The generator
+joins every thread in a `finally`, which is reachable on all three paths.
 """
 
 from __future__ import annotations
@@ -49,8 +51,13 @@ class Stage:
 
     `credits` is the max number of finished batches that may sit between this stage
     and the next before this stage blocks — the backpressure knob (and the prefetch
-    depth). `num_gpus` is a placement hint for the distributed scheduler (0 = CPU);
-    it does not affect single-node execution.
+    depth).
+
+    `num_gpus` is declared but **not yet consumed**: single-node execution ignores it,
+    and the distributed scheduler (`dist/streaming/pipeline.py`) reads its resource
+    class from the logical plan, not from this field. It is documented as a placement
+    hint in `docs/ml/model-serving-patterns.md`, so treat it as a promise the engine
+    still owes rather than as a knob that does anything today.
 
     Examples:
         .. doctest::
@@ -155,7 +162,12 @@ def run_pipeline(
         in_q = queues[i - 1] if i > 0 else Queue(maxsize=max(1, stages[0].credits))
         if i == 0:
             source_q = in_q  # the producer feeds this
-        t = threading.Thread(target=pump, args=(stage, in_q, queues[i]), daemon=True)
+        t = threading.Thread(
+            target=pump,
+            args=(stage, in_q, queues[i]),
+            name=f"batcher-ml-pipeline-{i}-{stage.name}",
+            daemon=True,
+        )
         t.start()
         threads.append(t)
 
@@ -170,23 +182,36 @@ def run_pipeline(
         finally:
             _put(source_q, _DONE)
 
-    feeder = threading.Thread(target=feed, daemon=True)
+    feeder = threading.Thread(target=feed, name="batcher-ml-pipeline-feed", daemon=True)
     feeder.start()
 
     # Drain the final stage with the same stop-aware get: if a stage errors while the
     # caller has paused (final queue full → last stage abandoned its put without a
     # `_DONE`), `_get` still returns `_DONE` on stop, so the consumer can't deadlock
     # waiting for a sentinel that will never arrive.
-    final_q = queues[-1]
-    while True:
-        item = _get(final_q)
-        if item is _DONE:
-            break
-        yield item
-
-    stop.set()
-    feeder.join(timeout=1.0)
-    for t in threads:
-        t.join(timeout=1.0)
+    #
+    # The drain sits in a `try`/`finally` so shutdown is reached on ALL three exits:
+    # a full drain, a stage error, and a consumer that abandons the generator (which
+    # throws `GeneratorExit` in at the `yield`). Without it, walking away from the
+    # iterator left the feeder blocked on a full queue until a poll happened to notice
+    # `stop` — which nothing ever set — so the threads outlived the call.
+    try:
+        final_q = queues[-1]
+        while True:
+            item = _get(final_q)
+            if item is _DONE:
+                break
+            yield item
+    finally:
+        # Joins are UNBOUNDED on purpose: the previous `timeout=1.0` let a thread
+        # survive the call, which is a leak, not a shutdown. Every blocking queue op
+        # here is stop-aware and polls at `_POLL_S`, so once `stop` is set each thread
+        # exits within one poll. The only way to block is a stage worker that itself
+        # never returns, and surfacing that hang beats leaking a thread that holds a
+        # GPU context or a model.
+        stop.set()
+        feeder.join()
+        for t in threads:
+            t.join()
     if error:
         raise error[0]

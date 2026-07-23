@@ -28,7 +28,6 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
-from batcher.io.formats.sql._common import connection_fingerprint
 
 __all__ = ["DynamoDBSource"]
 
@@ -91,27 +90,26 @@ class DynamoDBSource(ScanSource):
         )
 
     def _identity_suffix(self) -> str:
-        """``<endpoint>:<region>/<table>`` — the endpoint is part of the relation's identity.
+        region = self._conn_kwargs["region_name"] or "default"
+        return f"{region}/{self._conn_kwargs['table']}"
 
-        The region was already in the key, which hides how much this matters: `endpoint_url`
-        is what distinguishes DynamoDB Local from the real service, and one AWS account's
-        table from another's at the same region and name. Both are the *same* relation under
-        a region-only key, so a laptop's ten-item fixture table taught Kyber the cardinality
-        it then used to plan the production table — and `identity()` is persisted, so that
-        estimate outlives the process that made it.
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """`_conn_kwargs` with the AWS keys dropped before the connection is fingerprinted.
 
-        `aws_secret_access_key` and `aws_access_key_id` are excluded rather than passed to
-        `connection_fingerprint`: its `_NON_IDENTIFYING` filter matches on key *name* and
-        does not cover the ``aws_``-prefixed spellings, so handing it the full kwargs would
-        digest the live credentials instead of dropping them. Excluding them also keeps a
-        key rotation from orphaning the table's statistics.
+        `connection_fingerprint` drops credentials by exact key name — ``password``,
+        ``secret``, ``token``, ``api_key`` — and AWS spells its own with a prefix.
+        ``aws_secret_access_key`` is not the string ``secret``, so it matched nothing and
+        the live secret key was digested straight into `identity()`, the **persisted**
+        learned-statistics key.
+
+        One-way, so not a plaintext leak, but every key rotation re-keys the relation and
+        silently orphans everything Kyber has learned about the table. What is left is the
+        genuinely identifying part: `endpoint_url` is what separates DynamoDB Local (and one
+        account's table) from the real service at the same region and name, so a laptop's
+        ten-item fixture no longer teaches the optimizer a cardinality it applies to
+        production.
         """
-        kw = self._conn_kwargs
-        region = kw["region_name"] or "default"
-        fingerprint = connection_fingerprint(
-            {"region_name": region, "endpoint_url": kw["endpoint_url"] or "aws"}
-        )
-        return f"{fingerprint}:{region}/{kw['table']}"
+        return {k: v for k, v in self._conn_kwargs.items() if not k.startswith("aws_")}
 
     def _infer_schema(self) -> pa.Schema:
         client = self._client()

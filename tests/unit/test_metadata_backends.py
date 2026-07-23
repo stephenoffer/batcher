@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from batcher.metadata import MetadataHub
-from batcher.metadata.backends import make_backend
+from batcher.metadata.backends import BACKEND_NAMES, make_backend
 from batcher.metadata.backends.layered import LayeredBackend
 from batcher.metadata.backends.object_storage import ObjectStorageBackend
 
@@ -86,10 +86,15 @@ def test_layered_refresh_picks_up_another_drivers_write(tmp_path):
 def test_make_backend_constructs_each_kind(tmp_path):
     assert isinstance(make_backend("object_storage", f"file://{tmp_path}"), ObjectStorageBackend)
     assert isinstance(make_backend("layered", f"file://{tmp_path}"), LayeredBackend)
-    with pytest.raises(ValueError, match="unknown metadata backend"):
+    # Both rejections stay catchable as `ValueError` (a bad config value is a bad
+    # argument), and are asserted on their structured fields rather than their prose —
+    # the message is free to improve, the facts it carries are not.
+    with pytest.raises(ValueError) as unknown:
         make_backend("nope")
-    with pytest.raises(ValueError, match="requires a uri"):
+    assert set(unknown.value.available) == set(BACKEND_NAMES)
+    with pytest.raises(ValueError) as no_uri:
         make_backend("object_storage", None)
+    assert "s3://" in no_uri.value.hint
 
 
 def test_sqlite_no_uri_persists_to_default_path(tmp_path, monkeypatch):

@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, fit_aggregate
+from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
 from batcher.plan.expr_ir import coalesce, col, count, lit
 
 if TYPE_CHECKING:
@@ -47,12 +47,12 @@ class SimpleImputer(Preprocessor):
 
     def __init__(
         self,
-        columns: Sequence[str],
+        columns: str | Sequence[str],
         *,
         strategy: str = "mean",
         fill_value: Any = None,
     ) -> None:
-        self.columns = list(columns)
+        self.columns = columns_arg(columns, what="SimpleImputer")
         if not self.columns:
             raise PlanError("SimpleImputer requires at least one column")
         if strategy not in _STRATEGIES:

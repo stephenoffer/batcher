@@ -4,7 +4,7 @@ This page covers reading and writing any SQL database from a standard connection
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.sql(query, uri=...)`, or `bt.read.table("dbapi", module=..., ...)` |
+| **Read** | `bt.read.sql(query, uri=...)`, `bt.read.sql(query, connection=...)`, or `bt.read.table("dbapi", module=..., ...)` |
 | **Write** | `ds.write.sql(table, uri=...)`, ADBC schemes only |
 | **Extra** | `pip install 'batcher-engine[sql]'` or `[connectorx]`, plus the per-database driver |
 | **Parallelism** | FlightSQL server-side partitions, or `partition_on=` range partitions on every other backend |
@@ -62,8 +62,44 @@ print(len(known_schemes()))
 ```text
 adbc adbc_driver_postgresql app
 connectorx
-18
+36
 ```
+
+### Wire-compatible databases
+
+Many databases are not PostgreSQL or MySQL but speak their wire protocol. The wire protocol is the only thing a driver needs to connect, execute, and return Arrow, so each of these routes to the same driver its base protocol uses. A PostgreSQL-wire database goes to `adbc_driver_postgresql`. A MySQL-wire database goes to ConnectorX's MySQL reader. You install the base driver, not a per-database one.
+
+| Scheme | Wire protocol | Backend | Driver loaded |
+| --- | --- | --- | --- |
+| `cockroachdb`, `cockroach` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `timescaledb` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `alloydb` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `greenplum` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `yugabytedb`, `yugabyte` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `risingwave` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `materialize` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `questdb` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `crate`, `cratedb` | PostgreSQL | ADBC | `adbc_driver_postgresql` |
+| `singlestore`, `memsql` | MySQL | ConnectorX | ConnectorX's MySQL reader |
+| `tidb` | MySQL | ConnectorX | ConnectorX's MySQL reader |
+| `starrocks` | MySQL | ConnectorX | ConnectorX's MySQL reader |
+| `doris` | MySQL | ConnectorX | ConnectorX's MySQL reader |
+| `percona` | MySQL | ConnectorX | ConnectorX's MySQL reader |
+
+```python
+# docs: skip
+events = bt.read.sql(
+    "SELECT event_id, ts, kind FROM events",
+    uri="cockroachdb://svc@crdb:26257/analytics",
+    password="env:CRDB_PASSWORD",
+)
+```
+
+:::{warning}
+Wire compatibility is not SQL compatibility. The connection works, the query runs, and Arrow comes back, but a query that calls a function the target engine does not implement fails on the server with the server's own error. Routing a `cockroachdb://` URI to the PostgreSQL driver does not make CockroachDB understand every PostgreSQL function. Test against the real database, not against PostgreSQL or MySQL.
+:::
+
+Presto is deliberately not routed. Presto and Trino diverged after the fork, and ConnectorX ships a Trino reader, so sending Presto to it would be a guess dressed up as support. A `presto://` URI raises a `BackendError` pointing at ODBC, `bt.read.table("odbc", connection_string=...)`.
 
 ## Credentials
 
@@ -289,6 +325,55 @@ Pushdown still works, and it matters more here than anywhere else on this page. 
 Types are the remaining sharp edge. PEP 249 exposes only four type singletons, `STRING`, `BINARY`, `NUMBER`, and `DATETIME`, and `NUMBER` covers integers, floats, and decimals alike. When the driver's codes do not resolve to one Arrow type, Batcher infers from the first real batch rather than guessing, which means `schema()` executes the query and reads one batch instead of costing nothing. The first batch then fixes the schema for every batch after it, so a column that is all-null in batch two cannot retype the relation. Pass `schema_override=` with an explicit Arrow schema when the types matter and the driver will not say.
 
 If a table has columns but no rows and the driver reports no types, the schema comes back with null-typed columns. That says exactly what is known. Dropping the columns would hand the planner an empty relation for a table with a real shape, and guessing `string` would be a lie the first non-empty read exposes.
+
+## Bring your own connection
+
+You can hand `bt.read.sql` a connection you already have, exactly as `pandas.read_sql(query, con)` does. Pass a live PEP 249 connection, or a SQLAlchemy `Engine` or `Connection`, as `connection=`. A SQLAlchemy handle is unwrapped to the DBAPI connection underneath it, and the unwrapping is duck-typed, so SQLAlchemy is never a required import.
+
+```python
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import batcher as bt
+from batcher import col
+
+db = str(Path(tempfile.mkdtemp()) / "shop.db")
+conn = sqlite3.connect(db)
+conn.execute("CREATE TABLE orders (id INTEGER, amount REAL, country TEXT)")
+conn.executemany(
+    "INSERT INTO orders VALUES (?, ?, ?)",
+    [(1, 10.0, "US"), (2, 250.0, "US"), (3, 7.5, "DE")],
+)
+conn.commit()
+
+orders = bt.read.sql("SELECT id, amount, country FROM orders", connection=conn)
+print(orders.filter(col("amount") > 9).select("id", "country").to_pydict())
+```
+
+```text
+{'id': [1, 2], 'country': ['US', 'US']}
+```
+
+A borrowed connection reads through the DB-API path, so its costs and its type handling are the ones in the DB-API section above. Three properties are specific to passing a live connection, and each is a deliberate choice rather than a limitation to work around:
+
+- It is single-node only. A live connection belongs to the process that opened it and cannot be pickled to a worker, so the read stays on one process. Combining `connection=` with `partition_on=` raises a `BackendError` rather than partitioning, because range partitioning runs one query per worker and there is no connection to give the other workers. Use `uri=` when you need to scale the read out.
+- Batcher never closes it. The caller owns a borrowed connection and keeps using it after the read, so Batcher closes only connections it opened itself. The connection in the example above is still open and usable when `collect` returns.
+- `uri=` and `connection=` together are refused. They name two databases with no way to tell which you meant, so passing both raises a `BackendError`.
+
+One more property is worth knowing before you rely on learned statistics. A borrowed connection is a live object with no stable identity across runs, so its split identity falls back to the driver name and cannot tell two databases reached through the same driver apart. Pass `bt.read.table("dbapi", module=..., connect_kwargs=...)` when you want a precise, reusable key for the optimizer.
+
+### Coming from pandas
+
+The `connection=` support is there so a `pandas.read_sql` line ports almost verbatim. pandas takes the query first and the connection second; Batcher takes the query first and the connection as a keyword.
+
+| pandas | Batcher |
+| --- | --- |
+| `pandas.read_sql(query, conn)` | `bt.read.sql(query, connection=conn)` |
+| `pandas.read_sql(query, engine)` | `bt.read.sql(query, connection=engine)` |
+| `pandas.read_sql(query, sqlalchemy_conn)` | `bt.read.sql(query, connection=sqlalchemy_conn)` |
+
+The result is a lazy `Dataset` rather than an eager DataFrame, so nothing runs until a terminal op such as `collect` or `to_pydict`. When you have a URI rather than a connection object, `bt.read.sql(query, uri=...)` is the better port, because it scales across workers and keeps the password out of the process image.
 
 ## Requirements and limitations
 

@@ -28,9 +28,10 @@ top (those need the engine / torch); the *ordering contract* lives here, verifie
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
+from batcher.ml.converters import _worker_stride
 from batcher.ml.permutation import _FeistelPermutation, epoch_permutation
 
 __all__ = [
@@ -105,7 +106,7 @@ def usable_length(total: int, world_size: int, *, drop_last: bool = True) -> int
     return total + (-total % world_size)
 
 
-def epoch_positions(order: list[int], *, world_size: int, drop_last: bool = True) -> list[int]:
+def epoch_positions(order: Sequence[int], *, world_size: int, drop_last: bool = True) -> list[int]:
     """`order` trimmed or padded to `usable_length` — the positions the ranks stride over.
 
     With ``drop_last`` the tail remainder is dropped. Without it the remainder is kept and the
@@ -114,12 +115,9 @@ def epoch_positions(order: list[int], *, world_size: int, drop_last: bool = True
     duplicates rather than dropped samples — the trade `DistributedSampler(drop_last=False)`
     makes, and the only way to see every sample *and* keep the ranks balanced.
     """
-    usable = usable_length(len(order), world_size, drop_last=drop_last)
-    if usable <= len(order):
-        return order[:usable]
-    if not order:
-        return []  # nothing to repeat from
-    return order + [order[i % len(order)] for i in range(usable - len(order))]
+    total = len(order)
+    usable = usable_length(total, world_size, drop_last=drop_last)
+    return [order[p if p < total else (p - total) % total] for p in range(usable)]
 
 
 def rank_shard(
@@ -129,24 +127,21 @@ def rank_shard(
 
     Striding (``positions[rank::world_size]``) means the union over all ranks is exactly
     the epoch's positions — every sample covered, none dropped — and every rank gets the
-    same count in both `drop_last` modes.
+    same count in both modes. This is `elastic_shard` from the top of the epoch, and shares
+    its implementation so the two can never drift.
     """
-    if not (0 <= rank < world_size):
-        raise ValueError(f"rank {rank} out of range for world_size {world_size}")
-    positions = epoch_positions(order, world_size=world_size, drop_last=drop_last)
-    return positions[rank::world_size]
+    return elastic_shard(order, world_size=world_size, rank=rank, drop_last=drop_last)
 
 
 def elastic_shard(
-    order: list[int],
+    order: Sequence[int],
     *,
     world_size: int,
     rank: int,
     global_consumed: int = 0,
     drop_last: bool = True,
 ) -> list[int]:
-    """Rank ``rank``'s *remaining* samples after ``global_consumed`` were already
-    processed globally this epoch — the resume path.
+    """Rank ``rank``'s samples left after ``global_consumed`` globally — the resume path.
 
     Because ``order`` is world-size-independent, ``global_consumed`` is a position in the
     global order, so a job can resume under a **different** ``world_size`` and still cover
@@ -162,12 +157,14 @@ def elastic_shard(
     Cross-world-size note: with ``drop_last`` and a total not divisible by both world sizes
     the trimmed tail differs, so a resume at a new size may include a few tail samples the
     original dropped (never a dup of a processed one).
+
+    Only this rank's ``1 / world_size`` share is built: materializing `epoch_positions` first
+    would cost O(``len(order)``) — the regression the O(1) design exists to avoid.
     """
-    if not (0 <= rank < world_size):
-        raise ValueError(f"rank {rank} out of range for world_size {world_size}")
-    positions = epoch_positions(order, world_size=world_size, drop_last=drop_last)
-    start = max(0, global_consumed)
-    return [positions[p] for p in range(rank, len(positions), world_size) if p >= start]
+    total = len(order)
+    positions = _rank_positions(total, world_size, rank, global_consumed, drop_last)
+    # Positions past the corpus are the padded tail, which repeats it from the front.
+    return [order[p if p < total else (p - total) % total] for p in positions]
 
 
 def _rank_positions(
@@ -412,7 +409,10 @@ class ResumableSampler:
 
         Nothing is materialized: the order is a keyed bijection evaluated per index and the
         positions are a `range`, so an epoch over a trillion samples costs the same memory
-        as one over ten.
+        as one over ten. The sequence is strided across DataLoader workers, each of which gets
+        its own copy of this sampler and would otherwise replay the whole stream — training on
+        every sample ``num_workers`` times, silently. The global position advances over skipped
+        samples too, so a `state_dict` means the same thing in every worker.
 
         Examples:
             .. doctest::
@@ -431,12 +431,14 @@ class ResumableSampler:
         positions = _rank_positions(
             self._num_samples, self._world_size, self._rank, self._consumed, self._drop_last
         )
-        for position in positions:
+        offset, stride = _worker_stride()
+        for i, position in enumerate(positions):
             # Count the sample *before* handing it over: a `state_dict` taken after
             # receiving k samples must say k were consumed, and post-yield code only
             # runs once the consumer asks for the next one (or never, if it stops).
             self._consumed += self._world_size
-            yield permutation[position % self._num_samples]
+            if i % stride == offset:
+                yield permutation[position % self._num_samples]
 
     def state_dict(self) -> dict[str, Any]:
         """The resume point: everything needed to rebuild this stream mid-epoch.
