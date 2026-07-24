@@ -99,3 +99,49 @@ def test_covar_corr_grouped_single_node_equals_distributed():
         for k, c, s, cp in zip(dd["g"], dd["c"], dd["s"], dd["cp"], strict=True)
     }
     assert single == multi
+
+
+# --- a non-finite value must not be clipped away ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+)
+@pytest.mark.parametrize("agg", ["var", "std"])
+def test_a_non_finite_value_does_not_produce_zero_variance(agg, bad):
+    """`var`/`std` over data containing NaN or +/-inf must not report `0.0`.
+
+    The Welford finalize clipped its result with ``max(0.0)`` to absorb the tiny negative
+    `M2` that cancellation can leave. `f64::max` returns the *other* operand when one is
+    NaN, so that clip also turned a NaN `M2` — which any NaN or infinity in the input
+    produces, since Welford's centering computes ``inf - inf`` — into a confident `0.0`.
+
+    Zero variance is not a near-miss: it is the signal that a column is constant, and it is
+    what drift detection, feature selection, and a data-quality "is this column dead?" check
+    all key on. `mean` and `sum` over the same rows propagate NaN, so the aggregates also
+    disagreed with each other about whether the data was finite.
+    """
+    ds = bt.from_pydict({"v": [1.0, bad, 2.0]})
+    got = ds.agg(r=getattr(col("v"), agg)()).to_pydict()["r"][0]
+    assert got != 0.0, f"{agg} over data containing {bad} reported zero variance"
+    assert got != got, f"{agg} over data containing {bad} should be NaN, got {got}"
+
+
+def test_the_clip_still_absorbs_the_negative_m2_it_was_written_for():
+    """A constant column still yields exactly 0.0, not a tiny negative from cancellation."""
+    ds = bt.from_pydict({"v": [_OFF + 1] * 6})
+    got = ds.agg(v=col("v").var(), s=col("v").std()).to_pydict()
+    assert got["v"][0] == 0.0, got
+    assert got["s"][0] == 0.0, got
+
+
+def test_every_path_agrees_about_a_non_finite_variance():
+    """...and the four schedulings agree, which is where the property suite caught it."""
+    ds = bt.from_pydict({"k": [0, 0, 0], "v": [1.0, float("nan"), 2.0]})
+    plan = ds.group_by("k").agg(s=col("v").std())
+    results = {
+        "collect": plan.collect().to_pydict()["s"][0],
+        "spill": plan.collect(spill=True).to_pydict()["s"][0],
+        "distributed": plan.collect(distributed=True, num_workers=2).to_pydict()["s"][0],
+    }
+    assert all(v != v for v in results.values()), f"paths disagree about NaN: {results}"
