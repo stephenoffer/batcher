@@ -9,9 +9,12 @@ Daft and Batcher target the same shape of work: multimodal and ML-first pipeline
 over a native columnar engine, distributed with Ray. The port is mostly mechanical.
 Read `docs/migration/transforming.md` and `docs/migration/reading-and-writing.md`
 (the mapping tables and the `from_*`/`to_*` adapters)
-and `docs/benchmarks/vs-daft.md` (an honest scorecard — Batcher wins multimodal
-ingest and top-N, ties aggregation, and **loses join-heavy TPC-H by 2–12×** and a
-per-batch Python UDF by ~2×) before promising a user a speedup.
+and `docs/benchmarks/vs-daft.md` (the scorecard) before promising a user a speedup.
+Batcher wins multimodal ingest and top-N and ties aggregation. The join-heavy TPC-H
+result is **hardware-dependent and has moved**: that page measures Daft ahead on a
+16-core node, while a 96-core re-run has Batcher ahead on 18 of the 19 queries both
+engines answer (`docs/internals/daft_parity_ledger.md`). Quote the conditions, not a
+multiplier.
 
 Every Batcher name below is verified against the live surface. If you need one this
 skill doesn't list, check it — `python -c "import batcher as bt; print(bt.<name>)"`,
@@ -245,9 +248,14 @@ assuming the port is wrong.
 - **Do not declare `input_columns` loosely.** An undeclared-but-read column can be
   pruned from the scan; that is a wrong answer, not a slow one. Unsure what the ported
   expression touches? Leave it `None` (the default) — every column stays alive.
-- **Do not promise a blanket speedup.** `docs/benchmarks/vs-daft.md` is the honest
-  scorecard: Daft wins join-heavy SQL by 2–12× and per-batch Python UDFs by ~2×.
-  Quote it rather than the multimodal number alone.
+- **Do not promise a blanket speedup**, in either direction. The join-heavy TPC-H
+  comparison depends on core count and has reversed between the two machines measured;
+  per-batch Python UDFs are still Daft's by ~2×. Quote `docs/benchmarks/vs-daft.md` and
+  the parity ledger *with their conditions*, never a bare multiplier.
+- **Do expect a ported SQL workload to change answers where Daft was wrong.** On TPC-H
+  at sf1 the harness's DuckDB gate fails Daft on q6, q15 and q18 and Daft errors on q21
+  and q22 — 5 of 22. If a ported query's numbers move, check DuckDB before assuming the
+  port broke it.
 
 ## See also
 

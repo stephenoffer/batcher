@@ -1477,7 +1477,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 4630 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 4686 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 167 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -1557,7 +1557,7 @@ Statistical analysis expressions — robust spread, distribution shape, associat
 |---|---|---|
 | `association.py` | 113 | How strongly two columns move together — the feature-selection primitives. |
 | `dispersion.py` | 177 | Quantile-based location and spread — the robust half of "describe". |
-| `inference.py` | 319 | Two-sample comparison and interval estimation as single-pass aggregates. |
+| `inference.py` | 331 | Two-sample comparison and interval estimation as single-pass aggregates. |
 | `moments.py` | 146 | Dispersion ratios — spread expressed relative to level, in one pass. |
 | `shape.py` | 130 | Distribution shape — skew, tail weight, and how far from normal a column is. |
 | `weighted.py` | 138 | Weighted statistics — a mean, variance, and correlation where rows carry different weights. |
@@ -1870,7 +1870,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 84 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
-| `eval/math.rs` | 416 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 402 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/mod.rs` | 617 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/image/reencode.rs` | 250 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
@@ -1922,7 +1922,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 191 | Bloom filter — approximate set membership for runtime join filters. |
 | `countmin.rs` | 194 | Count-Min — frequency (heavy-hitter) estimation. |
-| `ddsketch.rs` | 401 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
+| `ddsketch.rs` | 423 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
 | `frequent.rs` | 220 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |
 | `hll.rs` | 339 | HyperLogLog++ — distinct-count (cardinality) estimation. |
 | `kll.rs` | 517 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |

@@ -98,7 +98,7 @@ survives here is a gap someone read the code to confirm.
 
 | Gap | Daft | Notes |
 |---|---|---|
-| Group-wise Python apply | `map_groups` | `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
+| Group-wise Python apply | `map_groups` | **Composition does not get there — measured.** `ds.repartition(by=k).map_batches(fn)` looks like it should work, but does not: over 50k rows and 20 keys, every one of the 20 keys appeared in all 4 batches, so a callback still sees fragments of a group. `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
 | Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | **Lower value than it first looks.** Batcher's Iceberg sink hands each shard to `pyiceberg`, which applies the table's own partition-spec transforms, so a partitioned write is already correct without these. What is left is manual bucketing and bucketed joins. The temporal four compose from existing expressions; only `bucket` needs an exact `murmur3_x86_32`, which is not in the tree. |
 | Row-identity generators | `monotonically_increasing_id`, `uuid`, `random_int` | **Two are spelling, one is a decision.** `monotonically_increasing_id` is `ds.with_row_index()` and `random_int` is `ds.with_random()` scaled and cast — both exist at `Dataset` level rather than as expressions, so they belong in the migration table. `uuid()` is genuinely absent and should stay absent in its usual form: a random UUID per row is non-deterministic, which breaks the interpreter-as-oracle property the whole test strategy rests on (sequential, parallel and distributed runs would disagree). `with_random` is seed-keyed for exactly that reason. A deterministic v5-style UUID over a key column would be admissible; nobody has asked, and `hash64`/`xxhash64` already cover surrogate keys. |
 | Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx` | `.video.decode()` already covers `video_metadata` (it returns `{width, height, num_frames, duration_secs, fps}`), so the real gap is frame *extraction*, not metadata. Needs the `video` cargo feature (system FFmpeg). |
@@ -240,6 +240,48 @@ on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regi
 per-file latency amortizes and Batcher's kernels dominate. The two results are consistent
 and describe different ends of the corpus-size range. What is now known is that the small
 end belongs to Daft.
+
+### TPC-H: the documented loss has reversed on a large machine
+
+`docs/benchmarks/vs-daft.md` has a section titled "Where Daft wins: multi-join SQL",
+reporting Batcher behind on q20 (2.03x), q3 (1.55x), q4 (1.51x), q17 (1.35x) and q5
+(1.13x) — measured on a **16-core** node. Re-run here on **96 cores**, release build,
+engine mtime verified unchanged across the run:
+
+| Query | 16-core (that page) | 96-core (this run) |
+|---|---|---|
+| q20 | 2.03x behind | **0.80x — ahead** |
+| q3 | 1.55x behind | **0.52x — ahead** |
+| q4 | 1.51x behind | 1.41x behind |
+| q17 | 1.35x behind | **0.20x — ahead** |
+| q5 | 1.13x behind | **0.80x — ahead** |
+
+Across the whole suite Batcher is ahead of Daft on 18 of the 19 queries both engines
+answer, from 0.13x (q10) to 0.80x, with q4 the single remaining loss at 1.41x.
+
+**This does not simply overwrite that page**, because it is different hardware and the two
+can both be true. But it does contradict the *explanation* the page gives for the gap:
+"single-node parallelism plateaus after about 8 cores where Daft uses effectively all 16".
+If that were the whole story, 96 cores would make Batcher's position worse, not reverse it
+on four of five queries. Either more has landed since, or the diagnosis needs revisiting.
+Either way, quoting "Daft wins join-heavy SQL by 2-12x" is no longer defensible, and the
+`migrate-from-daft` skill said exactly that.
+
+### Daft fails or errors on 5 of 22 TPC-H queries
+
+The harness gates timing on agreement with DuckDB, so these are its verdicts, not ours:
+
+| Query | Daft |
+|---|---|
+| q6 | 75,207,768 where DuckDB says 123,141,078 — the `0.06 + 0.01` float fold `vs-daft.md` already documents |
+| q15 | 0 rows where DuckDB returns 1 |
+| q18 | wrong columns: `l_quantity` where the query asks for `sum(l_quantity)` |
+| q21 | `DaftError::InternalError: Outer reference columns cannot be bound` |
+| q22 | `InvalidSQLException: Unsupported SQL: SUBSTRING(expr FROM start FOR len)` |
+
+Worth stating plainly because a parity ledger that only tracks *our* gaps is half a
+picture: on the SQL surface both engines claim, Batcher answers 22 of 22 correctly and
+Daft 17.
 
 ### A correctness divergence in Daft, found by running it
 

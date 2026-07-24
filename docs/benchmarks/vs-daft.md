@@ -21,7 +21,7 @@ page passed that gate first.
 | Global aggregate, group-by, expression ETL | Tie |
 | Distributed join (sf1 to sf100) | Batcher, 1.7x to 2.2x |
 | Distributed `filter → count` (sf10, sf100) | Daft, 0.84x to 0.92x |
-| TPC-H multi-join queries | **Daft, up to 2x** |
+| TPC-H multi-join queries | Depends on cores: **Daft up to 2x** at 16, **Batcher on 18 of 19** at 96 |
 | Per-batch Python UDF | **Daft, ~2×** |
 
 :::{note}
@@ -59,11 +59,15 @@ kernels with no I/O in the way. Single node, 16 cores:
 
 Hold on to this table. It is what makes the next one interesting.
 
-## Where Daft wins: multi-join SQL
+## Multi-join SQL: it depends on the machine
 
 :::{warning}
-**Daft is faster on the join-heavy TPC-H queries**, led by q20 at 2.03x, q3 at 1.55x, and q4 at 1.51x. It's also about **2x faster on a per-batch Python UDF**, where a numpy `map_batches` reduce takes 85 ms against Daft's 41 ms. Parity on global aggregation, group-by, and single-stage expression ETL doesn't offset that.
+**On 16 cores Daft is faster on the join-heavy TPC-H queries**, led by q20 at 2.03x, q3 at 1.55x, and q4 at 1.51x. It's also about **2x faster on a per-batch Python UDF**, where a numpy `map_batches` reduce takes 85 ms against Daft's 41 ms.
+
+**On 96 cores that reverses.** A re-run at sf1 on a 96-core node put Batcher ahead on 18 of the 19 queries both engines answer, including q20 at 0.80x, q3 at 0.52x, q17 at 0.20x and q5 at 0.80x. q4 is the one that stays Daft's, at 1.41x rather than 1.51x. Both measurements are real; the join result is a function of core count, so quote the machine with the number. The 96-core run is recorded in `docs/internals/daft_parity_ledger.md`.
 :::
+
+That reversal also puts a question against the explanation below. If the gap were purely that Batcher's single-node parallelism plateaus around 8 cores while Daft uses all 16, more cores should widen it rather than close it on four of five queries. Either work landed since this section was written, or the diagnosis is incomplete. It is left standing, with this note, rather than quietly rewritten.
 
 TPC-H at scale factor 1, 16 cores, re-measured 2026-07-18. The ratio is `batcher / daft`, so **above 1 means Daft is faster**. Batcher is faster on 11 of the 18 queries Daft answers correctly. {doc}`tpch` carries the full per-query table.
 
@@ -123,13 +127,24 @@ other data-movement bugs, produced the table above. The superseded section is ke
 
 ## Correctness
 
-Daft computes TPC-H **q6 wrong**. It folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row, and returns 75.2M where
-the correct revenue is 123.1M. It also cannot parse the `SUBSTRING(x FROM a FOR b)` in q22.
-The harness declines to time a query whose result does not match, so Daft gets no number on
-q6 rather than a fast one.
+The harness declines to time a query whose result does not match DuckDB, so a wrong answer
+gets no number rather than a fast one. At sf1 that gate catches Daft on five of the 22:
 
-Batcher matches DuckDB on all 22. The gap to Daft is purely speed, never correctness, and this page
-would rather say that than pretend the speed gap does not exist.
+| Query | What Daft does |
+|---|---|
+| q6 | Folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row: returns 75.2M where the correct revenue is 123.1M |
+| q15 | Returns 0 rows where DuckDB returns 1 |
+| q18 | Returns `l_quantity` where the query asks for `sum(l_quantity)` |
+| q21 | `DaftError::InternalError: Outer reference columns cannot be bound` |
+| q22 | Cannot parse `SUBSTRING(x FROM a FOR b)` |
+
+Daft also disagrees with SQL on window frames outside TPC-H: `sum(x) OVER (PARTITION BY k
+ORDER BY o)` returns the whole-partition sum where the default frame is `RANGE UNBOUNDED
+PRECEDING TO CURRENT ROW`, so on `v = [10, 20, 30]` it gives `60, 60, 60` against DuckDB's
+and Batcher's `10, 30, 60`.
+
+Batcher matches DuckDB on all 22, and on the window frame. Where this page reports a speed
+loss it means it; correctness is a separate axis and Batcher does not lose on it.
 
 ## Reproduce
 
