@@ -949,7 +949,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate_columns.py` | 235 | Aggregate output column statistics — the values a grouped/global aggregate produces. |
+| `aggregate_columns.py` | 248 | Aggregate output column statistics — the values a grouped/global aggregate produces. |
 | `columns.py` | 411 | Per-operator column-statistics propagation. |
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
@@ -1350,7 +1350,7 @@ Source connectors — the façade over the source implementation modules.
 |---|---|---|
 | `base.py` | 184 | The `Source` protocol — the contract every connector satisfies. |
 | `inmemory.py` | 476 | `InMemorySource` — a relation already materialized as Arrow record batches. |
-| `inmemory_stats.py` | 266 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
+| `inmemory_stats.py` | 295 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 186 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
 | `materialized.py` | 70 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
 | `read.py` | 160 | The neutral read helpers every executor calls a `Source` through. |

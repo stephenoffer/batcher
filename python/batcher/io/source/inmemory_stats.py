@@ -121,10 +121,39 @@ def column_predicate_count(build: ColumnBuilder, op: str, name: str, value: obje
         col = build(name)
         if _float_order_differs(col):
             return None  # see below — this count would not be the count the engine produces
-        count = pc.sum(kernel(col, pa.scalar(value, col.type)), skip_nulls=True).as_py()
+        count = pc.sum(kernel(col, _literal_scalar(value, col.type)), skip_nulls=True).as_py()
         return int(count) if count is not None else 0
     except (*_ARROW_ERRORS, pa.ArrowTypeError):
         return None
+
+
+def _literal_scalar(value: object, col_type: pa.DataType) -> pa.Scalar:
+    """The literal as a scalar that still *means* `value` against a `col_type` column.
+
+    Typing the scalar as the column's type is the fast path and is right whenever the cast
+    is lossless. It is not always lossless: `pa.scalar(-2.5, pa.int64())` is `-2`, so a
+    count for ``n > -0.5`` was taken as ``n > 0`` and silently lost every row where
+    ``n == 0``, while ``n == -2.5`` — which no integer can satisfy — counted the rows equal
+    to `-2`. Because this count answers `COUNT(*)` *without executing*, the result
+    contradicted the rows the same filter materializes: `count()` said 1 where
+    `to_pydict()` returned none.
+
+    When the cast would change the value, the scalar keeps its own type instead and Arrow's
+    kernels promote both sides to a common type — which is what the engine does when it
+    evaluates the predicate for real, so the count and the rows agree again.
+
+    Args:
+        value: The literal the predicate compares against.
+        col_type: The Arrow type of the column being compared.
+
+    Returns:
+        A scalar equal to `value`, typed as the column where that is exact.
+    """
+    try:
+        typed = pa.scalar(value, col_type)
+    except (*_ARROW_ERRORS, pa.ArrowTypeError, pa.ArrowInvalid):
+        return pa.scalar(value)
+    return typed if typed.as_py() == value else pa.scalar(value)
 
 
 def _float_order_differs(col: pa.ChunkedArray | pa.Array) -> bool:
