@@ -90,6 +90,12 @@ its own.
 
 Ranked by value. "Daft" names the Daft function the gap was found from.
 
+Every row below has been checked against the code, not just against the name diff. That
+distinction is not pedantry: four rows that started here (`audio_metadata`, MCAP,
+HuggingFace, the tokenizer) turned out to be present already, and one more (Iceberg
+partition transforms) turned out to matter far less than its name suggested. A row that
+survives here is a gap someone read the code to confirm.
+
 | Gap | Daft | Notes |
 |---|---|---|
 | Group-wise Python apply | `map_groups` | `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
