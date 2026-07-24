@@ -9,38 +9,16 @@ pool, mirroring what the session-warm path already did.
 
 from __future__ import annotations
 
-import sys
-import types
-
 import pytest
 
-
-def _install_fake_ray(monkeypatch):
-    exc = types.ModuleType("ray.exceptions")
-
-    class RayError(Exception):
-        pass
-
-    class RayTaskError(RayError):
-        pass
-
-    exc.RayError = RayError
-    exc.RayTaskError = RayTaskError
-    ray_mod = types.ModuleType("ray")
-    ray_mod.exceptions = exc
-    ray_mod.wait = lambda refs, num_returns=1: ([refs[0]], refs[1:])
-    ray_mod.get = lambda ref: ref()
-    ray_mod.kill = lambda actor: None
-    monkeypatch.setitem(sys.modules, "ray", ray_mod)
-    monkeypatch.setitem(sys.modules, "ray.exceptions", exc)
-    return RayError, RayTaskError
+from _fake_ray import install_fake_ray
 
 
 @pytest.mark.unit
 def test_a_lost_resident_pool_heals_onto_a_recovering_pool(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    RayError, _ = _install_fake_ray(monkeypatch)
+    RayError, _ = install_fake_ray(monkeypatch)
 
     calls: dict[str, int] = {"resident": 0, "drive": 0, "evict": 0}
 
@@ -75,7 +53,7 @@ def test_a_lost_resident_pool_heals_onto_a_recovering_pool(monkeypatch):
 def test_a_healthy_resident_pool_is_used_directly(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     used = {"resident": 0, "drive": 0}
 
     def _resident(plan0, partitions, opts, size, registry):
@@ -98,7 +76,7 @@ def test_a_healthy_resident_pool_is_used_directly(monkeypatch):
 def test_evict_scoped_pool_removes_the_signature_from_the_scope(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
 
     class _Fn:
         pass

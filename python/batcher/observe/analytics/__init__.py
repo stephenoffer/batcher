@@ -11,11 +11,11 @@ an invalidation bug in exchange for nothing measurable.
 
 from __future__ import annotations
 
-from .comparison import compare_runs
-from .health import health_report
-from .pipeline import pipeline_report
-from .rollups import failure_groups, operator_rollup
-from .series import percentiles, throughput_series
+from batcher.observe.analytics.comparison import compare_runs
+from batcher.observe.analytics.health import health_report
+from batcher.observe.analytics.pipeline import pipeline_report
+from batcher.observe.analytics.rollups import failure_groups, operator_rollup
+from batcher.observe.analytics.series import percentiles, throughput_series
 
 __all__ = [
     "compare_runs",

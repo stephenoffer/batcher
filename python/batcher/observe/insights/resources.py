@@ -8,7 +8,7 @@ from __future__ import annotations
 import pathlib
 from typing import Any
 
-from .kinds import (
+from batcher.observe.insights.kinds import (
     _CPU_IDLE,
     _LOAD_CONTENDED,
     _MEMORY_IDLE,

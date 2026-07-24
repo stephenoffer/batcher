@@ -50,7 +50,7 @@ list.** Read the site before you touch it.
 | `dead-rust` | a column-0 `pub` item reached only by its own unit tests | a primitive built for a caller that never arrived |
 | `near-duplicate` | cross-file bodies ≥85% identical | the copy that drifted one line, invisible to `lint_duplication` |
 | `stub` | a documented function with a do-nothing body, excluding `-> X \| None` (a documented "unknown" default) | a docstring promising what the body does not do |
-| `swallowed-error` | `except: pass`, and broad `except` over a large `try` | a bug becoming a wrong answer instead of a traceback |
+| `swallowed-error` | a handler that *declares itself* best-effort and leaves no trace; a comment-less `pass`; a broad `except` over a large `try` | the first is the real one — the learned-stats loop dying with every gate green |
 | `vacuous-test` | a `test_*` with no assertion anywhere in its call graph | passes as long as nothing raises |
 | `order-blind-test` | a test that sorts, then asserts order-independently | `high` = both sides order, mechanically fixable; `medium` = read it, an ordered assertion may be wrong |
 | `production` | `print` outside a display function, `assert` on a public function's argument, mutable defaults | ships to a user as-is |
@@ -101,6 +101,34 @@ ORDER BY y)` ranks rows *within* a partition or an aggregate and says nothing ab
 order of the result. The same run flagged 21 `production` findings, every one of which was
 a `print` inside `ds.show()`/`glimpse()`/the console sink or an `assert isinstance(...)`
 narrowing for the type checker. After calibration: 31 and 0.
+
+Two later calibrations, for the same reason — record yours the same way:
+
+`swallowed-error` was measuring the wrong thing in **both** directions. All 18 `except ...:
+pass` sites in the tree turned out to be legitimate (documented control-flow fall-throughs,
+optional imports, browser-disconnect handling), while 47 handlers that *declared themselves*
+best-effort — "learning must never break a query" — substituted a fallback and returned with
+no trace at all, and the detector saw only three of them. The declaration is the signal, not
+the syntax: a broad `except Exception: return None` on an optional-dependency probe is fine,
+and the same handler on a path the author promised would never break is the moat going quietly
+dead. Keying on the syntax alone reported 190 sites, ~150 of them legitimate. Also: `continue`
+is not silence (inside a loop it means "skip this entry" — all 16 sites were legitimate), and
+a handler that reads its bound exception is not silent either, because threading it into a
+reason string the caller logs carries it just as well.
+
+`order-blind-test` reported 32; 30 were false and 2 were real. The 30 were the detector
+treating *inner* ordering as result ordering — an `order_by=` **keyword** picks which row an
+aggregate keeps, which duplicate `distinct` survives, or how a window frame ranks rows, and
+never orders the result; and a sorted relation feeding `GROUP BY`/`UNION` has no result order
+left to check. The 2 real ones both covered a Kyber rule that *rewrites a sort* while comparing
+against an oracle query with no `ORDER BY`, so the rule could have destroyed the ordering it
+was rewriting and the test would still have passed.
+
+And one that is not a detector but changes every count you read: `lint_structure`'s
+function-length check counts the docstring. Public functions here carry mandatory Google-style
+docstrings with runnable doctests, so 117 of the 214 functions it flagged were over the line on
+docstring alone. It now excludes them, the way the Rust file check excludes `#[cfg(test)]`.
+**40% of the Python tree is docstring** — measure code, not lines, before calling anything bloated.
 
 So: **revert a bad batch rather than arguing with the suite.** A conversion that turns a
 green suite red is evidence about your rule, not about the tests — unless you can point at

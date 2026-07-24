@@ -29,7 +29,7 @@ import time
 
 import numpy as np
 import pyarrow as pa
-from _ray_env import init_batcher_ray
+from _ray_env import init_batcher_ray, with_timeout
 
 print = functools.partial(print, flush=True)
 
@@ -254,30 +254,6 @@ def _agreement(a: dict, b: dict) -> float:
     return sum(1 for k in common if abs(pa_[k] - pb[k]) <= 0.5) / len(common)
 
 
-def _with_timeout(fn, t):
-    import threading
-
-    def wrapped():
-        box: dict = {}
-
-        def run():
-            try:
-                box["v"] = fn()
-            except BaseException as e:
-                box["e"] = e
-
-        th = threading.Thread(target=run, daemon=True)
-        th.start()
-        th.join(t)
-        if th.is_alive():
-            raise TimeoutError
-        if "e" in box:
-            raise box["e"]
-        return box.get("v")
-
-    return wrapped
-
-
 def _time(run, monitor):
     if monitor:
         monitor.start()
@@ -299,7 +275,7 @@ def bench(cfg: dict, n: int) -> dict:
     out: dict = {}
     for eng, builder in (("batcher", batcher_thunk), ("ray", ray_thunk)):
         try:
-            run = _with_timeout(builder(cfg), cfg["timeout"])
+            run = with_timeout(builder(cfg), cfg["timeout"])
             print(f"  [{eng}] warmup ...")
             warm = run()
             best, util = float("inf"), {}

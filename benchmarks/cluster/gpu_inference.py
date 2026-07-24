@@ -30,6 +30,7 @@ import time
 
 import numpy as np
 import pyarrow as pa
+from _ray_env import with_timeout
 
 print = functools.partial(print, flush=True)
 
@@ -254,30 +255,6 @@ def _agreement(a: dict, b: dict) -> float:
     return sum(1 for k in common if pa_[k] == pb[k]) / len(common)
 
 
-def _with_timeout(fn, timeout_s: float):
-    import threading
-
-    def wrapped():
-        box: dict = {}
-
-        def run():
-            try:
-                box["v"] = fn()
-            except BaseException as e:
-                box["e"] = e
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        t.join(timeout_s)
-        if t.is_alive():
-            raise TimeoutError
-        if "e" in box:
-            raise box["e"]
-        return box.get("v")
-
-    return wrapped
-
-
 def _time(run, monitor=None):
     if monitor:
         monitor.start()
@@ -298,7 +275,7 @@ def bench(table: pa.Table, cfg: dict) -> dict:
     for eng, builder in ENGINES.items():
         thunk = builder(table, cfg)
         try:
-            run = _with_timeout(thunk, cfg["timeout"])
+            run = with_timeout(thunk, cfg["timeout"])
             print(f"  [{eng}] warmup (pays actor spawn + model load) ...")
             warm = run()
             best, util = float("inf"), {}
