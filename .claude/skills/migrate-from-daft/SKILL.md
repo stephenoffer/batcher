@@ -64,6 +64,7 @@ model or does network IO.
 | `col("img").image.resize(w, h)` | `col("img").image.resize(w, h)` |
 | `crop(c, x, y, w, h)` | `col("c").image.crop(x, y, w, h)` — clips at the edge; `center_crop` is the padding one |
 | `encode_image(c, fmt)` | `col("c").image.encode(fmt)` — `png`/`jpeg`/`bmp`/`gif` |
+| `convert_image(c, mode)` | `col("c").image.convert(mode)` — `L`/`LA`/`RGB`/`RGBA` |
 | image → tensor for a model | `col("img").image.to_tensor()` |
 | audio decode / resample | `col("a").audio.decode()`, `.audio.resample(...)`, `.audio.to_waveform()` |
 | video decode | `col("v").video.decode()` |
