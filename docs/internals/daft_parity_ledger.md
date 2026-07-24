@@ -32,6 +32,15 @@ Two things that number is not:
 The triage below therefore separates *real capability gaps* from *spelling gaps*, and only
 the first kind produces work.
 
+**A measurement of the method itself.** Re-running the same diff after the work in the
+closed table below: Batcher's vocabulary went 1,377 → 1,404 names, and Daft names absent
+went 220 → 212. Roughly fifty capabilities landed and the headline number moved by eight.
+Both halves of that are the point. Most of what landed is *parameterized* — one
+`to_case(style)` covers seven Daft functions, one `from_epoch(unit)` covers three, one
+`compress(codec)` covers four — so closing a capability gap usually adds one name, not
+seven. And most of the residual 212 were never capability gaps at all. Do not track this
+number as progress; track the closed table.
+
 ## Closed
 
 | # | Gap | What landed | Verified by |
