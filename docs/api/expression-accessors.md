@@ -55,6 +55,8 @@ Each namespace and the methods it carries:
 | `.to_date(format="%Y-%m-%d")` | parse into a Date with a strftime format; unmatched → NULL (→ Date32) |
 | `.to_datetime(format)` | parse into a Timestamp (DuckDB `try_strptime`); unmatched → NULL (→ Timestamp(us)) |
 | `.to_case(style)` | re-case an identifier into `style`, one of `snake`, `upper_snake`, `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train` |
+| `.compress(codec)` | compress the raw bytes with `gzip`, `zlib`, `deflate`, `zstd`, `brotli`, or `lz4` (→ Binary) |
+| `.decompress(codec)` | the inverse; a frame that isn't valid for `codec` is null, not an error |
 
 ### More `.dt` methods
 

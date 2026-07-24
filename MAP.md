@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 819 Python modules across 124 packages and 160 Rust files across 13 crates.
+Covering 819 Python modules across 124 packages and 161 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -635,7 +635,7 @@ Join lowering for the SQL translator — a façade over the join rewrite modules
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1168 | The distributed executor — the dispatcher. |
+| `executor.py` | 1212 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 616 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 353 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 342 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -1476,7 +1476,7 @@ The scalar expression algebra.
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 4628 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 165 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `fn_names.py` | 166 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 291 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -1505,7 +1505,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
 | `collections.py` | 1306 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 3597 | The `.str` accessor namespace. |
+| `strings.py` | 3679 | The `.str` accessor namespace. |
 | `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -1751,7 +1751,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 546 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 241 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1049 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1057 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 214 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -1761,12 +1761,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 2686 | The multi-core executor. |
+| `par.rs` | 2701 | The multi-core executor. |
 | `stream/breaker.rs` | 304 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 197 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 212 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 703 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 808 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/mod.rs` | 708 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/parallel.rs` | 816 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `window_spill.rs` | 72 | Bounded-memory window execution via grace partitioning. |
@@ -1779,7 +1779,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg/accum.rs` | 554 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
+| `agg/accum.rs` | 559 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 97 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
 | `agg/distinct.rs` | 381 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/fused.rs` | 418 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
@@ -1851,7 +1851,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 390 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 87 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 685 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 716 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 441 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/dispatch.rs` | 378 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
@@ -1880,19 +1880,20 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/security/mod.rs` | 115 | Data-protection string functions: `hmac_sha256`, `aes_encrypt`, `aes_decrypt`, `mask`. |
 | `eval/str/case.rs` | 134 | Identifier case conversion for `StrFunc::ToCase` — one word splitter, ten styles. |
 | `eval/str/chunk.rs` | 182 | `StrFunc::Chunk` — overlapping text windows (the RAG document splitter). |
+| `eval/str/compress.rs` | 144 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
 | `eval/str/html.rs` | 172 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 80 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
 | `eval/str/json.rs` | 531 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1314 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1371 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/temporal/date.rs` | 717 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 61 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1087 | `bc-expr` — scalar expression IR and its evaluation. |
-| `select.rs` | 253 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
+| `lib.rs` | 1097 | `bc-expr` — scalar expression IR and its evaluation. |
+| `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
 

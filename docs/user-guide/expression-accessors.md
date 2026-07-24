@@ -111,6 +111,44 @@ print(out.to_pydict())
 The styles are `snake`, `upper_snake`, `camel`, `pascal`, `kebab`, `upper_kebab`,
 `title`, `sentence`, `dot`, and `train`.
 
+### Compressed payloads inside a column
+
+Compressed bytes arrive inside columns, not only inside files: a gzipped JSON body in a
+Kafka record, a zstd-framed blob in a warehouse table. `compress(codec)` and
+`decompress(codec)` handle those without leaving the engine for a Python UDF.
+
+```python
+blobs = bt.from_pydict({"body": ["a payload worth compressing " * 10]})
+out = blobs.select(
+    packed=bt.col("body").str.compress("gzip").str.len_bytes(),
+    raw=bt.col("body").str.len_bytes(),
+)
+print(out.to_pydict())
+# {'packed': [51], 'raw': [280]}
+```
+
+The codecs are `gzip`, `zlib`, `deflate`, `zstd`, `brotli`, and `lz4`. The frames are the
+real thing, so anything else that reads gzip reads what Batcher writes, and the reverse.
+
+```python
+records = bt.from_pydict({"body": ["round trip"]})
+out = records.select(
+    back=bt.col("body").str.compress("zstd").str.decompress("zstd").cast("string")
+)
+print(out.to_pydict())
+# {'back': ['round trip']}
+```
+
+A frame that isn't valid for the codec you named decompresses to null rather than failing
+the query, so one corrupt blob in a scan of a billion rows costs you that row and nothing
+else.
+
+:::{note}
+`deflate` is the one codec that can't tell a corrupt frame from a valid one: raw deflate
+carries no header and no checksum. Use `zlib` or `gzip` where detection matters. They wrap
+the same algorithm in a frame that can be validated.
+:::
+
 :::{note}
 Recasing is idempotent in every style that joins with a separator. `camel` and `pascal`
 join with nothing, so an input with consecutive single-letter words can't survive a round

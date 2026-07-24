@@ -514,10 +514,12 @@ name = "bc-expr"
 version = "0.1.0"
 dependencies = [
  "aes-gcm-siv",
+ "ahash",
  "arrow",
  "base64",
  "bc-arrow",
  "bc-secrets",
+ "brotli",
  "chrono",
  "chrono-tz",
  "crc32fast",
@@ -526,9 +528,11 @@ dependencies = [
  "dasp_signal",
  "fast_image_resize",
  "ffmpeg-next",
+ "flate2",
  "hmac",
  "image",
  "jpeg-decoder",
+ "lz4_flex",
  "md-5",
  "memchr",
  "rayon",
@@ -541,6 +545,7 @@ dependencies = [
  "symphonia",
  "thiserror",
  "twox-hash 1.6.3",
+ "zstd",
 ]
 
 [[package]]

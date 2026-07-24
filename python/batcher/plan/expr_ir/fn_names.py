@@ -103,7 +103,8 @@ class Math2Fn(StrEnum):
 STR_FNS: Final[frozenset[str]] = frozenset(
     {
         "aes_decrypt", "aes_encrypt", "ascii", "base64", "bit_length", "chunk", "contains",
-        "crc32", "ends_with", "from_base64", "hash64", "hex", "hmac_sha256", "ilike",
+        "compress", "crc32", "decompress", "ends_with", "from_base64", "hash64", "hex",
+        "hmac_sha256", "ilike",
         "initcap", "json_array_length", "json_array_values", "json_exists",
         "json_extract_bool", "json_extract_float", "json_extract_int",
         "json_object_keys", "json_type",

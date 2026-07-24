@@ -10,6 +10,7 @@ use crate::{ExprError, StrFunc};
 
 mod case;
 mod chunk;
+mod compress;
 mod html;
 mod jaro;
 mod json;
@@ -85,7 +86,7 @@ pub(crate) fn eval_str(
     // dropped every non-UTF-8 row. DuckDB's `hex(BLOB)`/`md5(BLOB)`/… operate on the
     // bytes regardless of textual validity; do the same here.
     if matches!(arr.data_type(), DataType::Binary | DataType::LargeBinary) {
-        if let Some(out) = eval_bytes(func, arr)? {
+        if let Some(out) = eval_bytes(func, arr, pattern)? {
             return Ok(out);
         }
     }
@@ -638,6 +639,16 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::Soundex => Arc::new(map_str(s, soundex)),
+        // A text column compresses its UTF-8 bytes. Decompressing text is accepted for
+        // the same reason `unhex` accepts it: the bytes are what matter, and refusing
+        // would only force a `cast("binary")` that changes nothing.
+        StrFunc::Compress | StrFunc::Decompress => {
+            use arrow::array::Array;
+            let rows: Vec<Option<&[u8]>> = (0..s.len())
+                .map(|i| (!s.is_null(i)).then(|| s.value(i).as_bytes()))
+                .collect();
+            compress_rows(func, &rows, pattern)?
+        }
         StrFunc::ToCase => {
             let style = pattern.ok_or_else(|| ExprError::MissingArgument {
                 func: "ToCase".to_string(),
@@ -652,6 +663,45 @@ pub(crate) fn eval_str(
         }
     };
     Ok(out)
+}
+
+/// Apply `Compress`/`Decompress` to a column already reduced to `Option<&[u8]>` rows.
+///
+/// Both the Utf8 and the Binary path funnel here, so the two cannot drift: a text column
+/// and the same bytes as a BLOB compress identically. The codec is validated once, before
+/// any row is touched — an unknown codec is a plan error, and raising it per row would
+/// emit the same message n times.
+fn compress_rows(
+    func: StrFunc,
+    rows: &[Option<&[u8]>],
+    pattern: Option<&str>,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::BinaryBuilder;
+
+    let codec = pattern.ok_or_else(|| ExprError::MissingArgument {
+        func: format!("{func:?}"),
+        arg: "codec",
+    })?;
+    if !compress::CODECS.contains(&codec) {
+        return Err(compress::unknown_codec(&format!("{func:?}"), codec));
+    }
+    let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
+    for row in rows {
+        match row {
+            None => b.append_null(),
+            Some(v) => match func {
+                StrFunc::Compress => {
+                    b.append_value(compress::compress(v, codec).expect("codec validated above")?)
+                }
+                // A frame that will not decode is a null row, not a failed batch.
+                _ => match compress::decompress(v, codec).expect("codec validated above") {
+                    Some(out) => b.append_value(out),
+                    None => b.append_null(),
+                },
+            },
+        }
+    }
+    Ok(Arc::new(b.finish()))
 }
 
 /// Whether `c` is a Unicode space separator (general category `Zs`).
@@ -883,7 +933,11 @@ fn initcap(v: &str) -> String {
 /// functions defined over raw bytes (matching DuckDB's `hex`/`md5`/`sha*`/`base64`/
 /// `octet_length` over a BLOB), and `None` for a text-oriented function so the caller
 /// falls back to the Utf8 path.
-fn eval_bytes(func: StrFunc, arr: &ArrayRef) -> Result<Option<ArrayRef>, ExprError> {
+fn eval_bytes(
+    func: StrFunc,
+    arr: &ArrayRef,
+    pattern: Option<&str>,
+) -> Result<Option<ArrayRef>, ExprError> {
     use arrow::array::{BinaryArray, LargeBinaryArray};
     // Iterate the rows as `Option<&[u8]>` for either binary offset width.
     let bytes: Vec<Option<&[u8]>> = match arr.data_type() {
@@ -902,6 +956,9 @@ fn eval_bytes(func: StrFunc, arr: &ArrayRef) -> Result<Option<ArrayRef>, ExprErr
         _ => return Ok(None),
     };
     let out: ArrayRef = match func {
+        StrFunc::Compress | StrFunc::Decompress => {
+            return compress_rows(func, &bytes, pattern).map(Some)
+        }
         StrFunc::OctetLength => Arc::new(
             bytes
                 .iter()

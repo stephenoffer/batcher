@@ -21,6 +21,16 @@ ahash.workspace = true
 # the difference between ~80 ns/row and DuckDB-class ~7 ns/row.
 memchr = "2"
 base64 = "0.22"
+# Byte-stream compression for `.str.compress`/`.str.decompress`. Payloads arrive *inside*
+# columns (a gzipped JSON body in a Kafka record, a zstd blob in a warehouse table), so
+# reading one has to be expressible without leaving the data plane for a Python UDF. All
+# four crates are already in the build via Arrow's `ipc_compression` and the object-store
+# stack, so these edges add no new third-party code — which is why six codecs cost what
+# three would.
+flate2 = "1"
+zstd = "0.13"
+brotli = "8"
+lz4_flex = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # IANA timezone database for `convert_timezone` (DST-aware tz conversion).
 chrono-tz = { version = "0.10", default-features = false }

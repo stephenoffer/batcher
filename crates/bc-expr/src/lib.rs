@@ -25,6 +25,7 @@ mod analyze;
 mod error;
 mod select;
 pub use error::ExprError;
+pub use select::ConjunctOrder;
 
 // The per-variant evaluation bodies (and `Expr::eval` itself) live in `eval`; the
 // wire-contract enum definitions stay here in `lib.rs`.
@@ -876,6 +877,15 @@ pub enum StrFunc {
     /// and comments, decodes entities, collapses whitespace, and separates elements with
     /// a space. Lenient on malformed markup. Null → null. → Utf8. See `eval::str::html`.
     StripHtml,
+    /// Compress the raw bytes with the codec named by `pattern` (`gzip`, `zlib`,
+    /// `deflate`, `zstd`, `brotli`, or `lz4`). Accepts Utf8 (its UTF-8 bytes) or Binary.
+    /// Null → null; an unknown codec is an error. → Binary. See `eval::str::compress`.
+    Compress,
+    /// Inverse of `Compress` under the codec named by `pattern`. Input that is not a valid
+    /// frame for that codec yields **null** rather than erroring, matching `from_base64`
+    /// and `unhex` — one corrupt blob in a scan is a bad row, not a bad query, which is
+    /// why there is no separate `try_decompress`. → Binary (nullable).
+    Decompress,
     /// Re-case an identifier into the style named by `pattern`: `snake`, `upper_snake`,
     /// `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train`.
     /// One word splitter serves every style (separators, lower→upper transitions, and

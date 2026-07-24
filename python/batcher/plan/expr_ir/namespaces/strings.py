@@ -20,6 +20,24 @@ from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 # Where `str.chunk` may end a chunk; mirrors `bc-expr`'s `chunk::Boundary`.
 _CHUNK_BOUNDARIES = frozenset({"char", "word", "sentence", "line"})
 
+# Byte-stream codecs `str.compress`/`str.decompress` accept; mirrors `case`'s sibling
+# `compress::CODECS` in `bc-expr`.
+_COMPRESSION_CODECS = frozenset({"gzip", "zlib", "deflate", "zstd", "brotli", "lz4"})
+
+
+def _require_codec(func: str, codec: str) -> str:
+    """Return `codec` if it names a supported codec, else raise a `PlanError`.
+
+    Shared by `compress` and `decompress` so the two cannot come to accept different
+    codec sets, which would make a round trip fail on one side only.
+    """
+    if codec not in _COMPRESSION_CODECS:
+        raise PlanError(
+            f"str.{func}(): codec must be one of {sorted(_COMPRESSION_CODECS)}, got {codec!r}"
+        )
+    return codec
+
+
 # Identifier styles `str.to_case` renders; mirrors `bc-expr`'s `case::STYLES`.
 _CASE_STYLES = frozenset(
     {
@@ -3062,6 +3080,70 @@ class _StrNamespace:
         # the two scalar slots that `repeat`/`right`/`split_part` already make — and
         # `pattern` carries the boundary mode, which is otherwise unused by `chunk`.
         return StrFunc("chunk", self._e, pattern=boundary, start=overlap, length=size)
+
+    def compress(self, codec: str) -> StrFunc:
+        """Compress each value's raw bytes with `codec` (→ Binary).
+
+        Accepts a text or a binary column; a text column compresses its UTF-8 bytes, so
+        the two spellings give identical output. The inverse is :meth:`decompress` under
+        the same codec.
+
+        The codecs are ``gzip``, ``zlib``, ``deflate``, ``zstd``, ``brotli``, and ``lz4``.
+        Each is a general-purpose default level; a compression *level* argument is
+        deliberately not exposed, since it is a second dimension on every codec.
+
+        Args:
+            codec: One of the six codec names above.
+
+        Returns:
+            A new Binary :class:`~batcher.Expr` of the compressed frames; null stays null.
+
+        Raises:
+            PlanError: If `codec` is not a recognized codec name.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello " * 20]})
+                >>> out = ds.select(
+                ...     n=bt.col("s").str.compress("gzip").str.len_bytes(),
+                ...     raw=bt.col("s").str.len_bytes(),
+                ... ).to_pydict()
+                >>> out["n"][0] < out["raw"][0]
+                True
+        """
+        return StrFunc("compress", self._e, pattern=_require_codec("compress", codec))
+
+    def decompress(self, codec: str) -> StrFunc:
+        """Decompress each value's bytes with `codec` (→ Binary); a bad frame is null.
+
+        The inverse of :meth:`compress`. Input that is not a valid frame for `codec`
+        yields null rather than failing the query, the same leniency
+        :meth:`from_base64` and :meth:`unhex` take: one corrupt blob in a scan of a
+        billion rows is a bad row, not a bad query.
+
+        Args:
+            codec: One of ``gzip``, ``zlib``, ``deflate``, ``zstd``, ``brotli``, ``lz4``.
+
+        Returns:
+            A new Binary :class:`~batcher.Expr` of the decompressed payloads; null where
+            the input is null or is not a valid frame.
+
+        Raises:
+            PlanError: If `codec` is not a recognized codec name.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["round trip"]})
+                >>> ds.select(
+                ...     r=bt.col("s").str.compress("zstd").str.decompress("zstd").cast("string")
+                ... ).to_pydict()
+                {'r': ['round trip']}
+        """
+        return StrFunc("decompress", self._e, pattern=_require_codec("decompress", codec))
 
     def to_case(self, style: str) -> StrFunc:
         """Re-case an identifier into `style`, e.g. ``"userID name"`` to ``user_id_name``.
