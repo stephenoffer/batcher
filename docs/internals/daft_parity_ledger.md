@@ -51,6 +51,8 @@ the first kind produces work.
 | 44 | `crop` | `.image.crop(x, y, w, h)` → PNG bytes, clipped at the edge rather than padded | same files |
 | 45-48 | `encode_image` | `.image.encode(format)` over png/jpeg/bmp/gif | same files |
 | 49 | *(benchmark)* Daft was measured only in the multi-node lineup | Daft added to the single-node default lineup | `benchmarks/engines/lineup.py`; results in this file |
+| 50 | *(process)* the debug-build guard was a timing heuristic that passed silently | `bc_py` exports `__engine_profile__`; the suite hard-stops on a debug engine, and `bt.versions()` reports it | `benchmarks/run.py::_check_build_profile`; `tests/unit/test_toplevel_namespace_ergonomics.py` |
+| — | `audio_metadata` | **Already present**, found while triaging: `.audio.decode()` returns `{sample_rate, channels, num_frames, duration_secs}`. Listed here because the ledger claimed it as a gap and was wrong. |
 
 ### Note on the epoch gap
 
@@ -71,8 +73,7 @@ Ranked by value. "Daft" names the Daft function the gap was found from.
 | Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | Needed to write a table another engine's Iceberg reader will prune correctly. |
 | Row-identity generators | `monotonically_increasing_id`, `uuid`, `random_int` | Batcher has `with_row_index`; the expression-level forms are absent. |
 | Image color conversion | `convert_image` | An explicit mode conversion (RGB to L, RGBA to RGB). `.image.to_grayscale` covers the common case; the general form is open. |
-| Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `video_metadata` | Batcher decodes video but exposes no frame-level accessor. |
-| Audio metadata | `audio_metadata` | Batcher has decode/resample/mel/mfcc but no metadata reader. |
+| Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx` | `.video.decode()` already covers `video_metadata` (it returns `{width, height, num_frames, duration_secs, fps}`), so the real gap is frame *extraction*, not metadata. Needs the `video` cargo feature (system FFmpeg). |
 | File metadata | `file_size`, `file_exists`, `file_path`, `guess_mime_type` | Path-level facts as expressions. **Costed and deferred:** each is a `stat` per row, which means object-store access from `bc-expr` — a crate that sits under everything and deliberately links no IO. The right home is `bc-io` or the UDF plane, and that is a design decision rather than a function to add. |
 | HDF5 accessors | `hdf5_attrs`, `hdf5_keys`, `hdf5_metadata` | Batcher reads HDF5 as a *format*; the per-row accessors are absent. |
 | Tokenizer round trip | `tokenize_encode`, `tokenize_decode` | Batcher estimates token counts; it cannot produce or consume real BPE ids. Needs a tokenizer dependency in the data plane — costed, not yet decided. |
