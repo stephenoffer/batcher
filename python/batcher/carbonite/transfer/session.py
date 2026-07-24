@@ -123,7 +123,7 @@ class ShuffleSession:
         self._shm = shm
         # Locality is tracked as two counters, not a per-fetch list: a long-lived
         # reducer does an unbounded number of fetches, so an append-per-fetch list
-        # would grow without bound (C13). off_network / total reconstruct the ratio.
+        # would grow without bound. off_network / total reconstruct the ratio.
         self._off_network = 0
         self._fetches = 0
         # Guards the read-modify-write bookkeeping (locality counters + the AIMD window)
@@ -402,7 +402,7 @@ class ShuffleSession:
         return locality_ratio_counts(self._off_network, self._fetches)
 
     def release(self, ticket: ShuffleTicket) -> None:
-        """Evict one published partition once its reducers have fetched it (C8)."""
+        """Evict one published partition once its reducers have fetched it."""
         self._server.release(ticket)
 
     def clear_plan(self, plan_id: int) -> None:

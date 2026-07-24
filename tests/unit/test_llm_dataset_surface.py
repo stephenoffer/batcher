@@ -247,21 +247,30 @@ def test_chat_messages_from_a_plain_string():
 # --- OpenAI request body -----------------------------------------------------
 
 
+def _sampling(**kw):
+    """A `_Sampling` with the given fields set (others default to None/omitted)."""
+    from batcher.ml.llm.engines.openai import _Sampling
+
+    return _Sampling(**kw)
+
+
 def test_openai_body_omits_unset_sampling_fields():
     """A null `stop` or an unknown key is rejected by several OpenAI-compatible servers."""
-    body = _openai_body("m", "hi", True, None, 16, 0.0)
+    body = _openai_body("m", "hi", True, None, _sampling(max_tokens=16, temperature=0.0), {})
     assert "top_p" not in body
     assert "stop" not in body
 
 
 def test_openai_body_includes_top_p_and_stop_when_given():
-    body = _openai_body("m", "hi", True, None, 16, 0.2, top_p=0.9, stop=["\n"])
+    body = _openai_body(
+        "m", "hi", True, None, _sampling(max_tokens=16, temperature=0.2, top_p=0.9, stop=["\n"]), {}
+    )
     assert body["top_p"] == 0.9
     assert body["stop"] == ["\n"]
 
 
 def test_openai_body_builds_chat_messages_with_a_system_turn():
-    body = _openai_body("m", "hi", True, "sys", 16, 0.0)
+    body = _openai_body("m", "hi", True, "sys", _sampling(max_tokens=16, temperature=0.0), {})
     assert body["messages"] == [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "hi"},
@@ -269,6 +278,42 @@ def test_openai_body_builds_chat_messages_with_a_system_turn():
 
 
 def test_openai_body_completion_mode_sends_a_bare_prompt():
-    body = _openai_body("m", "hi", False, "sys", 16, 0.0)
+    body = _openai_body("m", "hi", False, "sys", _sampling(max_tokens=16, temperature=0.0), {})
     assert body["prompt"] == "hi"
     assert "messages" not in body
+
+
+def test_openai_body_per_row_overrides_win():
+    """A per-row max_tokens/temperature in the request dict beats the engine default."""
+    body = _openai_body(
+        "m",
+        "hi",
+        True,
+        None,
+        _sampling(max_tokens=16, temperature=0.0),
+        {"max_tokens": 128, "temperature": 0.9},
+    )
+    assert body["max_tokens"] == 128
+    assert body["temperature"] == 0.9
+
+
+def test_guided_decoding_kwargs_selects_the_right_constraint():
+    """guided_choice constrains decoding to exactly one label; precedence json>regex>choice."""
+    from batcher.ml.llm.engines.vllm import _guided_decoding_kwargs
+
+    assert _guided_decoding_kwargs(None, None, ["yes", "no"]) == {"choice": ["yes", "no"]}
+    assert _guided_decoding_kwargs(None, r"\d+", None) == {"regex": r"\d+"}
+    assert _guided_decoding_kwargs({"type": "object"}, None, None) == {"json": {"type": "object"}}
+    assert _guided_decoding_kwargs(None, None, None) is None
+    # JSON wins when several are set (the engine's documented precedence).
+    assert _guided_decoding_kwargs({"type": "object"}, r"\d+", ["a"]) == {
+        "json": {"type": "object"}
+    }
+
+
+def test_guided_grammar_completes_the_decoding_surface():
+    from batcher.ml.llm.engines.vllm import _guided_decoding_kwargs
+
+    assert _guided_decoding_kwargs(None, None, None, "root ::= 'a'") == {"grammar": "root ::= 'a'"}
+    # choice still wins over grammar (documented precedence).
+    assert _guided_decoding_kwargs(None, None, ["a"], "g") == {"choice": ["a"]}

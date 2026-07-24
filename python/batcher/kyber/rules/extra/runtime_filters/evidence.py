@@ -29,8 +29,8 @@ so `sink_runtime_filter_to_source` sees the filter it inserts.
 from __future__ import annotations
 
 import dataclasses
-import math
 
+from batcher._internal.mathx import is_nan
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.rule import Phase, RuleCategory
 from batcher.kyber.rules.joins import _FILTERABLE_SIDES
@@ -292,7 +292,7 @@ def _eq_value(expr: Expr, col: str) -> object:
     for side, other in ((expr.left, expr.right), (expr.right, expr.left)):
         if isinstance(side, Col) and side.name == col and isinstance(other, Lit):
             value = other.value
-            if value is None or (isinstance(value, float) and math.isnan(value)):
+            if value is None or is_nan(value):
                 return _MISSING
             return value
     return _MISSING

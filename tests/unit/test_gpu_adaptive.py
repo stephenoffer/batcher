@@ -152,11 +152,24 @@ def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
 
 
 def _stats(base, spread, n=8, slope=1e-5, icept=100.0, noise=0.0):
+    """`n` observations of `y = icept + slope*x + noise`, folded exactly as the loop folds them."""
     import random
+
+    from batcher.kyber.ols import ols_update
 
     random.seed(0)
     xs = [base + spread * i / (n - 1) for i in range(n)]
     ys = [icept + slope * x + random.uniform(-noise, noise) for x in xs]
+    stats: dict = {}
+    for x, y in zip(xs, ys, strict=True):
+        stats = ols_update(stats, x, y)
+    return stats
+
+
+def _power_sum_stats(base, spread, n=8, slope=1e-5, icept=100.0):
+    """The **legacy** power-sum shape, for the compatibility path."""
+    xs = [base + spread * i / (n - 1) for i in range(n)]
+    ys = [icept + slope * x for x in xs]
     return {
         "n": n,
         "sx": sum(xs),
@@ -276,3 +289,77 @@ def test_a_mixed_fleet_keeps_the_pooled_bucket(monkeypatch):
         ],
     )
     assert accelerators.cluster_accelerator_type() == "NVIDIA_A100"
+
+
+def test_a_line_that_explains_nothing_is_refused():
+    """Spread in `x` makes a slope identifiable; it does not make it real.
+
+    Eight runs across a full decade of input sizes whose times are pure noise still admit a
+    least-squares line, and that line's intercept is the whole numerator of a crossover
+    threshold. R² measures whether the line explains anything, and a bucket that cannot
+    explain half the variance must not move a threshold.
+    """
+    import random
+
+    from batcher.kyber.ols import fit_ols, ols_update
+
+    random.seed(3)
+    stats: dict = {}
+    for i in range(24):
+        x = 1e6 * (i + 1)
+        stats = ols_update(stats, x, random.uniform(50.0, 150.0))  # time independent of x
+    assert fit_ols(stats) is None
+
+    # ...while a genuinely linear relationship with the same amount of noise still fits.
+    random.seed(3)
+    good: dict = {}
+    for i in range(24):
+        x = 1e6 * (i + 1)
+        good = ols_update(good, x, 100.0 + 1e-4 * x + random.uniform(-5.0, 5.0))
+    fit = fit_ols(good)
+    assert fit is not None
+    assert fit[1] == pytest.approx(1e-4, rel=0.05)
+
+
+def test_legacy_power_sum_state_is_discarded_rather_than_misread():
+    """A hub carrying the old power-sum shape must rebuild, not fit garbage from it.
+
+    The centered moments cannot be recovered from power sums without exactly the
+    cancellation the centered form exists to avoid, so the bucket restarts and the config
+    default holds for a few runs.
+    """
+    from batcher.kyber.ols import fit_ols, ols_update
+
+    legacy = _power_sum_stats(1e6, 7e6)
+    assert fit_ols(legacy) is None
+    # The next observation starts a fresh centered bucket rather than mixing the shapes.
+    restarted = ols_update(legacy, 1e6, 110.0)
+    assert restarted["n"] == 1.0
+    assert "sxx" not in restarted
+
+
+def test_centered_moments_are_exact_where_power_sums_cancel():
+    """The conditioning the centered state buys, stated precisely.
+
+    `n·Sxx - Sx²` is the difference of two numbers that agree to `(spread/base)²` in relative
+    terms, so at a 1e12 offset with a 1e6 spread it retains no significant digits at all. The
+    centered `M2x` computes the same quantity directly and is exact. The spread guard happens
+    to reject this sample for a *different* reason (extrapolating a slope from a 1e-6 relative
+    spread is statistically reckless whatever the arithmetic), which is exactly why the two
+    concerns should not be conflated in one guard.
+    """
+    from batcher.kyber.ols import ols_update
+
+    base, spread, n = 1e12, 1e6, 16
+    xs = [base + spread * i / (n - 1) for i in range(n)]
+    stats: dict = {}
+    for x in xs:
+        stats = ols_update(stats, x, 42.0 + 3e-6 * x)
+
+    mean = sum(xs) / n
+    exact = sum((x - mean) ** 2 for x in xs)
+    power_sum = n * sum(x * x for x in xs) - sum(xs) ** 2
+    assert stats["m2x"] == pytest.approx(exact, rel=1e-9)
+    assert abs(power_sum - exact) / exact > 0.1, (
+        "the power-sum form is expected to have lost most of its digits here"
+    )

@@ -7,6 +7,7 @@ aggregates; `Sort` orders rows (and carries an optional top-N `limit`).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any
 
 import pyarrow as pa
@@ -112,18 +113,13 @@ class Aggregate(LogicalPlan):
         inp = self.input.available_schema()
         if inp is None:
             return None
-        fields: list[pa.Field] = []
-        for key in self.group_keys:
-            t = infer_type(key.expr, inp)
-            if t is None:
-                return None
-            fields.append(pa.field(key.alias, t))
-        for spec in self.aggregates:
-            t = _agg_output_type(spec.agg, inp)
-            if t is None:
-                return None
-            fields.append(pa.field(spec.alias, t))
-        return SchemaRef.from_arrow(pa.schema(fields))
+        # Group keys first, then aggregates — the output order `available_columns` promises.
+        return SchemaRef.from_typed_fields(
+            chain(
+                ((key.alias, infer_type(key.expr, inp)) for key in self.group_keys),
+                ((spec.alias, _agg_output_type(spec.agg, inp)) for spec in self.aggregates),
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)

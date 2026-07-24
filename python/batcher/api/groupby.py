@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from batcher._internal.errors import PlanError
+from batcher.api.dataset.compat.guidance import groupby_attribute_error
 from batcher.plan.expr_ir import AggExpr, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector
 from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
@@ -93,6 +94,25 @@ class GroupBy:
             "or use .window(partition_by=[...]) to compute per-group values while "
             "keeping every row."
         )
+
+    def __getattr__(self, name: str) -> Any:
+        """Raise an `AttributeError` that names the window or aggregate to use instead.
+
+        Only reached when normal lookup fails. A pandas/Spark migrant reaches for a
+        per-group operation Batcher spells differently (``gb.transform``, ``gb.apply``,
+        ``gb.cumcount``, ``gb.get_group``), so the traceback carries the mapping — see
+        `batcher.api.dataset.compat.guidance`.
+
+        Args:
+            name: The attribute name that was not found.
+
+        Raises:
+            AttributeError: Always, with guidance for `name`.
+        """
+        # Dunder and private probes (copy/pickle/inspect) must fail plainly.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise groupby_attribute_error(self, name)
 
     @property
     def keys(self) -> list[str]:

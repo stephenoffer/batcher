@@ -289,7 +289,7 @@ fn gen_bool(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
         );
     }
     match rng.below(6) {
-        0 | 1 | 2 => bin(
+        0..=2 => bin(
             *rng.pick(CMP_OPS),
             gen_num(rng, depth - 1, nulls),
             gen_num(rng, depth - 1, nulls),

@@ -118,8 +118,7 @@ class DocumentSource(FileSource):
                 try:
                     text: str | None = page.extract_text() or ""
                 except Exception as exc:
-                    if not self._errors.tolerate(path, exc, format_name=self.format_name):
-                        raise
+                    self._errors.tolerate(path, exc, format_name=self.format_name)
                     text = None
                 paths.append(path)
                 pages.append(number)

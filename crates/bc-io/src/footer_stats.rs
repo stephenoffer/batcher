@@ -783,10 +783,10 @@ mod tests {
 
         // Collapse the first two, then fold the survivor with the third — what the
         // threshold does mid-pass.
-        let early_min = fold_bound(&parts[..2].to_vec(), false, &dt);
-        let early_max = fold_bound(&parts[..2].to_vec(), true, &dt);
-        let staged_min = fold_bound(&vec![early_min, parts[2].clone()], false, &dt);
-        let staged_max = fold_bound(&vec![early_max, parts[2].clone()], true, &dt);
+        let early_min = fold_bound(&parts[..2], false, &dt);
+        let early_max = fold_bound(&parts[..2], true, &dt);
+        let staged_min = fold_bound(&[early_min, parts[2].clone()], false, &dt);
+        let staged_max = fold_bound(&[early_max, parts[2].clone()], true, &dt);
 
         assert_eq!(&staged_min, &all_at_once_min);
         assert_eq!(&staged_max, &all_at_once_max);

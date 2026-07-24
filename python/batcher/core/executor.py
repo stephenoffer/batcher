@@ -17,6 +17,7 @@ from collections.abc import Sequence
 
 import pyarrow as pa
 
+from batcher._internal.mathx import safe_div
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilization
@@ -104,7 +105,7 @@ def _record_op_feedback(
                 n_actual=int(rows_out),
                 t_op_ms=op.get("elapsed_ns", 0) / 1e6,
                 m_peak_bytes=int(op.get("peak_bytes", 0)),
-                selectivity=(rows_out / rows_in) if rows_in else 1.0,
+                selectivity=safe_div(rows_out, rows_in, 1.0),
                 batch_size=batch_size,
                 backend=op.get("backend", "interp"),
                 algorithm="spill" if op.get("spilled") else "",

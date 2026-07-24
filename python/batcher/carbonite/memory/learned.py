@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import median
 
+from batcher._internal.mathx import blend, clamp_factor
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 
@@ -181,9 +182,8 @@ class LearnedMemoryModel:
         if bpr is None or plan_estimate <= 0 or self._row_bytes <= 0:
             return plan_estimate
         measured = plan_estimate * (bpr / self._row_bytes)
-        blended = self._alpha * measured + (1.0 - self._alpha) * plan_estimate
-        lo, hi = plan_estimate / self._clamp, plan_estimate * self._clamp
-        return int(max(lo, min(hi, blended)))
+        blended = blend(plan_estimate, measured, self._alpha)
+        return int(clamp_factor(blended, plan_estimate, self._clamp))
 
     def plan_peak(self, plan_ops: object) -> int:
         """The plan's dominant-breaker peak, each op blended toward measured reality.

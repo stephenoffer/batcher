@@ -26,6 +26,45 @@ from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 __all__ = ["EventHubsSource"]
 
 
+def _as_bytes(value: Any) -> bytes | None:
+    """Coerce an Event Hub field to the ``bytes`` the broker schema declares.
+
+    Event Hub payloads and partition keys can arrive as ``str`` or ``bytes`` depending on
+    how the producer sent them. The broker schema is fixed at ``binary`` for both ``value``
+    and ``key``, so a ``str`` reaches `_make_batch` and raises `ArrowTypeError` there. A
+    ``None`` (an unkeyed message) passes through unchanged.
+    """
+    if value is None or isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return bytes(value)
+
+
+def _event_to_message(ev: Any, partition_id: int, topic: str) -> BrokerMessage:
+    """Turn one ``EventData`` into a `BrokerMessage`, preserving raw bytes.
+
+    Reads the body as raw bytes (`body_as_bytes`), not `body_as_str`: a binary Event Hub
+    payload — a protobuf, an Avro frame, a compressed blob — is not valid UTF-8, so
+    decoding it raised `UnicodeDecodeError` and a non-UTF-8-but-decodable payload was
+    silently mangled by the decode/re-encode round trip. The partition key is coerced to
+    bytes for the same fixed-`binary` schema reason.
+
+    ``resume_token`` carries the Event Hub *offset string* — the exact `event_position` a
+    recovering consumer resumes from. The int64 ``offset`` column is a lossy `int(...)` of
+    it, fine for ordering but not for seeking, so the raw string is kept for the checkpoint.
+    """
+    return BrokerMessage(
+        value=_as_bytes(ev.body_as_bytes()) or b"",
+        partition=partition_id,
+        offset=int(ev.offset) if ev.offset is not None else 0,
+        resume_token=str(ev.offset) if ev.offset is not None else None,
+        timestamp=ev.enqueued_time_utc_ms or 0,
+        topic=topic,
+        key=_as_bytes(ev.partition_key),
+    )
+
+
 def _import_consumer() -> Any:
     """Import ``EventHubConsumerClient`` or raise a guiding ``BackendError``."""
     try:
@@ -113,24 +152,27 @@ class EventHubsSource(BrokerSource):
             else [int(p) for p in client.get_partition_ids()]
         )
         for partition_id in partitions:
+            # Resume from the checkpointed offset when recovering this partition; otherwise the
+            # configured start. Without this the source always restarted from
+            # `starting_position`, silently replaying or skipping on every recovery — every
+            # other broker here (`kafka`, `kinesis`, `pulsar`) honors its checkpoint, and this
+            # one quietly did not. `seek` populates `_resume_from`; a live offset is exclusive,
+            # so the consumer resumes strictly after the last delivered event.
+            event_position = self._resume_from.get(partition_id, self._options["starting_position"])
             consumer = client._create_consumer(
                 consumer_group=self._options["consumer_group"],
                 partition_id=str(partition_id),
-                event_position=self._options["starting_position"],
+                event_position=event_position,
                 on_event_received=lambda *_: None,
             )
-            events = consumer.receive_message_batch(
-                max_batch_size=self.poll_size, max_wait_time=1.0
-            )
-            for ev in events:
-                messages.append(
-                    BrokerMessage(
-                        value=bytes(ev.body_as_str(), "utf-8"),
-                        partition=partition_id,
-                        offset=int(ev.offset) if ev.offset is not None else 0,
-                        timestamp=ev.enqueued_time_utc_ms or 0,
-                        topic=self.topic,
-                        key=ev.partition_key,
-                    )
+            # Each `_create_consumer` opens its own AMQP link. Without this `finally` a
+            # continuous stream leaked one consumer (a socket plus background threads) per
+            # partition on *every* poll — seconds apart, for the life of the query.
+            try:
+                events = consumer.receive_message_batch(
+                    max_batch_size=self.poll_size, max_wait_time=1.0
                 )
+                messages.extend(_event_to_message(ev, partition_id, self.topic) for ev in events)
+            finally:
+                consumer.close()
         return messages

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import Config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
@@ -181,6 +182,7 @@ def annotate_ops(
                     ),
                 )
             )
-    except Exception:
+    except Exception as exc:
+        note_suppressed("kyber", "annotate resource bounds", exc)
         return ()  # estimation unavailable (e.g. unbound sources) → Carbonite abstains
     return tuple(ops)

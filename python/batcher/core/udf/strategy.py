@@ -25,6 +25,7 @@ import warnings
 
 import pyarrow as pa
 
+from batcher._internal.mathx import ceil_div
 from batcher.plan.logical import MapBatches
 
 __all__ = [
@@ -235,7 +236,7 @@ def thread_batch_target(
     `fn` is cheap. A `fn` measured as heavy (real per-row work) keeps the per-worker split so
     every core stays busy. The per-row cost is measured once on a sample and cached.
     """
-    per_worker = -(-total_rows // max(1, num_workers))  # ceil-divide
+    per_worker = ceil_div(total_rows, max(1, num_workers))
     floor = morsel
     # Only worth probing (and coarsening) when the input is big enough for the batch count
     # to matter; a small query keeps the morsel and pays no probe latency.
@@ -409,7 +410,7 @@ def _run_proc_probe(op: MapBatches, total_rows: int, current: list[pa.RecordBatc
 def _probe_callable(op: MapBatches):
     """Build the per-batch callable for the probe (Arrow in/out, or format-wrapped)."""
     from batcher.core.udf.call import _formatted
-    from batcher.core.udf.execute import build_udf_callable
+    from batcher.core.udf.lifecycle import build_udf_callable
 
     fn = build_udf_callable(op.fn)
     return fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)

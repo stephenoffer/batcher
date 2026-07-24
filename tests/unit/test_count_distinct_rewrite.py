@@ -57,6 +57,30 @@ def test_no_fire_for_approx_count_distinct():
     assert count_distinct_to_distinct_count(ds._plan, _ctx(ds)) is None
 
 
+def test_gated_on_group_count_against_cores():
+    # The rewrite wins only when the direct count_distinct is parallelism-starved — few groups
+    # over many cores. Once the group count already meets the core count (TPC-H q16's ~18k
+    # groups on a 92-core box: 26 ms rewritten, 13.7 ms not), the direct path saturates every
+    # core and the rewrite only adds a full distinct pass. Gate on estimated groups vs cores.
+    import dataclasses
+
+    from batcher.plan.resource import HardwareProfile
+
+    ds = _ds().group_by("g").agg(nd=col("v").n_unique())  # ~2 groups
+
+    def _ctx_cores(n: int) -> OptimizerContext:
+        est = StatsEstimator(ds._sources, learned={})
+        hw = dataclasses.replace(HardwareProfile.local(), cpu_cores=n)
+        return OptimizerContext(
+            config=active_config(), sources=ds._sources, hub=None, estimator=est, hardware=hw
+        )
+
+    # Groups (~2) already meet a 1-core budget → the direct path is not starved → refuse.
+    assert count_distinct_to_distinct_count(ds._plan, _ctx_cores(1)) is None
+    # Groups far below the core count → the direct path would waste cores → still fire.
+    assert count_distinct_to_distinct_count(ds._plan, _ctx_cores(1000)) is not None
+
+
 def test_result_preserved_end_to_end():
     # The optimized query returns the same per-group distinct counts.
     got = _ds().group_by("g").agg(nd=col("v").n_unique()).collect().to_pydict()

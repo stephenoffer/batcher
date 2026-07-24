@@ -29,14 +29,18 @@ def test_gpu_plain_function_warns():
 
 
 def test_gpu_class_does_not_warn():
+    """A class is constructed once per worker, which is the thing the warning asks for."""
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]}))
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning would fail the test
-        ds.ml.map_batches(_Model, num_gpus=1, output_columns=["x"])
+        out = ds.ml.map_batches(_Model, num_gpus=1, output_columns=["x"])
+    assert out.columns == ["x"]
 
 
 def test_cpu_plain_function_does_not_warn():
+    """The warning is about per-worker model load cost, which a CPU stage does not pay."""
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]}))
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        ds.ml.map_batches(lambda b: b, output_columns=["x"])  # num_gpus=0 default
+        out = ds.ml.map_batches(lambda b: b, output_columns=["x"])  # num_gpus=0 default
+    assert out.columns == ["x"]

@@ -376,8 +376,8 @@ _MAX_SPILL_RECURSION = 3
 _SUB_BUCKETS = 8
 # Cap on simultaneously-open spill files: the partition phase holds one writer per
 # non-empty bucket open at once, so an unbounded `num_partitions` would exhaust the
-# process file-descriptor limit at scale (N14). Capping keeps FDs bounded; a bigger
-# data volume is then absorbed by grace recursion (N13) into larger-then-split
+# process file-descriptor limit at scale. Capping keeps FDs bounded; a bigger
+# data volume is then absorbed by grace recursion into larger-then-split
 # buckets rather than more files.
 _FD_SAFE_PARTITIONS = 1024
 

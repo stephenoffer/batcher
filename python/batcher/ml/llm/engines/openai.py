@@ -3,11 +3,19 @@
 Targets vLLM's OpenAI server, llama.cpp, or a hosted API. The batch's requests go out
 concurrently over a worker-lifetime thread pool, so a batch costs the slowest request
 rather than their sum, and connections are not rebuilt per batch.
+
+An engine request is either a plain prompt string or a ``{"prompt": ..., ...}`` dict when
+a per-row column is set (a LoRA ``adapter``, a vision ``image``, a per-row ``max_tokens``
+or ``temperature``). This backend honors those dict requests the same way `vllm_engine`
+does, so a per-row column produces a correct request against a served endpoint instead of
+a malformed one.
 """
 
 from __future__ import annotations
 
-from batcher.ml.llm.channels import finish_reason_sink, usage_sink
+from typing import Any
+
+from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 from batcher.ml.llm.engines.base import Engine, EngineFactory
 
 __all__ = ["http_engine"]
@@ -24,7 +32,16 @@ def http_engine(
     temperature: float = 0.0,
     top_p: float | None = None,
     stop: list[str] | None = None,
+    seed: int | None = None,
+    frequency_penalty: float | None = None,
+    presence_penalty: float | None = None,
+    logprobs: bool = False,
+    response_format: dict | None = None,
+    extra_body: dict | None = None,
+    on_error: str = "raise",
     timeout: float = 60.0,
+    retries: int = 3,
+    backoff: float = 0.5,
     concurrency: int = 8,
 ) -> EngineFactory:
     """An `EngineFactory` calling an OpenAI-compatible HTTP endpoint — a *served* model.
@@ -39,6 +56,10 @@ def http_engine(
     where one request barely uses the connection. Each request still retries with
     backoff on the 429s a hosted API returns.
 
+    Per-row overrides carried on a request dict (``max_tokens``, ``temperature``, a
+    vision ``image``) take precedence over the engine-wide defaults, so one pass can mix a
+    16-token classification with a 2000-token summary, or send an image with some rows.
+
     Examples:
         .. doctest::
 
@@ -52,17 +73,51 @@ def http_engine(
         api_key: bearer token, when the endpoint needs one.
         system: a system message prepended to every chat request.
         chat: call ``/chat/completions`` (default) rather than ``/completions``.
-        max_tokens: tokens to sample per request.
-        temperature: sampling temperature (0 = greedy).
+        max_tokens: tokens to sample per request (a per-row ``max_tokens`` overrides it).
+        temperature: sampling temperature, 0 = greedy (a per-row value overrides it).
         top_p: nucleus-sampling mass; omitted from the body when unset, so a server that
             rejects unknown or null fields still works.
         stop: stop strings; omitted from the body when unset.
+        seed: sampling seed for reproducible output, when the server honors it.
+        frequency_penalty: OpenAI frequency penalty; omitted when unset.
+        presence_penalty: OpenAI presence penalty; omitted when unset.
+        logprobs: request per-token log-probabilities and report each generation's summed
+            logprob through the logprob channel (so ``generate(logprobs=True)`` works over
+            HTTP as it does for vLLM).
+        response_format: an OpenAI ``response_format`` (e.g. ``{"type": "json_object"}`` or
+            a json-schema block) for structured / guided decoding on a served endpoint.
+        extra_body: extra fields merged into every request body (``logit_bias``, vendor
+            extensions, ...); an escape hatch for options without a named parameter.
+        on_error: ``"raise"`` (default) to fail the batch on an exhausted/un-retryable
+            request, or ``"null"`` to yield an empty generation for that row and continue —
+            per-row tolerance so one bad row does not lose a batch of good ones.
         timeout: per-request timeout in seconds.
+        retries: retry attempts per request on a transient failure (429/5xx/connection).
+        backoff: base seconds for the jittered exponential backoff between retries.
         concurrency: in-flight requests per batch. Set to 1 to serialize.
 
     Returns:
         A zero-arg factory building the HTTP-backed `Engine` once per worker.
+
+    Raises:
+        PlanError: if `on_error` is not ``"raise"`` or ``"null"``.
     """
+    if on_error not in ("raise", "null"):
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(f"on_error must be 'raise' or 'null', got {on_error!r}")
+    defaults = _Sampling(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        stop=stop,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        response_format=response_format,
+        extra_body=extra_body,
+    )
 
     def factory() -> Engine:
         from concurrent.futures import ThreadPoolExecutor
@@ -74,13 +129,24 @@ def http_engine(
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        def call_one(prompt: str) -> tuple[str, tuple[int | None, int | None], str | None]:
-            body = _openai_body(
-                model, prompt, chat, system, max_tokens, temperature, top_p=top_p, stop=stop
+        def call_one(request: Any) -> _Result:
+            prompt, image, overrides = _unpack_request(request)
+            body = _openai_body(model, prompt, chat, system, defaults, overrides, image)
+            try:
+                # Retries with jittered backoff handle the 429 rate limits hosted APIs return.
+                resp = post_json(
+                    url, body, headers=headers, timeout=timeout, retries=retries, backoff=backoff
+                )
+            except Exception:
+                if on_error == "raise":
+                    raise
+                return _Result("", (None, None), None, None)
+            return _Result(
+                _openai_text(resp, chat),
+                _openai_usage(resp),
+                _openai_finish_reason(resp),
+                _openai_logprob(resp, chat) if defaults.logprobs else None,
             )
-            # Retries with jittered backoff handle the 429 rate limits hosted APIs return.
-            resp = post_json(url, body, headers=headers, timeout=timeout)
-            return _openai_text(resp, chat), _openai_usage(resp), _openai_finish_reason(resp)
 
         # One pool for the worker's whole life, not one per batch. Building a
         # `ThreadPoolExecutor` per call spawned and tore down `concurrency` threads for
@@ -89,22 +155,77 @@ def http_engine(
         # more than the inference.
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
 
-        def engine(prompts: list[str]) -> list[str]:
+        def engine(prompts: list) -> list[str]:
             if concurrency <= 1 or len(prompts) <= 1:
                 results = [call_one(p) for p in prompts]
             else:
                 # `Executor.map` preserves input order; the calls overlap because each
                 # blocks on network I/O (GIL released), bounded to `concurrency` slots.
                 results = list(pool.map(call_one, prompts))
-            usage = [u for _text, u, _r in results]
+            usage = [r.usage for r in results]
             usage_sink().report(usage)
-            finish_reason_sink().report([r for _text, _u, r in results])
+            finish_reason_sink().report([r.finish_reason for r in results])
+            logprob_sink().report([r.logprob for r in results])
             engine.last_usage = usage  # the documented legacy channel
-            return [text for text, _u, _r in results]
+            return [r.text for r in results]
 
         return engine
 
     return factory
+
+
+class _Sampling:
+    """The engine-wide sampling defaults, merged with any per-row overrides per request."""
+
+    __slots__ = (
+        "extra_body",
+        "frequency_penalty",
+        "logprobs",
+        "max_tokens",
+        "presence_penalty",
+        "response_format",
+        "seed",
+        "stop",
+        "temperature",
+        "top_p",
+    )
+
+    def __init__(self, **kw: Any) -> None:
+        for name in self.__slots__:
+            setattr(self, name, kw.get(name))
+
+
+class _Result:
+    """One request's outcome: the text plus its usage, finish reason, and logprob."""
+
+    __slots__ = ("finish_reason", "logprob", "text", "usage")
+
+    def __init__(
+        self,
+        text: str,
+        usage: tuple[int | None, int | None],
+        finish_reason: str | None,
+        logprob: float | None,
+    ) -> None:
+        self.text = text
+        self.usage = usage
+        self.finish_reason = finish_reason
+        self.logprob = logprob
+
+
+def _unpack_request(request: Any) -> tuple[str, Any, dict]:
+    """Split a request into ``(prompt, image, overrides)``.
+
+    A plain string carries only the prompt. A dict may also carry a vision ``image`` and
+    per-row ``max_tokens`` / ``temperature`` overrides; ``adapter`` is dropped here because
+    a served endpoint selects the model by name, not per request.
+    """
+    if not isinstance(request, dict):
+        return str(request), None, {}
+    prompt = str(request.get("prompt", ""))
+    image = request.get("image")
+    overrides = {k: request[k] for k in ("max_tokens", "temperature", "stop") if k in request}
+    return prompt, image, overrides
 
 
 def _openai_body(
@@ -112,29 +233,73 @@ def _openai_body(
     prompt: str,
     chat: bool,
     system: str | None,
-    max_tokens: int,
-    temperature: float,
-    *,
-    top_p: float | None = None,
-    stop: list[str] | None = None,
+    defaults: _Sampling,
+    overrides: dict,
+    image: Any = None,
 ) -> dict[str, object]:
     """The OpenAI request body. Unset sampling fields are omitted, not sent as null:
-    several OpenAI-compatible servers reject a null `stop` or an unknown key."""
-    common: dict[str, object] = {
+    several OpenAI-compatible servers reject a null `stop` or an unknown key. Per-row
+    `overrides` win over the engine-wide `defaults`."""
+    body: dict[str, object] = {
         "model": model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+        "max_tokens": overrides.get("max_tokens", defaults.max_tokens),
+        "temperature": overrides.get("temperature", defaults.temperature),
     }
-    if top_p is not None:
-        common["top_p"] = top_p
-    if stop:
-        common["stop"] = stop
+    stop = overrides.get("stop", defaults.stop)
+    _put_optional(
+        body,
+        top_p=defaults.top_p,
+        stop=stop or None,
+        seed=defaults.seed,
+        frequency_penalty=defaults.frequency_penalty,
+        presence_penalty=defaults.presence_penalty,
+        response_format=defaults.response_format,
+    )
+    if defaults.logprobs:
+        body["logprobs"] = True
+    if defaults.extra_body:
+        body.update(defaults.extra_body)
     if not chat:
-        return {**common, "prompt": prompt}
-    messages = ([{"role": "system", "content": system}] if system else []) + [
-        {"role": "user", "content": prompt}
+        body["prompt"] = prompt
+        return body
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": _user_content(prompt, image)})
+    body["messages"] = messages
+    return body
+
+
+def _put_optional(body: dict[str, object], **fields: object) -> None:
+    """Add each field to `body` only when its value is not ``None`` (omit, never null)."""
+    for name, value in fields.items():
+        if value is not None:
+            body[name] = value
+
+
+def _user_content(prompt: str, image: Any) -> object:
+    """The chat user message content: a plain string, or a text+image content list.
+
+    A vision request becomes the OpenAI multimodal shape — a list of a text block and an
+    ``image_url`` block whose URL is a base64 ``data:`` URI — so a served vision model
+    receives the image inline. A `None` image keeps the plain string.
+    """
+    if image is None:
+        return prompt
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": _image_data_uri(image)}},
     ]
-    return {**common, "messages": messages}
+
+
+def _image_data_uri(image: Any) -> str:
+    """A ``data:image/png;base64,...`` URI for a decoded PIL image (or a passthrough str)."""
+    if isinstance(image, str):
+        return image  # already a URL or data URI
+    import base64
+    import io
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def _openai_text(response: dict, chat: bool) -> str:
@@ -152,3 +317,22 @@ def _openai_usage(response: dict) -> tuple[int | None, int | None]:
     or `(None, None)` when the server reported none."""
     usage = response.get("usage") or {}
     return usage.get("prompt_tokens"), usage.get("completion_tokens")
+
+
+def _openai_logprob(response: dict, chat: bool) -> float | None:
+    """The generation's summed log-probability, or `None` if the server reported none.
+
+    Chat returns ``logprobs.content[i].logprob``; the completions route returns
+    ``logprobs.token_logprobs``. Either way the per-token values are summed, matching the
+    cumulative logprob the vLLM path reports.
+    """
+    choice = (response.get("choices") or [{}])[0]
+    block = choice.get("logprobs")
+    if not block:
+        return None
+    if chat:
+        content = block.get("content") or []
+        values = [tok.get("logprob") for tok in content if tok.get("logprob") is not None]
+    else:
+        values = [v for v in (block.get("token_logprobs") or []) if v is not None]
+    return float(sum(values)) if values else None

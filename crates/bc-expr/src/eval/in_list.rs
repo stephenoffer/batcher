@@ -10,10 +10,8 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
-};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type};
 use arrow::error::ArrowError;
 
 use crate::{ExprError, Literal};
@@ -62,7 +60,7 @@ impl<T: Hash + Eq> Members<T> {
 pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef, ExprError> {
     let out: BooleanArray = match array.data_type() {
         DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>().expect("int64");
+            let a = array.as_primitive::<Int64Type>();
             let members = Members::new(set.iter().filter_map(literal_i64).collect());
             membership(
                 a.len(),
@@ -71,10 +69,7 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
             )
         }
         DataType::Date32 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .expect("date32");
+            let a = array.as_primitive::<Date32Type>();
             let members = Members::new(set.iter().filter_map(literal_date).collect());
             membership(
                 a.len(),
@@ -91,10 +86,7 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
         // integer-valued literals (0.0, 1.0, …, all canonical positive bits), so a column
         // `-0.0`/`NaN` correctly never lands in the set.
         DataType::Float64 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("float64");
+            let a = array.as_primitive::<Float64Type>();
             let members = Members::new(
                 set.iter()
                     .filter_map(literal_f64)
@@ -108,7 +100,7 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
             )
         }
         DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+            let a = array.as_string::<i32>();
             let members = Members::new(set.iter().filter_map(literal_str).collect());
             membership(
                 a.len(),
@@ -186,7 +178,7 @@ mod tests {
 
     fn run(arr: ArrayRef, set: &[Literal]) -> Vec<Option<bool>> {
         let out = eval_in_list(&arr, set).unwrap();
-        let b = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let b = out.as_boolean();
         (0..b.len())
             .map(|i| (!b.is_null(i)).then(|| b.value(i)))
             .collect()

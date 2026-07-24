@@ -20,6 +20,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 
 use super::AggFunc;
+use crate::agg::var::NeumaierSum;
 use crate::error::RuntimeError;
 
 /// Per-group covariance/correlation state, 6 columns:
@@ -45,21 +46,23 @@ pub(crate) fn covar_state(
     // aggregate (the common small-query path) — and the state still merges via Chan's
     // parallel formula ([`merge_covar`]) across partitions/morsels.
     let mut n = vec![0i64; num_groups];
-    let mut mean_x = vec![0f64; num_groups];
-    let mut mean_y = vec![0f64; num_groups];
+    let mut sum_x = vec![NeumaierSum::default(); num_groups];
+    let mut sum_y = vec![NeumaierSum::default(); num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
         if xa.is_valid(i) && ya.is_valid(i) {
             let g = g as usize;
             n[g] += 1;
-            mean_x[g] += xa.value(i);
-            mean_y[g] += ya.value(i);
+            sum_x[g].add(xa.value(i));
+            sum_y[g].add(ya.value(i));
         }
     }
+    let mut mean_x = vec![0f64; num_groups];
+    let mut mean_y = vec![0f64; num_groups];
     for g in 0..num_groups {
         if n[g] > 0 {
             let nn = n[g] as f64;
-            mean_x[g] /= nn;
-            mean_y[g] /= nn;
+            mean_x[g] = sum_x[g].total() / nn;
+            mean_y[g] = sum_y[g].total() / nn;
         }
     }
     let mut c2 = vec![0f64; num_groups];
@@ -113,6 +116,18 @@ pub(crate) fn merge_covar(
         }
         let g = g as usize;
         let na = n[g];
+        if na == 0 {
+            // First partial for this group: copy it exactly. Folding it through the
+            // mean-difference formula instead is algebraically the same but rounds three
+            // times on the way, so a single-partial group would not equal its own state.
+            n[g] = nb;
+            mean_x[g] = mx_in.value(i);
+            mean_y[g] = my_in.value(i);
+            c2[g] = c2_in.value(i);
+            m2x[g] = m2x_in.value(i);
+            m2y[g] = m2y_in.value(i);
+            continue;
+        }
         let ntot = na + nb;
         let (naf, nbf, nf) = (na as f64, nb as f64, ntot as f64);
         let dx = mx_in.value(i) - mean_x[g];
@@ -153,17 +168,18 @@ pub(crate) fn moment_state(
     // exactly for a single-partition aggregate. The state still merges across partitions
     // via Terriberry's parallel formula ([`merge_moments`]).
     let mut n = vec![0i64; num_groups];
-    let mut mean = vec![0f64; num_groups];
+    let mut sums = vec![NeumaierSum::default(); num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
         if a.is_valid(i) {
             let g = g as usize;
             n[g] += 1;
-            mean[g] += a.value(i);
+            sums[g].add(a.value(i));
         }
     }
+    let mut mean = vec![0f64; num_groups];
     for g in 0..num_groups {
         if n[g] > 0 {
-            mean[g] /= n[g] as f64;
+            mean[g] = sums[g].total() / n[g] as f64;
         }
     }
     let mut m2 = vec![0f64; num_groups];
@@ -293,11 +309,19 @@ pub(crate) fn finalize_corr(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError
             b.append_null();
             continue;
         }
-        let denom = (m2x.value(i) * m2y.value(i)).max(0.0).sqrt();
-        if denom == 0.0 {
+        // `sqrt(M2x) · sqrt(M2y)`, never `sqrt(M2x · M2y)`. The product overflows to
+        // infinity once either centered sum passes ~1e154 — a column of values around 1e80,
+        // which a physics or financial dataset reaches — and the correlation of two perfectly
+        // correlated columns then came back as 0 rather than 1. Taking each root first keeps
+        // every intermediate inside the representable range, and underflows gracefully too.
+        let denom = m2x.value(i).max(0.0).sqrt() * m2y.value(i).max(0.0).sqrt();
+        if denom == 0.0 || !denom.is_finite() {
             b.append_null();
         } else {
-            b.append_value(c2.value(i) / denom);
+            // Cauchy-Schwarz bounds the true value to [-1, 1]; rounding in the three
+            // accumulated moments can put the quotient a few ulps outside it, and a
+            // correlation of 1.0000000000000002 is a wrong answer, not a rounding detail.
+            b.append_value((c2.value(i) / denom).clamp(-1.0, 1.0));
         }
     }
     Ok(Arc::new(b.finish()))
@@ -311,7 +335,10 @@ pub(crate) fn finalize_skewness(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeE
         if n < 3.0 || m2 <= 0.0 {
             return None;
         }
-        let g1 = m3 / m2.powf(1.5);
+        // `m2 · sqrt(m2)`, not `m2.powf(1.5)`: `powf` goes through `exp(1.5·ln m2)` and
+        // carries the rounding of both transcendentals, where the explicit form is one
+        // correctly-rounded square root and one multiply.
+        let g1 = m3 / (m2 * m2.sqrt());
         Some(g1 * (n * (n - 1.0)).sqrt() / (n - 2.0))
     })
 }
@@ -482,7 +509,7 @@ mod tests {
             Arc::new(Float64Array::from(m3)),
             Arc::new(Float64Array::from(m4)),
         ];
-        let merged = merge_moments(&cat, &vec![0u32; 3], 1).unwrap();
+        let merged = merge_moments(&cat, &[0u32; 3], 1).unwrap();
         for (wcol, mcol) in whole.iter().zip(&merged) {
             // Compare each moment column (skip n, which is exact).
             if let (Some(wf), Some(mf)) = (
@@ -511,6 +538,67 @@ mod tests {
             (wk.as_primitive::<Float64Type>().value(0) - mk.as_primitive::<Float64Type>().value(0))
                 .abs()
                 < 1e-9
+        );
+    }
+
+    /// `corr` of two perfectly correlated columns must be 1, even when the centered sums are
+    /// large enough that their *product* overflows to infinity.
+    ///
+    /// `sqrt(M2x · M2y)` overflows once either moment passes ~1e154; the denominator became
+    /// infinite and the correlation came back as 0 — the opposite of the truth — for data
+    /// that is entirely representable. Taking each square root first keeps every intermediate
+    /// finite.
+    #[test]
+    fn corr_survives_moments_whose_product_overflows() {
+        let x: Vec<f64> = (1..=5).map(|i| i as f64 * 1e120).collect();
+        let y: Vec<f64> = (1..=5).map(|i| i as f64 * 1e120).collect();
+        let g = vec![0u32; x.len()];
+        let st = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
+        // The guard the fix exists for: the product really does overflow here.
+        let m2x = st[4].as_primitive::<Float64Type>().value(0);
+        assert!(
+            !(m2x * m2x).is_finite(),
+            "test no longer exercises the overflow"
+        );
+        let out = finalize_corr(&st).unwrap();
+        let a = out.as_primitive::<Float64Type>();
+        assert!(a.is_valid(0), "corr must not be null here");
+        assert!((a.value(0) - 1.0).abs() < 1e-12, "corr = {}", a.value(0));
+    }
+
+    /// A correlation is bounded to [-1, 1] by Cauchy-Schwarz; rounding across three
+    /// accumulated moments must not be allowed to report a value outside it.
+    #[test]
+    fn corr_is_clamped_to_the_unit_interval() {
+        for (x, y) in [
+            (vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 4.0, 6.0, 8.0]),
+            (vec![1.0, 2.0, 3.0, 4.0], vec![-2.0, -4.0, -6.0, -8.0]),
+        ] {
+            let g = vec![0u32; x.len()];
+            let st = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
+            let out = finalize_corr(&st).unwrap();
+            let v = out.as_primitive::<Float64Type>().value(0);
+            assert!((-1.0..=1.0).contains(&v), "corr {v} outside [-1, 1]");
+        }
+    }
+
+    /// The two-pass moment accumulators condition everything on the pass-1 mean, so that sum
+    /// is compensated. A naive running sum of many values around a large offset loses the
+    /// low bits of each addend and biases the mean, which the centering then amplifies.
+    #[test]
+    fn compensated_mean_keeps_the_moment_state_accurate() {
+        // 1e6 values whose true variance is exactly known, offset far enough that a naive
+        // sum drops bits on every addition.
+        let n = 200_000;
+        let values: Vec<f64> = (0..n).map(|i| 1e9 + (i % 2) as f64).collect();
+        let g = vec![0u32; values.len()];
+        let st = moment_state(&f64s(&values), &g, 1, AggFunc::Skewness).unwrap();
+        let m2 = st[2].as_primitive::<Float64Type>().value(0);
+        // Half the values are 1e9 and half 1e9+1, so Σ(x-x̄)² is exactly n/4.
+        let expected = n as f64 / 4.0;
+        assert!(
+            (m2 - expected).abs() / expected < 1e-9,
+            "M2 {m2} differs from the exact {expected}"
         );
     }
 }

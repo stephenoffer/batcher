@@ -44,6 +44,7 @@ __all__ = [
     "CompileError",
     "ConfigError",
     "DataQualityError",
+    "DataWarning",
     "ExecutionError",
     "FatalShuffleError",
     "FormatError",
@@ -68,6 +69,28 @@ class PerformanceWarning(UserWarning):
     e.g. a plain-function UDF on a GPU stage that reloads the model every batch. The
     query still runs and returns the right answer; the warning points at the faster
     spelling."""
+
+
+class DataWarning(UserWarning):
+    """The read succeeded but returned less than the data on disk appears to hold.
+
+    The third member of the "correct but not what you meant" family, alongside
+    `PerformanceWarning` and `SecurityWarning`. Those two warn about *how* a correct
+    query runs; this one warns that the *result itself* is quietly narrower than the
+    source — the case a wrong answer and a right one look identical, because the missing
+    part never appears anywhere to be compared against.
+
+    Raised (via `warnings.warn`) when reading a Hive-partitioned directory with a reader
+    that does not recover partition columns, so ``k=1/part.parquet`` returns every row
+    but no ``k``.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import DataWarning
+            >>> issubclass(DataWarning, UserWarning)
+            True
+    """
 
 
 class SecurityWarning(UserWarning):

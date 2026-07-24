@@ -20,6 +20,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import FormatError
 from batcher._internal.errors import IOError as BatcherIOError
+from batcher._internal.logging import note_suppressed
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SOURCES
 
@@ -97,8 +98,10 @@ class EmbeddingSource:
                             return shape[1]
                         if len(shape) == 1:
                             return shape[0]  # a 1-D vector is one row of width len(vector)
-            except Exception:
-                pass  # unknown .npy version/layout — fall back to a full read below
+            except Exception as exc:
+                note_suppressed(
+                    "io", "read vector width from the .npy header", exc
+                )  # unknown .npy version/layout — fall back to a full read below
         elif path.endswith(".parquet"):
             import pyarrow.parquet as pq
 
@@ -107,8 +110,10 @@ class EmbeddingSource:
                     schema = pq.read_schema(fh)
                 if len(schema) == 1 and pa.types.is_fixed_size_list(schema.field(0).type):
                     return schema.field(0).type.list_size
-            except Exception:
-                pass  # variable-width or unreadable schema — fall back to a full read
+            except Exception as exc:
+                note_suppressed(
+                    "io", "read vector width from the parquet schema", exc
+                )  # variable-width or unreadable schema — fall back to a full read
         return self._file_vectors(path).shape[1]
 
     def schema(self) -> pa.Schema:

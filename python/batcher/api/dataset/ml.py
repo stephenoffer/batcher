@@ -48,6 +48,36 @@ def _validate_concurrency(concurrency: int | tuple[int, int] | None) -> None:
         )
 
 
+def _normalize_retry(
+    timeout: float,
+    max_retries: int,
+    retry_backoff: float,
+    retry_on: type[BaseException] | tuple[type[BaseException], ...] | None,
+) -> tuple[float, int, float, tuple[type[BaseException], ...]]:
+    """Validate and normalize the `map_batches` retry/timeout options at the API edge.
+
+    Turns a deferred, opaque failure deep in the worker into an eager `PlanError` here, and
+    coerces `retry_on` (a single exception type, a tuple of them, or ``None``) to the tuple the
+    `MapBatches` node stores. Every exception type must be a `BaseException` subclass.
+    """
+    from batcher._internal.errors import PlanError
+
+    if timeout < 0:
+        raise PlanError(f"timeout must be >= 0 seconds (0 = no timeout), got {timeout}")
+    if max_retries < 0:
+        raise PlanError(f"max_retries must be >= 0, got {max_retries}")
+    if retry_backoff < 0:
+        raise PlanError(f"retry_backoff must be >= 0 seconds, got {retry_backoff}")
+    if retry_on is None:
+        types: tuple[type[BaseException], ...] = ()
+    else:
+        types = retry_on if isinstance(retry_on, tuple) else (retry_on,)
+    for t in types:
+        if not (isinstance(t, type) and issubclass(t, BaseException)):
+            raise PlanError(f"retry_on must be an exception type or a tuple of them, got {t!r}")
+    return float(timeout), int(max_retries), float(retry_backoff), types
+
+
 def _as_key_columns(key: str | list[str] | None) -> list[str] | None:
     """Normalize a split key: a single column name, several, or `None` (hash every column)."""
     if key is None:
@@ -68,6 +98,123 @@ def _require_column(ds: Dataset, column: str, *, param: str) -> None:
     raise ColumnNotFoundError(
         unknown_message("column", column, ds.columns, hint=f"Pass an existing column to {param}.")
     )
+
+
+def _validate_fn(fn: object) -> None:
+    """Reject a `map_batches` `fn` that cannot be called, eagerly at the API edge.
+
+    Turns the two common foot-guns into an actionable `PlanError` here instead of a deferred,
+    opaque failure deep in a worker: a non-callable object, and a class whose instances are not
+    callable (a model class that forgot ``def __call__(self, batch)``, so loading it once per
+    worker leaves nothing to score each batch).
+    """
+    from batcher._internal.errors import PlanError
+
+    if isinstance(fn, type):
+        if not any("__call__" in klass.__dict__ for klass in fn.__mro__ if klass is not object):
+            raise PlanError(
+                f"map_batches got the class {fn.__name__!r}, but its instances are not callable. "
+                "Define __call__(self, batch) so the model loaded once per worker can score each "
+                "batch, or pass a function instead."
+            )
+        return
+    if not callable(fn):
+        raise PlanError(
+            "map_batches fn must be callable — a function, or a class to load once per worker; "
+            f"got {type(fn).__name__}."
+        )
+
+
+def _validate_output_columns(
+    output_columns: list[str] | None, *, param: str = "output_columns"
+) -> None:
+    """Reject an empty, non-string, or duplicated `output_columns` name at the API edge.
+
+    A duplicate or blank output name otherwise surfaces as an opaque Arrow schema error deep in
+    the engine (or worse, a silently shadowed column); catching it here names the offender.
+    """
+    if output_columns is None:
+        return
+    from batcher._internal.errors import PlanError
+
+    if len(output_columns) == 0:
+        # An empty list is stored as a non-None () and makes the plan believe the stage produces
+        # zero columns (`available_columns() == []`) while the `fn` actually keeps the input
+        # schema — a silent plan/execution mismatch. Use None to mean "unchanged".
+        raise PlanError(
+            f"{param} cannot be empty; pass None to keep the input columns, or list the "
+            "columns the fn produces."
+        )
+    seen: set[str] = set()
+    for name in output_columns:
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{param} must be non-empty strings, got {name!r}")
+        if name in seen:
+            raise PlanError(f"{param} has a duplicate column name {name!r}")
+        seen.add(name)
+
+
+def _warn_async_combos(fn: object, multiprocessing: bool, num_gpus: float) -> None:
+    """Warn about knobs an ``async def`` `fn` silently ignores.
+
+    Async runs on one event loop — its point is overlapping I/O awaits, not filling cores or a
+    device. `multiprocessing=True` (the process pool) is never used, and the GPU auto-batching /
+    autocast a synchronous `num_gpus` stage gets are skipped. Surfacing the ignored intent beats
+    dropping it silently, since the user asked for a behavior they will not get.
+    """
+    if not (multiprocessing or num_gpus > 0):
+        return
+    from batcher.core.udf.async_udf import is_async_udf
+
+    if not is_async_udf(fn):
+        return
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    if multiprocessing:
+        warnings.warn(
+            "map_batches got an async fn with multiprocessing=True; async runs on one event "
+            "loop and never uses the process pool, so multiprocessing is ignored. Drop it, or "
+            "pass a synchronous fn to run CPU-bound work across processes.",
+            PerformanceWarning,
+            stacklevel=3,
+        )
+    if num_gpus > 0:
+        warnings.warn(
+            "map_batches got an async fn with num_gpus > 0; the GPU auto-batching and autocast "
+            "that a synchronous GPU stage gets are skipped on the async event-loop path. Use a "
+            "synchronous class fn for a GPU model, or async only for I/O-bound (API) work.",
+            PerformanceWarning,
+            stacklevel=3,
+        )
+
+
+def _row_adapter(fn: Callable, cols: tuple[str, ...] | None, max_concurrency: int, *, flat: bool):
+    """Pick the per-row batch adapter for `map`/`flat_map`: async-concurrent or plain.
+
+    An ``async def`` row `fn` gets an adapter that awaits a batch's rows concurrently (up to
+    `max_concurrency`); a plain `fn` gets the sequential adapter. `flat` selects the
+    one-to-many (`flat_map`) variant.
+    """
+    import inspect
+
+    from batcher.api.dataset.callbacks import (
+        _DEFAULT_ROW_CONCURRENCY,
+        _AsyncRowFlatMap,
+        _AsyncRowMap,
+        _RowFlatMap,
+        _RowMap,
+    )
+
+    if inspect.iscoroutinefunction(fn):
+        if max_concurrency < 0:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"max_concurrency must be >= 0, got {max_concurrency}")
+        limit = max_concurrency or _DEFAULT_ROW_CONCURRENCY
+        return (_AsyncRowFlatMap if flat else _AsyncRowMap)(fn, cols, limit)
+    return (_RowFlatMap if flat else _RowMap)(fn, cols)
 
 
 def _bind_fn(
@@ -95,13 +242,26 @@ def _bind_fn(
         return fn
     if isinstance(fn, type):
         base = fn
+        from batcher.core.udf.async_udf import is_async_udf
 
-        class _BoundModel:
-            def __init__(self) -> None:
-                self._inner = base(**ckw)
+        if is_async_udf(base):
+            # An async model must stay async through the wrapper, or the coroutine `__call__`
+            # returns is never awaited (it is routed to the sync path and coerced as garbage).
+            class _BoundModel:
+                def __init__(self) -> None:
+                    self._inner = base(**ckw)
 
-            def __call__(self, batch: object) -> object:
-                return self._inner(batch, **fkw)
+                async def __call__(self, batch: object) -> object:
+                    return await self._inner(batch, **fkw)
+
+        else:
+
+            class _BoundModel:
+                def __init__(self) -> None:
+                    self._inner = base(**ckw)
+
+                def __call__(self, batch: object) -> object:
+                    return self._inner(batch, **fkw)
 
         _BoundModel.__name__ = f"Bound{base.__name__}"
         _BoundModel.__qualname__ = _BoundModel.__name__
@@ -192,6 +352,11 @@ class DatasetML:
         model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
+        max_concurrency: int = 0,
     ) -> Dataset:
         """Apply a Python function to each batch.
 
@@ -203,10 +368,12 @@ class DatasetML:
 
         `batch_format` chooses what `fn` sees and returns: ``"pyarrow"`` (a
         `pyarrow.RecordBatch`, zero-copy, the default), ``"numpy"`` (a
-        ``{column: ndarray}`` dict), ``"pandas"`` (a `DataFrame`), or ``"torch"`` (a
-        ``{column: tensor}`` dict over numeric columns). Conversion happens only
-        around the call; the engine boundary stays Arrow. A `pyarrow`/`numpy` `fn`
-        may also return a Table or column dict.
+        ``{column: ndarray}`` dict), ``"pandas"`` (a `DataFrame`), ``"torch"`` (a
+        ``{column: tensor}`` dict over numeric columns), ``"polars"`` (a
+        `polars.DataFrame`, Arrow-native), or ``"jax"`` (a ``{column: jax.Array}`` dict
+        over numeric columns). Conversion happens only around the call; the engine
+        boundary stays Arrow. A `pyarrow`/`numpy` `fn` may also return a Table or column
+        dict.
 
         `batch_size` rebatches before calling `fn` (e.g. to a model's GPU batch size).
         `output_columns` declares the result schema. `num_workers` (default ``"auto"``:
@@ -228,6 +395,25 @@ class DatasetML:
         is *dropped* (up to this many, per worker) so a corrupt image / malformed record
         doesn't kill a long inference job — the guides' ``max_errored_blocks`` need. Beyond
         the budget the error propagates, so a real bug on clean data still fails fast.
+
+        `max_retries`/`timeout` add resilience for a flaky or external `fn` — an LLM API call, a
+        vector-DB upsert, a model that intermittently OOMs. A batch whose `fn` raises is retried
+        up to `max_retries` times with exponential backoff (`retry_backoff * 2**attempt`
+        seconds); `retry_on` restricts retries to specific exception types (a tuple or a single
+        type), so a real bug does not burn the budget. `timeout` bounds a single call's wall
+        clock — a call that exceeds it raises `TimeoutError`, retried like any transient. A
+        failure that survives every retry falls through to `max_errored_rows`. Retries apply on
+        the thread/sequential/streaming paths (where a flaky I/O-bound `fn` runs), not the
+        multiprocessing path (reserved for CPU-bound pure-Python `fn`s). Python cannot preempt a
+        running call, so a timed-out call's thread is abandoned, not killed — use `timeout` to
+        keep one hung call from stalling the query, not as a hard resource limit.
+
+        Pass an ``async def`` `fn` (or a class whose ``__call__`` is ``async``) for an I/O-bound
+        stage — an LLM/API enrichment that spends its time awaiting a remote service. Its batches
+        run concurrently on one event loop, up to `max_concurrency` in flight, so you issue many
+        concurrent requests without a thread per request. On the async path `timeout` *cancels*
+        the pending coroutine (a real abandon at the next await), unlike the thread-based timeout
+        for a synchronous `fn`.
 
         Warns (`PerformanceWarning`) when a GPU stage (`num_gpus > 0`) is given a
         plain function rather than a class/factory: a function is rebuilt on every
@@ -286,12 +472,18 @@ class DatasetML:
             model_memory_gb: The model's footprint, for memory budgeting.
             multiprocessing: Run CPU-bound pure-Python calls across processes.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one `fn` call; 0 = no timeout.
+            max_retries: Times to retry a batch whose `fn` raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
+            max_concurrency: Max in-flight batches for an ``async def`` `fn`; 0 = a default.
+                Ignored for a synchronous `fn`.
 
         Returns:
             A new lazy `Dataset` with `fn` applied to every batch.
 
         Raises:
-            PlanError: if `batch_format` or `concurrency` is invalid.
+            PlanError: if `batch_format`, `concurrency`, or a retry/timeout option is invalid.
 
         Examples:
             .. doctest::
@@ -319,6 +511,16 @@ class DatasetML:
         validate_batch_size(batch_size)
         validate_num_gpus(num_gpus)
         _validate_concurrency(concurrency)
+        timeout_s, retries, backoff_s, retry_types = _normalize_retry(
+            timeout, max_retries, retry_backoff, retry_on
+        )
+        if max_concurrency < 0:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"max_concurrency must be >= 0 (0 = a default), got {max_concurrency}")
+        _validate_fn(fn)
+        _validate_output_columns(output_columns)
+        _warn_async_combos(fn, multiprocessing, num_gpus)
         fn = _bind_fn(fn, fn_kwargs, fn_constructor_kwargs)
         _warn_if_model_reloads(fn, num_gpus)
         cols = tuple(output_columns) if output_columns is not None else None
@@ -341,6 +543,11 @@ class DatasetML:
                 model_memory_gb=model_memory_gb,
                 multiprocessing=multiprocessing,
                 max_errored_rows=max_errored_rows,
+                max_retries=retries,
+                retry_backoff_s=backoff_s,
+                retry_on=retry_types,
+                timeout_s=timeout_s,
+                max_concurrency=max_concurrency,
             )
         )
 
@@ -352,6 +559,7 @@ class DatasetML:
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         concurrency: int | tuple[int, int] | None = None,
+        max_concurrency: int = 0,
     ) -> Dataset:
         """Apply a per-row Python function ``fn(row_dict) -> row_dict`` (Ray Data ``map``).
 
@@ -360,12 +568,17 @@ class DatasetML:
         Prefer the vectorized `map_batches` (whole Arrow batch) when you can express
         the work over columns — it is far faster.
 
+        Pass an ``async def`` `fn` for an I/O-bound per-row call (a per-row LLM / API /
+        vector-DB request): each batch's rows are awaited concurrently, up to
+        `max_concurrency` at a time, instead of one at a time.
+
         Args:
-            fn: A ``row_dict -> row_dict`` function applied per row.
+            fn: A ``row_dict -> row_dict`` function (or ``async def``) applied per row.
             batch_size: Rebatch to this many rows before processing.
             output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
+            max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
 
         Returns:
             A new lazy `Dataset` with `fn` applied to every row.
@@ -378,11 +591,10 @@ class DatasetML:
                 >>> ds.ml.map(lambda row: {"x": row["x"] * 10}).to_pydict()
                 {'x': [10, 20, 30]}
         """
-        from batcher.api.dataset.callbacks import _RowMap
-
+        _validate_fn(fn)  # the row adapter is callable, so validate the user's fn before wrapping
         cols = tuple(output_columns) if output_columns is not None else None
         return self.map_batches(
-            _RowMap(fn, cols),
+            _row_adapter(fn, cols, max_concurrency, flat=False),
             batch_size=batch_size,
             output_columns=output_columns,
             num_workers=num_workers,
@@ -397,18 +609,21 @@ class DatasetML:
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         concurrency: int | tuple[int, int] | None = None,
+        max_concurrency: int = 0,
     ) -> Dataset:
         """Apply ``fn(row_dict) -> iterable[row_dict]`` and flatten (Ray Data ``flat_map``).
 
         A one-to-many row transform. Like `map`, `fn` runs per row inside the worker;
-        each call returns zero or more output rows (dicts), all concatenated.
+        each call returns zero or more output rows (dicts), all concatenated. An
+        ``async def`` `fn` has its rows awaited concurrently within a batch.
 
         Args:
-            fn: A ``row_dict -> iterable[row_dict]`` function applied per row.
+            fn: A ``row_dict -> iterable[row_dict]`` function (or ``async def``) applied per row.
             batch_size: Rebatch to this many rows before processing.
             output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
+            max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
 
         Returns:
             A new lazy `Dataset` with the flattened per-row outputs.
@@ -421,11 +636,10 @@ class DatasetML:
                 >>> ds.ml.flat_map(lambda row: [{"x": row["x"]}, {"x": row["x"]}]).to_pydict()
                 {'x': [1, 1, 2, 2, 3, 3]}
         """
-        from batcher.api.dataset.callbacks import _RowFlatMap
-
+        _validate_fn(fn)  # validate the user's fn before the row adapter (itself callable) wraps it
         cols = tuple(output_columns) if output_columns is not None else None
         return self.map_batches(
-            _RowFlatMap(fn, cols),
+            _row_adapter(fn, cols, max_concurrency, flat=True),
             batch_size=batch_size,
             output_columns=output_columns,
             num_workers=num_workers,
@@ -549,6 +763,204 @@ class DatasetML:
             model_memory_gb=model_memory_gb,
         )
 
+    def predict(
+        self,
+        model: object,
+        *,
+        features: list[str] | None = None,
+        framework: str | None = None,
+        method: str = "predict",
+        output_column: str = "prediction",
+        output_columns: list[str] | None = None,
+        as_list: bool = False,
+        missing: float = float("nan"),
+        dtype: str | None = None,
+        threads: int | None = None,
+        batch_size: int | None = None,
+        num_workers: int | str = "auto",
+        num_gpus: float = 0.0,
+        concurrency: int | tuple[int, int] | None = None,
+        accelerator_type: str | None = None,
+        model_memory_gb: float = 0.0,
+        options: dict[str, object] | None = None,
+    ) -> Dataset:
+        """Score a fitted **tabular** model over the dataset (XGBoost, LightGBM, sklearn, …).
+
+        The classical-ML counterpart of `infer`. Pass a fitted model object or a path to a
+        saved one, name the feature columns in the order the model was trained on, and the
+        prediction is appended as `output_column`. The model loads **once per worker** and
+        each batch's features are assembled into one dense matrix, so nothing crosses the
+        boundary a row at a time.
+
+        The framework is detected from the model (or the file extension) and covers
+        ``xgboost``, ``lightgbm``, ``catboost``, ``sklearn`` (any fitted estimator or
+        ``Pipeline``), and ``onnx``. `method` is uniform across all of them:
+
+        - ``"predict"`` — the model's natural output.
+        - ``"predict_proba"`` — class probabilities, one column per class.
+        - ``"raw"`` — the untransformed margin / decision function.
+        - ``"leaf"`` — the leaf index per tree (boosters only).
+        - ``"contrib"`` — per-feature SHAP contributions (boosters only).
+
+        A null feature becomes NaN, which is what XGBoost and LightGBM treat as missing;
+        pass `missing` when the model was trained with a different sentinel. Feature order
+        is checked against the model's own recorded feature names where it has them,
+        because a re-ordered feature list silently changes every prediction rather than
+        raising anywhere.
+
+        Args:
+            model: A fitted model object, or a path/URI to a saved model.
+            features: The feature columns in model order; every column when omitted.
+            framework: Force the framework instead of detecting it.
+            method: What to compute — see the list above.
+            output_column: Base name of the appended prediction column(s).
+            output_columns: Explicit names for a multi-output model's columns.
+            as_list: Emit one `List<Float64>` column instead of one column per output.
+            missing: The value a null feature takes in the matrix (NaN by default).
+            dtype: Feature-matrix dtype, ``"float32"`` or ``"float64"``. Defaults to the
+                framework's own precision: float32 for the boosters, which compute in it
+                anyway, and float64 for scikit-learn, which does not — feeding a float64
+                estimator float32 shifts the last digits of every prediction against what
+                the same estimator returns in-process.
+            threads: The model's own thread pool size per worker; auto-capped when unset.
+            batch_size: Rows per scoring call; larger amortizes the per-call overhead.
+            num_workers: Concurrent per-batch calls within a worker.
+            num_gpus: GPUs to reserve per distributed worker.
+            concurrency: Size of the distributed actor pool.
+            accelerator_type: Pin GPU actors to a device model.
+            model_memory_gb: The model's footprint, for memory budgeting.
+            options: Extra framework keywords, e.g. ``{"iteration_range": (0, 50)}``.
+
+        Returns:
+            A new lazy `Dataset` with the prediction column(s) appended.
+
+        Raises:
+            PlanError: On an unknown framework or method, an empty feature list, or a
+                feature order that contradicts the model's own.
+            ColumnNotFoundError: If a named feature column is not in the dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from sklearn.linear_model import LinearRegression
+                >>> model = LinearRegression().fit([[0.0], [1.0], [2.0]], [0.0, 2.0, 4.0])
+                >>> ds = bt.from_pydict({"x": [3.0, 4.0]})
+                >>> scored = ds.ml.predict(model, features=["x"])
+                >>> [round(v, 6) for v in scored.to_pydict()["prediction"]]
+                [6.0, 8.0]
+        """
+        from batcher.ml.tabular import (
+            detect_framework,
+            predicted_column_names,
+            resolve_features,
+            tabular_predictor,
+        )
+
+        feature_list = resolve_features(features, self._ds.columns)
+        resolved = framework or detect_framework(model)
+        appended = predicted_column_names(
+            model,
+            framework=resolved,
+            method=method,
+            features=feature_list,
+            output_column=output_column,
+            output_columns=output_columns,
+            as_list=as_list,
+        )
+        udf = tabular_predictor(
+            model,
+            tuple(feature_list),
+            framework=resolved,
+            method=method,
+            output_column=output_column,
+            output_columns=tuple(appended),
+            as_list=as_list,
+            missing=missing,
+            dtype=dtype,
+            threads=threads,
+            options=tuple(sorted((options or {}).items())),
+        )
+        new = [c for c in appended if c not in self._ds.columns]
+        return self.map_batches(
+            udf,
+            output_columns=[*self._ds.columns, *new],
+            batch_size=batch_size,
+            num_workers=num_workers,
+            num_gpus=num_gpus,
+            concurrency=concurrency,
+            accelerator_type=accelerator_type,
+            model_memory_gb=model_memory_gb,
+        )
+
+    def evaluate(
+        self,
+        y_true: str,
+        *,
+        y_pred: str | None = None,
+        y_score: str | None = None,
+        task: str = "auto",
+        metrics: list[str] | None = None,
+        positive: object = 1,
+        threshold: float = 0.5,
+        by: str | list[str] | None = None,
+    ) -> dict[str, float] | Dataset:
+        """Score predictions against labels, returning the task's whole metric set.
+
+        The evaluation counterpart of `predict`. Every aggregate metric is computed in one
+        pass over the predictions, so a ten-metric report costs what one costs; the
+        rank-based metrics (``roc_auc``, ``average_precision``, ``ks``, ``gini``) each add
+        a sort and are computed only when requested.
+
+        `by` is the reason this is a query rather than a function call: it reports the same
+        metrics per segment, per day, or per cohort over the full dataset, which is the
+        question a model review actually asks and the one a driver-side
+        ``sklearn.metrics`` call cannot answer at scale.
+
+        For a binary task, `y_score` alone is enough: the hard predictions are derived at
+        `threshold`, so the threshold metrics and the ranking metrics come from one column.
+
+        Args:
+            y_true: The label column.
+            y_pred: The hard-prediction column (a label, or a value for regression).
+            y_score: The predicted probability of the positive class, for a binary task.
+            task: ``"binary"``, ``"multiclass"``, ``"regression"``, or ``"auto"``.
+            metrics: The metric names to compute; the task's default set when omitted.
+            positive: The label value that counts as the positive class.
+            threshold: The cutoff turning `y_score` into a hard prediction.
+            by: Column(s) to report a separate row of metrics for.
+
+        Returns:
+            A ``{metric: value}`` dict, or a `Dataset` of one row per group when `by` is
+            given.
+
+        Raises:
+            PlanError: On an unknown task or metric name, or when neither `y_pred` nor
+                `y_score` is given.
+            ColumnNotFoundError: If a named column is not in the dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": [1, 0, 1, 0], "s": [0.9, 0.2, 0.8, 0.4]})
+                >>> ds.ml.evaluate("y", y_score="s")["accuracy"]
+                1.0
+        """
+        from batcher.ml.metrics import evaluate
+
+        return evaluate(
+            self._ds,
+            y_true,
+            y_pred=y_pred,
+            y_score=y_score,
+            task=task,
+            metrics=metrics,
+            positive=positive,
+            threshold=threshold,
+            by=by,
+        )
+
     def train_test_split(
         self, test_size: float = 0.25, *, seed: int = 0, key: str | list[str] | None = None
     ) -> tuple[Dataset, Dataset]:
@@ -588,6 +1000,159 @@ class DatasetML:
                 1000
         """
         return build_train_test_split(self._ds, test_size, seed=seed, key=_as_key_columns(key))
+
+    def drift(
+        self,
+        reference: Dataset,
+        columns: list[str] | None = None,
+        *,
+        buckets: int = 10,
+    ) -> Dataset:
+        """Compare this dataset's feature distributions against a `reference` one.
+
+        The check a deployed model needs before its labels arrive: the code is unchanged,
+        the accuracy is unmeasurable, and the only observable thing is whether the *inputs*
+        still look like the ones the model was trained on.
+
+        Bin edges always come from `reference`, then apply unchanged here, so a shift shows
+        up as mass moving between bins rather than as the bins themselves moving. Deriving
+        the edges separately for each side would make two very different distributions look
+        identical.
+
+        Read the PSI with the conventional thresholds: below 0.1 is stable, 0.1 to 0.25 is
+        moderate, above 0.25 warrants retraining. The result is a `Dataset` rather than a
+        dict so it appends to a monitoring table with a timestamp — a single PSI says much
+        less than its history.
+
+        Args:
+            reference: The baseline dataset, usually the training data.
+            columns: The numeric columns to check; every numeric column when omitted.
+            buckets: How many quantile bins to build from the reference per column.
+
+        Returns:
+            A `Dataset` of ``column``, ``psi``, ``js_divergence``, ``mean_shift``,
+            ``null_rate_shift``, ordered by descending PSI.
+
+        Raises:
+            PlanError: If `columns` is empty, or a reference column is constant.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> train = bt.from_pydict({"x": [float(i) for i in range(100)]})
+                >>> today = bt.from_pydict({"x": [float(i) + 60 for i in range(100)]})
+                >>> today.ml.drift(train, ["x"], buckets=4).to_pydict()["psi"][0] > 0.25
+                True
+        """
+        from batcher.ml.stats import drift_report
+
+        names = columns if columns is not None else list(self._ds.select_dtypes("number").columns)
+        return drift_report(reference, self._ds, names, buckets=buckets)
+
+    def kfold(
+        self,
+        k: int = 5,
+        *,
+        seed: int = 0,
+        key: str | list[str] | None = None,
+        stratify: str | None = None,
+        group: str | None = None,
+    ) -> list[tuple[Dataset, Dataset]]:
+        """Split into `k` ``(train, validation)`` pairs for cross-validation.
+
+        Every row validates exactly once. Each pair is two lazy `Dataset`s over the same
+        deterministic fold assignment, so an unused fold costs nothing and the assignment
+        is identical however the data is partitioned — single-node, distributed, or
+        streaming. No shuffle and no materialized index array.
+
+        `stratify` and `group` select the variant the data needs, and picking the right one
+        is usually the difference between a trustworthy score and a misleading one:
+
+        - `stratify` keeps each label's proportion the same in every fold. Use it whenever
+          the label is imbalanced, or the fold-to-fold variance measures the split rather
+          than the model.
+        - `group` keeps every row of a group in the same fold. Use it whenever rows repeat
+          an entity — a user, a patient, a session. Without it the model memorizes the
+          entity, cross-validation looks excellent, and production does not.
+
+        Args:
+            k: How many folds.
+            seed: Seed for the fold assignment; the same seed reproduces it.
+            key: The column(s) identifying a row. Prefer it on a real corpus: hashing only
+                these keeps the assignment stable when other columns change.
+            stratify: A label column whose distribution every fold must preserve.
+            group: A column that must not span folds.
+
+        Returns:
+            `k` ``(train, validation)`` pairs, in fold order.
+
+        Raises:
+            PlanError: If `k` is less than 2, or both `stratify` and `group` are given.
+            ColumnNotFoundError: If a named column is not in the dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.range(0, 100)
+                >>> folds = ds.ml.kfold(4, key="value")
+                >>> sum(validate.count() for _, validate in folds)
+                100
+        """
+        from batcher.ml.splitting import group_kfold, kfold, stratified_kfold
+
+        if stratify is not None and group is not None:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                "kfold() takes stratify= or group=, not both: one spreads a label evenly "
+                "across folds and the other keeps a group inside one, and they cannot both "
+                "hold. Pick the constraint that matters for this dataset."
+            )
+        if stratify is not None:
+            return stratified_kfold(self._ds, stratify, k, seed=seed, key=key)
+        if group is not None:
+            return group_kfold(self._ds, group, k, seed=seed)
+        return kfold(self._ds, k, seed=seed, key=key)
+
+    def time_series_split(
+        self, time_column: str, n_splits: int = 5, *, expanding: bool = True
+    ) -> list[tuple[Dataset, Dataset]]:
+        """Split chronologically into ``(train, validation)`` pairs — never train on the future.
+
+        The only correct cross-validation for a time series, and the one `kfold` silently
+        breaks: a random fold puts next week's rows in the training set, so the model sees
+        the future and the validation score is one no deployment will reproduce.
+
+        Split *i* trains on everything before the *i*-th time cut and validates on the
+        window that follows it. `expanding` grows the training window with each split,
+        matching a model retrained on all history; ``expanding=False`` slides a
+        fixed-width window instead, matching one that deliberately forgets.
+
+        Args:
+            time_column: The column defining chronological order.
+            n_splits: How many train/validation pairs to produce.
+            expanding: Grow the training window (default) rather than sliding it.
+
+        Returns:
+            `n_splits` ``(train, validation)`` pairs, earliest first.
+
+        Raises:
+            PlanError: If `n_splits` is less than 1.
+            ColumnNotFoundError: If `time_column` is not in the dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": list(range(100)), "x": list(range(100))})
+                >>> [(tr.count(), va.count()) for tr, va in ds.ml.time_series_split("t", 4)]
+                [(19, 20), (39, 20), (59, 20), (79, 19)]
+        """
+        from batcher.ml.splitting import time_series_split
+
+        return time_series_split(self._ds, time_column, n_splits, expanding=expanding)
 
     def random_split(
         self, fractions: list[float], *, seed: int = 0, key: str | list[str] | None = None
@@ -833,8 +1398,9 @@ class DatasetML:
                 stored vectors' dimension.
             column: The embedding column to search (a list/tensor of floats).
             k: How many nearest rows to return.
-            metric: ``"cosine"`` (default), ``"l2"`` (Euclidean), or ``"dot"`` (inner
-                product). ``cosine``/``l2`` rank by smallest distance; ``dot`` by largest.
+            metric: ``"cosine"`` (default), ``"l2"`` (Euclidean), ``"l1"`` (Manhattan),
+                ``"hamming"`` (for binary/quantized codes), or ``"dot"`` (inner product).
+                All but ``dot`` rank by smallest distance; ``dot`` ranks by largest.
             distance_column: Name of the appended score column.
 
         Returns:
@@ -859,15 +1425,21 @@ class DatasetML:
             raise PlanError(f"nearest_neighbors k must be >= 1, got {k}")
         q = array(*[lit(float(x)) for x in query])
         vec = col(column)
-        # cosine/l2 are distances (smaller = nearer); dot is a similarity (larger = nearer).
+        # cosine/l2/l1/hamming are distances (smaller = nearer); dot is a similarity.
         if metric == "cosine":
             score, descending = vec.list.cosine_distance(q), False
         elif metric == "l2":
             score, descending = vec.list.l2_distance(q), False
+        elif metric == "l1":
+            score, descending = vec.list.l1_distance(q), False
+        elif metric == "hamming":
+            score, descending = vec.list.hamming_distance(q), False
         elif metric == "dot":
             score, descending = vec.list.dot(q), True
         else:
-            raise PlanError(f"metric must be 'cosine', 'l2', or 'dot', got {metric!r}")
+            raise PlanError(
+                f"metric must be 'cosine', 'l2', 'l1', 'hamming', or 'dot', got {metric!r}"
+            )
         return (
             self._ds.with_columns(**{distance_column: score})
             .sort(distance_column, descending=descending)
@@ -903,6 +1475,118 @@ class DatasetML:
         out = output_column or column
         return self._ds.with_columns(**{out: col(column).list.normalize()})
 
+    def truncate_embeddings(
+        self,
+        column: str,
+        dim: int,
+        *,
+        output_column: str | None = None,
+        normalize: bool = True,
+    ) -> Dataset:
+        """Shorten a Matryoshka embedding to its first `dim` dimensions, re-normalized.
+
+        Matryoshka-trained models (``text-embedding-3-*``, Nomic, mxbai) pack the most
+        information into the leading dimensions, so keeping a prefix trades a little recall
+        for a smaller, faster index — 256 of 1536 dims is a common 6x storage win. The
+        catch is that a raw prefix is no longer unit length, and a cosine index assumes it
+        is; `normalize` re-normalizes by default so the truncated vectors stay searchable.
+        A plain ``.list.slice`` without it is the silent-wrong-results version of this.
+
+        Runs as a native `.list.slice` (+ `.list.normalize`) projection — no per-row Python.
+
+        Args:
+            column: The embedding column (a list of floats).
+            dim: How many leading dimensions to keep; must be at least 1.
+            output_column: Where to write the truncated vector; defaults to `column`.
+            normalize: Re-L2-normalize the prefix (the default, correct for cosine search).
+
+        Returns:
+            A new `Dataset` with the truncated embedding column.
+
+        Raises:
+            PlanError: if `dim` is less than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"emb": [[3.0, 4.0, 1.0, 1.0]]})
+                >>> ds.ml.truncate_embeddings("emb", 2).to_pydict()
+                {'emb': [[0.6, 0.8]]}
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import col
+
+        if dim < 1:
+            raise PlanError(f"truncate_embeddings dim must be >= 1, got {dim}")
+        out = output_column or column
+        vec = col(column).list.slice(0, dim)
+        if normalize:
+            vec = vec.list.normalize()
+        return self._ds.with_columns(**{out: vec})
+
+    def drop_degenerate_embeddings(self, column: str) -> Dataset:
+        """Drop rows whose embedding is null or the zero vector — the pre-index filter.
+
+        A zero vector has no direction, so its cosine similarity to everything is undefined
+        and an index returns it as a garbage neighbor; it usually means an empty input or a
+        failed encode. A null vector is worse. Removing both before building an index is the
+        difference between clean retrieval and silent holes in it. Runs as a native
+        `.list.is_zero_vector` filter — no per-row Python — and keeps the input schema.
+
+        Args:
+            column: The embedding column to check (a list of floats).
+
+        Returns:
+            A new `Dataset` with the degenerate rows removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"id": [1, 2, 3], "emb": [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]]}
+                ... )
+                >>> ds.ml.drop_degenerate_embeddings("emb").to_pydict()["id"]
+                [1, 3]
+        """
+        from batcher.plan.expr_ir import col, lit
+
+        # is_zero_vector is null for a null vector, so `== False` drops both the zero and
+        # the null rows (a null predicate row is filtered out) — exactly the degenerate set.
+        return self._ds.filter(col(column).list.is_zero_vector() == lit(False))
+
+    def binarize_embeddings(self, column: str, *, output_column: str | None = None) -> Dataset:
+        """Turn a float embedding into a 0/1 **sign code** for Hamming-distance retrieval.
+
+        Binary embeddings trade a little recall for a much cheaper distance: each dimension
+        becomes a single bit by its sign, and search ranks by Hamming distance (the count of
+        differing bits) instead of a float dot product. Pair with
+        ``nearest_neighbors(..., metric="hamming")`` or ``.list.hamming_distance`` — the
+        code composes a native `.list.transform`, so there is no per-row Python.
+
+        Args:
+            column: The float embedding column (a list of floats).
+            output_column: Where to write the code; defaults to `column` (in place).
+
+        Returns:
+            A new `Dataset` with the binary code column (each element ``0`` or ``1``).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"emb": [[0.5, -0.2, 0.9, -0.1]]})
+                >>> ds.ml.binarize_embeddings("emb", output_column="code").to_pydict()["code"]
+                [[1, 0, 1, 0]]
+        """
+        from batcher.plan.expr_ir import col, lit
+        from batcher.plan.functions.collection import element
+
+        out = output_column or column
+        code = col(column).list.transform((element() > lit(0.0)).cast("int"))
+        return self._ds.with_columns(**{out: code})
+
     def similarity_to(
         self,
         query: list[float],
@@ -921,8 +1605,9 @@ class DatasetML:
         Args:
             query: The query embedding as a list of floats (length must match the column).
             column: The embedding column to score (a list/tensor of floats).
-            metric: ``"cosine"`` similarity (default), ``"dot"`` inner product, or ``"l2"``
-                (negative Euclidean distance, so larger is still nearer).
+            metric: ``"cosine"`` similarity (default), ``"dot"`` inner product, ``"l2"``
+                (negative Euclidean distance, so larger is still nearer), or ``"l1"``
+                (negative Manhattan distance).
             output_column: Name of the appended score column.
 
         Returns:
@@ -948,9 +1633,254 @@ class DatasetML:
             score = vec.list.dot(q)
         elif metric == "l2":
             score = vec.list.l2_distance(q) * -1.0  # negate so "larger = nearer" holds
+        elif metric == "l1":
+            score = vec.list.l1_distance(q) * -1.0
         else:
-            raise PlanError(f"metric must be 'cosine', 'dot', or 'l2', got {metric!r}")
+            raise PlanError(f"metric must be 'cosine', 'dot', 'l2', or 'l1', got {metric!r}")
         return self._ds.with_columns(**{output_column: score})
+
+    def batched_nearest_neighbors(
+        self,
+        queries: Dataset,
+        *,
+        query_key: str,
+        query_column: str,
+        corpus_key: str,
+        column: str = "embedding",
+        k: int = 10,
+        metric: str = "cosine",
+        distance_column: str = "distance",
+        rank_column: str | None = None,
+    ) -> Dataset:
+        """The `k` nearest corpus rows for **each** query row — brute-force, exact, no index.
+
+        The multi-query form of `nearest_neighbors`, for retrieval evaluation: score a whole
+        query set against this corpus and keep each query's top `k`. It composes a cross
+        join, a distance projection, and a per-query windowed rank, so it runs wherever those
+        run, including distributed, and nothing materializes on the driver.
+
+        It is ``O(queries x corpus)`` by construction — right for an eval set against a
+        modest corpus, wrong for production serving. For a large corpus queried repeatedly,
+        build an ANN index (`batcher.ml.build_vector_index` / `vector_search`) instead.
+
+        Args:
+            queries: A `Dataset` of query rows, each with `query_key` and `query_column`.
+            query_key: The column identifying a query row.
+            query_column: The query embedding column (a list of floats).
+            corpus_key: The column identifying a corpus row (on this dataset).
+            column: The corpus embedding column to search.
+            k: How many nearest corpus rows to keep per query.
+            metric: ``"cosine"`` (default), ``"l2"``, ``"l1"``, ``"hamming"``, or ``"dot"``.
+            distance_column: Name of the appended distance/score column.
+            rank_column: If set, also append each row's 1-based rank within its query — the
+                hook a rank-based metric (MRR, NDCG) needs on top of the retrieved set.
+
+        Returns:
+            A `Dataset` of ``query_key``, ``corpus_key``, `distance_column` (and `rank_column`
+            when set) — up to `k` rows per query, nearest first within each query.
+
+        Raises:
+            PlanError: if `k` is less than 1 or `metric` is unknown.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> corpus = bt.from_pydict(
+                ...     {"cid": [1, 2, 3], "emb": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]}
+                ... )
+                >>> queries = bt.from_pydict({"qid": [10], "qv": [[1.0, 0.05]]})
+                >>> hits = corpus.ml.batched_nearest_neighbors(
+                ...     queries, query_key="qid", query_column="qv",
+                ...     corpus_key="cid", column="emb", k=1,
+                ... )
+                >>> hits.to_pydict()["cid"]
+                [1]
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import col, lit
+
+        if k < 1:
+            raise PlanError(f"batched_nearest_neighbors k must be >= 1, got {k}")
+        vec, qvec = col(column), col("_bnn_qvec")
+        # All but dot are distances (smaller = nearer, ascending rank); dot is a similarity.
+        distances = {
+            "cosine": (vec.list.cosine_distance(qvec), False),
+            "l2": (vec.list.l2_distance(qvec), False),
+            "l1": (vec.list.l1_distance(qvec), False),
+            "hamming": (vec.list.hamming_distance(qvec), False),
+            "dot": (vec.list.dot(qvec), True),
+        }
+        if metric not in distances:
+            raise PlanError(f"metric must be one of {sorted(distances)}, got {metric!r}")
+        score, descending = distances[metric]
+        # Rename the query vector to a private name so the cross join can't collide with the
+        # corpus embedding column even when both are called "embedding".
+        prepared = queries.select(**{query_key: col(query_key), "_bnn_qvec": col(query_column)})
+        joined = self._ds.join(prepared, how="cross").with_columns(**{distance_column: score})
+        ranked = joined.window(
+            partition_by=[query_key],
+            order_by=[(distance_column, descending)],
+            functions={"_bnn_rank": "row_number"},
+        )
+        kept = ranked.filter(col("_bnn_rank") <= lit(k))
+        if rank_column is not None:
+            kept = kept.with_columns(**{rank_column: col("_bnn_rank")})
+            return kept.select(query_key, corpus_key, distance_column, rank_column)
+        return kept.select(query_key, corpus_key, distance_column)
+
+    def recall_at_k(self, relevant: Dataset, *, query_key: str, corpus_key: str) -> float:
+        """Mean recall of these retrieved neighbors against ground-truth `relevant` pairs.
+
+        The headline retrieval-quality number, and the natural follow-on to
+        `batched_nearest_neighbors`: of the documents that *should* have been retrieved for
+        each query, what fraction actually appear in the retrieved set. Averaged over
+        queries. Since the retrieved set is already the top `k` neighbors, this is recall@k.
+
+        This dataset supplies the retrieved ``(query_key, corpus_key)`` pairs (any extra
+        columns, such as a distance, are ignored); `relevant` supplies the ground-truth
+        pairs. A query with no relevant documents is not counted. Composes a join and two
+        grouped counts — no per-row Python — then collapses to one number.
+
+        Args:
+            relevant: A `Dataset` of ground-truth ``(query_key, corpus_key)`` relevant pairs.
+            query_key: The column identifying a query, on both datasets.
+            corpus_key: The column identifying a retrieved/relevant document, on both.
+
+        Returns:
+            The mean per-query recall in ``[0, 1]`` (``0.0`` when there are no relevant pairs).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> retrieved = bt.from_pydict({"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21]})
+                >>> relevant = bt.from_pydict({"qid": [1, 2, 2], "cid": [10, 20, 22]})
+                >>> round(retrieved.ml.recall_at_k(relevant, query_key="qid", corpus_key="cid"), 3)
+                0.75
+        """
+        from batcher.plan.expr_ir import coalesce, col, lit
+
+        rel = relevant.group_by(query_key).agg(_recall_nrel=col(corpus_key).count())
+        hits = (
+            self._ds.join(relevant, on=[query_key, corpus_key], how="inner")
+            .group_by(query_key)
+            .agg(_recall_nhit=col(corpus_key).count())
+        )
+        per_query = rel.join(hits, on=query_key, how="left").with_columns(
+            _recall=coalesce(col("_recall_nhit"), lit(0)) / col("_recall_nrel")
+        )
+        collected = per_query.agg(recall=col("_recall").mean()).to_pydict()["recall"]
+        return float(collected[0]) if collected and collected[0] is not None else 0.0
+
+    def mrr(
+        self, relevant: Dataset, *, query_key: str, corpus_key: str, rank_column: str = "rank"
+    ) -> float:
+        """Mean Reciprocal Rank of these ranked neighbors against `relevant` ground truth.
+
+        The other headline retrieval number: how high the *first* relevant document sits in
+        each query's ranking, averaged over queries as ``1 / rank``. A first-relevant at
+        rank 1 scores 1, at rank 2 scores 0.5; a query with no relevant document in the
+        ranking scores 0. It rewards getting *a* good answer to the top, where recall
+        rewards getting *all* of them back.
+
+        This dataset must carry a per-query `rank_column` — pass ``rank_column=`` to
+        `batched_nearest_neighbors` to produce it. Composes a join, a grouped min, and a
+        mean — no per-row Python.
+
+        Args:
+            relevant: A `Dataset` of ground-truth ``(query_key, corpus_key)`` relevant pairs.
+            query_key: The column identifying a query, on both datasets.
+            corpus_key: The column identifying a document, on both datasets.
+            rank_column: The 1-based per-query rank column on this dataset.
+
+        Returns:
+            The mean reciprocal rank in ``[0, 1]`` (``0.0`` when nothing matched).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ranked = bt.from_pydict(
+                ...     {"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21], "rank": [1, 2, 1, 2]}
+                ... )
+                >>> relevant = bt.from_pydict({"qid": [1, 2], "cid": [10, 21]})
+                >>> ranked.ml.mrr(relevant, query_key="qid", corpus_key="cid")
+                0.75
+        """
+        from batcher.plan.expr_ir import coalesce, col, lit
+
+        queries = self._ds.select(query_key).distinct()
+        matched = (
+            self._ds.join(relevant, on=[query_key, corpus_key], how="inner")
+            .group_by(query_key)
+            .agg(_mrr_rank=col(rank_column).min())
+        )
+        per_query = queries.join(matched, on=query_key, how="left").with_columns(
+            _mrr_rr=coalesce(lit(1.0) / col("_mrr_rank"), lit(0.0))
+        )
+        collected = per_query.agg(mrr=col("_mrr_rr").mean()).to_pydict()["mrr"]
+        return float(collected[0]) if collected and collected[0] is not None else 0.0
+
+    def reciprocal_rank_fusion(
+        self,
+        *others: Dataset,
+        key: str,
+        score: str,
+        k: int = 60,
+        output_column: str = "rrf_score",
+    ) -> Dataset:
+        """Fuse this ranked result with `others` by Reciprocal Rank Fusion — hybrid search.
+
+        The standard way to combine a dense (embedding) ranking with a lexical (BM25) one,
+        or any set of ranked result lists, without having to calibrate their scores onto a
+        common scale. Each list contributes ``1 / (k + rank)`` per key, and the fused score
+        is the sum — so a row ranked highly by *either* retriever floats up, and one ranked
+        highly by *both* wins. `k` damps the tail (60 is the common default). Each input is
+        ranked by its own `score` column independently, so the two need no shared units.
+
+        Every input must carry the same `key` and `score` columns. A key present in only one
+        list still contributes its single term. Composes a window rank, a union, and a
+        grouped sum — no per-row Python — so it runs wherever those run, including distributed.
+
+        Args:
+            others: The other ranked `Dataset`s to fuse with this one.
+            key: The column identifying a result row across the lists (a doc id).
+            score: The per-list score column each list is ranked by (higher is better).
+            k: The RRF damping constant; must be positive.
+            output_column: Name of the appended fused-score column.
+
+        Returns:
+            A `Dataset` of ``key`` and `output_column`, ordered by descending fused score.
+
+        Raises:
+            PlanError: if `k` is not positive.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> dense = bt.from_pydict({"id": [1, 2, 3], "score": [0.9, 0.5, 0.1]})
+                >>> lexical = bt.from_pydict({"id": [2, 3, 4], "score": [0.8, 0.7, 0.6]})
+                >>> fused = dense.ml.reciprocal_rank_fusion(lexical, key="id", score="score")
+                >>> fused.to_pydict()["id"]
+                [2, 3, 1, 4]
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import col, lit
+
+        if k <= 0:
+            raise PlanError(f"reciprocal_rank_fusion k must be positive, got {k}")
+        contributions = []
+        for result in (self._ds, *others):
+            ranked = result.window(order_by=[(score, True)], functions={"_rrf_rank": "row_number"})
+            term = lit(1.0) / (lit(float(k)) + col("_rrf_rank"))
+            contributions.append(ranked.select(**{key: col(key), "_rrf_term": term}))
+        combined = contributions[0]
+        for contribution in contributions[1:]:
+            combined = combined.union(contribution)
+        fused = combined.group_by(key).agg(**{output_column: col("_rrf_term").sum()})
+        return fused.sort(output_column, descending=True)
 
     def stream_loader(
         self,
@@ -1284,8 +2214,14 @@ class DatasetML:
         template: str | None = None,
         image_column: str | None = None,
         adapter_column: str | None = None,
+        max_tokens_column: str | None = None,
+        temperature_column: str | None = None,
+        few_shot: list[tuple[str, str]] | None = None,
         parse_json: bool = False,
         usage: bool = False,
+        finish_reason: bool = False,
+        logprobs: bool = False,
+        dedup: bool = False,
         batch_size: int | None = None,
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
@@ -1316,9 +2252,27 @@ class DatasetML:
                 vision-language models.
             adapter_column: A column naming the per-row LoRA adapter; pair with
                 ``vllm_engine(lora_paths=...)``.
+            max_tokens_column: A column giving each row its own token budget, so one pass
+                can mix a 16-token classification with a 2000-token summary. A null uses
+                the engine's default.
+            temperature_column: A column giving each row its own sampling temperature (a
+                null uses the engine's default), so a factual extraction and a creative
+                rewrite share one pass.
+            few_shot: Fixed ``(input, output)`` demonstration pairs prepended to every
+                prompt, so the task format is shown once rather than baked into a template.
             parse_json: Parse each output as JSON into a struct column (null on a parse
                 error). Pair with ``vllm_engine(guided_json=...)`` for reliable output.
             usage: Also append ``prompt_tokens`` / ``completion_tokens`` columns.
+            finish_reason: Also append a ``finish_reason`` column, so a generation cut off
+                at ``max_tokens`` (``"length"``) is detectable rather than silently
+                corrupting a downstream `parse_json`.
+            logprobs: Also append a ``logprob`` column holding each generation's cumulative
+                log-probability — the model's own confidence, for routing the least certain
+                rows to review. Null for an engine that does not report one.
+            dedup: Send each distinct prompt to the engine once and copy its result to every
+                row that repeats it — a throughput win for deterministic decoding over a
+                corpus with duplicate prompts. Leave off when sampling and an independent
+                draw per row is wanted.
             batch_size: Rebatch before each engine call; leave unset for the engine's own.
             num_gpus: GPUs to reserve per worker.
             concurrency: Size of the distributed actor pool.
@@ -1346,10 +2300,22 @@ class DatasetML:
             template=template,
             image_column=image_column,
             adapter_column=adapter_column,
+            max_tokens_column=max_tokens_column,
+            temperature_column=temperature_column,
+            few_shot=few_shot,
             parse_json=parse_json,
             usage=usage,
+            finish_reason=finish_reason,
+            logprobs=logprobs,
+            dedup=dedup,
         )
-        appended = [output_column, *(["prompt_tokens", "completion_tokens"] if usage else [])]
+        # Order must match GenerateSpec.appended_columns: output, usage, finish_reason, logprob.
+        appended = [
+            output_column,
+            *(["prompt_tokens", "completion_tokens"] if usage else []),
+            *(["finish_reason"] if finish_reason else []),
+            *(["logprob"] if logprobs else []),
+        ]
         new = [c for c in appended if c not in self._ds.columns]
         return self.map_batches(
             udf,
@@ -1369,6 +2335,7 @@ class DatasetML:
         prompt_column: str | None = None,
         template: str | None = None,
         instruct: bool = True,
+        image_column: str | None = None,
         batch_size: int | None = None,
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
@@ -1403,6 +2370,9 @@ class DatasetML:
             template: A ``str.format`` template over the row's columns.
             instruct: Append a "reply with JSON having exactly these keys" instruction to
                 each prompt. Turn it off when the engine already constrains decoding.
+            image_column: An image column (bytes or an ``(H, W, 3)`` tensor) for a vision
+                model, so fields are extracted from an image (an invoice photo →
+                ``{vendor, total}``). The engine must be vision-capable.
             batch_size: Rebatch before each engine call; leave unset for the engine's own.
             num_gpus: GPUs to reserve per worker.
             concurrency: Size of the distributed actor pool.
@@ -1435,6 +2405,7 @@ class DatasetML:
             prompt_column=prompt_column,
             template=template,
             instruct=instruct,
+            image_column=image_column,
         )
         new = [c for c in schema if c not in self._ds.columns]
         return self.map_batches(
@@ -1456,6 +2427,7 @@ class DatasetML:
         output_column: str = "label",
         template: str | None = None,
         instruct: bool = True,
+        image_column: str | None = None,
         batch_size: int | None = None,
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
@@ -1483,6 +2455,8 @@ class DatasetML:
             template: A ``str.format`` template over the row's columns.
             instruct: Append the "answer with one of these labels" instruction to each
                 prompt. Turn it off when the template says it itself.
+            image_column: An image column for a vision model, so a row is classified from an
+                image rather than text. The engine must be vision-capable.
             batch_size: Rebatch before each engine call; leave unset for the engine's own.
             num_gpus: GPUs to reserve per worker.
             concurrency: Size of the distributed actor pool.
@@ -1516,6 +2490,7 @@ class DatasetML:
             output_column=output_column,
             template=template,
             instruct=instruct,
+            image_column=image_column,
         )
         new = [] if output_column in self._ds.columns else [output_column]
         return self.map_batches(

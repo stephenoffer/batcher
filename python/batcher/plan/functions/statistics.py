@@ -355,66 +355,6 @@ def arg_max(value: str | Expr, by: IntoExpr) -> AggExpr:
     return _as_column(value).arg_max(by)
 
 
-def q1(column: str | Expr) -> AggExpr:
-    """First quartile — the 0.25 quantile of a column.
-
-    Args:
-        column: The column (or expression) to summarize.
-
-    Returns:
-        An aggregate expression of the first quartile.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
-            >>> ds.agg(v=bt.q1("x")).to_pydict()
-            {'v': [2.75]}
-    """
-    return _as_column(column).quantile(0.25)
-
-
-def q3(column: str | Expr) -> AggExpr:
-    """Third quartile — the 0.75 quantile of a column.
-
-    Args:
-        column: The column (or expression) to summarize.
-
-    Returns:
-        An aggregate expression of the third quartile.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
-            >>> ds.agg(v=bt.q3("x")).to_pydict()
-            {'v': [6.25]}
-    """
-    return _as_column(column).quantile(0.75)
-
-
-def iqr(column: str | Expr) -> Expr:
-    """Interquartile range — ``q3 - q1``, the robust spread used for outlier fences.
-
-    Args:
-        column: The column (or expression) to summarize.
-
-    Returns:
-        The interquartile range per group.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
-            >>> ds.agg(v=bt.iqr("x")).to_pydict()
-            {'v': [3.5]}
-    """
-    return q3(column) - q1(column)
-
-
 def value_range(column: str | Expr) -> Expr:
     """Range — ``max - min``, the full spread of a column.
 

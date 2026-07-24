@@ -954,7 +954,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     adaptive = dc.adaptive_credits
     # The shuffle auth token is decided on the driver (the worker can't see the
     # driver's config_context) and shipped to every actor, so all servers expect and
-    # all clients present the same secret. Env var overrides config (N5).
+    # all clients present the same secret. Env var overrides config.
     import os
 
     # An `env:`/`file:` reference is resolved here so an operator can mount the token as a

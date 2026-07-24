@@ -48,6 +48,7 @@ import hashlib
 from collections import OrderedDict
 from typing import Any
 
+from batcher._internal.mathx import safe_div
 from batcher.config import Config
 from batcher.kyber import learning
 from batcher.plan.source_stats import source_stats_key
@@ -315,7 +316,7 @@ def _ratio(numerator: object, denominator: object) -> float:
     """`numerator / denominator` as a float, or 0.0 for a zero/unusable denominator."""
     try:
         den = float(denominator)  # type: ignore[arg-type]
-        return float(numerator) / den if den else 0.0  # type: ignore[arg-type]
+        return safe_div(float(numerator), den)  # type: ignore[arg-type]
     except (TypeError, ValueError):  # pragma: no cover - non-numeric bookkeeping
         return 0.0
 

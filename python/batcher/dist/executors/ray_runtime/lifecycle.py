@@ -110,7 +110,7 @@ _originals: dict[tuple[str, str], object] = {}
 _wrapped_resources: tuple | None = None
 # Guards the module-global rebind in `_wrap_tasks`: two concurrent distributed
 # queries with different envelopes must not interleave their re-wraps and hand one
-# query's tasks the other's resource grant (N12).
+# query's tasks the other's resource grant.
 _wrap_lock = threading.Lock()
 
 

@@ -2692,6 +2692,14 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
     use std::sync::Arc;
 
+    /// One join fixture as `(left keys, left vals, right keys, right vals)`, nulls included.
+    type JoinCase = (
+        Vec<Option<i64>>,
+        Vec<Option<i64>>,
+        Vec<Option<i64>>,
+        Vec<Option<i64>>,
+    );
+
     fn batch(keys: &[i64], vals: &[i64]) -> RecordBatch {
         RecordBatch::try_from_iter(vec![
             ("k", Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef),
@@ -2768,12 +2776,7 @@ mod tests {
             rows.sort();
             rows
         };
-        let cases: Vec<(
-            Vec<Option<i64>>,
-            Vec<Option<i64>>,
-            Vec<Option<i64>>,
-            Vec<Option<i64>>,
-        )> = vec![
+        let cases: Vec<JoinCase> = vec![
             (
                 (0..200).map(|i| Some(i % 10)).collect(),
                 (0..200).map(Some).collect(),
@@ -3501,7 +3504,7 @@ mod tests {
         let data = vec![str_batch(&refs)];
 
         let plan = RelOp::Scan { source_id: 0 };
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         let opts = ExecOptions {
             morsel_rows: 16_384, // row bound will not trip
@@ -3596,7 +3599,7 @@ mod tests {
             batch(&[1, 3], &[30, 40]),
             batch(&[2, 1], &[50, 60]),
         ];
-        let seq = execute(&plan, &[one.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&one)).unwrap();
         let par1 = execute_parallel(&plan, &[one]).unwrap();
         let par2 = execute_parallel(&plan, &[many]).unwrap();
         assert_eq!(rows(&seq), rows(&par1));
@@ -3691,7 +3694,7 @@ mod tests {
         }
         let data = vec![nbatch(&ks, &vs)];
 
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let dir = std::env::temp_dir().join(format!("bc_med_spill_{}", std::process::id()));
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
@@ -3792,7 +3795,7 @@ mod tests {
         }
         let data = vec![nbatch(&ks, &vs)];
 
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let dir = std::env::temp_dir().join(format!("bc_mixed_spill_{}", std::process::id()));
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
@@ -3997,7 +4000,7 @@ mod tests {
         }
         let data = vec![nbatch(&ks, &vs)];
 
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let dir = std::env::temp_dir().join(format!("bc_ndistinct_spill_{}", std::process::id()));
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
@@ -4073,7 +4076,7 @@ mod tests {
         }
         let data = vec![nbatch(&ks, &vs)];
 
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let dir = std::env::temp_dir().join(format!("bc_mode_spill_{}", std::process::id()));
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
@@ -4154,7 +4157,7 @@ mod tests {
         }
         let data = vec![nbatch(&ks, &vs)];
 
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let dir = std::env::temp_dir().join(format!("bc_hist_spill_{}", std::process::id()));
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
@@ -4219,7 +4222,7 @@ mod tests {
             vs.push(v);
         }
         let data = vec![nbatch(&ks, &vs)];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let dir = std::env::temp_dir().join(format!("bc_q_spill_{}", std::process::id()));
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
@@ -4265,7 +4268,7 @@ mod tests {
             alias: "x".into(),
         };
         let data = vec![list_batch()];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let par = execute_parallel(&plan, &[data]).unwrap();
         assert_eq!(rows(&seq), rows(&par));
 
@@ -4301,7 +4304,7 @@ mod tests {
             value_name: "value".into(),
         };
         let data = vec![wide_batch()];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let par = execute_parallel(&plan, &[data]).unwrap();
         assert_eq!(rows(&seq), rows(&par));
 
@@ -4399,7 +4402,7 @@ mod tests {
             rows_batch(100, 200),
             rows_batch(200, 300),
         ];
-        let seq = execute(&plan, &[one.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&one)).unwrap();
         let par_one = execute_parallel(&plan, &[one]).unwrap();
         let par_many = execute_parallel(&plan, &[many]).unwrap();
         // Same rows regardless of batching or seq/par (content-hash sampling).
@@ -4430,7 +4433,7 @@ mod tests {
             rows_batch(100, 200),
             rows_batch(200, 300),
         ];
-        let seq = execute(&plan, &[one.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&one)).unwrap();
         let par_one = execute_parallel(&plan, &[one]).unwrap();
         let par_many = execute_parallel(&plan, &[many]).unwrap();
         assert_eq!(count_rows(&seq), 40); // exactly n
@@ -4475,7 +4478,7 @@ mod tests {
             batch(&[4, 2, 5, 1, 3, 6], &[1, 2, 3, 4, 5, 6]),
             batch(&[1, 7, 2, 8, 3, 9], &[7, 8, 9, 10, 11, 12]),
         ];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         // memory_budget_bytes = 1 forces the grace-partitioned spill path.
         let dir = std::env::temp_dir().join(format!("bc_par_winspill_{}", std::process::id()));
@@ -4525,7 +4528,7 @@ mod tests {
         };
         // k: [1,2,1,2,1], v: [30,5,10,15,20]
         let data = vec![batch(&[1, 2, 1, 2, 1], &[30, 5, 10, 15, 20])];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let par = execute_parallel(&plan, &[data]).unwrap();
         // Both must agree (window is deterministic; rows compared as a multiset).
         assert_eq!(rows(&seq), rows(&par));
@@ -4581,7 +4584,7 @@ mod tests {
         };
         // k=1: v=[30,10,20] → keep v=10(rn1),20(rn2); k=2: v=[5,15] → keep both.
         let data = vec![batch(&[1, 2, 1, 2, 1], &[30, 5, 10, 15, 20])];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
         let par = execute_parallel(&plan, &[data]).unwrap();
         assert_eq!(rows(&seq), rows(&par)); // parity with the oracle
 
@@ -4623,7 +4626,7 @@ mod tests {
             batch(&[4, 2, 5, 1, 3, 6], &[1, 2, 3, 4, 5, 6]),
             batch(&[1, 7, 2, 8, 3, 9], &[7, 8, 9, 10, 11, 12]),
         ];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         // memory_budget_bytes = 1 forces the spill branch and many partitions.
         let dir = std::env::temp_dir().join(format!("bc_par_spill_{}", std::process::id()));
@@ -4651,7 +4654,7 @@ mod tests {
             batch(&[4, 2, 5, 1, 3, 6], &[1, 20, 3, 10, 40, 6]),
             batch(&[1, 7, 2, 8, 3, 9], &[10, 8, 20, 10, 40, 12]),
         ];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         let dir =
             std::env::temp_dir().join(format!("bc_par_distinct_spill_{}", std::process::id()));
@@ -4863,7 +4866,7 @@ mod tests {
             batch(&[4, 5, 6], &[30, 90, 20]),
             batch(&[7, 8, 9], &[70, 40, 60]),
         ];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         let dir = std::env::temp_dir().join(format!("bc_sort_spill_{}", std::process::id()));
         let opts = ExecOptions {
@@ -4906,7 +4909,7 @@ mod tests {
         let ids: Vec<i64> = (0..60).collect();
         let vals: Vec<i64> = (0..60).map(|i| (i * 37 + 11) % 60).collect();
         let data = vec![batch(&ids, &vals)];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         let dir = std::env::temp_dir().join(format!("bc_sort_multipass_{}", std::process::id()));
         let opts = ExecOptions {
@@ -5072,7 +5075,7 @@ mod tests {
         };
         let data = vec![batch(&[1, 2, 3, 4], &[10, 20, 30, 40])];
 
-        let plain = execute_parallel(&plan, &[data.clone()]).unwrap();
+        let plain = execute_parallel(&plan, std::slice::from_ref(&data)).unwrap();
         let (metered, m) =
             execute_parallel_with_metrics(&plan, &[data], &ExecOptions::default()).unwrap();
         assert_eq!(
@@ -5115,8 +5118,12 @@ mod tests {
         let data = vec![batch(&[1, 2, 1, 3, 2, 1], &[10, 20, 30, 40, 50, 60])];
 
         // No budget → no spill.
-        let (_, in_mem) =
-            execute_parallel_with_metrics(&plan, &[data.clone()], &ExecOptions::default()).unwrap();
+        let (_, in_mem) = execute_parallel_with_metrics(
+            &plan,
+            std::slice::from_ref(&data),
+            &ExecOptions::default(),
+        )
+        .unwrap();
         let agg = in_mem.ops.iter().find(|o| o.kind == "aggregate").unwrap();
         assert!(!agg.spilled, "no envelope means no spill");
 
@@ -5547,7 +5554,7 @@ mod tests {
     fn pool_pressure_triggers_aggregate_spill() {
         let plan = sum_by_k_plan();
         let data = vec![batch(&[1, 2, 1, 3, 2, 1], &[10, 20, 30, 40, 50, 60])];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         let pool = MemoryPool::new(64);
         // Another operator already holds all but 1 byte, so this aggregate's
@@ -5579,7 +5586,7 @@ mod tests {
     fn pool_with_headroom_runs_in_memory_and_releases() {
         let plan = sum_by_k_plan();
         let data = vec![batch(&[1, 2, 1, 3, 2, 1], &[10, 20, 30, 40, 50, 60])];
-        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let seq = execute(&plan, std::slice::from_ref(&data)).unwrap();
 
         let pool = MemoryPool::new(1 << 30);
         let dir = std::env::temp_dir().join(format!("bc_pool_headroom_{}", std::process::id()));

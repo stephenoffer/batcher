@@ -6,13 +6,15 @@ what lets vLLM, an OpenAI-compatible HTTP endpoint, and a deterministic test dou
 interchangeable — and what keeps the columnar machinery in `generate` free of any
 model library.
 
-`base` holds the contract, `vllm` the GPU-resident offline backend, and `openai` the
-served-endpoint backend. The private helpers are re-exported here because they are the
-seams the engine tests drive directly, without a GPU or a network.
+`base` holds the contract, `vllm` the GPU-resident offline backend, `openai` the
+OpenAI-compatible served-endpoint backend, and `anthropic` the Anthropic Messages API
+backend. The private helpers are re-exported here because they are the seams the engine
+tests drive directly, without a GPU or a network.
 """
 
 from __future__ import annotations
 
+from batcher.ml.llm.engines.anthropic import anthropic_engine
 from batcher.ml.llm.engines.base import Engine, EngineFactory
 from batcher.ml.llm.engines.openai import (
     _openai_body as _openai_body,
@@ -51,4 +53,4 @@ from batcher.ml.llm.engines.vllm import (
     vllm_engine,
 )
 
-__all__ = ["Engine", "EngineFactory", "http_engine", "vllm_engine"]
+__all__ = ["Engine", "EngineFactory", "anthropic_engine", "http_engine", "vllm_engine"]

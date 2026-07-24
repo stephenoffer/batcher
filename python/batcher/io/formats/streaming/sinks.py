@@ -159,7 +159,7 @@ class ForeachBatchStreamSink:
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
         self._fn(table, batch_id)
-        return None
+        return f"foreach_batch:{batch_id}"
 
     def close(self) -> None:
         pass
@@ -180,10 +180,10 @@ class ForeachStreamSink:
     def open(self) -> None:
         pass
 
-    def write_batch(self, _batch_id: int, table: pa.Table) -> str | None:
+    def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
         for row in table.to_pylist():
             self._fn(row)
-        return None
+        return f"foreach:{batch_id}"
 
     def close(self) -> None:
         pass
@@ -253,6 +253,7 @@ class DeltaStreamSink:
         pass
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
+        from batcher._internal.errors import CommitError
         from batcher.io.formats import SINKS
         from batcher.io.manifest import WriteManifest
 
@@ -262,7 +263,20 @@ class DeltaStreamSink:
         if sink.is_committed(self._uri):
             return f"delta:{batch_id}:already-committed"
         written = sink.write(table, self._uri)
-        sink.commit(WriteManifest((written,), schema=table.schema), self._uri)
+        try:
+            sink.commit(WriteManifest((written,), schema=table.schema), self._uri)
+        except CommitError:
+            # The pre-check is not atomic with the commit. A second writer sharing this
+            # `app_id` — a concurrent driver, or this query racing its own restart —
+            # can pass the same check, and the Delta log's optimistic concurrency
+            # rejects the loser's transaction at commit time. Re-read the log: if this
+            # `(app_id, batch_id)` transaction is now recorded, the batch is durably
+            # committed and the conflict is benign (the loser's data file is an
+            # uncommitted orphan the log ignores and vacuum reclaims). Re-raise only
+            # when the transaction still is not there — a genuine commit failure.
+            if not sink.is_committed(self._uri):
+                raise
+            return f"delta:{batch_id}:already-committed"
         return f"delta:{batch_id}:{written.rows}"
 
     def close(self) -> None:

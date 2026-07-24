@@ -17,9 +17,11 @@
   <div class="brand"><span class="mark" aria-hidden="true">▚</span><span class="name">Batcher</span></div>
   <nav class="viewnav" role="tablist" aria-label="Sections">
     <button class="viewtab is-active" data-view="pipelines" role="tab" aria-selected="true">Pipelines</button>
+    <button class="viewtab" data-view="live" role="tab" aria-selected="false">Live<span class="nav-dot" id="live-dot" hidden aria-hidden="true"></span></button>
     <button class="viewtab" data-view="logs" role="tab" aria-selected="false">Logs</button>
     <button class="viewtab" data-view="system" role="tab" aria-selected="false">System</button>
     <button class="viewtab" data-view="learn" role="tab" aria-selected="false">Learn</button>
+    <span class="viewnav-ink" aria-hidden="true"></span>
   </nav>
   <div class="topbar-right">
     <span class="hint" id="idle-hint" hidden>idle · every 5s</span>
@@ -82,14 +84,14 @@
           <option value="name">Name</option>
         </select>
         <div class="segmented" role="group" aria-label="Layout">
-          <button id="lay-cards" class="seg is-on" type="button" aria-pressed="true">Cards</button>
+          <button id="lay-cards" class="seg is-on" type="button" aria-pressed="true">Lanes</button>
           <button id="lay-table" class="seg" type="button" aria-pressed="false">Table</button>
         </div>
         <button id="clear-filters" class="ghost" type="button" hidden>Clear filters</button>
       </div>
     </div>
     <div class="panel-body">
-      <div class="cards" id="pipeline-cards"></div>
+      <div class="lanes" id="pipeline-cards"></div>
       <div id="pipeline-table" class="scroll-x" hidden></div>
       <p id="pipelines-empty" class="empty">No pipelines yet. Run a query and it appears here.</p>
     </div>
@@ -206,23 +208,38 @@
   <div id="d-strip" class="statstrip" hidden></div>
 
   <div class="panel section-gap">
-    <!-- Five sections, not nine. Plan/Timeline/Operators were three tabs over the *same*
-         per-step data, so they are one section with a rendering switch; Decisions folds into
-         Insights (both answer "what did the engine conclude") and Raw into Details. -->
+    <!-- Six sections. Plan/Timeline/Operators were three tabs over the *same* per-step
+         data, so they are one section with a rendering switch; Decisions folds into
+         Insights (both answer "what did the engine conclude") and Raw into Details.
+         Query is the one genuinely different subject: the plan as a document — what you
+         wrote, what the optimizer made of it, and the exact IR that crossed into Rust. -->
     <nav class="tabs" role="tablist" aria-label="Run detail sections">
       <button class="tab is-active" data-tab="steps" role="tab" aria-selected="true">Steps</button>
+      <button class="tab" data-tab="query" role="tab" aria-selected="false">Query<span class="badge" id="diff-count" hidden>0</span></button>
       <button class="tab" data-tab="insights" role="tab" aria-selected="false">Findings <span class="badge" id="insight-count" hidden>0</span></button>
       <button class="tab" data-tab="compare" role="tab" aria-selected="false">Compare</button>
       <button class="tab" data-tab="logs" role="tab" aria-selected="false">Logs</button>
       <button class="tab" data-tab="meta" role="tab" aria-selected="false">Details</button>
+      <span class="tabs-ink" aria-hidden="true"></span>
     </nav>
 
-    <!-- One dataset, three renderings. A graph shows shape, a timeline shows overlap, a
-         table ranks. Switching between them must not feel like changing subject. -->
+    <!-- One dataset, five renderings. A graph shows shape, a timeline ranks by duration, a
+         table lets you sort, stages show what streamed together, and the flame shows where
+         the time went by depth. Switching between them must not feel like changing subject. -->
     <div class="pane-switch" id="steps-switch" role="group" aria-label="How to show the steps">
       <button class="seg is-on" data-steps="plan" type="button" aria-pressed="true">Graph</button>
-      <button class="seg" data-steps="timeline" type="button" aria-pressed="false">Timeline</button>
+      <button class="seg" data-steps="stages" type="button" aria-pressed="false">Stages</button>
+      <button class="seg" data-steps="flame" type="button" aria-pressed="false">Flame</button>
+      <button class="seg" data-steps="timeline" type="button" aria-pressed="false">Ranked</button>
       <button class="seg" data-steps="operators" type="button" aria-pressed="false">Table</button>
+    </div>
+
+    <!-- Three renderings of the plan as a *document*, distinct from the per-step data
+         above: what it says, what changed, and what it literally is. -->
+    <div class="pane-switch" id="query-switch" role="group" aria-label="How to show the query" hidden>
+      <button class="seg is-on" data-query="explain" type="button" aria-pressed="true">Explain</button>
+      <button class="seg" data-query="diff" type="button" aria-pressed="false">What the optimizer changed</button>
+      <button class="seg" data-query="ir" type="button" aria-pressed="false">Plan document</button>
     </div>
 
     <div class="panel-body">
@@ -262,11 +279,44 @@
       </div>
 
       <div id="tab-timeline" class="tabpane"><div id="timeline" class="timeline"></div></div>
+      <div id="tab-stages" class="tabpane"><div id="stages"></div></div>
+      <div id="tab-flame" class="tabpane"><div id="flame"></div></div>
       <div id="tab-operators" class="tabpane">
         <div class="pane-actions"><button id="export-ops" class="ghost" type="button">Download CSV</button></div>
         <div id="operators" class="scroll-x"></div>
       </div>
+
+      <!-- ── the query as a document ── -->
+      <div id="tab-explain" class="tabpane">
+        <div class="pane-actions">
+          <input id="explain-search" class="filter" type="search" placeholder="Find a step…"
+                 aria-label="Find a step in the plan">
+          <label class="toggle"><input type="checkbox" id="explain-original"> Show the plan as written</label>
+          <span class="spacer"></span>
+          <button id="explain-expand" class="ghost" type="button">Expand all</button>
+          <button id="explain-copy" class="ghost" type="button">Copy as text</button>
+        </div>
+        <p class="hint" id="explain-note"></p>
+        <div id="explain" class="planview"></div>
+      </div>
+      <div id="tab-diff" class="tabpane"><div id="plan-diff"></div></div>
+      <div id="tab-ir" class="tabpane">
+        <div class="pane-actions">
+          <div class="segmented" role="group" aria-label="Which plan document">
+            <button id="ir-optimized" class="seg is-on" type="button" aria-pressed="true">As run</button>
+            <button id="ir-logical" class="seg" type="button" aria-pressed="false">As written</button>
+          </div>
+          <span class="spacer"></span>
+          <button id="ir-copy" class="ghost" type="button">Copy JSON</button>
+        </div>
+        <p class="hint">The exact document that crossed into the Rust engine. This is the one
+          panel that can tell you whether a plan is wrong or only drawn wrongly.</p>
+        <div id="ir"></div>
+      </div>
       <div id="tab-insights" class="tabpane"><div id="insights" class="insights"></div></div>
+      <!-- Re-optimization at a pipeline breaker, on rows the engine actually counted rather
+           than rows it predicted. Recorded on every profile and, until now, never shown. -->
+      <div id="tab-adaptive" class="tabpane"><div id="adaptive"></div></div>
       <div id="tab-decisions" class="tabpane"><span id="decision-count" hidden>0</span><div id="decisions" class="decisions"></div></div>
       <div id="tab-compare" class="tabpane">
         <div class="pane-actions">
@@ -328,6 +378,25 @@
   </section>
 </section>
 
+<!-- ══════════ LIVE ══════════
+     The only forward-looking page. Everything else here is retrospective — a run finished,
+     here is its profile — which is the wrong shape for a job that runs for an hour. The
+     engine already publishes partition, GPU, inference, pool, and dropped-row events; this
+     is where they surface. -->
+<section id="view-live" class="view" aria-label="Live">
+  <div class="page-head">
+    <div>
+      <h1>Live</h1>
+      <p class="page-sub">What the engine is doing right now — progress, accelerators, and
+        the pipeline's own health.</p>
+    </div>
+    <div class="head-actions">
+      <span id="live-status" class="verdict" hidden></span>
+    </div>
+  </div>
+  <div id="live-body"></div>
+</section>
+
 <!-- ══════════ SYSTEM ══════════ -->
 <section id="view-system" class="view" aria-label="System">
   <p class="lede">The machine and settings every timing here is relative to.
@@ -335,6 +404,12 @@
   <div class="cards" id="system-cards"></div>
 </section>
 </main>
+
+<!-- Appears once the page has scrolled far enough to want it. The reference and the
+     pipelines list both run long; a way back to the top that is always in reach beats
+     flicking a scrollbar. -->
+<button id="to-top" class="to-top" type="button" title="Back to top (Home)"
+        aria-label="Scroll back to top" hidden><span aria-hidden="true">↑</span></button>
 
 <div id="scrim" class="scrim" hidden></div>
 
@@ -380,10 +455,16 @@
 <div id="toasts" class="toasts" aria-live="polite"></div>
 <div id="tip" class="tip" role="tooltip" hidden></div>
 
+<!-- Load order is dependency order, and every file is a plain script defining one global:
+     no bundler, no module graph, nothing to install. `charts` needs `ui`; `plan` and `live`
+     need `charts` and `dag`; `views` needs all of them; `app` wires the shell last. -->
 <script src="/ui.js"></script>
 <script src="/reference.js"></script>
+<script src="/charts.js"></script>
 <script src="/dag.js"></script>
 <script src="/learn.js"></script>
+<script src="/plan.js"></script>
+<script src="/live.js"></script>
 <script src="/views.js"></script>
 <script src="/app.js"></script>
 </body>

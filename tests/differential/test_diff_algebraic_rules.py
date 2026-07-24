@@ -5,7 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 
@@ -48,7 +48,7 @@ def test_nested_limits_vs_duckdb(duck):
     duck.register("t", t)
     out = bt.from_arrow(t).sort("y").limit(6).limit(3, offset=1).collect()
     expected = duck.sql("SELECT * FROM (SELECT * FROM t ORDER BY y LIMIT 6) LIMIT 3 OFFSET 1")
-    assert_same(out, expected)
+    assert_same_ordered(out, expected)
 
 
 def test_limit_through_project_vs_duckdb(duck):
@@ -57,7 +57,7 @@ def test_limit_through_project_vs_duckdb(duck):
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").select(z=col("x") * col("y")).limit(2).collect()
     expected = duck.sql("SELECT x * y AS z FROM t ORDER BY x LIMIT 2")
-    assert_same(out, expected)
+    assert_same_ordered(out, expected)
 
 
 def test_sort_before_aggregate_vs_duckdb(duck):
@@ -74,7 +74,7 @@ def test_filter_through_sort_vs_duckdb(duck):
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").filter(col("x") > 3).collect()
     expected = duck.sql("SELECT * FROM t WHERE x > 3 ORDER BY x")
-    assert_same(out, expected)
+    assert_same_ordered(out, expected)
 
 
 def test_filter_through_aggregate_vs_duckdb(duck):

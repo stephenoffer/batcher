@@ -38,6 +38,23 @@ def _import_boto3() -> Any:
     return boto3
 
 
+def _is_throttle(exc: BaseException) -> bool:
+    """Whether `exc` is Kinesis back-pressure (a `GetRecords` throughput limit).
+
+    Kinesis caps `GetRecords` at 5 transactions/second/shard and rejects an over-rate poll
+    with ``ProvisionedThroughputExceededException``. That is normal back-pressure, not a
+    failure — the records are still there next poll. Matched by class name and by the boto
+    ``ClientError`` error code so the optional ``botocore`` need not be importable to
+    recognize it.
+    """
+    if type(exc).__name__ == "ProvisionedThroughputExceededException":
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return response.get("Error", {}).get("Code") == "ProvisionedThroughputExceededException"
+    return False
+
+
 # AWS caps `GetRecords`'s `Limit` at 10,000 records per call, and rejects anything larger
 # with `InvalidArgumentException`. The engine's usual 16,384-row morsel is therefore not a
 # legal request here, so every poll is clamped to the API's ceiling.
@@ -59,7 +76,7 @@ class KinesisSource(BrokerSource):
 
     format_name = "kinesis"
 
-    __slots__ = ("_client_obj", "_iterators", "_partitions", "_shard_ids")
+    __slots__ = ("_client_obj", "_closed", "_iterators", "_partitions", "_shard_ids")
 
     def __init__(
         self,
@@ -82,6 +99,10 @@ class KinesisSource(BrokerSource):
         self._client_obj: Any = None
         self._shard_ids: list[str] | None = None
         self._iterators: dict[str, str] = {}
+        # Shards drained to their end (a `GetRecords` returning no `NextShardIterator`).
+        # Their records already flowed through the children a reshard created, so they must
+        # never be polled again — reusing their final iterator raises `ExpiredIterator`.
+        self._closed: set[str] = set()
 
     def _client(self) -> Any:
         if self._client_obj is None:
@@ -153,7 +174,11 @@ class KinesisSource(BrokerSource):
         """
         shard_map = self._shard_map()
         numbers = self._partitions if self._partitions is not None else sorted(shard_map)
-        return [(n, shard_map[n]) for n in numbers if n in shard_map]
+        return [
+            (n, shard_map[n])
+            for n in numbers
+            if n in shard_map and shard_map[n] not in self._closed
+        ]
 
     def _iterator(self, shard_id: str, shard_number: int) -> str:
         """A shard iterator, resuming after a checkpointed sequence when present.
@@ -186,13 +211,28 @@ class KinesisSource(BrokerSource):
         client = self._client()
         messages: list[BrokerMessage] = []
         for shard_number, shard_id in self._active_shards():
-            resp = client.get_records(
-                ShardIterator=self._iterator(shard_id, shard_number),
-                Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
-            )
+            try:
+                resp = client.get_records(
+                    ShardIterator=self._iterator(shard_id, shard_number),
+                    Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
+                )
+            except Exception as exc:
+                if _is_throttle(exc):
+                    # Back-pressure on this shard: skip it for this poll (its iterator is
+                    # unchanged, so its records are read next poll) rather than failing the
+                    # whole query. No sleep here — the trigger cadence paces the retry, and a
+                    # blocking sleep would stall the loop's stop signal.
+                    continue
+                raise
             next_iter = resp.get("NextShardIterator")
             if next_iter is not None:
                 self._iterators[shard_id] = next_iter
+            else:
+                # No next iterator means this shard is closed and fully drained. Retire it:
+                # drop the now-invalid iterator and stop `_active_shards` from polling it,
+                # rather than reusing the stale token forever (an `ExpiredIterator` loop).
+                self._closed.add(shard_id)
+                self._iterators.pop(shard_id, None)
             for rec in resp.get("Records", []):
                 ts = rec.get("ApproximateArrivalTimestamp")
                 messages.append(

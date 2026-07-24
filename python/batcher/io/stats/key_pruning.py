@@ -46,6 +46,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.logging import note_suppressed
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -122,7 +124,8 @@ def key_digest(keys: pa.Table, max_exact: int = MAX_EXACT_KEYS) -> KeyDigest:
         try:
             minmax = pc.min_max(column)  # null-skipping
             low, high = minmax["min"].as_py(), minmax["max"].as_py()
-        except Exception:
+        except Exception as exc:
+            note_suppressed("io", "compute a key column's min/max", exc)
             continue  # a type with no orderable min/max prunes nothing on this column
         if low is None or high is None:
             continue  # an all-null key column carries no bound to prune with
@@ -205,7 +208,8 @@ def _surviving(digest: KeyDigest, manifest: Any) -> list[str] | None:
                 pc.less_equal(file_low, pa.scalar(high, file_low.type)),
                 pc.greater_equal(file_high, pa.scalar(low, file_high.type)),
             )
-        except Exception:
+        except Exception as exc:
+            note_suppressed("io", "compare file and source key bounds", exc)
             continue  # a type that will not compare prunes nothing on this column
 
         exact = digest.values.get(name)

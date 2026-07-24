@@ -205,32 +205,65 @@ impl DDSketch {
         if x < self.min {
             return 0.0;
         }
+        // `below` accumulates whole buckets strictly below `x`; `partial` accumulates the
+        // fraction of the one bucket that straddles `x`. Interpolating that straddling bucket
+        // — rather than counting 0 or all of it — turns a step CDF into a continuous one, so
+        // two predicates a hair apart get selectivities a hair apart instead of jumping by a
+        // whole bucket's mass. The interpolation is log-uniform within the bucket, matching
+        // the sketch's own geometric spacing: a value's position is `log_γ(x/lower) ∈ [0, 1]`
+        // across the bucket `(lower, upper]`.
         let mut below = 0u64;
+        let mut partial = 0.0;
         if x >= 0.0 {
             // x ≥ 0: every negative and every zero is ≤ x.
             below += self.negative.values().sum::<u64>();
             below += self.zeros;
-            // Positive buckets lying entirely at or below x.
             for (&i, &c) in self.positive.iter() {
-                if self.upper_bound_of(i) <= x {
+                let upper = self.upper_bound_of(i);
+                if upper <= x {
                     below += c;
                 } else {
+                    partial = c as f64 * self.bucket_fraction_below(i, x);
                     break;
                 }
             }
         } else {
-            // x < 0: only sufficiently large-magnitude negatives are ≤ x. Bucket
-            // `i` of the mirror map holds values in `[-γ^i, -γ^(i-1))`, so the
-            // whole bucket is ≤ x when its *least* negative end is: -γ^(i-1) ≤ x.
+            // x < 0: only sufficiently large-magnitude negatives are ≤ x. Bucket `i` of the
+            // mirror map holds values in `[-γ^i, -γ^(i-1))`, so the whole bucket is ≤ x when
+            // its *least* negative end is: -γ^(i-1) ≤ x.
             for (&i, &c) in self.negative.iter().rev() {
                 if -self.upper_bound_of(i - 1) <= x {
                     below += c;
+                } else if -self.upper_bound_of(i) < x {
+                    // The straddling negative bucket: `[-γ^i, -γ^(i-1))`, ordered so more of
+                    // it is ≤ x the closer x is to its most-negative end.
+                    let hi = -self.upper_bound_of(i - 1);
+                    let lo = -self.upper_bound_of(i);
+                    partial = c as f64 * ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+                    break;
                 } else {
                     break;
                 }
             }
         }
-        below as f64 / self.n as f64
+        (below as f64 + partial) / self.n as f64
+    }
+
+    /// The fraction of a positive bucket `(γ^(i-1), γ^i]` whose values are ≤ `x`.
+    ///
+    /// Log-uniform within the bucket, so the interpolation follows the same geometric spacing
+    /// the sketch uses to place values: `(ln x - ln lower) / (ln upper - ln lower)`.
+    #[inline]
+    fn bucket_fraction_below(&self, i: i32, x: f64) -> f64 {
+        let lower = self.upper_bound_of(i - 1);
+        if x <= lower {
+            return 0.0;
+        }
+        let span = self.ln_gamma; // ln(upper) - ln(lower) == ln(γ)
+        if span <= 0.0 {
+            return 0.0;
+        }
+        ((x.ln() - lower.ln()) / span).clamp(0.0, 1.0)
     }
 
     /// Serialize to a byte blob. Layout (all little-endian):
@@ -779,6 +812,59 @@ mod tests {
                     "trial {trial}: alpha={alpha} n={n} q={q} merge != single"
                 );
             }
+        }
+    }
+
+    /// `rank` must vary *continuously* with `x`, not jump by a whole bucket's mass at each
+    /// bucket boundary — the selectivity of `col <= x` and `col <= x + ε` should differ by ε.
+    #[test]
+    fn rank_interpolates_within_a_bucket() {
+        let mut d = DDSketch::new(0.02);
+        for i in 1..=100_000u64 {
+            d.add(i as f64);
+        }
+        // March across a decade in the middle of the range; adjacent ranks must move smoothly
+        // and monotonically, with no single step carrying a whole bucket.
+        let mut prev = d.rank(20_000.0);
+        let mut x = 20_000.0;
+        while x < 40_000.0 {
+            x += 50.0;
+            let r = d.rank(x);
+            assert!(r >= prev - 1e-9, "rank went backwards at {x}");
+            assert!(r - prev < 0.01, "rank jumped by {} at {x}", r - prev);
+            prev = r;
+        }
+    }
+
+    /// Interpolation must not cost the relative-accuracy guarantee: a known quantile's rank
+    /// still comes back right.
+    #[test]
+    fn interpolated_rank_stays_accurate() {
+        let mut d = DDSketch::new(0.01);
+        for i in 0..100_000u64 {
+            d.add(i as f64);
+        }
+        for (x, want) in [(10_000.0, 0.1), (50_000.0, 0.5), (90_000.0, 0.9)] {
+            let got = d.rank(x);
+            assert!((got - want).abs() < 0.02, "rank({x}) = {got}, want {want}");
+        }
+    }
+
+    /// The interpolation must handle negative values too — the mirror map is ordered the
+    /// opposite way, so getting the direction wrong would make `rank` non-monotone at 0.
+    #[test]
+    fn rank_is_monotone_across_zero() {
+        let mut d = DDSketch::new(0.02);
+        for i in -50_000..50_000i64 {
+            d.add(i as f64);
+        }
+        let mut prev = 0.0;
+        let mut x = -10_000.0;
+        while x < 10_000.0 {
+            let r = d.rank(x);
+            assert!(r >= prev - 1e-9, "rank not monotone at {x}: {r} < {prev}");
+            prev = r;
+            x += 100.0;
         }
     }
 }

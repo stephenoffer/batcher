@@ -37,9 +37,7 @@ def _wave_png(size: int, cycles: float) -> bytes:
         for x in range(size):
             v = int(
                 128
-                + 120
-                * math.sin(x / size * cycles * 2 * math.pi)
-                * math.cos(y / size * 2 * math.pi)
+                + 120 * math.sin(x / size * cycles * 2 * math.pi) * math.cos(y / size * 2 * math.pi)
             )
             v = max(0, min(255, v))
             px[x, y] = (v, v, v)

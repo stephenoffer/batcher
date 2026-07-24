@@ -39,7 +39,10 @@ mod var;
 
 use accum::{bitfold_acc, bool_acc, concat_col, minmax_acc, product_acc, require, sum_acc};
 use argextreme::{arg_extreme_state, merge_arg_extreme};
-use distinct::{bucket_values_into_list, distinct_state, finalize_count_distinct, merge_distinct};
+use distinct::{
+    bucket_values_into_list, distinct_state, finalize_count_distinct, flatten_list_state,
+    merge_distinct,
+};
 pub use distinct::{distinct_batch, distinct_dense};
 pub(crate) use group::assign_groups;
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};

@@ -13,8 +13,9 @@ It lives in `api` because it imports all three subsystems (plus `dist`); the
 independence contract forbids any of them from importing the others, so the
 conductor is the one layer allowed to assemble them.
 
-Split into a package on its seam — zero-config resolution (`autoconfig`) and the contract
-loop (`run`); the import path is unchanged.
+The package splits on its seams: zero-config resolution (`autoconfig`), plan sizing from
+metadata (`sizing`), the three mutually exclusive execution routes (`stages`), and the loop
+that sequences them (`run`). The import path is unchanged.
 """
 
 from __future__ import annotations
@@ -24,12 +25,12 @@ from batcher.api.orchestration.autoconfig import (
     resolve_auto_config,
     with_auto_config,
 )
-from batcher.api.orchestration.run import (
+from batcher.api.orchestration.run import run_relational
+from batcher.api.orchestration.sizing import (
     _MAX_PARTITIONS,  # noqa: F401
     DEFAULT_PARTITIONS,
     _clamp_partitions,  # noqa: F401  (sibling modules reuse the shared partition clamp)
     partitions_from_physical,
-    run_relational,
 )
 from batcher.api.source_stats import (
     collect_source_stats,

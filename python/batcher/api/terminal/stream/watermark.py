@@ -130,10 +130,19 @@ def stream_watermark_dedup(
             if b.num_rows == 0:
                 continue
             table = pa.Table.from_batches([b])
-            if wm is not None:  # drop rows below the watermark (late)
-                table = table.filter(pc.greater_equal(_event_micros(table.column(et)), wm))
-                if table.num_rows == 0:
-                    continue
+            # A watermark window is defined only for a row that has an event time, so
+            # drop null-event-time rows uniformly. Post-watermark they were already
+            # dropped as "late" (a null fails `>= wm`); pre-watermark they were kept,
+            # folded into the seen set, then evicted on the very next batch (a null fails
+            # the eviction `>= wm` too) — forgetting the key and re-emitting a later
+            # duplicate as genuinely new. Dropping them keeps dedup sound and consistent.
+            et_micros = _event_micros(table.column(et))
+            mask = pc.is_valid(et_micros)
+            if wm is not None:  # also drop rows below the watermark (late)
+                mask = pc.and_kleene(mask, pc.greater_equal(et_micros, wm))
+            table = table.filter(mask)
+            if table.num_rows == 0:
+                continue
             # Duplicate check against the seen-keys state *before* advancing the
             # watermark (a key is a duplicate while it is still in state).
             deduped = from_arrow(table).distinct(subset, keep="first", order_by=[(et, False)])
@@ -191,6 +200,13 @@ def stream_stream_join(
     lt, rt = plan.left_time, plan.right_time
     within, lateness = plan.within_micros, plan.lateness_micros
     lk, rk = list(plan.left_keys), list(plan.right_keys)
+    # The interval filter differences the two event-time columns *of the join output*.
+    # When both streams name their time column the same, the join suffixes the right
+    # one (e.g. left `ts`, right `ts_right`); differencing the raw `left_time`/
+    # `right_time` names would then read the left column twice, making every diff 0 so
+    # every pair passes the interval filter. Resolve each side's real output alias.
+    lt_out = next((o.alias for o in plan.output if o.side == "left" and o.name == lt), lt)
+    rt_out = next((o.alias for o in plan.output if o.side == "right" and o.name == rt), rt)
     left_opt = kyber.optimize(plan.left, sources=[sources[0]], hub=hub)
     right_opt = kyber.optimize(remap_sources(plan.right, -1), sources=[sources[1]], hub=hub)
 
@@ -220,9 +236,9 @@ def stream_stream_join(
         joined = left_ds.join(right_ds, left_on=lk, right_on=rk, how="inner")
         # Normalize event time to microseconds (`within` is micros) before differencing,
         # so a non-`us` timestamp (e.g. ns) is not compared 1000x off and missing matches.
-        diff = joined[lt].cast("timestamp").cast("int64") - joined[rt].cast("timestamp").cast(
-            "int64"
-        )
+        diff = joined[lt_out].cast("timestamp").cast("int64") - joined[rt_out].cast(
+            "timestamp"
+        ).cast("int64")
         res = joined.filter((diff <= within) & (diff >= -within)).collect()
         if res.num_rows == 0:
             return []

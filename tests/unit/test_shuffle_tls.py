@@ -43,7 +43,8 @@ def test_tls_is_off_by_default():
 
 
 def test_a_default_config_validates():
-    validate_config(Config())  # TLS off → no TLS checks run
+    """TLS is off by default, so none of the certificate checks run."""
+    assert validate_config(Config()) is None
 
 
 def test_enabling_tls_without_a_ca_is_rejected():
@@ -77,7 +78,7 @@ def test_a_complete_config_validates(certs):
         require_client_auth=True,
         server_name="batcher-shuffle",
     )
-    validate_config(_with_tls(tls))  # no raise
+    assert validate_config(_with_tls(tls)) is None
 
 
 def test_loader_reads_the_mounted_pem(certs):

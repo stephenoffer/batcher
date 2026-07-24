@@ -10,10 +10,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.api.streaming._query import (
-    _ACTIVE,
-    _LOCK,
     StreamingQuery,
+    _deregister,
     _next_name,
+    _register,
     _warn_if_checkpoint_not_durable,
 )
 from batcher.plan.streaming import OutputMode, Trigger
@@ -135,9 +135,15 @@ def start_streaming_query(
         predicate=predicate,
     )
     query = StreamingQuery(query_name, engine)
-    with _LOCK:
-        _ACTIVE[query_name] = query
-    engine.start()
+    _register(query_name, query)
+    try:
+        engine.start()
+    except BaseException:
+        # `start()` opens the sink and recovers from the checkpoint before the loop
+        # thread launches; if either raises, the query never runs, so it must not linger
+        # in the registry as a phantom active stream.
+        _deregister(query_name)
+        raise
     return query
 
 

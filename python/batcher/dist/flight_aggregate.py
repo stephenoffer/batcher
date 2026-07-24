@@ -562,7 +562,7 @@ def _tree_reduce_with_recovery(
     def _detect_dead():
         # Ping every live actor *concurrently* (one ray.get over all refs), not one
         # at a time — O(workers) serial RPCs each recovery round is slow on a big
-        # cluster (N9). A ref that raises marks its actor dead.
+        # cluster. A ref that raises marks its actor dead.
         candidates = [i for i in range(workers) if i not in dead]
         refs = [actors[i].addr.remote() for i in candidates]
         for i, ref in zip(candidates, refs, strict=True):

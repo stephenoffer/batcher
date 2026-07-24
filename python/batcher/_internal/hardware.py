@@ -16,6 +16,8 @@ import glob
 import os
 import sys
 
+from batcher._internal.mathx import ceil_div
+
 __all__ = [
     "INFERENCE_INFLIGHT_DEPTH_MAX",
     "available_cpu_count",
@@ -51,7 +53,7 @@ def _affinity_count() -> int | None:
 def _quota_cores(quota: int, period: int) -> int | None:
     """`ceil(quota / period)` cores, or `None` when either is non-positive (unlimited)."""
     if quota > 0 and period > 0:
-        return max(1, -(-quota // period))  # ceil-div
+        return max(1, ceil_div(quota, period))  # ceil-div
     return None
 
 
@@ -75,15 +77,13 @@ def _read_cgroup_v2_quota(base: str) -> int | None:
 
 
 def cgroup_v2_dirs() -> list[str]:
-    """Every cgroup v2 dir whose ``cpu.max`` can bind this process: the mount root and each
-    ancestor from the process's own leaf (``/proc/self/cgroup``) up to it.
+    """Every cgroup v2 dir whose ``cpu.max`` can bind this process: mount root through leaf.
 
-    The root and leaf coincide inside a K8s pod (a cgroup *namespace* maps the pod's cgroup to
-    the mount root) but diverge for a process in a *delegated* cgroup with no namespace — a Ray
-    worker under a systemd slice, a nested container. cgroup v2 enforces the CFS bandwidth quota
-    at **every** level, so the effective limit is the tightest ``cpu.max`` anywhere in the chain:
-    a quota set on a parent slice rather than the leaf would be missed by checking only the ends.
-    Walking the full ancestry and taking the minimum is correct for any topology.
+    The leaf comes from the process's own ``/proc/self/cgroup``. Root and leaf coincide inside a
+    K8s pod (a cgroup *namespace* maps the pod's cgroup to the mount root) but diverge in a
+    *delegated* cgroup with no namespace (a Ray worker under a systemd slice). cgroup v2 enforces
+    the CFS bandwidth quota at **every** level, so the effective limit is the tightest ``cpu.max``
+    anywhere in the chain — checking only the ends would miss a quota set on a parent slice.
     """
     dirs = ["/sys/fs/cgroup"]
     sub = ""

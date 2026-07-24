@@ -434,6 +434,48 @@ Column attribute access (`df.amount`) is absent for a subtler reason: a column n
 `filter` or `join` would shadow a method, which is a real source of pandas bugs. Use
 `ds["amount"]` for the expression, or `bt.col("amount")` to build one.
 
+## The error messages teach you the mapping
+
+You don't have to memorize the tables above. Type the method you already know, and the
+traceback tells you the Batcher spelling. This works at every level: on a `Dataset`, on
+an expression, on a `GroupBy`, and on the `bt` package itself.
+
+```python
+import batcher as bt
+
+demo = bt.from_pydict({"x": [1, 2, 3], "k": ["a", "b", "a"]})
+
+# A pandas reshape on a Dataset:
+try:
+    demo.pivot_table
+except AttributeError as exc:
+    assert "ds.pivot" in str(exc)
+
+# A Polars per-element UDF on an expression:
+try:
+    bt.col("x").map_elements
+except AttributeError as exc:
+    assert "map_batches" in str(exc)
+
+# A pandas GroupBy transform:
+try:
+    demo.group_by("k").transform
+except AttributeError as exc:
+    assert "ds.window" in str(exc)
+
+# A Polars top-level constructor:
+try:
+    bt.LazyFrame
+except AttributeError as exc:
+    assert "already lazy" in str(exc)
+
+print("every wrong spelling names its Batcher replacement")
+# every wrong spelling names its Batcher replacement
+```
+
+A near miss on a real method gets a `Did you mean ...?` suggestion instead, so a typo
+such as `ds.filtr` or `bt.col("x").meen` points straight at `filter` and `mean`.
+
 ## Checking a port
 
 `ds.equals(other)` compares *results*, not plans, so it answers the only question that

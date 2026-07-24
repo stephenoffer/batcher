@@ -51,6 +51,21 @@ class LogSource(FileSource):
         super().__init__(path, **kwargs)
         self.pattern = pattern
 
+    def _estimated_row_count(self, byte_total: int | None) -> int | None:
+        """An advisory line count from a byte sample — a log file emits one row per line.
+
+        A log source has no footer, so cardinality was the planner's default. Every line is
+        one Arrow row (no header), so the shared delimited estimator scales the first file's
+        average line width by the dataset's on-disk size. Advisory (`statistics()` marks it
+        `exact_rows=False`), and cheap enough to run at plan time. `byte_total` is the size
+        `statistics()` already computed, reused so the file sizes are not swept twice.
+        """
+        from batcher.io.stats.row_estimate import estimate_delimited_rows
+
+        return estimate_delimited_rows(
+            self._fs, self._files(), has_header=False, total_bytes=byte_total
+        )
+
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:  # noqa: ARG002 (fixed schema)
         return LOG_SCHEMA
 

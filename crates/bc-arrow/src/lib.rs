@@ -26,7 +26,7 @@ pub use hardware::{usable_cores, HardwareProfile, SimdOverride};
 pub mod float_ident;
 pub use float_ident::{
     canon_f32, canon_f32_bits, canon_f64, canon_f64_bits, canon_float_array, float_total_cmp,
-    CANONICAL_NAN_BITS_F32, CANONICAL_NAN_BITS_F64,
+    needs_canon_f32, needs_canon_f64, CANONICAL_NAN_BITS_F32, CANONICAL_NAN_BITS_F64,
 };
 
 /// A unit of data flow between operators: an Arrow `RecordBatch`.

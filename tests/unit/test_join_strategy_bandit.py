@@ -31,14 +31,17 @@ _ARMS = ("hash", "sort_merge")
 
 
 def _arm(n: int, mean: float) -> dict:
-    return {"n": n, "sum": mean * n, "sumsq": mean * mean * n}
+    """`n` identical observations of `mean` — a Welford state with no spread."""
+    return {"n": float(n), "mean": mean, "m2": 0.0}
 
 
 def _pull(stats: dict, arm: str, reward: float) -> None:
+    """Fold one reward into an arm, exactly as `record_arm` does (Welford, no discount)."""
     a = stats[arm]
-    a["n"] += 1
-    a["sum"] += reward
-    a["sumsq"] += reward * reward
+    a["n"] += 1.0
+    delta = reward - a["mean"]
+    a["mean"] += delta / a["n"]
+    a["m2"] += delta * (reward - a["mean"])
 
 
 def _bare_radius_pick(stats: dict, c: float = 1.0) -> str:
@@ -51,8 +54,7 @@ def _bare_radius_pick(stats: dict, c: float = 1.0) -> str:
     return min(
         sorted(tried),
         key=lambda a: (
-            tried[a]["sum"] / tried[a]["n"]
-            - c * math.sqrt(2.0 * math.log(max(2, total)) / tried[a]["n"])
+            tried[a]["mean"] - c * math.sqrt(2.0 * math.log(max(2, total)) / tried[a]["n"])
         ),
     )
 
@@ -63,7 +65,7 @@ def _simulate(pick, *, unit: float, rounds: int = 80, seed: int = 11, noise: flo
     Returns cumulative regret in ms and the per-arm pull counts.
     """
     rng = random.Random(seed)
-    stats = {a: {"n": 0, "sum": 0.0, "sumsq": 0.0} for a in _ARMS}
+    stats = {a: {"n": 0.0, "mean": 0.0, "m2": 0.0} for a in _ARMS}
     truth = {"hash": 2.0, "sort_merge": 4.0}
     sizes = [50.0] + [rng.choice([1.0, 2.0, 3.0]) for _ in range(rounds)]
     regret = 0.0
@@ -134,7 +136,7 @@ def test_the_scaled_radius_does_not_resurrect_a_genuinely_worse_arm():
     for _ in range(400):
         arm = ucb1_best_arm(stats, _ARMS)
         _pull(stats, arm, 5.0 if arm == "hash" else 10.0)
-    assert stats["hash"]["n"] == 1, "expected the poisoned arm to stay retired"
+    assert stats["hash"]["n"] == 1.0, "expected the poisoned arm to stay retired"
 
 
 def test_record_join_strategy_normalizes_by_input_rows():
@@ -153,3 +155,46 @@ def test_record_join_strategy_normalizes_by_input_rows():
     finally:
         bandit.record_arm = original
     assert recorded == [("hash", 20.0), ("hash", 40.0)]
+
+
+def test_discounting_lets_a_changed_arm_be_re_examined():
+    """The non-stationary case UCB1 cannot handle, and discounting exists for.
+
+    An arm measured badly long ago keeps its mean under undiscounted statistics, and its
+    confidence radius shrinks to nothing, so it can never be re-checked even after the world
+    changed. Discounting decays the *evidence* (the effective count and the accumulated
+    spread) while keeping the estimate, so the radius reopens over time.
+    """
+    from batcher.kyber.learned_tuning.bandit import _ARM_DISCOUNT, _decayed
+
+    state = {"n": 200.0, "mean": 600.0, "m2": 400.0}
+    for _ in range(200):
+        state = _decayed(state)
+    assert state["mean"] == 600.0, "the estimate itself must not drift toward zero"
+    assert state["n"] < 200.0 * _ARM_DISCOUNT**100, "evidence must decay geometrically"
+    assert state["n"] > 0.0
+
+
+def test_a_consistent_arm_is_not_explored_as_hard_as_an_erratic_one():
+    """UCB-V: the radius uses the arm's *own* spread, not the pooled one.
+
+    Two arms with the same mean, one measured identically every time and one wildly noisy.
+    The consistent one has nothing left to learn, so its lower-confidence bound must sit
+    above the noisy one's — the noisy arm is the one worth another look.
+    """
+    consistent = {"n": 20.0, "mean": 100.0, "m2": 0.0}
+    erratic = {"n": 20.0, "mean": 100.0, "m2": 20.0 * 400.0}  # sd 20
+    assert ucb1_best_arm({"hash": consistent, "sort_merge": erratic}, _ARMS) == "sort_merge"
+
+
+def test_variance_is_read_without_catastrophic_cancellation():
+    """A tight spread on a large mean must survive.
+
+    `sumsq/n - mean^2` at mean 1e6 with sd 1 subtracts two numbers that agree to 12 digits,
+    and the answer is noise. The Welford `m2` never forms that difference.
+    """
+    stats = {a: {"n": 0.0, "mean": 0.0, "m2": 0.0} for a in _ARMS}
+    for i in range(200):
+        _pull(stats, "hash", 1e6 + (i % 2))
+    sd = math.sqrt(stats["hash"]["m2"] / stats["hash"]["n"])
+    assert 0.4 < sd < 0.6, f"recovered sd {sd}, expected ~0.5"

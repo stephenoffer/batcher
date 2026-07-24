@@ -16,7 +16,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 
@@ -34,25 +34,33 @@ def _t(duck):
 def test_sum_over_topn(duck):
     ds = _t(duck)
     out = ds.sort("a", descending=True).limit(2).agg(s=col("a").sum()).collect()
-    assert_same(out, duck.sql("SELECT sum(a) AS s FROM (SELECT a FROM t ORDER BY a DESC LIMIT 2)"))
+    assert_same_ordered(
+        out, duck.sql("SELECT sum(a) AS s FROM (SELECT a FROM t ORDER BY a DESC LIMIT 2)")
+    )
 
 
 def test_mean_over_topn(duck):
     ds = _t(duck)
     out = ds.sort("a", descending=True).limit(2).agg(s=col("a").mean()).collect()
-    assert_same(out, duck.sql("SELECT avg(a) AS s FROM (SELECT a FROM t ORDER BY a DESC LIMIT 2)"))
+    assert_same_ordered(
+        out, duck.sql("SELECT avg(a) AS s FROM (SELECT a FROM t ORDER BY a DESC LIMIT 2)")
+    )
 
 
 def test_min_over_topn(duck):
     ds = _t(duck)
     out = ds.sort("a", descending=True).limit(2).agg(s=col("a").min()).collect()
-    assert_same(out, duck.sql("SELECT min(a) AS s FROM (SELECT a FROM t ORDER BY a DESC LIMIT 2)"))
+    assert_same_ordered(
+        out, duck.sql("SELECT min(a) AS s FROM (SELECT a FROM t ORDER BY a DESC LIMIT 2)")
+    )
 
 
 def test_max_over_asc_topn(duck):
     ds = _t(duck)
     out = ds.sort("a").limit(3).agg(s=col("a").max()).collect()
-    assert_same(out, duck.sql("SELECT max(a) AS s FROM (SELECT a FROM t ORDER BY a ASC LIMIT 3)"))
+    assert_same_ordered(
+        out, duck.sql("SELECT max(a) AS s FROM (SELECT a FROM t ORDER BY a ASC LIMIT 3)")
+    )
 
 
 def test_sum_over_plain_limit(duck):
@@ -72,7 +80,7 @@ def test_sorted_no_limit_aggregate_still_exact(duck):
     """A `Sort` with no limit is stat-preserving, so the aggregate answer stays valid."""
     ds = _t(duck)
     out = ds.sort("a").agg(s=col("a").sum()).collect()
-    assert_same(out, duck.sql("SELECT sum(a) AS s FROM t"))
+    assert_same_ordered(out, duck.sql("SELECT sum(a) AS s FROM t"))
 
 
 # --- scalar column shortcuts (ds.min / ds.max / ds.n_unique) over a top-N ------

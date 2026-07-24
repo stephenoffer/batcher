@@ -477,9 +477,63 @@ print(out.to_pydict())
 # {'z': [-0.7071, 0.7071, -0.7071, 0.7071], 'share': [0.25, 0.75, 0.3333333333333333, 0.6666666666666666], 'bucket': [1, 1, 1, 1]}
 ```
 
+**Weighted statistics** (when rows carry survey, recency, or size weights):
+`bt.weighted_mean(x, w)`, `bt.weighted_var(x, w)`, `bt.weighted_std(x, w)`,
+`bt.weighted_covariance(x, y, w)`, and `bt.weighted_correlation(x, y, w)` — each the
+frequency-weighted form matching `numpy.average`.
+
 Column-level profiling aggregates complete the toolkit: `bt.q1(x)` / `bt.q3(x)` /
 `bt.iqr(x)` (robust spread), `bt.value_range(x)`, `bt.null_rate(x)` /
 `bt.non_null_rate(x)` (completeness), and `bt.nunique_ratio(x)`, the cardinality ratio, where near 1 marks an identifier and near 0 a categorical.
+
+## Model evaluation metrics
+
+Every model-evaluation metric is an expression, so it belongs inside `agg()` and composes
+with `group_by` — a per-segment report is the same query with a grouping added, at no extra
+pass. All are checked against scikit-learn where it defines them.
+
+**Regression error**: `bt.rmse`, `bt.mse`, `bt.mae`, `bt.medae`, `bt.max_error`,
+`bt.mean_bias`, `bt.mean_percentage_error` (the signed bias), `bt.normalized_rmse`, `bt.mape`, `bt.smape`, `bt.wape`, `bt.msle`, `bt.rmsle`, `bt.r2`,
+`bt.explained_variance`, `bt.huber_loss`, `bt.pinball_loss` — each ``metric(y_true, y_pred)``.
+
+**Classification (from the confusion counts)**: `bt.accuracy`, `bt.precision`, `bt.recall`,
+`bt.specificity`, `bt.false_negative_rate`, `bt.false_positive_rate`, `bt.negative_predictive_value`, `bt.f1_score`,
+`bt.fbeta_score`, `bt.balanced_accuracy`, `bt.matthews_corrcoef`, `bt.cohen_kappa`,
+`bt.prevalence`, plus the raw cells `bt.true_positives` / `bt.false_positives` /
+`bt.false_negatives` / `bt.true_negatives`.
+
+**Probabilistic**: `bt.log_loss` and `bt.brier_score` over a predicted probability. `bt.hamming_loss` is the multi-label error rate (`1 - accuracy` for a single label). `bt.hinge_loss` and `bt.squared_hinge_loss` score a raw decision function (a margin) rather than a probability — the support-vector-machine objective.
+
+**Agreement and efficiency** (agreement, not just correlation — a prediction that is always
+half the truth correlates perfectly and is useless): `bt.concordance_correlation` (Lin's CCC),
+`bt.nash_sutcliffe_efficiency`, and `bt.kling_gupta_efficiency`, from method-comparison and
+hydrology.
+
+**Count and rate models**: `bt.poisson_deviance`, `bt.gamma_deviance`, and
+`bt.tweedie_deviance(y, p, power=...)` — the losses a Poisson, gamma, or Tweedie model is
+fitted on, for a count or rate target where squared error is the wrong shape. Each matches
+scikit-learn's `mean_*_deviance`.
+
+**Diagnostic-test vocabulary** (the epidemiology names, all over the same four cells):
+`bt.jaccard_score`, `bt.false_discovery_rate`, `bt.false_omission_rate`,
+`bt.positive_likelihood_ratio`, `bt.negative_likelihood_ratio`, `bt.diagnostic_odds_ratio`,
+`bt.informedness` (Youden's J), `bt.markedness`, `bt.fowlkes_mallows_index`,
+`bt.geometric_mean_score` (the geometric mean of sensitivity and specificity, high only when
+*both* classes are recalled well), and `bt.prevalence_threshold` (the base rate below which a
+positive result is more likely wrong than right).
+
+```python
+scored = bt.from_pydict({"y": [1, 0, 1, 1, 0], "p": [1, 0, 0, 1, 1]})
+print(scored.agg(
+    f1=bt.f1_score("y", "p"),
+    jaccard=bt.jaccard_score("y", "p"),
+    informedness=bt.informedness("y", "p"),
+).to_pydict())
+```
+
+The metrics that need a global ordering (ROC AUC, average precision) or return a table
+(confusion matrix, calibration curve) are Dataset functions in `batcher.ml.metrics`, not
+expressions — see {doc}`../ml/evaluation`.
 
 ## AI data-pipeline toolkit
 

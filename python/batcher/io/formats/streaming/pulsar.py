@@ -59,7 +59,14 @@ class PulsarSource(BrokerSource):
 
     format_name = "pulsar"
 
-    __slots__ = ("_client_obj", "_consumer", "_num_partitions", "_partitions", "_unacked")
+    __slots__ = (
+        "_client_obj",
+        "_consumer",
+        "_num_partitions",
+        "_partitions",
+        "_receive_timeout_millis",
+        "_unacked",
+    )
 
     def __init__(
         self,
@@ -70,6 +77,7 @@ class PulsarSource(BrokerSource):
         service_url: str = "pulsar://localhost:6650",
         subscription: str = "batcher",
         num_partitions: int = 1,
+        receive_timeout_millis: int = 1000,
         **options: Any,
     ) -> None:
         super().__init__(
@@ -83,6 +91,10 @@ class PulsarSource(BrokerSource):
         self._num_partitions = num_partitions
         self._client_obj: Any = None
         self._consumer: Any = None
+        # How long a single `receive` blocks before a poll settles for what it has. It
+        # bounds the micro-batch loop's stop latency and how long an idle topic waits before
+        # yielding an empty poll; kept off `_options` so it never leaks to the Pulsar client.
+        self._receive_timeout_millis = receive_timeout_millis
         # Messages polled but not yet published, held so `_commit_delivered` can ack them
         # at the only correct moment — after the epoch they became is published.
         self._unacked: list[Any] = []
@@ -122,7 +134,7 @@ class PulsarSource(BrokerSource):
         raw: list[Any] = []
         for _ in range(self.poll_size):
             try:
-                msg = consumer.receive(timeout_millis=1000)
+                msg = consumer.receive(timeout_millis=self._receive_timeout_millis)
             except pulsar.Timeout:
                 break
             raw.append(msg)

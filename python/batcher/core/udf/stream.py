@@ -22,10 +22,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.core.udf import strategy as strat
+from batcher.core.udf.async_udf import is_async_udf
 from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
-from batcher.core.udf.execute import build_udf_callable
+from batcher.core.udf.lifecycle import build_udf_callable, teardown_udf
+from batcher.core.udf.resilience import wrap_resilient
 from batcher.io.schema.evolution import normalize_batch, unify_schemas
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 
@@ -47,7 +50,7 @@ _STREAM_PREFETCH_DEPTH = max(0, int(os.environ.get("BATCHER_STREAM_PREFETCH_DEPT
 _GPU_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_PIPELINE_DEPTH", "1")))
 # In-flight forwards for a LONE GPU stage (no upstream CPU stage feeding it): default 2 so a
 # scan->GPU inference overlaps read/tensorize with the forward instead of idling the device.
-# Public because the MATERIALIZING path needs the same overlap: `execute._apply_udf_autobatch`
+# Public because the MATERIALIZING path needs the same overlap: `apply._apply_udf_autobatch`
 # sizes its dispatch pool from it, so a solo GPU stage gets the same two in-flight forwards
 # whichever path the plan shape routes it to. One definition, not two that can drift.
 _GPU_SOLO_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_SOLO_PIPELINE_DEPTH", "2")))
@@ -91,7 +94,8 @@ def _stream_hub():
         from batcher.core.runtime import default_hub
 
         return default_hub()
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "resolve metadata hub", exc)
         return None
 
 
@@ -120,7 +124,8 @@ def _fold_ema(namespace: str, key: str | None, value: float) -> None:
         prior = s.get("ema")
         ema = value if prior is None else a * value + (1.0 - a) * float(prior)
         hub.put_keyed_param(namespace, key, {"ema": ema, "n": int(s.get("n", 0)) + 1})
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "fold learned ema", exc)
         return
 
 
@@ -133,7 +138,8 @@ def _read_ema(namespace: str, key: str | None) -> float | None:
         return None
     try:
         s = hub.get_keyed_param(namespace, key) or {}
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
+        note_suppressed("core", "read learned ema", exc)
         return None
     return float(s["ema"]) if "ema" in s else None
 
@@ -175,7 +181,8 @@ def _learned_read_depth(source) -> int:
     a chunk is read, never which rows it holds, so the result is identical at any depth."""
     try:
         ident = source.identity()
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
+        note_suppressed("core", "read source identity", exc)
         return _STREAM_PREFETCH_DEPTH
     tput = _read_ema(_SCAN_TPUT_NS, ident)
     if tput is None:
@@ -269,6 +276,11 @@ def stream_eligible(stages: list[MapBatches]) -> bool:
         return False
     if any(getattr(op, "multiprocessing", False) for op in stages):
         return False
+    # An async (`async def`) stage runs on its own event loop (`apply._apply_udf_async`); the
+    # synchronous stage-overlap path here would hand it an un-awaited coroutine. Keep any async
+    # stage on the materializing path, which routes it correctly.
+    if any(is_async_udf(op.fn) for op in stages):
+        return False
     if len(stages) >= 2:
         return True
     return stages[0].num_gpus > 0 and stages[0].batch_size is not None
@@ -339,6 +351,10 @@ def _apply_udf_stream(
         from batcher.ml.gpu import autocast_call
 
         call = autocast_call(call)
+    # Retry a transient failure / bound a hung call around the raw `fn`, before the GPU
+    # OOM-halving and error-budget bisection in `_emit` — so a flaky external stage streams
+    # with the same resilience as the materializing path.
+    call = wrap_resilient(call, op)
     # An explicit batch_size always wins. Without one, the chunk ADAPTS to the data's row width:
     # a GPU stage sizes from a VRAM byte budget capped at the model's learned safe size
     # (`_learned_gpu_cap`), and a CPU stage sizes from a (larger) byte budget capped at the
@@ -370,12 +386,16 @@ def _apply_udf_stream(
         return [batch]
 
     def _parallel_units(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
-        """Sub-batches to run in parallel for a CPU stage: the `batch_size` chunks if that
-        already yields ``>= workers`` of them, else the morsel split into `workers` even
-        slices — so a decode/preprocess stage with no `batch_size` still uses every spare
-        core to stay ahead of a fast GPU stage (the guides' CPU:GPU-ratio feeding)."""
+        """Sub-batches to run in parallel for a CPU stage.
+
+        With no explicit `batch_size`, a stage whose adaptive chunk is the whole morsel would
+        hand the pool a single unit and idle every other core; splitting the morsel into
+        `workers` even slices keeps a decode/preprocess stage ahead of a fast GPU stage (the
+        guides' CPU:GPU-ratio feeding). An **explicit** `batch_size` still wins — the same
+        invariant `_subs` holds — so it is parallelized over its own chunks and never re-sliced
+        to fill the pool, which would silently change the batch boundaries the `fn` sees."""
         subs = _subs(batch)
-        if len(subs) >= workers or batch.num_rows < workers:
+        if explicit is not None or len(subs) >= workers or batch.num_rows < workers:
             return subs
         step = -(-batch.num_rows // workers)  # ceil, so exactly <= workers slices
         return [
@@ -386,7 +406,7 @@ def _apply_udf_stream(
     # halving) or when the user allowed skipping corrupt rows (`max_errored_rows`); a plain CPU
     # stage with no error budget calls directly so a real bug still fails fast.
     # The allowance is shared per worker process (`strategy.error_budget`), not rebuilt here:
-    # this module and `execute._apply_udf` used to build one each, so a query routed through
+    # this module and `apply.apply_udf` used to build one each, so a query routed through
     # both paths — or a streaming query calling in once per window — got several full budgets.
     budget = strat.error_budget(op)
     resilient = is_gpu or op.max_errored_rows > 0
@@ -428,6 +448,9 @@ def _apply_udf_stream(
         # changes what the model computes, and OOM-halving stays the in-run safety net.
         if is_gpu and explicit is None and observed_gpu:
             _fold_ema(_GPU_BATCH_NS, _stage_sig(op), float(min(observed_gpu)))
+        # Release a class model this stage owns (a plain class `fn` built here, not a prebuilt
+        # instance the streaming loop owns) — deterministic teardown at stage end.
+        teardown_udf(fn, op)
 
 
 def _pipelined_emit(gen, subs_fn, emit_fn, depth: int) -> Iterator[pa.RecordBatch]:

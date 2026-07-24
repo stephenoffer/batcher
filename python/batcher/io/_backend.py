@@ -22,6 +22,7 @@ from typing import IO, Any, Protocol, runtime_checkable
 import pyarrow.fs as pafs
 
 from batcher._internal.errors import IOError
+from batcher._internal.logging import note_suppressed
 from batcher.io._file_cache import get_file_cache
 
 __all__ = ["FileSystem", "_ArrowFileSystem", "_is_data_file", "_scheme"]
@@ -420,13 +421,12 @@ class _ArrowFileSystem:
         )
 
     def _cached_local(self, in_path: str) -> str | None:
-        """The local-cache copy of a remote file, fetching it on a miss; `None` when
-        caching is off or unavailable. Best-effort — any failure falls back to a direct
-        remote read, so the cache never breaks a read.
+        """The local-cache copy of a remote file, fetched on a miss; `None` when caching is off.
 
-        The cache key folds in the file's size and mtime (one cheap HEAD/stat per open),
-        so overwriting the same remote path with new content is a miss, not a stale hit
-        — correctness over saving a metadata round-trip."""
+        Best-effort: any failure falls back to a direct remote read, so the cache never breaks
+        a read. The cache key folds in the file's size and mtime (one cheap HEAD/stat per open),
+        so overwriting the same remote path with new content is a miss, not a stale hit —
+        correctness over saving a metadata round-trip."""
         if not self._cacheable:
             return None
         try:
@@ -436,12 +436,12 @@ class _ArrowFileSystem:
             info = self._fs.get_file_info(in_path)
             key = f"{in_path}\0{info.size}\0{info.mtime_ns}"
             return cache.get_or_fetch(key, lambda dst: self._download(in_path, dst))
-        except Exception:  # pragma: no cover - a cache failure must not break reads
+        except Exception as exc:  # pragma: no cover - a cache failure must not break reads
+            note_suppressed("io", "read cached remote file", exc)
             return None
 
     def _download(self, in_path: str, dst: str) -> None:
-        """Stream a remote file to local `dst` (chunked, so a large file never fully
-        materializes in memory)."""
+        """Stream a remote file to local `dst`, chunked so a large file never fully materializes."""
         with self._fs.open_input_file(in_path) as src, open(dst, "wb") as out:
             while chunk := src.read(1 << 20):
                 out.write(chunk)

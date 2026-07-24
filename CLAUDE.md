@@ -122,7 +122,7 @@ Nothing is done until the gate is green. Run what your change touches:
 
 | Changed | Run |
 |---|---|
-| Any Rust | `just check` → `just test-rust` → `cargo clippy --workspace --exclude bc-py -- -D warnings` → `cargo fmt --all` |
+| Any Rust | `just check` → `just test-rust` → `cargo clippy --workspace --exclude bc-py --all-targets -- -D warnings` → `cargo fmt --all` |
 | Any Python | `just lint-py` → `just lint-layers` → `just lint-structure` → `just build` → `just test-py` |
 | FFI surface or IR tags | **both** of the above (the two sides must move together) |
 | Public API | `just lint-docstrings` + `just docs` |

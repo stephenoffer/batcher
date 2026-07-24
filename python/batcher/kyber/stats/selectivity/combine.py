@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from batcher._internal.mathx import clamp01
 from batcher.config import CardinalityConfig
 from batcher.kyber.stats.selectivity.leaves import (
     _equality_selectivity,
@@ -76,7 +77,7 @@ def predicate_selectivity(
     sel = _raw_predicate_selectivity(
         expr, ndv, cfg, quantiles or {}, mcv or {}, bounds or {}, nulls or {}
     )
-    return min(1.0, max(0.0, sel))
+    return clamp01(sel)
 
 
 def _raw_predicate_selectivity(
@@ -394,7 +395,7 @@ def _interval_selectivity(
         else:  # gt / ge → lower bound: keep the largest (tightest floor)
             cdf = frac - _point_mass(col, value, ndv, mcv) if eff == "ge" else frac
             lower_cdf = max(lower_cdf, cdf)
-    return max(0.0, min(1.0, upper_cdf - lower_cdf))
+    return clamp01(upper_cdf - lower_cdf)
 
 
 def _exponential_backoff(sels: list[float]) -> float:

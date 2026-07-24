@@ -21,8 +21,9 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Queue
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from batcher._internal.mathx import clamp
 from batcher.config import active_config
 
 if TYPE_CHECKING:
@@ -186,11 +187,11 @@ class _LatencyController:
             return self.current()
         pid = self._pid
         error = (self._target - observed_ms) / self._target
-        self._integral = max(-pid.integral_clamp, min(pid.integral_clamp, self._integral + error))
+        self._integral = clamp(self._integral + error, -pid.integral_clamp, pid.integral_clamp)
         derivative = error - self._prev
         self._prev = error
         raw = pid.kp * error + pid.ki * self._integral + pid.kd * derivative
-        adjustment = max(-pid.max_step_fraction, min(pid.max_step_fraction, raw))
+        adjustment = clamp(raw, -pid.max_step_fraction, pid.max_step_fraction)
         self._cur = min(float(self._max), max(float(self._min), self._cur * (1.0 + adjustment)))
         return self.current()
 
@@ -228,6 +229,10 @@ class InferencePool:
         min_batch_rows / max_batch_rows: bounds for the dynamic size.
         max_inflight: cap on submitted-but-unyielded batches, which bounds resident
             memory to the pool rather than the dataset. Defaults to ``num_workers * 4``.
+        learned_hub / learned_signature: opt into the persistent batch-size warm-start
+            (throughput objective) — the pool records its plateau under `learned_signature`
+            in the `MetadataHub` so the next run of the same job starts near the tuned size
+            instead of cold-climbing again. Both default to None (the pure hill-climb).
     """
 
     def __init__(
@@ -242,6 +247,8 @@ class InferencePool:
         min_batch_rows: int = 1,
         max_batch_rows: int = 65_536,
         max_inflight: int | None = None,
+        learned_hub: Any = None,
+        learned_signature: str | None = None,
     ) -> None:
         self._factory = worker_factory
         self._num_workers = max(1, num_workers)
@@ -276,8 +283,15 @@ class InferencePool:
         if objective == "throughput":
             from batcher.ml.autobatch import ThroughputController
 
+            # Thread the learned-stats hub + signature through so a recurring inference job
+            # warm-starts the batch-size climb from its last plateau instead of paying the
+            # full cold-start ramp every run. Both default to None → the pure hill-climb.
             self._throughput_ctl = ThroughputController(
-                min_rows=min_batch_rows, max_rows=max_batch_rows, initial=self._target_rows
+                min_rows=min_batch_rows,
+                max_rows=max_batch_rows,
+                initial=self._target_rows,
+                hub=learned_hub,
+                signature=learned_signature,
             )
         elif objective != "latency":
             raise ValueError(f"objective must be 'latency' or 'throughput', got {objective!r}")

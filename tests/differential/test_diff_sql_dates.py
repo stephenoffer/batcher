@@ -8,7 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 
 
 @pytest.fixture
@@ -83,7 +83,7 @@ def ts(duck):
 def test_date_trunc(duck, ts, unit):
     """DATE_TRUNC('<unit>', ts) — the ClickBench Q42 shape — matches DuckDB."""
     q = f"SELECT id, DATE_TRUNC('{unit}', ev) m FROM ts ORDER BY id"
-    assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
+    assert_same_ordered(bt.sql(q, ts=ts).collect(), duck.sql(q))
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_date_trunc(duck, ts, unit):
     ],
 )
 def test_timestamp_interval(duck, ts, q):
-    assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
+    assert_same_ordered(bt.sql(q, ts=ts).collect(), duck.sql(q))
 
 
 @pytest.mark.parametrize(

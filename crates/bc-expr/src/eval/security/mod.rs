@@ -115,7 +115,7 @@ fn reveal_count(n: Option<i64>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::Array;
+    use arrow::array::{Array, AsArray};
 
     use super::*;
 
@@ -126,7 +126,7 @@ mod tests {
     fn eval(func: StrFunc, pattern: Option<&str>) -> Vec<Option<String>> {
         let arr = utf8([Some("alice"), None]);
         let out = eval_security(func, &arr, pattern, None, None).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let out = out.as_string::<i32>();
         out.iter().map(|o| o.map(str::to_string)).collect()
     }
 
@@ -149,9 +149,9 @@ mod tests {
     fn aes_round_trips_through_the_array_path() {
         let arr = utf8([Some("alice"), None]);
         let ct = eval_security(StrFunc::AesEncrypt, &arr, Some(HEX_KEY), None, None).unwrap();
-        let ct = ct.as_any().downcast_ref::<StringArray>().unwrap();
+        let ct = ct.as_string::<i32>();
         let pt = eval_security(StrFunc::AesDecrypt, ct, Some(HEX_KEY), None, None).unwrap();
-        let pt = pt.as_any().downcast_ref::<StringArray>().unwrap();
+        let pt = pt.as_string::<i32>();
         assert_eq!(pt.value(0), "alice");
         assert!(pt.is_null(1));
     }
@@ -160,7 +160,7 @@ mod tests {
     fn a_wrong_key_nulls_the_column_rather_than_erroring() {
         let arr = utf8([Some("alice"), None]);
         let ct = eval_security(StrFunc::AesEncrypt, &arr, Some(HEX_KEY), None, None).unwrap();
-        let ct = ct.as_any().downcast_ref::<StringArray>().unwrap();
+        let ct = ct.as_string::<i32>();
         let pt = eval_security(StrFunc::AesDecrypt, ct, Some(&"f".repeat(64)), None, None).unwrap();
         assert_eq!(pt.null_count(), pt.len());
     }
@@ -192,7 +192,7 @@ mod tests {
     fn mask_reveal_counts_come_from_start_and_length() {
         let arr = utf8([Some("4111111111111234"), None]);
         let out = eval_security(StrFunc::Mask, &arr, Some("*"), Some(0), Some(4)).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let out = out.as_string::<i32>();
         assert_eq!(out.value(0), "************1234");
     }
 
@@ -200,7 +200,7 @@ mod tests {
     fn a_negative_reveal_count_reveals_nothing() {
         let arr = utf8([Some("abc"), None]);
         let out = eval_security(StrFunc::Mask, &arr, None, Some(-5), Some(-1)).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let out = out.as_string::<i32>();
         assert_eq!(out.value(0), "XXX");
     }
 

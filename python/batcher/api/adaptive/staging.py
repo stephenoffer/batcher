@@ -122,7 +122,7 @@ def _worker_loss_errors() -> tuple[type[BaseException], ...]:
         import ray
 
         errs = (*errs, ray.exceptions.RayActorError, ray.exceptions.RayTaskError)
-    except Exception:  # pragma: no cover - ray optional
+    except (ImportError, AttributeError):  # pragma: no cover - ray absent, or too old
         pass
     return errs
 

@@ -4,7 +4,7 @@ DuckDB (like Python/C ``strftime``) renders and parses ``%f`` as **microseconds*
 right-padded to 6 digits (``.5`` ↔ ``500000``). chrono — the engine's formatter —
 instead treats ``%f`` as 9-digit *nanoseconds* on format (``.123456`` → ``.123456000``)
 and as a raw nanosecond integer on parse (``.123456`` → 123 µs, ``.5`` → 0 µs), a
-silently ~1000×-wrong result. These pin the corrected microsecond semantics.
+silently ~1000x-wrong result. These pin the corrected microsecond semantics.
 """
 
 from __future__ import annotations

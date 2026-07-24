@@ -19,9 +19,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array};
 use arrow::compute::cast;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Float64Type, Int64Type};
 
 use crate::ExprError;
 
@@ -86,10 +86,7 @@ pub(crate) fn eval_hash(args: &[ArrayRef], seed: i64, rows: usize) -> Result<Arr
 fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
     match arr.data_type() {
         DataType::Boolean => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("boolean");
+            let a = arr.as_boolean();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let v = if a.is_null(i) {
                     NULL_TAG
@@ -101,10 +98,7 @@ fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
         }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
             let f = cast(arr, &DataType::Float64)?;
-            let a = f
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .expect("float64");
+            let a = f.as_primitive::<Float64Type>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let v = if a.is_null(i) {
                     NULL_TAG
@@ -116,7 +110,7 @@ fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
         }
         DataType::Utf8 | DataType::LargeUtf8 => {
             let s = cast(arr, &DataType::Utf8)?;
-            let a = s.as_any().downcast_ref::<StringArray>().expect("utf8");
+            let a = s.as_string::<i32>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let v = if a.is_null(i) {
                     NULL_TAG
@@ -128,7 +122,7 @@ fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
         }
         dt if dt.is_integer() || matches!(dt, DataType::Date32 | DataType::Date64) => {
             let i64s = cast(arr, &DataType::Int64)?;
-            let a = i64s.as_any().downcast_ref::<Int64Array>().expect("int64");
+            let a = i64s.as_primitive::<Int64Type>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let v = if a.is_null(i) {
                     NULL_TAG
@@ -140,7 +134,7 @@ fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
         }
         DataType::Timestamp(_, _) => {
             let i64s = cast(arr, &DataType::Int64)?;
-            let a = i64s.as_any().downcast_ref::<Int64Array>().expect("int64");
+            let a = i64s.as_primitive::<Int64Type>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let v = if a.is_null(i) {
                     NULL_TAG
@@ -157,7 +151,7 @@ fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
             // Binary / decimal / struct: fall back to the textual form rather than
             // refusing to hash. Correct and deterministic, just not free.
             let s = cast(arr, &DataType::Utf8)?;
-            let a = s.as_any().downcast_ref::<StringArray>().expect("utf8");
+            let a = s.as_string::<i32>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let v = if a.is_null(i) {
                     NULL_TAG
@@ -178,11 +172,11 @@ fn fold_column(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
 /// training sequence, an embedding — has no `Utf8` cast at all, so the textual fallback
 /// would fail outright on exactly the columns an ML pipeline carries.
 fn fold_list(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
-    use arrow::array::{FixedSizeListArray, LargeListArray, ListArray};
+    use arrow::array::FixedSizeListArray;
 
     let (child, bounds): (ArrayRef, Vec<(usize, usize)>) = match arr.data_type() {
         DataType::List(_) => {
-            let a = arr.as_any().downcast_ref::<ListArray>().expect("list");
+            let a = arr.as_list::<i32>();
             let off = a.value_offsets();
             let b = (0..a.len())
                 .map(|i| (off[i] as usize, off[i + 1] as usize))
@@ -190,10 +184,7 @@ fn fold_list(acc: &mut [u64], arr: &ArrayRef) -> Result<(), ExprError> {
             (Arc::clone(a.values()), b)
         }
         DataType::LargeList(_) => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<LargeListArray>()
-                .expect("large");
+            let a = arr.as_list::<i64>();
             let off = a.value_offsets();
             let b = (0..a.len())
                 .map(|i| (off[i] as usize, off[i + 1] as usize))
@@ -238,7 +229,7 @@ mod tests {
     fn hash_of(args: Vec<ArrayRef>, seed: i64) -> Vec<i64> {
         let rows = args[0].len();
         let out = eval_hash(&args, seed, rows).unwrap();
-        let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let a = out.as_primitive::<Int64Type>();
         (0..a.len()).map(|i| a.value(i)).collect()
     }
 

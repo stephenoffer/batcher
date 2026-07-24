@@ -46,7 +46,7 @@ pub(crate) struct FlightHandler {
     /// Optional shared-secret token. When set, a `do_exchange` whose first message
     /// does not carry a matching token (in `flight_descriptor.path[1]`) is rejected
     /// with `Unauthenticated` — so a process that can merely reach the port cannot
-    /// exfiltrate shuffle partitions (N5). `None` disables the check (single-host /
+    /// exfiltrate shuffle partitions. `None` disables the check (single-host /
     /// trusted-network default).
     pub(crate) token: Option<String>,
 }
@@ -63,7 +63,7 @@ impl FlightService for FlightHandler {
     type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
     type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
 
-    // NOTE (C45): `do_get` is the *un-credited* fetch — it encodes a whole partition
+    // NOTE: `do_get` is the *un-credited* fetch — it encodes a whole partition
     // with no flow control, so a slow consumer could accumulate unbounded in-flight
     // frames. It is NOT on the production reducer path (which is the credit-bounded
     // `do_exchange`) and is not reachable from `bc-py`; it is retained only for the
@@ -72,7 +72,7 @@ impl FlightService for FlightHandler {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        // Auth (N5): `do_get` shares the service and ticket space with `do_exchange`, so it
+        // Auth: `do_get` shares the service and ticket space with `do_exchange`, so it
         // must enforce the same token — otherwise enabling `shuffle_token` protects the
         // credited path while leaving this one an open read of every partition. A `Ticket`
         // has no path field to carry the token (unlike `do_exchange`'s descriptor), so it
@@ -204,7 +204,7 @@ impl FlightService for FlightHandler {
                 )
             })?;
 
-        // Auth (N5): when a token is configured, the consumer must present a matching
+        // Auth: when a token is configured, the consumer must present a matching
         // one in path[1]. Rejected before any data is served.
         if let Some(expected) = &self.token {
             let provided = first
@@ -241,12 +241,12 @@ impl FlightService for FlightHandler {
         // grant messages; we start it empty and add the first message's grant. A
         // missing/malformed seed decodes to 0, which would stall the producer
         // forever waiting for a grant that may never come; default to a safe
-        // minimum window so the exchange always makes progress (C27).
+        // minimum window so the exchange always makes progress.
         let credits = Arc::new(Semaphore::new(0));
         let decoded = decode_credits(&first.app_metadata);
         // 0 means a missing/malformed seed (a well-formed window is always >= 1);
         // fall back to a safe default rather than stalling, but never override a
-        // legitimate explicit window — that would break the credit bound (C27).
+        // legitimate explicit window — that would break the credit bound.
         let initial = if decoded == 0 {
             crate::DEFAULT_CREDITS
         } else {

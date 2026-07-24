@@ -478,6 +478,81 @@ def test_spill_global_window_streams_via_iter_batches():
     assert _norm(streamed) == _norm(in_memory)
 
 
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("num_partitions", [1, 16, 64])
+def test_spill_global_window_avg_matches_in_memory(descending, num_partitions):
+    # A running `avg` over a global window is not a constant offset, but its running sum
+    # and count each are, so the bounded-memory stream offsets those two and divides. The
+    # streamed mean must equal the in-memory kernel for any bucket count and direction.
+    factory, schema, table = _sort_dataset()
+
+    def q(ds):
+        return ds.window(
+            order_by=[("k", descending)],
+            functions={"a": ("avg", "v"), "s": ("sum", "v"), "c": ("count", "v"), "rk": "rank"},
+        )
+
+    spilled = q(bt.from_batches(factory, schema)).collect(
+        spill=True, num_partitions=num_partitions
+    )
+    in_memory = q(bt.from_arrow(table)).collect()
+    assert spilled.column_names == in_memory.column_names
+    assert _norm(spilled) == _norm(in_memory)
+
+
+@pytest.mark.parametrize("num_partitions", [1, 4, 8])
+def test_spill_global_window_avg_with_nulls(num_partitions):
+    # The kernel's running sum is NULL until the first non-null input; the offset must read
+    # that as a 0 contribution (not carry a NULL forward) and only emit NULL where no
+    # non-null value has been seen through the row. A null-only leading bucket is the case
+    # a naive `sum + offset` gets wrong, so pin it against the in-memory kernel.
+    schema = pa.schema([("k", pa.int64()), ("v", pa.int64())])
+    table = pa.table(
+        {"k": [1, 2, 3, 4, 5, 6], "v": [None, None, 10, None, 20, None]}, schema=schema
+    )
+
+    def q(ds):
+        return ds.window(order_by=[("k", False)], functions={"a": ("avg", "v")})
+
+    spilled = q(bt.from_arrow(table)).collect(spill=True, num_partitions=num_partitions)
+    in_memory = q(bt.from_arrow(table)).collect()
+    assert _norm(spilled) == _norm(in_memory)
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("num_partitions", [1, 16, 64])
+def test_spill_global_window_first_value_matches_in_memory(descending, num_partitions):
+    # `first_value` is offset by pinning the first processed bucket's first value across
+    # every later bucket. It streams but had no differential coverage, so pin it here
+    # (the first bucket is the max-key bucket when descending, which the offset handles).
+    factory, schema, table = _sort_dataset()
+
+    def q(ds):
+        return ds.window(order_by=[("k", descending)], functions={"fv": ("first_value", "v")})
+
+    spilled = q(bt.from_batches(factory, schema)).collect(
+        spill=True, num_partitions=num_partitions
+    )
+    in_memory = q(bt.from_arrow(table)).collect()
+    assert _norm(spilled) == _norm(in_memory)
+
+
+def test_spill_global_window_avg_repeatable():
+    # Regression: `to_ir()` memoizes and returns the plan's shared functions list, so the
+    # avg-helper injection must copy before appending. Mutating the cached list corrupted
+    # every later run of a structurally-equal plan ("field exists N times in schema"), so
+    # run the same shape several times in one process and require each to stay correct.
+    factory, schema, table = _sort_dataset()
+
+    def q(ds):
+        return ds.window(order_by=[("k", False)], functions={"a": ("avg", "v")})
+
+    in_memory = q(bt.from_arrow(table)).collect()
+    for _ in range(4):
+        spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=16)
+        assert _norm(spilled) == _norm(in_memory)
+
+
 def test_spill_global_value_list_matches_in_memory():
     # A *global* (no GROUP BY) value-list aggregate must spill correctly: the mixed
     # path (median + a constant-state aggregate) and the lone paths (n_unique, mode)

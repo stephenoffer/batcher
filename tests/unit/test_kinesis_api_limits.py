@@ -98,3 +98,69 @@ def test_shards_are_discovered_once_and_cached():
     src._shards()
     assert len(fake.list_shards_calls) == calls_after_first  # cached, not re-listed
     assert calls_after_first == 3  # 250 shards over 100-shard pages
+
+
+def test_poll_retires_a_closed_shard_instead_of_reusing_a_stale_iterator():
+    """A `GetRecords` with no `NextShardIterator` means the shard is drained/closed.
+
+    Reusing its final iterator on the next poll raises `ExpiredIteratorException` forever;
+    the source must instead retire the shard and stop polling it.
+    """
+
+    class _ClosingKinesis(_FakeKinesis):
+        def __init__(self) -> None:
+            super().__init__(shard_count=1)
+            self.get_records_calls = 0
+
+        def get_records(self, **kwargs: Any) -> dict[str, Any]:
+            self.get_records_calls += 1
+            # The shard hands back its last records and then closes (no next iterator).
+            return {"Records": [], "NextShardIterator": None}
+
+    fake = _ClosingKinesis()
+    src = _source(fake)
+    assert src._poll() == []  # drains and retires the shard
+    assert fake.get_records_calls == 1
+    assert src._poll() == []  # retired: no second GetRecords against a stale iterator
+    assert fake.get_records_calls == 1
+
+
+def test_is_throttle_matches_by_name_and_by_client_error_code():
+    from batcher.io.formats.streaming.kinesis import _is_throttle
+
+    class ProvisionedThroughputExceededException(Exception):
+        pass
+
+    class _ClientError(Exception):
+        def __init__(self, code):
+            self.response = {"Error": {"Code": code}}
+
+    assert _is_throttle(ProvisionedThroughputExceededException()) is True
+    assert _is_throttle(_ClientError("ProvisionedThroughputExceededException")) is True
+    assert _is_throttle(_ClientError("AccessDenied")) is False
+    assert _is_throttle(ValueError("nope")) is False
+
+
+def test_poll_skips_a_throttled_shard_instead_of_failing():
+    class _Throttle(Exception):
+        pass
+
+    _Throttle.__name__ = "ProvisionedThroughputExceededException"
+
+    class _ThrottlingKinesis(_FakeKinesis):
+        def __init__(self):
+            super().__init__(shard_count=1)
+            self.calls = 0
+
+        def get_records(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise _Throttle()  # first poll is throttled
+            return {"Records": [], "NextShardIterator": "iter-1"}
+
+    fake = _ThrottlingKinesis()
+    src = _source(fake)
+    assert src._poll() == []  # throttled shard skipped, no exception
+    assert fake.calls == 1
+    assert src._poll() == []  # next poll succeeds
+    assert fake.calls == 2

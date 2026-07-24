@@ -109,7 +109,7 @@ allowlist it with a reason.
 
 ## Before done
 
-`just check` → `just test-rust` → `cargo clippy --workspace --exclude bc-py -- -D warnings`
+`just check` → `just test-rust` → `cargo clippy --workspace --exclude bc-py --all-targets -- -D warnings`
 → `cargo fmt --all`. Touched the FFI surface or IR tags? Also `just build` + `just test-py`,
 and prove the boundary is unchanged with `just surface-diff`. New `bc-runtime` primitive?
 Add a `#[cfg(test)]` unit test **and** the mergeability invariant test; if stateful, test it

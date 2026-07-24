@@ -21,6 +21,7 @@ from batcher._internal.errors.hierarchy import (
     CompileError,
     ConfigError,
     DataQualityError,
+    DataWarning,
     ExecutionError,
     FatalShuffleError,
     FormatError,
@@ -37,6 +38,7 @@ from batcher._internal.errors.hierarchy import (
     unknown_value,
 )
 from batcher._internal.errors.suggest import (
+    absent_error,
     candidate_list,
     did_you_mean,
     suggestion,
@@ -53,6 +55,7 @@ __all__ = [
     "CompileError",
     "ConfigError",
     "DataQualityError",
+    "DataWarning",
     "ExecutionError",
     "FatalShuffleError",
     "FormatError",
@@ -66,6 +69,7 @@ __all__ = [
     "SchemaError",
     "SecurityWarning",
     "TransportError",
+    "absent_error",
     "candidate_list",
     "did_you_mean",
     "suggestion",

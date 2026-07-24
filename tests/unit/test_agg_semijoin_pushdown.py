@@ -137,6 +137,48 @@ def test_cost_gates_refuse_a_small_or_unprofitable_aggregate():
     assert _fire(ds, reduction=10**9) is None
 
 
+def test_refuses_when_recomputing_the_restricting_side_costs_more_than_the_aggregate():
+    # Q21's failure mode. The semi-join recomputes `node.left` a second time (once for its
+    # build, once for the outer join it already fed). When that side is a cheap dimension the
+    # cost is nothing; when it is *itself* the expensive relation — Q21's `supplier ⋈ lineitem
+    # ⋈ orders ⋈ nation` spine — recomputing it costs more than the aggregate the semi-join
+    # shrinks, so the plan the group-reduction ratio approves is a ~2x wall-time loss. The cost
+    # gate refuses exactly when `cost(node.left) >= cost(agg)`, independent of how favorable the
+    # cardinality looks. A stub cost model makes the two costs unambiguous.
+    from batcher.kyber.cost import Cost
+
+    ds = _decorrelated("left")
+    node = ds._plan
+    while not isinstance(node, Join):
+        node = node.input
+
+    def _ctx_with(cost_of_left: float):
+        est = StatsEstimator(ds._sources, learned={})
+
+        class _Costs:
+            def cost(self, n):
+                return Cost(cpu=cost_of_left) if n is node.left else Cost(cpu=1.0)
+
+        return OptimizerContext(
+            config=active_config(),
+            sources=ds._sources,
+            hub=None,
+            estimator=est,
+            cost_model=_Costs(),
+        )
+
+    old_ratio, old_floor = _mod._MIN_GROUP_REDUCTION, _mod._MIN_AGG_INPUT_ROWS
+    _mod._MIN_GROUP_REDUCTION, _mod._MIN_AGG_INPUT_ROWS = 0.0, 1.0
+    try:
+        # An expensive restricting side (cost 10^12 ≫ the aggregate's 1.0) refuses...
+        assert push_semijoin(node, _ctx_with(10**12)) is None
+        # ...while a cheap one (cost 0.1 < 1.0) still fires — the gate discriminates on cost,
+        # not merely on the plan shape both share.
+        assert push_semijoin(node, _ctx_with(0.1)) is not None
+    finally:
+        _mod._MIN_GROUP_REDUCTION, _mod._MIN_AGG_INPUT_ROWS = old_ratio, old_floor
+
+
 def test_optimizer_is_idempotent_with_the_rule_registered():
     # The rewrite puts a Join above the Aggregate it matched, so a rule that re-fired
     # on its own output would not converge. ENFORCE runs once; prove the whole

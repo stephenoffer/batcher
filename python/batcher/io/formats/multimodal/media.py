@@ -376,8 +376,7 @@ class MediaSource:
         try:
             return self._read_payload(path, materialize)
         except Exception as exc:
-            if not self._errors.tolerate(path, exc, format_name=self.format_name):
-                raise
+            self._errors.tolerate(path, exc, format_name=self.format_name)
             return None
 
     def corrupt_files(self) -> list[str]:

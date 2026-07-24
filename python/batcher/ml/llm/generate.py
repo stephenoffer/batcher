@@ -48,10 +48,12 @@ def llm_udf(
     adapter_column: str | None = None,
     max_tokens_column: str | None = None,
     temperature_column: str | None = None,
+    few_shot: list[tuple[str, str]] | None = None,
     parse_json: bool = False,
     usage: bool = False,
     finish_reason: bool = False,
     logprobs: bool = False,
+    dedup: bool = False,
 ) -> type:
     """A **load-once class UDF** that appends an LLM-generated column to each batch.
 
@@ -82,6 +84,8 @@ def llm_udf(
         temperature_column: optional column giving each row its own sampling temperature
             (a null uses the engine's default), so a factual extraction and a creative
             rewrite can share one pass over the data.
+        few_shot: fixed ``(input, output)`` demonstration pairs prepended to every prompt,
+            so the model is shown the task format once rather than per row in a template.
         parse_json: parse each output as JSON into a struct column (null on error).
         usage: also append ``prompt_tokens`` / ``completion_tokens``.
         finish_reason: also append a ``finish_reason`` column, so a generation truncated
@@ -89,6 +93,10 @@ def llm_udf(
         logprobs: also append a ``logprob`` column holding the generation's cumulative
             log-probability — the model's own confidence, for routing the least certain
             rows to review. Null for an engine that does not report one.
+        dedup: send each distinct prompt to the engine only once and copy its result to
+            every row that repeats it — a throughput win for deterministic decoding over a
+            corpus with duplicate prompts. Leave off when sampling and you want an
+            independent draw per row even for identical prompts.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus the
@@ -102,10 +110,12 @@ def llm_udf(
         adapter_column=adapter_column,
         max_tokens_column=max_tokens_column,
         temperature_column=temperature_column,
+        few_shot=tuple(tuple(pair) for pair in few_shot) if few_shot else None,
         parse_json=parse_json,
         usage=usage,
         finish_reason=finish_reason,
         logprobs=logprobs,
+        dedup=dedup,
     )
 
     class _LlmGenerate:
@@ -131,10 +141,12 @@ def llm_generate(
     adapter_column: str | None = None,
     max_tokens_column: str | None = None,
     temperature_column: str | None = None,
+    few_shot: list[tuple[str, str]] | None = None,
     parse_json: bool = False,
     usage: bool = False,
     finish_reason: bool = False,
     logprobs: bool = False,
+    dedup: bool = False,
     num_workers: int = 1,
     target_batch_rows: int | None = None,
 ) -> Iterator[pa.RecordBatch]:
@@ -174,6 +186,7 @@ def llm_generate(
         max_tokens_column: optional per-row token budget; a null uses the engine default.
         temperature_column: optional per-row sampling temperature; a null uses the
             engine default.
+        few_shot: fixed ``(input, output)`` demonstration pairs prepended to every prompt.
         parse_json: parse each output as JSON into a struct column (guided/structured
             decoding); on a parse error the row's value is null.
         usage: also append integer ``prompt_tokens`` and ``completion_tokens`` columns
@@ -187,6 +200,9 @@ def llm_generate(
             report one.
         logprobs: also append a float ``logprob`` column (the generation's cumulative
             log-probability). Null for an engine that does not report one.
+        dedup: run each distinct prompt through the engine only once and copy its result to
+            the rows that repeat it. A throughput win for deterministic decoding over a
+            corpus with duplicate prompts; leave off for independent samples per row.
         num_workers: how many engines to build **in this process** and run batches
             across. Leave at ``1`` for a GPU-resident engine: each worker calls
             `engine_factory` again, so ``2`` loads two full copies of the weights onto
@@ -211,10 +227,12 @@ def llm_generate(
         adapter_column=adapter_column,
         max_tokens_column=max_tokens_column,
         temperature_column=temperature_column,
+        few_shot=few_shot,
         parse_json=parse_json,
         usage=usage,
         finish_reason=finish_reason,
         logprobs=logprobs,
+        dedup=dedup,
     )
     if num_workers <= 1 and target_batch_rows is None:
         # The documented default: one engine, the caller's batches, in order. No pool,
@@ -271,9 +289,12 @@ def _generate_batch(
     from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 
     requests = _build_requests(spec, batch)
-    order = _length_sorted_order(requests)
+    # Collapse identical prompts to distinct requests when asked (`dedup`); the engine then
+    # runs each once and its result is copied to every row that shared it.
+    uniques, inverse = _dedup_requests(requests) if spec.dedup else (requests, None)
+    order = _length_sorted_order(uniques)
     with usage_sink().capture(), finish_reason_sink().capture(), logprob_sink().capture():
-        generated = list(engine([requests[i] for i in order]))
+        generated = list(engine([uniques[i] for i in order]))
         reported = _Reported(
             usage=usage_sink().collected(),
             reasons=finish_reason_sink().collected(),
@@ -281,12 +302,81 @@ def _generate_batch(
         )
     if len(generated) != len(order):
         raise _count_mismatch(engine, len(generated), len(order))
-    outputs = _restore_order(generated, order)
+    # Undo the length-sort (dispatch → unique order), then fan uniques back out to rows.
+    unique_outputs = _restore_order(generated, order)
+    outputs = _fan_out(unique_outputs, inverse)
+    row_reported = _row_reported(engine, reported, order, inverse, spec)
 
     arrays = [batch.column(i) for i in range(batch.num_columns)]
     arrays.append(_output_column(outputs, spec))
-    arrays += _reported_columns(engine, outputs, order, reported, spec)
+    # Everything is already in row order (order un-applied, uniques fanned out), so the
+    # column builders un-permute nothing: pass order=None.
+    arrays += _reported_columns(engine, outputs, None, row_reported, spec)
     return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, *spec.appended_columns])
+
+
+def _dedup_requests(requests: list) -> tuple[list, list[int]]:
+    """Collapse identical requests → ``(uniques, inverse)`` with ``inverse[row]`` its index.
+
+    Only plain-string requests are deduped. A dict request (per-row image, adapter, or
+    sampling override) is treated as unique — two rows with the same prompt but different
+    token budgets are genuinely different requests, and an image is not hashable anyway.
+    """
+    uniques: list = []
+    inverse: list[int] = []
+    seen: dict[str, int] = {}
+    for request in requests:
+        key = request if isinstance(request, str) else None
+        if key is not None and key in seen:
+            inverse.append(seen[key])
+            continue
+        position = len(uniques)
+        if key is not None:
+            seen[key] = position
+        uniques.append(request)
+        inverse.append(position)
+    return uniques, inverse
+
+
+def _fan_out(values: list, inverse: list[int] | None) -> list:
+    """Copy each unique value out to the rows that share it, or return it unchanged."""
+    if inverse is None:
+        return values
+    return [values[i] for i in inverse]
+
+
+def _row_reported(
+    engine: Engine,
+    reported: _Reported,
+    order: list[int],
+    inverse: list[int] | None,
+    spec: GenerateSpec,
+) -> _Reported:
+    """`reported` (dispatch order over uniques) restored and fanned out to row order.
+
+    Only the channels the spec asked for are resolved. Usage keeps the legacy
+    ``engine.last_usage`` fallback, un-permuted and fanned out the same way, so an engine
+    that reports usage only through that attribute still lines its counts up with the rows.
+    """
+    u = len(order)
+
+    def resolve(values: list | None, *, fallback: list | None = None) -> list | None:
+        chosen = values if values is not None else fallback
+        if chosen is None or len(chosen) != u:
+            return None
+        return _fan_out(_restore_order(chosen, order), inverse)
+
+    usage = reasons = logprobs = None
+    if spec.usage:
+        # A [None]*n list (not None) bypasses _usage_columns' own last_usage re-read, which
+        # would see the shorter unique-length list and raise a spurious count mismatch.
+        n = len(inverse) if inverse is not None else u
+        usage = resolve(reported.usage, fallback=getattr(engine, "last_usage", None)) or [None] * n
+    if spec.finish_reason:
+        reasons = resolve(reported.reasons)
+    if spec.logprobs:
+        logprobs = resolve(reported.logprobs)
+    return _Reported(usage=usage, reasons=reasons, logprobs=logprobs)
 
 
 class _Reported:

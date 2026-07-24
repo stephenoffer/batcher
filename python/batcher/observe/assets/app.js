@@ -20,6 +20,9 @@ const POLL_ACTIVE_MS = 1000;
 const POLL_IDLE_MS = 5000;
 const SYSTEM_EVERY_MS = 30000;
 const LEVELS = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+//: How many log rows to put in the DOM at once. Generous enough that scrolling feels
+//: unbounded, small enough that a repaint stays under a frame.
+const LOG_RENDER_CAP = 800;
 const $ = (id) => document.getElementById(id);
 
 /* Bind a handler, tolerating a missing element. `boot` wires ~40 controls, and an exception
@@ -38,13 +41,18 @@ const state = {
   // The three levels of the hierarchy. `pipeline` is a signature, `selected` a run id;
   // either being set is what makes that level's page meaningful.
   view: 'pipelines', pipeline: null, selected: null,
-  tab: 'steps', stepsView: 'plan', compareWith: null,
+  tab: 'steps', stepsView: 'plan', queryView: 'explain', compareWith: null,
   logCursor: 0, logLines: [], lastSystemAt: 0,
   logRange: null, logFields: new Map(), logPending: 0, logHistoGeom: null,
   detail: null, detailId: null, compare: null,
-  queries: [], pipelines: [], summary: {}, system: {}, operators: [],
+  queries: [], pipelines: [], summary: {}, system: {}, operators: [], live: null,
   pipelineSort: 'time', pipelineFilter: '', pipelineLayout: 'cards',
   paused: false, lastError: null, loaded: false, report: null, reportFor: null,
+  linkedShown: null,
+  // Query-viewer state. `explainCollapsed` is a set of op_ids, not a copy of the tree, so
+  // it survives the plan being re-fetched and can never describe a shape that changed.
+  explainCollapsed: new Set(), explainNeedle: '', explainOriginal: false,
+  irOriginal: false, diffShowAll: false,
 };
 
 const hashes = new Map();
@@ -65,45 +73,50 @@ async function getJSON(path) {
   return res.json();
 }
 
+/* The connection status, tolerant of a single hiccup.
+ *
+ * A poll can fail transiently — a navigation aborts an in-flight fetch, the engine is busy
+ * for a beat — and a full-width red "lost contact" banner on the strength of one miss is
+ * alarmist. So the pill flips to a quiet "reconnecting" on the first failure and only the
+ * *second consecutive* failure raises the banner; any success clears both at once. */
+let connFailures = 0;
 function setConnected(ok, message) {
   const el = $('conn');
-  el.textContent = ok ? (state.paused ? 'paused' : 'live') : 'disconnected';
-  el.className = `pill ${ok ? (state.paused ? '' : 'is-live') : 'is-down'}`;
-  $('error-banner').hidden = ok;
-  if (!ok && message) $('error-text').textContent = message;
+  if (ok) connFailures = 0; else connFailures += 1;
+  const down = connFailures >= 2;
+  el.textContent = ok ? (state.paused ? 'paused' : 'live') : (down ? 'disconnected' : 'reconnecting');
+  el.className = `pill ${ok ? (state.paused ? '' : 'is-live') : (down ? 'is-down' : 'is-warn')}`;
+  $('error-banner').hidden = !down;
+  if (down && message) $('error-text').textContent = message;
 }
+
+/* One poll, in two tiers.
+ *
+ * Everything used to be fetched every second, which meant a session with 100 retained runs
+ * recomputed every cross-run analysis on the server — percentiles, the operator rollup, the
+ * health report, the failure grouping — once a second, forever, to redraw panels whose
+ * inputs change only when a query *finishes*. The fast tier is what genuinely moves while a
+ * query runs; the slow tier is the rest, refreshed on a longer beat and immediately whenever
+ * the run count changes, so nothing is ever stale after something happens.
+ */
+const ANALYSIS_EVERY_MS = 6000;
 
 async function poll() {
   if (state.paused) { setTimeout(poll, POLL_IDLE_MS); return; }
   let running = 0;
   try {
-    const wants = [getJSON('/api/summary'), getJSON('/api/pipelines'), getJSON('/api/queries'),
-                   getJSON(`/api/logs?since=${state.logCursor}`), getJSON('/api/health'),
-                   getJSON('/api/timeseries'), getJSON('/api/operators'),
-                   getJSON('/api/failures')];
-    if (Date.now() - state.lastSystemAt > SYSTEM_EVERY_MS) wants.push(getJSON('/api/system'));
-    const [summary, pipelines, queries, logs, health, series, operators, failures, system] =
-      await Promise.all(wants);
+    const [summary, queries, logs, live] = await Promise.all([
+      getJSON('/api/summary'), getJSON('/api/queries'),
+      getJSON(`/api/logs?since=${state.logCursor}`), getJSON('/api/live'),
+    ]);
     running = summary.n_running || 0;
-    Object.assign(state, { summary, queries: queries.queries, pipelines: pipelines.pipelines,
-                           operators: operators.operators, loaded: true });
+    Object.assign(state, { summary, queries: queries.queries, loaded: true,
+                           live: live && live.query_id ? live : null });
 
-    paint('health', health, () => VIEWS.health(health));
     paint('kpis', summary, () => VIEWS.kpis(summary, flash));
-    paint('series', series, () => VIEWS.throughput(series));
-    paint('rollup', operators.operators, () => VIEWS.operatorRollup(operators.operators));
-    paint('split', pipelines.pipelines, () => VIEWS.timeSplit(pipelines.pipelines));
-    paint('failures', failures.groups, () => {
-      $('failure-count').textContent = failures.groups.reduce((n, g) => n + g.count, 0);
-      VIEWS.failures(failures.groups);
-    });
-    paint('attention', [queries.queries.filter((q) => q.status === 'error').map((q) => q.query_id),
-                        state.detail?.insights],
-          () => VIEWS.attention(queries.queries, state.detail?.insights));
-    renderPipelineList();
-    renderPipelinePage();
     ingestLogs(logs);
-    if (system) { state.lastSystemAt = Date.now(); state.system = system; paint('system', system, () => VIEWS.system(system)); }
+    renderLive();
+    await pollAnalysis(summary);
 
     if (state.selected) await loadDetail(state.selected);
     renderCrumbs();
@@ -117,6 +130,70 @@ async function poll() {
     $('idle-hint').hidden = !idle || state.paused;
     setTimeout(poll, idle ? POLL_IDLE_MS : POLL_ACTIVE_MS);
   }
+}
+
+/* The cross-run analyses. Refetched on a slow beat, or at once when the number of finished
+ * runs changes — the only event that can alter any of them. */
+let lastAnalysisAt = 0;
+let lastRunCount = -1;
+async function pollAnalysis(summary) {
+  const settled = (summary.n_queries || 0) - (summary.n_running || 0);
+  const due = Date.now() - lastAnalysisAt > ANALYSIS_EVERY_MS || settled !== lastRunCount;
+  if (!due) return;
+  lastAnalysisAt = Date.now();
+  lastRunCount = settled;
+
+  const wants = [getJSON('/api/pipelines'), getJSON('/api/health'), getJSON('/api/timeseries'),
+                 getJSON('/api/operators'), getJSON('/api/failures')];
+  if (Date.now() - state.lastSystemAt > SYSTEM_EVERY_MS) wants.push(getJSON('/api/system'));
+  const [pipelines, health, series, operators, failures, system] = await Promise.all(wants);
+  Object.assign(state, { pipelines: pipelines.pipelines, operators: operators.operators });
+
+  paint('health', health, () => VIEWS.health(health));
+  paint('series', series, () => VIEWS.throughput(series));
+  paint('rollup', operators.operators, () => VIEWS.operatorRollup(operators.operators));
+  paint('split', pipelines.pipelines, () => VIEWS.timeSplit(pipelines.pipelines));
+  paint('failures', failures.groups, () => {
+    $('failure-count').textContent = failures.groups.reduce((n, g) => n + g.count, 0);
+    VIEWS.failures(failures.groups);
+  });
+  paint('attention', [state.queries.filter((q) => q.status === 'error').map((q) => q.query_id),
+                      state.detail?.insights],
+        () => VIEWS.attention(state.queries, state.detail?.insights));
+  renderPipelineList();
+  renderPipelinePage();
+  if (system) {
+    state.lastSystemAt = Date.now();
+    state.system = system;
+    paint('system', system, () => VIEWS.system(system));
+  }
+}
+
+/* The live page, plus the dot on its nav tab.
+ *
+ * The dot is the whole reason a person on another page ever comes here: work that only
+ * matters while it is happening has to announce itself, or the page it lives on is only
+ * ever found after the fact. */
+function renderLive() {
+  // Sample first, unconditionally: the trends are built from readings taken over time, and
+  // sampling only while the page is visible would restart them on every navigation.
+  LIVE.observe(state.live);
+  const runningRuns = state.queries.filter((q) => q.status === 'running');
+  const dot = $('live-dot');
+  if (dot) dot.hidden = !runningRuns.length;
+  const badge = $('live-status');
+  if (badge) {
+    badge.hidden = !runningRuns.length && !state.live;
+    badge.className = `verdict ${runningRuns.length ? 'is-live' : ''}`;
+    badge.textContent = runningRuns.length
+      ? `${runningRuns.length} running` : 'nothing in flight';
+  }
+  // Drawing, unlike sampling, is skipped while the page is off screen — a live view builds
+  // gauges and a chart on every poll, and doing that for a hidden section is pure cost.
+  if (state.view !== 'live') return;
+  paint('live', [state.live, runningRuns.map((q) => [q.query_id, q.rows_seen, q.n_done])], () => {
+    LIVE.render(state.live, runningRuns, { onOpenRun: openRun });
+  });
 }
 
 function flash(el) {
@@ -165,20 +242,47 @@ function renderPipelineList() {
       onOpen: openPipeline,
       onPin: (sig) => { UI.togglePin(sig); invalidate('pipelines'); renderPipelineList();
                         UI.toast(UI.isPinned(sig) ? 'Pipeline pinned' : 'Pin removed'); },
+      onRename: renamePipeline,
     });
     VIEWS.pipelineTable(shown || state.pipelines, openPipeline);
-    const cards = state.pipelineLayout === 'cards';
-    $('pipeline-cards').hidden = !cards;
-    $('pipeline-table').hidden = cards;
-    $('lay-cards').classList.toggle('is-on', cards);
-    $('lay-table').classList.toggle('is-on', !cards);
-    $('lay-cards').setAttribute('aria-pressed', String(cards));
+    const lanes = state.pipelineLayout !== 'table';
+    $('pipeline-cards').hidden = !lanes;
+    $('pipeline-table').hidden = lanes;
+    $('lay-cards').classList.toggle('is-on', lanes);
+    $('lay-table').classList.toggle('is-on', !lanes);
+    $('lay-cards').setAttribute('aria-pressed', String(lanes));
     // Offered once, and only now: a tour of an empty dashboard points at nothing, so it
     // waits until there is real work on screen to point at.
     LEARN.maybeOfferTour(state.pipelines.length > 0);
-    $('lay-table').setAttribute('aria-pressed', String(!cards));
+    $('lay-table').setAttribute('aria-pressed', String(!lanes));
   });
 }
+
+/* Persist a pipeline's name. The dashboard's one write — it POSTs to the registry endpoint,
+ * updates the in-memory copy optimistically so the rename is instant, and re-renders. If the
+ * write fails (a read-only mount, say), it says so rather than pretending it stuck. */
+async function renamePipeline(signature, name) {
+  const p = state.pipelines.find((x) => x.signature === signature);
+  if (p) p.name = name;                     // optimistic; the next poll confirms from disk
+  invalidate('pipelines', 'pipeline-page');
+  renderPipelineList();
+  renderPipelinePage();
+  renderCrumbs();
+  try {
+    const res = await fetch('/api/pipeline/meta', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pipeline_id: signature, name }),
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    UI.toast(name ? `Named “${name}”` : 'Name cleared', 'good');
+  } catch (err) {
+    UI.toast('Could not save the name — the dashboard could not write to disk', 'warn');
+  }
+}
+
+/** A pipeline's display name: a person's, or one generated from its plan shape. */
+const pipelineDisplayName = (p) => (p ? DAG.pipelineName(p.plan_shape, p.name) : '');
 
 /* ---------- level 2: one pipeline ---------- */
 
@@ -218,6 +322,7 @@ function renderPipelinePage() {
     VIEWS.pipelineDetail(p, runs, {
       onOpenRun: openRun,
       onCompare: (runId, against) => openRun(runId, against),
+      onRename: renamePipeline,
     });
   });
 }
@@ -261,7 +366,7 @@ function showPipelineNodeTip(event, node, share) {
 
 function openPipeline(signature) {
   const p = state.pipelines.find((x) => x.signature === signature);
-  if (p) noteVisit('pipeline', signature, DAG.friendlyKind(p.label));
+  if (p) noteVisit('pipeline', signature, pipelineDisplayName(p));
   state.pipeline = signature;
   state.selected = null;
   state.detail = null;
@@ -286,6 +391,17 @@ function openRun(id, compareWith = null) {
   UI.writeRoute({ view: 'run', pipeline: state.pipeline || '', run: id, cmp: compareWith || '' });
   switchView('run');
   if (compareWith) switchTab('compare');
+  // While the detail is in flight, say "Loading…" rather than "Select a run" — the placeholder
+  // is for having chosen nothing, not for a choice that is a beat from arriving.
+  if (!state.detail || state.detailId !== id) {
+    $('d-title').textContent = 'Loading run…';
+    const empty = $('d-empty');
+    if (empty) { empty.hidden = false; empty.textContent = 'Loading this run…'; }
+  }
+  // Load the run's detail *now*, not on the next poll. Idle polling is every 5 s, so without
+  // this a click left the run page sitting on "Select a run" for up to five seconds — the
+  // single worst piece of navigation latency in the app.
+  loadDetail(id);
 }
 
 function goUp() {
@@ -312,15 +428,19 @@ function renderRelated(d) {
   const siblings = (d.siblings || []).slice().sort((a, b) => a.started_wall - b.started_wall);
   if (siblings.length < 2) { host.hidden = true; return; }
   host.hidden = false;
-  const slowest = Math.max(...siblings.map((r) => r.total_ms || 0), 1);
-  host.innerHTML = `<span class="rail-label">This pipeline's runs</span>` + siblings.map((r) => {
-    const h = Math.max(12, ((r.total_ms || 0) / slowest) * 100);
-    const cls = `related-dot${r.query_id === d.query_id ? ' is-current' : ''}` +
-                `${r.status === 'error' ? ' is-error' : ''}`;
-    return `<button class="${cls}" type="button" data-run="${UI.esc(r.query_id)}" ` +
-      `title="${UI.clock(r.started_wall)} · ${UI.ms(r.total_ms)}${r.status === 'error' ? ' · failed' : ''}">` +
-      `<i style="height:${h}%"></i></button>`;
-  }).join('');
+  // The same "bars whose height is a duration" the chart layer already draws. Built there
+  // rather than here so the run rail, the pipeline trend, and any future strip share one
+  // implementation instead of three that drift.
+  host.innerHTML = `<span class="rail-label">This pipeline's runs</span>` +
+    CHARTS.strip(siblings.map((r) => ({
+      id: r.query_id,
+      value: r.total_ms || 0,
+      current: r.query_id === d.query_id,
+      tone: r.status === 'error' ? 'error' : '',
+      label: `${UI.clock(r.started_wall)} ·${r.status === 'error' ? ' failed ·' : ''}`,
+    })), { height: 34, format: 'ms', onPick: true });
+  // `data-pick` carries the run id; route it through the same opener every other panel uses.
+  CHARTS.onPick(host, openRun);
 }
 
 function renderRunPosition() {
@@ -350,8 +470,7 @@ function installCrossReferences() {
     else if (el.dataset.pipe) { event.preventDefault(); openPipeline(el.dataset.pipe); }
     else if (el.dataset.op != null) {
       event.preventDefault();
-      switchTab('plan');
-      requestAnimationFrame(() => DAG.select(Number(el.dataset.op)));
+      focusStep(Number(el.dataset.op));
     }
   });
   // Keyboard parity for the rows that are buttons in spirit but divs in markup.
@@ -390,9 +509,14 @@ function renderRecentRail() {
 
 /* ---------- breadcrumb ---------- */
 
+//: The breadcrumb belongs only to the pipeline/run drill-down. Every top-level destination
+//: reached from the nav must hide it, or the trail from a run you left keeps claiming you
+//: are still inside it while you read the Logs. 'live' and 'learn' were missing.
+const TOP_LEVEL_VIEWS = new Set(['pipelines', 'live', 'logs', 'system', 'learn']);
+
 function renderCrumbs() {
   const crumbs = $('crumbs');
-  if (state.view === 'logs' || state.view === 'system' || state.view === 'pipelines') {
+  if (TOP_LEVEL_VIEWS.has(state.view)) {
     crumbs.hidden = true;
     return;
   }
@@ -400,8 +524,8 @@ function renderCrumbs() {
   const parts = [`<button class="crumb" data-go="pipelines" type="button">All pipelines</button>`];
   if (p) {
     parts.push(state.view === 'pipeline'
-      ? `<span class="crumb is-current" aria-current="page">${UI.esc(DAG.friendlyKind(p.label))}</span>`
-      : `<button class="crumb" data-go="pipeline" type="button">${UI.esc(DAG.friendlyKind(p.label))}</button>`);
+      ? `<span class="crumb is-current" aria-current="page">${UI.esc(pipelineDisplayName(p))}</span>`
+      : `<button class="crumb" data-go="pipeline" type="button">${UI.esc(pipelineDisplayName(p))}</button>`);
   }
   if (state.view === 'run' && state.detail) {
     parts.push(`<span class="crumb is-current" aria-current="page">Run at ${UI.clock(state.detail.started_wall)}</span>`);
@@ -448,9 +572,11 @@ function renderDetail(d) {
   $('d-story').innerHTML = VIEWS.story(d);
   VIEWS.statStrip(d);
   renderPlan(d);
-  VIEWS.timeline(d.dag?.nodes || []);
-  VIEWS.operators(d.dag?.nodes || [], (opId) => { switchTab('plan'); DAG.select(opId); });
+  renderStepsView(d);
+  renderQueryView(d);
+  VIEWS.operators(d.dag?.nodes || [], focusStep);
   VIEWS.insights(d.insights || [], d.query_id);
+  VIEWS.adaptive(d);
   VIEWS.decisions(d.decisions || []);
   renderRunLogs(d);
   VIEWS.meta(d);
@@ -459,6 +585,59 @@ function renderDetail(d) {
   renderRunPosition();
   renderRelated(d);
   renderCrumbs();
+}
+
+/** Show a step in the graph, from wherever it was named. Every panel that mentions an
+ *  operator routes here, so "show me this one" means the same thing everywhere. */
+function focusStep(opId) {
+  switchStepsView('plan');
+  requestAnimationFrame(() => DAG.select(Number(opId)));
+}
+
+/* The step renderings other than the graph. Each is cheap, but a run with 200 operators
+ * draws three of them for nothing if the reader is looking at the fourth — so only the
+ * visible one is built, and switching rebuilds it. */
+function renderStepsView(d) {
+  const nodes = d.dag?.nodes || [];
+  if (state.stepsView === 'timeline') VIEWS.timeline(nodes);
+  else if (state.stepsView === 'stages') PLAN.stages('stages', d.dag, focusStep);
+  else if (state.stepsView === 'flame') PLAN.flame('flame', nodes, focusStep);
+}
+
+/* The plan as a document: the text tree, the optimizer's diff, or the raw IR. */
+function renderQueryView(d) {
+  const diff = d.plan_diff || {};
+  const badge = $('diff-count');
+  if (badge) {
+    const primary = (diff.changes || []).filter((c) => c.primary).length;
+    badge.hidden = !primary;
+    badge.textContent = primary;
+  }
+  if (state.queryView === 'explain') renderExplain(d);
+  else if (state.queryView === 'diff') {
+    PLAN.diff('plan-diff', diff, { showAll: state.diffShowAll });
+  } else {
+    PLAN.ir('ir', state.irOriginal ? d.profile?.logical_ir : d.profile?.optimized_ir);
+  }
+}
+
+function renderExplain(d) {
+  const rows = state.explainOriginal ? d.logical_explain : d.explain;
+  const note = $('explain-note');
+  if (note) {
+    note.innerHTML = state.explainOriginal
+      ? 'The plan <b>as written</b>, before the optimizer touched it. It carries no timings — ' +
+        'this shape never ran.'
+      : 'The plan <b>as run</b>, with each step’s measured time. Click a row to open it in ' +
+        'the graph; the bar is its share of total step time.';
+  }
+  PLAN.explain('explain', rows || [], {
+    needle: state.explainNeedle,
+    collapsed: state.explainCollapsed,
+    // The graph and the text tree share one selection: picking a step in either must light
+    // it in the other, or they read as two unrelated views of unrelated plans.
+    selected: DAG.selectedNode()?.op_id ?? null,
+  });
 }
 
 /* Selection is shared between the graph and the ranked cost table: choosing a step in one
@@ -578,7 +757,8 @@ function renderRunLogs(d) {
   const end = start + (d.total_ms || 0) / 1000 + 0.25;
   const lines = state.logLines.filter((l) => l.wall >= start - 0.25 && l.wall <= end);
   $('run-logs').innerHTML = lines.length
-    ? `<p class="hint">Lines written while this run was executing.</p>` + lines.map(logLine).join('')
+    ? `<p class="hint">Lines written while this run was executing.</p>` +
+      lines.map((l, i) => VIEWS.logLine(l, i)).join('')
     : '<p class="empty">No log lines during this run. Raise the engine’s verbosity to see ' +
       'optimizer decisions — <span class="mono">observability.verbosity = "verbose"</span>.</p>';
 }
@@ -675,13 +855,42 @@ function renderLogs() {
         : `${lines.length} of ${fetched.length}`;
     }
     const host = $('logs');
+    // Only the newest slice is put in the DOM. A busy session retains thousands of lines,
+    // and rendering all of them costs a repaint on every poll to draw rows nobody has
+    // scrolled to. The cap is stated when it bites, because a list that silently stops is
+    // a list that claims to be complete.
+    const shownLines = lines.length > LOG_RENDER_CAP ? lines.slice(-LOG_RENDER_CAP) : lines;
+    const truncated = lines.length - shownLines.length;
     host.innerHTML = lines.length
-      ? lines.map((l, i) => VIEWS.logLine(l, i)).join('')
+      ? (truncated
+          ? `<p class="log-truncated">Showing the newest ${LOG_RENDER_CAP.toLocaleString()} of ` +
+            `${lines.length.toLocaleString()} matching lines. Narrow the filter or pick a ` +
+            `window on the histogram to see the earlier ones.</p>`
+          : '') +
+        shownLines.map((l, i) => VIEWS.logLine(l, i)).join('')
       : '<p class="empty">No lines match. Lower the level, clear the search, or raise the engine’s ' +
         'verbosity — <span class="mono">observability.verbosity = "verbose"</span> shows what the ' +
         'optimizer decided.</p>';
     if ($('log-follow').checked && !state.logRange) host.scrollTop = host.scrollHeight;
+    revealLinkedLine();
   });
+}
+
+/* Scroll to the line a copied link named, once, when it first appears.
+ *
+ * Once: the log list re-renders on every poll, and re-scrolling to an old line each time
+ * would fight a reader who has since scrolled somewhere else. */
+function revealLinkedLine() {
+  const seq = UI.readRoute().line;
+  if (!seq || state.linkedShown === seq) return;
+  const row = document.getElementById(`L${seq}`);
+  if (!row) return;                 // not in the fetched window yet; try again next render
+  state.linkedShown = seq;
+  // Following the tail would immediately scroll away from the line just landed on.
+  $('log-follow').checked = false;
+  row.classList.add('is-linked');
+  row.scrollIntoView({ block: 'center' });
+  announce(`Jumped to the linked log line`);
 }
 
 /* Drag across the histogram to select a time window.
@@ -748,7 +957,7 @@ function showLogContext(seq) {
   panel.innerHTML =
     `<div class="log-context-head">Lines around this one, ignoring filters` +
     `<button class="linkish" type="button" data-close-context>close</button></div>` +
-    around.map((l) => VIEWS.logLine(l, l.seq)).join('');
+    around.map((l) => VIEWS.logLine(l, l.seq, { anchored: false })).join('');
   panel.querySelector('[data-close-context]').addEventListener('click', () => panel.remove());
   // Mark the origin line inside the panel so the reader keeps their place.
   const marked = panel.querySelector(`[data-seq="${seq}"]`);
@@ -807,7 +1016,7 @@ const hideTip = () => { $('tip').hidden = true; };
 /* ---------- navigation ---------- */
 
 //: How deep each destination sits, so a transition can tell "drilled in" from "went back".
-const VIEW_DEPTH = { pipelines: 0, logs: 0, system: 0, pipeline: 1, run: 2 , learn: 0 };
+const VIEW_DEPTH = { pipelines: 0, live: 0, logs: 0, system: 0, learn: 0, pipeline: 1, run: 2 };
 
 function switchView(view) {
   // Direction encodes the move: down slides in from the right, up from the left. The
@@ -825,11 +1034,18 @@ function switchView(view) {
     t.setAttribute('aria-selected', String(on));
   }
   for (const s of document.querySelectorAll('.view')) s.classList.toggle('is-active', s.id === `view-${view}`);
+  moveInk('.viewnav');
   // The reference is static content, so it is drawn on arrival rather than by the poll loop.
   if (view === 'learn') LEARN.renderLearn($('learn-body'), $('learn-search').value);
+  // The live page is skipped by the poll loop while it is hidden, so arriving at it has to
+  // draw once rather than wait up to five seconds for the next tick.
+  if (view === 'live') { invalidate('live'); renderLive(); }
   UI.writeRoute({ view }, { replace: true });
   renderCrumbs();
   announce(`${view.replace('pipelines', 'all pipelines')} view`);
+  // A new destination starts at its top. Without this, drilling from a lane you scrolled to
+  // into its pipeline page left you halfway down that page, past the header and the plan.
+  window.scrollTo(0, 0);
   // Move focus to the new page's heading. Without this a keyboard user stays parked on the
   // link they clicked and has to tab back through the chrome to reach the content.
   const heading = $(`view-${view}`)?.querySelector('h1, h2');
@@ -843,7 +1059,7 @@ function switchView(view) {
 function updateDocumentTitle() {
   const parts = ['Batcher'];
   if (state.view === 'pipeline' && currentPipeline()) {
-    parts.unshift(DAG.friendlyKind(currentPipeline().label));
+    parts.unshift(pipelineDisplayName(currentPipeline()));
   } else if (state.view === 'run' && state.detail) {
     parts.unshift(`${DAG.friendlyKind(state.detail.label)} · ${UI.ms(state.detail.total_ms)}`);
   } else if (state.view !== 'pipelines') {
@@ -863,11 +1079,19 @@ function announce(message) {
  * were never worth the navigation. */
 const TAB_PANES = {
   steps: () => [`tab-${state.stepsView}`],
-  insights: () => ['tab-insights', 'tab-decisions'],
+  query: () => [`tab-${state.queryView}`],
+  insights: () => ['tab-insights', 'tab-adaptive', 'tab-decisions'],
   compare: () => ['tab-compare'],
   logs: () => ['tab-logs'],
   meta: () => ['tab-meta', 'tab-raw'],
 };
+
+//: Which rendering switch belongs above which tab. A switch shown over a tab it does not
+//: control is a control that appears to do nothing, which is worse than an absent one.
+const TAB_SWITCH = { steps: 'steps-switch', query: 'query-switch' };
+
+const STEPS_VIEWS = ['plan', 'stages', 'flame', 'timeline', 'operators'];
+const QUERY_VIEWS = ['explain', 'diff', 'ir'];
 
 function switchTab(tab) {
   state.tab = TAB_PANES[tab] ? tab : 'steps';
@@ -880,26 +1104,73 @@ function switchTab(tab) {
   for (const p of document.querySelectorAll('.tabpane')) {
     p.classList.toggle('is-active', shown.has(p.id));
   }
-  // The rendering switch belongs to Steps and would be meaningless above the others.
-  const sw = $('steps-switch');
-  if (sw) sw.hidden = state.tab !== 'steps';
+  moveInk('.tabs');
+  for (const [owner, id] of Object.entries(TAB_SWITCH)) {
+    const sw = $(id);
+    if (sw) sw.hidden = state.tab !== owner;
+  }
   UI.writeRoute({ tab: state.tab }, { replace: true });
   if (state.tab === 'steps' && state.stepsView === 'plan') {
     requestAnimationFrame(() => DAG.fit());
   }
 }
 
-/** Pick which rendering of the steps to show. The tab does not change — the subject is the
- *  same, only the view of it. */
-function switchStepsView(view) {
-  state.stepsView = ['plan', 'timeline', 'operators'].includes(view) ? view : 'plan';
-  UI.setPref('stepsView', state.stepsView);
-  for (const b of document.querySelectorAll('#steps-switch .seg')) {
-    const on = b.dataset.steps === state.stepsView;
+/* Put the travelling indicator under the active tab.
+ *
+ * Measured from the tab's own box rather than computed from an index, so it stays correct
+ * when a tab's label changes width, the density switch fires, or a narrow window wraps the
+ * row. Deferred to the next frame because a tab that has just become visible has no layout
+ * yet and would measure as zero-width. */
+function moveInk(container) {
+  const nav = typeof container === 'string' ? document.querySelector(container) : container;
+  const ink = nav?.querySelector('.viewnav-ink, .tabs-ink');
+  if (!ink) return;
+  requestAnimationFrame(() => {
+    const active = nav.querySelector('.is-active');
+    if (!active || !active.offsetWidth) { ink.style.opacity = '0'; return; }
+    ink.style.transform = `translateX(${active.offsetLeft}px)`;
+    ink.style.width = `${active.offsetWidth}px`;
+    ink.style.opacity = '1';
+  });
+}
+
+/** Keep both indicators in step with a resize, which changes every offset they read. */
+function installInkBars() {
+  const reposition = () => { moveInk('.viewnav'); moveInk('.tabs'); };
+  window.addEventListener('resize', UI.debounce(reposition, 80));
+  // A late web font changes every tab's width after the first paint.
+  if (document.fonts?.ready) document.fonts.ready.then(reposition);
+  reposition();
+}
+
+/** Mark one segmented control's buttons, so pressed state and ARIA never disagree. */
+function markSwitch(group, attr, value) {
+  for (const b of document.querySelectorAll(`#${group} .seg`)) {
+    const on = b.dataset[attr] === value;
     b.classList.toggle('is-on', on);
     b.setAttribute('aria-pressed', String(on));
   }
+}
+
+/** Pick which rendering of the steps to show. The tab does not change — the subject is the
+ *  same, only the view of it. */
+function switchStepsView(view) {
+  state.stepsView = STEPS_VIEWS.includes(view) ? view : 'plan';
+  UI.setPref('stepsView', state.stepsView);
+  markSwitch('steps-switch', 'steps', state.stepsView);
   switchTab('steps');
+  // Stages and flame are drawn from the detail document rather than by the poll loop, so
+  // arriving at one for the first time has to draw it.
+  if (state.detail) renderStepsView(state.detail);
+}
+
+/** Pick which rendering of the plan *document* to show. */
+function switchQueryView(view) {
+  state.queryView = QUERY_VIEWS.includes(view) ? view : 'explain';
+  UI.setPref('queryView', state.queryView);
+  markSwitch('query-switch', 'query', state.queryView);
+  switchTab('query');
+  if (state.detail) renderQueryView(state.detail);
 }
 
 /** Render the shortcut sheet from the one registry, so it cannot drift from what the keys
@@ -987,13 +1258,111 @@ function installSegmentedGroups() {
  * handler makes them all copyable, and a `data-copy-value` attribute overrides the visible
  * text when the two differ (a truncated id must copy in full). */
 function installCopyAnywhere() {
+  const grab = (el) => {
+    // The visible text may be truncated; `data-copy-value` carries the whole thing, so a
+    // 12-character preview of a plan signature still copies the signature.
+    const text = el.dataset.copyValue || el.textContent.trim().replace(/…$/, '');
+    UI.copy(text, 'Copied');
+  };
   document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-copyable]');
     if (!el) return;
     // Never hijack a selection: a reader highlighting part of a value wants that, not a copy.
     if (String(window.getSelection?.() || '').length) return;
-    UI.copy(el.dataset.copyValue || el.textContent.trim(), 'Copied');
+    grab(el);
   });
+  // These carry `tabindex="0"` and so are in the focus order. Something focusable that only
+  // responds to a mouse is a keyboard trap in miniature: you can reach it and not use it.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const el = e.target.closest('[data-copyable]');
+    if (!el) return;
+    e.preventDefault();
+    grab(el);
+  });
+}
+
+/* ---------- the query viewer ---------- */
+
+/* Everything the Explain / Diff / IR panes need, bound once by delegation. Their contents
+ * are rebuilt on every navigation between runs, so a per-element binding would go stale on
+ * the first redraw and the controls would silently stop working. */
+function installQueryViewer() {
+  on('explain-search', 'input', UI.debounce((e) => {
+    state.explainNeedle = e.target.value;
+    if (state.detail) renderExplain(state.detail);
+  }, 90));
+  on('explain-original', 'change', (e) => {
+    state.explainOriginal = e.target.checked;
+    // Collapsing is keyed by op_id, and the two plans number their operators differently.
+    // Carrying the set across would fold an unrelated subtree.
+    state.explainCollapsed.clear();
+    if (state.detail) renderExplain(state.detail);
+  });
+  on('explain-expand', 'click', () => {
+    const anyClosed = state.explainCollapsed.size > 0;
+    state.explainCollapsed.clear();
+    if (!anyClosed) {
+      // Collapse to the roots: every operator that has something nested under it.
+      const rows = (state.explainOriginal ? state.detail?.logical_explain : state.detail?.explain) || [];
+      for (let i = 1; i < rows.length; i += 1) {
+        if (rows[i].depth > rows[i - 1].depth && rows[i - 1].depth > 0) {
+          state.explainCollapsed.add(rows[i - 1].op_id);
+        }
+      }
+    }
+    $('explain-expand').textContent = state.explainCollapsed.size ? 'Expand all' : 'Collapse all';
+    if (state.detail) renderExplain(state.detail);
+  });
+  on('explain-copy', 'click', copyExplain);
+
+  const explainHost = $('explain');
+  if (explainHost) {
+    explainHost.addEventListener('click', (e) => {
+      const twisty = e.target.closest('[data-collapse]');
+      if (!twisty) return;
+      e.stopPropagation();
+      const id = Number(twisty.dataset.collapse);
+      if (state.explainCollapsed.has(id)) state.explainCollapsed.delete(id);
+      else state.explainCollapsed.add(id);
+      if (state.detail) renderExplain(state.detail);
+    });
+  }
+
+  on('plan-diff', 'click', (e) => {
+    if (!e.target.closest('[data-show-all]')) return;
+    state.diffShowAll = true;
+    if (state.detail) renderQueryView(state.detail);
+  });
+
+  for (const [id, original] of [['ir-optimized', false], ['ir-logical', true]]) {
+    on(id, 'click', () => {
+      state.irOriginal = original;
+      $('ir-optimized').classList.toggle('is-on', !original);
+      $('ir-logical').classList.toggle('is-on', original);
+      $('ir-optimized').setAttribute('aria-pressed', String(!original));
+      $('ir-logical').setAttribute('aria-pressed', String(original));
+      if (state.detail) renderQueryView(state.detail);
+    });
+  }
+  on('ir-copy', 'click', () => {
+    const doc = state.irOriginal ? state.detail?.profile?.logical_ir : state.detail?.profile?.optimized_ir;
+    if (!doc) return UI.toast('No plan document for this run', 'warn');
+    UI.copy(JSON.stringify(doc, null, 2), 'Plan document copied');
+  });
+}
+
+function copyExplain() {
+  const rows = (state.explainOriginal ? state.detail?.logical_explain : state.detail?.explain) || [];
+  if (!rows.length) return UI.toast('No plan to copy', 'warn');
+  UI.copy(PLAN.explainText(rows), 'Plan copied as text');
+}
+
+/* Every chart raises `chart-hover` / `chart-leave` rather than reaching for the tooltip
+ * itself, so the plots stay renderers and there is one tooltip on the page. */
+function installChartTooltips() {
+  document.addEventListener('chart-hover', (e) => showTip(e.detail.event, e.detail.html));
+  document.addEventListener('chart-leave', hideTip);
 }
 
 /* ---------- command palette ---------- */
@@ -1002,6 +1371,7 @@ function installCopyAnywhere() {
 
 const ACTIONS = [
   { id: 'view-pipelines', label: 'All pipelines', keys: 'g p', run: () => switchView('pipelines') },
+  { id: 'view-live', label: 'Live — what is running now', keys: 'g r', run: () => switchView('live') },
   { id: 'view-logs', label: 'Logs', keys: 'g l', run: () => switchView('logs') },
   { id: 'view-system', label: 'System', keys: 'g s', run: () => switchView('system') },
   { id: 'up', label: 'Up one level', keys: 'u', run: goUp },
@@ -1018,17 +1388,24 @@ const ACTIONS = [
   { id: 'help', label: 'Toggle inline explanations', keys: 'e', run: toggleHelp },
   { id: 'fit', label: 'Fit plan to view', keys: 'f', run: () => DAG.fit() },
   { id: 'steps-graph', label: 'Show steps as a graph', run: () => switchStepsView('plan') },
-  { id: 'steps-timeline', label: 'Show steps as a timeline', run: () => switchStepsView('timeline') },
+  { id: 'steps-stages', label: 'Show steps grouped into pipeline stages', run: () => switchStepsView('stages') },
+  { id: 'steps-flame', label: 'Show steps as a flame graph', run: () => switchStepsView('flame') },
+  { id: 'steps-timeline', label: 'Show steps ranked by duration', run: () => switchStepsView('timeline') },
   { id: 'steps-table', label: 'Show steps as a table', run: () => switchStepsView('operators') },
+  { id: 'explain', label: 'Explain this query (the plan as text)', keys: 'x',
+    run: () => switchQueryView('explain') },
+  { id: 'plan-diff', label: 'Show what the optimizer changed', run: () => switchQueryView('diff') },
+  { id: 'plan-ir', label: 'Show the raw plan document', run: () => switchQueryView('ir') },
+  { id: 'copy-explain', label: 'Copy the plan as text', run: copyExplain },
   { id: 'critical', label: 'Toggle critical path', keys: 'c', run: () => {
       const box = $('dag-critical'); box.checked = !box.checked; DAG.setCritical(box.checked); } },
   { id: 'export-run', label: 'Download this run as JSON', run: exportRun },
   { id: 'export-pipelines', label: 'Download the pipeline list as CSV', run: exportPipelines },
   { id: 'export-ops', label: 'Download the operator table as CSV', run: exportOperators },
   { id: 'copy-link', label: 'Copy a link to this view', run: () => UI.copy(location.href, 'Link copied') },
-  { id: 'learn', label: 'Open the reference (terms, plan steps, how-tos)', run: () => setView('learn') },
-  { id: 'tour', label: 'Take the guided tour', run: () => { setView('pipelines'); setTimeout(LEARN.startTour, 60); } },
-  { id: 'glossary', label: 'Look up a term in the glossary', run: () => setView('learn') },
+  { id: 'learn', label: 'Open the reference (terms, plan steps, how-tos)', run: () => switchView('learn') },
+  { id: 'tour', label: 'Take the guided tour', run: () => { switchView('pipelines'); setTimeout(LEARN.startTour, 60); } },
+  { id: 'glossary', label: 'Look up a term in the glossary', run: () => switchView('learn') },
 ];
 
 /** How well `needle` matches `text`: 4 exact, 3 prefix, 2 word-start, 1 subsequence, 0 none.
@@ -1046,7 +1423,7 @@ function paletteItems(needle) {
   const items = ACTIONS.map((a) => ({ ...a, group: 'Action' }));
   for (const p of state.pipelines) {
     items.push({ id: `pipe-${p.signature}`, group: 'Pipeline',
-                 label: `${DAG.friendlyKind(p.label)} — ${p.runs} runs, ${UI.ms(p.median_ms)} typical`,
+                 label: `${pipelineDisplayName(p)} — ${p.runs} runs, ${UI.ms(p.median_ms)} typical`,
                  run: () => { rememberPaletteChoice(`pipe-${p.signature}`); openPipeline(p.signature); } });
   }
   for (const q of state.queries.slice(0, 40)) {
@@ -1215,6 +1592,8 @@ function toggleDensity() {
   const next = UI.getPref('density') === 'compact' ? 'comfortable' : 'compact';
   UI.setPref('density', next);
   document.body.classList.toggle('is-compact', next === 'compact');
+  // Density changes every tab's box, so the travelling indicator has to be re-measured.
+  moveInk('.viewnav'); moveInk('.tabs');
   UI.toast(`Density: ${next}`);
 }
 function toggleHelp() {
@@ -1261,7 +1640,10 @@ function boot() {
   applyTheme(UI.getPref('theme'));
   document.body.classList.toggle('is-compact', UI.getPref('density') === 'compact');
   document.body.classList.toggle('help-on', UI.getPref('help'));
-  state.stepsView = UI.getPref('stepsView') || 'plan';
+  state.stepsView = STEPS_VIEWS.includes(UI.getPref('stepsView')) ? UI.getPref('stepsView') : 'plan';
+  state.queryView = QUERY_VIEWS.includes(UI.getPref('queryView')) ? UI.getPref('queryView') : 'explain';
+  markSwitch('steps-switch', 'steps', state.stepsView);
+  markSwitch('query-switch', 'query', state.queryView);
   $('help').setAttribute('aria-pressed', String(UI.getPref('help')));
   $('log-level').value = UI.getPref('logLevel');
   $('log-follow').checked = UI.getPref('logFollow');
@@ -1276,10 +1658,11 @@ function boot() {
   // Routes saved before the tab consolidation still name a retired pane; map them onto the
   // section that absorbed them rather than dropping the reader on an empty page.
   if (route.tab) {
-    const LEGACY = { plan: 'steps', timeline: 'steps', operators: 'steps',
-                     decisions: 'insights', raw: 'meta' };
-    const stepView = ['plan', 'timeline', 'operators'].includes(route.tab) ? route.tab : null;
-    if (stepView) state.stepsView = stepView;
+    const LEGACY = { plan: 'steps', timeline: 'steps', operators: 'steps', stages: 'steps',
+                     flame: 'steps', decisions: 'insights', raw: 'meta',
+                     explain: 'query', diff: 'query', ir: 'query' };
+    if (STEPS_VIEWS.includes(route.tab)) state.stepsView = route.tab;
+    if (QUERY_VIEWS.includes(route.tab)) state.queryView = route.tab;
     switchTab(LEGACY[route.tab] || route.tab);
   }
   switchView(route.view || 'pipelines');
@@ -1293,6 +1676,10 @@ function boot() {
   for (const b of document.querySelectorAll('#steps-switch .seg')) {
     b.addEventListener('click', () => switchStepsView(b.dataset.steps));
   }
+  for (const b of document.querySelectorAll('#query-switch .seg')) {
+    b.addEventListener('click', () => switchQueryView(b.dataset.query));
+  }
+  installQueryViewer();
   for (const c of document.querySelectorAll('.status-chip')) {
     c.addEventListener('click', () => {
       c.classList.toggle('is-on');
@@ -1389,10 +1776,15 @@ function boot() {
       }
       const perma = e.target.closest('[data-permalink]');
       if (perma) {
-        const id = `L${perma.dataset.permalink}`;
+        // A route parameter, not a bare `#L123` fragment. The whole page is addressed by
+        // the hash, so a fragment written into it wiped the view, the pipeline, and the run
+        // — the copied link reopened the dashboard on the overview with no log line in
+        // sight, which is the opposite of what "copy a link to this line" promises.
         for (const row of logHost.querySelectorAll('.logline')) row.classList.remove('is-linked');
         perma.closest('.logline')?.classList.add('is-linked');
-        UI.copy(`${location.href.split('#')[0]}#${id}`, 'Link to line copied');
+        const seq = perma.dataset.permalink;
+        UI.copy(`${location.href.split('#')[0]}#view=logs&line=${encodeURIComponent(seq)}`,
+                'Link to line copied');
       }
     });
   }
@@ -1417,10 +1809,10 @@ function boot() {
     if (!action) return;
     const id = action.getAttribute('data-empty-action');
     if (id === 'tour') LEARN.startTour();
-    if (id === 'learn') setView('learn');
+    if (id === 'learn') switchView('learn');
   });
   on('learn-search', 'input', UI.debounce(() => LEARN.renderLearn($('learn-body'), $('learn-search').value), 120));
-  on('learn-tour', 'click', () => { setView('pipelines'); setTimeout(LEARN.startTour, 60); });
+  on('learn-tour', 'click', () => { switchView('pipelines'); setTimeout(LEARN.startTour, 60); });
   on('pause', 'click', togglePause);
   on('refresh', 'click', () => { invalidateAll(); poll(); UI.toast('Refreshed'); });
   on('palette-open', 'click', () => showModal('palette'));
@@ -1437,8 +1829,21 @@ function boot() {
   window.addEventListener('hashchange', () => {
     const r = UI.readRoute();
     if (r.pipeline !== state.pipeline) { state.pipeline = r.pipeline || null; invalidate('pipeline-page'); }
-    if ((r.run || null) !== state.selected) { state.selected = r.run || null; invalidate('detail'); }
+    if ((r.run || null) !== state.selected) {
+      state.selected = r.run || null;
+      invalidate('detail');
+      // Back/forward to a run loads it now rather than after the next poll (up to 5 s idle).
+      if (state.selected) loadDetail(state.selected);
+    }
     if (r.view && r.view !== state.view) switchView(r.view);
+    // Sync the run-detail tab and sub-view too, so a shared link to a run's Query or Findings
+    // tab opens there — not only on a fresh load but on any hash change, which is what the
+    // browser's back/forward buttons produce.
+    if (r.tab) {
+      if (STEPS_VIEWS.includes(r.tab)) switchStepsView(r.tab);
+      else if (QUERY_VIEWS.includes(r.tab)) switchQueryView(r.tab);
+      else if (r.tab !== state.tab) switchTab(r.tab);
+    }
   });
 
   // KPIs summarise something; make them the way to it.
@@ -1451,8 +1856,24 @@ function boot() {
     const spilled = state.queries.find((q) => (q.n_stages || 0) > 0 && q.status === 'ok');
     if (spilled) openRun(spilled.query_id);
   });
+  // Every summary KPI is a way *to* the thing it counts: pipelines and runs jump to the
+  // list, running work jumps to the Live page. A tile that leads somewhere says so (the
+  // cursor and hover come from `is-clickable`, set on render for these).
+  for (const [id, run] of [
+    ['k-pipelines', () => { switchView('pipelines'); $('pipeline-cards')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }],
+    ['k-queries', () => { switchView('pipelines'); $('pipeline-cards')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }],
+    ['k-running', () => switchView('live')],
+  ]) {
+    const kpi = up($(id), '.kpi');
+    if (kpi) {
+      kpi.classList.add('is-clickable');
+      kpi.setAttribute('tabindex', '0');
+      kpi.setAttribute('role', 'button');
+      on(kpi, 'click', run);
+    }
+  }
   // Enter or Space on a focused, actionable KPI does what a click does.
-  for (const el of ['k-failed', 'k-spill']) {
+  for (const el of ['k-failed', 'k-spill', 'k-pipelines', 'k-queries', 'k-running']) {
     on(up($(el), '.kpi'), 'keydown', (e) => {
       if ((e.key === 'Enter' || e.key === ' ') && e.currentTarget.classList.contains('is-clickable')) {
         e.preventDefault();
@@ -1476,8 +1897,26 @@ function boot() {
 
   installShortcuts();
   installCrossReferences();
+  installChartTooltips();
+  installInkBars();
+  installBackToTop();
   renderRecentRail();
   poll();
+}
+
+/* The back-to-top button: shown only once there is enough page above to want it, and it
+ * takes focus to the top so a keyboard user is not dropped back where they were. */
+function installBackToTop() {
+  const btn = $('to-top');
+  if (!btn) return;
+  const update = () => { btn.hidden = window.scrollY < 600; };
+  window.addEventListener('scroll', update, { passive: true });
+  btn.addEventListener('click', () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    const heading = document.querySelector('.view.is-active h1, .view.is-active h2');
+    if (heading) { heading.setAttribute('tabindex', '-1'); heading.focus({ preventScroll: true }); }
+  });
+  update();
 }
 
 let chord = null;
@@ -1502,7 +1941,7 @@ function installShortcuts() {
     // `g` then a letter jumps between views, the convention every developer tool uses.
     if (chord === 'g') {
       chord = null;
-      const target = { p: 'pipelines', l: 'logs', s: 'system' }[e.key];
+      const target = { p: 'pipelines', r: 'live', l: 'logs', s: 'system', h: 'learn' }[e.key];
       if (target) { e.preventDefault(); switchView(target); }
       return;
     }
@@ -1513,6 +1952,9 @@ function installShortcuts() {
     else if (e.key === 'e') toggleHelp();
     else if (e.key === 'v') setPipelineLayout(state.pipelineLayout === 'cards' ? 'table' : 'cards');
     else if (e.key === 'u') goUp();
+    else if (e.key === 'Home') { e.preventDefault(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+    else if (e.key === 'End') { e.preventDefault(); window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); }
+    else if (e.key === 'x' && state.view === 'run') switchQueryView('explain');
     else if (e.key === 'j') stepRun(-1);
     else if (e.key === 'k') stepRun(1);
     else if (e.key === 'r') { invalidateAll(); poll(); UI.toast('Refreshed'); }

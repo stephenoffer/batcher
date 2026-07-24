@@ -28,7 +28,6 @@ readable, so the omission is discoverable rather than silent.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterator
 from typing import IO, Any, ClassVar
 
@@ -118,12 +117,7 @@ class MDFSource(FileSource):
             The base file identity, suffixed with a digest of the sorted signal set when
             `signals` is set.
         """
-        base = super().identity()
-        if self._signals is None:
-            return base
-        digest = hashlib.sha256("\n".join(sorted(self._signals)).encode()).hexdigest()[:16]
-        sep = "&" if "#" in base else "#"
-        return f"{base}{sep}signals={digest}"
+        return self._subset_identity(super().identity(), "signals", self._signals)
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         """Read from an open handle — the template's fallback when no path is available."""

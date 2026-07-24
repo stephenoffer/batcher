@@ -53,9 +53,15 @@ path (one footer read instead of N), and it is the right default when every file
 does share a schema. It is a lie the moment they do not.
 
 If the *type* moved rather than the column set (`amount` written as `int32` in January
-and `float64` in March), strict is worse than silent. It hands the decoder the January
-types and the read fails outright on the March file. An error you can see beats a column
-you cannot, but neither is what you wanted.
+and `float64` in March), strict does not go quiet. The first file's type is the contract,
+March cannot be cast to it without losing the fractional part, and the read stops with a
+`SchemaError` naming the file, the column, both types, and `schema_mode="union"` as the
+fix. An error you can see beats a column you cannot, but neither is what you wanted.
+
+A file that is *missing* a declared column fails the same way and for the same reason:
+strict promised that column for the whole directory. Only an **extra** column is dropped
+rather than reported, because it was never part of the contract the first file set. That
+is the one case above, and the reason it is the dangerous one.
 
 ## Union: read every footer, reconcile
 

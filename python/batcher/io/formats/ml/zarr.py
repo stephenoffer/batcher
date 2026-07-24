@@ -20,6 +20,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.mathx import ceil_div
 from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.ml._ndarray import schema_from_array_meta, slice_to_batch
@@ -113,7 +114,7 @@ class ZarrSource:
             chunk = int(array.chunks[0]) or n or 1
         except Exception:
             return None
-        groups = -(-n // chunk) if n else 0  # ceil, matching `splits` block count
+        groups = ceil_div(n, chunk) if n else 0  # ceil, matching `splits` block count
         return SourceStatistics(row_count=n, exact_rows=True, row_group_count=groups)
 
     def identity(self) -> str:

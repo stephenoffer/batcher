@@ -1067,7 +1067,7 @@ mod tests {
 
     fn check_i64(vals: Vec<Option<i64>>) {
         let arr: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
-        let (ids, n, cols) = assign_groups(&[arr.clone()], vals.len()).unwrap();
+        let (ids, n, cols) = assign_groups(std::slice::from_ref(&arr), vals.len()).unwrap();
         let (want_ids, want_n, want_reps) = reference(&vals);
         assert_eq!(ids, want_ids, "group_ids for {vals:?}");
         assert_eq!(n, want_n, "num_groups for {vals:?}");
@@ -1287,7 +1287,7 @@ mod tests {
     /// A narrower int type takes the same dense path.
     #[test]
     fn dense_i32_keys_match_reference() {
-        let vals: Vec<i32> = (0..1000).map(|i| (i % 37) as i32).collect();
+        let vals: Vec<i32> = (0..1000).map(|i| i % 37).collect();
         let arr: ArrayRef = Arc::new(Int32Array::from(vals.clone()));
         let (ids, n, _) = assign_groups(&[arr], vals.len()).unwrap();
         let as_i64: Vec<Option<i64>> = vals.iter().map(|&v| Some(v as i64)).collect();

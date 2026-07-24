@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from decimal import Decimal
 from typing import Any
 
+from batcher.kyber.stats.distribution import residual_eq_frequency
 from batcher.plan.expr_ir import Binary, Col, Lit
 
 _COMPARISONS = {"lt", "le", "gt", "ge"}
@@ -110,15 +111,20 @@ def _point_mass(
 ) -> float:
     """`P(col = value)` — the probability mass sitting exactly on a range boundary.
 
-    A measured most-common-value frequency when the literal is a known skew value, else
-    the uniform `1/ndv`. Zero when the distinct count is unknown, which degrades the
-    strict/non-strict distinction back to none rather than inventing a mass.
+    A measured most-common-value frequency when the literal is a known skew value; else the
+    *residual* uniform frequency, which is what is left for a value the MCV table does not
+    list (`residual_eq_frequency`) rather than the whole column's `1/ndv`. Zero when the
+    distinct count is unknown, which degrades the strict/non-strict distinction back to none
+    rather than inventing a mass.
     """
-    freq = _mcv_lookup(mcv.get(col), value)
+    col_mcv = mcv.get(col)
+    freq = _mcv_lookup(col_mcv, value)
     if freq is not None:
         return max(0.0, min(1.0, freq))
     d = ndv.get(col)
-    return 1.0 / d if d and d > 0 else 0.0
+    if not d or d <= 0:
+        return 0.0
+    return residual_eq_frequency(d, col_mcv, default=0.0)
 
 
 def _outside_bounds(value: Any, bound: tuple[Any, Any] | None) -> bool:

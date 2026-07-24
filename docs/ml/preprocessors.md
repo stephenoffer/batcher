@@ -207,6 +207,7 @@ does. Stateless entries learn nothing and only need a `fit` call to satisfy the 
 | `OrdinalEncoder` | sorted categories | integer code per category |
 | `LabelEncoder` | sorted classes | integer code for one target column |
 | `OneHotEncoder` | categories | one 0/1 indicator column per category |
+| `BinaryEncoder` | categories | the category's integer code in base 2, one column per bit |
 | `MultiHotEncoder` | distinct list elements | one 0/1 indicator column per category, for a list column |
 | `TargetEncoder` | per-category target mean, global prior | smoothed mean-target code per high-cardinality category |
 | `KBinsDiscretizer` | bin edges, quantile or uniform | integer bin index `0..n_bins-1` |
@@ -215,6 +216,15 @@ does. Stateless entries learn nothing and only need a `fit` call to satisfy the 
 | `Concatenator` | nothing, stateless | stack columns into one tensor column |
 | `PolynomialFeatures` | nothing, stateless | add interaction and power terms such as `a*b` and `a^2` up to a degree |
 | `Tokenizer` | nothing, stateless | tokenize text with a user tokenizer |
+| `QuantileTransformer` | `n_quantiles` cut points | map onto a uniform or normal distribution by rank |
+| `PowerTransformer` | the Yeo-Johnson lambda, by maximum likelihood | make a skewed column more Gaussian |
+| `BoxCoxTransformer` | the Box-Cox lambda, by maximum likelihood | the same, for a strictly positive column |
+| `LogTransformer` | nothing, stateless | `log(x + offset)`, the explainable shape fix |
+| `Clipper` | lower and upper quantiles | clamp values into the learned range |
+| `MissingIndicator` | nothing, stateless | append a boolean flag per column, before imputation |
+| `FrequencyEncoder` | per-category frequency | replace a category with how often it occurs |
+| `RareCategoryEncoder` | the categories clearing `min_frequency` | collapse the tail into one bucket |
+| `HashingEncoder` | nothing, stateless | hash a category into one of `n_buckets` |
 
 All preprocessors share the `Preprocessor` base contract of `fit`, `transform`, and
 `fit_transform`.
@@ -223,6 +233,250 @@ Each scaler matches scikit-learn's definitions, and `StandardScaler` uses popula
 variance. `fit` lowers to the existing `group_by().agg(...)` and `distinct()`
 operators, so it is partition-independent. A fit on a distributed dataset learns the
 same statistics as a single-node fit.
+
+## Rank and label transforms
+
+`RankTransformer` replaces a value with its percentile rank — like `QuantileTransformer` it
+keeps only the order and is immune to outliers, but it is exact (every distinct value gets its
+own rank) rather than binned, which matters on a small column.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import RankTransformer
+
+ds = bt.from_pydict({"x": [10.0, 40.0, 20.0, 1000.0]})
+print(RankTransformer("x").fit_transform(ds).to_pydict()["x"])
+```
+
+`LabelBinarizer` one-vs-rest expands a categorical *label* into a 0/1 column per class — the
+target-side counterpart of one-hot encoding, for a per-class metric or a set of binary models.
+`MultiLabelBinarizer` does the same for a *list* column, where a row can carry many labels at
+once (tags, genres), which is the standard input shaping for a multi-label classifier.
+
+## Reshaping a distribution
+
+Scaling changes a column's units; these change its *shape*, which is what a linear model,
+a distance metric, and a neural net actually need. Standardizing a log-normal column leaves
+it just as skewed, with a mean still sitting at the 70th percentile.
+
+`QuantileTransformer` is the most aggressive and the most reliable: it keeps only the
+*order* of the values, so the output is uniform whatever went in and an outlier cannot
+survive it.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import QuantileTransformer
+
+ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 1000.0]})
+print(QuantileTransformer("x", n_quantiles=4).fit_transform(ds).to_pydict())
+```
+
+`PowerTransformer` is the data-driven middle ground. It finds the Yeo-Johnson power that
+makes the column most Gaussian by maximum likelihood — and does it in **one pass**, because
+the likelihood at every candidate lambda is an aggregate, so the whole grid is evaluated
+together rather than one scan per optimizer iteration.
+
+```python
+from batcher.ml.preprocessors import PowerTransformer
+
+skewed = bt.from_pydict({"x": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]})
+print(PowerTransformer("x").fit(skewed).lambdas_["x"] < 0.5)
+```
+
+`BoxCoxTransformer` fits the same way on the Box-Cox family, which is what most statistics tooling means by "the Box-Cox transform". It needs strictly positive values and raises on anything else rather than producing NaNs, so use it when reproducing an existing Box-Cox analysis and `PowerTransformer` when the column can be zero or negative.
+
+```python
+from batcher.ml.preprocessors import BoxCoxTransformer
+
+positive = bt.from_pydict({"x": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]})
+print(-2.0 <= BoxCoxTransformer("x").fit(positive).lambdas_["x"] <= 2.0)
+```
+
+`LogTransformer` is the version an analyst can defend to a stakeholder: `log1p` is exactly
+right for a multiplicative quantity, it is stateless, and it needs no explanation of what a
+lambda of 0.3 means.
+
+`Clipper` clamps into a learned quantile range rather than dropping anything, so the row
+count and every join key survive. Applying the *training* cut points to serving data is the
+point: a new record-breaking value is clamped rather than extrapolated into a region the
+model never saw.
+
+`MissingIndicator` records which values were missing **before** an imputer fills them.
+Missingness is usually a signal — a blank income field means something different from a low
+one — and imputing first destroys it permanently.
+
+```python
+from batcher.ml.preprocessors import Chain, MissingIndicator, SimpleImputer
+
+ds = bt.from_pydict({"income": [50000.0, None, 70000.0]})
+flagged = Chain(MissingIndicator("income"), SimpleImputer(["income"])).fit_transform(ds)
+print(flagged.to_pydict()["income_missing"])
+```
+
+## Features from a timestamp
+
+A raw timestamp is the least useful column in a feature table. A tree model can only split
+it into "before and after some instant", which generalizes to nothing; a linear model treats
+it as a number that grows forever. What a model can learn from is the *parts*, because those
+repeat.
+
+`DateTimeFeaturizer` expands a timestamp into calendar parts as ordinary integer columns,
+which is what a tree wants — it can split on "hour >= 18" directly.
+
+```python
+import datetime as dt
+
+import batcher as bt
+from batcher.ml.preprocessors import DateTimeFeaturizer
+
+ds = bt.from_pydict({"ordered_at": [dt.datetime(2024, 3, 16, 14, 30)]})
+featurized = DateTimeFeaturizer("ordered_at", parts=["hour", "weekday", "is_weekend"])
+print(featurized.fit_transform(ds).columns)
+```
+
+`CyclicalEncoder` is what a linear model, a distance metric, or a neural net needs instead.
+Encoded as an integer, hour 23 and hour 0 sit 23 units apart while being one hour apart, so
+the model learns a discontinuity at midnight that is not there — and no amount of scaling
+fixes it. Two coordinates on a circle put them adjacent, which is the truth.
+
+```python
+from batcher.ml.preprocessors import CyclicalEncoder
+
+hours = bt.from_pydict(
+    {"ordered_at": [dt.datetime(2024, 1, 1, 23), dt.datetime(2024, 1, 2, 0)]}
+)
+circle = CyclicalEncoder("ordered_at", parts=["hour"]).fit_transform(hours).to_pydict()
+print([round(v, 4) for v in circle["ordered_at_hour_cos"]])
+```
+
+Both are stateless, so the same expression applies to training and serving data with nothing
+fitted in between.
+
+## Surface features from text
+
+An embedding is the powerful way to featurize text and the expensive one. A great many text
+signals need no model at all — whether a review is long, whether a message is all-caps, how
+many digits a field has — and they are what a gradient-boosted model actually splits on.
+`TextStatFeaturizer` computes them as pure string expressions, so a dozen text features over
+a billion rows is one pass and no GPU.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import TextStatFeaturizer
+
+ds = bt.from_pydict({"review": ["GREAT product!!! 10/10", "ok"]})
+out = TextStatFeaturizer("review", features=["char_count", "upper_ratio", "digit_ratio"])
+print(out.fit_transform(ds).to_pydict()["review_upper_ratio"])
+```
+
+Reach for an embedding when these plateau, not before.
+
+## History as features
+
+A forecasting model needs to know what happened before, and the columns that carry that are
+lags and rolling aggregates. Building them is where forecasting pipelines leak most often:
+a rolling mean that includes the current row has the target's own value inside its own
+feature, and a "last 7 days" window computed over the whole table mixes entities together.
+Both produce a cross-validated score no deployment reproduces, and neither raises.
+
+`RollingFeaturizer`'s window therefore ends at the **previous** row by construction, with no
+option to include the current one, and both take a `partition_by` that keeps each series
+separate.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import LagFeaturizer, RollingFeaturizer
+
+sales = bt.from_pydict(
+    {"store": ["a", "a", "a"], "day": [1, 2, 3], "units": [10.0, 20.0, 60.0]}
+)
+lagged = LagFeaturizer("units", order_by="day", lags=[1], partition_by="store")
+rolled = RollingFeaturizer("units", order_by="day", window=2, partition_by="store")
+out = rolled.fit_transform(lagged.fit_transform(sales)).sort("day")
+print(out.to_pydict()["units_rolling_mean_2"])
+```
+
+Rows near the start of a series have no history and get null, which is the honest answer:
+drop them, or let a booster use the null as the signal it is.
+
+## Encoding a high-cardinality category
+
+`OneHotEncoder` and `OrdinalEncoder` both learn the category set, which caps them at the
+cardinality the plan can express. Real categorical columns break that cap constantly: a URL
+path, a product SKU, a user agent, a postcode. Three strategies handle it, in increasing
+order of the cardinality they tolerate.
+
+`FrequencyEncoder` replaces each category with how often it occurs. One numeric column, and
+it often carries real signal — a rare value behaves differently from a common one. An unseen
+category encodes as 0, which is the correct answer.
+
+```python
+from batcher.ml.preprocessors import FrequencyEncoder
+
+ds = bt.from_pydict({"agent": ["chrome", "chrome", "chrome", "curl"]})
+print(FrequencyEncoder("agent").fit_transform(ds).to_pydict())
+```
+
+`RareCategoryEncoder` keeps the categories worth keeping and collapses the tail into one
+bucket. This is the step that makes a one-hot encoding possible on a long-tailed column, and
+it also fixes the serving-time unknown-category problem, because the bucket already exists.
+
+```python
+from batcher.ml.preprocessors import RareCategoryEncoder
+
+ds = bt.from_pydict({"c": ["a"] * 90 + ["b"] * 9 + ["z"]})
+encoder = RareCategoryEncoder("c", min_frequency=0.05).fit(ds)
+print(encoder.transform(bt.from_pydict({"c": ["never_seen"]})).to_pydict())
+```
+
+`HashingEncoder` hashes into a fixed number of buckets. Unbounded cardinality, no fitted
+state at all, and therefore no train/serve skew — at the cost of collisions, which a tree
+model tolerates better than most people expect. It uses the engine's stable `xxhash64`
+rather than Python's `hash()`, which varies per process and would be a silent skew.
+
+`BinaryEncoder` is the middle ground between `OneHotEncoder` and `HashingEncoder` when a column has many categories but not unboundedly many: it assigns each category an integer and writes it in base 2, so 100 categories cost 7 bit columns rather than 100 one-hot columns, with no collisions. An unseen category encodes as all-zero bits.
+
+## Weight-of-evidence encoding
+
+`TargetEncoder` replaces a category with the target's mean; `WOEEncoder` replaces it with the
+log-odds of the target relative to the overall odds. That is the transform a regulated credit
+scorecard is built on, because WOE is additive in the log-odds space a logistic regression
+works in — a WOE-encoded feature enters a linear model as a straight, interpretable
+coefficient.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import WOEEncoder
+
+ds = bt.from_pydict({"grade": ["a", "a", "b", "b"], "default": [0, 0, 1, 1]})
+encoded = WOEEncoder(["grade"], "default").fit_transform(ds).to_pydict()["grade"]
+print(encoded[0] < 0 < encoded[2])   # grade a leans safe, grade b leans default
+```
+
+Like `TargetEncoder` it is supervised, so fit it on the training split only. An unseen or
+single-class category encodes as a neutral 0 rather than an infinite log-odds.
+
+## Saving a fitted preprocessor
+
+A preprocessor is only useful because its state is learned once and reused: the scaler
+standardizing a request at serving time must hold the *training* set's mean. `save` writes
+that state as plain JSON.
+
+```python
+import os
+import tempfile
+
+from batcher.ml.preprocessors import Preprocessor, StandardScaler
+
+scaler = StandardScaler("x").fit(bt.from_pydict({"x": [1.0, 3.0]}))
+path = os.path.join(tempfile.mkdtemp(), "scaler.json")
+scaler.save(path)
+print(Preprocessor.load(path).mean_)
+```
+
+JSON rather than a pickle, deliberately: the file is reviewable, diffable, portable to a
+serving stack in another language, and safe to load from a store you do not fully control.
+A cloud URI works wherever a local path does.
 
 ## Scaling numeric columns
 
@@ -416,6 +670,30 @@ print(binned.column("x").to_pylist())
 # [0, 1, 1, 1, 2, 3, 3, 3]
 ```
 
+When the edges are known up front rather than learned from the data, `bt.cut` is the pure expression for the job. It needs no `fit`, takes explicit break points, and returns the integer bin index or a label per bucket, so it composes anywhere an expression does and runs in one streaming pass.
+
+```python
+ds = bt.from_pydict({"age": [5, 18, 40, 70]})
+banded = ds.with_columns(band=bt.cut("age", [12, 19, 65], labels=["child", "teen", "adult", "senior"]))
+print(banded.to_pydict()["band"])
+# ['child', 'teen', 'adult', 'senior']
+```
+
+## Reducing dimensionality
+
+`PCA` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan — the mean and covariance are aggregates — and only the small eigendecomposition runs on the driver.
+
+```python
+from batcher.ml.preprocessors import PCA
+
+ds = bt.from_pydict({"a": [1.0, 2.0, 3.0, 4.0], "b": [1.0, 2.1, 2.9, 4.0], "c": [4.0, 3.0, 2.0, 1.0]})
+reducer = PCA(["a", "b", "c"], n_components=2).fit(ds)
+print(reducer.transform(ds).columns)
+# ['pc1', 'pc2']
+```
+
+`TruncatedSVD` is the same idea without centering the columns first, which is what you want on a non-negative or sparse feature block (a bag-of-words count matrix) where centering would destroy the structure. On centered data it coincides with `PCA`.
+
 ## Assembling features
 
 `Concatenator` stacks several numeric columns into one list column. It is the "make a
@@ -437,6 +715,85 @@ print(assembled.column("features").to_pylist())
 
 The assembled list column becomes a tensor for training with zero or one copy. See
 [PyTorch integration](pytorch.md).
+
+### Deriving and selecting columns
+
+Before assembly, you often build new columns and drop useless ones. `InteractionFeatures`
+appends the pairwise products of its columns, and `RatioFeatures` appends the ratio of
+each named pair. Both give a linear model a signal it cannot learn from the raw columns:
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import InteractionFeatures, RatioFeatures
+
+ds = bt.from_pydict({"a": [1.0, 2.0, 3.0], "b": [10.0, 20.0, 30.0]})
+crossed = InteractionFeatures(["a", "b"]).fit_transform(ds)
+print(crossed.collect().column_names)
+# ['a', 'b', 'a_x_b']
+ratioed = RatioFeatures([("a", "b")]).fit_transform(ds)
+print(ratioed.collect().column_names)
+# ['a', 'b', 'a_per_b']
+```
+
+`GroupStatEncoder` attaches a per-group statistic of a value column to every row of that
+group, so a row can see how it compares to its cohort. `GroupImputer` fills nulls with the
+group's mean rather than the global one, which matters when the groups differ:
+
+```python
+from batcher.ml.preprocessors import GroupImputer, GroupStatEncoder
+
+grouped = bt.from_pydict(
+    {"grp": ["x", "x", "y", "y"], "val": [1.0, 3.0, 5.0, None]}
+)
+encoded = GroupStatEncoder("val", by="grp", statistics=["mean"]).fit_transform(grouped)
+print(encoded.collect().column_names)
+# ['grp', 'val', 'val_mean_by_grp']
+imputed = GroupImputer("val", by="grp").fit_transform(grouped)
+print(imputed.collect().column("val").to_pylist())
+# [1.0, 3.0, 5.0, 5.0]
+```
+
+`Binarizer` maps a numeric column to 0/1 by a threshold. `VarianceThreshold` drops columns
+whose variance is at or below a threshold, which removes constant columns for free.
+`ColumnSelector` and `ColumnDropper` are the projection steps as pipeline stages, for when
+selection has to sit inside a `Chain`:
+
+```python
+from batcher.ml.preprocessors import (
+    Binarizer,
+    ColumnDropper,
+    ColumnSelector,
+    VarianceThreshold,
+)
+
+table = bt.from_pydict(
+    {"a": [1.0, 2.0, 3.0, 4.0], "b": [10.0, 20.0, 30.0, 40.0], "const": [5.0, 5.0, 5.0, 5.0]}
+)
+print(Binarizer("a", threshold=2.5).fit_transform(table).collect().column("a").to_pylist())
+# [0, 0, 1, 1]
+print(VarianceThreshold("const").fit_transform(table).collect().column_names)
+# ['a', 'b']
+print(ColumnSelector(["a", "b"]).fit_transform(table).collect().column_names)
+# ['a', 'b']
+print(ColumnDropper(["const"]).fit_transform(table).collect().column_names)
+# ['a', 'b']
+```
+
+### Pinning the feature contract
+
+A trained model is valid only against the exact columns, order, and dtypes it saw during
+training. `FeatureSpec` captures that contract so a scoring frame can be checked against it
+rather than producing wrong numbers on a silently reordered or retyped input:
+
+```python
+from batcher.ml import FeatureSpec
+
+spec = FeatureSpec(["age", "income"], {"age": "float64", "income": "float64"})
+print(spec.features)
+# ['age', 'income']
+print(spec.dtypes)
+# {'age': 'float64', 'income': 'float64'}
+```
 
 `Tokenizer` maps a text column through a user-supplied tokenizer, which is either a
 `str -> list` callable or any object with `.encode`, such as a HuggingFace tokenizer.

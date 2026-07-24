@@ -12,8 +12,15 @@ constant.
 
 Kept a `DEFAULT`-provenance estimate, never `EXACT`: integer arithmetic can overflow at the
 extreme and float arithmetic rounds, so the derived interval must inform cost and pruning
-without ever answering an exact `min`/`max`/`count` from metadata. Quantiles and MCVs are
-dropped rather than transformed — bounds and ndv are the sound, useful part.
+without ever answering an exact `min`/`max`/`count` from metadata.
+
+The *shape* statistics transform too, and exactly. A strictly monotonic `g` satisfies
+`F_y(g(x)) = F_x(x)`, so a quantile grid maps through it value-by-value (reversed, with
+`probs` complemented, when `g` decreases); and `g` is injective, so every value's frequency
+is carried unchanged to its image. Dropping them meant `SELECT x * 100 AS cents ... WHERE
+cents BETWEEN ...` fell from histogram interpolation to a flat constant on a column whose
+distribution was fully known — which is the common shape, since a derived column exists to
+be filtered on.
 """
 
 from __future__ import annotations
@@ -27,14 +34,24 @@ from batcher.plan.stats import ColumnStat, Provenance, RelStats
 __all__ = ["derived_projection_stat"]
 
 
-def _minmax_bounds(inputs: list[Expr], child: RelStats) -> ColumnStat | None:
+def _minmax_bounds(inputs: list[Expr], child: RelStats, *, greatest: bool) -> ColumnStat | None:
     """Bounding-box bounds for `greatest(...)`/`least(...)` over its argument columns.
 
-    Every output value equals one of the (non-null) inputs, so it lies in the union of the
-    input ranges: `[min(all mins), max(all maxes)]`. That box is a valid superset for both
-    `greatest` and `least` regardless of nulls (SQL ignores them), so a downstream range
-    filter on the derived column stays sharp. Requires every argument to be a bounded column
-    or a numeric literal; anything else (a nested expression with no bounds) yields None.
+    Every output value equals one of the (non-null) inputs, and *which* one is known: a
+    `least` is at most the smallest of the arguments' maxima, and a `greatest` is at least
+    the largest of their minima. So the bounds are
+
+    * `least`    -> `[min(all mins), min(all maxes)]`
+    * `greatest` -> `[max(all mins), max(all maxes)]`
+
+    and only one end of each comes from the union box the previous version used for both. The
+    difference is not cosmetic: `least(price, 100)` over a price column spanning `[0, 10^6]`
+    is bounded above by **100**, not by a million, and a downstream `WHERE capped > 500` is
+    provably empty rather than estimated at a third of the table.
+
+    Sound under nulls, which SQL ignores here: the result is one of the non-null arguments,
+    so it lies inside the bounds of the arguments that were present. Requires every argument
+    to be a bounded column or a numeric literal; anything else yields None.
     """
     mins: list[float] = []
     maxs: list[float] = []
@@ -57,7 +74,9 @@ def _minmax_bounds(inputs: list[Expr], child: RelStats) -> ColumnStat | None:
             return None
     if not mins:
         return None
-    return ColumnStat(min=min(mins), max=max(maxs), provenance=Provenance.DEFAULT)
+    if greatest:
+        return ColumnStat(min=max(mins), max=max(maxs), provenance=Provenance.DEFAULT)
+    return ColumnStat(min=min(mins), max=min(maxs), provenance=Provenance.DEFAULT)
 
 
 def _numeric(value: object) -> float | int | Decimal | None:
@@ -94,7 +113,7 @@ def derived_projection_stat(expr: Expr, child: RelStats) -> ColumnStat | None:
             return dataclasses.replace(src.downgrade(Provenance.DEFAULT), null_count=None)
         return None
     if isinstance(expr, (Greatest, Least)):
-        return _minmax_bounds(expr.inputs, child)
+        return _minmax_bounds(expr.inputs, child, greatest=isinstance(expr, Greatest))
     if not isinstance(expr, Binary) or expr.op not in ("add", "sub", "mul"):
         return None
     col, lit, col_on_left = _column_and_literal(expr)
@@ -111,6 +130,7 @@ def derived_projection_stat(expr: Expr, child: RelStats) -> ColumnStat | None:
     if bounds is None:
         return None
     new_min, new_max = bounds
+    scale = _scale_of(expr.op, c, col_on_left)
     return ColumnStat(
         min=new_min,
         max=new_max,
@@ -119,7 +139,73 @@ def derived_projection_stat(expr: Expr, child: RelStats) -> ColumnStat | None:
         ndv=src.ndv,
         null_count=src.null_count,
         provenance=Provenance.DEFAULT,
+        quantiles=_transform_quantiles(src.quantiles, expr.op, c, col_on_left),
+        mcv=_transform_mcv(src.mcv, expr.op, c, col_on_left),
+        # An affine map of a number does not change how many bytes it occupies.
+        avg_bytes=src.avg_bytes,
+        # `mean(a·x + b) = a·mean(x) + b`, exactly. The total sum needs the row count to
+        # shift, which is not carried here, so it is left unknown.
+        mean=None if src.mean is None or scale is None else scale[0] * src.mean + scale[1],
     )
+
+
+def _scale_of(op: str, c, col_on_left: bool) -> tuple[float, float] | None:
+    """`(a, b)` for the affine map `y = a·x + b` this projection applies, or None."""
+    if op == "add":
+        return 1.0, float(c)
+    if op == "sub":
+        return (1.0, -float(c)) if col_on_left else (-1.0, float(c))
+    if op == "mul":
+        return (float(c), 0.0) if c != 0 else None
+    return None
+
+
+def _apply(scale: tuple[float, float], x: float) -> float:
+    return scale[0] * x + scale[1]
+
+
+def _transform_quantiles(grid, op: str, c, col_on_left: bool):
+    """Map a quantile grid through the affine projection, or None when it cannot be.
+
+    Exact for a strictly monotonic map: `P(y <= g(x)) = P(x <= x)` when `g` increases, so the
+    boundary *values* move and the probabilities do not. A decreasing `g` reverses the order,
+    which means reversing the value list and complementing the probabilities — the grid the
+    interpolator expects is ascending in both.
+    """
+    scale = _scale_of(op, c, col_on_left)
+    if not grid or scale is None:
+        return None
+    values = grid.get("values") or []
+    probs = grid.get("probs") or []
+    if len(values) != len(probs) or len(values) < 2:
+        return None
+    try:
+        mapped = [_apply(scale, float(v)) for v in values]
+    except (TypeError, ValueError):  # pragma: no cover - a non-numeric grid
+        return None
+    if scale[0] > 0:
+        return {"probs": [float(p) for p in probs], "values": mapped}
+    return {"probs": [1.0 - float(p) for p in reversed(probs)], "values": list(reversed(mapped))}
+
+
+def _transform_mcv(mcv, op: str, c, col_on_left: bool):
+    """Carry each most-common value's frequency to its image under the projection.
+
+    The map is injective, so no two values collide and every frequency transfers unchanged.
+    The table is keyed by the value's string form, so the image is re-rendered the same way —
+    which is what lets a downstream `WHERE derived = k` still find the measured skew instead
+    of falling back to a uniform `1/ndv`.
+    """
+    scale = _scale_of(op, c, col_on_left)
+    if not mcv or scale is None:
+        return None
+    out: dict[str, float] = {}
+    for key, freq in mcv.items():
+        try:
+            out[str(_apply(scale, float(key)))] = float(freq)
+        except (TypeError, ValueError):
+            return None  # a non-numeric key: the whole table is untransformable
+    return out
 
 
 def _column_and_literal(expr: Binary) -> tuple[Col | None, Lit, bool]:

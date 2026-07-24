@@ -14,5 +14,19 @@ accessors are bound in `namespaces/_bind.py`.
 from __future__ import annotations
 
 from batcher.plan.expr_ir.compat.binder import bind_compat_methods
+from batcher.plan.expr_ir.compat.guidance import (
+    DT_UNSUPPORTED,
+    LIST_UNSUPPORTED,
+    STR_UNSUPPORTED,
+    accessor_attribute_error,
+    expr_attribute_error,
+)
 
-__all__ = ["bind_compat_methods"]
+__all__ = [
+    "DT_UNSUPPORTED",
+    "LIST_UNSUPPORTED",
+    "STR_UNSUPPORTED",
+    "accessor_attribute_error",
+    "bind_compat_methods",
+    "expr_attribute_error",
+]

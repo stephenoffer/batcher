@@ -3,8 +3,10 @@
 //! Estimates the number of distinct values in a column using a fixed `6·m` bits
 //! with ~`1.04/√m` relative error. Cheap distinct counts are what let the
 //! optimizer choose join build sides and size aggregations without a second scan.
-//! Includes the small-range linear-counting correction (the practically important
-//! part of the "++"); a 64-bit hash makes the large-range correction unnecessary.
+//! The cardinality estimator is Ertl's improved maximum-likelihood form
+//! (`sigma`/`tau` corrections), which is continuous and essentially unbiased across
+//! the whole range — so it needs neither a linear-counting handover threshold nor
+//! HyperLogLog++'s empirical per-precision bias tables.
 
 use std::hash::Hash;
 
@@ -167,26 +169,53 @@ impl HyperLogLog {
     }
 
     /// Estimate the number of distinct values added.
+    ///
+    /// Uses Ertl's improved estimator rather than the textbook
+    /// `α_m·m²/Σ2^-r` raw estimator with a linear-counting small-range switch. The
+    /// difference is structural, not a tuning detail:
+    ///
+    /// * The classic pair is **two** estimators glued at a threshold, and the raw one is
+    ///   biased high for `m < n < 5m`. Whatever the handover point, the join is a
+    ///   discontinuity, and the sweep that picked the previous constant could only trade one
+    ///   region's bias against another's — the best it achieved was 0.75% RMSE with a 0.38%
+    ///   worst-case bias. HyperLogLog++ patches the same gap with ~15×200 empirically
+    ///   measured per-precision bias constants.
+    /// * Ertl's estimator is **one** continuous function of the register multiplicities,
+    ///   derived by maximizing the Poisson likelihood of the observed registers. It is
+    ///   essentially unbiased over the entire range — from an empty sketch to a saturated one
+    ///   — with relative error ≈ `1.04/√m` throughout, and it needs no bias tables and no
+    ///   threshold at all.
+    ///
+    /// The two correction terms are what make the whole range work: `σ` accounts for the
+    /// registers still at zero (the information linear counting extracts, but in closed form
+    /// and blended rather than switched), and `τ` accounts for registers saturated at the
+    /// maximum rank (the large-range end). Between them the estimator degrades gracefully
+    /// instead of stepping.
     pub fn estimate(&self) -> f64 {
         let m = self.m() as f64;
-        // Single pass: harmonic-sum term and empty-register count together. `2^-r`
-        // is built from the IEEE exponent field (exact, and cheaper than `powi`).
-        let mut sum = 0f64;
-        let mut zeros = 0usize;
+        let q = 64 - self.precision as u32; // registers hold ranks 0..=q+1
+                                            // Register multiplicities: `counts[k]` = how many registers hold rank `k`. Ertl's
+                                            // estimator is a function of this histogram alone, which is also a cheaper pass than
+                                            // the float harmonic sum it replaces (integer increments, no FP per register).
+        let mut counts = vec![0u32; q as usize + 2];
         for &r in &self.registers {
-            sum += pow2_neg(r);
-            if r == 0 {
-                zeros += 1;
-            }
+            counts[r as usize] += 1;
         }
-        let raw = alpha(self.m()) * m * m / sum;
-
-        // Small-range correction: linear counting while enough registers are empty.
-        if raw <= LINEAR_COUNTING_MAX_LOAD * m && zeros > 0 {
-            m * (m / zeros as f64).ln()
-        } else {
-            raw
+        if counts[0] == self.registers.len() as u32 {
+            return 0.0; // every register untouched: the sketch is empty
         }
+        let mut z = m * tau((m - counts[q as usize + 1] as f64) / m);
+        for k in (1..=q as usize).rev() {
+            z = 0.5 * (z + counts[k] as f64);
+        }
+        z += m * sigma(counts[0] as f64 / m);
+        if z <= 0.0 || !z.is_finite() {
+            // Every register saturated at the maximum rank — unreachable with a 64-bit hash
+            // below ~2^58 distinct values, but the estimate is unbounded there rather than
+            // wrong, so report the largest finite count instead of an infinity.
+            return f64::MAX;
+        }
+        ALPHA_INF * m * m / z
     }
 
     /// Serialize to a self-describing byte blob: `[precision: u8][registers…]`.
@@ -246,50 +275,65 @@ fn canon_float_bits(v: f64) -> u64 {
     }
 }
 
-/// `2^-r` for a register rank `r` (`0..=64`), built directly from the IEEE-754
-/// exponent field. Exact and branch-free — avoids a `powi`/`exp2` call per register
-/// in [`HyperLogLog::estimate`]. (Rank stays ≤ 64, so `1023 - r` is a normal
-/// exponent.)
-#[inline]
-fn pow2_neg(r: u8) -> f64 {
-    f64::from_bits((1023u64 - r as u64) << 52)
+/// The HyperLogLog normalization constant in the limit, `α_∞ = 1/(2·ln 2)`.
+///
+/// The classic per-`m` constants (0.673, 0.697, 0.709, `0.7213/(1 + 1.079/m)`) correct the
+/// *raw* estimator's finite-`m` bias. Ertl's estimator handles that bias through the `σ`/`τ`
+/// terms instead, so the exact limiting constant is the right one at every precision.
+const ALPHA_INF: f64 = 0.721_347_520_444_481_7;
+
+/// `σ(x) = x + Σ_{k≥1} x^(2^k) · 2^(k-1)` — the zero-register correction.
+///
+/// This is the closed form of the information carried by registers that are still zero: with
+/// `x` the fraction of empty registers, `σ` says how much cardinality mass is hiding below the
+/// sketch's resolution. It is what makes a separate linear-counting branch unnecessary — the
+/// correction is *blended in* rather than switched to, so there is no discontinuity to tune.
+///
+/// The series converges quadratically (`x^(2^k)` squares each step), so the loop runs a
+/// handful of iterations before the sum stops changing in double precision. `σ(1) = ∞` is the
+/// correct limit: an all-zero sketch carries no information about the cardinality, and the
+/// caller short-circuits that case.
+fn sigma(mut x: f64) -> f64 {
+    if x == 1.0 {
+        return f64::INFINITY;
+    }
+    let mut y = 1.0;
+    let mut z = x;
+    loop {
+        x *= x;
+        let previous = z;
+        z += x * y;
+        y += y;
+        if z == previous {
+            return z;
+        }
+    }
 }
 
-/// HyperLogLog bias constant α_m.
-/// Load factor `n/m` at which linear counting hands over to the raw HLL estimator.
+/// `τ(x)` — the saturated-register correction, the large-range counterpart of [`sigma`].
 ///
-/// Flajolet's original constant here is `2.5`. It is wrong for a 64-bit hash: the raw
-/// estimator carries a large positive bias for `m < n < 5m`, so switching to it at `2.5m`
-/// steps straight onto the worst of that bias. Measured over 20–40 independent trials per
-/// point (`examples/hll_bias.rs`), the discontinuity at `2.5` was a **+2.4% systematic
-/// overestimate at 26–42 standard errors** — bias, not noise — decaying to zero by `n ≈ 4m`.
+/// With `x` the fraction of registers *not* pinned at the maximum rank, `τ` accounts for the
+/// cardinality the sketch can no longer resolve at the top of its range. It is the term that
+/// replaces HyperLogLog++'s large-range correction, and with a 64-bit hash it is essentially
+/// zero in practice — but including it is what lets one continuous formula cover the whole
+/// range rather than three glued pieces.
 ///
-/// HLL++ removes it with empirical per-precision bias tables. Those are ~15×200 measured
-/// constants; rather than carry them, we move the handover to where the two estimators'
-/// *total* error is balanced. Linear counting's relative standard error is closed-form,
-/// `sqrt(e^t − t − 1) / (t·sqrt(m))` for `t = n/m`, and grows with `t`; the raw estimator's
-/// is a flat `1.04/sqrt(m)` plus that bias. Sweeping the handover point and scoring RMSE
-/// over `n/m ∈ [0.5, 8]`:
-///
-/// | threshold | RMSE (p=14) | worst per-point bias |
-/// |-----------|-------------|----------------------|
-/// | 2.5       | 0.915%      | 2.56%                |
-/// | 3.0       | 0.751%      | 1.01%                |
-/// | **3.5**   | **0.746%**  | **0.38%**            |
-/// | 4.5       | 0.832%      | 0.30%                |
-///
-/// `3.5` sits within 1% of the RMSE minimum at every precision tested (12, 14, 16) while
-/// cutting the worst-case bias by ~6x. Both error terms depend on `t` alone (scaled by
-/// `1/sqrt(m)`), which is why one constant serves every precision — as the measurements
-/// across p=12/14/16 confirm.
-const LINEAR_COUNTING_MAX_LOAD: f64 = 3.5;
-
-fn alpha(m: usize) -> f64 {
-    match m {
-        16 => 0.673,
-        32 => 0.697,
-        64 => 0.709,
-        _ => 0.7213 / (1.0 + 1.079 / m as f64),
+/// Converges by repeated square roots (again quadratic), and `τ(0) = τ(1) = 0` are the exact
+/// boundary values.
+fn tau(mut x: f64) -> f64 {
+    if x == 0.0 || x == 1.0 {
+        return 0.0;
+    }
+    let mut y = 1.0;
+    let mut z = 1.0 - x;
+    loop {
+        x = x.sqrt();
+        let previous = z;
+        y *= 0.5;
+        z -= (1.0 - x).powi(2) * y;
+        if z == previous {
+            return z / 3.0;
+        }
     }
 }
 
@@ -317,12 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn no_bias_spike_at_the_linear_counting_handover() {
-        // The raw estimator is biased high for `m < n < 5m`. Handing over to it at the
-        // classic `2.5m` stepped onto a +2.4% overestimate at ~26 standard errors. Averaged
+    fn unbiased_across_the_whole_transition_range() {
+        // The range `0.5m < n < 5m` is where the classic raw estimator is worst and where a
+        // linear-counting handover has to be glued in. Ertl's estimator is one continuous
+        // function there, so it should show no bias anywhere across it — including at the
+        // load factors (2.4–3.0) where the old two-estimator hybrid had its seam. Averaged
         // over 24 trials the sampling error is ~0.17%, so a 1% bound cannot pass by luck.
         let m = 1u64 << 14;
-        for mult in [2.4_f64, 2.5, 2.6, 3.0] {
+        for mult in [0.5_f64, 1.0, 2.0, 2.4, 2.5, 2.6, 3.0, 4.0, 5.0] {
             let n = (mult * m as f64) as u64;
             let bias = mean_relative_error(14, n, 24);
             assert!(
@@ -334,15 +380,36 @@ mod tests {
     }
 
     #[test]
-    fn linear_counting_stays_accurate_up_to_the_handover() {
-        // Below the handover the estimate is pure linear counting, which is unbiased.
+    fn accurate_far_below_one_register_per_value() {
+        // The sparse end, where almost every register is still zero and the estimate rests
+        // entirely on the `sigma` correction.
         let m = 1u64 << 14;
-        let bias = mean_relative_error(14, m, 16);
-        assert!(
-            bias.abs() < 0.005,
-            "linear counting biased by {:.3}%",
-            bias * 100.0
-        );
+        for n in [16u64, 128, m / 8] {
+            let bias = mean_relative_error(14, n, 16);
+            assert!(
+                bias.abs() < 0.01,
+                "n = {n}: sparse-range bias {:.3}%",
+                bias * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn empty_sketch_estimates_zero() {
+        assert_eq!(HyperLogLog::new(12).estimate(), 0.0);
+    }
+
+    #[test]
+    fn correction_terms_have_their_exact_boundary_values() {
+        // The two closed forms anchor the estimator at the ends of its range; a wrong
+        // boundary value would show up as a bias that no amount of averaging removes.
+        assert_eq!(tau(0.0), 0.0);
+        assert_eq!(tau(1.0), 0.0);
+        assert_eq!(sigma(0.0), 0.0);
+        assert!(sigma(1.0).is_infinite());
+        // Both series are monotone in their argument over (0, 1).
+        assert!(sigma(0.9) > sigma(0.5) && sigma(0.5) > sigma(0.1));
+        assert!(tau(0.1) > tau(0.5) && tau(0.5) > tau(0.9));
     }
 
     #[test]
@@ -359,26 +426,13 @@ mod tests {
     }
 
     #[test]
-    fn pow2_neg_matches_powi_bit_for_bit() {
-        // The exponent-field trick must equal `2.powi(-r)` exactly for every rank,
-        // so the estimate is unchanged from the old per-register `powi`.
-        for r in 0u8..=64 {
-            assert_eq!(
-                pow2_neg(r).to_bits(),
-                2f64.powi(-(r as i32)).to_bits(),
-                "mismatch at r={r}"
-            );
-        }
-    }
-
-    #[test]
     fn small_cardinality_is_accurate() {
         let mut hll = HyperLogLog::new(14);
         for i in 0..100u64 {
             hll.add(&i);
         }
         let est = hll.estimate();
-        // Linear counting should be near-exact for small sets.
+        // The `sigma` correction should make a sketch this sparse near-exact.
         assert!((est - 100.0).abs() < 5.0, "small estimate {est}");
     }
 

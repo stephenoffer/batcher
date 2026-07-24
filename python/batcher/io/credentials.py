@@ -66,8 +66,7 @@ def resolve_secret(value: str | None, *, what: str = "credential") -> str | None
     """
     if not is_secret_ref(value):
         return value
-    assert value is not None  # narrowed by is_secret_ref
-    scheme, _, target = value.partition(":")
+    scheme, _, target = str(value).partition(":")
     if scheme == "env":
         import os
 

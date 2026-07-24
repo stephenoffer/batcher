@@ -16,6 +16,7 @@ turn both into a typed error at the point of construction, naming what is missin
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Protocol, runtime_checkable
 
@@ -25,10 +26,33 @@ from batcher._internal.errors import ConfigError
 # how to encode them. Values are opaque bytes (callers serialize their own rows).
 Key = tuple[object, ...]
 
-__all__ = ["Key", "MetadataBackend", "check_backend", "require_uri"]
+__all__ = [
+    "Key",
+    "MetadataBackend",
+    "check_backend",
+    "decode_key",
+    "encode_key",
+    "require_uri",
+]
 
 #: The methods a `MetadataBackend` must provide, in the order they are documented.
 BACKEND_METHODS: tuple[str, ...] = ("get", "put", "scan", "batch_put")
+
+
+def encode_key(key: Key) -> str:
+    """Encode a `Key` tuple as a compact, round-trippable JSON string.
+
+    The canonical spelling of a key for every backend that stores keys as strings — SQLite,
+    Redis, and (base64-wrapped) object storage. Compact separators keep it short; the tuple is
+    stored as a JSON list and restored by `decode_key`. One definition so the backends cannot
+    drift into mutually-unreadable encodings.
+    """
+    return json.dumps(list(key), separators=(",", ":"))
+
+
+def decode_key(encoded: str) -> Key:
+    """Decode a string produced by `encode_key` back into its `Key` tuple."""
+    return tuple(json.loads(encoded))
 
 
 @runtime_checkable

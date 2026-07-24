@@ -29,9 +29,14 @@ __all__ = ["config_to_dict", "env_var_names"]
 def config_to_dict(config: Config, *, only_non_default: bool = False) -> dict[str, Any]:
     """Convert a `Config` to a nested plain-dict, ready for JSON/TOML/YAML.
 
-    The inverse of `Config.from_dict`, and closed under round-trip: feeding the result
-    back produces an equal `Config`. Values are plain scalars, so the dict is safe to
-    `json.dumps`, log, or ship as part of a job manifest.
+    The inverse of `Config.from_dict`. Values are JSON-native — scalars and lists — so the
+    dict is safe to `json.dumps`, log, or ship as part of a job manifest.
+
+    Feeding the result back reproduces the same config, with one documented exception: the
+    fields `Config.from_dict` auto-resolves come back resolved. A config carrying the
+    ``autoscale_wait_s = -1`` sentinel for "decide from the environment" reloads as the
+    wait the current environment implies, which is the point of the sentinel rather than a
+    lossy round trip.
 
     Examples:
         .. doctest::
@@ -71,8 +76,21 @@ def _to_dict(obj: object, default: object | None) -> dict[str, Any]:
             if nested or default is None:
                 out[field.name] = nested
         elif default is None or value != base:
-            out[field.name] = value
+            out[field.name] = _jsonable(value)
     return out
+
+
+def _jsonable(value: object) -> object:
+    """Render one config value in a form JSON has a type for.
+
+    A config's sequence fields are tuples, because the sections are frozen and hashable.
+    JSON has only arrays, so a tuple that went out as a tuple came back as a list and the
+    round trip was not closed: the reloaded section compared unequal to the original and
+    was no longer hashable — which matters, because shipping a config to a Ray worker as
+    JSON is exactly that round trip. Emit the list here and let `Config.from_dict` restore
+    the declared type on the way back in.
+    """
+    return list(value) if isinstance(value, tuple) else value
 
 
 def env_var_names(config: Config | None = None) -> dict[str, str]:

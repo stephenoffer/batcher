@@ -23,6 +23,8 @@ exact value the field held before, so a cluster that can't be probed plans as it
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
+
 __all__ = ["cluster_l3_cache_bytes"]
 
 # Binding L3 per topology signature, so the probe runs once per distinct cluster shape rather
@@ -68,7 +70,8 @@ def cluster_l3_cache_bytes() -> int:
         result = _probe_representatives(ray, reps)
         _L3_BY_TOPOLOGY[signature] = result
         return result
-    except Exception:  # pragma: no cover - Ray optional / probe unschedulable
+    except Exception as exc:  # pragma: no cover - Ray optional / probe unschedulable
+        note_suppressed("dist", "probe ray node hardware", exc)
         return 0
 
 

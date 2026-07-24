@@ -140,7 +140,10 @@ def test_in_list_is_clamped_to_one():
 def test_in_list_uses_measured_frequencies_for_skewed_values():
     mcv = {"x": {"1": 0.5}}  # value 1 holds half the rows
     got = sel(InList(bt.col("x"), (1, 2)), _NDV, _CFG, None, mcv)
-    assert got == pytest.approx(0.5 + 0.1)  # measured skew + uniform for the other
+    # The listed value takes its measured 0.5; value 2 is *not* a most-common value, so it
+    # draws from the residual — the 0.5 of mass the table leaves, shared by the other 9 of
+    # the 10 distinct values — rather than the whole column's uniform 1/10.
+    assert got == pytest.approx(0.5 + 0.5 / 9)
 
 
 # --- most-common-value lookup is type-tolerant ------------------------------------

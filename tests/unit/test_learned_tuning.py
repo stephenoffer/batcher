@@ -28,7 +28,7 @@ def test_ucb1_returns_none_when_no_arm_tried():
 
 def test_ucb1_explores_an_untried_arm_first():
     # Two arms sampled, one untried → the untried arm is explored (deterministically, lowest name).
-    stats = {"hash": {"n": 3, "sum": 30.0}, "sort_merge": {"n": 3, "sum": 9.0}}
+    stats = {"hash": {"n": 3, "mean": 10, "m2": 0.0}, "sort_merge": {"n": 3, "mean": 3, "m2": 0.0}}
     got = lt.ucb1_best_arm(stats, ("broadcast", "hash", "sort_merge"))
     assert got == "broadcast"
 
@@ -36,18 +36,18 @@ def test_ucb1_explores_an_untried_arm_first():
 def test_ucb1_exploits_the_fastest_arm_once_all_tried():
     # All arms tried; sort_merge is clearly fastest (lowest mean latency) → it wins.
     stats = {
-        "hash": {"n": 5, "sum": 500.0},  # mean 100 ms
-        "broadcast": {"n": 5, "sum": 400.0},  # mean 80 ms
-        "sort_merge": {"n": 5, "sum": 50.0},  # mean 10 ms
+        "hash": {"n": 5, "mean": 100, "m2": 0.0},  # mean 100 ms
+        "broadcast": {"n": 5, "mean": 80, "m2": 0.0},  # mean 80 ms
+        "sort_merge": {"n": 5, "mean": 10, "m2": 0.0},  # mean 10 ms
     }
     assert lt.ucb1_best_arm(stats, ("hash", "broadcast", "sort_merge")) == "sort_merge"
 
 
 def test_ucb1_is_deterministic():
     stats = {
-        "hash": {"n": 5, "sum": 500.0},
-        "broadcast": {"n": 5, "sum": 400.0},
-        "sort_merge": {"n": 5, "sum": 50.0},
+        "hash": {"n": 5, "mean": 100, "m2": 0.0},
+        "broadcast": {"n": 5, "mean": 80, "m2": 0.0},
+        "sort_merge": {"n": 5, "mean": 10, "m2": 0.0},
     }
     arms = ("hash", "broadcast", "sort_merge")
     assert len({lt.ucb1_best_arm(stats, arms) for _ in range(20)}) == 1

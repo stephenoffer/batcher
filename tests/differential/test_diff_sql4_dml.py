@@ -12,7 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 
 
 # --------------------------------------------------------------------------
@@ -49,7 +49,7 @@ def nums(duck):
     ],
 )
 def test_ordered_set_aggregate_matches_duckdb(nums, duck, query):
-    assert_same(bt.sql(query, t=nums).to_arrow(), duck.sql(query))
+    assert_same_ordered(bt.sql(query, t=nums).to_arrow(), duck.sql(query))
 
 
 def test_percentile_disc_within_group_clean_error(nums):

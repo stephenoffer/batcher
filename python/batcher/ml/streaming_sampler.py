@@ -31,6 +31,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from typing import Any
 
+from batcher._internal.mathx import ceil_div
 from batcher.ml.converters import _worker_stride
 from batcher.ml.permutation import _FeistelPermutation, epoch_permutation
 
@@ -183,7 +184,7 @@ def _rank_positions(
     first = rank
     if start > rank:
         # The first position >= start that is congruent to `rank` modulo `world_size`.
-        first = rank + -(-(start - rank) // world_size) * world_size
+        first = rank + ceil_div(start - rank, world_size) * world_size
     return range(min(first, usable), usable, world_size)
 
 
@@ -204,7 +205,7 @@ def num_rank_batches(
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     total = len(_rank_positions(num_samples, world_size, rank, global_consumed, drop_last))
-    return total // batch_size if drop_last else -(-total // batch_size)
+    return total // batch_size if drop_last else ceil_div(total, batch_size)
 
 
 def rank_index_batches(

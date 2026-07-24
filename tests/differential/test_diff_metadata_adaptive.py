@@ -14,7 +14,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.metadata_adaptive as _metadata_adaptive  # noqa: F401
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.io.source import InMemorySource, source_statistics
@@ -56,13 +56,13 @@ def test_sort_over_one_row_source(duck):
     t = pa.table({"x": [7], "y": ["a"]})
     ds = _reg(duck, "s1", t)
     assert _absent(ds.sort("x"), Sort)  # one row → the sort is dropped
-    assert_same(ds.sort("x").collect(), duck.sql("SELECT * FROM s1 ORDER BY x"))
+    assert_same_ordered(ds.sort("x").collect(), duck.sql("SELECT * FROM s1 ORDER BY x"))
 
 
 def test_sort_over_one_null_row(duck):
     t = pa.table({"x": pa.array([None], pa.int64()), "y": ["a"]})
     ds = _reg(duck, "s1n", t)
-    assert_same(ds.sort("x").collect(), duck.sql("SELECT * FROM s1n ORDER BY x"))
+    assert_same_ordered(ds.sort("x").collect(), duck.sql("SELECT * FROM s1n ORDER BY x"))
 
 
 def test_sort_over_global_aggregate(duck):
@@ -70,7 +70,9 @@ def test_sort_over_global_aggregate(duck):
     ds = _reg(duck, "s2", t)
     q = ds.agg(n=col("x").count(), s=col("x").sum()).sort("s")
     assert _absent(q, Sort)  # a global aggregate is exactly one row
-    assert_same(q.collect(), duck.sql("SELECT count(x) AS n, sum(x) AS s FROM s2 ORDER BY s"))
+    assert_same_ordered(
+        q.collect(), duck.sql("SELECT count(x) AS n, sum(x) AS s FROM s2 ORDER BY s")
+    )
 
 
 # --- prune_constant_sort_keys --------------------------------------------------
@@ -81,7 +83,7 @@ def test_constant_sort_key_pruned(duck):
     ds = _reg(duck, "c1", t)
     out = ds.with_columns(k=7).sort("k", "x")
     # The literal key `k` is pruned; the result (incl. the constant column) is unchanged.
-    assert_same(out.collect(), duck.sql("SELECT *, 7 AS k FROM c1 ORDER BY k, x"))
+    assert_same_ordered(out.collect(), duck.sql("SELECT *, 7 AS k FROM c1 ORDER BY k, x"))
 
 
 def test_all_constant_sort_keys_dropped(duck):
@@ -89,7 +91,7 @@ def test_all_constant_sort_keys_dropped(duck):
     ds = _reg(duck, "c2", t)
     out = ds.with_columns(k=1).sort("k")
     assert _absent(out, Sort)  # the only key is constant and there is no top-N
-    assert_same(out.collect(), duck.sql("SELECT *, 1 AS k FROM c2 ORDER BY k"))
+    assert_same_ordered(out.collect(), duck.sql("SELECT *, 1 AS k FROM c2 ORDER BY k"))
 
 
 # --- drop_distinct_when_unique -------------------------------------------------

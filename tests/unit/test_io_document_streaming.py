@@ -19,6 +19,7 @@ import pytest
 pypdf = pytest.importorskip("pypdf")
 
 import batcher.io.formats.unstructured.documents as doc_mod  # noqa: E402
+from batcher._internal.errors import FormatError  # noqa: E402
 from batcher.io.formats.unstructured.documents import DocumentSource  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -101,13 +102,25 @@ def test_a_page_that_will_not_extract_is_null_under_skip(corpus, monkeypatch) ->
 
 
 def test_a_page_that_will_not_extract_raises_by_default(corpus, monkeypatch) -> None:
+    """Without `on_error`, an extraction failure propagates — as a *typed* error.
+
+    `ErrorPolicy` raises `FormatError` rather than re-raising the backend's own exception,
+    so the message names the file and the flag that would tolerate it instead of leaving
+    the caller with whichever error the backend happened to pick. The original is chained,
+    so nothing is lost — asserted here, because a wrapper that swallowed the cause would
+    be worse than the bare error it replaced.
+    """
+
     def explode(self):
         raise ValueError("cannot extract")
 
     monkeypatch.setattr(pypdf._page.PageObject, "extract_text", explode)
 
-    with pytest.raises(ValueError, match="cannot extract"):
+    with pytest.raises(FormatError) as exc:
         list(DocumentSource(corpus).iter_batches())
+    assert "on_error='skip'" in str(exc.value)
+    assert isinstance(exc.value.__cause__, ValueError)
+    assert "cannot extract" in str(exc.value.__cause__)
 
 
 def test_the_batch_size_is_what_splits_the_pages(tmp_path, monkeypatch) -> None:

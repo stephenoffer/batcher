@@ -8,8 +8,9 @@ arm provably carries the same type. `_pure` stops a drop from erasing an error.
 from __future__ import annotations
 
 import datetime as dt
-import math
 from collections.abc import Sequence
+
+from batcher._internal.mathx import is_nan
 
 # `_key` (structural identity), `_rewrite_node` (leaf Expr rule → rebuilt node, or None) and
 # `_safe` (deterministic + non-erroring) are the sibling family's helpers, imported rather than
@@ -132,6 +133,6 @@ def _is_null_lit(expr: Expr) -> bool:
     ):
         return False
     value = expr.left.value
-    if isinstance(value, float) and math.isnan(value):
+    if is_nan(value):
         return False
     return _key(expr.left) == _key(expr.right)

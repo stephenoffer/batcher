@@ -20,6 +20,7 @@ from batcher._sql.parser.expressions.literals import (
     _EXTRACT_PART,
     _TEMPORAL_KINDS,
     _apply_interval,
+    _const_str_arg,
     _dtype_name,
     _fold_const_arith,
     _like_to_regex,
@@ -168,15 +169,13 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, exp.RegexpReplace):
         return _regexp_replace(tr, node)
     if isinstance(node, exp.RegexpLike):  # regexp_matches(s, pattern[, options])
-        pat = node.expression
-        if not (isinstance(pat, exp.Literal) and pat.is_string):
-            raise NotImplementedError("regexp_matches requires a constant string pattern")
+        pat = _const_str_arg(node.expression, "regexp_matches", "pattern")
         flag_node = node.args.get("flag")
         is_str_lit = isinstance(flag_node, exp.Literal) and flag_node.is_string
         if flag_node is not None and not is_str_lit:
             raise NotImplementedError("regexp_matches options must be a constant string")
         prefix = _regexp_flags_prefix(flag_node.this if is_str_lit else None)
-        return tr._scalar(node.this).str.regexp_matches(prefix + pat.this)
+        return tr._scalar(node.this).str.regexp_matches(prefix + pat)
     if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
         return json_extract(tr, node)
 

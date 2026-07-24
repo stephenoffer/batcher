@@ -113,13 +113,10 @@ class Project(LogicalPlan):
         inp = self.input.available_schema()
         if inp is None:
             return None
-        fields: list[pa.Field] = []
-        for item in self.items:
-            t = infer_type(item.expr, inp)
-            if t is None:  # one uncertain column → fall back for the whole plan
-                return None
-            fields.append(pa.field(item.alias, t))
-        return SchemaRef.from_arrow(pa.schema(fields))
+        # One uncertain column falls the whole plan back — see `from_typed_fields`.
+        return SchemaRef.from_typed_fields(
+            (item.alias, infer_type(item.expr, inp)) for item in self.items
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +377,30 @@ class MapBatches(LogicalPlan):
     # malformed JSON / bad record doesn't kill a long inference job (the guides' universal
     # ``max_errored_blocks`` need). Executed in Python; no IR change.
     max_errored_rows: int = 0
+    # Transient-failure resilience for a flaky/external `fn` (an LLM API, a vector-DB upsert, a
+    # model that intermittently OOMs) — the ML-inference workload Batcher targets. A batch whose
+    # `fn` raises a retryable error is retried up to `max_retries` times with exponential backoff
+    # (`retry_backoff_s * 2**attempt`), before the failure falls through to `max_errored_rows`.
+    # 0 (the default) = no retry, so a real bug on clean data still fails fast on the first call.
+    max_retries: int = 0
+    retry_backoff_s: float = 0.5
+    # The exception types worth retrying; empty = retry any `Exception` when `max_retries > 0`.
+    # A non-retryable bug (a `TypeError` from a schema mismatch) should not burn the retry budget,
+    # so restrict retries to the transient errors an external service actually raises.
+    retry_on: tuple[type[BaseException], ...] = ()
+    # Wall-clock ceiling (seconds) for a single per-batch `fn` call; 0 = no timeout. A call that
+    # exceeds it raises `TimeoutError` (retried like any transient error, then charged to the
+    # error budget). Guards a query against a hung external call — Python cannot preempt a
+    # running call, so the timed-out call's thread is abandoned and its result discarded, not
+    # killed. Applies to the thread/sequential paths (where a flaky I/O-bound `fn` runs), not the
+    # multiprocessing path (reserved for CPU-bound pure-Python `fn`s). On the async path
+    # (`async def fn`) the timeout instead *cancels* the pending coroutine at its next await.
+    timeout_s: float = 0.0
+    # Max in-flight batches for an async (`async def`) `fn`: an I/O-bound inference/enrichment
+    # `fn` awaits a remote service, so many batches' awaits overlap on ONE event loop bounded by
+    # this semaphore — the LLM-API concurrency pattern, without a thread per request. 0 = an
+    # adaptive default. Ignored for a synchronous `fn` (which uses the thread/process paths).
+    max_concurrency: int = 0
 
     def to_ir(self) -> dict[str, Any]:
         raise NotImplementedError("map_batches is executed in Python, not lowered to the engine IR")

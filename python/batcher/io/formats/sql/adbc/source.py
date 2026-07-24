@@ -29,6 +29,7 @@ URI onto the right driver.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -121,6 +122,36 @@ class _ADBCQuerySplit:
             reader = cur.fetch_record_batch()
             for batch in reader:
                 yield batch.select(projection) if projection is not None else batch
+        finally:
+            conn.close()
+
+    @contextmanager
+    def catalog_session(self) -> Iterator[tuple[Any, Any]]:
+        """Yield ``(run_scalar, run_rows)`` sharing **one** connection for the catalog probes.
+
+        A `statistics()` call issues three catalog queries; opening a connection per query
+        tripled the connect round trips against the database. They share one connection here
+        — one connect, three cheap `execute`s, one close — each on its own short-lived cursor,
+        rolling back on failure so a Postgres-style transaction abort does not poison the
+        queries that follow. A catalog answer is one row, so `execute`/`fetch` is used rather
+        than `fetch_arrow_table`, whose Arrow materialization would be pure overhead here.
+        """
+        conn = _connect(self.driver, self.db_kwargs, self.conn_kwargs)
+
+        def _run(sql: str, *, many: bool) -> Any:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                return list(cur.fetchall()) if many else (cur.fetchone() or (None,))[0]
+            except Exception:
+                with suppress(Exception):
+                    conn.rollback()
+                raise
+            finally:
+                cur.close()
+
+        try:
+            yield (lambda sql: _run(sql, many=False), lambda sql: _run(sql, many=True))
         finally:
             conn.close()
 
@@ -337,6 +368,29 @@ class ADBCSource:
 
     def row_count(self) -> int | None:
         return None
+
+    def statistics(self) -> Any:
+        """Catalog row count, byte size, and per-column stats for a `table=` read, else None.
+
+        A base ``table=`` has a system-catalog entry the driver's own dialect can answer
+        without scanning it; a ``query=`` read is an arbitrary expression with none. The
+        dialect is read from the ADBC driver name (``adbc_driver_postgresql`` -> Postgres),
+        so a Postgres-over-ADBC table reaches Kyber with the same null/ndv/mcv/quantile
+        facets a Parquet footer would supply. Best-effort: any catalog failure yields None.
+        """
+        if self.table is None or self.driver is None:
+            return None
+        from batcher.io.stats import dialect_for_driver, sql_statistics
+
+        dialect = dialect_for_driver(self.driver)
+        if dialect is None:
+            return None
+        split = _ADBCQuerySplit(self.driver, self.db_kwargs or {}, self.conn_kwargs, "")
+        try:
+            with split.catalog_session() as (run_scalar, run_rows):
+                return sql_statistics(dialect, self.table, run_scalar=run_scalar, run_rows=run_rows)
+        except Exception:
+            return None
 
     def identity(self) -> str:
         # The connection is part of the key: the same query against production and

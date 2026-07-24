@@ -19,75 +19,16 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array};
 use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
+// The engine's single definition of float identity: `-0.0` folds into `0.0` and every NaN
+// bit-pattern into one. It lives in `bc-arrow`, the lowest crate this and `bc-expr` share,
+// exactly so the grouping keys here and the scalar comparisons there cannot drift apart.
+pub(crate) use bc_arrow::{canon_f32, canon_f64_bits as canon_f64, float_total_cmp};
+use bc_arrow::{needs_canon_f32, needs_canon_f64};
 
 /// A fixed hash for null keys so every null row lands in one partition — and therefore one
 /// group. Grouping inside the partition still compares keys, so a non-null value that
 /// collides with this hash is never conflated with null; only co-location depends on it.
 pub(crate) const NULL_HASH: u64 = 0xa5a5_5a5a_dead_beef;
-
-/// Canonical `u64` key bits for an `f64`.
-///
-/// Every NaN bit-pattern maps to one value and negative zero maps to positive zero, so
-/// raw-bit hashing and equality agree with SQL `GROUP BY` semantics: all NaNs form one
-/// group and the two zeros form one group (matching DuckDB). Every other value keeps its
-/// exact bits, so distinct finite values stay distinct.
-#[inline]
-pub(crate) fn canon_f64(v: f64) -> u64 {
-    if v.is_nan() {
-        0x7ff8_0000_0000_0000 // one canonical quiet NaN
-    } else if v == 0.0 {
-        0 // +0.0 bits (folds -0.0 into 0.0)
-    } else {
-        v.to_bits()
-    }
-}
-
-/// Total order over `f64` for `min`/`max`, matching the order `ORDER BY` sorts in.
-///
-/// Raw IEEE comparison is *not* a total order: every comparison with NaN is false, so a
-/// `max()` written as `v > cur` silently **ignores** NaN and returns the largest non-NaN value.
-/// That contradicts our own `ORDER BY`, which sorts NaN last (i.e. treats it as the greatest
-/// value) — so `max(x)` disagreed with `SELECT x ORDER BY x DESC LIMIT 1` on the same column,
-/// and with DuckDB. Here all NaNs compare equal and greater than every number, which is the
-/// order the sort already uses.
-///
-/// `-0.0` and `0.0` compare `Equal` (as they do in `=`, `GROUP BY`, and [`canon_f64`]), so which
-/// of the two an extreme returns is first-seen — the same rule every other engine applies.
-#[inline]
-pub(crate) fn float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a.is_nan(), b.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        // Neither is NaN, so `partial_cmp` is total here.
-        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-    }
-}
-
-/// Whether `v` is negative zero — the one non-NaN value [`canon_f64`] rewrites.
-///
-/// `v == 0.0` is true for both zeros, so the sign bit is what distinguishes them.
-#[inline]
-fn is_neg_zero(v: f64) -> bool {
-    v == 0.0 && v.is_sign_negative()
-}
-
-/// Canonical `f32` bits, mirroring [`canon_f64`] for a 32-bit float.
-///
-/// Top-level `Float32` keys are widened to `Float64` at the FFI boundary, but a `Float32`
-/// *nested* inside a list/struct key is not, so a float leaf can still arrive as `f32` and
-/// must fold `-0.0`/all-NaN the same way. Every NaN → one quiet NaN, `-0.0` → `0.0`.
-#[inline]
-fn canon_f32(v: f32) -> f32 {
-    if v.is_nan() {
-        f32::from_bits(0x7fc0_0000) // one canonical quiet NaN
-    } else if v == 0.0 {
-        0.0 // folds -0.0 into 0.0
-    } else {
-        v
-    }
-}
 
 /// Whether a data type has a floating-point leaf that needs canonicalizing — a top-level
 /// float, or a float nested inside a list/struct key. Dictionary and top-level narrow
@@ -122,7 +63,7 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
             // 6M rows, serially) before anything else in the operator starts. Slots under a
             // null are read here too; a null's payload is arbitrary, so at worst it triggers a
             // rewrite that was not needed, which is still correct.
-            if !f.values().iter().any(|x| x.is_nan() || is_neg_zero(*x)) {
+            if !f.values().iter().any(|x| needs_canon_f64(*x)) {
                 return None;
             }
             // `canon_f64` returns hash bits; map back to the f64 they denote so the column
@@ -135,11 +76,7 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
         }
         DataType::Float32 => {
             let f = arr.as_any().downcast_ref::<Float32Array>()?;
-            if !f
-                .values()
-                .iter()
-                .any(|x| x.is_nan() || (*x == 0.0 && x.is_sign_negative()))
-            {
+            if !f.values().iter().any(|x| needs_canon_f32(*x)) {
                 return None;
             }
             let canon: Float32Array = f.iter().map(|v| v.map(canon_f32)).collect();

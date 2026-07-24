@@ -70,13 +70,23 @@ def test_sequence_inclusive_series(start, stop, step, expected):
 
 
 def test_sequence_over_large_range_errors_not_oom():
-    """~10^10 elements must raise, not exhaust memory / overflow the 32-bit offsets."""
+    """~10^10 elements must raise, not exhaust memory / overflow the 32-bit offsets.
+
+    The message names the limit, so an operator who hits it knows the cap is the list
+    builder's 32-bit offsets rather than a transient memory shortage.
+    """
     ds = bt.from_pydict({"z": [0]})
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match=r"exceeds the supported maximum of 2147483647"):
         ds.select(r=sequence(bt.lit(1), bt.lit(10_000_000_000), bt.lit(1))).collect()
 
 
-def test_sequence_zero_step_errors():
+def test_sequence_zero_step_errors_and_names_the_step():
+    """A zero step is reported as a zero *step*, not as a division by zero.
+
+    The generator divides by the step to size the result, so the raw arithmetic error
+    used to surface as "integer division or modulo by zero" — which sends the reader
+    hunting for a division they never wrote.
+    """
     ds = bt.from_pydict({"z": [0]})
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match=r"sequence: step must be non-zero"):
         ds.select(r=sequence(bt.lit(1), bt.lit(5), bt.lit(0))).collect()

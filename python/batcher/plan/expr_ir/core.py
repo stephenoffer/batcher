@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
+from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import ExprTag
 from batcher.plan.types import CAST_DTYPES
 
@@ -130,6 +131,27 @@ class Expr:
                 {'e': 'col', 'name': 'x'}
         """
         raise NotImplementedError
+
+    def __getattr__(self, name: str) -> Any:
+        """Raise an `AttributeError` that names the Batcher spelling for an absent idiom.
+
+        Only reached when normal lookup fails, so it never shadows a real method or a
+        typed accessor. A pandas/Polars migrant reaches for an expression method Batcher
+        spells differently (``.map_elements``, ``.clip_lower``, ``.argmax``) or does not
+        have at expression level (``.filter``, ``.value_counts``); the traceback carries
+        the mapping — see `batcher.plan.expr_ir.compat.guidance`.
+
+        Args:
+            name: The attribute name that was not found.
+
+        Raises:
+            AttributeError: Always, with guidance for `name`.
+        """
+        # Dunder and private probes (copy/pickle/inspect, subclass instance state) must
+        # fail plainly: a decorated failure would turn a routine hasattr into a hard error.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise _expr_attribute_error(self, name)
 
     # --- comparison operators (yield boolean expressions) ------------------
     def __gt__(self, other: IntoExpr) -> Expr:

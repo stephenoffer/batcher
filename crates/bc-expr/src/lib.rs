@@ -702,6 +702,15 @@ pub enum StrFunc {
     /// string, so the final chunk may be shorter. Empty string → empty list; null →
     /// null list.
     Chunk,
+    /// Word n-grams → a `List<Utf8>`: split on whitespace, then join each window of
+    /// `length` adjacent tokens with a single space. `length` carries `n` (reusing the
+    /// scalar slot the way `chunk`/`repeat` do). A string with fewer than `n` tokens
+    /// yields the single n-gram of all its tokens (never an empty list for non-empty
+    /// input), so a short document still contributes. Empty string → empty list; null →
+    /// null list. This is the token-level counterpart of `chunk`'s character windows,
+    /// and the primitive the multiset generation metrics (BLEU/ROUGE-N/Distinct-n) build
+    /// their token n-gram sets from.
+    TokenNgrams,
     /// True where `pattern` (a regex) matches anywhere in the string. → Boolean.
     RegexpMatches,
     /// Replace the first match of regex `pattern` with `replacement`. → Utf8.

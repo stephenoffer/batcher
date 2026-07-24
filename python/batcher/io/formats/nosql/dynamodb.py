@@ -28,6 +28,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["DynamoDBSource"]
 
@@ -110,6 +111,31 @@ class DynamoDBSource(ScanSource):
         production.
         """
         return {k: v for k, v in self._conn_kwargs.items() if not k.startswith("aws_")}
+
+    def statistics(self) -> SourceStatistics | None:
+        """Advisory item count and on-disk byte size from ``DescribeTable`` — no scan.
+
+        DynamoDB maintains ``ItemCount`` and ``TableSizeBytes`` on the table and returns
+        both from a single ``DescribeTable`` metadata call, so the planner gets a
+        cardinality and a size for free instead of paying read-capacity to scan the table
+        to learn them. Both are updated roughly every six hours, so they are **estimates**:
+        `exact_rows=False`, so the figure sizes joins and the worker fan-out but never
+        answers an exact ``count()``. Best-effort — any AWS error yields None.
+        """
+        try:
+            client = self._client()
+            table = client.describe_table(TableName=self._conn_kwargs["table"])["Table"]
+        except Exception:
+            return None
+        rows = table.get("ItemCount")
+        size = table.get("TableSizeBytes")
+        if rows is None and not size:
+            return None
+        return SourceStatistics(
+            row_count=int(rows) if rows is not None else None,
+            byte_size=int(size) if size else None,
+            exact_rows=False,  # DescribeTable's counters refresh only ~every six hours
+        )
 
     def _infer_schema(self) -> pa.Schema:
         client = self._client()

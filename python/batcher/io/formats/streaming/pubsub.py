@@ -45,6 +45,18 @@ def _stable_offset(message_id: str) -> int:
     )
 
 
+def _is_pull_timeout(exc: BaseException) -> bool:
+    """Whether `exc` is a Pub/Sub pull that timed out with nothing to deliver.
+
+    An idle subscription has no messages, so a bounded pull hits its deadline. Google raises
+    ``DeadlineExceeded`` (or wraps it in ``RetryError``); both mean "no data within the
+    window", not a failure. Matched by class name so the optional ``google-api-core`` need
+    not be importable to recognize the idle case.
+    """
+    names = {type(exc).__name__ for exc in (exc, exc.__cause__) if exc is not None}
+    return bool(names & {"DeadlineExceeded", "RetryError", "_MultiThreadedRendezvous"})
+
+
 def _import_subscriber() -> Any:
     """Import ``pubsub_v1.SubscriberClient`` or raise a guiding ``BackendError``."""
     try:
@@ -69,7 +81,7 @@ class PubSubSource(BrokerSource):
 
     format_name = "pubsub"
 
-    __slots__ = ("_client_obj", "_pending_acks")
+    __slots__ = ("_client_obj", "_pending_acks", "_pull_timeout")
 
     def __init__(
         self,
@@ -77,12 +89,17 @@ class PubSubSource(BrokerSource):
         *,
         poll_size: int = 16_384,
         partitions: list[int] | None = None,  # noqa: ARG002 (single logical partition)
+        pull_timeout: float = 10.0,
         **options: Any,
     ) -> None:
         super().__init__(topic, poll_size=poll_size, **options)
         self._client_obj: Any = None
         # Ack ids pulled but not yet published, acked by `_commit_delivered`.
         self._pending_acks: list[str] = []
+        # Bound a single pull so an idle subscription does not block the poll — and with it
+        # the trigger cadence and `stop()` — indefinitely. A deadline hit with no messages is
+        # treated as an empty poll (the loop simply polls again on the next trigger).
+        self._pull_timeout = pull_timeout
 
     def _client(self) -> Any:
         if self._client_obj is None:
@@ -95,7 +112,15 @@ class PubSubSource(BrokerSource):
 
     def _poll(self) -> list[BrokerMessage] | None:
         client = self._client()
-        response = client.pull(request={"subscription": self.topic, "max_messages": self.poll_size})
+        try:
+            response = client.pull(
+                request={"subscription": self.topic, "max_messages": self.poll_size},
+                timeout=self._pull_timeout,
+            )
+        except Exception as exc:
+            if _is_pull_timeout(exc):
+                return []  # idle subscription: no data within the deadline, poll again later
+            raise
         received = response.received_messages
         messages = [
             BrokerMessage(

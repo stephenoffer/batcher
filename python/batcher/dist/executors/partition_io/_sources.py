@@ -24,6 +24,7 @@ import pickle
 
 import pyarrow as pa
 
+from batcher._internal.mathx import ceil_div
 from batcher.dist.executors.scan_read import (
     _SCAN_PREFETCH,
     _SPLIT_TARGET_BYTES,
@@ -154,7 +155,7 @@ def _contiguous(splits: list[Split], workers: int) -> list[list[Split]]:
     groups: list[list[Split]] = [[] for _ in range(workers)]
     if workers <= 0 or not splits:
         return groups
-    target = max(1, -(-sum(s.row_count() or 1 for s in splits) // workers))  # ceil per group
+    target = max(1, ceil_div(sum(s.row_count() or 1 for s in splits), workers))  # ceil per group
     w, load = 0, 0
     for s in splits:
         groups[w].append(s)

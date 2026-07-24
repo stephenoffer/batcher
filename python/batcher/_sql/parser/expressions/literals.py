@@ -192,6 +192,34 @@ def _int_literal(node) -> int | None:
     return None
 
 
+def _const_str_arg(node, what: str, role: str = "argument") -> str:
+    """The string a constant string-literal argument denotes, or raise.
+
+    Many SQL scalar functions (`replace`, `split_part`, `regexp_extract`, …) can only
+    lower a pattern/delimiter/prefix when it is a constant string literal. `what` names
+    the function and `role` the argument, so the rejection reads e.g. `split_part()
+    requires a constant string delimiter`.
+    """
+    from sqlglot import expressions as exp
+
+    if not (isinstance(node, exp.Literal) and node.is_string):
+        raise NotImplementedError(f"{what} requires a constant string {role}")
+    return node.this
+
+
+def _const_int_arg(node, what: str) -> int:
+    """The integer a constant integer-literal argument denotes, or raise.
+
+    Wraps `_int_literal` (which folds a `Neg`-wrapped negative literal) with the uniform
+    `must be an integer literal` rejection the scalar path repeats. `what` names the
+    offending argument for the error message.
+    """
+    value = _int_literal(node)
+    if value is None:
+        raise NotImplementedError(f"{what} must be an integer literal")
+    return value
+
+
 def _fold_const_arith(node) -> Expr | None:
     """Constant-fold ``literal <op> literal`` arithmetic with exact decimal semantics.
 

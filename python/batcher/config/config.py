@@ -344,7 +344,7 @@ class FlowControlConfig:
     # MiB/channel of narrow rows) is unchanged from the historical `4 x 16`; only the
     # *starting* window rose, not the memory ceiling.
     credit_ceiling_factor: int = 4
-    # Byte ceiling for one shuffle channel's credit window (C53). A credit ≈ one
+    # Byte ceiling for one shuffle channel's credit window. A credit ≈ one
     # `morsel_bytes` batch, so a count-only ceiling can buffer GBs for wide rows
     # (embeddings, blobs). The granted window is also clamped to
     # `credit_byte_budget // morsel_bytes`, so a channel's buffered memory is bounded
@@ -718,34 +718,34 @@ AUTOSCALE_WAIT_AUTO: float = -1.0
 class ShuffleTlsConfig:
     """TLS for the inter-node Arrow Flight shuffle — encrypt the wire, authenticate peers.
 
-    The shuffle moves query data (including already-decrypted or masked columns) directly
-    between worker processes. On any network the operator does not fully control, that
-    traffic must be encrypted and the peers mutually authenticated. These are **file
-    paths** to PEM material the platform mounts on every worker (a Kubernetes secret
-    volume, cert-manager, a cloud private-CA); Batcher reads them at worker start and
-    issues no certificates itself — minting and rotating them is a platform concern.
+        The shuffle moves query data (including already-decrypted or masked columns) directly
+        between worker processes. On any network the operator does not fully control, that
+        traffic must be encrypted and the peers mutually authenticated. These are **file
+        paths** to PEM material the platform mounts on every worker (a Kubernetes secret
+        volume, cert-manager, a cloud private-CA); Batcher reads them at worker start and
+        issues no certificates itself — minting and rotating them is a platform concern.
 
-    Off by default (`enabled=False`) for a plaintext shuffle on a trusted network. One
-    cluster CA typically signs both the server and the client certificates, so
-    `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
-    turn on mTLS (a connecting peer must present a certificate that CA signed).
-    Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
+        Off by default (`enabled=False`) for a plaintext shuffle on a trusted network. One
+        cluster CA typically signs both the server and the client certificates, so
+        `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
+        turn on mTLS (a connecting peer must present a certificate that CA signed).
+        Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
 
-    Examples:
-        .. doctest::
+        Examples:
+            .. doctest::
 
-            >>> from batcher.config import ShuffleTlsConfig
-            >>> ShuffleTlsConfig().enabled  # plaintext shuffle by default
-            False
-            >>> tls = ShuffleTlsConfig(
-            ...     enabled=True,
-            ...     ca_cert_path="/etc/batcher/ca.pem",
-            ...     server_cert_path="/etc/batcher/server.pem",
-            ...     server_key_path="/etc/batcher/server.key",
-            ...     require_client_auth=True,
-            ... )
-            >>> tls.server_name  # the SAN a peer's certificate must carry
-            'batcher-shuffle'
+                >>> from batcher.config import ShuffleTlsConfig
+                >>> ShuffleTlsConfig().enabled  # plaintext shuffle by default
+                False
+                >>> tls = ShuffleTlsConfig(
+    ...     enabled=True,
+    ...     ca_cert_path="/etc/batcher/ca.pem",
+    ...     server_cert_path="/etc/batcher/server.pem",
+    ...     server_key_path="/etc/batcher/server.key",
+    ...     require_client_auth=True,
+    ... )
+                >>> tls.server_name  # the SAN a peer's certificate must carry
+                'batcher-shuffle'
     """
 
     enabled: bool = False
@@ -1013,7 +1013,7 @@ class DistributedConfig:
     #   True  — always engage (for a known-selective workload).
     #   False — never engage (pin the plain shuffle).
     runtime_bloom_join: bool | str = "auto"
-    # Shared-secret token authenticating Flight shuffle fetches (N5). When set, a
+    # Shared-secret token authenticating Flight shuffle fetches. When set, a
     # peer must present it to fetch a partition, so a process that can merely reach
     # the port cannot exfiltrate shuffle data. None (default) disables the check —
     # appropriate on a trusted/isolated cluster network. Also read from the
@@ -1626,7 +1626,7 @@ class Config:
             self.execution.morsel_rows,
             self.execution.morsel_bytes,
             self.execution.parallelism,
-            self._rust_memory_budget_bytes(),
+            self.spill_budget_bytes(),
             self.memory.spill_dir,
             self.memory.spill_compression,
             self.execution.fuse_linear,
@@ -1674,8 +1674,12 @@ class Config:
         validate_config(self)
         return self
 
-    def _rust_memory_budget_bytes(self) -> int:
-        """The per-operator spill budget shipped to the data plane (bytes).
+    def spill_budget_bytes(self) -> int:
+        """The per-operator spill budget, in bytes — the point at which an operator spills.
+
+        Shipped to the data plane as the engine config's `memory_budget_bytes`, and read by
+        the cost model so that "this operator will spill" means the same thing to the planner
+        and to the engine that will run it.
 
         Derived statically from `MemoryConfig` so `config` stays neutral — it never
         senses (the `api` auto-tuning resolver fills `max_memory_bytes` from the live
@@ -1695,6 +1699,27 @@ class Config:
         time: it is a spill threshold, and spilling is result-invariant, so
         over-estimating it on a small box spills later and under-estimating it on a
         large one spills sooner — either beats being killed.
+
+        Examples:
+            .. doctest::
+
+                >>> import dataclasses
+                >>> from batcher.config import Config
+                >>> cfg = Config()
+                >>> capped = dataclasses.replace(
+                ...     cfg, memory=dataclasses.replace(cfg.memory, max_memory_bytes=1_000_000_000)
+                ... )
+                >>> capped.spill_budget_bytes()
+                900000000
+
+                >>> opted_out = dataclasses.replace(
+                ...     cfg, memory=dataclasses.replace(cfg.memory, unbounded_memory=True)
+                ... )
+                >>> opted_out.spill_budget_bytes()
+                0
+
+        Returns:
+            The spill threshold in bytes, or 0 when the user opted out of any bound.
         """
         mem = self.memory
         if mem.unbounded_memory:
@@ -1995,7 +2020,13 @@ def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
 
 
 def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
-    """Recursively overlay a nested dict of overrides onto a frozen config object."""
+    """Recursively overlay a nested dict of overrides onto a frozen config object.
+
+    A sequence value is restored to the declared field's type. Every serialization format
+    the config is read from — JSON, TOML, YAML — has arrays but not tuples, so a sequence
+    always arrives as a list; storing it as one would leave the section unequal to its
+    source and unhashable, since the sections are frozen and hashable by design.
+    """
     fields = {f.name for f in dataclasses.fields(obj)}
     updates: dict[str, object] = {}
     for name, value in data.items():
@@ -2004,6 +2035,8 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
         current = getattr(obj, name)
         if dataclasses.is_dataclass(current) and isinstance(value, dict):
             updates[name] = _overlay_dict(current, value)  # type: ignore[arg-type]
+        elif isinstance(current, tuple) and isinstance(value, list):
+            updates[name] = tuple(value)
         else:
             updates[name] = value
     return replace(obj, **updates) if updates else obj
@@ -2092,24 +2125,25 @@ def set_config(config: Config) -> None:
 def config_context(config: Config) -> Iterator[Config]:
     """Temporarily activate `config` for the duration of the `with` block.
 
-    Validates `config` on entry (raises `ConfigError` on a bad value).
+        Validates `config` on entry (raises `ConfigError` on a bad value).
 
-    Examples:
-        .. doctest::
+        Examples:
+            .. doctest::
 
-            >>> from batcher.config import Config, ExecutionConfig, active_config, config_context
-            >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
-            >>> with config_context(cfg):
-            ...     active_config().execution.morsel_rows
-            4096
-            >>> active_config().execution.morsel_rows
-            16384
+                >>> from batcher.config import Config, ExecutionConfig
+                >>> from batcher.config import active_config, config_context
+                >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+                >>> with config_context(cfg):
+    ...     active_config().execution.morsel_rows
+                4096
+                >>> active_config().execution.morsel_rows
+                16384
 
-    Args:
-        config: The Config to activate for the block. It is validated on entry.
+        Args:
+            config: The Config to activate for the block. It is validated on entry.
 
-    Yields:
-        The resolved Config that is active inside the block.
+        Yields:
+            The resolved Config that is active inside the block.
     """
     resolved = _resolved(config)
     token = _active.set(resolved)

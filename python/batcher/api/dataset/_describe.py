@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher._internal.mathx import safe_div
 from batcher.plan.expr_ir import col, count
 
 if TYPE_CHECKING:
@@ -126,7 +127,7 @@ def profile(ds: Dataset) -> Dataset:
         names.append(c)
         counts.append(cnt)
         null_counts.append(total - cnt)
-        null_fracs.append((total - cnt) / total if total else 0.0)
+        null_fracs.append(safe_div(total - cnt, total))
         distincts.append(cell[f"{c}__nd"])
 
     from batcher.api.session import from_arrow

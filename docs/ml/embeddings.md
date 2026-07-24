@@ -74,6 +74,34 @@ Sizing the actor pool is the other half of keeping the device busy.
 
 See [GPU scheduling](gpu.md).
 
+## Embed via a served endpoint
+
+When the embedding model runs behind a service — a HuggingFace Text-Embeddings-Inference
+(TEI) server on a GPU box, or a hosted API such as OpenAI — the worker calls it instead of
+loading weights. Two load-once encoders speak the two common wire shapes and drop into
+`ds.ml.embed` exactly like a local model:
+
+```python
+# docs: skip
+from batcher.ml import openai_embedding_encoder, tei_encoder
+
+# An OpenAI-compatible /embeddings endpoint (OpenAI, Azure, Together, vLLM's server).
+openai = openai_embedding_encoder(
+    "text-embedding-3-small", "text", api_key="sk-...", dimensions=256
+)
+vectors = docs.ml.embed(openai, output_columns=["id", "text", "embedding"])
+
+# A HuggingFace TEI server (BGE / GTE / E5 on a GPU), normalizing server-side.
+tei = tei_encoder("text", base_url="http://tei-host:8080")
+vectors = docs.ml.embed(tei, output_columns=["id", "text", "embedding"])
+```
+
+Each batch's texts are sent in concurrent, size-bounded requests, so a served endpoint is
+saturated rather than called one row at a time. The `dimensions` argument asks a Matryoshka
+model (the `text-embedding-3-*` family) for a shorter vector, trading a little recall for a
+smaller index. The output column is a `fixed_size_list<float32>` — the shape Lance ANN
+indexing expects — so the served and local paths are interchangeable downstream.
+
 The mechanics run without a GPU, which is worth seeing once. The encoder here is a toy,
 but the pipeline shape is the real one.
 
@@ -118,6 +146,45 @@ print(unit.select(norm=col("embedding").list.l2_norm()).to_pydict())
 normalized before you spend a pass normalizing them again. Many hosted embedding APIs
 return unit vectors; many local models do not.
 
+## Binarize for cheap Hamming search
+
+When a small recall loss is acceptable, a binary embedding is far cheaper to search: each
+dimension becomes one bit by its sign, and distance is a bit count rather than a float dot
+product. `ds.ml.binarize_embeddings` produces the sign code, and `nearest_neighbors` ranks
+it with `metric="hamming"`.
+
+```python
+coded = vectors.ml.binarize_embeddings("embedding", output_column="code")
+print(coded.select(col("code")).to_pydict()["code"][0])
+# a list of 0/1, one per dimension
+```
+
+## Shrink Matryoshka vectors, and drop the degenerate ones
+
+A Matryoshka-trained model (the `text-embedding-3-*` family, Nomic, mxbai) packs the most
+signal into the leading dimensions, so a prefix is a smaller, faster index for a small
+recall cost. Take the prefix with `ds.ml.truncate_embeddings`, which re-normalizes it — a
+raw slice is no longer unit length, and a cosine index silently assumes it is:
+
+```python
+short = unit.ml.truncate_embeddings("embedding", 2)
+print(short.select(norm=col("embedding").list.l2_norm()).to_pydict())
+# {'norm': [1.0, 1.0, 1.0]}
+```
+
+Before indexing, drop rows whose vector is the zero vector or null. A zero vector has no
+direction, so an index returns it as a garbage neighbor; it usually means an empty input
+or a failed encode. `ds.ml.drop_degenerate_embeddings` removes both:
+
+```python
+with_holes = bt.from_pydict(
+    {"id": [1, 2, 3], "embedding": [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]]}
+)
+clean = with_holes.ml.drop_degenerate_embeddings("embedding")
+print(clean.to_pydict()["id"])
+# [1, 3]
+```
+
 ## Deduplicate before you embed, not after
 
 Embedding is the expensive stage. Every duplicate document is a full forward pass you did
@@ -146,6 +213,65 @@ print(sorted(deduped.to_pydict()["id"]))
 Two of the four documents were going to cost a forward pass each for nothing. On a real
 crawl the near-duplicate rate is routinely 20% to 40%, and that is the same fraction off
 your GPU bill. See [preprocessors](preprocessors.md) for the MinHash and LSH tuning.
+
+## Fuse dense and lexical rankings
+
+Dense embedding search and lexical (BM25) search miss different things: the embedding finds
+paraphrases, the keyword match finds exact terms and rare tokens. Hybrid retrieval runs both
+and fuses the rankings. `ds.ml.reciprocal_rank_fusion` does the fusing without asking you to
+put the two score scales into agreement — each list contributes `1 / (k + rank)` per key, and
+a document ranked highly by either retriever floats up.
+
+```python
+dense = bt.from_pydict({"id": [1, 2, 3], "score": [0.9, 0.5, 0.1]})
+lexical = bt.from_pydict({"id": [2, 3, 4], "score": [0.8, 0.7, 0.6]})
+fused = dense.ml.reciprocal_rank_fusion(lexical, key="id", score="score")
+print(fused.to_pydict()["id"])
+# [2, 3, 1, 4]
+```
+
+Documents 2 and 3, ranked by both retrievers, win; 1 and 4, each ranked by only one, follow.
+Pass more result sets as extra arguments to fuse three or more retrievers.
+
+## Score a whole query set at once
+
+Evaluating retrieval means running many queries against the corpus, not one.
+`ds.ml.batched_nearest_neighbors` scores a query set against this corpus and keeps each
+query's top `k` in one pass — an exact, index-free brute force that is right for an eval set
+and honest about being `O(queries x corpus)`.
+
+```python
+corpus = bt.from_pydict({"cid": [1, 2, 3], "emb": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]})
+queries = bt.from_pydict({"qid": [10, 11], "qv": [[1.0, 0.05], [0.0, 1.0]]})
+hits = corpus.ml.batched_nearest_neighbors(
+    queries, query_key="qid", query_column="qv", corpus_key="cid", column="emb", k=1
+)
+print(sorted(zip(hits.to_pydict()["qid"], hits.to_pydict()["cid"])))
+# [(10, 1), (11, 2)]
+```
+
+For a large corpus queried in production, build an ANN index instead — see below.
+
+Once you have the retrieved neighbors and a set of ground-truth relevant pairs,
+`ds.ml.recall_at_k` scores the retrieval: of the documents that should have come back for
+each query, what fraction did, averaged over queries.
+
+```python
+retrieved = bt.from_pydict({"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21]})
+relevant = bt.from_pydict({"qid": [1, 2, 2], "cid": [10, 20, 22]})
+print(round(retrieved.ml.recall_at_k(relevant, query_key="qid", corpus_key="cid"), 3))
+# 0.75
+```
+
+Recall asks whether the right documents came back; `ds.ml.mrr` asks how *high* the first
+right one ranked. Ask for the rank alongside the neighbors (`rank_column="rank"` on
+`batched_nearest_neighbors`), then:
+
+```python
+ranked = bt.from_pydict({"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21], "rank": [1, 2, 1, 2]})
+print(ranked.ml.mrr(relevant, query_key="qid", corpus_key="cid"))
+# a first-relevant near the top scores near 1; missing it scores 0
+```
 
 ## Chunk long documents first
 
@@ -214,6 +340,29 @@ batches = embed(chunks.iter_batches(), encoder_factory, text_column="chunk", num
 
 Same contract as the `WorkerFactory` in [inference](inference.md), which is why a local
 model, an ONNX runtime, and a hosted embedding API are interchangeable at this seam.
+
+## Scoring embedding quality
+
+Once vectors exist, the questions you ask of them are numeric, and the metrics for that aggregate a per-row vector operation to a corpus score in one scan. `bt.mean_cosine_similarity(query, doc)` is the headline retrieval-alignment number; `bt.mean_euclidean_distance` and `bt.mean_dot_product` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
+
+```python
+import batcher as bt
+
+pairs = bt.from_pydict({"q": [[1.0, 0.0], [1.0, 1.0]], "doc": [[1.0, 0.0], [0.0, 1.0]]})
+print(pairs.agg(sim=bt.mean_cosine_similarity("q", "doc")).to_pydict())
+```
+
+The single-column checks catch a degenerate index before it returns garbage: `bt.unit_norm_rate` verifies the vectors are normalized the way a cosine index assumes, `bt.zero_vector_rate` finds empty or failed embeddings, and `bt.mean_embedding_norm` tracks the average magnitude for drift. All compose with `group_by` to monitor per model, per source, or per day.
+
+Match the drift metric to the distance space your index uses. `bt.mean_cosine_distance` is the `1 - cosine` form a cosine index ranks by, `bt.mean_manhattan_distance` is the L1 metric that resists a single dominant dimension, `bt.mean_angular_distance` is the true-metric angle some indexes build on, and `bt.mean_hamming_distance` is the bit-disagreement count for binary or product-quantized vectors.
+
+```python
+import batcher as bt
+
+vecs = bt.from_pydict({"a": [[1.0, 0.0], [1.0, 0.0]], "b": [[1.0, 0.0], [0.0, 1.0]]})
+print(vecs.agg(drift=bt.mean_cosine_distance("a", "b")).to_pydict())
+# {'drift': [0.5]}
+```
 
 ## See also
 

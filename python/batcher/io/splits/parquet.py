@@ -18,6 +18,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.io.splits.base import Split
 from batcher.io.stats.file_identity import file_identity
 
@@ -349,7 +350,8 @@ def _surviving_row_groups(meta: Any, predicate: dict) -> list[int]:
             return list(range(meta.num_row_groups))
         keep = pc.fill_null(mask, True).to_pylist()
         return [i for i, k in enumerate(keep) if k]
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "prune parquet row groups", exc)
         return list(range(meta.num_row_groups))  # a footer we cannot read prunes nothing
 
 

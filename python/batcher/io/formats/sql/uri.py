@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from batcher._internal.errors import BackendError
+from batcher._internal.errors import BackendError, ConfigError
 
 __all__ = [
     "ParsedURI",
@@ -318,8 +318,13 @@ def adbc_connection(
     if parsed.password is not None:
         merged["password"] = parsed.password
     merged.update(db_kwargs or {})
-    assert parsed.driver is not None  # narrowed by the backend check above
-    return driver or parsed.driver, merged, parsed.uri
+    resolved = driver or parsed.driver
+    if resolved is None:
+        raise ConfigError(
+            f"no ADBC driver for {parsed.uri!r}; pass driver=... or use a scheme with a "
+            "registered driver"
+        )
+    return resolved, merged, parsed.uri
 
 
 def _database_from_path(path: str, scheme: str) -> str | None:

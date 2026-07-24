@@ -39,6 +39,7 @@ from collections.abc import Callable
 from typing import TextIO
 
 from batcher._internal import events
+from batcher._internal.mathx import clamp
 from batcher.observe.theme import Palette, detect
 
 __all__ = ["ConsoleReporter", "should_render"]
@@ -299,7 +300,7 @@ class ConsoleReporter:
     def _bar_width(self) -> int:
         """Bar width, scaled to the terminal and clamped to a legible range."""
         columns = shutil.get_terminal_size((100, 24)).columns
-        return max(12, min(28, (columns - 74) // 2 + 12))
+        return clamp((columns - 74) // 2 + 12, 12, 28)
 
     # --- permanent lines ----------------------------------------------------
 

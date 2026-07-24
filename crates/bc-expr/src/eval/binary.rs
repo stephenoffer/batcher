@@ -904,8 +904,8 @@ mod scalar_path_tests {
         let out = eval_binary(BinaryOp::Ne, &bin, &lit).unwrap();
         let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         // "a" <> "" is true, "" <> "" is false, NULL <> "" is null.
-        assert_eq!(got.value(0), true);
-        assert_eq!(got.value(1), false);
+        assert!(got.value(0));
+        assert!(!got.value(1));
         assert!(got.is_null(2));
     }
 
@@ -958,9 +958,9 @@ mod scalar_path_tests {
         let lit: ArrayRef = Arc::new(StringArray::from(vec!["2013-07-01"; 3]));
         let out = eval_binary(BinaryOp::Ge, &dates, &lit).unwrap();
         let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(got.value(0), false); // 06-30 >= 07-01 → false
-        assert_eq!(got.value(1), true); // 07-01 >= 07-01 → true
-        assert_eq!(got.value(2), true); // 07-02 >= 07-01 → true
+        assert!(!got.value(0)); // 06-30 >= 07-01 → false
+        assert!(got.value(1)); // 07-01 >= 07-01 → true
+        assert!(got.value(2)); // 07-02 >= 07-01 → true
     }
 
     /// `DATE - DATE` is the integer count of days between them (DuckDB), not an interval.

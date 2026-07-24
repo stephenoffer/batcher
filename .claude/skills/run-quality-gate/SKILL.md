@@ -19,7 +19,7 @@ just check                  # cargo check --workspace --exclude bc-py
 just test-rust              # cargo test --workspace --exclude bc-py
 
 # 3. Rust lint + format
-cargo clippy --workspace --exclude bc-py -- -D warnings
+cargo clippy --workspace --exclude bc-py --all-targets -- -D warnings
 cargo fmt --all --check
 
 # 4. Python quality — ruff lint + format

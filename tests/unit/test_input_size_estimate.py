@@ -13,7 +13,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from batcher.api.orchestration.run import _projected_input_bytes
+from batcher.api.orchestration.sizing import projected_input_bytes as _projected_input_bytes
 
 pytestmark = pytest.mark.unit
 

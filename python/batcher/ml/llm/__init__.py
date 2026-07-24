@@ -10,7 +10,13 @@ the AI-powered-ETL step, where an unconstrained string becomes a column you can 
 
 from __future__ import annotations
 
-from batcher.ml.llm.engines import Engine, EngineFactory, http_engine, vllm_engine
+from batcher.ml.llm.engines import (
+    Engine,
+    EngineFactory,
+    anthropic_engine,
+    http_engine,
+    vllm_engine,
+)
 from batcher.ml.llm.generate import llm_generate, llm_udf
 from batcher.ml.llm.packing import pack_sequences
 from batcher.ml.llm.structured import json_schema, llm_classify_udf, llm_extract_udf
@@ -18,6 +24,7 @@ from batcher.ml.llm.structured import json_schema, llm_classify_udf, llm_extract
 __all__ = [
     "Engine",
     "EngineFactory",
+    "anthropic_engine",
     "http_engine",
     "json_schema",
     "llm_classify_udf",

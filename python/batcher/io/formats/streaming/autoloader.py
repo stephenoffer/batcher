@@ -77,6 +77,7 @@ class IncrementalFileSource:
         "_completed",
         "_format",
         "_fs",
+        "_max_files",
         "_path",
         "_pending",
         "_schema_cache",
@@ -91,11 +92,21 @@ class IncrementalFileSource:
         *,
         state_dir: str,
         suffix: str | None = None,
+        max_files_per_trigger: int | None = None,
     ) -> None:
         self._path = path
         self._format = format
         self._state_dir = state_dir
         self._suffix = suffix if suffix is not None else _DEFAULT_SUFFIX.get(format, "")
+        # Backpressure (Spark `maxFilesPerTrigger` / Auto Loader `cloudFiles.maxFilesPerTrigger`):
+        # cap the new files a single discovery pass admits so a large backlog is drained across
+        # many bounded micro-batches instead of one giant epoch that blows memory. The rest stay
+        # undiscovered — neither pending nor seen — so the next pass finds them again.
+        if max_files_per_trigger is not None and max_files_per_trigger < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"max_files_per_trigger must be >= 1, got {max_files_per_trigger}")
+        self._max_files = max_files_per_trigger
         self._fs = resolve_filesystem(path)
         self._schema_cache: pa.Schema | None = None
         # Files handed out by `discover()` whose epoch has not been published yet. They
@@ -138,6 +149,10 @@ class IncrementalFileSource:
             candidates = self._list_candidates(store)
             held = set(self._pending)
             new_files = [f for f in store.unseen(candidates) if f not in held]
+        if self._max_files is not None:
+            # `candidates` comes back sorted, so capping the head drains the backlog in a
+            # stable, oldest-name-first order; the tail is left undiscovered for a later pass.
+            new_files = new_files[: self._max_files]
         self._pending.extend(new_files)
         return new_files
 
@@ -155,8 +170,7 @@ class IncrementalFileSource:
         if not self._completed:
             return
         with self._store() as store:
-            for f in self._completed:
-                store.mark(f, size=_safe_size(self._fs, f), mtime=_safe_mtime(f))
+            store.mark_many([(f, _safe_size(self._fs, f), _safe_mtime(f)) for f in self._completed])
         done = set(self._completed)
         self._pending = [f for f in self._pending if f not in done]
         self._completed.clear()

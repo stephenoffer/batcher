@@ -243,12 +243,25 @@ class BrokerSource(ABC):
 
     def _poll_loop(self, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
         """The poll/assemble/publish/commit cycle, wrapped by `iter_batches`' cleanup."""
+        import time
+
+        # Adaptive back-off between *empty* polls. A broker whose `_poll` returns immediately
+        # when there is nothing to read (Kinesis `GetRecords` always returns; a Kinesis shard
+        # skipped for throttling returns empty at once) would otherwise spin this loop as fast
+        # as the CPU allows — burning a core and hammering a rate-limited API into the very
+        # throttling it should avoid. The back-off grows to a low cap so a stop is still
+        # observed promptly and the first record after idle is barely delayed; a broker whose
+        # `_poll` already blocks (Kafka's consume timeout) rarely reaches this and pays nothing.
+        idle = 0.0
         while True:
             messages = self._poll()
             if messages is None:
                 return
             if not messages:
+                idle = min(idle * 2, 0.25) if idle else 0.01
+                time.sleep(idle)
                 continue
+            idle = 0.0
             self._track_positions(messages)
             batch = self._make_batch(messages)
             yield batch.select(projection) if projection is not None else batch

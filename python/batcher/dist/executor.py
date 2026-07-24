@@ -24,6 +24,7 @@ import math
 import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
+from batcher._internal.logging import note_suppressed
 
 # Re-exported (`X as X`) so the Flight + spill paths can keep importing these
 # helpers from `batcher.dist.executor` after the split.
@@ -321,8 +322,8 @@ def _max_workers_per_node(workers: int, num_cpus: float) -> int:
         node_cpus = _worker_node_cpus()
         if node_cpus and num_cpus > 0:
             return max(1, max(int(c // num_cpus) for c in node_cpus))
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("dist", "read worker node CPU topology", exc)
     return max(1, math.ceil(workers / max(1, alive_node_count())))
 
 

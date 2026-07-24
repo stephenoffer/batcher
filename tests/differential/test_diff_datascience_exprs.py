@@ -14,7 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -234,8 +234,11 @@ def test_quantile_rejects_out_of_range_q(ds):
 
 
 def test_tail_matches_duckdb_offset(duck, ds):
+    # Ordered: both sides sort on `id`, so row order is part of what `tail` promises and the
+    # comparison has to see it. `assert_same` is order-independent and would pass on a
+    # `tail` that returned the right two rows the wrong way round.
     got = ds.sort("id").tail(2).to_arrow()
-    assert_same(got, duck.sql("SELECT * FROM t ORDER BY id OFFSET 4"))
+    assert_same_ordered(got, duck.sql("SELECT * FROM t ORDER BY id OFFSET 4"))
 
 
 def test_tail_larger_than_relation_returns_everything(ds):

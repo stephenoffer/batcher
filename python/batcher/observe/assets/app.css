@@ -45,30 +45,34 @@
    * :root[data-theme=...] blocks below are overrides for an explicit choice, not the
    * only place the palette exists. */
   color-scheme: light;
-  --bg: #f4f3ef;
-  --surface-1: #ffffff;
-  --surface-2: #f8f7f3;
-  --surface-3: #eeece6;
-  --surface-4: #e4e1d9;
-  --border: #e0ded6;
-  --border-strong: #c4c1b7;
-  --text-1: #16150f;
-  --text-2: #56544c;
-  --text-3: #82806f;
-  --accent: #1f6fd0;
-  --accent-2: #5b9ae4;
-  --accent-wash: rgba(31, 111, 208, .09);
-  --accent-line: rgba(31, 111, 208, .26);
-  --seq-1: #cde2fb; --seq-2: #86b6ef; --seq-3: #1f6fd0; --seq-4: #256abf; --seq-5: #184f95;
-  --good: #17872a; --warn: #a97400; --serious: #bf5628; --critical: #c0392f;
-  --good-wash: rgba(23, 135, 42, .09); --warn-wash: rgba(169, 116, 0, .10);
-  --serious-wash: rgba(191, 86, 40, .09); --critical-wash: rgba(192, 57, 47, .09);
-  --shadow-1: 0 1px 2px rgb(24 22 15 / .07);
-  --shadow-2: 0 2px 5px rgb(24 22 15 / .07), 0 8px 18px rgb(24 22 15 / .07);
-  --shadow-3: 0 10px 24px rgb(24 22 15 / .10), 0 26px 60px rgb(24 22 15 / .10);
-  --grid-line: rgba(0, 0, 0, .05);
-  --glass: rgba(255, 255, 255, .84);
-  --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+  --bg: #eceff4;
+    --surface-1: #ffffff;
+    --surface-2: #f5f7fb;
+    --surface-3: #e9edf4;
+    --surface-4: #dbe1eb;
+    --border: #dce1ea;
+    --border-strong: #bcc5d3;
+    --text-1: #0e141d;
+    --text-2: #47515f;
+    --text-3: #78828f;
+    --accent: #2563eb;
+    --accent-2: #5b8def;
+    --accent-wash: rgba(37, 99, 235, .09);
+    --accent-line: rgba(37, 99, 235, .24);
+    --seq-1: #c7dbfa; --seq-2: #86b0f0; --seq-3: #2563eb; --seq-4: #1e51c0; --seq-5: #16388a;
+    --good: #0f9d6b; --warn: #b7791f; --serious: #cf5a2c; --critical: #d0362f;
+    --good-wash: rgba(15, 157, 107, .09); --warn-wash: rgba(183, 121, 31, .10);
+    --serious-wash: rgba(207, 90, 44, .09); --critical-wash: rgba(208, 54, 47, .09);
+    --shadow-1: 0 1px 2px rgb(20 30 48 / .06);
+    --shadow-2: 0 2px 6px rgb(20 30 48 / .07), 0 8px 20px rgb(20 30 48 / .06);
+    --shadow-3: 0 10px 24px rgb(20 30 48 / .10), 0 26px 60px rgb(20 30 48 / .10);
+    --grid-line: rgba(30, 60, 120, .05);
+    --glass: rgba(255, 255, 255, .82);
+    --glow-accent: 0 0 0 rgba(0,0,0,0);
+    --glow-good: 0 0 0 rgba(0,0,0,0);
+    --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
+    --scan: rgba(30, 60, 120, .02);
+    --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
 }
 
 /* No explicit choice recorded: follow the OS. :where() keeps specificity at zero so an
@@ -76,97 +80,125 @@
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme])) {
     color-scheme: dark;
-    --bg: #0c0c0b;
-    --surface-1: #141413;
-    --surface-2: #1c1c1a;
-    --surface-3: #242422;
-    --surface-4: #2c2c29;
-    --border: #2b2b28;
-    --border-strong: #3d3c37;
-    --text-1: #f6f5f1;
-    --text-2: #b5b3a8;
-    --text-3: #7e7c6f;
-    --accent: #4a92e8;
-    --accent-2: #7fb4f0;
-    --accent-wash: rgba(74, 146, 232, .14);
-    --accent-line: rgba(74, 146, 232, .34);
-    --seq-1: #cde2fb; --seq-2: #86b6ef; --seq-3: #4a92e8; --seq-4: #256abf; --seq-5: #184f95;
-    --good: #35b13a; --warn: #f0ad1e; --serious: #ee8a5f; --critical: #e05252;
-    --good-wash: rgba(53, 177, 58, .13); --warn-wash: rgba(240, 173, 30, .13);
-    --serious-wash: rgba(238, 138, 95, .13); --critical-wash: rgba(224, 82, 82, .13);
-    --shadow-1: 0 1px 2px rgb(0 0 0 / .5);
-    --shadow-2: 0 2px 6px rgb(0 0 0 / .45), 0 8px 20px rgb(0 0 0 / .32);
-    --shadow-3: 0 8px 20px rgb(0 0 0 / .5), 0 24px 56px rgb(0 0 0 / .42);
-    --grid-line: rgba(255, 255, 255, .045);
-    --glass: rgba(20, 20, 19, .82);
-    --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+    --bg: #080a10;
+      --surface-1: #0d111a;
+      --surface-2: #131824;
+      --surface-3: #1a2030;
+      --surface-4: #242c40;
+      --border: #212a3c;
+      --border-strong: #35415a;
+      --text-1: #e9edf7;
+      --text-2: #9aa7c0;
+      --text-3: #66718a;
+      --accent: #56a0ff;
+      --accent-2: #8fc0ff;
+      --accent-wash: rgba(86, 160, 255, .13);
+      --accent-line: rgba(86, 160, 255, .32);
+      --seq-1: #bcd8ff; --seq-2: #7fb0f5; --seq-3: #56a0ff; --seq-4: #2f6fd4; --seq-5: #1d4c96;
+      --good: #34d399; --warn: #f0b429; --serious: #f97c5a; --critical: #f2555a;
+      --good-wash: rgba(52, 211, 153, .13); --warn-wash: rgba(240, 180, 41, .13);
+      --serious-wash: rgba(249, 124, 90, .13); --critical-wash: rgba(242, 85, 90, .13);
+      --shadow-1: 0 1px 2px rgb(0 0 0 / .55);
+      --shadow-2: 0 2px 8px rgb(0 0 0 / .5), 0 10px 26px rgb(2 6 18 / .42);
+      --shadow-3: 0 10px 26px rgb(0 0 0 / .55), 0 28px 64px rgb(2 6 18 / .5);
+      --grid-line: rgba(120, 160, 255, .05);
+      --glass: rgba(10, 13, 21, .8);
+      --glow-accent: 0 0 14px rgba(86, 160, 255, .5);
+      --glow-good: 0 0 12px rgba(52, 211, 153, .45);
+      --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
+      --scan: rgba(120, 160, 255, .03);
+      --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
   }
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0c0c0b;
-  --surface-1: #141413;
-  --surface-2: #1c1c1a;
-  --surface-3: #242422;
-  --surface-4: #2c2c29;
-  --border: #2b2b28;
-  --border-strong: #3d3c37;
-  --text-1: #f6f5f1;
-  --text-2: #b5b3a8;
-  --text-3: #7e7c6f;
-  --accent: #4a92e8;
-  --accent-2: #7fb4f0;
-  --accent-wash: rgba(74, 146, 232, .14);
-  --accent-line: rgba(74, 146, 232, .34);
-  --seq-1: #cde2fb; --seq-2: #86b6ef; --seq-3: #4a92e8; --seq-4: #256abf; --seq-5: #184f95;
-  --good: #35b13a; --warn: #f0ad1e; --serious: #ee8a5f; --critical: #e05252;
-  --good-wash: rgba(53, 177, 58, .13); --warn-wash: rgba(240, 173, 30, .13);
-  --serious-wash: rgba(238, 138, 95, .13); --critical-wash: rgba(224, 82, 82, .13);
-  --shadow-1: 0 1px 2px rgb(0 0 0 / .5);
-  --shadow-2: 0 2px 6px rgb(0 0 0 / .45), 0 8px 20px rgb(0 0 0 / .32);
-  --shadow-3: 0 8px 20px rgb(0 0 0 / .5), 0 24px 56px rgb(0 0 0 / .42);
-  --grid-line: rgba(255, 255, 255, .045);
-  --glass: rgba(20, 20, 19, .82);
-  --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+  --bg: #080a10;
+    --surface-1: #0d111a;
+    --surface-2: #131824;
+    --surface-3: #1a2030;
+    --surface-4: #242c40;
+    --border: #212a3c;
+    --border-strong: #35415a;
+    --text-1: #e9edf7;
+    --text-2: #9aa7c0;
+    --text-3: #66718a;
+    --accent: #56a0ff;
+    --accent-2: #8fc0ff;
+    --accent-wash: rgba(86, 160, 255, .13);
+    --accent-line: rgba(86, 160, 255, .32);
+    --seq-1: #bcd8ff; --seq-2: #7fb0f5; --seq-3: #56a0ff; --seq-4: #2f6fd4; --seq-5: #1d4c96;
+    --good: #34d399; --warn: #f0b429; --serious: #f97c5a; --critical: #f2555a;
+    --good-wash: rgba(52, 211, 153, .13); --warn-wash: rgba(240, 180, 41, .13);
+    --serious-wash: rgba(249, 124, 90, .13); --critical-wash: rgba(242, 85, 90, .13);
+    --shadow-1: 0 1px 2px rgb(0 0 0 / .55);
+    --shadow-2: 0 2px 8px rgb(0 0 0 / .5), 0 10px 26px rgb(2 6 18 / .42);
+    --shadow-3: 0 10px 26px rgb(0 0 0 / .55), 0 28px 64px rgb(2 6 18 / .5);
+    --grid-line: rgba(120, 160, 255, .05);
+    --glass: rgba(10, 13, 21, .8);
+    --glow-accent: 0 0 14px rgba(86, 160, 255, .5);
+    --glow-good: 0 0 12px rgba(52, 211, 153, .45);
+    --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
+    --scan: rgba(120, 160, 255, .03);
+    --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f3ef;
-  --surface-1: #ffffff;
-  --surface-2: #f8f7f3;
-  --surface-3: #eeece6;
-  --surface-4: #e4e1d9;
-  --border: #e0ded6;
-  --border-strong: #c4c1b7;
-  --text-1: #16150f;
-  --text-2: #56544c;
-  --text-3: #82806f;
-  --accent: #1f6fd0;
-  --accent-2: #5b9ae4;
-  --accent-wash: rgba(31, 111, 208, .09);
-  --accent-line: rgba(31, 111, 208, .26);
-  --seq-1: #cde2fb; --seq-2: #86b6ef; --seq-3: #1f6fd0; --seq-4: #256abf; --seq-5: #184f95;
-  --good: #17872a; --warn: #a97400; --serious: #bf5628; --critical: #c0392f;
-  --good-wash: rgba(23, 135, 42, .09); --warn-wash: rgba(169, 116, 0, .10);
-  --serious-wash: rgba(191, 86, 40, .09); --critical-wash: rgba(192, 57, 47, .09);
-  --shadow-1: 0 1px 2px rgb(24 22 15 / .07);
-  --shadow-2: 0 2px 5px rgb(24 22 15 / .07), 0 8px 18px rgb(24 22 15 / .07);
-  --shadow-3: 0 10px 24px rgb(24 22 15 / .10), 0 26px 60px rgb(24 22 15 / .10);
-  --grid-line: rgba(0, 0, 0, .05);
-  --glass: rgba(255, 255, 255, .84);
-  --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+  --bg: #eceff4;
+    --surface-1: #ffffff;
+    --surface-2: #f5f7fb;
+    --surface-3: #e9edf4;
+    --surface-4: #dbe1eb;
+    --border: #dce1ea;
+    --border-strong: #bcc5d3;
+    --text-1: #0e141d;
+    --text-2: #47515f;
+    --text-3: #78828f;
+    --accent: #2563eb;
+    --accent-2: #5b8def;
+    --accent-wash: rgba(37, 99, 235, .09);
+    --accent-line: rgba(37, 99, 235, .24);
+    --seq-1: #c7dbfa; --seq-2: #86b0f0; --seq-3: #2563eb; --seq-4: #1e51c0; --seq-5: #16388a;
+    --good: #0f9d6b; --warn: #b7791f; --serious: #cf5a2c; --critical: #d0362f;
+    --good-wash: rgba(15, 157, 107, .09); --warn-wash: rgba(183, 121, 31, .10);
+    --serious-wash: rgba(207, 90, 44, .09); --critical-wash: rgba(208, 54, 47, .09);
+    --shadow-1: 0 1px 2px rgb(20 30 48 / .06);
+    --shadow-2: 0 2px 6px rgb(20 30 48 / .07), 0 8px 20px rgb(20 30 48 / .06);
+    --shadow-3: 0 10px 24px rgb(20 30 48 / .10), 0 26px 60px rgb(20 30 48 / .10);
+    --grid-line: rgba(30, 60, 120, .05);
+    --glass: rgba(255, 255, 255, .82);
+    --glow-accent: 0 0 0 rgba(0,0,0,0);
+    --glow-good: 0 0 0 rgba(0,0,0,0);
+    --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
+    --scan: rgba(30, 60, 120, .02);
+    --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
 }
 
 /* ═══════════════ base ═══════════════ */
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The `hidden` attribute must win over any component's own `display`. Without this a rule
+ * like `.banner { display: flex }` overrides the UA `[hidden] { display: none }` (higher
+ * specificity), and the element can never be hidden by toggling the attribute — which is
+ * exactly what pinned the "Lost contact" banner open on every page. One guard fixes the
+ * whole class: every element the app hides by attribute now actually hides. */
+[hidden] { display: none !important; }
+
+/* A control-panel grid behind everything — the faintest graph-paper ruling, fixed so the
+ * panels read as glass laid over an instrument surface rather than floating on flat colour.
+ * `--grid-line` is ~5% alpha, so it registers as texture, never as lines to read. */
 body {
-  margin: 0; background: var(--bg); color: var(--text-1);
+  margin: 0; color: var(--text-1);
   font: var(--t4) / var(--lh-snug) var(--font-ui);
   -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  background:
+    linear-gradient(var(--grid-line) 1px, transparent 1px) 0 -1px / 100% 46px,
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px) -1px 0 / 46px 100%,
+    radial-gradient(120% 80% at 50% -10%, var(--accent-wash), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
 }
 h1, h2, h3 { text-wrap: balance; }
 
@@ -235,14 +267,24 @@ h1, h2, h3 { text-wrap: balance; }
   font: 520 var(--t3) / 1 var(--font-ui); padding: 0 var(--s4); height: 100%;
   transition: color var(--dur-1) var(--ease-out);
 }
-.viewtab::after {
-  content: ""; position: absolute; left: var(--s3); right: var(--s3); bottom: 0; height: 2px;
-  background: var(--accent); border-radius: 2px 2px 0 0;
-  transform: scaleX(0); transition: transform var(--dur-2) var(--ease-spring);
-}
 .viewtab:hover { color: var(--text-1); }
 .viewtab.is-active { color: var(--text-1); }
-.viewtab.is-active::after { transform: scaleX(1); }
+
+/* One indicator that *travels* between tabs rather than a per-tab underline that fades in
+ * where the old one faded out. The movement is the feedback: it says which way you went and
+ * from where, which two independent fades cannot. It is positioned by `app.js` from the
+ * active tab's own box, so it stays correct under a font swap, a density change, or a
+ * narrow window that wraps the row.
+ *
+ * `opacity: 0` until placed, so it never flashes at x=0 on first paint. Under reduced
+ * motion the transition collapses and the `is-active` colour alone carries the state. */
+.viewnav { position: relative; }
+.viewnav-ink, .tabs-ink {
+  position: absolute; bottom: 0; left: 0; height: 2px; width: 0; opacity: 0;
+  background: var(--accent); border-radius: 2px 2px 0 0; pointer-events: none;
+  transition: transform var(--dur-2) var(--ease-spring), width var(--dur-2) var(--ease-spring),
+              opacity var(--dur-1) var(--ease-out);
+}
 
 .topbar-right { display: flex; align-items: center; gap: var(--s2); margin-left: auto; }
 .hint { color: var(--text-3); font-size: var(--t1); }
@@ -256,6 +298,8 @@ h1, h2, h3 { text-wrap: balance; }
 .pill.is-live { border-color: var(--good); color: var(--good); background: var(--good-wash); }
 .pill.is-live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--good); animation: pulse 2s var(--ease-in-out) infinite; }
 .pill.is-down { border-color: var(--critical); color: var(--critical); background: var(--critical-wash); }
+/* The tolerant middle state: one missed poll shows a quiet "reconnecting", not a red alarm. */
+.pill.is-warn { border-color: var(--warn); color: var(--warn); background: var(--warn-wash); }
 
 .ghost {
   background: none; border: 1px solid var(--border-strong); color: var(--text-2);
@@ -306,7 +350,9 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
 .lede { color: var(--text-2); font-size: var(--t3); max-width: 76ch; margin: 0 0 var(--s4); line-height: var(--lh-body); }
 .lede b { color: var(--text-1); }
 
-.col2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s4); align-items: start; }
+/* Stretch, not start: two panels side by side read as lopsided the moment their heights
+ * differ, so the frames are made equal and the content sits inside a matching box. */
+.col2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s4); align-items: stretch; }
 @media (max-width: 980px) { .col2 { grid-template-columns: 1fr; } }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: var(--s4); }
 
@@ -357,13 +403,16 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
 
 /* ═══════════════ health ═══════════════ */
 
-.health { border: 1px solid var(--border); border-radius: var(--r2); background: var(--surface-1);
+.health { position: relative; border: 1px solid var(--border); border-radius: var(--r2);
+          background: linear-gradient(180deg, var(--good-wash), transparent 60%), var(--surface-1);
           padding: var(--s3) var(--s4); margin-bottom: var(--s4); box-shadow: var(--shadow-1);
-          border-left: 3px solid var(--good); }
-.health.is-warn { border-left-color: var(--warn); }
-.health.is-critical { border-left-color: var(--critical); }
+          border-left: 3px solid var(--good); overflow: hidden; }
+.health.is-warn { border-left-color: var(--warn); background: linear-gradient(180deg, var(--warn-wash), transparent 60%), var(--surface-1); }
+.health.is-critical { border-left-color: var(--critical); background: linear-gradient(180deg, var(--critical-wash), transparent 60%), var(--surface-1); }
 .health-head { display: flex; align-items: center; gap: var(--s2); font-size: var(--t3); margin-bottom: var(--s2); }
-.health-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); flex: none; }
+/* The "all clear" light glows like a real status lamp — a small, deliberate bit of retro. */
+.health-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); flex: none;
+              box-shadow: var(--glow-good); }
 .health.is-warn .health-dot { background: var(--warn); }
 .health.is-critical .health-dot { background: var(--critical); animation: pulse 1.8s var(--ease-in-out) infinite; }
 .health-checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--s2); }
@@ -381,29 +430,30 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
         border-radius: var(--r2); overflow: hidden; margin-bottom: var(--s4); box-shadow: var(--shadow-1); }
 .kpi { background: var(--surface-1); padding: var(--s3) var(--s4); display: flex; flex-direction: column; gap: 1px; transition: background var(--dur-1); }
 .kpi:hover { background: var(--surface-2); }
-.kpi-label { color: var(--text-3); font-size: var(--t0); text-transform: uppercase; letter-spacing: .07em; }
-.kpi-value { font-size: var(--t7); font-weight: 600; letter-spacing: -.025em; line-height: var(--lh-tight); }
+.kpi-label { color: var(--text-3); font-size: var(--t0); text-transform: uppercase; letter-spacing: .09em; }
+/* An instrument readout: the mono face and tabular figures make the numbers line up column
+ * to column and read as a measurement, which is the whole point of a KPI strip. */
+.kpi-value { font-family: var(--font-mono); font-size: var(--t7); font-weight: 600;
+             font-variant-numeric: tabular-nums; letter-spacing: -.02em; line-height: var(--lh-tight); }
 .kpi-note { color: var(--text-3); font-size: var(--t1); }
-.kpi-value.is-live { color: var(--accent); }
+.kpi-value.is-live { color: var(--accent); text-shadow: var(--glow-accent); }
 .kpi-value.did-change { animation: flash var(--dur-flash) var(--ease-out); }
+/* A hairline of accent along the top of the strip — the HUD "this panel is powered" cue. */
+.kpis { position: relative; }
+.kpis::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 1px;
+                background: var(--hairline); opacity: .8; z-index: 1; }
 
 /* ═══════════════ cards ═══════════════ */
 
+/* `.pcard` is now only the System page's static info cards; the pipeline list moved to
+ * lanes. What is left is the static form and the two children the system cards use. */
 .pcard { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r2);
-         padding: var(--s4); cursor: pointer; text-align: left; width: 100%; color: inherit;
+         padding: var(--s4); text-align: left; width: 100%; color: inherit;
          display: flex; flex-direction: column; gap: var(--s3);
-         transition: border-color var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out), box-shadow var(--dur-2) var(--ease-out);
          animation: rise var(--dur-3) var(--ease-out) both; }
-.pcard:hover { border-color: var(--border-strong); transform: translateY(-2px); box-shadow: var(--shadow-2); }
-.pcard:active { transform: translateY(0); }
 .pcard.is-static { cursor: default; }
-.pcard.is-static:hover { transform: none; box-shadow: var(--shadow-1); border-color: var(--border); }
 .pcard-head { display: flex; align-items: center; gap: var(--s2); }
 .pcard-name { font-weight: 620; font-size: var(--t4); }
-.pcard-sig { color: var(--text-3); font-size: var(--t1); font-family: var(--font-mono); }
-.pcard-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--s2); }
-.pcard-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); flex-wrap: wrap; }
-.pcard-actions { display: flex; gap: var(--s3); padding-top: var(--s2); border-top: 1px solid var(--border); font-size: var(--t1); }
 .metric { display: flex; flex-direction: column; gap: 1px; }
 .metric b { font-size: var(--t5); font-weight: 600; }
 .metric span { color: var(--text-3); font-size: var(--t0); text-transform: uppercase; letter-spacing: .05em; }
@@ -414,7 +464,6 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
 .pin:hover { color: var(--text-1); transform: scale(1.2) rotate(8deg); }
 .pin.is-on { color: var(--warn); }
 
-.pcard-charts { display: flex; gap: var(--s4); flex-wrap: wrap; }
 .chartlet { display: flex; flex-direction: column; gap: 2px; }
 .chartlet-label { font-size: var(--t0); text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
 
@@ -442,13 +491,7 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
 .spark-end { fill: var(--accent); }
 .histo rect { fill: var(--seq-2); transform-origin: bottom; animation: grow var(--dur-3) var(--ease-out) both; }
 
-.stack { display: flex; height: 12px; border-radius: var(--r1); overflow: hidden; gap: 2px; margin-bottom: var(--s3); }
-.stack-seg { display: block; transition: width var(--dur-3) var(--ease-out), filter var(--dur-1); }
-.stack-seg:hover { filter: brightness(1.25); }
-.seq-1 { background: var(--seq-1); } .seq-2 { background: var(--seq-2); }
-.seq-3 { background: var(--seq-3); } .seq-4 { background: var(--seq-4); } .seq-5 { background: var(--seq-5); }
-.split-row, .split-line { display: flex; align-items: center; gap: var(--s2); padding: 2px var(--s1); font-size: var(--t2); border-radius: var(--r1); }
-.split-row:hover { background: var(--surface-2); }
+.split-line { display: flex; align-items: center; gap: var(--s2); padding: 2px var(--s1); font-size: var(--t2); border-radius: var(--r1); }
 .split-name { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .split-bar-val { margin-left: auto; color: var(--text-2); font-size: var(--t1); font-family: var(--font-mono); }
 .split-pct { color: var(--text-3); font-size: var(--t1); width: 36px; text-align: right; font-family: var(--font-mono); }
@@ -500,11 +543,9 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
        font-size: var(--t2); padding: var(--s2) var(--s3); margin-bottom: -1px;
        display: flex; align-items: center; gap: var(--s1); border-radius: var(--r1) var(--r1) 0 0;
        transition: color var(--dur-1), background var(--dur-1); }
-.tab::after { content: ""; position: absolute; left: var(--s2); right: var(--s2); bottom: 0; height: 2px;
-              background: var(--accent); transform: scaleX(0); transition: transform var(--dur-2) var(--ease-spring); }
 .tab:hover { color: var(--text-1); background: var(--surface-1); }
 .tab.is-active { color: var(--text-1); background: var(--surface-1); }
-.tab.is-active::after { transform: scaleX(1); }
+.tabs { position: relative; }
 .tabpane { display: none; }
 .tabpane.is-active { display: block; animation: rise var(--dur-2) var(--ease-out); }
 
@@ -537,7 +578,14 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
 .dag-edge.is-critical { stroke: var(--accent); stroke-width: 2.5; }
 .dag-edge.is-dim { opacity: .1; }
 
-.dag-node { cursor: move; animation: rise var(--dur-3) var(--ease-out) both; transition: opacity var(--dur-2); }
+/* Entrance is opacity only, never `transform`. Each node is positioned by its SVG
+ * `transform` attribute (`translate(x y)`), and a CSS `transform` — which is what a
+ * `rise`/translateY animation applies — OVERRIDES that attribute in every browser, collapsing
+ * every node onto the graph's origin while the edges (positioned by path data) still fan out
+ * to where the nodes should be. That is the "the plan graph is all broken" bug: one card at
+ * the origin, the rest stacked under it, edges pointing at nothing. Fading only leaves the
+ * positioning attribute untouched. */
+.dag-node { cursor: move; animation: fade var(--dur-3) var(--ease-out) both; transition: opacity var(--dur-2); }
 .dag-node:focus { outline: none; }
 .dag-node:focus-visible .node-box { stroke: var(--accent); stroke-width: 2.5; }
 .dag-node:hover .node-box { filter: brightness(1.16); }
@@ -775,15 +823,10 @@ body.is-compact .logs { max-height: 68vh; }
 .rail-item:hover { background: var(--surface-3); color: var(--text-1); border-color: var(--border-strong); }
 .rail-item.is-current { border-color: var(--accent-line); color: var(--accent); background: var(--accent-wash); }
 
-/* Related-runs strip on the run page — sideways movement within a pipeline. */
-.related { display: flex; align-items: center; gap: var(--s1); flex-wrap: wrap; margin-top: var(--s2); }
-.related-dot { width: 26px; height: 22px; border-radius: var(--r1); border: 1px solid var(--border);
-               background: var(--surface-2); cursor: pointer; position: relative; overflow: hidden;
-               transition: transform var(--dur-1) var(--ease-out), border-color var(--dur-1); }
-.related-dot i { position: absolute; left: 0; bottom: 0; width: 100%; background: var(--seq-3); }
-.related-dot:hover { transform: translateY(-2px); border-color: var(--border-strong); }
-.related-dot.is-current { border-color: var(--accent); }
-.related-dot.is-error i { background: var(--critical); }
+/* Related-runs strip on the run page — sideways movement within a pipeline. The bars
+ * themselves are `CHARTS.strip`, so only the rail around them is styled here. */
+.related { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; margin-top: var(--s2); }
+.related .ch-strip { flex: 1 1 auto; min-width: 120px; max-width: 420px; }
 
 /* Inline "jump to" affordance used inside insights and the inspector. */
 .jump-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; margin-top: var(--s2); }
@@ -903,15 +946,6 @@ table.grid th, table.grid td { border: 0; padding: 0; }
              height: 3px; border-radius: 2px; background: var(--surface-3); overflow: hidden; }
 .stat-fill i { display: block; height: 100%; background: var(--seq-3);
                animation: sweep var(--dur-3) var(--ease-out) both; transform-origin: left; }
-
-/* A card's state is a ribbon down its left edge — visible before any text is read. */
-.pcard.has-ribbon { position: relative; padding-left: calc(var(--s4) + 3px); }
-.pcard.has-ribbon::before {
-  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-  border-radius: var(--r2) 0 0 var(--r2); background: var(--good);
-}
-.pcard.is-warn::before { background: var(--warn); }
-.pcard.is-critical::before { background: var(--critical); }
 
 /* A number and its magnitude belong in one cell, not two columns. */
 .cell-bar { position: relative; display: inline-flex; align-items: center; justify-content: flex-end;
@@ -1247,8 +1281,12 @@ td.num, th.num, .num { font-variant-numeric: tabular-nums; font-feature-settings
 
 /* Contents strip for the reference: at 50+ entries, landing at the top and scrolling is the
  * wrong default. Counts are part of the label so a reader knows the size before jumping. */
-.learn-toc { display: flex; gap: var(--s2); flex-wrap: wrap; margin-bottom: var(--s5);
-             padding-bottom: var(--s3); border-bottom: 1px solid var(--border); }
+/* Sticky under the topbar (52px): the reference is a very long page, so the section jumps
+ * must stay reachable while you scroll rather than only at the very top. */
+.learn-toc { position: sticky; top: 52px; z-index: 10; display: flex; gap: var(--s2);
+             flex-wrap: wrap; margin: 0 calc(var(--s5) * -1) var(--s5); padding: var(--s3) var(--s5);
+             border-bottom: 1px solid var(--border); background: var(--glass);
+             backdrop-filter: saturate(1.6) blur(12px); -webkit-backdrop-filter: saturate(1.6) blur(12px); }
 .learn-toc a { font-size: var(--t2); color: var(--text-2); text-decoration: none;
                padding: var(--s1) var(--s3); border: 1px solid var(--border-strong);
                border-radius: var(--r-pill); transition: all var(--dur-1) var(--ease-out); }
@@ -1281,7 +1319,7 @@ td.num, th.num, .num { font-variant-numeric: tabular-nums; font-feature-settings
  * to see where they are as clearly as a mouse reader sees what they are pointing at. These
  * give the interactive rows and chips the same emphasis on focus that they get on hover, so
  * tabbing through the dashboard is not a guess. */
-.cost-row:focus-visible, .row:focus-visible, .split-row:focus-visible,
+.cost-row:focus-visible, .row:focus-visible,
 .grid-cell:focus-visible, .rail-item:focus-visible,
 .log-kv-item:focus-visible, .status-chip:focus-visible {
   outline: 2px solid var(--accent); outline-offset: -2px; background: var(--accent-wash);
@@ -1290,11 +1328,10 @@ td.num, th.num, .num { font-variant-numeric: tabular-nums; font-feature-settings
 .seg:focus-visible, .tab:focus-visible, .viewtab:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
-.pcard:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-
 /* A hover cue that is not also a focus cue is a cue only half your users get. This makes the
- * pairing structural: any element that lifts or tints on hover does the same on focus. */
-.pcard:focus-within { border-color: var(--border-strong); }
+ * pairing structural: the pipeline lane, which lifts and tints on hover, does the same on
+ * focus (its own `:focus-visible` outline lives beside the lane styles). */
+.plane:focus-within { border-color: var(--accent-line); }
 
 /* Framework-free virtualization: skip layout and paint for rows scrolled out of view. The
  * intrinsic-size hint keeps the scrollbar honest before a row has been measured. */
@@ -1360,3 +1397,633 @@ table.dense tbody tr { content-visibility: auto; contain-intrinsic-size: auto 28
   /* The severity stripe on an insight/health card is colour-only; keep a visible edge. */
   .insight, .health, .panel-error { border: 1px solid; }
 }
+
+/* ═══════════════ the chart layer ═══════════════
+ *
+ * Styling for `charts.js`. Every rule here is the *presentation* of an encoding decision
+ * made there: the sequential ramp for magnitude, the status palette for state, thin marks,
+ * recessive grid, a 2px surface gap wherever two fills touch.
+ *
+ * Marks are token-coloured rather than inline-styled, so a theme switch restyles every
+ * chart on the page without a redraw — and so no caller can smuggle in a raw colour.
+ */
+
+.chart { width: 100%; height: auto; display: block; overflow: visible; }
+
+/* Recessive grid: present enough to read a value against, quiet enough that the data line
+ * is the salient thing. A grid you notice is a grid that is too strong. */
+.ch-grid { stroke: var(--grid-line); stroke-width: 1; shape-rendering: crispEdges; }
+.ch-axis { stroke: var(--border-strong); stroke-width: 1; shape-rendering: crispEdges; }
+.ch-tick { fill: var(--text-3); font: var(--t0) / 1 var(--font-mono); }
+
+/* One hue for the primary series, stepping down the sequential ramp for further ones. This
+ * is a *magnitude* ramp being reused for a small ordered set, which is why more than three
+ * series on one plot is not supported: past that the steps stop being tellable apart and
+ * the answer is small multiples, not more colours. */
+.ch-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.ch-area { stroke: none; opacity: .16; }
+.ch-dot { stroke: var(--surface-1); stroke-width: 1.5; }
+.ch-s1 { stroke: var(--accent); fill: var(--accent); }
+.ch-s2 { stroke: var(--seq-2); fill: var(--seq-2); }
+.ch-s3 { stroke: var(--seq-4); fill: var(--seq-4); }
+.ch-s4 { stroke: var(--serious); fill: var(--serious); }
+.ch-s5 { stroke: var(--text-3); fill: var(--text-3); }
+
+/* The hit target is the whole plot area, so a 2px line never has to be hit exactly. */
+.ch-capture { fill: transparent; cursor: crosshair; }
+.ch-cross-line { stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 3; opacity: .7; }
+
+.ch-legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); margin-top: var(--s2);
+             font-size: var(--t1); color: var(--text-2); }
+.ch-key { display: inline-flex; align-items: center; gap: var(--s2); }
+.ch-swatch { width: 10px; height: 10px; border-radius: 3px; flex: none;
+             background: currentColor; }
+.ch-key .ch-swatch.ch-s1 { background: var(--accent); }
+.ch-key .ch-swatch.ch-s2 { background: var(--seq-2); }
+.ch-key .ch-swatch.ch-s3 { background: var(--seq-4); }
+.ch-key .ch-swatch.ch-s4 { background: var(--serious); }
+.ch-key .ch-swatch.ch-s5 { background: var(--text-3); }
+
+.chart-slot { margin: var(--s2) 0; }
+
+/* ---- ranked bars ---- */
+
+.ch-bars { display: grid; gap: var(--s1); }
+.ch-bar-row {
+  display: grid; align-items: center; gap: var(--s3); width: 100%; text-align: left;
+  grid-template-columns: minmax(120px, 1.4fr) minmax(80px, 3fr) auto 46px;
+  padding: var(--s2); border: 0; border-radius: var(--r1); background: transparent;
+  color: inherit; font: inherit; cursor: default;
+}
+button.ch-bar-row { cursor: pointer; }
+button.ch-bar-row:hover { background: var(--surface-2); }
+.ch-bars.is-dense .ch-bar-row { padding: var(--s1) var(--s2); }
+.ch-bar-label { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-size: var(--t3); }
+.ch-bar-sub { font-size: var(--t0); color: var(--text-3); }
+.ch-bar-track { height: 10px; border-radius: var(--r1); background: var(--surface-3);
+                overflow: hidden; }
+.ch-bar-fill { display: block; height: 100%; border-radius: var(--r1);
+               background: linear-gradient(90deg, var(--seq-3), var(--seq-4)); }
+.ch-bar-row.is-serious .ch-bar-fill { background: linear-gradient(90deg, var(--serious), var(--critical)); }
+.ch-bar-row.is-warn .ch-bar-fill { background: var(--warn); }
+.ch-bar-value, .ch-bar-share { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+                               font-size: var(--t2); }
+.ch-bar-share { color: var(--text-3); text-align: right; }
+.ch-bar-note { grid-column: 1 / -1; display: flex; gap: var(--s2); align-items: center;
+               font-size: var(--t1); }
+
+/* Bars grow from zero, staggered, so a repaint reads as the list arriving rather than as a
+ * flicker. `--d` is the row's own delay; the reduced-motion rule above collapses it. */
+.ch-grow { animation: ch-grow var(--dur-3) var(--ease-out) backwards; }
+@keyframes ch-grow { from { width: 0 !important; } }
+
+/* ---- proportion bar ---- */
+
+/* The 2px gap is the whole reason this reads correctly: two adjacent steps of one ramp with
+ * no gap look like one segment. */
+.ch-prop { display: flex; height: 16px; border-radius: var(--r1); overflow: hidden;
+           background: var(--surface-3); gap: 2px; }
+.ch-prop-seg { display: block; min-width: 2px; transition: filter var(--dur-1) var(--ease-out); }
+.ch-prop-seg[role="button"] { cursor: pointer; }
+.ch-prop-seg:hover, .ch-prop-seg:focus-visible { filter: brightness(1.25); }
+.ch-p1 { background: var(--seq-5); } .ch-p2 { background: var(--seq-4); }
+.ch-p3 { background: var(--seq-3); } .ch-p4 { background: var(--seq-2); }
+.ch-p5 { background: var(--seq-1); } .ch-p6 { background: var(--border-strong); }
+.ch-prop-keys { display: grid; gap: 1px; margin-top: var(--s3); }
+.ch-prop-key { display: grid; grid-template-columns: 12px 1fr auto 46px; align-items: center;
+               gap: var(--s2); padding: var(--s1) var(--s2); border-radius: var(--r1);
+               font-size: var(--t2); }
+.ch-prop-key[role="button"] { cursor: pointer; }
+.ch-prop-key:hover { background: var(--surface-2); }
+.ch-prop-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ch-prop-val, .ch-prop-pct { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.ch-prop-pct { color: var(--text-3); text-align: right; }
+
+/* ---- flame ---- */
+
+.ch-flame { display: grid; gap: 2px; margin-top: var(--s3); }
+.ch-flame-row { display: flex; gap: 2px; height: 26px; }
+.ch-flame-cell {
+  display: flex; align-items: center; min-width: 0; padding: 0 var(--s2); border: 0;
+  border-radius: var(--r1); color: var(--on-accent); font: var(--t1) var(--font-ui);
+  cursor: pointer; overflow: hidden; transition: transform var(--dur-1) var(--ease-out),
+                                                 filter var(--dur-1) var(--ease-out);
+}
+.ch-flame-cell:hover, .ch-flame-cell:focus-visible { filter: brightness(1.18); transform: translateY(-1px); }
+.ch-flame-cell.is-crit { box-shadow: inset 0 0 0 2px var(--warn); }
+.ch-flame-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ch-seq-1 { background: var(--seq-1); color: var(--text-1); }
+.ch-seq-2 { background: var(--seq-2); color: var(--text-1); }
+.ch-seq-3 { background: var(--seq-3); }
+.ch-seq-4 { background: var(--seq-4); }
+.ch-seq-5 { background: var(--seq-5); }
+
+/* ---- gauge ---- */
+
+.ch-gauge { display: grid; gap: var(--s1); margin: var(--s2) 0; }
+.ch-gauge-head { display: flex; justify-content: space-between; align-items: baseline;
+                 font-size: var(--t2); }
+.ch-gauge-label { color: var(--text-2); }
+.ch-gauge-value { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+                  font-size: var(--t4); }
+.ch-gauge-track { position: relative; height: 12px; border-radius: var(--r-pill);
+                  background: var(--surface-3); overflow: hidden; }
+/* The bands say where the reading *should* sit. Without them a gauge reports a number
+ * without saying whether that number is good, which for GPU utilization is the question. */
+.ch-gauge-band { position: absolute; top: 0; bottom: 0; opacity: .22; }
+.ch-gauge-band.is-good { background: var(--good); }
+.ch-gauge-band.is-warn { background: var(--warn); }
+.ch-gauge-band.is-critical { background: var(--critical); }
+.ch-gauge-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: var(--r-pill);
+                 background: var(--accent); transition: width var(--dur-3) var(--ease-out); }
+.ch-gauge.is-good .ch-gauge-fill { background: var(--good); }
+.ch-gauge.is-warn .ch-gauge-fill { background: var(--warn); }
+.ch-gauge.is-critical .ch-gauge-fill { background: var(--critical); }
+
+/* ---- box plot ---- */
+
+.ch-box { position: relative; height: 22px; margin: var(--s3) 0 var(--s1); }
+.ch-box-whisker { position: absolute; top: 10px; height: 2px; background: var(--border-strong); }
+.ch-box-iqr { position: absolute; top: 4px; height: 14px; border-radius: var(--r1);
+              background: var(--accent-wash); border: 1px solid var(--accent-line); }
+.ch-box-median { position: absolute; top: 2px; width: 2px; height: 18px; background: var(--accent); }
+.ch-box-scale { display: flex; justify-content: space-between; font-size: var(--t0);
+                color: var(--text-3); font-family: var(--font-mono); }
+.ch-box-mid { color: var(--text-2); }
+
+/* ---- delta ---- */
+
+/* Arrow carries direction, colour carries whether that direction is good. Both are shown so
+ * an improvement is as visible as a regression. */
+.ch-delta { display: inline-flex; align-items: center; gap: var(--s2); }
+.ch-delta-track { position: relative; display: inline-block; width: 64px; height: 8px;
+                  border-radius: var(--r1); background: var(--surface-3); }
+.ch-delta-track b { position: absolute; top: 0; bottom: 0; }
+.ch-delta-track .to-left { right: 50%; background: var(--good); border-radius: var(--r1) 0 0 var(--r1); }
+.ch-delta-track .to-right { left: 50%; background: var(--warn); border-radius: 0 var(--r1) var(--r1) 0; }
+.ch-delta.is-good .ch-delta-value { color: var(--good); }
+.ch-delta.is-warn .ch-delta-value { color: var(--warn); }
+.ch-delta.is-flat { color: var(--text-3); font-size: var(--t1); }
+.ch-delta-value { font-family: var(--font-mono); font-size: var(--t2); }
+
+/* ---- micro strip ---- */
+
+.ch-strip { display: flex; align-items: flex-end; gap: 2px; }
+.ch-strip-bar { flex: 1 1 0; min-width: 2px; border: 0; padding: 0;
+                border-radius: 2px 2px 0 0; background: var(--seq-3); cursor: pointer;
+                transition: background var(--dur-1) var(--ease-out); }
+.ch-strip-bar:hover { background: var(--accent); }
+.ch-strip-bar.is-current { background: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
+.ch-strip-bar.is-error { background: var(--critical); }
+
+/* ---- gantt (lanes on a shared scale) ---- */
+
+.ch-gantt { position: relative; display: grid; gap: var(--s1); }
+.ch-gantt-scale { position: relative; height: 14px; }
+.ch-gantt-tick { position: absolute; font: var(--t0) var(--font-mono); color: var(--text-3);
+                 transform: translateX(-50%); }
+.ch-lane { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: var(--s3); }
+.ch-lane-name { font-size: var(--t1); color: var(--text-2); }
+.ch-lane-track { position: relative; height: 22px; background: var(--surface-2);
+                 border-radius: var(--r1); }
+.ch-lane-grid { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid-line); }
+.ch-gantt-bar { position: absolute; top: 3px; height: 16px; border: 0; border-radius: var(--r1);
+                background: var(--seq-3); color: var(--on-accent); font: var(--t0) var(--font-ui);
+                padding: 0 var(--s1); overflow: hidden; cursor: pointer; }
+.ch-gantt-bar.is-crit { box-shadow: inset 0 0 0 2px var(--warn); }
+.ch-gantt-text { white-space: nowrap; }
+
+/* ═══════════════ the query viewer ═══════════════
+ *
+ * `plan.js`. The text tree is the piece with real layout constraints: it must stay
+ * readable at 200 rows, keep its spine aligned under proportional text, and put the
+ * timing where the eye can scan a column of it.
+ */
+
+/* Capped so the per-step metrics sit beside the tree rather than being flung to the far
+ * edge of a wide screen with a lake of empty space between a step and its own numbers. */
+.planview { font-family: var(--font-mono); font-size: var(--t2); max-width: 1040px; }
+
+.pv-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center;
+  gap: var(--s4); padding: 2px var(--s2); border-radius: var(--r1); cursor: pointer;
+  border-left: 2px solid transparent;
+  transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out);
+}
+.pv-row:hover { background: var(--surface-2); }
+.pv-row.is-selected { background: var(--accent-wash); border-left-color: var(--accent); }
+/* A search hit is marked, not filtered to: the surrounding tree is the context that makes
+ * the hit mean something, and hiding it would leave a match with no plan around it. */
+.pv-row.is-hit { background: var(--warn-wash); }
+.pv-tree { display: flex; align-items: center; gap: 2px; min-width: 0; }
+
+/* The spine. Fixed-width spacers rather than characters, so the tree stays aligned even
+ * where the operator names are proportional. */
+.pv-spine, .pv-branch { flex: none; width: 14px; height: 20px; position: relative; }
+.pv-spine.is-open::before, .pv-branch::before {
+  content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: 1px;
+  background: var(--border-strong);
+}
+.pv-branch::after {
+  content: ""; position: absolute; left: 6px; top: 50%; width: 8px; height: 1px;
+  background: var(--border-strong);
+}
+.pv-branch.is-last::before { bottom: 50%; }
+
+.pv-twisty { flex: none; width: 16px; height: 16px; padding: 0; border: 0; border-radius: 3px;
+             background: transparent; color: var(--text-3); cursor: pointer; font-size: 9px;
+             line-height: 16px; }
+.pv-twisty span { display: inline-block; transition: transform var(--dur-1) var(--ease-out); transform: rotate(90deg); }
+.pv-twisty.is-closed span { transform: rotate(0deg); }
+.pv-twisty:hover { background: var(--surface-3); color: var(--text-1); }
+.pv-twisty.is-leaf { cursor: default; }
+.pv-glyph { flex: none; display: inline-flex; color: var(--text-3); }
+.pv-kind { flex: none; color: var(--text-1); font-weight: 600; }
+.pv-detail { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-folded { color: var(--accent); }
+.pv-metrics { display: grid; grid-template-columns: 60px 62px 62px 74px; align-items: center;
+              gap: var(--s2); font-variant-numeric: tabular-nums; text-align: right; }
+.pv-share { height: 6px; border-radius: var(--r1); background: var(--surface-3); overflow: hidden; }
+.pv-share i { display: block; height: 100%; background: var(--seq-3); }
+.pv-ms { color: var(--text-1); }
+.pv-rows, .pv-est { color: var(--text-3); font-size: var(--t1); }
+.pv-unmeasured { grid-column: 1 / 3; color: var(--text-3); font-size: var(--t1); }
+
+/* ---- the optimizer diff ---- */
+
+.pv-diff-summary { font-size: var(--t5); line-height: var(--lh-snug); margin: 0 0 var(--s4);
+                   color: var(--text-1); }
+.pv-diff-summary.is-quiet { color: var(--text-2); font-size: var(--t4); }
+.pv-changes { display: grid; gap: var(--s2); }
+.pv-change {
+  display: grid; grid-template-columns: 84px minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  align-items: center; gap: var(--s3); padding: var(--s3);
+  border-radius: var(--r2); border: 1px solid var(--border); background: var(--surface-1);
+  border-left-width: 3px;
+}
+/* A knock-on change is real and is shown, but it is the consequence of the rewrite above
+ * it — so it recedes rather than competing with the finding that explains it. */
+.pv-change.is-secondary { background: transparent; opacity: .72; font-size: var(--t2); }
+.pv-change.is-accent { border-left-color: var(--accent); }
+.pv-change.is-good { border-left-color: var(--good); }
+.pv-change.is-warn { border-left-color: var(--warn); }
+.pv-change[role="button"] { cursor: pointer; }
+.pv-change[role="button"]:hover { border-color: var(--accent-line); background: var(--surface-2); }
+.pv-change-verb { font-size: var(--t1); text-transform: uppercase; letter-spacing: .06em;
+                  color: var(--text-3); }
+.pv-change-what { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.pv-change-note { color: var(--text-2); }
+.pv-change-go { font-size: var(--t1); color: var(--accent); opacity: 0;
+                transition: opacity var(--dur-1) var(--ease-out); }
+.pv-change:hover .pv-change-go { opacity: 1; }
+.pv-more { width: 100%; padding: var(--s3); border: 1px dashed var(--border-strong);
+           border-radius: var(--r2); background: transparent; color: var(--text-2);
+           font: inherit; font-size: var(--t2); cursor: pointer; text-align: left; }
+.pv-more:hover { border-color: var(--accent-line); color: var(--text-1); }
+.pv-counts { margin-top: var(--s5); }
+.pv-counts-total td { border-top: 1px solid var(--border-strong); font-weight: 600; }
+
+/* ---- the raw IR ---- */
+
+.pv-ir { font-size: var(--t2); line-height: 1.7; }
+.pv-node { margin-left: var(--s4); border-left: 1px solid var(--border); padding-left: var(--s2); }
+.pv-node > summary { cursor: pointer; list-style: none; margin-left: calc(var(--s4) * -1);
+                     padding-left: var(--s4); border-radius: var(--r1); }
+.pv-node > summary::-webkit-details-marker { display: none; }
+.pv-node > summary::before { content: "▸"; display: inline-block; width: 12px;
+                             color: var(--text-3); font-size: 9px;
+                             transition: transform var(--dur-1) var(--ease-out); }
+.pv-node[open] > summary::before { transform: rotate(90deg); }
+.pv-node > summary:hover { background: var(--surface-2); }
+.pv-line { padding: 0 var(--s1); }
+.pv-key { color: var(--text-2); }
+.pv-colon { color: var(--text-3); }
+.pv-tag { color: var(--accent); font-weight: 600; }
+.pv-str { color: var(--good); }
+.pv-num { color: var(--serious); }
+.pv-bool, .pv-null { color: var(--text-3); }
+.pv-punct { color: var(--text-3); }
+
+/* ---- pipeline stages ---- */
+
+.pv-stage { margin-bottom: var(--s5); border: 1px solid var(--border); border-radius: var(--r2);
+            overflow: hidden; background: var(--surface-1); }
+.pv-stage-head { display: flex; align-items: baseline; gap: var(--s3); flex-wrap: wrap;
+                 padding: var(--s3); background: var(--surface-2);
+                 border-bottom: 1px solid var(--border); }
+.pv-stage-num { font-family: var(--font-mono); font-size: var(--t1); text-transform: uppercase;
+                letter-spacing: .06em; color: var(--accent); }
+.pv-stage-what { font-size: var(--t3); }
+.pv-stage-cost { margin-left: auto; color: var(--text-2); font-size: var(--t2); }
+.pv-stage-lead { font-size: var(--t1); color: var(--text-3); }
+.pv-stage-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(80px, 2fr) 64px 82px;
+                align-items: center; gap: var(--s3); width: 100%; padding: var(--s2) var(--s3);
+                border: 0; background: transparent; color: inherit; font: inherit;
+                text-align: left; cursor: pointer; }
+.pv-stage-row:hover { background: var(--surface-2); }
+.pv-stage-row.is-crit { box-shadow: inset 2px 0 0 var(--warn); }
+.pv-stage-name { display: flex; align-items: center; gap: var(--s2); min-width: 0;
+                 font-size: var(--t3); overflow: hidden; }
+.pv-stage-track { height: 10px; border-radius: var(--r1); background: var(--surface-3); overflow: hidden; }
+.pv-stage-track i { display: block; height: 100%; background: var(--seq-3); }
+.pv-stage-track i.is-spilled { background: repeating-linear-gradient(45deg,
+  var(--serious), var(--serious) 4px, var(--critical) 4px, var(--critical) 8px); }
+.pv-stage-ms, .pv-stage-rows { text-align: right; font-size: var(--t2); }
+
+/* ═══════════════ live ═══════════════ */
+
+.live-run { display: grid; gap: var(--s2); padding: var(--s4); border-radius: var(--r2);
+            border: 1px solid var(--border); background: var(--surface-1); cursor: pointer;
+            margin-bottom: var(--s3); transition: border-color var(--dur-1) var(--ease-out); }
+.live-run:hover { border-color: var(--accent-line); }
+.live-run-head { display: flex; align-items: center; gap: var(--s2); }
+.live-run-bar { height: 6px; border-radius: var(--r-pill); background: var(--surface-3); overflow: hidden; }
+.live-run-bar i { display: block; height: 100%; background: var(--accent);
+                  transition: width var(--dur-3) var(--ease-out); }
+.live-run-stats { display: flex; flex-wrap: wrap; gap: var(--s5); }
+.live-stat { display: grid; gap: 1px; }
+.live-stat-label { font-size: var(--t0); text-transform: uppercase; letter-spacing: .06em;
+                   color: var(--text-3); }
+.live-stat-value { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+                   font-size: var(--t4); }
+
+/* A running query is the one thing on this page that is genuinely changing, and the pulse
+ * is how it says so without a spinner claiming progress it cannot measure. */
+.pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none;
+             animation: pulse 1.8s var(--ease-in-out) infinite; }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--good-wash); opacity: 1; }
+  50% { box-shadow: 0 0 0 6px transparent; opacity: .55; }
+}
+
+.live-headline { display: flex; align-items: baseline; gap: var(--s3); flex-wrap: wrap;
+                 margin-bottom: var(--s3); }
+.live-headline-num { font-family: var(--font-mono); font-size: var(--t7); font-variant-numeric: tabular-nums; }
+.live-headline-of { font-size: var(--t5); color: var(--text-3); }
+.live-headline-label { color: var(--text-2); }
+.live-eta { margin-left: auto; font-size: var(--t2); color: var(--accent); }
+.live-eta.is-quiet { color: var(--text-3); }
+.live-progress { height: 10px; border-radius: var(--r-pill); background: var(--surface-3); overflow: hidden; }
+.live-progress i { display: block; height: 100%; border-radius: var(--r-pill);
+                   background: linear-gradient(90deg, var(--seq-3), var(--accent));
+                   transition: width var(--dur-3) var(--ease-out); }
+.live-stages { display: grid; gap: var(--s2); margin-top: var(--s4); }
+.live-stage { display: grid; grid-template-columns: minmax(90px, 1fr) 3fr auto auto;
+              align-items: center; gap: var(--s3); font-size: var(--t2); }
+.live-stage-track { height: 8px; border-radius: var(--r1); background: var(--surface-3); overflow: hidden; }
+.live-stage-track i { display: block; height: 100%; background: var(--seq-3); }
+.live-stage-count, .live-stage-rows { text-align: right; }
+
+.live-gpus { display: grid; gap: var(--s4); grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.live-gpu { padding: var(--s4); border: 1px solid var(--border); border-radius: var(--r2);
+            background: var(--surface-1); }
+.live-gpu-head { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s2); }
+.live-gpu-note { margin: var(--s2) 0 0; font-size: var(--t1); color: var(--text-3); }
+.live-gpu-trend { margin-top: var(--s3); }
+.live-warn { padding: var(--s3); border-left: 3px solid var(--warn); background: var(--warn-wash);
+             border-radius: 0 var(--r1) var(--r1) 0; margin: 0 0 var(--s3); }
+.live-skipped { margin-top: var(--s3); }
+.live-trend { margin-top: var(--s4); }
+
+/* ═══════════════ new chrome ═══════════════ */
+
+/* The dot on the Live tab. Work that only matters while it is happening has to announce
+ * itself from wherever the reader is, or its page is only ever found after the fact. */
+.nav-dot { display: inline-block; width: 6px; height: 6px; margin-left: 5px; border-radius: 50%;
+           background: var(--good); vertical-align: middle;
+           animation: pulse 1.8s var(--ease-in-out) infinite; }
+.badge.is-live { background: var(--good-wash); color: var(--good); }
+.chip.is-quiet { background: var(--surface-3); color: var(--text-3); }
+.pane-switch[hidden] { display: none; }
+
+/* ═══════════════ coming from another engine ═══════════════ */
+
+.compare-block { margin-bottom: var(--s6); }
+.compare-block h4 { margin: 0 0 var(--s1); font-size: var(--t5); }
+.compare-familiar { margin: 0 0 var(--s3); color: var(--text-2); font-size: var(--t3); }
+.compare-table { width: 100%; }
+/* The left column is the thing the reader already knows, so it carries the emphasis: they
+ * are scanning for a familiar name, not reading the table left to right. */
+.compare-there { font-weight: 600; white-space: nowrap; color: var(--text-1); }
+.compare-table td { vertical-align: top; }
+
+/* ═══════════════ adaptive re-optimization ═══════════════
+ *
+ * The panel for the engine's own moat: what it predicted, what it counted, and what it did
+ * about the gap. Laid out as prediction → measurement because the size of the miss is the
+ * reason the re-plan was worth making, and a table of two columns would bury it.
+ */
+
+.adapt { padding: var(--s4); margin-bottom: var(--s3); border: 1px solid var(--border);
+         border-left: 3px solid var(--accent); border-radius: var(--r2);
+         background: var(--surface-1); cursor: pointer;
+         transition: border-color var(--dur-1) var(--ease-out); }
+.adapt:hover { border-color: var(--accent-line); }
+.adapt.is-warn { border-left-color: var(--warn); }
+.adapt-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+              margin-bottom: var(--s3); }
+.adapt-nums { display: flex; align-items: center; gap: var(--s5); }
+.adapt-num { display: grid; gap: 1px; }
+.adapt-label { font-size: var(--t0); text-transform: uppercase; letter-spacing: .06em;
+               color: var(--text-3); }
+.adapt-value { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+               font-size: var(--t6); }
+.adapt-arrow { color: var(--text-3); font-size: var(--t5); }
+.adapt-action { margin: var(--s3) 0 0; color: var(--text-2); }
+
+.meta-note { grid-column: 1 / -1; margin-top: var(--s5); padding-top: var(--s4);
+             border-top: 1px solid var(--border); }
+.meta-note h3 { margin: 0 0 var(--s2); font-size: var(--t4); }
+
+/* A cap that announces itself. A list that silently stops rendering claims to be complete,
+ * which is the same lie as a truncated table with no note. */
+.log-truncated { position: sticky; top: 0; z-index: 1; margin: 0; padding: var(--s2) var(--s3);
+                 background: var(--surface-3); color: var(--text-2); font-size: var(--t1);
+                 border-bottom: 1px solid var(--border); }
+
+/* The comparison's answer, before its evidence. */
+.cmp-headline { font-size: var(--t5); line-height: var(--lh-snug); margin: 0 0 var(--s4); }
+
+/* ═══════════════ entrance motion for the new panels ═══════════════
+ *
+ * A staggered rise, not a fade: the offset is what makes a list read as *arriving* in
+ * order rather than as one block appearing. Capped at twelve so a long list does not take
+ * a third of a second to finish landing, and routed through the reduced-motion rule at the
+ * top of this file like everything else.
+ */
+
+@media (prefers-reduced-motion: no-preference) {
+  .pv-change, .adapt, .live-run, .pv-stage {
+    animation: rise var(--dur-2) var(--ease-out) backwards;
+  }
+  .pv-change:nth-child(1), .adapt:nth-child(1), .live-run:nth-child(1) { animation-delay: 0ms; }
+  .pv-change:nth-child(2), .adapt:nth-child(2), .live-run:nth-child(2) { animation-delay: 40ms; }
+  .pv-change:nth-child(3), .adapt:nth-child(3), .live-run:nth-child(3) { animation-delay: 80ms; }
+  .pv-change:nth-child(4), .adapt:nth-child(4), .live-run:nth-child(4) { animation-delay: 120ms; }
+  .pv-change:nth-child(n+5), .adapt:nth-child(n+5), .live-run:nth-child(n+5) { animation-delay: 160ms; }
+}
+
+/* The flame view's blocks land left to right, which is also the order they ran in — the
+ * one place on this page where the motion carries information rather than only polish. */
+@media (prefers-reduced-motion: no-preference) {
+  .ch-flame-row { animation: flame-in var(--dur-3) var(--ease-spring) backwards; }
+  .ch-flame-row:nth-child(2) { animation-delay: 50ms; }
+  .ch-flame-row:nth-child(3) { animation-delay: 100ms; }
+  .ch-flame-row:nth-child(n+4) { animation-delay: 150ms; }
+  @keyframes flame-in { from { opacity: 0; transform: scaleX(.94); transform-origin: left; } }
+}
+
+/* A chart redrawing on a poll must not restart its own entrance every second — the whole
+ * point of the paint-only-on-change rule upstream. The line is drawn once and only its
+ * geometry changes, so the transition belongs on the shape, not on an animation. */
+.ch-line, .ch-area { transition: d var(--dur-2) var(--ease-out); }
+
+/* ═══════════════ pipeline lanes ═══════════════
+ *
+ * The pipelines list, redesigned around recognition. Each pipeline is a full-width lane led
+ * by a thumbnail of its plan, so a reader tells one pipeline from another by its *shape*
+ * before reading its name — which the old four-across card grid, where every card looked
+ * alike, made impossible. The thumbnail is the fingerprint; the name and id make it
+ * addressable; the stats and trend say how it is doing.
+ */
+
+.lanes { display: grid; gap: var(--s3); }
+
+.plane {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) 224px; gap: var(--s5); align-items: center;
+  padding: var(--s4); border: 1px solid var(--border); border-radius: var(--r2);
+  background: var(--surface-1); cursor: pointer; position: relative; overflow: hidden;
+  transition: border-color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out),
+              transform var(--dur-1) var(--ease-out);
+}
+@media (max-width: 900px) { .plane { grid-template-columns: 1fr; } }
+.plane:hover { border-color: var(--accent-line); box-shadow: var(--shadow-2); transform: translateY(-1px); }
+.plane:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* The health ribbon: a hairline down the left edge, its colour the pipeline's state. Paired
+ * with the status dot and the drift chip, so state never rides on colour alone. */
+.plane.has-ribbon::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+}
+.plane.is-ok::before { background: var(--good); }
+.plane.is-warn::before { background: var(--warn); }
+.plane.is-critical::before { background: var(--critical); }
+
+/* The thumbnail — the plan's shape, the whole point of the redesign. */
+.plane-thumb { display: flex; align-items: center; justify-content: center;
+               width: 156px; padding: var(--s2); border-radius: var(--r1);
+               background: var(--surface-2); }
+.dag-thumb { width: 100%; height: auto; }
+.dag-thumb.is-empty { display: flex; align-items: center; justify-content: center;
+                      color: var(--text-3); min-height: 72px; }
+.tn-edge { stroke: var(--border-strong); stroke-width: 1.5; }
+.tn-node circle { fill: var(--surface-1); stroke: var(--border-strong); stroke-width: 1.4; }
+.tn-node { color: var(--text-2); }
+/* The critical path is state, not identity, so it is the one thing the neutral thumbnail
+ * tints — a faint accent ring and glyph, enough to pick the chain out. */
+.tn-node.is-crit circle { stroke: var(--accent); fill: var(--accent-wash); }
+.tn-node.is-crit { color: var(--accent); }
+
+.plane-body { display: grid; gap: var(--s2); align-content: start; min-width: 0; }
+.plane-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.plane-name { margin: 0; font-size: var(--t5); font-weight: 600; line-height: 1.2;
+              overflow: hidden; text-overflow: ellipsis; }
+/* A generated name is the plan-as-a-chain, shown when nobody has named the pipeline. It
+ * reads as provisional — lighter and in the mono face — so a real name stands apart from it. */
+.plane-name.is-generated { color: var(--text-2); font-family: var(--font-mono);
+                           font-weight: 500; font-size: var(--t4); }
+.plane-rename { font-size: var(--t3); padding: 2px var(--s1); opacity: 0;
+                transition: opacity var(--dur-1) var(--ease-out); }
+.plane:hover .plane-rename, .plane-rename:focus-visible { opacity: 1; }
+.plane-id { font-size: var(--t1); color: var(--text-3); padding: 1px var(--s1);
+            border-radius: var(--r1); background: var(--surface-3); }
+.plane-name-input { font-size: var(--t5); font-weight: 600; padding: 2px var(--s2);
+                    border: 1px solid var(--accent); border-radius: var(--r1);
+                    background: var(--surface-1); color: var(--text-1); min-width: 200px;
+                    font-family: var(--font-ui); }
+.plane-name-input.is-large { font-size: var(--t7); }
+.plane-note { margin: 0; font-size: var(--t2); color: var(--text-2); }
+.plane-stats { display: flex; align-items: center; gap: var(--s5); flex-wrap: wrap; }
+.plane-stats .metric { display: flex; flex-direction: column; gap: 1px; }
+.plane-stats .metric b { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+                         font-size: var(--t4); }
+.plane-stats .metric span { font-size: var(--t0); color: var(--text-3);
+                            text-transform: uppercase; letter-spacing: .05em; }
+/* The right-hand trend rail: a fixed column so the sparkline is anchored and readable, with
+ * a hairline separating it from the body — an instrument gauge rather than a stray line. */
+.plane-rail { display: flex; flex-direction: column; align-items: flex-end; gap: var(--s1);
+              padding-left: var(--s5); border-left: 1px solid var(--border); align-self: stretch;
+              justify-content: center; }
+.plane-rail-label { font-size: var(--t0); text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
+.plane-rail .spark { width: 200px; }
+@media (max-width: 900px) { .plane-rail { border-left: 0; padding-left: 0; align-items: flex-start; } }
+.plane-foot { display: flex; align-items: center; justify-content: space-between;
+              font-size: var(--t2); }
+.plane-open { color: var(--accent); opacity: 0; transition: opacity var(--dur-1) var(--ease-out); }
+.plane:hover .plane-open { opacity: 1; }
+
+@media (max-width: 640px) {
+  .plane { grid-template-columns: 1fr; }
+  .plane-thumb { width: 100%; }
+}
+
+/* The pipeline page heading carries the same inline rename. */
+#p-title { display: flex; align-items: center; gap: var(--s2); }
+#p-title .is-generated { color: var(--text-2); font-family: var(--font-mono); font-weight: 500; }
+.p-rename { font-size: var(--t4); }
+
+/* ═══════════════ back-to-top + anchor offsets ═══════════════ */
+
+/* Anchor jumps (the Learn contents strip, log permalinks) must clear the sticky topbar and,
+ * on the reference, the sticky section nav — otherwise the target lands hidden underneath. */
+.learn-block, [id^="opref-"], [id^="gloss-"], [id^="learn-"] { scroll-margin-top: 116px; }
+.logline { scroll-margin-top: 64px; }
+
+/* Bottom-left, clear of the toast stack (which lives bottom-right). */
+.to-top {
+  position: fixed; left: var(--s5); bottom: var(--s5); z-index: 40;
+  width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--border-strong);
+  background: var(--surface-1); color: var(--text-1); cursor: pointer; box-shadow: var(--shadow-2);
+  font-size: var(--t5); line-height: 1; display: grid; place-items: center;
+  transition: transform var(--dur-1) var(--ease-out), background var(--dur-1), border-color var(--dur-1);
+  animation: rise var(--dur-2) var(--ease-out);
+}
+.to-top:hover { background: var(--accent); color: var(--on-accent); border-color: var(--accent);
+                transform: translateY(-2px); }
+
+/* ═══════════════ retro-futuristic accents ═══════════════
+ *
+ * A restrained "mission-control" layer over the base system: phosphor glow on the few things
+ * that are genuinely *live*, hairline accents on the frames, and instrument-panel micro-type.
+ * Everything here is a small deliberate flourish — the page must still read as a professional
+ * tool, not a theme. All of it is opacity/shadow/tint, so reduced-motion and light mode stay
+ * clean (the glow tokens collapse to nothing in light).
+ */
+
+/* Live status lamp glows; the pulse it already has now has a halo. */
+.pill.is-live { box-shadow: var(--glow-accent); }
+.pill.is-live::before { box-shadow: 0 0 6px var(--good); }
+
+/* The sliding tab indicator gets a faint bloom, like an illuminated readout. */
+.viewnav-ink, .tabs-ink { box-shadow: var(--glow-accent); }
+
+/* Panel headings: the right-hand hint reads as an instrument caption — small, spaced, quiet. */
+.panel-head .hint { font-size: var(--t0); text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
+
+/* A hairline of accent across the top of the primary panels, brightening on hover — the
+ * "powered frame" cue without a heavy border. Only the interactive/data panels, not every box. */
+.panel[data-panel]::after {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 1px;
+  background: var(--hairline); opacity: 0; transition: opacity var(--dur-2) var(--ease-out);
+  pointer-events: none; z-index: 1;
+}
+.panel[data-panel]:hover::after { opacity: .7; }
+
+/* A drilled-in graph panel is the centrepiece; give its frame a faint permanent hairline. */
+.dag-wrap { box-shadow: inset 0 1px 0 var(--accent-line); }
+
+/* The active nav tab label glows subtly — the eye finds "where am I" instantly. */
+.viewtab.is-active { text-shadow: 0 0 10px var(--accent-wash); }
+
+/* Monospace data cells get the phosphor treatment on the ones that are the live headline
+ * numbers: the run's big stats and the pipeline's typical time. Subtle — a hint of bloom. */
+.stat-value { font-variant-numeric: tabular-nums; }

@@ -149,7 +149,7 @@ class ResourceManager:
                 # Honor the byte bound (`credit_byte_budget`) via the learned wide-row width,
                 # exactly as the static grant does — otherwise a wide-row shuffle's learned
                 # window would be clamped only by the un-corrected count ceiling and buffer far
-                # past the byte budget (C53). Cold/narrow model → the plain count ceiling.
+                # past the byte budget. Cold/narrow model → the plain count ceiling.
                 ceiling = credit_ceiling(self._config, learned_channel_morsel_bytes(self._ctx))
                 return max(1, min(learned, ceiling))
         return self._flow_control.grant(requested, self._ctx)
@@ -191,7 +191,7 @@ class ResourceManager:
         initial = load_shuffle_window(self._hub, signature) if signature is not None else None
         # Thread the learned wide-row width so AIMD's ceiling keeps the same byte bound the
         # static grant enforces — a wide-row channel must not grow its window past
-        # `credit_byte_budget` (C53) just because it took the adaptive path.
+        # `credit_byte_budget` just because it took the adaptive path.
         return AIMDFlowControl(
             self._config,
             initial_window=initial,
@@ -268,7 +268,7 @@ class ResourceManager:
         """The plan's peak in-memory bytes (learned-blended), computed once per plan.
 
         `estimated_bytes`, `should_spill`, and `reserve` all consult this, so the
-        per-plan envelope is built once rather than three times (C37). The estimator
+        per-plan envelope is built once rather than three times. The estimator
         blends each operator's plan estimate toward its *measured* peak (learned from
         `m_peak_bytes`) when the hub has one, so all three decisions size against reality;
         on a cold store it is exactly the plan's dominant breaker.

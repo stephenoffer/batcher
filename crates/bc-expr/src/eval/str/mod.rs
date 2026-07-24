@@ -464,6 +464,39 @@ pub(crate) fn eval_str(
             Arc::new(builder.finish())
         }
         StrFunc::Chunk => chunk::eval_chunk(s, start, length, pattern)?,
+        StrFunc::TokenNgrams => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            // `length` carries `n`; clamp to at least 1 so a bad plan never panics.
+            let n = length.unwrap_or(1).max(1) as usize;
+            // Each n-gram re-emits its tokens plus one joining space, so the values are
+            // ~n× the input bytes; size the value buffer generously to skip regrowth.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len() * n),
+                s.len(),
+            );
+            for o in s.iter() {
+                match o {
+                    Some(v) => {
+                        let tokens: Vec<&str> = v.split_whitespace().collect();
+                        if tokens.is_empty() {
+                            // Empty or whitespace-only input → an empty list (matches
+                            // `chunk`'s empty-string behaviour), not a `[""]`.
+                        } else if tokens.len() < n {
+                            // Fewer than `n` tokens: emit the single n-gram of all of
+                            // them so a short document still contributes one gram.
+                            builder.values().append_value(tokens.join(" "));
+                        } else {
+                            for window in tokens.windows(n) {
+                                builder.values().append_value(window.join(" "));
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
         StrFunc::MinHash => minhash::eval_minhash(s, start, length)?,
         StrFunc::StripHtml => Arc::new(map_str(s, html::strip_html_text)),
         StrFunc::SubstringIndex => {
@@ -1257,14 +1290,17 @@ mod tests {
             name: "s".to_string(),
         };
 
-        // (func, pattern, replacement, start, length)
-        let cases: Vec<(
+        /// One dispatch case: the function plus whichever of its optional arguments it
+        /// takes — pattern, replacement, start, length.
+        type Case = (
             StrFunc,
-            Option<&str>,
-            Option<&str>,
+            Option<&'static str>,
+            Option<&'static str>,
             Option<i64>,
             Option<i64>,
-        )> = vec![
+        );
+
+        let cases: Vec<Case> = vec![
             (StrFunc::Upper, None, None, None, None),
             (StrFunc::Lower, None, None, None, None),
             (StrFunc::Len, None, None, None, None),
@@ -1812,6 +1848,35 @@ mod tests {
         assert_eq!(row(0), ["a", "b", "c"]);
         assert_eq!(row(1), ["中", "a"]);
         assert_eq!(row(2), [""]);
+    }
+
+    /// `token_ngrams` splits on whitespace and joins each window of `n` adjacent tokens:
+    /// overlapping n-grams, a single all-tokens gram when there are fewer than `n`, and an
+    /// empty list for empty/whitespace-only input.
+    #[test]
+    fn token_ngrams_windows_of_n_tokens() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("the cat sat"),
+            Some("solo"),
+            Some("  "),
+            Some(""),
+            None,
+        ]));
+        let out = eval_str(StrFunc::TokenNgrams, &arr, None, None, None, Some(2)).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let row = |i: usize| {
+            let v = list.value(i);
+            let v = v.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..v.len()).map(|j| v.value(j).to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(row(0), ["the cat", "cat sat"]); // overlapping bigrams
+        assert_eq!(row(1), ["solo"]); // fewer than n tokens → one all-tokens gram
+        assert!(row(2).is_empty()); // whitespace only → empty list
+        assert!(row(3).is_empty()); // empty string → empty list
+        assert!(list.is_null(4)); // null → null list
     }
 
     /// `replace(s, '', r)` returns `s` unchanged (DuckDB); Rust's `str::replace("")`

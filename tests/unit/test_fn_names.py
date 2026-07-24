@@ -17,11 +17,16 @@ from batcher.plan.expr_ir.func_nodes import ListFunc, MapFunc, StrFunc
 
 
 def test_known_functions_construct() -> None:
-    # A representative valid fn from each validated family builds without error.
-    StrFunc("contains", _col(), pattern="x")
-    ListFunc("sum", _col())
-    MathExpr("sqrt", _col())
-    MapFunc(MapFn.MAP_KEYS, _col())  # StrEnum member is accepted (it is a str)
+    """A representative valid fn from each validated family builds and keeps its name.
+
+    The name is what reaches the Rust `serde` tag, so a constructor that silently
+    normalized or dropped it would break the wire contract rather than raise.
+    """
+    assert StrFunc("contains", _col(), pattern="x").fn == "contains"
+    assert ListFunc("sum", _col()).fn == "sum"
+    assert MathExpr("sqrt", _col()).fn == "sqrt"
+    # A StrEnum member is accepted, because it is a str, and stores as its value.
+    assert MapFunc(MapFn.MAP_KEYS, _col()).fn == MapFn.MAP_KEYS
 
 
 @pytest.mark.parametrize(

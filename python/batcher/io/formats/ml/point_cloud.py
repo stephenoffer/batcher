@@ -23,16 +23,33 @@ files are read concurrently like any `FileSource`.
 from __future__ import annotations
 
 import os
-from typing import IO, Any, ClassVar
+from typing import IO, TYPE_CHECKING, Any, ClassVar
 
-import numpy as np
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
 
+if TYPE_CHECKING:
+    # Annotation-only: `dict[str, np.ndarray]` return types resolve for type checkers
+    # without importing numpy at runtime (see `_np` for the deferred runtime import).
+    import numpy as np
+
 __all__ = ["PointCloudSource"]
+
+
+def _np() -> Any:
+    # Deferred so `import batcher` (which eagerly imports every IO format to self-register)
+    # never pulls numpy. numpy is not a core dependency, and a module-scope import here made
+    # the whole package — and the docs autodoc build that imports it — fail without numpy
+    # installed. Matches the sibling `numpy` format's accessor.
+    try:
+        import numpy as np
+    except ImportError as exc:  # numpy is near-ubiquitous but kept optional/deferred
+        raise BackendError("reading point-cloud files needs numpy: pip install numpy") from exc
+    return np
+
 
 _SUFFIXES = (".bin", ".pcd", ".ply")
 _FRAME = "frame"
@@ -137,7 +154,7 @@ class PointCloudSource(FileSource):
                 if ext == ".ply":
                     return _ply_point_count(head)
                 size = self._fs.size(path)
-            stride = len(self._bin_cols) * np.dtype(self._bin_dtype).itemsize
+            stride = len(self._bin_cols) * _np().dtype(self._bin_dtype).itemsize
             return size // stride if stride else None
         except Exception:
             return None
@@ -170,6 +187,7 @@ def _sniff(data: bytes) -> str:
 
 def _parse_bin(data: bytes, columns: tuple[str, ...], dtype: str) -> dict[str, np.ndarray]:
     """Reshape a raw ``(N, len(columns))`` buffer into one array per column."""
+    np = _np()
     stride = len(columns)
     flat = np.frombuffer(data, dtype=dtype)
     if stride == 0 or flat.size % stride:
@@ -183,6 +201,7 @@ def _parse_bin(data: bytes, columns: tuple[str, ...], dtype: str) -> dict[str, n
 
 def _parse_pcd(data: bytes) -> dict[str, np.ndarray]:
     """Parse a PCD file (ASCII or binary DATA) into one array per FIELD."""
+    np = _np()
     header_end = data.find(b"DATA")
     if header_end < 0:
         raise BackendError("not a PCD file: no DATA line in the header")
@@ -224,6 +243,7 @@ def _parse_pcd(data: bytes) -> dict[str, np.ndarray]:
 
 def _parse_ply(data: bytes) -> dict[str, np.ndarray]:
     """Parse a PLY file (ASCII or binary vertex data) into one array per property."""
+    np = _np()
     marker = b"end_header\n"
     header_end = data.find(marker)
     if not data.lstrip().startswith(b"ply") or header_end < 0:

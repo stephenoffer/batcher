@@ -23,6 +23,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.mathx import ceil_div
 from batcher._internal.native import engine
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.source import Source
@@ -42,7 +43,7 @@ def _distributed_write(
 
     _ensure_ray(workers)
     n = table.num_rows
-    per = max(1, -(-n // workers))  # ceil
+    per = max(1, ceil_div(n, workers))
     shards = [table.slice(i * per, per) for i in range(workers) if i * per < n]
     if not shards:  # empty result still writes one (empty) shard for a valid dir
         shards = [table.slice(0, 0)]

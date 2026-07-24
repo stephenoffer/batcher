@@ -67,10 +67,11 @@ def test_record_and_load_avg_byte_width():
 
 
 def test_record_column_stats_best_effort_on_none_hub():
-    # Must never raise when there is no hub or nothing to record.
-    record_column_stats(None, {"a": 1.0}, {})
-    record_column_stats(_hub(), {}, {})
-    record_column_stats(_hub(), {}, {}, {})
+    """No hub, or nothing to record, must be a silent no-op rather than a raise."""
+    assert record_column_stats(None, {"a": 1.0}, {}) is None
+    hub = _hub()
+    assert record_column_stats(hub, {}, {}) is None
+    assert record_column_stats(hub, {}, {}, {}) is None
 
 
 def test_grouped_aggregate_cardinality_uses_ndv():

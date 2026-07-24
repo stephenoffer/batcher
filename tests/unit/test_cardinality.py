@@ -86,12 +86,19 @@ def test_mcv_sharpens_equality_on_skew_value():
     assert abs(_rows(ds, learned=learned) - 60.0) < 1e-9
 
 
-def test_mcv_only_applies_to_listed_value_else_falls_to_ndv():
-    # `x == 7` is not a most-common-value, so it keeps the uniform 1/ndv (not an MCV
-    # frequency); only the listed value 5 uses its measured frequency.
+def test_mcv_only_applies_to_listed_value_else_falls_to_residual_uniform():
+    # `x == 7` is not a most-common-value, so it does not get an MCV frequency — but it does
+    # not get the whole column's `1/ndv` either. The MCV table says the listed values already
+    # took 60% of the mass, so the other 49 distinct values share the remaining 40%:
+    # (1 - 0.6) / (50 - 1) per value, well below the uniform 1/50. Pricing an unlisted value
+    # at 1/ndv double-counts the skew the table exists to record.
     learned = {"__column_mcv__": {"x": {"5": 0.6}}, "__column_ndv__": {"x": 50}}
     unlisted = bt.from_pydict({"x": list(range(100))}).filter(col("x") == lit(7))
-    assert abs(_rows(unlisted, learned=learned) - 100 * (1.0 / 50.0)) < 1e-9
+    residual = (1.0 - 0.6) / (50.0 - 1.0)
+    assert abs(_rows(unlisted, learned=learned) - 100 * residual) < 1e-9
+    # And with no measured skew at all the estimate is exactly the uniform 1/ndv.
+    no_mcv = {"__column_ndv__": {"x": 50}}
+    assert abs(_rows(unlisted, learned=no_mcv) - 100 * (1.0 / 50.0)) < 1e-9
 
 
 def test_mcv_complements_under_not_equal():

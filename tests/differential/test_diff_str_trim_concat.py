@@ -29,7 +29,7 @@ def test_trim_strips_only_space_separators(duck):
             "s": pa.array(
                 [
                     "\t\n",  # pure control whitespace -> unchanged
-                    "  x　 ",  # Zs on both sides of 'x'
+                    " \u00a0x\u3000 ",  # NBSP / ideographic space around 'x'
                     "\tx\t",  # tabs kept
                     "  hi  ",  # plain ASCII spaces
                     "\r\nline\r\n",  # CR/LF kept

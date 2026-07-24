@@ -32,6 +32,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 from batcher._internal.optional import require
 
 __all__ = ["DeltaSnapshot", "open_snapshot", "require_deltalake"]
@@ -151,7 +152,8 @@ class DeltaSnapshot:
                     masks[relative(paths[i].as_py())] = _pa.array(
                         vectors[i].values, type=_pa.bool_()
                     )
-        except Exception:
+        except Exception as exc:
+            note_suppressed("io", "read deletion vectors", exc)
             return {}
         return masks
 

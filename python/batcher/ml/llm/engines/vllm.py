@@ -22,6 +22,8 @@ def vllm_engine(
     sampling: dict[str, object] | None = None,
     guided_json: dict[str, object] | None = None,
     guided_regex: str | None = None,
+    guided_choice: list[str] | None = None,
+    guided_grammar: str | None = None,
     lora_path: str | None = None,
     lora_paths: dict[str, str] | None = None,
     quantization: str | None = "auto",
@@ -66,6 +68,11 @@ def vllm_engine(
             — the reliable way to get parseable output; pair with
             ``llm_generate(parse_json=True)``.
         guided_regex: constrain generation to this regex, same mechanism.
+        guided_choice: constrain generation to **exactly one** of these strings — the
+            zero-loss classification path (``ds.ml.classify`` with ``instruct=False``), where
+            the model can only emit a declared label, not one buried in a sentence.
+        guided_grammar: constrain generation to an EBNF/GBNF grammar — a DSL/SQL or any
+            formal language, same mechanism.
         lora_path: serve a single LoRA adapter on top of the base `model` (applied to
             every row that does not name another adapter).
         lora_paths: a ``{name: path}`` table of adapters to **multiplex**: a request
@@ -105,9 +112,11 @@ def vllm_engine(
         enable_lora = lora_path is not None or bool(lora_paths)
         llm = LLM(model=model, enable_lora=enable_lora, **kwargs)
         sampling_kwargs = {"temperature": 0.0, **(sampling or {})}
-        guided = _guided_decoding(guided_json, guided_regex)
-        if guided is not None:
-            sampling_kwargs["guided_decoding"] = guided
+        gkw = _guided_decoding_kwargs(guided_json, guided_regex, guided_choice, guided_grammar)
+        if gkw is not None:
+            from vllm.sampling_params import GuidedDecodingParams
+
+            sampling_kwargs["guided_decoding"] = GuidedDecodingParams(**gkw)
         params = SamplingParams(**sampling_kwargs)
         lora_table = _lora_table(lora_path, lora_paths)
 
@@ -453,15 +462,22 @@ def _vllm_request(prompt: object) -> object:
     return request
 
 
-def _guided_decoding(guided_json: dict | None, guided_regex: str | None) -> object | None:
-    """A vLLM `GuidedDecodingParams` for JSON-schema or regex-constrained output."""
-    if guided_json is None and guided_regex is None:
-        return None
-    from vllm.sampling_params import GuidedDecodingParams
+def _guided_decoding_kwargs(
+    guided_json: dict | None,
+    guided_regex: str | None,
+    guided_choice: list[str] | None,
+    guided_grammar: str | None = None,
+) -> dict | None:
+    """The single `GuidedDecodingParams` kwarg the constraints select, or `None`.
 
-    if guided_json is not None:
-        return GuidedDecodingParams(json=guided_json)
-    return GuidedDecodingParams(regex=guided_regex)
+    Pure/vLLM-free so it is unit-testable without a GPU; precedence json > regex > choice
+    > grammar (the engine's own order)."""
+    for key, value in (("json", guided_json), ("regex", guided_regex)):
+        if value is not None:
+            return {key: value}
+    if guided_choice is not None:
+        return {"choice": list(guided_choice)}
+    return {"grammar": guided_grammar} if guided_grammar is not None else None
 
 
 def _lora_table(lora_path: str | None, lora_paths: dict[str, str] | None) -> dict:

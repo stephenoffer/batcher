@@ -402,7 +402,6 @@ def test_sketched_ndv_is_not_a_uniqueness_proof(duck):
         .agg(sa=bt.sum(col("a")), n=bt.count())
         .collect(),
         duck.sql(
-            "SELECT k, sum(a) AS sa, count(*) AS n "
-            "FROM u_left JOIN u_right USING (k) GROUP BY k"
+            "SELECT k, sum(a) AS sa, count(*) AS n FROM u_left JOIN u_right USING (k) GROUP BY k"
         ),
     )

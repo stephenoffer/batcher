@@ -36,26 +36,11 @@ from batcher.plan.expr_ir import col, nullif, when
 def _correlation_neq(leaf, local: set[str], local_cols: set[str] | None = None):
     """If `leaf` is `outer.col <> inner.col`, return `(outer_col, inner_col)`, else None.
 
-    The `<>` analogue of `_correlation_pair`: exactly one side is an outer reference."""
+    The `<>` analogue of `_correlation_pair`, and nothing more: the outer-reference test is
+    the same one, so this passes `exp.NEQ` rather than restating it."""
     from sqlglot import expressions as exp
 
-    if not isinstance(leaf, exp.NEQ):
-        return None
-    lhs, rhs = leaf.this, leaf.expression
-    if not (isinstance(lhs, exp.Column) and isinstance(rhs, exp.Column)):
-        return None
-
-    def _is_outer(c) -> bool:
-        if c.table:
-            return c.table not in local
-        return local_cols is not None and c.name not in local_cols
-
-    lhs_outer, rhs_outer = _is_outer(lhs), _is_outer(rhs)
-    if lhs_outer and not rhs_outer:
-        return (lhs.name, rhs.name)
-    if rhs_outer and not lhs_outer:
-        return (rhs.name, lhs.name)
-    return None
+    return _correlation_pair(leaf, local, local_cols, op=exp.NEQ)
 
 
 def _all_local(preds, local: set[str], local_cols: set[str] | None) -> bool:

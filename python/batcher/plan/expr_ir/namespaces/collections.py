@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.core import Expr, _wrap
 from batcher.plan.expr_ir.func_nodes import (
     ListBinary,
@@ -293,6 +294,24 @@ class _ListNamespace:
     def __repr__(self) -> str:
         """Show the accessor and its parent, e.g. ``<.list accessor of col('c')>``."""
         return f"<.list accessor of {self._e!r}>"
+
+    def __getattr__(self, name: str) -> Any:
+        """Point a Polars/Daft ``.list`` (``.arr``) idiom at its Batcher spelling.
+
+        Only reached when normal lookup fails, so it never shadows a real ``.list``
+        method. ``.list.eval``, ``.list.gather``, ``.list.explode`` come back naming
+        ``.list.transform``, ``.list.get``, ``ds.explode`` — see
+        `batcher.plan.expr_ir.compat.guidance`.
+
+        Args:
+            name: The attribute name that was not found.
+
+        Raises:
+            AttributeError: Always, with guidance for `name`.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise accessor_attribute_error(self, "'.list' accessor", name, LIST_UNSUPPORTED)
 
     def get(self, index: int) -> ListGet:
         """Return the element at ``index`` of each list; null if out of range.

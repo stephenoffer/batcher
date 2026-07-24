@@ -42,22 +42,22 @@ MIN_SIGNATURE_CHARS = 350
 #: design (`__init__` assigning its args, `__eq__` comparing fields). Not duplication.
 SKIP_NAMES = {"__init__", "__eq__", "__hash__", "__repr__", "__str__", "__enter__", "__exit__"}
 
-#: Known duplicates, each with a reason. Keyed by the sorted "file:line" list of its sites.
+#: Known duplicates, each with a reason. Keyed by the sorted "file:function" list of its
+#: sites — deliberately NOT by line, because an edit anywhere above a listed site shifts its
+#: line number, the key stops matching, and a ledgered duplicate silently becomes a red gate
+#: that has nothing to do with the change that tripped it. That is not hypothetical: this
+#: entry was keyed at 332/161 while the functions sat at 343/162, so `just lint-duplication`
+#: (a pre-commit hook) failed at HEAD.
+#:
 #: This is a *ledger*, not an amnesty: an entry here is debt that is visible and expected to
 #: shrink, not a duplicate that has been blessed. Prefer fixing to listing.
-DUPLICATION_ALLOW: dict[str, str] = {
-    # TRACKED DEBT (not justified): the speculative-relaunch closure pair `_launch`/`_relaunch`
-    # is copy-pasted between the Flight sort and the Flight window reducers. They differ only in
-    # which actor method they call (`sort_reduce` vs `reduce_window`) and the IR they pass, so
-    # the fix is a shared launcher in `dist/executors/ray_runtime` taking the remote call as a
-    # parameter — next to `gather_with_backups`, which is already shared. It is listed rather
-    # than fixed because it is Ray actor code with no runnable test in this environment, and a
-    # blind refactor of the straggler/backup path is a worse risk than the duplication.
-    "python/batcher/dist/flight_sort.py:332,python/batcher/dist/flight_window.py:161": (
-        "tracked debt: speculative-relaunch closure duplicated; fix = shared launcher in "
-        "dist/executors/ray_runtime beside gather_with_backups"
-    ),
-}
+# Empty: the one tracked entry (the speculative-relaunch closure copy-pasted across the four
+# Flight reducers) was fixed rather than blessed — the shared barrier now lives in
+# `dist/executors/ray_runtime/reduce.py::run_bucket_reduce`, and the sort/window/join/aggregate
+# reducers each supply only the two closures that vary. The `test_join_recovery` and
+# `test_carbonite_recovery_e2e` integration tests exercise the merged path under real
+# worker loss, which is what the entry claimed there was no test for.
+DUPLICATION_ALLOW: dict[str, str] = {}
 
 
 class _Normalize(ast.NodeTransformer):
@@ -73,9 +73,7 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.Attribute:
         self.generic_visit(node)
-        return ast.copy_location(
-            ast.Attribute(value=node.value, attr="_", ctx=node.ctx), node
-        )
+        return ast.copy_location(ast.Attribute(value=node.value, attr="_", ctx=node.ctx), node)
 
     def visit_Constant(self, node: ast.Constant) -> ast.Constant:
         return ast.copy_location(ast.Constant(value="_"), node)
@@ -129,7 +127,7 @@ def main() -> int:
 
     failures = []
     for sites in sorted(groups, key=lambda g: (-len(g), g[0][0])):
-        key = ",".join(sorted(f"{file}:{line}" for file, line, _ in sites))
+        key = ",".join(sorted(f"{file}:{name}" for file, _, name in sites))
         if key in DUPLICATION_ALLOW:
             print(f"allow: {sites[0][2]}() x{len(sites)} — {DUPLICATION_ALLOW[key]}")
             continue

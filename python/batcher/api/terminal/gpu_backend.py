@@ -23,6 +23,8 @@ from __future__ import annotations
 import contextlib
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -147,8 +149,8 @@ def _agg_input_rows(plan, sources, fallback: int = 0) -> int:
             rc = sources[spec[3].source_id].row_count()
             if rc:
                 return int(rc)
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("api", "read exact rows for GPU sizing", exc)
     return fallback
 
 
@@ -454,16 +456,11 @@ def _cluster_gpu_count() -> int:
             from batcher.dist.executors.ray_runtime import cluster_topology
 
             return int(cluster_topology().get("gpus", 0))
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("api", "read cluster GPU topology", exc)
     from batcher.core.gpu_transform import gpu_available
 
     return 1 if gpu_available() else 0
-
-
-def _cluster_has_gpu() -> bool:
-    """Whether the live cluster (or local process) exposes at least one GPU."""
-    return _cluster_gpu_count() > 0
 
 
 def _gpu_aggregate_worker(table, key: str, aggs: dict):

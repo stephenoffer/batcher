@@ -154,14 +154,35 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
         self.counters.get(key).copied().unwrap_or(0)
     }
 
-    /// Monitored keys whose counter exceeds `fraction * total`, sorted by count
-    /// descending — the keys skewed enough to be worth salting.
+    /// The maximum a monitored counter could undercount the true frequency by.
+    ///
+    /// Misra-Gries decrements every counter each time a new key evicts one, and there are at
+    /// most `total / (capacity + 1)` such decrement rounds, so a monitored key's true count is
+    /// in `[counter, counter + this]`.
+    #[inline]
+    fn count_error(&self) -> f64 {
+        self.total as f64 / (self.capacity as f64 + 1.0)
+    }
+
+    /// Monitored keys that **could** exceed `fraction * total`, sorted by count descending —
+    /// the keys skewed enough to be worth salting.
+    ///
+    /// The test is against the counter's *upper* bound (`counter + count_error`), not the raw
+    /// counter, because the two directions of error are not equally costly here. This feeds
+    /// shuffle salting, where a false positive costs one extra sub-partition and a false
+    /// negative leaves a hot key to overload a single reducer — a straggler that shows up only
+    /// at scale. Misra-Gries counters *underestimate* (they are decremented), so filtering on
+    /// the raw counter drops exactly the borderline-heavy keys whose counters were decremented
+    /// the most, which is the unsafe direction. Comparing the upper bound reports every key
+    /// that could be heavy and cannot miss one — the same safety choice Count-Min's `is_heavy`
+    /// and the join bloom make.
     pub fn heavy_hitters(&self, fraction: f64) -> Vec<(K, u64)> {
         let threshold = fraction * self.total as f64;
+        let error = self.count_error();
         let mut out: Vec<(K, u64)> = self
             .counters
             .iter()
-            .filter(|(_, &c)| (c as f64) > threshold)
+            .filter(|(_, &c)| (c as f64) + error > threshold)
             .map(|(k, &c)| (k.clone(), c))
             .collect();
         out.sort_by_key(|entry| std::cmp::Reverse(entry.1));
@@ -353,7 +374,7 @@ mod tests {
         for k in 100..130u64 {
             fi2.add(k);
         }
-        assert_eq!(fi2.estimate(&7) > 900, true, "hot key undercounted");
+        assert!(fi2.estimate(&7) > 900, "hot key undercounted");
     }
 
     #[test]
@@ -453,5 +474,42 @@ mod tests {
                 "trial {trial}: heavy key {heavy_key} (count {heavy_count}/{n}) lost after merge; cap={capacity} parts={parts} reported={heavy:?}"
             );
         }
+    }
+
+    /// A key that is genuinely heavy but whose Misra-Gries counter was decremented below the
+    /// threshold must still be reported — a missed hot key is a shuffle straggler, the failure
+    /// salting exists to prevent.
+    #[test]
+    fn heavy_hitters_reports_a_key_whose_counter_was_decremented() {
+        // A small table over many distinct keys forces heavy decrementing, so a real heavy
+        // hitter's counter lags its true frequency.
+        let mut fi = FrequentItems::new(4);
+        for _ in 0..500 {
+            fi.add(0u64); // ~33% of the stream, genuinely heavy
+        }
+        for i in 1..1000u64 {
+            fi.add(i); // a long tail of singletons that decrement key 0's counter
+        }
+        // Key 0's true frequency is well above 10%; the upper-bound test must still surface it
+        // even though its stored counter has been decremented.
+        let heavy = fi.heavy_hitters(0.1);
+        assert!(
+            heavy.iter().any(|(k, _)| *k == 0),
+            "the genuinely-heavy key 0 was missed: {heavy:?}"
+        );
+    }
+
+    /// The upper-bound test must not turn every singleton into a heavy hitter — the error term
+    /// is bounded by `total/(capacity+1)`, so on a large table it stays small.
+    #[test]
+    fn heavy_hitters_does_not_flag_the_whole_tail() {
+        let mut fi = FrequentItems::new(64);
+        for i in 0..100_000u64 {
+            fi.add(i % 5000); // 5000 roughly equal keys, none close to 10%
+        }
+        assert!(
+            fi.heavy_hitters(0.1).is_empty(),
+            "no key holds 10%, yet some were flagged"
+        );
     }
 }

@@ -46,7 +46,7 @@ def test_uint64_above_i64max_is_not_silently_nulled():
     """A UInt64 above i64::MAX must not cross the boundary as a silent null."""
     big = 2**63 + 5  # > i64::MAX, unrepresentable in Int64
     tbl = pa.table({"u": pa.array([1, big, 3], type=pa.uint64())})
-    with pytest.raises(Exception) as exc:  # noqa: B017 - typed error surfaces as RuntimeError
+    with pytest.raises(Exception) as exc:
         bt.from_arrow(tbl).collect()
     # The message must name the offending column/type, not fail opaquely.
     assert "u" in str(exc.value) or "Int64" in str(exc.value)
@@ -71,31 +71,31 @@ def test_uint32_max_roundtrips_exactly():
 
 
 def test_partition_batches_bad_index_raises_clean_exception():
-    with pytest.raises(Exception) as exc:  # noqa: B017
+    with pytest.raises(Exception) as exc:
         _native.partition_batches([_rb()], [99], 4)
     assert isinstance(exc.value, Exception)  # not a bare BaseException/PanicException
 
 
 def test_partition_batches_zero_partitions_raises_clean_exception():
-    with pytest.raises(Exception) as exc:  # noqa: B017
+    with pytest.raises(Exception) as exc:
         _native.partition_batches([_rb()], [0], 0)
     assert isinstance(exc.value, Exception)
 
 
 def test_range_partition_batches_bad_index_raises_clean_exception():
-    with pytest.raises(Exception) as exc:  # noqa: B017
+    with pytest.raises(Exception) as exc:
         _native.range_partition_batches([_rb()], 99, [1.0], 2, True, False)
     assert isinstance(exc.value, Exception)
 
 
 def test_salted_partition_batches_bad_index_raises_clean_exception():
-    with pytest.raises(Exception) as exc:  # noqa: B017
+    with pytest.raises(Exception) as exc:
         _native.salted_partition_batches([_rb()], [99], 4, [], 2, False)
     assert isinstance(exc.value, Exception)
 
 
 def test_build_key_bloom_bad_index_raises_clean_exception():
-    with pytest.raises(Exception) as exc:  # noqa: B017
+    with pytest.raises(Exception) as exc:
         _native.build_key_bloom([_rb()], [99], 100)
     assert isinstance(exc.value, Exception)
 

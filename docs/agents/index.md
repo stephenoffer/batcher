@@ -1,4 +1,4 @@
-# Working with coding agents
+//# Working with coding agents
 
 This page catalogs the agent skills Batcher ships, and explains how a coding agent
 picks one and how you use them in your own project.
@@ -74,6 +74,7 @@ For work *on* Batcher rather than *with* it. These encode the invariants in
 | `add-distributed-operator` | Wiring an operator through the distributed path so a multi-node result equals single-node. |
 | `add-an-io-format-or-connector` | Adding a reader/writer for a file format, lakehouse table, database, or streaming source. |
 | `run-quality-gate` | Before committing, opening a PR, or claiming a change works. |
+| `audit-codebase-health` | A periodic health pass over the whole tree: dead code, duplication, swallowed errors, tests that cannot fail, production readiness. Fixes what it finds. |
 
 Documentation is part of the engine, so it has its own pair. The contract they apply is
 `.claude/rules/documentation.md`.

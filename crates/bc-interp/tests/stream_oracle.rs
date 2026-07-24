@@ -562,7 +562,7 @@ fn limit_does_not_evaluate_rows_it_will_never_return() {
     let p = plan(&json);
 
     assert!(
-        execute(&p, &[src.clone()]).is_err(),
+        execute(&p, std::slice::from_ref(&src)).is_err(),
         "the oracle projects the whole relation and must hit the bad cast"
     );
     let got = execute_streaming(&p, &[src], 0).expect("streaming stops before the bad batch");

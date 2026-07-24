@@ -128,6 +128,8 @@ const LEARN = (() => {
       body: 'Automatic checks over recent runs. Each one links straight to the evidence behind it, so a verdict is never a dead end.' },
     { sel: '.pcard', title: 'Open a pipeline',
       body: 'A pipeline page shows every run of that query, its history, and the plan the engine chose. Click a card to go in.' },
+    { sel: '[data-view="live"]', title: 'Work in flight',
+      body: 'Everything else here is retrospective. Live is the page for a job that runs for minutes — partition progress, GPU load, and whether the pipeline is keeping the workers fed. A dot appears on this tab whenever something is running.' },
     { sel: '[data-view="logs"]', title: 'The log stream',
       body: 'Structured logs from the engine, filterable by level and source. Useful when a query failed rather than merely ran slowly.' },
     { sel: '#help', title: 'Help whenever you want it',
@@ -205,8 +207,14 @@ const LEARN = (() => {
 
   /* Offered once, and only when there is something on screen worth pointing at — a tour of
    * an empty dashboard teaches nothing. */
+  let tourOffered = false;
   function maybeOfferTour(hasData) {
-    if (!hasData || UI.getPref('tourSeen')) return;
+    // Offered at most once per session, and never twice on screen: `renderPipelineList`
+    // calls this on every repaint, and without the guard a stack of identical sticky toasts
+    // grew over the content. A person who dismisses it, or has seen it before, is not asked
+    // again.
+    if (!hasData || tourOffered || UI.getPref('tourSeen')) return;
+    tourOffered = true;
     UI.toast('New here? Take the 6-step tour.', {
       action: { label: 'Start tour', run: startTour },
       dismiss: { label: 'No thanks', run: () => UI.setPref('tourSeen', true) },
@@ -231,8 +239,11 @@ const LEARN = (() => {
     const terms = REFERENCE.termKeys
       .map((k) => [k, REFERENCE.TERMS[k]])
       .filter(([k, t]) => match(k) || match(t.what) || match(t.why || ''));
+    const comparisons = REFERENCE.COMPARISONS.filter((c) => (
+      match(c.tool) || match(c.familiar) || c.rows.some(([a, b]) => match(a) || match(b))));
 
-    if (!recipes.length && !operators.length && !metrics.length && !terms.length) {
+    if (!recipes.length && !operators.length && !metrics.length && !terms.length &&
+        !comparisons.length) {
       host.innerHTML = UI.emptyState({
         glyph: 'search', title: `Nothing matches “${esc(filter)}”`,
         body: 'Try a shorter word, or clear the box to browse everything.',
@@ -244,6 +255,7 @@ const LEARN = (() => {
     // wrong default. A contents strip and per-section counts let a reader jump.
     const toc = [
       recipes.length ? ['how', `How do I\u2026 (${recipes.length})`] : null,
+      comparisons.length ? ['coming', `Coming from another engine (${comparisons.length})`] : null,
       operators.length ? ['steps', `Plan steps (${operators.length})`] : null,
       metrics.length ? ['metrics', `Metrics (${metrics.length})`] : null,
       terms.length ? ['glossary', `Glossary (${terms.length})`] : null,
@@ -260,6 +272,22 @@ const LEARN = (() => {
           `<article class="recipe"><h4>${esc(r.task)}</h4><ol>` +
           r.steps.map((s) => `<li>${esc(s)}</li>`).join('') + `</ol></article>`)).join('') +
         `</div></section>` : '') +
+
+      // A map, not a scoreboard. Nobody arrives at a new engine's dashboard without having
+      // read another one first, and naming the familiar panel is the fastest way to make
+      // this one legible. Performance claims belong in the competitive scorecard, not here.
+      (comparisons.length ? `<section class="learn-block" id="learn-coming">` +
+        `<h3>Coming from another engine</h3>` +
+        `<p class="lede">Where the panel you already know lives here. This is a map for ` +
+        `finding your way around — it says nothing about which engine is faster.</p>` +
+        comparisons.map((c) => (
+          `<article class="compare-block"><h4>${esc(c.tool)}</h4>` +
+          `<p class="compare-familiar">${esc(c.familiar)}</p>` +
+          `<table class="dense compare-table"><thead><tr>` +
+          `<th scope="col">There</th><th scope="col">Here</th></tr></thead><tbody>` +
+          c.rows.map(([there, here]) => (
+            `<tr><td class="compare-there">${esc(there)}</td><td>${esc(here)}</td></tr>`)).join('') +
+          `</tbody></table></article>`)).join('') + `</section>` : '') +
 
       (operators.length ? `<section class="learn-block" id="learn-steps"><h3>Plan steps</h3>` +
         `<p class="lede">Every step the engine can put in a plan, what makes each one slow, and what to do about it.</p>` +

@@ -120,6 +120,31 @@ class ElasticsearchSource(ScanSource):
         kw = self._conn_kwargs
         return es.Elasticsearch(hosts=kw["hosts"], api_key=self._secret("api_key"))
 
+    def row_count(self) -> int | None:
+        """The exact matching-document count via the ``_count`` API — no scroll, no scan.
+
+        ``_count`` runs the same DSL query the scroll path reads but returns only the
+        cardinality, so it is a single cheap round trip that answers ``count()`` and sizes
+        the estimator's cardinality exactly. The result is the count of the base relation
+        (the source's own ``query``, before Kyber's pushed predicate narrows it further),
+        which is what a `Scan` leaf's statistics describe.
+
+        Only the search/scroll path answers here: an ES|QL result has no cheap count (it
+        would need ``| STATS COUNT(*)``, a second full query), so it stays None. Best-effort
+        — any cluster error yields None and the planner falls back to its default.
+        """
+        if self._conn_kwargs["esql"]:
+            return None
+        try:
+            with contextlib.closing(self._client()) as client:
+                resp = client.count(
+                    index=self._conn_kwargs["index"], query=self._conn_kwargs["query"]
+                )
+            count = resp["count"] if isinstance(resp, dict) else resp.body["count"]
+            return int(count)
+        except Exception:
+            return None
+
     def _identity_suffix(self) -> str:
         return str(self._conn_kwargs["index"])
 

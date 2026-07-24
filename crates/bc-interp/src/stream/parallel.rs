@@ -329,7 +329,10 @@ fn run_with_cache(
     // `sources` view its worker will scan. Built *before* the parallel loop so they outlive the
     // morsel streams that borrow them (a stream is a `Box<dyn Iterator + 'a>`, and `'a` has to
     // outlive the closure that produced it).
-    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = shard(&sources[driving], workers)
+    // Capped so no shard is under a morsel (see `effective_shard_count`) — else a medium
+    // relation's sub-morsel shards run the parallel path slower than sequential.
+    let shard_workers = effective_shard_count(workers, driving_rows);
+    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = shard(&sources[driving], shard_workers)
         .into_iter()
         .map(|sh| swap(sources, driving, sh))
         .collect();
@@ -539,6 +542,19 @@ fn swap(
     let mut out = sources.to_vec();
     out[idx] = shard;
     out
+}
+
+/// Shards to split the driving relation into: `workers`, capped so no shard is under a morsel.
+///
+/// Splitting a medium relation across every core gives sub-morsel shards whose per-shard
+/// dispatch + `combine` (~15 µs) dwarf their work. `driving_rows / MORSEL_ROWS` (floor — `shard`
+/// spreads rows evenly, so ceiling would push the split back below a morsel) keeps every worker
+/// at ≥ one morsel; a relation with ≥ `workers` morsels still fills every core. Scheduling only:
+/// `combine` is associative + commutative over contiguous in-order shards, so the result stands.
+fn effective_shard_count(workers: usize, driving_rows: usize) -> usize {
+    workers
+        .min(driving_rows / bc_arrow::DEFAULT_MORSEL_ROWS)
+        .max(1)
 }
 
 /// Split a relation into `workers` contiguous, in-order shards of whole morsels.
@@ -856,5 +872,34 @@ mod tests {
         assert_eq!(opts.parallelism, 0, "default is 'all cores'");
         let expected = bc_arrow::usable_cores();
         assert_eq!(opts.workers(), expected);
+    }
+
+    /// The shard count never produces a sub-morsel shard, and a relation big enough to fill
+    /// every worker still fans out fully. Without the cap, a 96-core box split a 200k-row
+    /// relation (~12 morsels) into 96 ~2k-row shards and the dispatch/`combine` overhead ran
+    /// the parallel path *slower* than sequential.
+    #[test]
+    fn shard_count_never_goes_below_one_morsel() {
+        let m = bc_arrow::DEFAULT_MORSEL_ROWS;
+        // A medium relation is capped by its whole-morsel count, not the machine width.
+        assert_eq!(effective_shard_count(96, 200_000), 200_000 / m);
+        // Exactly the shard threshold (4 morsels) yields at most 4 shards, not 96.
+        assert_eq!(effective_shard_count(96, 4 * m), 4);
+        // A relation with ≥ `workers` morsels still uses every worker.
+        assert_eq!(effective_shard_count(96, 200 * m), 96);
+        // Degenerate inputs never yield zero shards.
+        assert_eq!(effective_shard_count(96, 0), 1);
+        assert_eq!(effective_shard_count(1, 200 * m), 1);
+        // Every shard of a capped split holds at least one full morsel's worth of rows — the
+        // whole point of the cap. `shard` spreads rows evenly, so the smallest shard is
+        // `rows / shards` (floored), which must still clear a morsel.
+        for rows in [4 * m, 65_536, 100_000, 200_000, 500_000, 96 * m + 1] {
+            let shards = effective_shard_count(96, rows);
+            assert!(
+                rows / shards >= m,
+                "{rows} rows split into {shards} shards gives a sub-morsel shard of {} rows",
+                rows / shards
+            );
+        }
     }
 }

@@ -117,6 +117,14 @@ video = ["av>=12"]
 # the `data` column, which is a downstream step the reader deliberately does not do.
 mcap = ["mcap>=1.1"]
 ros2 = ["mcap-ros2-support>=0.5"]
+# --- Tabular / classical ML (ds.ml.predict) ---
+# Each is only needed to score a model of that framework; the feature-matrix assembly and
+# the metric aggregates need none of them.
+xgboost = ["xgboost>=2"]
+lightgbm = ["lightgbm>=4"]
+catboost = ["catboost>=1.2"]
+onnx = ["onnxruntime>=1.17"]
+sklearn = ["scikit-learn>=1.3", "joblib>=1.3"]
 # --- Framework interop (Ray Data `from_*` parity) ---
 pandas = ["pandas>=2"]
 huggingface = ["datasets>=2.18"]
@@ -128,6 +136,7 @@ streaming = ["batcher-engine[kafka,kinesis,eventhubs,pubsub,pulsar]"]
 multimodal = ["batcher-engine[image,audio,video,pdf]"]
 robotics = ["batcher-engine[mcap,ros2,hdf5]"]
 ml-formats = ["batcher-engine[lance,avro,hdf5,zarr,tfrecord]"]
+tabular = ["batcher-engine[xgboost,lightgbm,catboost,onnx,sklearn]"]
 dev = [
     "maturin>=1.7,<2",
     "pytest>=8",
@@ -145,6 +154,11 @@ dev = [
     "polars>=1.0",
     "numpy>=1.24",
     "scikit-learn>=1.3",
+    # The tabular-inference adapters (`ds.ml.predict`) are optional for a user but not for
+    # the suite: without them `tests/unit/test_ml_tabular_predict.py` skips its booster
+    # coverage and the XGBoost/LightGBM paths ship unexercised.
+    "xgboost>=2",
+    "lightgbm>=4",
     # The lakehouse backends are optional *for a user*, but not for the suite: the
     # lakehouse guides, the Delta/Iceberg integration pages, and `examples/lakehouse_scd.py`
     # are executed for real by `tests/docs/`, and `tests/io/test_lakehouse.py` round-trips
@@ -282,6 +296,7 @@ markers = [
     "integration: end-to-end pipelines",
     "property: hypothesis-driven invariants",
     "docs: runnable code blocks extracted from the documentation",
+    "io: readers, writers, and lakehouse round-trips",
 ]
 
 # --- Coverage (pytest-cov) ----------------------------------------------------

@@ -32,8 +32,14 @@ from batcher.kyber.learning import (
 )
 from batcher.kyber.properties import project_ordering
 from batcher.kyber.stats import columns as col_prop
+from batcher.kyber.stats.distribution import (
+    join_match_fraction,
+    mcv_join_rows,
+    overlap_fraction,
+    union_ndv,
+)
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.kyber.stats.selectivity.scalars import _ordinal
+from batcher.kyber.stats.selectivity.scalars import _fraction_below_quantiles, _ordinal
 from batcher.plan.expr_ir import Col, Expr, IsNotNull, Lit
 from batcher.plan.logical import (
     Aggregate,
@@ -489,8 +495,17 @@ class StatsEstimator:
         names = node.available_columns()
         columns = col_prop.union_columns(children, names)
         if node.distinct:
-            # Dedup across branches: row count is no longer exact (overlap unknown).
-            return RelStats(total, weakest(prov, Provenance.DEFAULT), columns)
+            # `UNION` (not `UNION ALL`) dedups across branches, so its output is the distinct
+            # count of the concatenation — bounded below by the largest branch and above by
+            # `Σ n_i`, never above. Reporting the un-deduplicated `total` was an upper bound
+            # only, and it made a `UNION` of near-identical partitions look like it doubled the
+            # data. `union_ndv` interpolates between those bounds with the same
+            # independent-membership model the column-stat merge uses, so the row estimate and
+            # the propagated per-column ndv cannot disagree.
+            deduped = union_ndv([c.rows for c in children], total)
+            largest = max(c.rows for c in children)
+            rows = total if deduped is None else min(total, max(deduped, largest))
+            return RelStats(rows, weakest(prov, Provenance.DEFAULT), columns)
         return RelStats(total, prov, columns)
 
     def _estimate_window(self, node: Window) -> RelStats:
@@ -520,17 +535,25 @@ class StatsEstimator:
         return RelStats(rows, Provenance.DEFAULT, columns, child.sorted_by)
 
     def _partition_count(self, node: Window, child: RelStats) -> float:
-        """How many partitions the window's keys cut the input into (1 when unpartitioned)."""
+        """How many partitions the window's keys cut the input into (1 when unpartitioned).
+
+        This is the distinct-combination count of the partition-key *set* — the same quantity
+        a group-by, a `DISTINCT`, and a join key set all ask for — so it goes through the same
+        damped combiner. Multiplying the per-key distinct counts (as this did) assumes the keys
+        are independent, which the keys of a real `PARTITION BY (region, store)` never are; the
+        product then saturates the row-count cap and a `QUALIFY rank <= k` is estimated to keep
+        every row, defeating the rank-limit fusion it exists to size.
+        """
         if not node.partition_keys:
             return 1.0
         ndv = _ndvs(child)
-        count = 1.0
+        per_key = []
         for key in node.partition_keys:
             if isinstance(key, Col) and key.name in ndv and ndv[key.name] > 0:
-                count *= ndv[key.name]
+                per_key.append(ndv[key.name])
             else:
                 return child.rows  # unknown ndv → assume every row its own partition
-        return min(count, child.rows)
+        return combine_ndv(per_key, child.rows)
 
     def _estimate_aggregate(self, node: Aggregate) -> RelStats:
         """Group-by output ≈ distinct group-key combinations; a global aggregate
@@ -659,13 +682,24 @@ class StatsEstimator:
             return self._semi_anti_rows(node, left, right, left_ndv, right_ndv)
 
         inner = self._inner_join_rows(node, left, right, left_ndv, right_ndv)
+        if node.join_type == "inner":
+            return inner, Provenance.DEFAULT
+        # An outer join emits the inner result **plus** a null-extended row for each unmatched
+        # row of its preserved side. Both terms are needed: `max(inner, |L|)` (the previous
+        # form) is only a lower bound, and it collapses to exactly `|L|` for the shape that
+        # matters most — a `LEFT JOIN` to a dimension that fans out — where the true size is
+        # `inner + unmatched` and can be several times larger. Under-estimating an outer join
+        # is the direction that under-sizes its hash table.
+        unmatched_left = left.rows * (1.0 - _match_fraction(left_ndv, right_ndv))
+        unmatched_right = right.rows * (1.0 - _match_fraction(right_ndv, left_ndv))
         if node.join_type == "left":
-            return max(inner, left.rows), Provenance.DEFAULT
+            return max(inner + unmatched_left, left.rows), Provenance.DEFAULT
         if node.join_type == "right":
-            return max(inner, right.rows), Provenance.DEFAULT
+            return max(inner + unmatched_right, right.rows), Provenance.DEFAULT
         if node.join_type == "full":
             # |L ⟗ R| = |matched| + |unmatched L| + |unmatched R| >= max(|L|, |R|).
-            return max(inner, left.rows, right.rows), Provenance.DEFAULT
+            total = inner + unmatched_left + unmatched_right
+            return max(total, left.rows, right.rows), Provenance.DEFAULT
         return inner, Provenance.DEFAULT
 
     def _semi_anti_rows(
@@ -687,18 +721,26 @@ class StatsEstimator:
         A **semi** join is additionally floored by skew: a hot left value that also appears
         in `R`'s measured MCV provably matches, so *all* `f_L(v)·|L|` of its rows survive —
         a firm lower bound the uniform ``d_R/d_L`` fraction can undercount on a skewed key.
-        (No such floor for `anti`: absence from `R`'s top-values MCV does not prove a value
-        is missing from `R`, so it cannot prove a row is *un*matched.)
+
+        Semi and anti are derived from **one** semi estimate, because they partition `|L|`
+        exactly: every left row either finds a match or does not. Estimating them
+        independently (as this did) let both claim `|L|` whenever the distinct counts were
+        unmeasured — a pair of estimates no execution can jointly produce — and priced a
+        near-empty anti-join at full width. Deriving anti as `|L| - semi` makes the identity
+        hold by construction, including the skew floor: rows *proved* to match by a shared hot
+        value are exactly the rows proved not to survive the anti-join.
         """
         if not left_ndv or not right_ndv or left_ndv <= 0:
-            base = left.rows
-        else:
-            matched = min(1.0, right_ndv / left_ndv)
-            fraction = matched if node.join_type == "semi" else 1.0 - matched
-            base = max(0.0, left.rows * fraction)
+            # No usable distinct counts: either variant could keep everything, and `|L|` is the
+            # tight upper bound for both. The complement identity is deliberately not applied
+            # here — it would report one of the two as empty on no evidence.
+            return left.rows, Provenance.DEFAULT
+        matched = join_match_fraction(left_ndv, right_ndv)
+        semi = max(0.0, min(left.rows, left.rows * matched))
+        semi = min(left.rows, max(semi, self._semi_skew_floor(node, left, right)))
         if node.join_type == "semi":
-            return max(base, self._semi_skew_floor(node, left, right)), Provenance.DEFAULT
-        return base, Provenance.DEFAULT
+            return semi, Provenance.DEFAULT
+        return max(0.0, left.rows - semi), Provenance.DEFAULT
 
     def _semi_skew_floor(self, node: Join, left: RelStats, right: RelStats) -> float:
         """Left rows guaranteed to survive a semi-join because their (hot) key is in `R`.
@@ -742,15 +784,94 @@ class StatsEstimator:
             left.rows, right.rows, left_ndv, right_ndv
         ):
             return max(left.rows, right.rows, skew)
+        # With both sides' key frequencies measured, the join decomposes exactly into the
+        # matched-hot-value term plus a uniform estimate over the *residual* mass. That sum is
+        # sharper than either part alone: the uniform estimate alone prices a 47%-frequent key
+        # as if it were average (a catastrophic under-estimate), while taking the skew term as
+        # a mere floor discards the mass the MCV table does not cover.
+        decomposed = self._mcv_join_rows(node, left, right, left_ndv, right_ndv)
+        if decomposed is not None:
+            return self._range_scaled(node, left, right, decomposed)
         ndvs = [v for v in (left_ndv, right_ndv) if v is not None and v > 0]
         if ndvs:
             # With only one side's ndv known, `max(d_L, d_R) >= d_known`, so dividing by
             # the known one over-estimates — the safe direction (over-budget, never OOM).
             selinger = min(left.rows * right.rows / max(ndvs), left.rows * right.rows)
-            return max(selinger, skew)
+            return self._range_scaled(node, left, right, max(selinger, skew))
         # No distinct counts at all: assume the key is ~unique on the smaller side, so the
         # result is ≈ the larger side.
         return max(left.rows, right.rows, skew)
+
+    def _mcv_join_rows(
+        self,
+        node: Join,
+        left: RelStats,
+        right: RelStats,
+        left_ndv: float | None,
+        right_ndv: float | None,
+    ) -> float | None:
+        """The skew+residual decomposition of a single-key equi-join, or None.
+
+        Single-key only: a composite key's *joint* frequency distribution is not measured, and
+        multiplying per-column frequencies would assume an independence the columns of a real
+        composite key never have.
+        """
+        if len(node.left_keys) != 1 or len(node.right_keys) != 1:
+            return None
+        lstat = left.columns.get(node.left_keys[0])
+        rstat = right.columns.get(node.right_keys[0])
+        if lstat is None or rstat is None:
+            return None
+        return mcv_join_rows(
+            left.rows,
+            right.rows,
+            lstat.mcv,
+            rstat.mcv,
+            left_ndv or lstat.ndv,
+            right_ndv or rstat.ndv,
+        )
+
+    def _range_scaled(self, node: Join, left: RelStats, right: RelStats, rows: float) -> float:
+        """Scale a join estimate by how much the two key ranges actually overlap.
+
+        Full disjointness is already special-cased as a provably-empty join. *Partial* overlap
+        is the far more common shape — a three-year fact table joined to a one-year dimension,
+        or either side narrowed by a date predicate — and every estimator above assumes the two
+        key domains coincide. They do not: only the keys inside the intersection of the two
+        `[min, max]` ranges can match, so under uniformity the estimate scales by the smaller
+        side's overlapping fraction.
+
+        Only trusted for ordinal bounds (`_ordinal`-mappable), for the same reason
+        `_join_keys_range_disjoint` is: a string column's footer bounds may be byte-truncated,
+        so an overlap computed from them is not sound. Never scales *up*, and never below the
+        skew floor the measured hot values already prove.
+        """
+        factor = 1.0
+        for lk, rk in zip(node.left_keys, node.right_keys, strict=False):
+            lstat, rstat = left.columns.get(lk), right.columns.get(rk)
+            if lstat is None or rstat is None:
+                continue
+            l_range = _ordinal_range(lstat)
+            r_range = _ordinal_range(rstat)
+            if l_range is None or r_range is None:
+                continue
+            lo, hi = max(l_range[0], r_range[0]), min(l_range[1], r_range[1])
+            # The *narrower* side's overlap fraction is the binding one: whichever key domain
+            # is smaller determines how much of the join can survive.
+            fractions = [
+                f
+                for f in (
+                    _overlap_share(lstat, l_range, lo, hi),
+                    _overlap_share(rstat, r_range, lo, hi),
+                )
+                if f is not None
+            ]
+            if fractions:
+                factor = min(factor, max(fractions))
+        if factor >= 1.0:
+            return rows
+        floor = self._skew_matched_rows(node, left, right)
+        return max(rows * factor, floor)
 
     def _skew_matched_rows(self, node: Join, left: RelStats, right: RelStats) -> float:
         """A lower bound on an equi-join's output from matching heavy-hitter key values.
@@ -976,6 +1097,53 @@ class StatsEstimator:
         return False
 
 
+def _match_fraction(side_ndv: float | None, other_ndv: float | None) -> float:
+    """The fraction of `side`'s rows that find a match, or 1.0 when it cannot be estimated.
+
+    Defaulting to "everything matches" is what keeps an unmeasured outer join at its previous
+    estimate: the unmatched term vanishes and the result falls back to `max(inner, |side|)`.
+    Guessing a match fraction from nothing would invent null-extended rows.
+    """
+    if not side_ndv or not other_ndv or side_ndv <= 0:
+        return 1.0
+    return join_match_fraction(side_ndv, other_ndv)
+
+
+def _overlap_share(
+    stat: ColumnStat, own: tuple[float, float], lo: float, hi: float
+) -> float | None:
+    """The share of one key column that lies inside `[lo, hi]`.
+
+    Measured as **mass** when the column carries a quantile grid — `F(hi) - F(lo)`, the
+    fraction of its rows inside the intersection — and only as a share of the `[min, max]`
+    *width* when it does not.
+
+    The distinction matters exactly where the estimate does. A fact table's date key spanning
+    three years joined to a dimension covering the most recent one overlaps in a third of its
+    *width*, but if the fact table's rows are concentrated in that recent year it overlaps in
+    most of its *mass* — and the width-based factor would then cut the join estimate to a
+    third of the truth. Real key distributions are rarely uniform over their range, which is
+    the whole reason the learning loop measures a quantile grid in the first place.
+    """
+    if hi < lo:
+        return 0.0
+    grid = stat.quantiles
+    if grid:
+        below_hi = _fraction_below_quantiles(hi, grid)
+        below_lo = _fraction_below_quantiles(lo, grid)
+        if below_hi is not None and below_lo is not None:
+            return max(0.0, min(1.0, below_hi - below_lo))
+    return overlap_fraction(own, (lo, hi))
+
+
+def _ordinal_range(stat: ColumnStat) -> tuple[float, float] | None:
+    """A column's `[min, max]` as a pair of ordinals, or None when it is not comparable."""
+    lo, hi = _ordinal(stat.min), _ordinal(stat.max)
+    if lo is None or hi is None or hi < lo:
+        return None
+    return lo, hi
+
+
 def _ndvs(stats: RelStats) -> dict[str, float]:
     """`{column: ndv}` for every column of `stats` whose distinct count is known.
 
@@ -1073,6 +1241,15 @@ def combine_ndv(per_column: Iterable[float], cap: float) -> float:
     sets — they are the same quantity, and estimating them differently made a group-by
     saturate to its input size while the join on the same columns did not.
 
+    One case is not a heuristic at all and is handled exactly: if any single column is
+    already a **key** of the relation — its distinct count reaches the row count — then it
+    functionally determines every other column, so the set has exactly that many distinct
+    combinations. Backoff would instead push the estimate above the row count and let the cap
+    clamp it, which looks identical for the count but hides the certainty; more importantly it
+    is the shape a surrogate-key group-by (`GROUP BY order_id, order_date`) always takes, and
+    the exact answer is what makes the group-by estimate stop depending on the number of
+    incidental columns dragged along with the key.
+
     Args:
         per_column: Each column's distinct count. Non-positive counts are ignored.
         cap: The relation's row count.
@@ -1083,6 +1260,8 @@ def combine_ndv(per_column: Iterable[float], cap: float) -> float:
     ordered = sorted((d for d in per_column if d > 0), reverse=True)
     if not ordered:
         return 1.0
+    if cap > 0 and ordered[0] >= _UNIQUE_KEY_NDV_RATIO * cap:
+        return max(1.0, min(ordered[0], cap))  # a key determines the rest
     combined = 1.0
     exponent = 1.0
     for d in ordered:

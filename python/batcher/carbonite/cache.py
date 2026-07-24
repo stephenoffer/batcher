@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
+from batcher._internal.mathx import safe_div
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import active_config
 
@@ -107,7 +108,7 @@ class CacheStore:
             return {
                 "hits": self._hits,
                 "misses": self._misses,
-                "hit_rate": (self._hits / total) if total else 0.0,
+                "hit_rate": safe_div(self._hits, total),
                 "used_bytes": self._used,
             }
 

@@ -683,7 +683,7 @@ mod tests {
 
         // Partition 1: two batches, multiple columns incl. nullable Utf8.
         let got = client.fetch("p1/s0/0/0").await.unwrap();
-        let expected = vec![batch_a(), batch_a2()];
+        let expected = [batch_a(), batch_a2()];
         assert_eq!(got.len(), expected.len());
         for (g, e) in got.iter().zip(expected.iter()) {
             assert_eq!(g.schema(), e.schema(), "schema preserved");

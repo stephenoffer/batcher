@@ -10,11 +10,10 @@ module without `redis` installed raises a clear error.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 
 from batcher._internal.errors import ConfigError, MissingDependencyError
-from batcher.metadata.store import Key, require_uri
+from batcher.metadata.store import Key, decode_key, encode_key, require_uri
 
 __all__ = ["RedisBackend"]
 
@@ -22,10 +21,6 @@ __all__ = ["RedisBackend"]
 #: answers a wrong scheme with an opaque failure, and because the mistake a user
 #: actually makes — a bare ``host:port`` — is one this can name precisely.
 _SCHEMES = ("redis://", "rediss://", "unix://")
-
-
-def _encode_key(key: Key) -> str:
-    return json.dumps(list(key), separators=(",", ":"))
 
 
 class RedisBackend:
@@ -69,20 +64,20 @@ class RedisBackend:
         return f"{self._ns}:{table}"
 
     def get(self, table: str, key: Key) -> bytes | None:
-        return self._redis.hget(self._hash(table), _encode_key(key))
+        return self._redis.hget(self._hash(table), encode_key(key))
 
     def put(self, table: str, key: Key, value: bytes) -> None:
-        self._redis.hset(self._hash(table), _encode_key(key), value)
+        self._redis.hset(self._hash(table), encode_key(key), value)
 
     def scan(self, table: str, prefix: Key = ()) -> Iterator[tuple[Key, bytes]]:
         plen = len(prefix)
         for field, value in self._redis.hscan_iter(self._hash(table)):
-            key = tuple(json.loads(field))
+            key = decode_key(field)
             if key[:plen] == prefix:
                 yield key, value
 
     def batch_put(self, table: str, items: list[tuple[Key, bytes]]) -> None:
         if not items:
             return
-        mapping = {_encode_key(k): v for k, v in items}
+        mapping = {encode_key(k): v for k, v in items}
         self._redis.hset(self._hash(table), mapping=mapping)

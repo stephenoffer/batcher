@@ -99,7 +99,8 @@ var document = {
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
   addEventListener() {},
 };
-var window = { matchMedia: () => ({ matches: false }), innerWidth: 1400, innerHeight: 900, addEventListener() {} };
+var window = { matchMedia: () => ({ matches: false }), innerWidth: 1400, innerHeight: 900,
+               scrollY: 0, scrollTo() {}, addEventListener() {} };
 var location = { hash: '', href: 'http://x/' };
 var history = { replaceState() {} };
 var localStorage = { getItem: () => null, setItem() {} };

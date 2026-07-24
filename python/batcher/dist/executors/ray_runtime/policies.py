@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 from collections import deque
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
 # Fallback in-flight cap for the map submission window when the live cluster size is
@@ -153,8 +154,8 @@ def _learned_straggler_factor(default: float) -> float:
             learned = learned_straggler_factor(default_hub(), family)
             if learned is not None:
                 return learned
-    except Exception:  # pragma: no cover - learning is best-effort
-        pass
+    except Exception as exc:  # pragma: no cover - learning is best-effort
+        note_suppressed("dist", "read learned straggler factor", exc)
     return default
 
 

@@ -50,6 +50,9 @@ def _sort_survives(dataset) -> bool:
 
 @pytest.mark.differential
 def test_array_agg_keeps_its_sort(data, duck):
+    # Order-independent on purpose. The `GROUP BY` discards the sort's *row* order, so what
+    # is under test is the order *inside* each group's list — which the value comparison
+    # checks element by element. Pinning the row order too would only make the test brittle.
     got = data.sort("x").group_by("g").agg(l=col("x").array_agg()).collect()
     assert_same(got, duck.sql("select g, list(x order by x) as l from t group by g"))
 
@@ -76,6 +79,9 @@ def test_mixed_aggregates_keep_the_sort_when_any_is_order_sensitive(data):
 @pytest.mark.differential
 def test_top_n_sort_is_never_eliminated(data, duck):
     # A `Sort` carrying a limit changes *which* rows are aggregated, not just their order.
+    # Compared order-independently on purpose: the `GROUP BY` above discards the sort's
+    # ordering, so what is under test is *which* three rows survived the limit, not the
+    # order the groups come back in.
     got = data.sort("x", descending=True).limit(3).group_by("g").agg(s=col("x").sum()).collect()
     assert_same(
         got,

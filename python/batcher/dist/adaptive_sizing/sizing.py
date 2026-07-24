@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
 if TYPE_CHECKING:
@@ -77,7 +78,8 @@ def _ema(hub: MetadataHub, namespace: str, key: str, value: float) -> None:
         a = _alpha()
         ema = float(value) if prior is None else a * float(value) + (1.0 - a) * float(prior)
         hub.put_keyed_param(namespace, key, {"ema": ema, "n": int(s.get("n", 0)) + 1})
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("dist", "fold sizing ema", exc)
         return
 
 

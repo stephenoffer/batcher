@@ -53,6 +53,34 @@ const REFERENCE = (() => {
       why: 'It decides join order, which filters run early, and which columns are read at all. Its choices show up in the Decisions panel.',
       see: ['plan', 'cardinality estimate'],
     },
+    explain: {
+      what: 'The plan written out as a text tree, with each step nested inside the one it feeds.',
+      why: 'Every SQL engine ships one and it is the form that pastes into an issue and searches with the browser. The graph shows a plan\u2019s shape; the tree shows what is nested inside what.',
+      fix: 'Open a run and go to Query. Tick \u201cShow the plan as written\u201d to see it before the optimizer touched it.',
+      see: ['plan', 'logical plan', 'optimizer'],
+    },
+    'plan diff': {
+      what: 'The plan you wrote compared against the plan that actually ran.',
+      why: 'It is the only view that shows what the optimizer contributed. One rewrite \u2014 a pushdown, say \u2014 moves one step and drags every step it passed into a new position, so the move that caused it is reported as the finding and the rest as its consequences.',
+      fix: 'Open a run, go to Query, then \u201cWhat the optimizer changed\u201d.',
+      see: ['optimizer', 'predicate pushdown', 'logical plan'],
+    },
+    'flame graph': {
+      what: 'Every step drawn as a block whose width is the time it took, stacked by how deep it sits in the plan.',
+      why: 'A ranked list loses the structure and a graph loses the cost; this shows both at once. A parent block is deliberately not the sum of its children, because steps run at the same time and stacking them would invent a total larger than the query took.',
+      see: ['operator time', 'critical path'],
+    },
+    'data starvation': {
+      what: 'A worker sitting idle because nothing has arrived for it to process.',
+      why: 'On the Live page it shows as a device swinging between idle and saturated rather than holding a steady load. The two average to the same number and need opposite fixes: a starved device is waiting on reading, decoding, or shuffling, so a bigger batch or a faster device changes nothing.',
+      fix: 'Widen the read parallelism or move decode work off the critical path before touching the model or the batch size.',
+      see: ['blocked time', 'backpressure'],
+    },
+    'blocked time': {
+      what: 'Time a worker spent waiting for its next input rather than computing.',
+      why: 'The single clearest signal that the bottleneck is upstream of the expensive part. Rising blocked time means the pipeline cannot keep the workers fed.',
+      see: ['data starvation', 'backpressure', 'flow control'],
+    },
     'critical path': {
       what: 'The chain of steps that feed one another from the start of the query to its end.',
       why: 'Its total is the floor on how fast the query can possibly be. Speeding up a step that is not on it changes the total by nothing at all.',
@@ -575,10 +603,33 @@ const REFERENCE = (() => {
    * slow"), not with a term, so the reference has to be reachable from that direction too. */
 
   const RECIPES = [
+    { task: 'See what the optimizer did to my query',
+      steps: ['Open a run and go to the Query tab.',
+              'Choose \u201cWhat the optimizer changed\u201d.',
+              'The finding at the top is the rewrite; the fold below it is every step that rewrite moved past.',
+              'If it says the original plan was not recorded, that is not the same as \u201cnothing changed\u201d.'] },
+    { task: 'Read the plan as text, the way EXPLAIN shows it',
+      steps: ['Open a run, go to Query, and stay on Explain.',
+              'Tick \u201cShow the plan as written\u201d for the plan before optimization.',
+              'Use \u201cCopy as text\u201d to paste the whole tree into an issue.',
+              'Press x from anywhere in a run to jump straight here.'] },
+    { task: 'Watch a long job while it runs',
+      steps: ['Open the Live tab, or press g then r.',
+              'Partition progress shows a percentage only where the engine reports a total.',
+              'GPU gauges carry their target bands, so a reading says whether it is good without you knowing the bands.',
+              'Check blocked time: if it is high, the bottleneck is upstream of the model.'] },
+    { task: 'Find out whether rows were silently dropped',
+      steps: ['Open the Live tab while the job runs.',
+              'Any rows skipped under on_read_error="skip" are reported with their reason.',
+              'This is the one failure mode that leaves no error behind, so it is worth looking for deliberately.'] },
+    { task: 'Scrape the engine into Prometheus',
+      steps: ['Start the dashboard with bt.start_ui().',
+              'Point your scraper at /metrics on its port.',
+              'The same numbers are at /api/metrics as JSON, and /api lists every route.'] },
     { task: 'Find out why one run was slow',
       steps: ['Open the pipeline, then the run.',
               'Read the verdict sentence at the top — it names the slowest step.',
-              'Open the Plan tab and look at the step with the longest bar.',
+              'Open the Steps tab and look at the step with the longest bar.',
               'Click that step: the inspector explains what it does and why it may be slow.'] },
     { task: 'Tell a regression from a naturally slow query',
       steps: ['Open the pipeline and look at the run history chart.',
@@ -588,7 +639,7 @@ const REFERENCE = (() => {
     { task: 'Work out whether a query is memory-bound',
       steps: ['Check the Spilled tile on the run.',
               'Anything above zero means it ran out of memory somewhere.',
-              'In the Plan tab, spilling steps are outlined and flagged.',
+              'In the Steps tab, spilling steps are outlined and flagged.',
               'Filter earlier, carry fewer columns, or raise the budget.'] },
     { task: 'Check whether cores are being used',
       steps: ['Compare Parallelism against your core count.',
@@ -694,6 +745,62 @@ const REFERENCE = (() => {
               'The link reopens the same pipeline, run, and tab.'] },
   ];
 
+  /* ═══════════ coming from another engine ═══════════
+   *
+   * Almost nobody arrives here without having read a Spark UI, an Airflow grid, a DuckDB
+   * EXPLAIN, or a Ray dashboard first, and the fastest way to make a new tool legible is to
+   * say which familiar thing each part of it *is*. This maps the panel a reader knows to
+   * the panel here.
+   *
+   * Two rules for anything added below. **Only describe features of the other tool that are
+   * long-standing and easily checked** — a Spark UI tab, an Airflow view, a documented
+   * command. And **never claim Batcher is faster, or better, here**: this is a map for
+   * finding your way around, not a scoreboard. The code-checked competitive comparison lives
+   * in `docs/internals/competitive_architecture.md`, and it is the only place that decides
+   * what Batcher may claim.
+   */
+  const COMPARISONS = [
+    { tool: 'Apache Spark',
+      familiar: 'The Spark UI — Jobs, Stages, SQL/DataFrame, Executors, Storage.',
+      rows: [
+        ['Stages tab', 'A run’s Steps view, switched to Stages. A stage here is the work between two pipeline breakers, which is the same idea Spark shuffles at.'],
+        ['SQL / DataFrame tab', 'The Query tab: Explain for the plan tree, and the optimizer diff for what Catalyst’s equivalent did to it.'],
+        ['Executors tab', 'The System page. Batcher is one process by default, so this reports the machine rather than a list of executors.'],
+        ['Event timeline', 'Not offered. The engine records how long each operator took, not when it started, so a timeline placed on a clock would be invented rather than measured.'],
+      ] },
+    { tool: 'Apache Airflow',
+      familiar: 'The Grid, Graph, and Gantt views over DAG runs.',
+      rows: [
+        ['Grid view', 'The Step history matrix on a pipeline page — one column per run, one row per step, shaded against that step’s own median.'],
+        ['Graph view', 'The Plan graph. The difference: Airflow’s nodes are tasks you wrote, these are operators the optimizer chose.'],
+        ['DAG runs list', 'The Runs table on a pipeline page.'],
+        ['Gantt view', 'Not offered, for the same reason as Spark’s event timeline — no measured start offsets. The Stages view answers the underlying question of what ran together.'],
+      ] },
+    { tool: 'Ray Data',
+      familiar: 'The Ray dashboard’s per-operator progress and resource panels.',
+      rows: [
+        ['Operator progress', 'The Live page: partitions finished per stage, with a real denominator where the engine reports one.'],
+        ['Resource usage', 'The Live page’s accelerator gauges, plus the System page for the host.'],
+        ['Backpressure', 'The blocked-time reading on the Live page. Rising blocked time means the workers are outrunning the pipeline feeding them.'],
+        ['Object store', 'Nothing to show. Batcher’s bulk data moves over Arrow Flight, deliberately bypassing the Ray object store.'],
+      ] },
+    { tool: 'DuckDB',
+      familiar: 'EXPLAIN and EXPLAIN ANALYZE at the SQL prompt.',
+      rows: [
+        ['EXPLAIN', 'The Query tab, Explain, with "Show the plan as written" ticked.'],
+        ['EXPLAIN ANALYZE', 'The Query tab, Explain, as it renders by default — the plan that ran, annotated with each step’s measured time and rows.'],
+        ['The profiling tree', 'The same view, or the Flame rendering under Steps if you would rather see the cost distribution than the nesting.'],
+      ] },
+    { tool: 'Polars',
+      familiar: '`.explain()`, `.profile()`, and the optimization flags on `collect()`.',
+      rows: [
+        ['explain(optimized=False)', 'The Query tab, Explain, showing the plan as written.'],
+        ['explain()', 'The Query tab, Explain, showing the plan as run.'],
+        ['profile()', 'The Steps view, in any of its five renderings.'],
+        ['Which optimizations fired', 'The optimizer diff — the panel with no direct equivalent elsewhere, because it shows the two plans against each other rather than one at a time.'],
+      ] },
+  ];
+
   const termKeys = Object.keys(TERMS).sort();
   /* A cross-reference resolves to a glossary term *or* an operator.
    *
@@ -739,8 +846,17 @@ const REFERENCE = (() => {
         hits.push({ kind: 'recipe', key: recipe.task, label: recipe.task, blurb: recipe.steps[0] });
       }
     }
+    // Someone typing "spark" or "airflow" is asking where the thing they know lives here,
+    // which is a question this reference can answer directly.
+    for (const entry of COMPARISONS) {
+      if (entry.tool.toLowerCase().includes(q) || entry.familiar.toLowerCase().includes(q)) {
+        hits.push({ kind: 'comparison', key: entry.tool,
+                    label: `Coming from ${entry.tool}`, blurb: entry.familiar });
+      }
+    }
     return hits.slice(0, 24);
   }
 
-  return { TERMS, OPERATORS, METRICS, RECIPES, termKeys, lookup, operator, metric, search };
+  return { TERMS, OPERATORS, METRICS, RECIPES, COMPARISONS, termKeys, lookup, operator,
+           metric, search };
 })();

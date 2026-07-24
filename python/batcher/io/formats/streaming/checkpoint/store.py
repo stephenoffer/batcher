@@ -59,6 +59,17 @@ class CheckpointStore:
         """
         self.state.prune(keep_through)
 
+    def prune_logs(self, keep_through: int) -> None:
+        """Bound the offset and commit logs by dropping batches before `keep_through`.
+
+        Recovery only ever consults the last committed batch's offsets and the commit-log
+        maximum, so rows before `keep_through` (the last committed batch) are dead weight.
+        Called after every commit, this keeps ``offsets.sqlite`` / ``commits.sqlite`` from
+        growing one row per micro-batch forever on a long-running stream.
+        """
+        self.offsets.prune(keep_through)
+        self.commits.prune(keep_through)
+
     def close(self) -> None:
         self.offsets.close()
         self.commits.close()

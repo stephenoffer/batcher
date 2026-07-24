@@ -34,7 +34,8 @@ __all__ = ["size_gpu_map_batches"]
 )
 def size_gpu_map_batches(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan | None:
     """Fill `num_gpus` / `batch_size` on an accelerator `map_batches` from its model footprint."""
-    assert isinstance(node, MapBatches)
+    if not isinstance(node, MapBatches):
+        return None  # the registry dispatches by node type; decline anything else
     if node.model_memory_gb <= 0.0:
         return None  # not a declared accelerator model → nothing to size
     if node.num_gpus > 0.0 and node.batch_size is not None:

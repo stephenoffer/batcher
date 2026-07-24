@@ -583,3 +583,147 @@ def test_resilient_call_reports_nothing_when_no_row_is_dropped() -> None:
     assert [v for b in out for v in b.column("x").to_pylist()] == list(range(8))
     assert budget == [4]
     assert not [e for e in seen if e.fields.get("dropped_rows")]
+
+
+def test_split_feed_passes_broadcast_inputs_through_whole():
+    """A shared (1, ...) input must not be sliced to empty on sub-batches after the first."""
+    from batcher.ml.serving.base import _split_feed
+
+    per_row = np.arange(4).reshape(4, 1)
+    shared = np.array([[7.0, 8.0]])  # one row, broadcast to the whole batch
+    parts = _split_feed({"x": per_row, "cfg": shared}, num_rows=4, max_batch_size=2)
+    assert len(parts) == 2
+    for part in parts:
+        assert part["cfg"].shape == (1, 2)  # never emptied
+    assert parts[0]["x"].tolist() == [[0], [1]]
+    assert parts[1]["x"].tolist() == [[2], [3]]
+
+
+def test_merge_results_handles_scalar_per_subbatch_outputs():
+    """A 0-d per-sub-batch output concatenates instead of raising."""
+    from batcher.ml.serving.base import _merge_results
+
+    parts = [{"summary": np.array(1.5)}, {"summary": np.array(2.5)}]
+    merged = _merge_results(parts)
+    assert merged["summary"].tolist() == [1.5, 2.5]
+
+
+def test_tensor_envelope_detection_ignores_a_lookalike_dict():
+    """A model output dict with dtype/shape/data keys but non-envelope value types is not
+    decoded as a tensor."""
+    from batcher.ml.serving.http import _decode_value, _is_tensor_envelope
+
+    lookalike = {"dtype": {"kind": "f"}, "shape": "big", "data": [1, 2, 3]}
+    assert not _is_tensor_envelope(lookalike)
+    # A real marker-carrying envelope is still detected.
+    import base64
+
+    real = {
+        "__tensor__": True,
+        "dtype": "<f4",
+        "shape": [2],
+        "data": base64.b64encode(np.array([1.0, 2.0], dtype="<f4").tobytes()).decode(),
+    }
+    assert _is_tensor_envelope(real)
+    assert _decode_value(real).tolist() == [1.0, 2.0]
+
+
+def test_post_json_wraps_a_non_json_body():
+    """A 200 with an HTML/proxy body raises BackendError, not an opaque JSONDecodeError."""
+    import batcher.ml.serving.http as http_mod
+    from batcher._internal.errors import BackendError
+
+    class _Resp:
+        def read(self):
+            return b"<html>502 Bad Gateway</html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    real = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=None: _Resp()
+    try:
+        with __import__("pytest").raises(BackendError, match="non-JSON"):
+            http_mod.post_json("http://x", {"a": 1}, headers={}, timeout=1, retries=0)
+    finally:
+        urllib.request.urlopen = real
+
+
+def test_triton_client_passes_a_request_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`timeout=` reaches the Triton `infer` call as `client_timeout`, so a wedged replica
+    aborts and is retried rather than blocking the worker forever."""
+    seen: dict[str, Any] = {}
+
+    class _InferInput:
+        def __init__(self, name: str, shape: list[int], dtype: str) -> None:
+            self.name = name
+
+        def set_data_from_numpy(self, arr: np.ndarray) -> None:
+            pass
+
+    class _Requested:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _Result:
+        def as_numpy(self, name: str) -> np.ndarray:
+            return np.array([1, 2])
+
+    class _Server:
+        def __init__(self, url: str) -> None:
+            pass
+
+        def is_model_ready(self, model: str, model_version: str = "") -> bool:
+            return True
+
+        def infer(self, *a: Any, **k: Any) -> _Result:
+            seen["client_timeout"] = k.get("client_timeout")
+            return _Result()
+
+    fake = types.ModuleType("tritonclient.http")
+    fake.InferInput = _InferInput  # type: ignore[attr-defined]
+    fake.InferRequestedOutput = _Requested  # type: ignore[attr-defined]
+    fake.InferenceServerClient = _Server  # type: ignore[attr-defined]
+    pkg = types.ModuleType("tritonclient")
+    pkg.http = fake  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tritonclient", pkg)
+    monkeypatch.setitem(sys.modules, "tritonclient.http", fake)
+
+    from batcher.ml.serving.triton import triton_client
+
+    udf = triton_client(
+        "localhost:8000", "m", input_columns=["x"], output_columns=["out"], timeout=5.0
+    )()
+    udf(_batch(2))
+    assert seen["client_timeout"] == 5.0
+
+
+def test_serving_rejects_a_non_numeric_input_column_by_name():
+    """A string input column fails with an actionable, column-named error instead of an
+    opaque triton dtype error or base64 garbage."""
+    from batcher._internal.errors import BackendError
+    from batcher.ml.serving.base import serving_udf
+
+    class _Client:
+        def predict(self, inputs):
+            return {"out": np.array([1])}
+
+    udf = serving_udf(lambda: _Client(), input_columns=["text"], output_columns=["out"])()
+    batch = pa.record_batch({"text": ["a", "b"]})
+    with pytest.raises(BackendError, match="text"):
+        udf(batch)
+
+
+def test_serving_accepts_a_numeric_input_column():
+    from batcher.ml.serving.base import serving_udf
+
+    class _Client:
+        def predict(self, inputs):
+            return {"out": inputs["x"] * 2}
+
+    udf = serving_udf(lambda: _Client(), input_columns=["x"], output_columns=["out"])()
+    out = udf(pa.record_batch({"x": [1, 2, 3]}))
+    assert out.column("out").to_pylist() == [2, 4, 6]

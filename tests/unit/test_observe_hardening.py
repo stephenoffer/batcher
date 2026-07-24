@@ -242,7 +242,9 @@ def test_ascii_stream_never_emits_a_character_it_cannot_encode(bus):
     reporter.handle(
         events.Event(events.QUERY_END, 2.0, 2.0, "q", "", {"ok": True, "rows": 5, "total_ms": 3.0})
     )
-    stream.getvalue().encode("ascii")  # raises if a non-ASCII glyph leaked through
+    written = stream.getvalue()
+    assert written  # the reporter did emit something to encode
+    written.encode("ascii")  # raises if a non-ASCII glyph leaked through
 
 
 def test_a_very_long_label_cannot_break_the_column_layout(bus):

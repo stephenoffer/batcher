@@ -71,6 +71,36 @@ def test_dedup_bounded_source_is_exact_distinct():
 
 
 @pytest.mark.integration
+def test_dedup_null_event_time_no_duplicate():
+    # A row whose event-time column is null belongs to no watermark window. Such a row
+    # must not corrupt dedup: previously the null-ts key entered the seen set, was
+    # evicted on the very next batch (a null fails the `>= watermark` keep filter), and
+    # a later real occurrence of that key was then re-emitted as new — a duplicate.
+    null_ts_batch = pa.RecordBatch.from_pydict(
+        {
+            "k": ["a", "b", "a"],
+            "ts": [_BASE, None, _BASE + dt.timedelta(minutes=2)],
+            "v": [1, 2, 3],
+        },
+        schema=_SCHEMA,
+    )
+
+    def batches():
+        yield null_ts_batch  # 'b' has a null event time
+        yield _rb([("b", 5, 4)])  # a real 'b' arrives later
+
+    ds = bt.from_batches(batches, _SCHEMA, bounded=False).drop_duplicates_within_watermark(
+        ["k"], event_time="ts", lateness="1h"
+    )
+    out = pa.Table.from_batches(list(ds.iter_batches()))
+    got = sorted(zip(out.column("k").to_pylist(), out.column("v").to_pylist(), strict=True))
+    # 'b' is emitted exactly once: the null-ts row is dropped (no window), and b@5 is its
+    # single kept occurrence. 'a' keeps its first occurrence. No key appears twice.
+    assert got == [("a", 1), ("b", 4)]
+    assert len(out.column("k").to_pylist()) == len(set(out.column("k").to_pylist()))
+
+
+@pytest.mark.integration
 def test_dedup_state_cap_fails_loudly():
     # A tiny `streaming_state_max_bytes` with a long lateness (watermark never evicts
     # keys) makes the seen-key state exceed the cap, so dedup raises a clear

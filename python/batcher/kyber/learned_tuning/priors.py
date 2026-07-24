@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber import plan_cache
 
@@ -65,8 +66,8 @@ def _record_scalar(
         entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
         plan_cache.record_write(hub, namespace, key, entry)
-    except Exception:  # pragma: no cover
-        return
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "record scalar prior", exc)
 
 
 def record_join_sides(
@@ -83,8 +84,8 @@ def record_join_sides(
             entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
         plan_cache.record_write(hub, _NS_SIDES, signature, entry)
-    except Exception:  # pragma: no cover
-        return
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "record join sides", exc)
 
 
 def learned_build_sides(hub: MetadataHub | None, signature: str) -> tuple[float, float] | None:
@@ -102,7 +103,8 @@ def learned_build_sides(hub: MetadataHub | None, signature: str) -> tuple[float,
         if left is None or right is None:
             return None
         return float(left), float(right)
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "read join sides", exc)
         return None
 
 
@@ -128,7 +130,8 @@ def learned_partition_count(
         if rows is None or float(rows) <= 0.0:
             return None
         return max(1, math.ceil(float(rows) / target_rows))
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "read partition rows", exc)
         return None
 
 
@@ -157,7 +160,8 @@ def learned_partial_agg(
         entry = hub.get_keyed_param(_NS_GROUP, signature) or {}
         ratio = entry.get("ratio")
         return None if ratio is None else float(ratio) <= engage_below
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "read group reduction", exc)
         return None
 
 
@@ -177,7 +181,8 @@ def learned_signature_rows(hub: MetadataHub | None, signature: str) -> float | N
 
         rows = load_learned_stats(hub).get(signature, {}).get("rows")
         return float(rows) if rows is not None else None
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "read signature rows", exc)
         return None
 
 
@@ -190,8 +195,8 @@ def record_adaptive_flip(hub: MetadataHub | None, signature: str, flipped: bool)
         entry["flips"] = int(entry.get("flips", 0)) + (1 if flipped else 0)
         entry["total"] = int(entry.get("total", 0)) + 1
         plan_cache.record_write(hub, _NS_ADAPT, signature, entry)
-    except Exception:  # pragma: no cover
-        return
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "record adaptive flip", exc)
 
 
 def learned_adaptive_helps(
@@ -213,5 +218,6 @@ def learned_adaptive_helps(
         if total < min_total:
             return False
         return int(entry.get("flips", 0)) / total >= threshold
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - best-effort learned prior
+        note_suppressed("kyber", "read adaptive flip", exc)
         return False

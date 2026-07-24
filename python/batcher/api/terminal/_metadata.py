@@ -17,7 +17,7 @@ import random
 
 import pyarrow as pa
 
-from batcher._internal.logging import get_logger
+from batcher._internal.logging import get_logger, note_suppressed
 from batcher.config import active_config
 from batcher.io.source import Source, iter_source
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
@@ -141,8 +141,8 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
                 keep.append(src)
         if sampled:
             learn_column_stats(hub, sampled, keep)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - learning must never break execution
+        note_suppressed("api", "learn column statistics", exc)
 
 
 def ndv_columns(plan: LogicalPlan) -> set[str]:
@@ -246,8 +246,8 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
             ndv = core.column_ndv(src.read(projection=cols), cols)
             if ndv:
                 kyber.record_column_stats(hub, ndv, {}, source_key=source_key)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - learning must never break execution
+        note_suppressed("api", "learn column NDV", exc)
 
 
 def learnable_columns(plan: LogicalPlan) -> set[str]:

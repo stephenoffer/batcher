@@ -28,12 +28,18 @@ def video_dataset(
     output_column: str = "frames",
     seek: bool = False,
     decode_concurrency: int = 4,
+    error_column: str | None = None,
 ) -> Dataset:
     """Decode a video-bytes column into a ``(num_frames, H, W, 3)`` uint8 tensor column.
 
     Samples `num_frames` evenly-spaced frames and resizes each to `size` via `PyAV`
     (``batcher-engine[video]``). Fixed frame count and size make the result a fixed-shape
     uint8 tensor, ready for a video model; undecodable rows become all-zero frames.
+
+    A clip that fails to decode is indistinguishable from a legitimately black one — both
+    are all-zero frames — which silently injects black samples into a training set. Set
+    `error_column` to append a boolean column that is ``True`` exactly for the rows whose
+    bytes were present but would not decode, so those rows can be counted and filtered out.
 
     **A clip is decoded in Python, one clip at a time.** That is a loop in the control
     plane, and it is unavoidable rather than fixed: PyAV exposes no batch API, and each
@@ -67,16 +73,26 @@ def video_dataset(
 
         src = batch.column(source_column)
         flat = np.zeros((batch.num_rows, per_row), dtype=np.uint8)
+        # A row failed only if its bytes were present (`is_valid`) yet decoded to nothing —
+        # a null-input row is not a failure. The validity bits are cheap (no bytes copied).
+        valid = src.is_valid().to_numpy(zero_copy_only=False) if error_column else None
+        failed = np.zeros(batch.num_rows, dtype=bool) if error_column else None
         # Materialize clip bytes lazily per row rather than via `.to_pylist()`, so at most
         # `decode_concurrency` clips are resident instead of the whole batch.
         clips = (s.as_py() if s.is_valid else None for s in src)
         for i, frames in enumerate(_bounded_map(_one, clips, max(decode_concurrency, 1))):
             if frames is not None:
                 flat[i] = frames.reshape(-1)
+            elif error_column and valid[i]:
+                failed[i] = True
         storage = pa.FixedSizeListArray.from_arrays(pa.array(flat.reshape(-1)), per_row)
-        return batch.append_column(output_column, as_tensor_column(storage, shape))
+        out = batch.append_column(output_column, as_tensor_column(storage, shape))
+        if error_column:
+            out = out.append_column(error_column, pa.array(failed))
+        return out
 
-    return ds.map_batches(_decode, output_columns=[*list(ds.columns), output_column])
+    appended = [output_column, *([error_column] if error_column else [])]
+    return ds.map_batches(_decode, output_columns=[*list(ds.columns), *appended])
 
 
 def _decode_video_bytes(

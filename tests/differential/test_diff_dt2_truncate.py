@@ -4,7 +4,7 @@ Wave-1 shipped `date_trunc` with only year/month/day/hour/minute/second; the
 calendar units DuckDB also supports (quarter, week, decade, century, millennium)
 and the sub-second units (millisecond, microsecond) errored instead of computing.
 These cases pin the full unit vocabulary, including pre-1970 instants where the
-truncation must floor toward −∞ (not toward zero).
+truncation must floor toward negative infinity (not toward zero).
 """
 
 from __future__ import annotations

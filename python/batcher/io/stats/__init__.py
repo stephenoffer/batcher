@@ -8,7 +8,8 @@ One module per metadata family, each a pure extraction function a connector's
   - `pruning`           : per-row-group zone-map bounds for file/row-group pruning
   - `lakehouse_manifest`: Delta/Iceberg manifest record counts + column bounds
   - `free_counts`       : NumPy ``.npy`` header row counts
-  - `sql_catalog`       : SQL warehouse system-catalog row counts
+  - `sql_catalog`       : SQL warehouse system-catalog row counts, byte size, and
+                          per-column null/ndv/mcv/quantile statistics
 
 These read footers/manifests/headers/catalogs — O(1) control-plane metadata I/O,
 never a per-row scan. The neutral `SourceStatistics` they return lives in
@@ -26,16 +27,26 @@ from batcher.io.stats.pruning import (
     parquet_row_group_bounds,
     surviving_rows_for_range,
 )
-from batcher.io.stats.sql_catalog import catalog_row_count
+from batcher.io.stats.sql_catalog import (
+    catalog_byte_size,
+    catalog_column_stats,
+    catalog_row_count,
+    dialect_for_driver,
+    sql_statistics,
+)
 
 __all__ = [
     "RowGroupBounds",
+    "catalog_byte_size",
+    "catalog_column_stats",
     "catalog_row_count",
+    "dialect_for_driver",
     "manifest_statistics",
     "numpy_statistics",
     "orc_statistics",
     "parquet_file_manifest",
     "parquet_row_group_bounds",
     "parquet_statistics",
+    "sql_statistics",
     "surviving_rows_for_range",
 ]

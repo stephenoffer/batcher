@@ -8,16 +8,27 @@ O(whole dataset) on the driver.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from batcher.io.base._paths import hive_segment
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
 
+if TYPE_CHECKING:
+    from batcher.plan.source_stats import SourceStatistics
+
 __all__ = ["ParquetDatasetSource", "ParquetFragmentSplit", "PartitionDirSplit"]
+
+# File count past which the driver stops sweeping every footer to build full statistics.
+# Mirrors `FileSource`'s `_MAX_FOOTER_PLAN_FILES` (same env var): a footer sweep is O(files)
+# object-store round trips on the driver, a good trade at hundreds of files and a
+# catastrophic one at millions. Above it, the cheap exact `row_count()` still answers.
+_MAX_FOOTER_PLAN_FILES = max(1, int(os.environ.get("BATCHER_MAX_FOOTER_PLAN_FILES", "10000")))
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,13 +193,10 @@ class PartitionDirSplit:
         return f"parquet_dataset:{self.subdir}"
 
 
-def _hive_segment(name: str) -> tuple[str, str] | None:
-    """Parse a ``col=val`` directory basename, or None if it isn't one."""
-    base = name.rstrip("/").rsplit("/", 1)[-1]
-    if "=" not in base:
-        return None
-    col, _, val = base.partition("=")
-    return (col, val) if col else None
+#: What counts as a partition directory, shared with `FileSource` so the reader that
+#: *recovers* partition columns and the reader that must warn it is *dropping* them
+#: cannot disagree about which layouts are partitioned.
+_hive_segment = hive_segment
 
 
 @SOURCES.register("parquet_dataset")
@@ -245,6 +253,54 @@ class ParquetDatasetSource:
 
     def row_count(self) -> int | None:
         return self._dataset().count_rows()
+
+    def statistics(self) -> SourceStatistics | None:
+        """Full footer statistics for the partitioned tree — the same the flat reader gives.
+
+        The partitioned reader is the PB-scale path, yet it surfaced only an exact row count
+        while the flat `ParquetSource` mined the footers for per-column min/max/null counts,
+        on-disk byte size, row-group count, and proven global sortedness. This closes that
+        gap: it runs the *same* `parquet_statistics` extractor over the dataset's data files,
+        so Kyber prunes partitions, sizes joins, and answers ``MIN``/``MAX``/``null_count``
+        on a Hive tree exactly as it does on a single directory.
+
+        The Hive partition columns live in the directory names rather than the file footers,
+        so they carry no column bounds here but are recorded in `partition_keys` — which is
+        what partition pruning keys on. Above `_MAX_FOOTER_PLAN_FILES` the footer sweep is
+        skipped (the driver would stall reading millions of footers); the exact
+        `row_count()` still answers. Best-effort — any footer failure yields None.
+        """
+        from batcher.io.filesystem import resolve_filesystem
+        from batcher.io.stats import parquet_statistics
+
+        try:
+            dataset = self._dataset()
+            files = [frag.path for frag in dataset.get_fragments()]
+        except Exception:
+            return None
+        if not files or len(files) > _MAX_FOOTER_PLAN_FILES:
+            return None
+        try:
+            stats = parquet_statistics(resolve_filesystem(self._path), files, dataset.schema)
+        except Exception:
+            return None
+        if stats is None:
+            return None
+        part_keys = self._partition_key_names(dataset)
+        if not part_keys:
+            return stats
+        import dataclasses
+
+        return dataclasses.replace(stats, partition_keys=part_keys)
+
+    @staticmethod
+    def _partition_key_names(dataset: Any) -> tuple[str, ...]:
+        """The Hive partition column names, from the dataset's partitioning schema."""
+        try:
+            schema = getattr(dataset.partitioning, "schema", None)
+            return tuple(schema.names) if schema is not None else ()
+        except Exception:
+            return ()
 
     def identity(self) -> str:
         return f"parquet_dataset:{self._path}"

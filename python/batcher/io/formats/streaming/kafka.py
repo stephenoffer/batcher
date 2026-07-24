@@ -57,7 +57,7 @@ class KafkaSource(BrokerSource):
 
     format_name = "kafka"
 
-    __slots__ = ("_consumer", "_partitions")
+    __slots__ = ("_consumer", "_partitions", "_poll_timeout")
 
     def __init__(
         self,
@@ -67,6 +67,7 @@ class KafkaSource(BrokerSource):
         partitions: list[int] | None = None,
         bootstrap_servers: str = "localhost:9092",
         group: str = "batcher",
+        poll_timeout: float = 1.0,
         **options: Any,
     ) -> None:
         super().__init__(
@@ -78,6 +79,11 @@ class KafkaSource(BrokerSource):
         )
         self._partitions = partitions
         self._consumer: Any = None
+        # How long a single `consume()` blocks waiting for a full poll. It bounds the
+        # micro-batch loop's stop latency (a `stop()` is observed only between polls) and
+        # trades latency against poll efficiency; kept out of `options` so it never leaks
+        # into the confluent-kafka config as a bogus `poll.timeout` key.
+        self._poll_timeout = poll_timeout
 
     def _client(self) -> Any:
         """Lazily construct and subscribe the underlying consumer."""
@@ -150,7 +156,7 @@ class KafkaSource(BrokerSource):
         # let alone published, this batch yet. `BrokerSource.iter_batches` calls
         # `_commit_delivered` once the epoch is published — the only correct moment.
         consumer = self._client()
-        records = consumer.consume(num_messages=self.poll_size, timeout=1.0)
+        records = consumer.consume(num_messages=self.poll_size, timeout=self._poll_timeout)
         return [
             BrokerMessage(
                 value=rec.value() or b"",

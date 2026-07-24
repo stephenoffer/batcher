@@ -157,7 +157,7 @@ def _measured_as_non_reducing(ctx: OptimizerContext, node: Aggregate) -> bool:
 
 
 @rule(name="count_distinct_to_distinct_count", phase=Phase.REWRITE, matches=(Aggregate,))
-def count_distinct_to_distinct_count(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
+def count_distinct_to_distinct_count(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a lone ``COUNT(DISTINCT x)`` group-by into a distinct then a plain count.
 
     ``Aggregate(group=G, [count_distinct(x) AS a])`` →
@@ -179,6 +179,12 @@ def count_distinct_to_distinct_count(node: Aggregate, _ctx: OptimizerContext) ->
         return None
     spec = node.aggregates[0]
     if spec.agg.func != "count_distinct" or spec.agg.input is None:
+        return None
+    # Fire only when the direct `count_distinct` is parallelism-starved: it partitions by the
+    # group key (≤ `groups` cores busy), so once the group count meets the cores the rewrite's
+    # value-parallel distinct only adds a full extra pass (TPC-H q16, ~2.4k groups on 92 cores:
+    # 26 ms rewritten vs 13.7 ms not). Refusing keeps the equally-correct un-rewritten plan.
+    if ctx.estimator.estimate(node).rows >= (ctx.hardware.cpu_cores or 8):
         return None
     # Alias clash with the synthetic value column (vanishingly rare) → leave it alone.
     if any(key.alias == _COUNT_DISTINCT_VALUE for key in node.group_keys):

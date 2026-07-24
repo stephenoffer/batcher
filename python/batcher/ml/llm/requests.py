@@ -32,10 +32,15 @@ class GenerateSpec:
         adapter_column: a column naming the per-row LoRA adapter.
         max_tokens_column: a column giving each row its own token budget.
         temperature_column: a column giving each row its own sampling temperature.
+        few_shot: fixed ``(input, output)`` demonstration pairs prepended to every prompt.
         parse_json: parse each output as JSON into a struct column (null on error).
         usage: append ``prompt_tokens`` / ``completion_tokens`` columns.
         finish_reason: append a ``finish_reason`` column.
         logprobs: append a ``logprob`` column.
+        dedup: send each distinct prompt to the engine only once and copy its result to
+            every row that shares it. A throughput win for deterministic decoding over a
+            corpus with repeated prompts; leave off when sampling (``temperature > 0``)
+            and independent samples for identical prompts are wanted.
     """
 
     prompt_column: str
@@ -45,10 +50,12 @@ class GenerateSpec:
     adapter_column: str | None = None
     max_tokens_column: str | None = None
     temperature_column: str | None = None
+    few_shot: tuple[tuple[str, str], ...] | None = None
     parse_json: bool = False
     usage: bool = False
     finish_reason: bool = False
     logprobs: bool = False
+    dedup: bool = False
 
     @property
     def appended_columns(self) -> list[str]:
@@ -63,13 +70,68 @@ class GenerateSpec:
         return names
 
 
-def _render(template: str | None, column: str, batch: pa.RecordBatch) -> list[str]:
+def _cell(value: object) -> str:
+    """One cell as prompt text — a null becomes ``""``, not the literal string ``"None"``.
+
+    ``str(None)`` renders ``"None"``, so a null prompt cell used to inject the four-letter
+    word ``None`` straight into the model's context. An empty string is the sane rendering.
+    """
+    return "" if value is None else str(value)
+
+
+def _few_shot_prefix(few_shot: tuple[tuple[str, str], ...] | None) -> str:
+    """A fixed demonstration block prepended to every prompt, or ``""`` when none.
+
+    Rendered as ``Input: … / Output: …`` pairs — the plain, model-agnostic few-shot shape
+    that works on both the completion and chat paths (the whole thing becomes one prompt)."""
+    if not few_shot:
+        return ""
+    blocks = [f"Input: {inp}\nOutput: {out}" for inp, out in few_shot]
+    return "\n\n".join(blocks) + "\n\n"
+
+
+def _render(
+    template: str | None,
+    column: str,
+    batch: pa.RecordBatch,
+    few_shot: tuple[tuple[str, str], ...] | None = None,
+) -> list[str]:
     """The prompt for each row: ``column`` verbatim, or `template` formatted with the
-    row's columns (``"{system} Q: {question}"``-style ``str.format`` placeholders)."""
+    row's columns (``"{system} Q: {question}"``-style ``str.format`` placeholders), with
+    any `few_shot` demonstrations prepended."""
+    prefix = _few_shot_prefix(few_shot)
     if template is None:
-        return [str(v) for v in batch.column(column).to_pylist()]
-    rows = batch.to_pylist()
-    return [template.format(**row) for row in rows]
+        return [prefix + _cell(v) for v in batch.column(column).to_pylist()]
+    _validate_template(template, batch.schema.names)
+    # A null in any referenced column renders as "" rather than "None" (see `_cell`).
+    return [
+        prefix + template.format(**{k: _cell(v) if v is None else v for k, v in row.items()})
+        for row in batch.to_pylist()
+    ]
+
+
+def _validate_template(template: str, names: list[str]) -> None:
+    """Raise a `PlanError` naming any ``{placeholder}`` the batch has no column for.
+
+    Without this a template referencing a missing column fails deep in the engine with a
+    bare ``KeyError`` that names neither the template nor the column — and it fails the
+    whole batch. Catching it here turns that into an actionable message at the UDF's edge.
+    """
+    import string
+
+    referenced: set[str] = set()
+    for _literal, field, _spec, _conv in string.Formatter().parse(template):
+        if field:
+            # ``{a.b}`` / ``{a[0]}`` reference column ``a``; take that root.
+            referenced.add(field.split(".", 1)[0].split("[", 1)[0])
+    missing = sorted(f for f in referenced if f and not f.isdigit() and f not in names)
+    if missing:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            f"generate template references column(s) not in the data: {missing}. "
+            f"Available columns: {sorted(names)}."
+        )
 
 
 #: The request-dict keys carrying a per-row *sampling* override, mapped to the spec field
@@ -104,7 +166,7 @@ def _build_requests(spec: GenerateSpec | str | None, *rest: object) -> list:
             image_column=image_column,  # type: ignore[arg-type]
             adapter_column=adapter_column,  # type: ignore[arg-type]
         )
-    prompts = _render(spec.template, spec.prompt_column, batch)
+    prompts = _render(spec.template, spec.prompt_column, batch, spec.few_shot)
     tags = _per_row_tags(spec, batch)
     if not tags:
         return prompts

@@ -34,7 +34,7 @@ allows. See `batcher.io.formats.sql.partition`.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -188,6 +188,47 @@ class _DBAPISplit:
             yield conn.cursor()
         finally:
             if self.borrowed is None:
+                conn.close()
+
+    @contextmanager
+    def catalog_session(self) -> Iterator[tuple[Any, Any]]:
+        """Yield ``(run_scalar, run_rows)`` sharing **one** connection for the catalog probes.
+
+        A `statistics()` call runs three catalog queries (row count, byte size, column
+        stats). Opening a fresh connection per query tripled the connect round trips — the
+        expensive part against a warehouse — so they share one connection here: one connect,
+        three cheap queries, one close.
+
+        Each query runs on its own short-lived cursor and, for a connection Batcher opened,
+        rolls back on failure so a backend that aborts its transaction on error (Postgres
+        does) does not poison the queries that follow. A **borrowed** connection is never
+        rolled back and never closed — it belongs to the caller, who may be mid-transaction,
+        and disturbing it is the kind of bug that surfaces far away in their next query.
+        """
+        borrowed = self.borrowed is not None
+        conn = (
+            _as_dbapi_connection(self.borrowed)
+            if borrowed
+            else _connect(self.module_name, self.connect_kwargs)
+        )
+
+        def _run(sql: str, *, many: bool) -> Any:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                return list(cur.fetchall()) if many else (cur.fetchone() or (None,))[0]
+            except Exception:
+                if not borrowed:  # never disturb a caller's live transaction
+                    with suppress(Exception):
+                        conn.rollback()
+                raise
+            finally:
+                cur.close()
+
+        try:
+            yield (lambda sql: _run(sql, many=False), lambda sql: _run(sql, many=True))
+        finally:
+            if not borrowed:
                 conn.close()
 
     def schema(self) -> pa.Schema:
@@ -354,6 +395,37 @@ class DBAPISource:
 
     def row_count(self) -> int | None:
         return None
+
+    def statistics(self) -> Any:
+        """Catalog row count, byte size, and per-column stats for a `table=` read, else None.
+
+        A ``table=`` read names a base table, so its system catalog can answer "how many
+        rows / bytes / how selective each column" without scanning it — the same footer-free
+        metadata a warehouse maintains for its own planner. A ``query=`` read is an arbitrary
+        expression with no catalog entry, so it declares nothing here and the estimator falls
+        back to `row_count` (None) as before.
+
+        The dialect is inferred from the driver module (``psycopg`` → Postgres,
+        ``sqlite3`` → SQLite, …); an unrecognized driver makes this a no-op. Best-effort
+        throughout — a permission error, an un-analyzed table, or a view rather than a base
+        table yields None and planning proceeds on defaults.
+        """
+        if self.table is None:
+            return None
+        from batcher.io.stats import dialect_for_driver, sql_statistics
+
+        driver = self.module or (
+            type(self.connection).__module__.split(".")[0] if self.connection is not None else ""
+        )
+        dialect = dialect_for_driver(driver)
+        if dialect is None:
+            return None
+        split = self._split("")  # a cursor host; the SQL it carries is unused by the session
+        try:
+            with split.catalog_session() as (run_scalar, run_rows):
+                return sql_statistics(dialect, self.table, run_scalar=run_scalar, run_rows=run_rows)
+        except Exception:
+            return None
 
     def identity(self) -> str:
         # The connection is part of the key: the same query against production and

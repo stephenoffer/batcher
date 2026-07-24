@@ -85,6 +85,24 @@ class ServingClient(Protocol):
         ...
 
 
+def _reject_non_numeric_inputs(feed: dict[str, np.ndarray], batch: pa.RecordBatch) -> None:
+    """Fail early and by name on a serving input that has no numeric array form.
+
+    A string/nested column converts to an ``object``-dtype array, which a Triton dtype
+    map rejects deep in the client and an HTTP client base64-mangles into garbage. Naming
+    the offending column here turns that into an actionable message at the batch edge.
+    """
+    for name, arr in feed.items():
+        if getattr(arr, "dtype", None) is not None and arr.dtype == object:
+            from batcher._internal.errors import BackendError
+
+            raise BackendError(
+                f"serving input column {name!r} is {batch.schema.field(name).type}, which "
+                "has no numeric/tensor array form for an inference endpoint. Select or cast "
+                "it to a numeric or tensor column before serving."
+            )
+
+
 def _column_to_numpy(column: pa.Array) -> np.ndarray:
     """A batch column as NumPy — tensor columns keep their ``(N, *shape)`` form.
 
@@ -155,8 +173,17 @@ def _split_feed(
     """
     if max_batch_size is None or max_batch_size <= 0 or num_rows <= max_batch_size:
         return [feed]
+
+    def _slice(arr: np.ndarray, start: int) -> np.ndarray:
+        # A per-row input is sliced; a broadcast/shared input (leading dim != num_rows,
+        # e.g. a single (1, ...) value for the whole batch) is passed through whole —
+        # slicing it would empty every sub-batch after the first and corrupt the request.
+        if getattr(arr, "shape", (0,))[:1] == (num_rows,):
+            return arr[start : start + max_batch_size]
+        return arr
+
     return [
-        {name: arr[start : start + max_batch_size] for name, arr in feed.items()}
+        {name: _slice(arr, start) for name, arr in feed.items()}
         for start in range(0, num_rows, max_batch_size)
     ]
 
@@ -195,7 +222,12 @@ def _merge_results(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
         return parts[0]
     import numpy as np
 
-    return {name: np.concatenate([p[name] for p in parts]) for name in parts[0]}
+    # `atleast_1d` so a 0-d (scalar-per-sub-batch) output — e.g. a per-batch summary from
+    # a split large batch — concatenates instead of raising "zero-dimensional arrays
+    # cannot be concatenated".
+    return {
+        name: np.concatenate([np.atleast_1d(p[name]) for p in parts]) for name in parts[0]
+    }
 
 
 def serving_udf(
@@ -257,6 +289,7 @@ def serving_udf(
             import pyarrow as pa
 
             feed = {name: _column_to_numpy(batch.column(name)) for name in inputs}
+            _reject_non_numeric_inputs(feed, batch)
             chunks = _split_feed(feed, batch.num_rows, max_batch_size)
             result = _merge_results(list(_pipelined(self._predict, chunks, depth)))
             keep = [batch.column(i) for i in range(batch.num_columns)]

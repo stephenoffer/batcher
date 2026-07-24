@@ -101,10 +101,19 @@ class BloomIndex:
 
     def contains_hash(self, h: int) -> bool:
         # Double hashing (`h1 + i·h2`) over the same positions bc_sketches sets.
-        h1 = h & 0xFFFFFFFF
+        #
+        # `h1` is the **whole** 64-bit hash, mirroring `BloomFilter::positions`. Truncating it
+        # to 32 bits caps the `i = 0` probe at index 2^32, so a filter larger than 512 MB
+        # addresses its upper bits only through the `i·h2` terms — and, more immediately, a
+        # truncated reader disagrees with the full-width builder and reports false negatives,
+        # which breaks the no-false-negatives contract that makes a `False` safe to prune on.
+        #
+        # Every step is masked to 64 bits because Rust computes this in wrapping `u64`
+        # arithmetic; Python ints are unbounded and would otherwise carry past the wrap.
+        h1 = h & _MASK64
         h2 = ((h >> 32) | 1) & _MASK64
         for i in range(self.num_hashes):
-            pos = (h1 + (i * h2 & _MASK64)) % self.num_bits
+            pos = ((h1 + (i * h2 & _MASK64)) & _MASK64) % self.num_bits
             if not (self._words[pos // 64] >> (pos % 64)) & 1:
                 return False
         return True

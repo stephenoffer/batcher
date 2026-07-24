@@ -144,8 +144,16 @@ impl TDigest {
             let proposed = acc.weight + c.weight;
             let q = (cum + proposed / 2.0) / total;
             if proposed <= Self::weight_limit(compression, total, q) {
-                // Absorb: weighted-mean update.
-                acc.mean = (acc.mean * acc.weight + c.mean * c.weight) / proposed;
+                // Absorb, as an *incremental* correction to the running mean rather than
+                // `(m_a·w_a + m_b·w_b)/w`. The product form rebuilds the mean from two large
+                // numbers on every absorption, and a centroid near the median absorbs
+                // thousands of them — so on a column whose values are large relative to their
+                // spread (timestamps, prices in cents, ids) the accumulated rounding shows up
+                // as a drifting centroid mean and therefore a drifting quantile. The
+                // incremental form only ever nudges an already-good mean by a weighted
+                // difference, which is the same reason Welford's update is preferred over
+                // sum-of-squares.
+                acc.mean += (c.mean - acc.mean) * (c.weight / proposed);
                 acc.weight = proposed;
             } else {
                 cum += acc.weight;
@@ -273,7 +281,24 @@ impl TDigest {
             }
             cum += c.weight;
         }
-        1.0
+        // Past every centroid mean but still below `max`: interpolate the remaining mass
+        // rather than reporting a saturated 1.0. The tail between the last centroid's mean
+        // and the exactly-tracked maximum holds half of that centroid's weight, and calling
+        // all of it "rank 1" made `rank` disagree with `quantile` (which does interpolate
+        // there) and reported `col <= x` as keeping *everything* for an `x` inside the data.
+        match self.centroids.last() {
+            Some(last) => {
+                let last_centre = self.n - last.weight / 2.0;
+                let span = self.max - last.mean;
+                let t = if span > 0.0 {
+                    ((x - last.mean) / span).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                ((last_centre + t * (self.n - last_centre)) / self.n).clamp(0.0, 1.0)
+            }
+            None => 1.0,
+        }
     }
 
     /// Serialize to a byte blob. Layout (all little-endian). Buffered values are
@@ -768,6 +793,46 @@ mod tests {
                 let err = (m - s).abs() / 2_000_000.0;
                 assert!(err < 0.02, "trial {trial} q={q} m={m} s={s} err={err}");
             }
+        }
+    }
+
+    /// `rank` and `quantile` must be mutual inverses across the whole range, including the
+    /// tail above the last centroid's mean — which used to report a saturated 1.0.
+    #[test]
+    fn rank_and_quantile_are_inverses_in_the_upper_tail() {
+        let mut t = TDigest::new(100.0);
+        for i in 0..100_000u64 {
+            t.add(i as f64);
+        }
+        for q in [0.9_f64, 0.99, 0.999, 0.9999] {
+            let v = t.quantile(q).expect("non-empty");
+            let back = t.rank(v);
+            assert!((back - q).abs() < 0.01, "q={q} -> v={v} -> rank={back}");
+        }
+        // And a value strictly inside the data must never be reported as keeping everything.
+        let near_max = t.quantile(0.99999).expect("non-empty");
+        assert!(
+            t.rank(near_max) < 1.0,
+            "an interior value reported rank 1.0"
+        );
+    }
+
+    /// Centroid means must stay accurate when the values are large relative to their spread —
+    /// the case the product form of the weighted-mean update loses.
+    #[test]
+    fn quantiles_stay_accurate_at_a_large_offset() {
+        let mut t = TDigest::new(200.0);
+        let offset = 1e12;
+        for i in 0..200_000u64 {
+            t.add(offset + i as f64);
+        }
+        for q in [0.25_f64, 0.5, 0.75] {
+            let got = t.quantile(q).expect("non-empty") - offset;
+            let want = q * 200_000.0;
+            assert!(
+                (got - want).abs() < 0.02 * 200_000.0,
+                "q={q}: got {got}, want ~{want}"
+            );
         }
     }
 }

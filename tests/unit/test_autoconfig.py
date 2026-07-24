@@ -60,10 +60,10 @@ def test_resolve_auto_config_fills_memory_budget():
     assert base.memory.max_memory_bytes is None
     # Unresolved still yields a *bounded* budget — the static `default_total_bytes`
     # envelope, not `0`. See `test_bypassing_the_resolver_still_bounds_the_budget`.
-    assert base._rust_memory_budget_bytes() > 0
+    assert base.spill_budget_bytes() > 0
     resolved = resolve_auto_config(base)
     assert resolved.memory.max_memory_bytes is not None
-    assert resolved._rust_memory_budget_bytes() > 0
+    assert resolved.spill_budget_bytes() > 0
 
 
 def test_bypassing_the_resolver_still_bounds_the_budget():
@@ -76,12 +76,12 @@ def test_bypassing_the_resolver_still_bounds_the_budget():
     import dataclasses
 
     base = Config()
-    assert base._rust_memory_budget_bytes() == int(
+    assert base.spill_budget_bytes() == int(
         base.memory.default_total_bytes * base.memory.hard_limit
     )
     # The explicit opt-out is the one way to get an unbounded data plane.
     ub = base.replace(memory=dataclasses.replace(base.memory, unbounded_memory=True))
-    assert ub._rust_memory_budget_bytes() == 0
+    assert ub.spill_budget_bytes() == 0
 
 
 def test_resolve_auto_config_honors_explicit_cap_and_unbounded():
@@ -93,9 +93,9 @@ def test_resolve_auto_config_honors_explicit_cap_and_unbounded():
     # An explicit cap is returned untouched (user override wins).
     cap = base.replace(memory=dataclasses.replace(base.memory, max_memory_bytes=1 << 30))
     assert resolve_auto_config(cap) is cap
-    assert cap._rust_memory_budget_bytes() == int((1 << 30) * cap.memory.hard_limit)
+    assert cap.spill_budget_bytes() == int((1 << 30) * cap.memory.hard_limit)
     # The unbounded opt-out is a no-op for the resolver and keeps the budget at 0
     # (the pre-auto-tuning in-memory behavior).
     ub = base.replace(memory=dataclasses.replace(base.memory, unbounded_memory=True))
     assert resolve_auto_config(ub) is ub
-    assert ub._rust_memory_budget_bytes() == 0
+    assert ub.spill_budget_bytes() == 0

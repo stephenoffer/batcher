@@ -29,6 +29,7 @@ import json
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml.llm.columns import _loads_lenient
 from batcher.plan.types import CAST_DTYPES, DTYPE_REGISTRY
 
 if TYPE_CHECKING:
@@ -172,6 +173,28 @@ def _apply_instruction(requests: list, suffix: str) -> list:
     return out
 
 
+def _dispatch_sorted(engine: Engine, requests: list) -> list:
+    """Run `requests` through `engine` longest-prompt-first, returning outputs in row order.
+
+    The same padding / prefix-cache throughput lever `generate` pulls (see
+    `requests._length_sorted_order`): a batch that mixes a 4-token prompt with a 4000-token
+    one otherwise pads every sequence to the longest. The results are un-permuted, so the
+    extracted columns line up with the caller's rows exactly.
+    """
+    from batcher.ml.llm.requests import _length_sorted_order, _restore_order
+
+    order = _length_sorted_order(requests)
+    generated = list(engine([requests[i] for i in order]))
+    if len(generated) != len(order):
+        from batcher._internal.errors import BackendError
+
+        raise BackendError(
+            f"{type(engine).__name__} returned {len(generated)} outputs for {len(order)} "
+            "requests; an engine must return exactly one string per request."
+        )
+    return _restore_order(generated, order)
+
+
 def _extract_batch(
     engine: Engine,
     batch: pa.RecordBatch,
@@ -181,6 +204,7 @@ def _extract_batch(
     template: str | None,
     instruct: bool,
     adapter_column: str | None = None,
+    image_column: str | None = None,
 ) -> pa.RecordBatch:
     """One batch through the engine, appending one typed column per declared field."""
     import pyarrow as pa
@@ -191,6 +215,7 @@ def _extract_batch(
         prompt_column=prompt_column or "",
         template=template,
         adapter_column=adapter_column,
+        image_column=image_column,
     )
     requests = _build_requests(spec, batch)
     if instruct:
@@ -198,11 +223,10 @@ def _extract_batch(
         requests = _apply_instruction(requests, suffix)
 
     parsed: list[dict] = []
-    for out in engine(requests):
-        try:
-            obj = json.loads(out)
-        except (TypeError, ValueError):
-            obj = None
+    for out in _dispatch_sorted(engine, requests):
+        # Lenient parse: a model told to reply with JSON routinely fences it or wraps it
+        # in a sentence, which raw json.loads would reject — nulling every field of the row.
+        obj = _loads_lenient(out)
         parsed.append(obj if isinstance(obj, dict) else {})
 
     arrays = [batch.column(i) for i in range(batch.num_columns)]
@@ -224,6 +248,7 @@ def llm_extract_udf(
     template: str | None = None,
     instruct: bool = True,
     adapter_column: str | None = None,
+    image_column: str | None = None,
 ) -> type:
     """A load-once class UDF appending one **typed** column per `schema` field.
 
@@ -238,6 +263,9 @@ def llm_extract_udf(
         adapter_column: Optional column naming the **LoRA adapter** to use per row, so
             one engine serves many fine-tuned extractors. Pair with
             ``vllm_engine(lora_paths={name: path})``; a null uses the base model.
+        image_column: Optional image column (raw bytes or an ``(H, W, 3)`` tensor) for a
+            **vision** model, so fields can be extracted from an image (an invoice photo
+            → ``{vendor, total}``). The engine must be vision-capable.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus one
@@ -260,6 +288,7 @@ def llm_extract_udf(
                 template=template,
                 instruct=instruct,
                 adapter_column=adapter_column,
+                image_column=image_column,
             )
 
     return _LlmExtract
@@ -302,6 +331,7 @@ def llm_classify_udf(
     template: str | None = None,
     instruct: bool = True,
     adapter_column: str | None = None,
+    image_column: str | None = None,
 ) -> type:
     """A load-once class UDF appending a label column constrained to `labels`.
 
@@ -319,6 +349,8 @@ def llm_classify_udf(
         adapter_column: Optional column naming the **LoRA adapter** to use per row, so
             one engine serves many fine-tuned classifiers. Pair with
             ``vllm_engine(lora_paths={name: path})``; a null uses the base model.
+        image_column: Optional image column for a **vision** model, so a row can be
+            classified from an image rather than text. The engine must be vision-capable.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus the label.
@@ -349,6 +381,7 @@ def llm_classify_udf(
                 template=template,
                 instruct=instruct,
                 adapter_column=adapter_column,
+                image_column=image_column,
             )
 
     return _LlmClassify
@@ -365,6 +398,7 @@ def _classify_batch(
     template: str | None,
     instruct: bool,
     adapter_column: str | None = None,
+    image_column: str | None = None,
 ) -> pa.RecordBatch:
     """One batch through the engine, appending the label column resolved against `lookup`.
 
@@ -380,12 +414,13 @@ def _classify_batch(
         prompt_column=prompt_column or "",
         template=template,
         adapter_column=adapter_column,
+        image_column=image_column,
     )
     requests = _build_requests(spec, batch)
     if instruct:
         suffix = "\n\n" + _CLASSIFY_INSTRUCTION.format(labels=", ".join(labels))
         requests = _apply_instruction(requests, suffix)
-    resolved = [_match_label(o, lookup) for o in engine(requests)]
+    resolved = [_match_label(o, lookup) for o in _dispatch_sorted(engine, requests)]
     arrays = [batch.column(i) for i in range(batch.num_columns)]
     arrays.append(pa.array(resolved, type=pa.string()))
     return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, output_column])

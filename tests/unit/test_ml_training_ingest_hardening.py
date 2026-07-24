@@ -166,10 +166,13 @@ def test_stream_loader_collate_fn_keeps_a_string_column():
 
 
 def test_collate_fn_suppresses_the_drop_warning():
+    """A user-supplied collate takes the whole table, so no column is dropped to warn about."""
     ds = _SpyDataset(pa.table({"id": [1, 2], "label": ["a", "b"]}))
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # nothing is dropped, so nothing may be warned about
-        stream_loader(ds, batch_size=2, shuffle=False, collate_fn=lambda t: t)
+        loader = stream_loader(ds, batch_size=2, shuffle=False, collate_fn=lambda t: t)
+        batches = list(loader)
+    assert [b.column_names for b in batches] == [["id", "label"]]
 
 
 def test_shard_stream_loader_takes_a_collate_fn(tmp_path):

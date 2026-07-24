@@ -18,6 +18,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import SchemaError
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.structured import _parquet_native
@@ -78,6 +79,12 @@ class ParquetSource(FileSource):
         per-file thread pool on a many-small-files scan. ``None`` (use base's per-file path)
         for a single file, in non-strict mode (base owns normalization), with a byte cache,
         or for a bring-your-own backend the bare URI cannot address.
+
+        The native reader returns each file with its own on-disk schema, so the result is
+        conformed to the source's declared schema per file on the way out — the same check
+        `_normalize` applies on the base path. Skipping it here is what let a directory
+        whose files disagree return silently column-dropped rows on this fast path while
+        the slower path raised.
         """
         files = self._files()
         if len(files) <= 1 or self._schema_mode != "strict":
@@ -87,7 +94,11 @@ class ParquetSource(FileSource):
         per_file = _parquet_native.read_many(files, projection)
         if per_file is None:
             return None
-        return [b for file_batches in per_file for b in file_batches]
+        return [
+            b
+            for path, file_batches in zip(files, per_file, strict=True)
+            for b in self._normalize(file_batches, projection, path)
+        ]
 
     def _native_uri_is_addressable(self, path: str) -> bool:
         """Whether the native reader can be handed `path` and reach the same bytes.
@@ -153,8 +164,13 @@ class ParquetSource(FileSource):
         def _read_one(f: str) -> list[pa.RecordBatch] | None:
             # `[]` row-groups = every row-group in the file; the reader prunes from there.
             batches = _parquet_native.read_row_groups_filtered(f, [], projection, predicate)
-            if not batches or pa_filter is None:
+            if not batches:
                 return batches  # None, or a file pruned away to nothing — both pass through
+            # Conform before filtering: the filter is bound against the source's declared
+            # schema, so a file whose column types differ must be cast to it first.
+            batches = list(self._normalize(batches, projection, f))
+            if pa_filter is None:
+                return batches
             # Filter per file, as each read lands, so the accumulated result holds only
             # matching rows — filtering at the end would first materialize every file's
             # unfiltered batches at once, which is the memory this exists to avoid.
@@ -333,7 +349,8 @@ class ParquetSource(FileSource):
         files = self._files()
 
         def _read_one(f: str) -> list[pa.RecordBatch]:
-            return self._read_table(f, projection, pa_filter).to_batches()
+            table = self._read_table(f, projection, pa_filter)
+            return list(self._normalize(table.to_batches(), projection, f))
 
         try:
             if len(files) <= 1:
@@ -348,6 +365,11 @@ class ParquetSource(FileSource):
                 for batches in pool.map(_read_one, files):  # order preserved
                     out.extend(batches)
             return out
+        except SchemaError:
+            # A file that disagrees with the source's declared schema is a fact about the
+            # data, not about this reader — falling back would re-read every file only to
+            # raise the identical error from the base path. Surface it now.
+            raise
         except Exception:
             # A filter the reader can't bind (e.g. a type it lacks a kernel for) must
             # never fail the query — the engine keeps the Filter operator, so an

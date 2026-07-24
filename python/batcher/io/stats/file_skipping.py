@@ -38,6 +38,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
+
 __all__ = [
     "MAX_PREFIX",
     "MIN_PREFIX",
@@ -207,7 +209,8 @@ def _comparison(
         if all_null is not None:
             keep = pc.and_(pc.fill_null(keep, True), pc.invert(all_null))
         return keep
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "evaluate zone-map prune", exc)
         return None  # a type that will not compare prunes nothing
 
 

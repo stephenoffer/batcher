@@ -393,10 +393,12 @@ def stream_topn(
     input_ir = json.dumps(sort.input.to_ir())
 
     running: list[pa.RecordBatch] = []
+    # The engine config is constant for the query, so read and serialize it once — not once
+    # per micro-batch inside the loop (`stream_limit` already hoists it the same way).
+    cfg_json = active_config().engine_config_json()
     for batch in source.iter_batches(None):
         if batch.num_rows == 0:
             continue
-        cfg_json = active_config().engine_config_json()
         rows = [b for b in nat.execute_plan(input_ir, [[batch]], cfg_json) if b.num_rows]
         merged = running + rows
         if not merged:

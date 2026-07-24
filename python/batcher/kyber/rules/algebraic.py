@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as _dt
 
+from batcher._internal.mathx import clamp
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
@@ -447,7 +448,7 @@ def combine_limits(node: Limit, _ctx: OptimizerContext) -> LogicalPlan | None:
     inner = node.input
     if isinstance(inner, Limit):
         new_offset = inner.offset + node.offset
-        new_n = max(0, min(node.n, inner.n - node.offset))
+        new_n = clamp(inner.n - node.offset, 0, node.n)
         return Limit(inner.input, new_n, new_offset)
     return None
 

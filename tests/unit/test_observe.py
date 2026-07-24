@@ -530,7 +530,16 @@ def test_dag_lays_a_join_out_over_both_of_its_children():
 def test_dag_of_a_missing_plan_is_empty_not_an_error():
     from batcher.observe.dag import build_dag
 
-    assert build_dag(None, []) == {"nodes": [], "edges": [], "width": 0, "depth": 0}
+    # Same *keys* as a populated graph, so a renderer never has to test for the empty case
+    # separately — only the values differ.
+    assert build_dag(None, []) == {
+        "nodes": [],
+        "edges": [],
+        "width": 0,
+        "depth": 0,
+        "critical_path": [],
+        "stages": 0,
+    }
 
 
 def test_insights_are_silent_on_a_healthy_run():
@@ -729,6 +738,7 @@ var __handlers = {};
 var document = {
   documentElement: { dataset: {} },
   getElementById: function () { return __el(); },
+  querySelector: function () { return __el(); },
   querySelectorAll: function () { return []; },
   addEventListener: function (name) { __handlers[name] = true; },
   body: { classList: { toggle: function () {} } },
@@ -750,8 +760,8 @@ function __el() {
            focus: function () {}, click: function () {} };
 }
 var window = { matchMedia: function () { return { matches: false }; },
-               innerWidth: 1280, innerHeight: 900,
-               addEventListener: function () {} };
+               innerWidth: 1280, innerHeight: 900, scrollY: 0,
+               scrollTo: function () {}, addEventListener: function () {} };
 var location = { hash: '', href: 'http://localhost/' };
 var history = { replaceState: function () {}, pushState: function () {} };
 var navigator = { clipboard: { writeText: function () { return Promise.resolve(); } } };
@@ -776,7 +786,17 @@ def _js_context():
 # Load order is a real dependency order, not an alphabetical one: `reference.js` is pure
 # data, `learn.js` renders it and needs UI, `views.js` calls LEARN.term, `app.js` needs all
 # of them at its top level. The cumulative test below names whichever one breaks first.
-_JS_MODULES = ("ui.js", "reference.js", "dag.js", "learn.js", "views.js", "app.js")
+_JS_MODULES = (
+    "ui.js",
+    "reference.js",
+    "charts.js",
+    "dag.js",
+    "learn.js",
+    "plan.js",
+    "live.js",
+    "views.js",
+    "app.js",
+)
 
 
 @pytest.mark.parametrize("upto", range(1, len(_JS_MODULES) + 1))
@@ -808,8 +828,11 @@ def test_script_load_order_matches_module_dependencies():
     at = {name: i for i, name in enumerate(order)}
     for module, needs in {
         "learn.js": ["ui.js", "reference.js"],
-        "views.js": ["ui.js", "dag.js", "learn.js"],
-        "app.js": ["ui.js", "dag.js", "learn.js", "views.js"],
+        "charts.js": ["ui.js"],
+        "plan.js": ["ui.js", "charts.js", "dag.js"],
+        "live.js": ["ui.js", "charts.js", "dag.js"],
+        "views.js": ["ui.js", "charts.js", "dag.js", "learn.js"],
+        "app.js": ["ui.js", "charts.js", "dag.js", "learn.js", "plan.js", "live.js", "views.js"],
     }.items():
         for dep in needs:
             assert at[dep] < at[module], f"{module} runs before its dependency {dep}"
@@ -887,9 +910,12 @@ def test_every_tab_shows_panes_and_every_pane_is_reachable():
     mapped: dict[str, set[str]] = {}
     for name, body in re.findall(r"(\w+): \(\) => \[([^\]]*)\]", block):
         mapped[name] = set(re.findall(r"tab-[a-z]+", body))
-    # `steps` is computed from state; name its three renderings explicitly.
+    # `steps` and `query` are computed from state rather than listed, so their renderings
+    # are named here. Keep these in step with STEPS_VIEWS / QUERY_VIEWS in app.js.
     mapped.setdefault("steps", set())
-    mapped["steps"] |= {"tab-plan", "tab-timeline", "tab-operators"}
+    mapped["steps"] |= {"tab-plan", "tab-stages", "tab-flame", "tab-timeline", "tab-operators"}
+    mapped.setdefault("query", set())
+    mapped["query"] |= {"tab-explain", "tab-diff", "tab-ir"}
 
     assert tabs == set(mapped), f"nav tabs {tabs} do not match TAB_PANES {set(mapped)}"
     for tab, panes in mapped.items():
@@ -1110,10 +1136,10 @@ def test_the_dashboard_is_a_three_level_drill_down():
     html = (_ASSETS / "index.html").read_text()
     nav = set(re.findall(r'data-view="([^"]+)"', html))
     panes = set(re.findall(r'id="view-([^"]+)"', html))
-    assert nav == {"pipelines", "logs", "system", "learn"}, (
+    assert nav == {"pipelines", "live", "logs", "system", "learn"}, (
         "only top-level destinations belong in the nav"
     )
-    assert panes == {"pipelines", "pipeline", "logs", "run", "system", "learn"}
+    assert panes == {"pipelines", "pipeline", "live", "logs", "run", "system", "learn"}
     # The load-bearing part: the two drill-down levels exist as pages but are reached by
     # clicking through, never from the nav — which is what stops one question being split
     # across two screens.
@@ -1137,16 +1163,36 @@ def test_breadcrumbs_exist_for_the_drill_down():
     assert "renderCrumbs" in app and "function goUp" in app
 
 
+_SPLIT_PIPELINES = [
+    {"signature": "sig-a", "label": "aggregate", "total_ms": 400.0},
+    {"signature": "sig-b", "label": "sort", "total_ms": 100.0},
+]
+
+_FAILURE_GROUPS = [
+    {"error": "boom", "count": 2, "last_wall": 1.0, "runs": ["q1", "q2"]},
+]
+
+
 def test_panels_cross_reference_each_other():
     """A dashboard where each panel is a dead end makes you re-navigate to follow a thread.
 
     Every panel that names a run, a pipeline, or a plan step emits a data attribute, and one
     delegated listener turns all of them into navigation.
     """
-    views = (_ASSETS / "views.js").read_text()
     app = (_ASSETS / "app.js").read_text()
-    for attr in ("data-run=", "data-pipe=", "data-op="):
-        assert attr in views, f"no panel emits {attr}"
+    # Asserted on the *rendered* markup, not on the source. A grep could not see `data-pipe`
+    # once the proportion bar began building the attribute name from a parameter, and the
+    # rendered form is the stronger check anyway: it proves the attribute reaches the page.
+    ctx = _views_context()
+    ctx.eval(f"VIEWS.timeSplit({json.dumps(_SPLIT_PIPELINES)});")
+    ctx.eval(f"VIEWS.failures({json.dumps(_FAILURE_GROUPS)});")
+    rendered = ctx.eval(
+        "document.getElementById('time-split').innerHTML + "
+        "document.getElementById('failures').innerHTML"
+    )
+    for attr in ("data-run=", "data-pipe="):
+        assert attr in rendered, f"no panel emits {attr}"
+    assert "data-op=" in (_ASSETS / "views.js").read_text()
     assert "installCrossReferences" in app
     # Delegated once on document, not bound per render — otherwise every redraw leaks.
     handler = app[app.index("function installCrossReferences") :]
@@ -1606,7 +1652,7 @@ def _render_context():
     quickjs = pytest.importorskip("quickjs")
     ctx = quickjs.Context()
     ctx.eval(_MINIDOM.read_text())
-    for name in ("ui.js", "dag.js", "views.js"):
+    for name in ("ui.js", "charts.js", "dag.js", "views.js"):
         ctx.eval((_ASSETS / name).read_text())
     return ctx
 
@@ -2011,7 +2057,16 @@ def _views_context():
     quickjs = pytest.importorskip("quickjs")
     ctx = quickjs.Context()
     ctx.eval(_MINIDOM.read_text())
-    for name in ("ui.js", "reference.js", "dag.js", "learn.js", "views.js"):
+    for name in (
+        "ui.js",
+        "reference.js",
+        "charts.js",
+        "dag.js",
+        "learn.js",
+        "plan.js",
+        "live.js",
+        "views.js",
+    ):
         ctx.eval((_ASSETS / name).read_text())
     return ctx
 
@@ -2422,7 +2477,7 @@ def test_the_run_page_groups_nine_old_tabs_into_five_sections():
     assert active("switchStepsView('timeline')") == ["tab-timeline"]
     assert active("switchStepsView('operators')") == ["tab-operators"]
     # Two former tabs now share one section.
-    assert set(active("switchTab('insights')")) == {"tab-insights", "tab-decisions"}
+    assert set(active("switchTab('insights')")) == {"tab-insights", "tab-adaptive", "tab-decisions"}
     assert set(active("switchTab('meta')")) == {"tab-meta", "tab-raw"}
     # An unknown tab lands on Steps rather than a blank panel — and keeps the rendering the
     # reader last chose, rather than resetting them to the graph.
@@ -2876,7 +2931,7 @@ def test_the_reference_page_offers_a_contents_strip_that_tracks_the_filter():
         return dict(re.findall(r'href="#learn-([a-z]+)">([^<]+)', html))
 
     full = toc("")
-    assert set(full) == {"how", "steps", "metrics", "glossary"}
+    assert set(full) == {"how", "coming", "steps", "metrics", "glossary"}
     # Every section id in the strip must exist as a target on the page.
     html = ctx.eval(
         "(function(){ var d = document.createElement('div');"
@@ -3028,7 +3083,9 @@ def test_keyboard_focus_rules_only_target_focusable_elements():
     """A `:focus-visible` rule on an element that can never receive focus is dead CSS. Every
     class in the shared keyboard-parity rule must be something the markup makes focusable."""
     css = (_ASSETS / "app.css").read_text()
-    js = "".join((_ASSETS / f).read_text() for f in ("views.js", "app.js"))
+    js = "".join(
+        (_ASSETS / f).read_text() for f in ("views.js", "charts.js", "plan.js", "live.js", "app.js")
+    )
     shell = (_ASSETS / "index.html").read_text()
     haystack = js + shell
     block = css[css.index("═══ keyboard parity ═══") :]
@@ -3355,11 +3412,18 @@ def test_the_comparison_change_encodes_direction_and_goodness_separately():
     html = ctx.eval("document.getElementById('compare').innerHTML")
     assert "▲" in html and "is-warn" in html, "a slower step is up-and-warn"
     assert "▼" in html and "is-good" in html, "a faster step is down-and-good"
-    # A magnitude bar behind each number, sized against the biggest change.
-    assert html.count("cmp-bar") == 2
-    # The change shows the absolute magnitude next to the arrow (no doubled sign).
-    assert "30.0ms" in html and "15.0ms" in html
+    # A magnitude bar behind each number, sized against the biggest change. Built by the
+    # shared chart layer (`CHARTS.delta`) so a signed change looks the same wherever the
+    # dashboard shows one.
+    assert html.count("ch-delta-track") == 2
+    # The bar grows away from a centre line, and which way encodes the direction too.
+    assert "to-right" in html and "to-left" in html
+    # The change shows the absolute magnitude next to the arrow (no doubled sign), through
+    # the page's one duration formatter rather than a local `toFixed`.
+    assert "30ms" in html and "15ms" in html
     assert "+30" not in html, "the arrow carries the sign, not a + prefix"
+    # The answer above the evidence: the step that accounts for most of the difference.
+    assert "accounts for" in html and "Join" in html
 
 
 def test_comparison_totals_judge_duration_but_not_a_different_result():
@@ -3765,30 +3829,37 @@ def test_user_data_is_escaped_before_it_reaches_the_dom():
 
 
 def test_a_query_label_with_markup_cannot_inject_via_a_card():
-    """A pipeline whose label contains a tag must render as text, not as live markup, on the
-    card that is the primary navigation."""
+    """A user-supplied pipeline name and note must render as text, not live markup, on the
+    lane that is the primary navigation.
+
+    The injection surface moved when pipelines gained names: the display name is now a
+    person's typed string (persisted in the registry) rather than the engine's op label, so
+    the name and the note are the user data that must be escaped."""
     ctx = _views_context()
     pipes = [
         {
             "signature": "s",
-            "label": "<svg onload=alert(1)>",
+            "pipeline_id": "s",
+            "name": "<svg onload=alert(1)>",
+            "note": "<img src=x onerror=alert(2)>",
+            "label": "aggregate",
             "last_status": "ok",
             "n_failed": 0,
             "runs": 1,
-            "p50_ms": 10,
-            "p95_ms": 20,
-            "last_ms": 10,
             "median_ms": 10,
             "recent_ms": [10],
+            "plan_shape": {"nodes": [], "edges": [], "width": 0, "depth": 0},
         }
     ]
     ctx.eval(f"var P = {json.dumps(pipes)};")
     ctx.eval(
-        "VIEWS.pipelines(P, {onOpen: function(){}, onPin: function(){}, sort: 'time', needle: ''});"
+        "VIEWS.pipelines(P, {onOpen: function(){}, onPin: function(){},"
+        " onRename: function(){}, sort: 'time', needle: ''});"
     )
     html = ctx.eval("document.getElementById('pipeline-cards').innerHTML")
-    assert "<svg onload" not in html, "the label's tag must not render"
-    assert "&lt;svg" in html, "it renders escaped"
+    assert "<svg onload" not in html, "the name's tag must not render"
+    assert "<img src=x" not in html, "the note's tag must not render"
+    assert "&lt;svg" in html and "&lt;img" in html, "both render escaped"
 
 
 def test_a_structured_log_field_value_cannot_inject():

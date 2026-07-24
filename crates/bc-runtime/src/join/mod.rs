@@ -2019,13 +2019,17 @@ mod hunt_tests {
         out
     }
 
+    /// One matched row as `((left key col a, col b), (right key col a, col b))`, with
+    /// `None` standing for the unmatched side of an outer join.
+    type KeyPair2 = ((Option<i64>, Option<i64>), (Option<i64>, Option<i64>));
+
     fn vpairs2(
         idx: &JoinIndices,
         la: &[Option<i64>],
         lb: &[Option<i64>],
         ra: &[Option<i64>],
         rb: &[Option<i64>],
-    ) -> Vec<((Option<i64>, Option<i64>), (Option<i64>, Option<i64>))> {
+    ) -> Vec<KeyPair2> {
         let mut out: Vec<_> = (0..idx.left.len())
             .map(|k| {
                 let l = if idx.left.is_valid(k) {

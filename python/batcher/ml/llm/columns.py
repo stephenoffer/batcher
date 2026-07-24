@@ -17,10 +17,92 @@ __all__: list[str] = []
 
 
 def _safe_json(text: str) -> object | None:
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
+    """Parse a generation as JSON, tolerating a fenced or prose-wrapped object → null."""
+    return _loads_lenient(text)
+
+
+def _loads_lenient(text: object) -> object | None:
+    """Parse JSON an instruction-tuned model produced, or `None` if there is none.
+
+    A model told to "reply with JSON" routinely wraps it in a ```json fence or a sentence
+    ("Here is the JSON: {...}"). Raw `json.loads` rejects every such row, silently nulling
+    it after the generation is already paid for. This tries the string as-is, then the
+    contents of a Markdown code fence, then the first balanced ``{...}``/``[...]`` span, so
+    the common wrappers parse while genuinely non-JSON output still falls through to null.
+    """
+    if not isinstance(text, str):
         return None
+    for candidate in _json_candidates(text):
+        try:
+            return json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _json_candidates(text: str):
+    """Yield the substrings of `text` worth attempting to parse, most-literal first."""
+    stripped = text.strip()
+    yield stripped
+    fenced = _strip_code_fence(stripped)
+    if fenced != stripped:
+        yield fenced
+    span = _first_json_span(fenced)
+    if span is not None and span != fenced:
+        yield span
+
+
+def _strip_code_fence(text: str) -> str:
+    """The contents of the first Markdown code fence in `text`, or `text` unchanged.
+
+    Handles ```` ```json ... ``` ```` and a bare ```` ``` ... ``` ````; a fence the model
+    opened but never closed still yields its body so a truncated response can parse.
+    """
+    import re
+
+    match = re.search(r"```[a-zA-Z0-9_-]*\s*\n?(.*?)(?:```|$)", text, re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
+def _first_json_span(text: str) -> str | None:
+    """The first balanced ``{...}`` or ``[...]`` in `text`, honoring strings, or `None`.
+
+    A brace counter that skips over braces inside string literals (and their escapes), so
+    a value like ``{"note": "a } brace"}`` is spanned correctly rather than cut short.
+    """
+    start = _first_of(text, "{[")
+    if start is None:
+        return None
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _first_of(text: str, chars: str) -> int | None:
+    """The index of the earliest of `chars` in `text`, or `None` if none appear."""
+    positions = [text.index(c) for c in chars if c in text]
+    return min(positions) if positions else None
 
 
 def _aligned(reported: list | None, n: int, order: list | None) -> list:

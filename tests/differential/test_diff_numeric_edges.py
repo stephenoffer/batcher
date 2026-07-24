@@ -28,7 +28,7 @@ def test_cast_double_to_int_rounds_half_to_even(duck):
 
 
 def test_greatest_least_coerce_mixed_numeric(duck):
-    """B5: greatest/least over int×float must coerce, not error."""
+    """B5: greatest/least over int/float must coerce, not error."""
     t = pa.table(
         {"a": pa.array([1, 5, 9], pa.int64()), "b": pa.array([2.5, 3.0, -1.0], pa.float64())}
     )

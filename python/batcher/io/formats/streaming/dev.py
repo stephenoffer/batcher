@@ -20,8 +20,6 @@ from batcher.io.splits import Split, WholeSourceSplit
 
 __all__ = ["RateSource", "SocketSource"]
 
-_EPOCH = datetime.datetime(1970, 1, 1)
-
 
 @SOURCES.register("rate")
 class RateSource:
@@ -79,15 +77,17 @@ class RateSource:
         return [WholeSourceSplit(self)]
 
     def _make_batch(self, first_value: int, n: int) -> pa.RecordBatch:
-        values = list(range(first_value, first_value + n))
+        import numpy as np
+        import pyarrow.compute as pc
+
+        # Vectorized, not a Python list comprehension: a rate source emits `rps` rows per
+        # batch, and building `n` `datetime` objects per batch was O(rows) Python in the data
+        # plane. `value` counts up from `first_value`; `timestamp` is `value * step_us`
+        # microseconds since the epoch, computed as int64 and reinterpreted as `timestamp[us]`.
         step_us = 1_000_000 // self._rps
-        timestamps = [_EPOCH + datetime.timedelta(microseconds=v * step_us) for v in values]
-        return pa.record_batch(
-            {
-                "timestamp": pa.array(timestamps, type=pa.timestamp("us")),
-                "value": pa.array(values, type=pa.int64()),
-            }
-        )
+        values = pa.array(np.arange(first_value, first_value + n, dtype=np.int64))
+        timestamps = pc.multiply(values, np.int64(step_us)).cast(pa.timestamp("us"))
+        return pa.record_batch({"timestamp": timestamps, "value": values})
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         import time
@@ -148,18 +148,21 @@ class SocketSource:
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         import socket
 
-        with socket.create_connection((self._host, self._port)) as conn:
-            buf = b""
-            with conn.makefile("rb") as fh:
-                lines: list[str] = []
-                for raw in fh:
-                    lines.append((buf + raw).decode("utf-8", "replace").rstrip("\n"))
-                    buf = b""
-                    if len(lines) >= self._batch_size:
-                        yield self._batch(lines, projection)
-                        lines = []
-                if lines:
+        with (
+            socket.create_connection((self._host, self._port)) as conn,
+            conn.makefile("rb") as fh,
+        ):
+            lines: list[str] = []
+            for raw in fh:
+                # `rstrip("\r\n")` strips a CRLF terminator, not just `\n`: a Windows
+                # or HTTP-style producer sends `\r\n`, and stripping only `\n` left a
+                # trailing `\r` in every `value`.
+                lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+                if len(lines) >= self._batch_size:
                     yield self._batch(lines, projection)
+                    lines = []
+            if lines:
+                yield self._batch(lines, projection)
 
     def _batch(self, lines: list[str], projection: list[str] | None) -> pa.RecordBatch:
         now = datetime.datetime.now()

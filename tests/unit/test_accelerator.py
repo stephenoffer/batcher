@@ -44,9 +44,7 @@ def test_unknown_backend_degrades_to_cpu_rather_than_raising(backend):
     assert torch_device(backend) == "cpu"
 
 
-@pytest.mark.parametrize(
-    ("backend", "device"), [("neuron", "xla"), ("hpu", "hpu"), ("tpu", "xla")]
-)
+@pytest.mark.parametrize(("backend", "device"), [("neuron", "xla"), ("hpu", "hpu"), ("tpu", "xla")])
 def test_non_gpu_accelerator_backends_map_to_their_device(backend, device):
     """Trainium/Inferentia (neuron) and Gaudi (hpu) are now recognized backends, so they map to
     their real torch device string instead of degrading to CPU."""

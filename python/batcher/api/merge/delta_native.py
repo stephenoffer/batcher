@@ -47,6 +47,7 @@ from batcher.api.merge.clauses import (
     SOURCE_PREFIX,
     MergeClause,
 )
+from batcher.api.merge.native import merge_predicate_for
 from batcher.io.formats.lakehouse.delta import require_deltalake
 from batcher.io.manifest import WriteManifest, WrittenFile
 
@@ -79,7 +80,7 @@ def merge_into_delta(
         BackendError: If the table cannot be opened or the merge fails.
     """
     deltalake = require_deltalake()
-    predicate = " AND ".join(f"target.{k} = source.{k}" for k in keys)
+    predicate = merge_predicate_for(keys)
     try:
         table = deltalake.DeltaTable(table_uri, storage_options=storage_options)
     except Exception as exc:

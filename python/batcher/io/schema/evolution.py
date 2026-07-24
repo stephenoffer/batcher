@@ -23,6 +23,7 @@ from batcher.plan.types import promote
 
 __all__ = [
     "SchemaDrift",
+    "conform_batch",
     "normalize_batch",
     "reconcile_batches",
     "schema_drift",
@@ -223,6 +224,72 @@ def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
                 cols.append(pc.cast(arr, field.type, safe=not lossy_int_to_float))
         else:
             cols.append(pa.nulls(batch.num_rows, type=field.type))
+    return pa.RecordBatch.from_arrays(cols, schema=target)
+
+
+def conform_batch(batch: pa.RecordBatch, target: pa.Schema, *, path: str) -> pa.RecordBatch:
+    """Reshape `batch` to `target` under ``schema_mode='strict'``, or raise `SchemaError`.
+
+    Strict mode declares that the **first file's schema is the contract** for the whole
+    source, and everything downstream — the plan's output schema, the optimizer's column
+    pruning, the final `Table.from_batches` — trusts that declaration. Nothing was
+    enforcing it, so a file that disagreed produced one of two silent-ish failures: an
+    extra column was dropped without a word, and a differing *type* surfaced hundreds of
+    lines later as a bare `pyarrow.lib.ArrowInvalid` from the concat, after the whole
+    read had been paid for. This makes the declaration true at the point it is made.
+
+    The rules match DuckDB's non-``union_by_name`` reader, which has the same "file 0
+    defines the contract" semantics:
+
+    - a column in the file but not in `target` is **dropped** (it is not in the contract);
+    - a column in `target` but not in the file **raises** — the contract promised it;
+    - a differing type is **cast** to the contract's type.
+
+    The cast is *safe*, which is the one deliberate departure from DuckDB: DuckDB reads a
+    ``float64`` file against an ``int64`` contract by truncating, so ``2.5`` silently
+    becomes ``2``. Silently corrupting a value is exactly the failure mode this function
+    exists to remove, so a lossy conformance raises and names ``schema_mode='union'``,
+    which promotes the column to ``float64`` and returns ``2.5`` intact.
+
+    Args:
+        batch: One batch as the file produced it.
+        target: The source's declared schema (already narrowed to any projection).
+        path: The file `batch` came from, for the error message.
+
+    Returns:
+        `batch` reshaped to `target`, or `batch` itself when it already conforms.
+
+    Raises:
+        SchemaError: If `path` lacks a declared column, or holds one whose type cannot be
+            cast to the declared type without losing data.
+    """
+    import pyarrow.compute as pc
+
+    if batch.schema.equals(target):
+        return batch
+    present = set(batch.schema.names)
+    cols: list[pa.Array] = []
+    for field in target:
+        if field.name not in present:
+            raise SchemaError(
+                f"file {path!r} is missing column {field.name!r}, which the source's schema "
+                f"declares (it is present in the first file). Columns here: "
+                f"{sorted(present)}. Use schema_mode='union' to read files whose columns "
+                "differ, filling the absent ones with nulls."
+            )
+        arr = batch.column(field.name)
+        if arr.type.equals(field.type):
+            cols.append(arr)
+            continue
+        try:
+            cols.append(pc.cast(arr, field.type))
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+            raise SchemaError(
+                f"file {path!r} has column {field.name!r} as {arr.type}, but the source's "
+                f"schema declares {field.type} (from the first file), and the values do not "
+                "convert without loss. Use schema_mode='union' to promote the column to a "
+                "type that holds both files."
+            ) from exc
     return pa.RecordBatch.from_arrays(cols, schema=target)
 
 

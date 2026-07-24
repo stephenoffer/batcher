@@ -82,6 +82,24 @@ class SeenStore:
         )
         self._conn.commit()
 
+    def mark_many(self, records: list[tuple[str, int, float]]) -> None:
+        """Record many ``(path, size, mtime)`` files as processed in one transaction.
+
+        Equivalent to calling `mark` for each record, but a single `executemany` and one
+        `commit` — so confirming a discovery pass of N files costs one fsync, not N. A
+        crash mid-transaction leaves the store exactly as it was (SQLite atomicity), which
+        is the same all-or-nothing guarantee the per-epoch caller already relies on: the
+        files are re-offered on restart rather than half-remembered.
+        """
+        if not records:
+            return
+        self._conn.executemany(
+            "INSERT INTO seen_files(path, size, mtime) VALUES(?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime = excluded.mtime",
+            records,
+        )
+        self._conn.commit()
+
     def unseen(self, candidates: list[str]) -> list[str]:
         """Return the subset of ``candidates`` not yet recorded, order preserved.
 

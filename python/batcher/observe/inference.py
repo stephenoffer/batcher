@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from batcher._internal import events
+from batcher._internal.mathx import safe_div
 
 __all__ = ["InferenceProgress"]
 
@@ -80,7 +81,7 @@ class _Gpu:
     @property
     def mem_fraction(self) -> float | None:
         """Used VRAM as a fraction of total, or `None` when total is unknown."""
-        return self.mem_used_bytes / self.mem_total_bytes if self.mem_total_bytes else None
+        return safe_div(self.mem_used_bytes, self.mem_total_bytes, None)
 
     @property
     def starved(self) -> bool:
@@ -256,7 +257,7 @@ class InferenceProgress:
                 "partitions": {
                     "done": done,
                     "total": total,
-                    "fraction": (done / total) if total else None,
+                    "fraction": safe_div(done, total, None),
                     "stages": {
                         name: {"done": s.done, "total": s.total, "rows": s.rows}
                         for name, s in job.stages.items()
