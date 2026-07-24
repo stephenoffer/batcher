@@ -147,9 +147,12 @@ Stage-overlap alone lifted a decode → ResNet-50 pipeline from **942 → 2504 i
 utilization from **~30% → 81%** — same result, the device just stops idling through the CPU decode.
 
 **Why the wins happen** — they're structural, not tuning: an in-process native engine over Arrow
-(no per-operation scheduler / object-store hop), composite-key hashing that makes aggregation and
-`DISTINCT` scale, warm model pools + stage-overlapped streaming for GPU work, and adaptive
-re-optimization that re-tunes the plan on measured cardinalities mid-query.
+(no per-operation scheduler / object-store hop), a high-cardinality aggregation path that hashes
+native and composite keys directly and merges its radix partitions in parallel without copying the
+key column twice — so `GROUP BY` and `COUNT(DISTINCT)` over string or near-unique keys scale, and
+`DISTINCT` shards across every core like the aggregate above it — warm model pools +
+stage-overlapped streaming for GPU work, and adaptive re-optimization that re-tunes the plan on
+measured cardinalities mid-query.
 
 ## Install
 
