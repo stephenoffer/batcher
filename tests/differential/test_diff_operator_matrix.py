@@ -70,6 +70,11 @@ RIGHT = pa.table(
 
 ORDERINGS = list(itertools.product([False, True], [False, True]))  # (descending, nulls_first)
 
+#: Every column of `BASE`, so ordering on it ties only between wholly identical rows.
+#: `row_number` needs this: with a partial order the rank handed to each row inside a tie
+#: group is a free choice, and asserting one path's choice against another's tests nothing.
+TOTAL_ORDER = ["k", "g", "f", "v"]
+
 #: operator -> (build, DuckDB SQL or None). Ordered comparisons are handled separately, since
 #: an unordered assert is structurally blind to a sort bug.
 UNORDERED_OPS: dict[str, tuple] = {
@@ -130,11 +135,24 @@ UNORDERED_OPS: dict[str, tuple] = {
         None,
     ),
     "window_sum": (lambda d: d.with_columns(s=bt.col("v").sum().over(partition_by="g")), None),
+    # `row_number` orders on TOTAL_ORDER, not on `k` alone. `k` repeats, and which of two
+    # rows tied on the ordering key receives the lower row number is unspecified in SQL, so
+    # a path-vs-path assertion on `order_by="k"` compares a free choice rather than the
+    # operator: the four paths agree on `BASE` by luck and diverge on `MULTIBATCH`, where
+    # 12 rows tie on `k IS NULL` inside partition `g='a'`. Ordering on every column makes
+    # each tie group a set of *identical* rows, so the output multiset is well defined and
+    # any real divergence is a bug. The tie-order freedom itself is not untested — see
+    # `test_row_number_is_a_permutation_consistent_with_its_order_key`, which pins the whole
+    # contract (a permutation of 1..n per partition, monotone in the order key) on the
+    # tie-heavy `order_by="k"` shape this entry used to assert too much about.
     "window_row_number": (
-        lambda d: d.with_columns(rn=bt.row_number().over(partition_by="g", order_by="k")),
+        lambda d: d.with_columns(rn=bt.row_number().over(partition_by="g", order_by=TOTAL_ORDER)),
         None,
     ),
-    "window_global": (lambda d: d.with_columns(rn=bt.row_number().over(order_by="k")), None),
+    "window_global": (
+        lambda d: d.with_columns(rn=bt.row_number().over(order_by=TOTAL_ORDER)),
+        None,
+    ),
     # Estimation-layer shapes, run through every execution path × edge-case input so a
     # spill/stream regression on any of them (not just the estimate) is caught.
     "filter_between": (
@@ -228,6 +246,51 @@ UNORDERED_OPS: dict[str, tuple] = {
 }
 
 
+def assert_row_number_contract(
+    out: pa.Table, *, partition: str, order: str, rn: str = "rn"
+) -> None:
+    """Assert everything `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)` actually promises.
+
+    Which of two rows tied on the ordering key gets the lower number is unspecified, so a
+    path-vs-path comparison of the emitted rows over-asserts (see the `window_row_number`
+    note in `UNORDERED_OPS`). What *is* specified, and what this pins on the tie-heavy
+    input the matrix can no longer assert on, is:
+
+    * within each partition the numbers are exactly ``1..n`` — no gap, no repeat, so a
+      reducer that restarted its counter or double-counted a row is caught;
+    * reading the partition in row-number order, the ordering key is non-decreasing with
+      nulls last — so a window that ignored its `order_by`, or placed nulls differently on
+      one path, is caught even though the tie order itself is free.
+
+    Args:
+        out: The window operator's output table.
+        partition: Name of the `partition_by` column.
+        order: Name of the `order_by` column.
+        rn: Name of the emitted row-number column.
+    """
+    d = out.to_pydict()
+    per: dict[object, list[tuple[int, object]]] = {}
+    for part, num, key in zip(d[partition], d[rn], d[order], strict=True):
+        per.setdefault(part, []).append((num, key))
+    for part, rows in per.items():
+        numbers = sorted(n for n, _ in rows)
+        assert numbers == list(range(1, len(rows) + 1)), (
+            f"partition {part!r}: row numbers {numbers} are not 1..{len(rows)}"
+        )
+        keys = [k for _, k in sorted(rows)]
+        seen_null = False
+        for i, key in enumerate(keys):
+            if key is None:
+                seen_null = True
+                continue
+            assert not seen_null, f"partition {part!r}: null sorted before {key!r} at rank {i + 1}"
+            if i and keys[i - 1] is not None:
+                assert keys[i - 1] <= key, (
+                    f"partition {part!r}: {order} decreases {keys[i - 1]!r} -> {key!r} at "
+                    f"rank {i + 1}"
+                )
+
+
 def _stream(ds) -> pa.Table:
     """`iter_batches()` collected back into a table (the streaming scheduling)."""
     batches = list(ds.iter_batches())
@@ -255,6 +318,24 @@ def test_every_operator_matches_duckdb(duck, op, shape):
     table = INPUTS[shape]
     duck.register("t", table)
     assert_same(build(bt.from_arrow(table)).collect(), duck.sql(sql))
+
+
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+def test_row_number_is_a_permutation_consistent_with_its_order_key(shape):
+    """The tie-heavy `order_by="k"` window, asserted on what it actually guarantees.
+
+    `UNORDERED_OPS["window_row_number"]` orders on every column so its output multiset is
+    well defined; this keeps the partially-ordered shape covered on all three single-node
+    paths by asserting the contract instead of one path's tie order.
+    """
+    plan = lambda d: d.with_columns(rn=bt.row_number().over(partition_by="g", order_by="k"))  # noqa: E731
+    table = INPUTS[shape]
+    for out in (
+        plan(bt.from_arrow(table)).collect(),
+        plan(bt.from_arrow(table)).collect(spill=True),
+        _stream(plan(bt.from_arrow(table))),
+    ):
+        assert_row_number_contract(out, partition="g", order="k")
 
 
 @pytest.mark.parametrize(("descending", "nulls_first"), ORDERINGS)
