@@ -28,7 +28,27 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from batcher._internal.logging import get_logger
+
 __all__ = ["SpeculationPolicy", "gather_with_backups", "stragglers_to_backup"]
+
+_LOG = get_logger("carbonite")
+
+# How long the barrier may sit with *nothing at all* finished before it says so, and how
+# often it repeats. Only the zero-completions case is reported: once one task has finished,
+# a slow stage is a straggler problem, which is what the speculation policy above is for.
+#
+# This is a diagnostic, not a deadline — the barrier still waits. It exists because the
+# alternative is a silent hang, and a silent hang here is *reachable by construction*:
+# `reserve_placement` gives up on an unsatisfiable placement group and falls back to default
+# scheduling, whose whole promise is to "degrade gracefully instead of hanging". It does not.
+# The fallback tasks carry the same large per-task CPU demand the bundles did, so on a node
+# whose CPUs are already inside somebody else's placement group they queue forever and this
+# barrier waits forever with them. Observed: two concurrent distributed sessions on one
+# 96-CPU node, `ray status` reporting `96.0/96.0 CPU (96.0 used ... in placement groups)`
+# against `{'CPU': 48.0}: 2+ pending tasks/actors`, and a window shuffle stuck 17+ minutes
+# in `ray.wait` with no error and no output.
+_STALL_WARN_AFTER_S = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +134,8 @@ def gather_with_backups(
     # Live copies (original + backups) per slot — consulted only on the failure-tolerant
     # path so a slot is finalized as failed *only* when every copy has died.
     alive: dict[int, set] = {i: {refs[i]} for i in range(n)} if on_failure is not None else {}
+    barrier_started = now
+    stall_warnings = 0
 
     while len(result_of) < n:
         # Drain *all* currently-ready refs per wake (not one): a burst of completions
@@ -122,6 +144,9 @@ def gather_with_backups(
         # below is unchanged (it re-evaluates at most once per poll window).
         done, pending = ray.wait(pending, num_returns=len(pending), timeout=poll_seconds)
         now = time.monotonic()
+        if not result_of and now - barrier_started > _STALL_WARN_AFTER_S * (stall_warnings + 1):
+            stall_warnings += 1
+            _warn_barrier_stalled(now - barrier_started, n)
         for r in done:
             i = ref_to_idx[r]
             if i in result_of:  # slot already won by another copy
@@ -158,3 +183,31 @@ def gather_with_backups(
             # soft cancel would leave wedged on a stuck straggler.
             ray.cancel(r, force=True)
     return [result_of[i] for i in range(n)]
+
+
+def _warn_barrier_stalled(waited_s: float, tasks: int) -> None:
+    """Report a barrier that has waited `waited_s` with zero of `tasks` finished.
+
+    Names Ray's own view of the cluster, because the actionable distinction is not visible
+    from here: tasks that are *running slowly* and tasks that are *pending because nothing
+    will ever free the CPUs they asked for* look identical to `ray.wait`. `Pending Demands`
+    against a fully-reserved CPU total is the signature of the second, and it is what tells
+    a reader to stop waiting and look at who else holds the node.
+    """
+    detail = ""
+    try:
+        import ray
+
+        total = ray.cluster_resources().get("CPU", 0.0)
+        free = ray.available_resources().get("CPU", 0.0)
+        detail = f" cluster CPU {total - free:.0f}/{total:.0f} in use"
+    except Exception:  # a diagnostic must never be the thing that fails the query
+        pass
+    _LOG.warning(
+        "distributed barrier has waited %.0fs with 0/%d tasks finished%s; "
+        "if `ray status` shows Pending Demands against a fully-reserved CPU total, the "
+        "tasks cannot be scheduled and the query will not progress on its own",
+        waited_s,
+        tasks,
+        detail,
+    )
