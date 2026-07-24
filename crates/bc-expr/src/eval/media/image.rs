@@ -526,15 +526,6 @@ fn luma(rgb: &[u8], row: usize, col: usize, width: usize) -> u32 {
     299 * r + 587 * g + 114 * b
 }
 
-/// Read just the image header to get `(width, height)`; `None` on any failure.
-fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    image::ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .ok()?
-        .into_dimensions()
-        .ok()
-}
-
 /// Header facts about an image: dimensions, channel count, and color-mode name.
 ///
 /// One header read yields all four. Daft spends a separate call on each of
@@ -852,7 +843,7 @@ mod tests {
     #[test]
     fn decode_reports_channels_and_mode_from_the_same_header_read() {
         use arrow::array::StringArray;
-        use image::{ColorType, DynamicImage, GrayImage, RgbImage, RgbaImage};
+        use image::{DynamicImage, GrayImage, RgbImage, RgbaImage};
 
         // One image per color mode, each encoded to PNG (which preserves the mode).
         fn png(img: DynamicImage) -> Vec<u8> {
@@ -1232,7 +1223,8 @@ mod tests {
         let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert!(b.is_valid(0));
         // The re-encoded PNG decodes back to the requested 4×2 dimensions.
-        assert_eq!(image_dimensions(b.value(0)), Some((4, 2)));
+        let (w, h, _, _) = image_header(b.value(0)).unwrap();
+        assert_eq!((w, h), (4, 2));
         assert!(b.is_null(1)); // null input → null
         assert!(b.is_null(2)); // undecodable input → null
     }

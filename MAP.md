@@ -1869,7 +1869,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map.rs` | 83 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 426 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
-| `eval/media/image.rs` | 641 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/image.rs` | 632 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 40 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/video.rs` | 159 | Video-decode evaluation for `Expr::Video` (the `.video` namespace). |
