@@ -1,12 +1,14 @@
 """`errors` — the typed exception hierarchy, and the machinery that makes it readable.
 
-Two modules, one import path. `hierarchy` holds the exception classes themselves;
+Three modules, one import path. `hierarchy` holds the exception classes themselves;
 `suggest` holds the "did you mean ...?" engine and the canonical unknown-name message
-shape that every layer of the engine formats its lookup failures through.
+shape that every layer of the engine formats its lookup failures through; `validate`
+turns a wrong-typed user argument into one of those exceptions at the API edge.
 
-They are split because they answer different questions — *what* failed versus *how to
-say so* — and joined here because ``from batcher._internal.errors import PlanError`` is
-the import the whole tree already writes, and a package split must never move a name.
+They are split because they answer different questions — *what* failed, *how to say so*,
+and *when to say it* — and joined here because ``from batcher._internal.errors import
+PlanError`` is the import the whole tree already writes, and a package split must never
+move a name.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from batcher._internal.errors.suggest import (
     suggestion,
     unknown_message,
 )
+from batcher._internal.errors.validate import require_int
 
 __all__ = [
     "AccessDeniedError",
@@ -72,6 +75,7 @@ __all__ = [
     "absent_error",
     "candidate_list",
     "did_you_mean",
+    "require_int",
     "suggestion",
     "unknown_message",
     "unknown_value",

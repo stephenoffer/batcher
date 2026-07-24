@@ -1478,7 +1478,7 @@ The scalar expression algebra.
 | `core.py` | 4628 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 167 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
-| `image.py` | 291 | The `.image` expression namespace — lazy, batch-level image decode. |
+| `image.py` | 302 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 498 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 235 | A readable ``repr`` for the scalar `Expr` tree. |
@@ -1869,7 +1869,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map.rs` | 83 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 426 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
-| `eval/media/image.rs` | 587 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/image.rs` | 641 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 40 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/video.rs` | 159 | Video-decode evaluation for `Expr::Video` (the `.video` namespace). |
