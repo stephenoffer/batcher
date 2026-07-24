@@ -121,6 +121,9 @@ absent from this table is either the same name or covered by the relational tabl
 | `date_format(c, f)` / `datepart(p, c)` / `date_trunc(u, c)` | `col("c").dt.strftime(f)` / `bt.date_part(p, c)` / `col("c").dt.truncate(u)` |
 | `dot_product(a, b)` / `jaccard_similarity(a, b)` | `a.list.dot(b)` / `a.list.jaccard(b)` |
 | `list_sum(c)` / `list_max(c)` / … | `col("c").list.sum()` / `.list.max()` / … |
+| `monotonically_increasing_id()` | `ds.with_row_index()` — a `Dataset` method, not an expression |
+| `random_int(lo, hi)` | `ds.with_random()` (seeded, `[0, 1)`) scaled and cast |
+| `uuid()` | no equivalent, deliberately: a random value per row would make the sequential, parallel and distributed paths disagree, and those must be identical. Use `col("k").str.hash64()` for a surrogate key |
 
 **Do not reach for an epoch cast.** Daft's `timestamp_seconds` has no Batcher alias on
 purpose: `col("t").cast("timestamp")` compiles, runs, and is wrong, because Arrow reads a
