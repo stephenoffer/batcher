@@ -134,6 +134,11 @@ print(cut.select(d=col("region").image.decode()).to_pydict())
 # {'d': [{'width': 4, 'height': 4, 'channels': 4, 'mode': 'RGBA'}]}
 ```
 
+`.image.convert(mode)` completes the set: it changes only the channels, which is what
+normalizing a corpus that mixes RGB and RGBA needs before a model that wants one of them.
+The mode names are the ones `decode` reports, so a mode read off one goes straight into
+the other, and grayscale uses the same Rec. 601 luma as `to_grayscale` and `dhash`.
+
 `crop` clips at the edge rather than padding. `center_crop` pads, because it feeds a model
 that needs a fixed input size; a cropped image is something a person or another tool will
 look at, and inventing black pixels there would be inventing data. A window starting past

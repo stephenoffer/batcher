@@ -82,6 +82,36 @@ def test_image_encode_changes_the_container():
     assert out["png"] == ["RGB"]
 
 
+def test_image_convert_changes_the_color_mode():
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
+    got = {
+        mode: ds.select(
+            m=bt.col("img").image.convert(mode).image.decode().struct.field("mode")
+        ).to_pydict()["m"][0]
+        for mode in ("L", "LA", "RGB", "RGBA")
+    }
+    # `decode` names the mode `convert` produced, so the two share one vocabulary.
+    assert got == {"L": "L", "LA": "LA", "RGB": "RGB", "RGBA": "RGBA"}
+
+
+def test_image_convert_and_to_grayscale_agree_on_luma():
+    # Rec. 601 in both, so a pipeline can use either without the greys shifting.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(2, 2)], type=pa.binary())}))
+    via_convert = ds.select(t=bt.col("img").image.convert("L").image.to_tensor(2, 2)).to_pydict()[
+        "t"
+    ][0]
+    via_kernel = ds.select(t=bt.col("img").image.to_grayscale(2, 2)).to_pydict()["t"][0]
+    # `to_tensor` re-expands L to RGB, so compare the luma against every channel.
+    assert via_convert[0] == via_kernel[0]
+
+
+def test_image_convert_rejects_an_unknown_mode():
+    from batcher._internal.errors import PlanError
+
+    with pytest.raises(PlanError, match="mode must be one of"):
+        bt.col("img").image.convert("CMYK")
+
+
 def test_image_encode_rejects_an_unwritable_format():
     from batcher._internal.errors import PlanError
 

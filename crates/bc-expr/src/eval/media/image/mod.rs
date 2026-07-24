@@ -11,7 +11,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, FixedSizeListArray, GenericBinaryArray, Int32Array, Int64Array,
+    Array, ArrayRef, FixedSizeListArray, GenericBinaryArray, Int32Array, Int64Array,
     OffsetSizeTrait, StructArray, UInt8Array,
 };
 use arrow::buffer::NullBuffer;
@@ -19,6 +19,10 @@ use arrow::datatypes::{DataType, Field};
 
 use super::map_rows;
 use crate::{ExprError, ImageFunc};
+
+mod reencode;
+
+use reencode::{convert, crop, encode, resize};
 
 /// Evaluate an image function over a Binary or LargeBinary array of encoded image bytes.
 ///
@@ -144,6 +148,7 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         ImageFunc::Resize => resize(bytes, width, height),
         ImageFunc::Crop => crop(bytes, args),
         ImageFunc::Encode => encode(bytes, args.format),
+        ImageFunc::Convert => convert(bytes, args.format),
         ImageFunc::Dhash => dhash(bytes),
     }
 }
@@ -221,180 +226,13 @@ fn assemble_u8_tensor(n: usize, per_row: usize, rows: Vec<Option<Vec<u8>>>) -> A
     ))
 }
 
-/// `resize(w, h)` → re-encoded PNG bytes at the new size. Null/undecodable → null.
-fn resize<O: OffsetSizeTrait>(
-    bytes: &GenericBinaryArray<O>,
-    width: Option<i64>,
-    height: Option<i64>,
-) -> Result<ArrayRef, ExprError> {
-    let w = dim("resize", "width", width)?;
-    let h = dim("resize", "height", height)?;
-    // Each dimension is a valid `u32`, but the resize allocates a `w * h * 3`-byte RGB
-    // buffer per row; an absurd product (e.g. 50_000²) is a multi-gigabyte allocation bomb
-    // driven by a query parameter. Cap it at `i32::MAX` — no legitimate thumbnail approaches
-    // 2 GiB — computed in `u64` so the multiply itself cannot overflow.
-    if (w as u64) * (h as u64) * 3 > i32::MAX as u64 {
-        return Err(ExprError::InvalidArgument {
-            func: "resize".to_string(),
-            reason: format!(
-                "resize to {w}x{h}x3 bytes exceeds the maximum of {} bytes",
-                i32::MAX
-            ),
-        });
-    }
-    let out: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            None
-        } else {
-            resize_png(bytes.value(i), w, h)
-        }
-    });
-    Ok(Arc::new(BinaryArray::from_iter(out)))
-}
-
-/// Decode, resize to `(w, h)`, and re-encode as PNG; `None` on any failure.
-fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let raw = decode_rgb_resized(data, w, h)?;
-    let img = image::RgbImage::from_raw(w, h, raw)?;
-    let mut buf = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .ok()?;
-    Some(buf.into_inner())
-}
-
-/// The container formats `encode` can write. Mirrored by `_IMAGE_FORMATS` in
-/// `plan/expr_ir/image.py`, which rejects a typo at plan-build time.
+/// Rec. 601 luma of one RGB pixel, rounded to nearest.
 ///
-/// WebP is decodable but not listed: `image` 0.25 reads WebP and does not write it, so
-/// offering it would fail at run time on a name the plan accepted.
-pub(crate) const ENCODE_FORMATS: [&str; 4] = ["png", "jpeg", "bmp", "gif"];
-
-fn encode_format(name: &str) -> Option<image::ImageFormat> {
-    Some(match name {
-        "png" => image::ImageFormat::Png,
-        "jpeg" => image::ImageFormat::Jpeg,
-        "bmp" => image::ImageFormat::Bmp,
-        "gif" => image::ImageFormat::Gif,
-        _ => return None,
-    })
-}
-
-/// `encode(format)` → the same pixels re-encoded in `format`.
-fn encode<O: OffsetSizeTrait>(
-    bytes: &GenericBinaryArray<O>,
-    format: Option<&str>,
-) -> Result<ArrayRef, ExprError> {
-    let name = format.ok_or(ExprError::MissingImageArg {
-        func: "encode".to_string(),
-        arg: "format",
-    })?;
-    // Validate once, before any row: an unknown format is a plan error, and raising it
-    // per row would emit the same message n times.
-    let fmt = encode_format(name).ok_or_else(|| ExprError::InvalidArgument {
-        func: "encode".to_string(),
-        reason: format!(
-            "unknown image format {name:?}; expected one of {}",
-            ENCODE_FORMATS.join(", ")
-        ),
-    })?;
-    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            return None;
-        }
-        let img = image::load_from_memory(bytes.value(i)).ok()?;
-        // JPEG has no alpha channel, so an RGBA source is flattened to RGB rather than
-        // failing the row. Every other target keeps whatever the decoder produced.
-        let img = if matches!(fmt, image::ImageFormat::Jpeg) {
-            image::DynamicImage::ImageRgb8(img.into_rgb8())
-        } else {
-            img
-        };
-        let mut out = Vec::new();
-        img.write_to(&mut Cursor::new(&mut out), fmt).ok()?;
-        Some(out)
-    });
-    Ok(assemble_binary(rows))
-}
-
-/// `crop(x, y, width, height)` → the requested region, re-encoded as PNG bytes.
-///
-/// The arbitrary-offset counterpart of `center_crop`, and the shape a detection pipeline
-/// needs: pull a bounding box out of a frame and keep it as an *image*, not as a tensor.
-///
-/// A window that runs past an edge is **clipped** to the image rather than zero-padded,
-/// which is the opposite of `center_crop`'s choice and deliberate. `center_crop` feeds a
-/// model that needs a fixed input size, so padding preserves the shape contract; `crop`
-/// produces an image a human or another tool will look at, and inventing black pixels
-/// there would be inventing data. A window entirely outside the image yields null.
-fn crop<O: OffsetSizeTrait>(
-    bytes: &GenericBinaryArray<O>,
-    args: ImageArgs<'_>,
-) -> Result<ArrayRef, ExprError> {
-    let w = dim("crop", "width", args.width)?;
-    let h = dim("crop", "height", args.height)?;
-    // `x`/`y` may be zero (unlike a dimension), so they are read directly rather than
-    // through `dim`, which rejects zero.
-    let x = offset("crop", "x", args.x)?;
-    let y = offset("crop", "y", args.y)?;
-    if (w as u64) * (h as u64) * 3 > i32::MAX as u64 {
-        return Err(ExprError::InvalidArgument {
-            func: "crop".to_string(),
-            reason: format!(
-                "crop of {w}x{h}x3 bytes exceeds the maximum of {}",
-                i32::MAX
-            ),
-        });
-    }
-    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            return None;
-        }
-        let img = image::load_from_memory(bytes.value(i)).ok()?;
-        let (sw, sh) = (img.width(), img.height());
-        if x >= sw || y >= sh {
-            return None; // the window starts past the image entirely
-        }
-        let cw = w.min(sw - x);
-        let ch = h.min(sh - y);
-        let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-        let mut out = Vec::new();
-        image::DynamicImage::ImageRgba8(cropped)
-            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-            .ok()?;
-        Some(out)
-    });
-    Ok(assemble_binary(rows))
-}
-
-/// A non-negative pixel offset narrowed to `u32`.
-///
-/// Separate from [`dim`] because zero is a valid offset and an invalid dimension, and
-/// because a negative offset must be rejected rather than wrapped to ~4 billion.
-fn offset(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprError> {
-    let value = value.ok_or(ExprError::MissingImageArg {
-        func: func.to_string(),
-        arg,
-    })?;
-    u32::try_from(value).map_err(|_| ExprError::InvalidImageDim {
-        func: func.to_string(),
-        arg,
-        value,
-        max: u32::MAX,
-    })
-}
-
-/// Collect per-row byte buffers into a `Binary` column (`None` → null).
-fn assemble_binary(rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
-    use arrow::array::BinaryBuilder;
-    let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 512);
-    for row in rows {
-        match row {
-            Some(v) => b.append_value(v),
-            None => b.append_null(),
-        }
-    }
-    Arc::new(b.finish())
+/// The single definition of "grey" in this module: `to_grayscale`, `dhash`, and
+/// `convert("L")` all reduce a pixel through these weights, so they cannot disagree.
+fn rec601([r, g, b]: [u8; 3]) -> u8 {
+    // +500 for round-to-nearest on the /1000 divide; the sum maxes at 255000 < u32.
+    ((299 * r as u32 + 587 * g as u32 + 114 * b as u32 + 500) / 1000) as u8
 }
 
 /// `decode` → struct `{width, height, channels, mode}` (header read only).
@@ -611,9 +449,7 @@ fn to_grayscale<O: OffsetSizeTrait>(
         let mut gray = vec![0u8; per_row];
         for (p, g) in gray.iter_mut().enumerate() {
             let base = p * 3;
-            let (r, gr, b) = (rgb[base] as u32, rgb[base + 1] as u32, rgb[base + 2] as u32);
-            // +500 for round-to-nearest on the /1000 divide; the sum maxes at 255000 < u32.
-            *g = ((299 * r + 587 * gr + 114 * b + 500) / 1000) as u8;
+            *g = rec601([rgb[base], rgb[base + 1], rgb[base + 2]]);
         }
         Some(gray)
     });
@@ -781,8 +617,12 @@ fn decode_jpeg_scaled(data: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::LargeBinaryArray;
+    // The `reencode` tests live here rather than beside their functions because they share
+    // this module's fixtures (`ei`, `args`, `red_png`) and its `eval_image` entry point;
+    // duplicating those into a second test module would cost more than the distance does.
+    use arrow::array::{BinaryArray, LargeBinaryArray};
 
+    use super::reencode::ENCODE_FORMATS;
     use super::*;
 
     /// `eval_image` without normalization — the non-`to_tensor_f32` ops ignore it, so
@@ -1109,6 +949,90 @@ mod tests {
                 x: Some(-1),
                 y: Some(0),
                 ..args(Some(4), Some(4))
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn convert_reports_the_mode_it_was_asked_for() {
+        // Round-trip through `decode`: whatever mode `convert` produces, `decode` must
+        // name it, since a caller reads a mode off one and hands it to the other.
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(4, 4).as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        for (mode, channels) in [("L", 1), ("LA", 2), ("RGB", 3), ("RGBA", 4)] {
+            let out = eval_image(
+                ImageFunc::Convert,
+                &arr,
+                ImageArgs {
+                    format: Some(mode),
+                    ..args(None, None)
+                },
+            )
+            .unwrap();
+            let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let (_, _, got_channels, got_mode) = image_header(b.value(0)).unwrap();
+            assert_eq!((got_mode, got_channels), (mode, channels), "{mode}");
+            assert!(b.is_null(1) && b.is_null(2), "{mode}");
+        }
+    }
+
+    #[test]
+    fn converting_to_grayscale_matches_the_to_grayscale_kernel() {
+        // Two paths reach a luma channel; they must not disagree about the weighting.
+        use image::{Rgb, RgbImage};
+        let mut img = RgbImage::new(2, 2);
+        img.put_pixel(0, 0, Rgb([10, 200, 30]));
+        img.put_pixel(1, 0, Rgb([255, 0, 0]));
+        img.put_pixel(0, 1, Rgb([0, 0, 255]));
+        img.put_pixel(1, 1, Rgb([70, 70, 70]));
+        let mut src = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut src, image::ImageFormat::Png)
+            .unwrap();
+        let src = src.into_inner();
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(src.as_slice())]));
+
+        let converted = eval_image(
+            ImageFunc::Convert,
+            &arr,
+            ImageArgs {
+                format: Some("L"),
+                ..args(None, None)
+            },
+        )
+        .unwrap();
+        let b = converted.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let via_convert = image::load_from_memory(b.value(0)).unwrap().into_luma8();
+
+        let grayscaled = ei(ImageFunc::ToGrayscale, &arr, Some(2), Some(2)).unwrap();
+        let fsl = grayscaled
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let row = fsl.value(0);
+        let via_kernel = row.as_any().downcast_ref::<UInt8Array>().unwrap();
+        for i in 0..4 {
+            assert_eq!(
+                via_convert.as_raw()[i],
+                via_kernel.value(i),
+                "pixel {i} disagreed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_color_mode_is_an_error() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
+        assert!(eval_image(
+            ImageFunc::Convert,
+            &arr,
+            ImageArgs {
+                format: Some("CMYK"),
+                ..args(None, None)
             }
         )
         .is_err());

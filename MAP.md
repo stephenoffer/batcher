@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 820 Python modules across 124 packages and 162 Rust files across 13 crates.
+Covering 820 Python modules across 124 packages and 163 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -1479,7 +1479,7 @@ The scalar expression algebra.
 | `core.py` | 4630 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 167 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
-| `image.py` | 385 | The `.image` expression namespace — lazy, batch-level image decode. |
+| `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 235 | A readable ``repr`` for the scalar `Expr` tree. |
@@ -1870,7 +1870,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map.rs` | 84 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 430 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
-| `eval/media/image.rs` | 781 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/image/mod.rs` | 617 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/image/reencode.rs` | 250 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 40 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/video.rs` | 159 | Video-decode evaluation for `Expr::Video` (the `.video` namespace). |
@@ -1893,7 +1894,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1121 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1127 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`

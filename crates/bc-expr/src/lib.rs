@@ -494,6 +494,12 @@ pub enum ImageFunc {
     /// pixels unchanged. Normalizes a mixed-format corpus to one codec, or trades a PNG
     /// for a smaller JPEG. Null/undecodable input → null. → Binary.
     Encode,
+    /// `convert(mode)` → the image converted to color mode `L`, `LA`, `RGB`, or `RGBA`,
+    /// re-encoded as PNG. The general form of `ToGrayscale`, which is `L` plus a resize;
+    /// this changes only the channels, so it is the step for normalizing a corpus that
+    /// mixes RGB and RGBA before a model that wants one of them. Reads the `format` slot,
+    /// like `Encode`. Null/undecodable input → null. → Binary.
+    Convert,
     /// `dhash()` → a 64-bit *difference hash*: the perceptual fingerprint that makes
     /// image near-duplicate detection expressible. Two visually similar images differ
     /// in few bits, so `bit_count(a ^ b)` is their Hamming distance and a threshold on

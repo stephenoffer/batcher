@@ -22,6 +22,11 @@ __all__ = ["ImageFunc", "_ImageNamespace"]
 # rejecting it here.
 _IMAGE_FORMATS = frozenset({"png", "jpeg", "bmp", "gif"})
 
+# Color modes `.image.convert` can produce; mirrors `bc-expr`'s `COLOR_MODES`, and the
+# same vocabulary `.image.decode()` reports — so a mode read off `decode` can be handed
+# straight back to `convert`.
+_IMAGE_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
+
 
 @expr_node
 class ImageFunc(IRNode):
@@ -186,6 +191,47 @@ class _ImageNamespace:
                 f"image.encode(): format must be one of {sorted(_IMAGE_FORMATS)}, got {format!r}"
             )
         return ImageFunc("encode", self._e, format=format)
+
+    def convert(self, mode: str) -> ImageFunc:
+        """Convert each image to color `mode`, re-encoded as PNG.
+
+        The general form of :meth:`to_grayscale`, which is ``"L"`` plus a resize. This
+        changes only the channels, which is what normalizing a corpus that mixes RGB and
+        RGBA needs before a model that wants one of them.
+
+        The mode names are the ones :meth:`decode` reports, so a mode read off one can be
+        handed straight back to the other. Grayscale uses Rec. 601 luma — the same
+        weighting :meth:`to_grayscale` and :meth:`dhash` use, so the three cannot disagree
+        about what grey means.
+
+        Args:
+            mode: One of ``"L"`` (grayscale), ``"LA"`` (grayscale + alpha), ``"RGB"``, or
+                ``"RGBA"``.
+
+        Returns:
+            An expression evaluating to PNG bytes in `mode`; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `mode` is not one of the four.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> grey = bt.col("img").image.convert("L")
+                >>> ds.select(m=grey.image.decode().struct.field("mode")).to_pydict()
+                {'m': ['L']}
+        """
+        if mode not in _IMAGE_MODES:
+            raise PlanError(
+                f"image.convert(): mode must be one of {sorted(_IMAGE_MODES)}, got {mode!r}"
+            )
+        # `format` carries the target mode here and the target container for `encode`;
+        # neither function uses the other's meaning, so they share the one string slot.
+        return ImageFunc("convert", self._e, format=mode)
 
     def to_tensor(self, width: int, height: int) -> ImageFunc:
         """Decode and resize to ``(width, height)``, flattened to RGB8 pixels.
