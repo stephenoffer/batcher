@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir import atan2
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.core import Binary, Expr, IntoExpr, Math2Expr, MathExpr, _wrap
@@ -296,6 +296,7 @@ def width_bucket(value: IntoExpr, low: IntoExpr, high: IntoExpr, count: int) -> 
             >>> ds.select(bt.width_bucket(bt.col("v"), 0, 10, 5).alias("r")).to_pydict()
             {'r': [1.0, 3.0, 0.0, 6.0]}
     """
+    count = require_int(count, func="width_bucket", arg="count", minimum=1)
     v, lo, hi = _wrap(value), _wrap(low), _wrap(high)
     # floor((value - low) / (high - low) * count) + 1, clamped to [0, count+1].
     # Cast the numerator to float so the division is true (not integer) division.

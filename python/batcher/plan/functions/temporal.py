@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import MakeTemporal, WindowBuckets, WindowStart
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
@@ -207,7 +207,8 @@ def date_add(expr: IntoExpr, days: int) -> Expr:
             >>> ds.select(bt.date_add(bt.col("d"), 5).alias("r")).to_pydict()
             {'r': [datetime.date(2024, 2, 5)]}
     """
-    return _wrap(expr).dt.offset_by(f"{int(days)}d")
+    days = require_int(days, func="date_add", arg="days")
+    return _wrap(expr).dt.offset_by(f"{days}d")
 
 
 def date_sub(expr: IntoExpr, days: int) -> Expr:
@@ -231,7 +232,8 @@ def date_sub(expr: IntoExpr, days: int) -> Expr:
             >>> ds.select(bt.date_sub(bt.col("d"), 5).alias("r")).to_pydict()
             {'r': [datetime.date(2024, 3, 10)]}
     """
-    return _wrap(expr).dt.offset_by(f"{-int(days)}d")
+    days = require_int(days, func="date_sub", arg="days")
+    return _wrap(expr).dt.offset_by(f"{-days}d")
 
 
 # Epoch unit → the engine `MakeTemporal` function that reads a count in that unit.

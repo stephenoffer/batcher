@@ -12,6 +12,7 @@ fraction of my rows have this problem".
 
 from __future__ import annotations
 
+from batcher._internal.errors import require_int
 from batcher.plan.expr_ir.constructors import lit
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
@@ -182,6 +183,7 @@ def long_output_rate(text: IntoExpr, min_chars: int) -> Expr:
             >>> ds.agg(l=bt.long_output_rate("o", min_chars=10)).to_pydict()["l"][0]
             0.5
     """
+    min_chars = require_int(min_chars, func="long_output_rate", arg="min_chars")
     return _rate(_as_column(text).str.len_chars() > lit(min_chars))
 
 
@@ -207,6 +209,7 @@ def short_output_rate(text: IntoExpr, max_chars: int) -> Expr:
             >>> ds.agg(s=bt.short_output_rate("o", max_chars=10)).to_pydict()["s"][0]
             0.5
     """
+    max_chars = require_int(max_chars, func="short_output_rate", arg="max_chars")
     return _rate(_as_column(text).str.len_chars() < lit(max_chars))
 
 

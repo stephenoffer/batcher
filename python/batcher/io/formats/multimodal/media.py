@@ -41,6 +41,11 @@ from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = ["MediaSource", "MediaSplit"]
 
+#: One file's read: header bytes, payload (None in reference mode), size, parsed header
+#: metadata (None when the source declares no metadata columns). `None` for the whole
+#: tuple means the file was unreadable and the error was tolerated.
+_Read = tuple[bytes, "bytes | None", int, "dict[str, Any] | None"] | None
+
 # In reference mode (no full-byte materialization) we still read a header chunk so
 # MIME sniffing and header-only metadata work; large enough for image/audio/video
 # container headers, tiny next to a multi-GB payload.
@@ -305,15 +310,16 @@ class MediaSource:
         """
         return self._assemble(chunk, self._read_chunk(chunk, materialize))
 
-    def _assemble(
-        self, chunk: list[str], reads: list[tuple[bytes, bytes | None, int]]
-    ) -> pa.RecordBatch:
+    def _assemble(self, chunk: list[str], reads: list[_Read]) -> pa.RecordBatch:
         """Build one `RecordBatch` from files and their already-read payloads.
 
         Split from the read so `read()` can bulk-fetch every file in one wide concurrent
         wave and then assemble the batches, instead of a fresh thread pool + a serial
         read per file-batch (which left a many-file scan far under the raw parallel-read
         throughput — the ingest floor for a directory of many small images/clips).
+
+        Header metadata arrives already extracted (see `_read_payload_safe`), so this
+        loop is list-appending only.
         """
         uris: list[str] = []
         blobs: list[bytes | None] = []
@@ -324,13 +330,13 @@ class MediaSource:
         for path, read in zip(chunk, reads, strict=True):
             if read is None:  # unreadable and tolerated — contributes no row
                 continue
-            header, payload, size = read
+            header, payload, size, meta = read
             uris.append(path)
             blobs.append(payload)  # None in reference mode
             sizes.append(size)
             mimes.append(sniff_mime(path, header))
-            if self._with_meta:
-                meta_rows.append(self._safe_extract(header, meta_fields))
+            if meta is not None:
+                meta_rows.append(meta)
         arrays: list[pa.Array] = [
             pa.array(uris, pa.string()),
             pa.array(blobs, pa.large_binary()),
@@ -343,9 +349,7 @@ class MediaSource:
             names.append(name)
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
-    def _read_chunk(
-        self, chunk: list[str], materialize: bool
-    ) -> list[tuple[bytes, bytes | None, int]]:
+    def _read_chunk(self, chunk: list[str], materialize: bool) -> list[_Read]:
         """Read every file in ``chunk`` concurrently, preserving order.
 
         Each media file is one object-store round trip; the read releases the GIL, so a
@@ -369,15 +373,26 @@ class MediaSource:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(read, chunk))  # order preserved
 
-    def _read_payload_safe(
-        self, path: str, materialize: bool
-    ) -> tuple[bytes, bytes | None, int] | None:
-        """`_read_payload`, honoring `on_error` — None marks a file to drop."""
+    def _read_payload_safe(self, path: str, materialize: bool) -> _Read:
+        """Fetch one file and parse its header metadata; None marks a file to drop.
+
+        Extraction runs **here**, inside the pool task, not in a serial loop after it: the
+        fetch was already concurrent, so one Pillow / soundfile / av header parse per file
+        on one thread was the part that was not. Each `_extract_meta` parses an independent
+        `BytesIO` and shares no state, so it fans out safely — unlike the footer *parse*
+        the pool-sizing comment below warns about.
+        """
         try:
-            return self._read_payload(path, materialize)
+            header, payload, size = self._read_payload(path, materialize)
         except Exception as exc:
             self._errors.tolerate(path, exc, format_name=self.format_name)
             return None
+        if not self._with_meta:
+            return header, payload, size, None
+        try:
+            return header, payload, size, self._extract_meta(header)
+        except Exception:  # a corrupt header nulls this file's metadata, not the batch
+            return header, payload, size, dict.fromkeys(n for n, _ in self._meta_fields())
 
     def corrupt_files(self) -> list[str]:
         """The paths this source skipped, in failure order (empty unless `on_error="skip"`).
@@ -411,20 +426,6 @@ class MediaSource:
         with self._fs.open(path) as fh:
             header = fh.read(_HEADER_BYTES)
         return header, None, self._fs.size(path)
-
-    def _safe_extract(
-        self, data: bytes, meta_fields: list[tuple[str, pa.DataType]]
-    ) -> dict[str, Any]:
-        """Extract header metadata, tolerating an unreadable/corrupt header.
-
-        A file whose header cannot be parsed yields nulls for its metadata
-        columns rather than failing the whole batch — a partial-listing read must
-        not be derailed by one bad file.
-        """
-        try:
-            return self._extract_meta(data)
-        except Exception:  # header parse errors are per-file, non-fatal
-            return dict.fromkeys((n for n, _ in meta_fields))
 
     # ---- override points --------------------------------------------------
     def _meta_fields(self) -> list[tuple[str, pa.DataType]]:

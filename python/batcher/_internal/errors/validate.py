@@ -22,7 +22,7 @@ from typing import Any
 
 from batcher._internal.errors.hierarchy import PlanError
 
-__all__ = ["require_int"]
+__all__ = ["require_float", "require_int"]
 
 
 def require_int(value: Any, *, func: str, arg: str, minimum: int | None = None) -> int:
@@ -50,3 +50,31 @@ def require_int(value: Any, *, func: str, arg: str, minimum: int | None = None) 
     if minimum is not None and number < minimum:
         raise PlanError(f"{func}(): {arg} must be >= {minimum}, got {number}")
     return number
+
+
+def require_float(value: Any, *, func: str, arg: str) -> float:
+    """Coerce `value` to a `float` for lowering into the IR, or raise `PlanError`.
+
+    Only the *type* is checked here. Callers keep their own domain checks (``0 <= q <= 1``)
+    because those messages name the real constraint; what they could not do is run at all
+    when handed a string, because ``0.0 <= "abc"`` raises `TypeError` before the check has
+    a chance to say anything useful.
+
+    Anything implementing ``__float__`` is accepted, so a NumPy float or a `Decimal` works.
+    `bool` is rejected for the same reason `require_int` rejects it: ``sample_frac(True)``
+    would silently mean "all rows" rather than being the mistake it is.
+
+    Args:
+        value: The argument as the caller passed it.
+        func: Dotted method name for the message, such as ``"quantile"``.
+        arg: Parameter name for the message.
+
+    Returns:
+        `value` as a plain `float`.
+
+    Raises:
+        PlanError: If `value` is not a number.
+    """
+    if isinstance(value, bool) or not hasattr(value, "__float__"):
+        raise PlanError(f"{func}(): {arg} must be a number, got {type(value).__name__} {value!r}")
+    return float(value)

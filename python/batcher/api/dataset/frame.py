@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float, require_int
 from batcher.api._join_helpers import (
     _as_expr,
     _as_key_expr,
@@ -1617,8 +1617,8 @@ class Dataset:
         """
         if num_files is not None and target_size_mb is not None:
             raise PlanError("repartition(): pass num_files or target_size_mb, not both")
-        if num_files is not None and num_files < 1:
-            raise PlanError(f"repartition(): num_files must be >= 1, got {num_files}")
+        if num_files is not None:
+            num_files = require_int(num_files, func="repartition", arg="num_files", minimum=1)
         if target_size_mb is not None and target_size_mb <= 0:
             raise PlanError(f"repartition(): target_size_mb must be > 0, got {target_size_mb}")
         by_cols = () if by is None else ((by,) if isinstance(by, str) else tuple(by))
@@ -1766,6 +1766,7 @@ class Dataset:
                 >>> ds.top_k(2, "x").to_pydict()
                 {'x': [5, 4]}
         """
+        k = require_int(k, func="top_k", arg="k", minimum=0)
         keys = by if isinstance(by, list) else [by]
         return self.sort(*keys, descending=descending).limit(k)
 
@@ -2458,8 +2459,8 @@ class Dataset:
                 >>> ds.sort("x").limit(2, offset=1).to_pydict()
                 {'x': [2, 3]}
         """
-        if n < 0 or offset < 0:
-            raise PlanError("limit() requires non-negative n and offset")
+        n = require_int(n, func="limit", arg="n", minimum=0)
+        offset = require_int(offset, func="limit", arg="offset", minimum=0)
         return self._derive(Limit(self._plan, n, offset))
 
     def head(self, n: int = 5) -> Dataset:
@@ -2540,10 +2541,8 @@ class Dataset:
                 >>> bt.from_pydict({"x": [10, 20, 30, 40, 50]}).gather_every(2).to_pydict()
                 {'x': [10, 30, 50]}
         """
-        if n < 1:
-            raise PlanError(f"gather_every(): n must be >= 1, got {n}")
-        if offset < 0:
-            raise PlanError(f"gather_every(): offset must be non-negative, got {offset}")
+        n = require_int(n, func="gather_every", arg="n", minimum=1)
+        offset = require_int(offset, func="gather_every", arg="offset", minimum=0)
         idx = "__bc_gather_idx"
         keep = (Col(idx) >= offset) & ((Col(idx) - offset) % n == 0)
         return self.with_row_index(idx).filter(keep).drop(idx)
@@ -2587,7 +2586,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [5, 3, 8, 1]}).bottom_k(2, "x").sort("x").to_pydict()
                 {'x': [1, 3]}
         """
-        return self.top_k(k, by, descending=False)
+        return self.top_k(require_int(k, func="bottom_k", arg="k"), by, descending=False)
 
     def slice(self, offset: int, length: int | None = None) -> Dataset:
         """Rows ``[offset, offset + length)`` — the Polars ``slice`` spelling of ``limit``.
@@ -2606,8 +2605,8 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).slice(1, 2).to_pydict()
                 {'x': [2, 3]}
         """
-        if length is None:
-            length = self.count()
+        offset = require_int(offset, func="slice", arg="offset")
+        length = self.count() if length is None else require_int(length, func="slice", arg="length")
         return self.limit(length, offset)
 
     def melt(
@@ -3160,7 +3159,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2]}).coalesce(1).count()
                 2
         """
-        return self.repartition(n)
+        return self.repartition(require_int(n, func="coalesce", arg="n", minimum=1))
 
     def lazy(self) -> Dataset:
         """Return this dataset unchanged — a `Dataset` is always lazy.
@@ -3521,7 +3520,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [5, 3, 8]}).nlargest(2, "x").sort("x").to_pydict()
                 {'x': [5, 8]}
         """
-        return self.top_k(n, columns)
+        return self.top_k(require_int(n, func="nlargest", arg="n"), columns)
 
     def nsmallest(self, n: int, columns: str | list[str]) -> Dataset:
         """The `n` rows with the smallest `columns` — the pandas ``nsmallest``.
@@ -3540,7 +3539,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [5, 3, 8]}).nsmallest(2, "x").sort("x").to_pydict()
                 {'x': [3, 5]}
         """
-        return self.bottom_k(n, columns)
+        return self.bottom_k(require_int(n, func="nsmallest", arg="n"), columns)
 
     def round(self, decimals: int = 0) -> Dataset:
         """Round every numeric column to `decimals` places — the pandas ``round``.
@@ -3688,7 +3687,7 @@ class Dataset:
                 >>> 0 < ds.sample_frac(0.5, seed=1).count() < 100
                 True
         """
-        return self.sample(fraction=frac, seed=seed)
+        return self.sample(fraction=require_float(frac, func="sample_frac", arg="frac"), seed=seed)
 
     def drop_constant_columns(self) -> Dataset:
         """Drop every column holding a single distinct value — the zero-variance filter.
@@ -3824,8 +3823,7 @@ class Dataset:
         """
         from batcher.plan.expr_ir.nodes import row_number
 
-        if n < 1:
-            raise PlanError(f"sample_per_group(): n must be >= 1, got {n}")
+        n = require_int(n, func="sample_per_group", arg="n", minimum=1)
         keys = [by] if isinstance(by, str) else list(by)
         order = order_by if order_by is not None else keys[0]
         rank = "__bc_group_rank"
@@ -4888,7 +4886,7 @@ class Dataset:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).corr("a", "b")
+                >>> round(bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).corr("a", "b"), 6)
                 1.0
         """
         from batcher.plan.functions.aggregate import corr
@@ -5148,6 +5146,7 @@ class Dataset:
                 >>> ds.approx_quantile("x", 0.5) is not None
                 True
         """
+        q = require_float(q, func="approx_quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"approx_quantile(q) requires q in [0, 1], got {q}")
         self._require_column(column, "approx_quantile")
@@ -5202,6 +5201,7 @@ class Dataset:
                 >>> ds.approx_percentile("x", 90) is not None
                 True
         """
+        p = require_float(p, func="approx_percentile", arg="p")
         if not 0.0 <= p <= 100.0:
             raise PlanError(f"approx_percentile(p) requires p in [0, 100], got {p}")
         return self.approx_quantile(column, p / 100.0)

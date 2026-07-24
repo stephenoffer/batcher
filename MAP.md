@@ -1182,7 +1182,7 @@ Multimodal sources — images/audio/video/embeddings as queryable Arrow columns.
 | `blob.py` | 166 | Blob-by-reference: offload large per-row payloads to a content-addressed store. |
 | `embeddings.py` | 219 | Embedding source — vector files (.npy / .parquet) → an Arrow embedding column. |
 | `images.py` | 59 | Image source — list image files + header-only width/height/mode. |
-| `media.py` | 499 | Multimodal media source base — list files, never decode pixels/frames. |
+| `media.py` | 500 | Multimodal media source base — list files, never decode pixels/frames. |
 | `video.py` | 70 | Video source — list video files + header-only fps/frames/width/height/duration. |
 
 ### `batcher/io/formats/nosql/` — 2 · neutral IO

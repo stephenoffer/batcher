@@ -14,7 +14,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.api.dataset import Dataset
 from batcher.api.session.frames import from_arrow
 
@@ -93,6 +93,10 @@ def range(
     Raises:
         PlanError: If `step` is zero.
     """
+    start = require_int(start, func="range", arg="start")
+    step = require_int(step, func="range", arg="step")
+    if stop is not None:
+        stop = require_int(stop, func="range", arg="stop")
     if stop is None:
         start, stop = 0, start
     if step == 0:
