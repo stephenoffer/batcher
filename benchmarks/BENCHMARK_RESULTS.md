@@ -1,5 +1,37 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## A self-join fell to the single-threaded streaming path — TPC-H q21 3.2x → 1.5x (2026-07-23)
+
+TPC-H q21 was the worst-remaining single-node query (3.2x DuckDB, 211 ms), and the cause was
+the *executor*, not a kernel. Its correlated `EXISTS`/`NOT EXISTS` decorrelate into self-joins
+over `lineitem` — the same source scanned three times. The streaming parallel executor refuses
+to shard a plan that reads a source more than once (sharding the driving scan would hand a build
+side a shard instead of the whole relation), so the entire query fell to the **single-threaded
+sequential streaming pipeline**, where the joins probe one morsel at a time. The materializing
+executor's `join_partitioned` spreads the probe across every core: q21 measured **251 ms
+streaming vs 92 ms materializing** at sf1.
+
+`bc_interp::streaming_parallelizes(plan)` reports whether the streaming executor can spread a
+plan (false iff a source is read twice). The single-node FFI dispatch now prefers the
+materializing executor for such a plan **when its input is a small fraction of the memory
+envelope** (`src_bytes × 8 < budget`). Streaming's value on a self-join is bounded *intermediate*
+memory — the join outputs it never holds in full — so it is given up only when those intermediates
+cannot approach the cap, and the materializing breakers spill on top of that. Verified both ways:
+an ample envelope routes q21 to materializing (156 ms), a 1 GB cap keeps it streaming (243 ms,
+bounded). The distributed path is untouched — it composes the `dist` primitives, not this
+dispatch — and both executors are checked against the same sequential oracle, so this trades only
+memory headroom for speed.
+
+| TPC-H sf1 q21 vs DuckDB | ms | ratio |
+|---|---:|---:|
+| before (streaming, single-threaded) | 211 | 3.2x |
+| after (materializing, per-core join) | 112 | 1.5x |
+
+Landed with a companion fix that compiles the streaming aggregate's JIT **once per query** rather
+than once per shard (a 92-core box was paying Cranelift's per-expression compile ~90 times):
+`fold_partial` takes a caller-shared `OnceLock<AggJit>`. 1081 Rust tests, the 224 differential
+join/subquery tests (`correlated_exists`, `sql_correlated`, `sql_subquery`), and clippy pass.
+
 ## The streaming aggregate interpreted its arithmetic inputs — TPC-H sf1 8/22 → 12/22 (2026-07-23)
 
 The streaming executor is the default, but its aggregate fold (`stream::fold_partial`) evaluated
