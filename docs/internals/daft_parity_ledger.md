@@ -178,11 +178,19 @@ then cost Batcher almost nothing on top (`img-resize` is *faster* than `img-deco
 DCT-scaled JPEG path doing its job), while Daft's resize adds ~30 ms. **Batcher's image
 kernels are the better ones; the loss is entirely in per-file fetch.**
 
-Ruled out so far: header metadata extraction ran in a serial Python loop after the
-concurrent fetch (one `PIL.Image.open` per file on one thread). That is now fused into the
-pool task, which is right on its own terms but moved the number only a few percent —
-239.7 / 243.1 / 252.0 ms across three runs, inside the spread. So the cost is somewhere
-else in the listing/fetch path, and the next attempt should profile rather than guess.
+Two things ruled out, so the next attempt does not re-chase them:
+
+1. **Serial header parsing.** Metadata extraction ran in a Python loop after the concurrent
+   fetch — one `PIL.Image.open` per file on one thread. It is now fused into the pool task,
+   which is right on its own terms but moved the number only a few percent
+   (239.7 / 243.1 / 252.0 ms across three runs, inside the spread).
+2. **Benchmark fairness.** The obvious excuse is that Batcher expands a glob while Daft is
+   handed a URI list. It does not hold: `ImageCorpus.uris()` calls `open()`, which calls
+   `_list_corpus` with no caching, inside the timed function. Both engines pay for the
+   listing. The gap is real.
+
+So the cost is elsewhere in the fetch path, and the next attempt should profile rather than
+guess.
 
 This does **not** contradict `docs/benchmarks/vs-daft.md`, which reports Batcher well ahead
 on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regime where
