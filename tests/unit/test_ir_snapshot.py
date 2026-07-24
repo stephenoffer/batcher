@@ -59,6 +59,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListSlice,
     ListTransform,
     ListZip,
+    MakeTemporal,
     MapFunc,
     Strftime,
     StrFunc,
@@ -139,6 +140,7 @@ def _representatives() -> dict[str, Any]:
         # --- date/time ----------------------------------------------------------
         "date_func": DateFunc("year", Col("d")),
         "date_trunc": DateTrunc(Col("d"), "month"),
+        "make_temporal": MakeTemporal("make_date", [Col("y"), Col("m"), Col("d")]),
         "convert_timezone": ConvertTimezone(Col("d"), "UTC", "America/New_York"),
         "date_offset_full": DateOffset(Col("d"), 1, 2, 3),
         "date_offset_partial": DateOffset(Col("d"), 0, 5, 0),  # omit zero months/micros

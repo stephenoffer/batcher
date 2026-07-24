@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, RecordBatch,
-};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow::compute::kernels::arity::try_binary;
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::zip::zip;

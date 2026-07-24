@@ -38,6 +38,7 @@ __all__ = [
     "DATE_FNS",
     "KEYED_STR_FNS",
     "LIST_FNS",
+    "MAKE_TEMPORAL_FNS",
     "MATH_FNS",
     "STR_FNS",
     "WINDOW_AGGREGATES",
@@ -134,6 +135,18 @@ DATE_FNS: Final[frozenset[str]] = frozenset(
         "year",
     }
 )  # fmt: skip
+
+MAKE_TEMPORAL_FNS: Final[frozenset[str]] = frozenset(
+    {
+        "make_date", "make_timestamp", "from_unix_seconds", "from_unix_millis",
+        "from_unix_micros", "from_unix_nanos", "from_unix_date",
+    }
+)  # fmt: skip
+"""Temporal *constructors* carried by `MakeTemporal` — the inverse of `DATE_FNS`.
+
+The epoch conversions are a family rather than one `from_epoch` node because the unit
+is not a value the engine can infer: an Int64 column of epoch counts carries no record
+of whether it counts seconds or nanoseconds, so the plan has to say."""
 
 LIST_FNS: Final[frozenset[str]] = frozenset(
     {

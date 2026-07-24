@@ -66,6 +66,10 @@ from batcher.plan.functions.temporal import (
     date_add,
     date_part,
     date_sub,
+    from_epoch,
+    from_unix_date,
+    make_date,
+    make_timestamp,
     window,
 )
 
@@ -99,6 +103,8 @@ __all__ = [
     "extract_tag",
     "fold_horizontal",
     "format_string",
+    "from_epoch",
+    "from_unix_date",
     "gcd",
     "hmac_sha256",
     "hypot",
@@ -106,6 +112,8 @@ __all__ = [
     "is_refusal",
     "lcm",
     "log",
+    "make_date",
+    "make_timestamp",
     "mask",
     "max",
     "max_horizontal",

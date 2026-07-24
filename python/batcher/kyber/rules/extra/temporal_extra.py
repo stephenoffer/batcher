@@ -28,7 +28,7 @@ Deliberately **not** rewritten — each omission is a decision, with the reason:
   ``millennium`` extension noted below) are range-sargable.
 * ``century`` / ``millennium`` — these *are* monotone and contiguous
   (``century = (Y-1)//100 + 1``, ``millennium = (Y-1)//1000 + 1``; see
-  ``bc-expr/src/eval/date.rs``), but their home is the ``_BUCKETS`` table in
+  ``bc-expr/src/eval/temporal/date.rs``), but their home is the ``_BUCKETS`` table in
   `temporal_sargable` — two entries, no new code. Left there deliberately rather than
   re-implemented here.
 * ``convert_timezone`` elimination — **not** an identity, even from a zone to *itself*:
@@ -354,7 +354,7 @@ def rewrite_date_cast_filter(node: Filter) -> Filter | None:
 
 # `DateFunc`s whose value Python computes *identically* to the engine. Each mirrors an
 # arrow `DatePart` (`date_part` is 1-based for quarter/day_of_year, as Python is) or the
-# engine's explicit year formula (`bc-expr/src/eval/date.rs`). Everything else is left to
+# engine's explicit year formula (`bc-expr/src/eval/temporal/date.rs`). Everything else is left to
 # the engine on purpose: `dayname`/`monthname` are locale-sensitive in Python but chrono
 # `%A`/`%B` in the engine; `week`/`iso_year`/`isodow` follow ISO rules Python spells
 # differently; `epoch`/`last_day`/`is_leap_year`/`days_in_month` have engine-specific

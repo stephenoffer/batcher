@@ -231,6 +231,10 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.date_part(part, expr)` | extract a calendar field (`year`/`month`/`dow`/…) |
 | `bt.date_add(expr, days)` | add a whole number of `days` to a date/time column (Spark `date_add`) |
 | `bt.date_sub(expr, days)` | subtract a whole number of `days` from a date/time column (Spark `date_sub`) |
+| `bt.make_date(year, month, day)` | build a Date from integer components; an impossible date is null |
+| `bt.make_timestamp(year, month, day, hour=0, minute=0, second=0)` | build a Timestamp from components |
+| `bt.from_epoch(expr, unit="s")` | read an integer epoch column as a Timestamp at a stated unit (`s`/`ms`/`us`/`ns`) |
+| `bt.from_unix_date(expr)` | read an integer column of days since 1970-01-01 as a Date |
 
 ## Top-level helpers
 
@@ -341,7 +345,7 @@ model once per worker.
 | `Tokenizer` / `Concatenator` | stateless text split / feature-vector assembly |
 | `Chain` | each step, fit on the previous step's output |
 
-See the [preprocessors guide](../ml/preprocessors.md) for the workflow and the
+See the [preprocessors guide](../ml/preprocessors/index.md) for the workflow and the
 [ML API page](ml.md) for the per-class reference.
 
 ## Configuration

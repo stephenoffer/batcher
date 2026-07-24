@@ -89,6 +89,7 @@ class ExprTag:
     LIST_SLICE: Final = "list_slice"
     STRUCT_FIELD: Final = "struct_field"
     MAKE_STRUCT: Final = "make_struct"
+    MAKE_TEMPORAL: Final = "make_temporal"
     MAP: Final = "map"
     IMAGE: Final = "image"
     AUDIO: Final = "audio"

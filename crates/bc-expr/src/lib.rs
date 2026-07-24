@@ -183,6 +183,26 @@ pub enum Expr {
     /// per-row element values (all elements coerced to a common type).
     Array { elements: Vec<Expr> },
 
+    /// Build a Date/Timestamp from integer inputs — the inverse of the `Date` field
+    /// extractions.
+    ///
+    /// One variant covers both directions because they share every hard part (null
+    /// propagation, range validation, the Arrow builder): `make_date`/`make_timestamp`
+    /// assemble calendar *parts*, and the `from_unix_*` functions reinterpret a single
+    /// *epoch count* at a stated unit. The unit has to be stated — an `Int64` column of
+    /// epoch values carries no record of whether it counts seconds, millis, or micros,
+    /// and a plain `CAST(x AS TIMESTAMP)` has to guess (it assumes microseconds), which
+    /// silently turns epoch seconds into 1970.
+    ///
+    /// Arity is checked at evaluation: 3 args for `make_date`, 6 for `make_timestamp`,
+    /// 1 for every `from_unix_*`. An out-of-range or non-existent date (month 13,
+    /// February 30) yields null rather than erroring, so one bad row cannot abort a scan.
+    MakeTemporal {
+        #[serde(rename = "fn")]
+        func: MakeTemporalFunc,
+        args: Vec<Expr>,
+    },
+
     /// `hash(e0, e1, …, seed)` — a deterministic 64-bit hash of the row's *values* → Int64.
     ///
     /// Typed, not textual: an integer hashes its bits, a float its (canonicalized) bits, a
@@ -863,6 +883,28 @@ pub enum StrFunc {
     /// null; an unknown style is an error, not a silent passthrough. → Utf8.
     /// See `eval::str::case`.
     ToCase,
+}
+
+/// Temporal *constructors* carried by [`Expr::MakeTemporal`] — the inverse direction of
+/// [`DateFunc`]'s extractions. Wire tags are snake_case (the contract with Python).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MakeTemporalFunc {
+    /// `(year, month, day)` → Date32. An impossible date is null, not an error.
+    MakeDate,
+    /// `(year, month, day, hour, minute, second)` → Timestamp(Microsecond).
+    MakeTimestamp,
+    /// Epoch **seconds** → Timestamp(Microsecond).
+    FromUnixSeconds,
+    /// Epoch **milliseconds** → Timestamp(Microsecond).
+    FromUnixMillis,
+    /// Epoch **microseconds** → Timestamp(Microsecond).
+    FromUnixMicros,
+    /// Epoch **nanoseconds** → Timestamp(Microsecond). Truncates toward negative
+    /// infinity, so the result is the microsecond containing the instant.
+    FromUnixNanos,
+    /// Days since 1970-01-01 → Date32 (Spark `date_from_unix_date`).
+    FromUnixDate,
 }
 
 /// Date/time field extractions (→ Int64). Wire tags are snake_case (the contract

@@ -17,13 +17,21 @@ from batcher.plan.expr_ir.fn_names import (
     DATE_FNS,
     KEYED_STR_FNS,
     LIST_FNS,
+    MAKE_TEMPORAL_FNS,
     STR_FNS,
     ListBinaryFn,
     ListSetFn,
     ListZipFn,
     MapFn,
 )
-from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, literal, scalar
+from batcher.plan.expr_ir.node_base import (
+    IRNode,
+    child,
+    children,
+    expr_node,
+    literal,
+    scalar,
+)
 from batcher.plan.ir_tags import ExprTag
 
 
@@ -71,6 +79,22 @@ class DateFunc(IRNode):
     vocab = DATE_FNS
     fn: str = scalar()
     input: Expr = child()
+
+
+@expr_node
+class MakeTemporal(IRNode):
+    """Build a Date/Timestamp from integer parts or an epoch count.
+
+    The inverse direction of `DateFunc`. One node covers both shapes because they
+    share their whole contract: every argument is coerced to Int64, a null in any
+    argument nulls the row, and a value that names no real instant (month 13,
+    February 30, an epoch count that overflows) yields null rather than raising.
+    """
+
+    tag = ExprTag.MAKE_TEMPORAL
+    vocab = MAKE_TEMPORAL_FNS
+    fn: str = scalar()
+    args: list[Expr] = children()
 
 
 @expr_node

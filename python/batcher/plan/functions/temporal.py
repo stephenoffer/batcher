@@ -13,7 +13,7 @@ import datetime as _dt
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _wrap
-from batcher.plan.expr_ir.func_nodes import WindowBuckets, WindowStart
+from batcher.plan.expr_ir.func_nodes import MakeTemporal, WindowBuckets, WindowStart
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
 
 _DAY_MICROS = 86_400_000_000
@@ -232,3 +232,146 @@ def date_sub(expr: IntoExpr, days: int) -> Expr:
             {'r': [datetime.date(2024, 3, 10)]}
     """
     return _wrap(expr).dt.offset_by(f"{-int(days)}d")
+
+
+# Epoch unit → the engine `MakeTemporal` function that reads a count in that unit.
+_EPOCH_UNITS = {
+    "s": "from_unix_seconds",
+    "ms": "from_unix_millis",
+    "us": "from_unix_micros",
+    "ns": "from_unix_nanos",
+}
+
+
+def make_date(year: IntoExpr, month: IntoExpr, day: IntoExpr) -> Expr:
+    """Build a Date column from year, month, and day columns (Spark ``make_date``).
+
+    The inverse of ``.dt.year()`` / ``.dt.month()`` / ``.dt.day()``. Each argument may
+    be a column or an integer literal, and is read as an integer.
+
+    A date that does not exist is null rather than an error, so one bad row in a scan
+    of dirty upstream integers cannot abort the query. February 30, month 13, and day 0
+    are all null; so is any row where any argument is null.
+
+    Args:
+        year: The year component.
+        month: The month component, 1-12.
+        day: The day-of-month component, 1-31.
+
+    Returns:
+        A Date32 expression.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"y": [2024, 2023], "m": [2, 2], "d": [29, 29]})
+            >>> ds.select(
+            ...     r=bt.make_date(bt.col("y"), bt.col("m"), bt.col("d"))
+            ... ).to_pydict()
+            {'r': [datetime.date(2024, 2, 29), None]}
+    """
+    return MakeTemporal("make_date", [_wrap(year), _wrap(month), _wrap(day)])
+
+
+def make_timestamp(
+    year: IntoExpr,
+    month: IntoExpr,
+    day: IntoExpr,
+    hour: IntoExpr = 0,
+    minute: IntoExpr = 0,
+    second: IntoExpr = 0,
+) -> Expr:
+    """Build a Timestamp column from calendar and clock components (Spark ``make_timestamp``).
+
+    The clock components default to zero, so it doubles as midnight-of-a-date. An
+    out-of-range component (hour 24, minute or second 60) yields null, as does a date
+    that does not exist or a null in any argument. Second 60 is rejected rather than
+    folded into the next minute: a leap second has no Arrow timestamp to land on.
+
+    Args:
+        year: The year component.
+        month: The month component, 1-12.
+        day: The day-of-month component, 1-31.
+        hour: The hour component, 0-23.
+        minute: The minute component, 0-59.
+        second: The second component, 0-59.
+
+    Returns:
+        A Timestamp expression at microsecond resolution.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"y": [2024], "mo": [3], "d": [15]})
+            >>> ds.select(
+            ...     r=bt.make_timestamp(bt.col("y"), bt.col("mo"), bt.col("d"), 13, 45, 30)
+            ... ).to_pydict()
+            {'r': [datetime.datetime(2024, 3, 15, 13, 45, 30)]}
+    """
+    parts = [year, month, day, hour, minute, second]
+    return MakeTemporal("make_timestamp", [_wrap(p) for p in parts])
+
+
+def from_epoch(expr: IntoExpr, unit: str = "s") -> Expr:
+    """Read an integer column of epoch counts as a Timestamp, at a stated `unit`.
+
+    The unit has to be stated because the data cannot carry it: an Int64 column of
+    epoch values looks identical whether it counts seconds or nanoseconds. A plain
+    ``cast("timestamp")`` has to assume one — Arrow assumes microseconds — which turns
+    a column of epoch *seconds* into January 1970 with no error at all. Naming the unit
+    is the only way to be right.
+
+    Nanoseconds are truncated toward negative infinity, so a pre-1970 sub-microsecond
+    instant lands in the microsecond that contains it rather than one microsecond late.
+    A value too large to scale into microseconds is null rather than a wrapped instant.
+
+    Args:
+        expr: An integer column of epoch counts.
+        unit: The unit of those counts: ``"s"``, ``"ms"``, ``"us"``, or ``"ns"``.
+
+    Returns:
+        A Timestamp expression at microsecond resolution.
+
+    Raises:
+        PlanError: If `unit` is not one of the four recognized units.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"t": [1700000000]})
+            >>> ds.select(r=bt.from_epoch(bt.col("t"))).to_pydict()
+            {'r': [datetime.datetime(2023, 11, 14, 22, 13, 20)]}
+
+            >>> ms = bt.from_pydict({"t": [1700000000123]})
+            >>> ms.select(r=bt.from_epoch(bt.col("t"), "ms")).to_pydict()
+            {'r': [datetime.datetime(2023, 11, 14, 22, 13, 20, 123000)]}
+    """
+    if unit not in _EPOCH_UNITS:
+        raise PlanError(f"from_epoch(): unit must be one of {sorted(_EPOCH_UNITS)}, got {unit!r}")
+    return MakeTemporal(_EPOCH_UNITS[unit], [_wrap(expr)])
+
+
+def from_unix_date(expr: IntoExpr) -> Expr:
+    """Read an integer column of days since 1970-01-01 as a Date (Spark ``date_from_unix_date``).
+
+    The counterpart of :func:`from_epoch` for a column that counts whole days rather
+    than sub-day units, which is how several warehouse exports encode a date.
+
+    Args:
+        expr: An integer column of days since the Unix epoch.
+
+    Returns:
+        A Date32 expression.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"d": [0, 19782]})
+            >>> ds.select(r=bt.from_unix_date(bt.col("d"))).to_pydict()
+            {'r': [datetime.date(1970, 1, 1), datetime.date(2024, 2, 29)]}
+    """
+    return MakeTemporal("from_unix_date", [_wrap(expr)])

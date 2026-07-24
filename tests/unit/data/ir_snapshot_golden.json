@@ -368,18 +368,6 @@
       "name": "b"
     }
   },
-  "list_zip": {
-    "e": "list_zip",
-    "fn": "list_add",
-    "left": {
-      "e": "col",
-      "name": "a"
-    },
-    "right": {
-      "e": "col",
-      "name": "b"
-    }
-  },
   "list_simhash": {
     "e": "list_simhash",
     "input": {
@@ -433,6 +421,18 @@
     "input": {
       "e": "col",
       "name": "a"
+    }
+  },
+  "list_zip": {
+    "e": "list_zip",
+    "fn": "list_add",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
     }
   },
   "lit_bool": {
@@ -491,6 +491,24 @@
         }
       }
     ]
+  },
+  "make_temporal": {
+    "args": [
+      {
+        "e": "col",
+        "name": "y"
+      },
+      {
+        "e": "col",
+        "name": "m"
+      },
+      {
+        "e": "col",
+        "name": "d"
+      }
+    ],
+    "e": "make_temporal",
+    "fn": "make_date"
   },
   "map_element_at": {
     "e": "map",

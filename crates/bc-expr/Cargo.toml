@@ -12,6 +12,9 @@ arrow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 regex = "1"
+# Fast non-cryptographic hashing for the `IN` membership set (see `eval/in_list.rs`):
+# `std`'s SipHash was the whole cost of a large `IN` over a wide column.
+ahash.workspace = true
 # Prebuilt SIMD substring search (Two-Way + memchr prefilter). SQL `LIKE`/`contains`
 # search the SAME needle across every row of a column; `str::contains` rebuilds its
 # searcher per call, so a prebuilt `memmem::Finder` reused across the whole column is

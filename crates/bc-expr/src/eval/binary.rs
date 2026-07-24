@@ -11,7 +11,7 @@ use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow::datatypes::DataType;
 use bc_arrow::canon_float_array;
 
-use crate::eval::date::add_months;
+use crate::eval::temporal::date::add_months;
 use crate::{BinaryOp, Expr, ExprError, Literal};
 
 /// Whether comparing this type's values raw would disagree with the engine's float identity.

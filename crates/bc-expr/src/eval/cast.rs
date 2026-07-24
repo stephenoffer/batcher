@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array};
 use arrow::compute::{cast_with_options, CastOptions};
-use arrow::datatypes::{Float32Type, Float64Type, Int8Type, Int64Type};
+use arrow::datatypes::Float64Type;
 use arrow::error::ArrowError;
 
 use crate::ExprError;
@@ -442,7 +442,9 @@ fn float_to_string(
 #[cfg(test)]
 mod narrowing_float_tests {
     use super::*;
-    use arrow::datatypes::DataType;
+    // Assertion-only type tags: unused in the lib target, so scoped to the tests that
+    // need them rather than left at module scope as dead code under `-D warnings`.
+    use arrow::datatypes::{DataType, Float32Type, Int64Type};
 
     fn f64arr(v: Vec<Option<f64>>) -> ArrayRef {
         Arc::new(Float64Array::from(v))
@@ -643,7 +645,8 @@ mod narrowing_float_tests {
 mod string_to_int_tests {
     use super::*;
     use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
+    // See `narrowing_float_tests` — assertion-only type tags.
+    use arrow::datatypes::{DataType, Int64Type, Int8Type};
 
     fn strs(v: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(v))

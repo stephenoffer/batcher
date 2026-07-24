@@ -319,6 +319,8 @@ pub(crate) fn analyze(
         Expr::Map { .. } => Err(CodegenError::Unsupported("map function".into())),
         Expr::ListSlice { .. } => Err(CodegenError::Unsupported("list slice".into())),
         Expr::DateTrunc { .. } => Err(CodegenError::Unsupported("date_trunc".into())),
+        // Calendar construction needs a date library; the interpreter owns it.
+        Expr::MakeTemporal { .. } => Err(CodegenError::Unsupported("temporal constructor".into())),
         Expr::Strftime { .. } => Err(CodegenError::Unsupported("strftime".into())),
         Expr::ConvertTimezone { .. } => Err(CodegenError::Unsupported("convert_timezone".into())),
         Expr::Strptime { .. } => Err(CodegenError::Unsupported("strptime".into())),

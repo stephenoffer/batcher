@@ -12,11 +12,11 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float32Builder, Float64Array, GenericBinaryArray, Int32Array,
-    Int64Array, ListBuilder, OffsetSizeTrait, StructArray,
+    Array, ArrayRef, Float32Builder, Float64Array, GenericBinaryArray, Int32Array, Int64Array,
+    ListBuilder, OffsetSizeTrait, StructArray,
 };
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, Int64Type};
+use arrow::datatypes::{DataType, Field};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -395,7 +395,11 @@ fn resample_signal(samples: &[f32], src: u32, dst: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{BinaryArray, LargeBinaryArray};
+    // `AsArray` and the primitive type tags drive the struct-column assertions below and are
+    // used nowhere in the lib target, so they are imported here rather than at module scope
+    // (where they are dead code under `-D warnings`).
+    use arrow::array::{AsArray, BinaryArray, LargeBinaryArray};
+    use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
 
     use super::*;
 

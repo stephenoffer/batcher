@@ -239,6 +239,43 @@ print(out.select(part=bt.col("part"), later=bt.col("later").dt.day(), earlier=bt
 # {'part': [1, 6], 'later': [22, 8], 'earlier': [8, 25]}
 ```
 
+### Building dates and timestamps
+
+The `.dt` accessors take a date apart. Four functions put one together.
+{py:obj}`bt.make_date(year, month, day) <batcher.make_date>` and
+{py:obj}`bt.make_timestamp(...) <batcher.make_timestamp>` assemble one from integer
+columns. A date that doesn't exist, such as February 29 in a non-leap year, becomes null
+rather than an error, so one bad row in a scan of dirty upstream integers doesn't abort
+the query.
+
+```python
+parts = bt.from_pydict({"y": [2024, 2023], "m": [2, 2], "d": [29, 29]})
+out = parts.select(day=bt.make_date(bt.col("y"), bt.col("m"), bt.col("d")))
+print(out.to_pydict())
+# {'day': [datetime.date(2024, 2, 29), None]}
+```
+
+{py:obj}`bt.from_epoch(expr, unit) <batcher.from_epoch>` reads an integer column of epoch
+counts as a timestamp, and {py:obj}`bt.from_unix_date(expr) <batcher.from_unix_date>` reads
+a column of days since 1970-01-01 as a date.
+
+```python
+logs = bt.from_pydict({"ts": [1700000000], "ms": [1700000000123]})
+out = logs.select(
+    from_s=bt.from_epoch(bt.col("ts"), "s"),
+    from_ms=bt.from_epoch(bt.col("ms"), "ms"),
+)
+print(out.to_pydict())
+# {'from_s': [datetime.datetime(2023, 11, 14, 22, 13, 20)], 'from_ms': [datetime.datetime(2023, 11, 14, 22, 13, 20, 123000)]}
+```
+
+:::{important}
+State the unit. An `Int64` column of epoch counts looks identical whether it holds seconds
+or nanoseconds, so `cast("timestamp")` has to assume one, and it assumes microseconds. A
+column of epoch seconds cast that way lands in January 1970 with no error at all. The
+units are `"s"`, `"ms"`, `"us"`, and `"ns"`.
+:::
+
 {py:obj}`bt.current_date() <batcher.current_date>` and
 {py:obj}`bt.current_timestamp() <batcher.current_timestamp>` capture "now" as a
 literal, bound once at plan-build time (so every row sees the same value). Because

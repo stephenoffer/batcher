@@ -14,10 +14,6 @@ use crate::eval::binary::{
     as_bool, coerce_numeric, eval_binary, try_dict_compare, try_scalar_binary,
 };
 use crate::eval::cast::cast_expr;
-use crate::eval::date::{
-    eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
-    eval_window_buckets, eval_window_start, parse_dtype,
-};
 use crate::eval::generate::eval_sequence;
 use crate::eval::in_list::eval_in_list;
 use crate::eval::list::{
@@ -31,7 +27,12 @@ use crate::eval::math::{
 };
 use crate::eval::media::{eval_audio, eval_image, eval_video};
 use crate::eval::str::{eval_str, try_dict_str};
-use crate::eval::timezone::eval_convert_timezone;
+use crate::eval::temporal::date::{
+    eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
+    eval_window_buckets, eval_window_start, parse_dtype,
+};
+use crate::eval::temporal::make::eval_make_temporal;
+use crate::eval::temporal::timezone::eval_convert_timezone;
 use crate::{BinaryOp, Expr, ExprError};
 
 /// Decode a dictionary-encoded array to its value type; identity for any other array.
@@ -219,6 +220,13 @@ impl Expr {
                 eval_in_list(&arr, set)
             }
             Expr::Array { elements } => eval_array(elements, batch),
+            Expr::MakeTemporal { func, args } => {
+                let evaluated: Vec<_> = args
+                    .iter()
+                    .map(|a| a.eval(batch))
+                    .collect::<Result<_, _>>()?;
+                eval_make_temporal(*func, &evaluated)
+            }
             Expr::Hash { inputs, seed } => {
                 let args: Vec<_> = inputs
                     .iter()
