@@ -1,5 +1,42 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## The streaming aggregate interpreted its arithmetic inputs — TPC-H sf1 8/22 → 12/22 (2026-07-23)
+
+The streaming executor is the default, but its aggregate fold (`stream::fold_partial`) evaluated
+each aggregate's input expression through the interpreter, while the materializing executor
+(`par.rs`) already compiled them with the Cranelift JIT via `eval_partial_jit`. So the arithmetic
+inside an aggregate — `SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax))`, the shape at the
+heart of TPC-H q1/q12/q17 — was evaluated per row on the interpreter, on the path almost every
+query takes. Arrow computes that chain as a sequence of separate kernel passes, each allocating a
+temporary column; the JIT fuses it into one pass over the values.
+
+`fold_partial` now compiles the computed group-key and aggregate-input expressions once, from the
+first morsel that carries rows, and reuses the JIT across the fold — the same thing the
+materializing path does. `eval_jit` is bit-identical to the interpreter on its supported subset
+and falls back to it otherwise, so the change is throughput only; the streaming-oracle aggregate
+tests pin it against that interpreter, the 264-case `{collect, spill, iter_batches}` matrix and
+1080 Rust tests pass, and each parallel shard compiles its own functions so nothing crosses a
+thread.
+
+| TPC-H sf1 vs DuckDB | before | after |
+|---|---:|---:|
+| wins (of 22) | 8 | 12 |
+| q7  | 1.05x | 0.98x |
+| q12 | 1.30x | 0.76x |
+| q13 | 1.04x | 0.86x |
+| q17 | 1.02x | 0.67x |
+
+The arithmetic-heavy aggregates flipped; q9/q10/q19 deepened. The streaming **filter/project** are
+deliberately left interpreted — arrow's compare/boolean kernels are already SIMD, and JIT there
+measured 1.01x over TPC-H with five queries *slower*, so only the arithmetic-chain aggregate
+inputs benefit from fusion.
+
+The queries still trailing DuckDB at sf1 are the bandwidth-bound scan+filter+low-cardinality
+shapes (q1, q3–q6 at 1.05–1.45x), q21 (a correlated `EXISTS`/`NOT EXISTS` DuckDB decorrelates
+especially well), and q22. Those are the structural gap — DuckDB's on-the-fly decompression and
+vector-at-a-time selection — not a contained fix, and closing them is the SIMD-kernel work the
+`README` names as open.
+
 ## High-cardinality grouping was the systematic loss; four fixes closed it (2026-07-23)
 
 The 2026-07-19 ClickBench sweep named one target for "the single most valuable finding of the
