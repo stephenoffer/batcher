@@ -161,6 +161,35 @@ barely moved the clock. Why is not established here, and guessing at it would be
 than leaving it open. The lesson taken is narrower and solid: **infer the build profile
 from the build, never from a stopwatch.**
 
+### Where Batcher is behind: small-corpus image ingest
+
+The multimodal suite at scale 10 (100 JPEGs from S3), release build, `b/daft` above 1
+meaning Batcher is slower:
+
+| Query | batcher_ms | daft_ms | b/daft |
+|---|---|---|---|
+| img-list | 239.7 | 130.7 | 1.83x |
+| img-decode | 285.5 | 130.8 | 2.18x |
+| img-resize | 253.2 | 158.1 | 1.60x |
+
+The interesting part is the *shape*, not the totals. `img-list` does no image work at all —
+it lists and fetches bytes — and Batcher is already 1.8x behind there. Decode and resize
+then cost Batcher almost nothing on top (`img-resize` is *faster* than `img-decode`, the
+DCT-scaled JPEG path doing its job), while Daft's resize adds ~30 ms. **Batcher's image
+kernels are the better ones; the loss is entirely in per-file fetch.**
+
+Ruled out so far: header metadata extraction ran in a serial Python loop after the
+concurrent fetch (one `PIL.Image.open` per file on one thread). That is now fused into the
+pool task, which is right on its own terms but moved the number only a few percent —
+239.7 / 243.1 / 252.0 ms across three runs, inside the spread. So the cost is somewhere
+else in the listing/fetch path, and the next attempt should profile rather than guess.
+
+This does **not** contradict `docs/benchmarks/vs-daft.md`, which reports Batcher well ahead
+on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regime where
+per-file latency amortizes and Batcher's kernels dominate. The two results are consistent
+and describe different ends of the corpus-size range. What is now known is that the small
+end belongs to Daft.
+
 ### A correctness divergence in Daft, found by running it
 
 The harness refuses to time a query whose result disagrees with the oracle, and it caught
