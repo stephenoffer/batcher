@@ -98,7 +98,7 @@ survives here is a gap someone read the code to confirm.
 
 | Gap | Daft | Notes |
 |---|---|---|
-| Group-wise Python apply | `map_groups` | **Composition does not get there — measured.** `ds.repartition(by=k).map_batches(fn)` looks like it should work, but does not: over 50k rows and 20 keys, every one of the 20 keys appeared in all 4 batches, so a callback still sees fragments of a group. `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
+| Group-wise Python apply | `map_groups` | `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
 | Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | **Lower value than it first looks.** Batcher's Iceberg sink hands each shard to `pyiceberg`, which applies the table's own partition-spec transforms, so a partitioned write is already correct without these. What is left is manual bucketing and bucketed joins. The temporal four compose from existing expressions; only `bucket` needs an exact `murmur3_x86_32`, which is not in the tree. |
 | Row-identity generators | `monotonically_increasing_id`, `uuid`, `random_int` | **Two are spelling, one is a decision.** `monotonically_increasing_id` is `ds.with_row_index()` and `random_int` is `ds.with_random()` scaled and cast — both exist at `Dataset` level rather than as expressions, so they belong in the migration table. `uuid()` is genuinely absent and should stay absent in its usual form: a random UUID per row is non-deterministic, which breaks the interpreter-as-oracle property the whole test strategy rests on (sequential, parallel and distributed runs would disagree). `with_random` is seed-keyed for exactly that reason. A deterministic v5-style UUID over a key column would be admissible; nobody has asked, and `hash64`/`xxhash64` already cover surrogate keys. |
 | Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx` | `.video.decode()` already covers `video_metadata` (it returns `{width, height, num_frames, duration_secs, fps}`), so the real gap is frame *extraction*, not metadata. Needs the `video` cargo feature (system FFmpeg). |
@@ -107,6 +107,35 @@ survives here is a gap someone read the code to confirm.
 | Tokenizer in the data plane | `tokenize_encode`, `tokenize_decode` | **Capability present, placement differs.** `batcher.ml.Tokenizer(column, tokenizer, max_length=, truncation=, padding=, attention_mask_column=)` takes any callable, including a HuggingFace fast tokenizer, and `decode` is the same shape in reverse — so real BPE ids are producible and consumable today (an earlier version of this row said otherwise and was wrong). The genuine difference is *where it runs*: Daft's is a Rust expression, Batcher's is a per-batch Python callback. Closing that means a tokenizer dependency in `bc-expr`, which is a weight decision on a crate everything links, not a missing function. |
 | `jq` | `jq` | A full jq engine. Recorded so the gap is honest; the shape accessors above cover the common cases. |
 | Connectors | `write_turbopuffer`, `write_bigtable`, `write_paimon` | Batcher's connector surface is wider overall (ten categories, 77 registered formats); these three remain Daft-only, all of them *sinks* into hosted services. **Two entries were listed here in error**: MCAP exists in `io/formats/robotics/` (a category the agent guidance itself had omitted), and HuggingFace is largely covered by `bt.from_huggingface(ds)` — what Daft additionally has is a Hub-name reader that streams the Hub's Parquet exports, where Batcher asks you to load the dataset first. WARC is now closed. |
+
+### `map_groups`: what a sort buys, and what `repartition` does not
+
+Measured over 50k rows and 20 keys, counting how many `map_batches` calls each key's rows
+were spread across:
+
+| Plan | calls | keys spanning >1 batch | worst key |
+|---|---|---|---|
+| `map_batches(fn)` | 4 | 20 / 20 | 4 batches |
+| `repartition(by="k").map_batches(fn)` | 4 | 20 / 20 | 4 batches |
+| `sort("k").map_batches(fn)` | 4 | **3 / 20** | **2 batches** |
+
+Two things worth having before anyone starts:
+
+1. **`repartition(by=)` is not a shuffle.** Its docstring is explicit — "set how the next
+   `write` lays out its files (the data is unchanged)" — and the measurement confirms it:
+   byte-identical spread to no repartition at all. An earlier version of this row cited it
+   as evidence that composition cannot work, which was the right conclusion from the wrong
+   experiment.
+2. **A sort nearly gets there.** Sorting by the key makes each group *contiguous*, so a
+   group can only be split where it straddles a batch boundary — at most two batches, and
+   only for 3 of 20 keys here. That makes `map_groups` a **streaming operator with a
+   one-group carry-over buffer**, not the shuffle-and-materialize this row first assumed.
+   Cost is the sort; correctness distributed still needs each key's rows on one worker,
+   which the existing hash shuffle provides.
+
+That is a materially smaller piece of work than "a distributed-execution change", and it is
+still not a `GroupBy` method — it needs an operator that can hold one group across a batch
+boundary.
 
 ## Open — spelling gaps only (no API work)
 
