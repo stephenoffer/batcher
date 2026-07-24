@@ -348,11 +348,15 @@ fn run_with_cache(
             // `finalize` once is the mergeable algebra (invariant #7) — the very same fold the
             // distributed path runs across *nodes*. One implementation, one set of semantics.
             let t = std::time::Instant::now();
+            // One compiled JIT for the aggregate's expressions, shared by every shard — the
+            // schema is identical across shards, so `compile_agg` runs exactly once (the first
+            // shard to see a row) rather than once per core.
+            let jit: std::sync::OnceLock<ops::AggJit> = std::sync::OnceLock::new();
             let folded: Vec<(Option<agg::Partial>, u64)> = shard_sources
                 .par_iter()
                 .map(|srcs| {
                     let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
-                    fold_partial(build_with(input, ctx)?, group_keys, aggregates)
+                    fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
 
@@ -765,9 +769,58 @@ fn count_scans(plan: &RelOp, counts: &mut HashMap<usize, usize>) {
     }
 }
 
+/// Whether the streaming parallel executor can spread this plan across cores.
+///
+/// It cannot when a source is scanned **more than once** — a self-join or a correlated
+/// subquery (TPC-H q21's `EXISTS`/`NOT EXISTS` over `lineitem`, q22's over `orders`). Sharding
+/// the driving scan would hand a *build* side a shard instead of the whole relation, so
+/// `shardable_source` refuses those plans and the entire query falls to the single-threaded
+/// sequential streaming pipeline — where the joins probe one morsel at a time on one core,
+/// while the materializing executor's `join_partitioned` spreads the probe across all of them.
+/// Measured at sf1, q21 was 251 ms streaming vs 92 ms materializing for exactly this reason.
+///
+/// The caller uses this to prefer the materializing parallel executor for such a plan **only
+/// when memory is unbounded** (`budget == 0`): with no memory cap the input already fits in RAM
+/// and the far faster per-core join wins, while a capped run (large scale, distributed) keeps
+/// the bounded-memory streaming path. Correctness is identical either way — both executors are
+/// checked against the sequential oracle — so this only trades memory for speed.
+pub fn streaming_parallelizes(plan: &RelOp) -> bool {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    count_scans(plan, &mut counts);
+    counts.values().all(|&c| c <= 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `streaming_parallelizes` is the routing predicate: false exactly when a source is read
+    /// more than once, because that is what makes the streaming executor decline to shard and
+    /// fall to its single-threaded pipeline. A plain scan and a two-*different*-source join are
+    /// parallelizable; a self-join (same `source_id` twice) is not.
+    #[test]
+    fn streaming_parallelizes_is_false_only_for_a_repeated_source() {
+        let scan = |sid| RelOp::Scan { source_id: sid };
+        assert!(streaming_parallelizes(&scan(0)), "a bare scan shards");
+
+        let join = |l, r| RelOp::HashJoin {
+            left: Box::new(l),
+            right: Box::new(r),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: bc_ir::JoinType::Inner,
+            output: vec![],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        assert!(
+            streaming_parallelizes(&join(scan(0), scan(1))),
+            "a join of two distinct sources shards (only the probe side is on the spine)"
+        );
+        assert!(
+            !streaming_parallelizes(&join(scan(0), scan(0))),
+            "a self-join reads source 0 twice, so the streaming executor cannot shard it"
+        );
+    }
 
     /// The streaming executor's body must run on a pool of the width it was asked for, never
     /// rayon's global pool.

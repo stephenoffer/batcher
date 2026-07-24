@@ -41,7 +41,9 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // which is O(groups). The fold reports the rows it consumed, which is this operator's
             // `rows_in`: Kyber's selectivity model reads `rows_out / rows_in`, so a zero here
             // would not be a missing number, it would be a *wrong* one.
-            match fold_partial(build_with(input, ctx)?, group_keys, aggregates)? {
+            // Sequential breaker: a fresh cell, compiled once on the first morsel.
+            let jit = std::sync::OnceLock::new();
+            match fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)? {
                 (Some(merged), rows_in) => {
                     // Both halves of the state, not just the keys. The accumulator columns
                     // are the half that can actually be unbounded: a holistic aggregate
