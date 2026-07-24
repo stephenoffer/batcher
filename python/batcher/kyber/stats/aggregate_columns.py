@@ -207,7 +207,19 @@ def _grouped_aggregate_bounds(node: Aggregate, child: RelStats) -> dict[str, Col
     * **order-bounded** — `min`/`max`/`avg`/`median` of a column return a value inside that
       column's own `[min, max]`, whatever the grouping is;
     * **counting** — a group has at least one row and at most all of them, so a per-group
-      count lies in `[1, |child|]`.
+      count lies in `[1, |child|]` — but **only when `|child|` is EXACT**. `min`/`max` stay
+      valid *bounds* under a downgraded provenance (see `ColumnStat`: a filtered column may
+      no longer attain its extremes, yet they still enclose it), and the counting upper
+      bound is the one place that does not hold: an *estimated* `|child|` can be smaller
+      than the truth, and a too-small upper bound is not conservative, it is wrong.
+
+      `zonemap_prune_filter` folds a `HAVING count(*) > n` whose bound cannot reach `n`
+      into the empty relation — deleting every row. Publishing an estimate here therefore
+      turned a learned row count into missing results: after a selective query taught the
+      hub that a scan yields ~1 row, an unrelated ``GROUP BY s HAVING count(*) > 6`` over
+      the *same source with a different predicate* returned nothing, and a later, less
+      selective query silently restored the right answer. An estimate may choose a plan; it
+      may never decide which rows exist.
 
     Always `DEFAULT` provenance: these are bounds on a *set* of values, so nothing here may
     answer an exact terminal — and a group's actual extreme is generally strictly inside them.
@@ -216,7 +228,8 @@ def _grouped_aggregate_bounds(node: Aggregate, child: RelStats) -> dict[str, Col
     for spec in node.aggregates:
         func = spec.agg.func
         if func in _COUNTING_AGGS:
-            hi = child.rows if child.rows > 0 else None
+            exact_rows = child.provenance.is_exact and child.rows > 0
+            hi = child.rows if exact_rows else None
             out[spec.alias] = ColumnStat(
                 min=1 if func != "count" else 0,  # count(col) is 0 for an all-null group
                 max=int(hi) if hi is not None else None,
