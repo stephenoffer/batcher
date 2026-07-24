@@ -8,6 +8,7 @@ use arrow::datatypes::DataType;
 
 use crate::{ExprError, StrFunc};
 
+mod case;
 mod chunk;
 mod html;
 mod jaro;
@@ -323,6 +324,71 @@ pub(crate) fn eval_str(
                     .collect::<BooleanArray>(),
             )
         }
+        StrFunc::JsonArrayLength => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::array_length(v, &path)))
+                    .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::JsonType => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::value_type(v, &path)))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::JsonExists => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| json::path_exists(v, &path)))
+                    .collect::<BooleanArray>(),
+            )
+        }
+        StrFunc::JsonObjectKeys | StrFunc::JsonArrayValues => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            let keys = matches!(func, StrFunc::JsonObjectKeys);
+            // Both shapes emit one `List<Utf8>` per row; the extracted text is a subset
+            // of the document, so the input's value bytes bound the output's.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
+            for o in s.iter() {
+                // A null input, an absent path, or a value of the wrong shape all yield a
+                // null list rather than an empty one, keeping "no answer" distinct from
+                // "an empty object/array", which is a real and different fact.
+                let produced = o.is_some_and(|v| {
+                    if keys {
+                        match json::object_keys(v, &path) {
+                            Some(ks) => {
+                                for k in ks {
+                                    builder.values().append_value(k);
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        match json::array_values(v, &path) {
+                            Some(vs) => {
+                                for e in vs {
+                                    builder.values().append_option(e);
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                });
+                builder.append(produced);
+            }
+            Arc::new(builder.finish())
+        }
         StrFunc::Hash64 => Arc::new(
             s.iter()
                 .map(|o| o.map(|v| fnv1a64(v.as_bytes()) as i64))
@@ -572,6 +638,18 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::Soundex => Arc::new(map_str(s, soundex)),
+        StrFunc::ToCase => {
+            let style = pattern.ok_or_else(|| ExprError::MissingArgument {
+                func: "ToCase".to_string(),
+                arg: "style",
+            })?;
+            // Reject the style once, before touching a row: an unknown style is a plan
+            // error, and raising it per row would emit the same message n times.
+            if !case::STYLES.contains(&style) {
+                return Err(case::unknown_style(style));
+            }
+            Arc::new(map_str(s, |v| case::to_case(v, style).unwrap_or_default()))
+        }
     };
     Ok(out)
 }
@@ -1870,7 +1948,9 @@ mod tests {
         let row = |i: usize| {
             let v = list.value(i);
             let v = v.as_any().downcast_ref::<StringArray>().unwrap();
-            (0..v.len()).map(|j| v.value(j).to_string()).collect::<Vec<_>>()
+            (0..v.len())
+                .map(|j| v.value(j).to_string())
+                .collect::<Vec<_>>()
         };
         assert_eq!(row(0), ["the cat", "cat sat"]); // overlapping bigrams
         assert_eq!(row(1), ["solo"]); // fewer than n tokens → one all-tokens gram

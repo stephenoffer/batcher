@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.core import Expr, _wrap
 from batcher.plan.expr_ir.func_nodes import (
@@ -177,6 +177,122 @@ class _JsonNamespace:
         """
         return StrFunc("json_extract_bool", self._e, pattern=path)
 
+    def array_length(self, path: str = "$") -> StrFunc:
+        """Count the elements of the JSON array at `path` (→ Int64).
+
+        The count is taken by skipping over each element structurally, so a long array
+        of large objects costs one pass over its bytes and parses none of them.
+
+        Args:
+            path: A JSONPath to the array; the document root by default.
+
+        Returns:
+            A new Int64 expression, or null if the path is absent or the value there is
+            not an array.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"xs": [1, 2, 3]}', '{"xs": 4}']})
+                >>> ds.select(r=bt.col("j").json.array_length("$.xs")).to_pydict()
+                {'r': [3, None]}
+        """
+        return StrFunc("json_array_length", self._e, pattern=path)
+
+    def keys(self, path: str = "$") -> StrFunc:
+        """List the keys of the JSON object at `path`, in source order (→ List<Utf8>).
+
+        Source order, not sorted order, so the keys line up with the document as written.
+
+        Args:
+            path: A JSONPath to the object; the document root by default.
+
+        Returns:
+            A new List<Utf8> expression, or a null list if the path is absent or the
+            value there is not an object.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"z": 1, "a": 2}', "[]"]})
+                >>> ds.select(r=bt.col("j").json.keys()).to_pydict()
+                {'r': [['z', 'a'], None]}
+        """
+        return StrFunc("json_object_keys", self._e, pattern=path)
+
+    def values(self, path: str = "$") -> StrFunc:
+        """Read the JSON array at `path` as a list of texts (→ List<Utf8>).
+
+        Each element is rendered the way :meth:`extract_string` renders a value: a string
+        element verbatim, an object or array as its compact JSON, a JSON ``null`` as a
+        null element. This is the bridge from a JSON array column to a Batcher list
+        column, so :meth:`~batcher.Dataset.explode` and the ``.list`` namespace apply.
+
+        Args:
+            path: A JSONPath to the array; the document root by default.
+
+        Returns:
+            A new List<Utf8> expression, or a null list if the path is absent or the
+            value there is not an array.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"xs": ["a", 1, {"b": 2}]}']})
+                >>> ds.select(r=bt.col("j").json.values("$.xs")).to_pydict()
+                {'r': [['a', '1', '{"b":2}']]}
+        """
+        return StrFunc("json_array_values", self._e, pattern=path)
+
+    def type_of(self, path: str = "$") -> StrFunc:
+        """Name the JSON type at `path` (→ Utf8).
+
+        One of ``object``, ``array``, ``string``, ``number``, ``boolean``, or ``null``.
+        Use it to route a heterogeneous field before extracting it, rather than
+        extracting into every type and coalescing.
+
+        Args:
+            path: A JSONPath; the document root by default.
+
+        Returns:
+            A new Utf8 expression, or null if the path is absent.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"v": [1]}', '{"v": "x"}', "{}"]})
+                >>> ds.select(r=bt.col("j").json.type_of("$.v")).to_pydict()
+                {'r': ['array', 'string', None]}
+        """
+        return StrFunc("json_type", self._e, pattern=path)
+
+    def exists(self, path: str) -> StrFunc:
+        """Test whether a value exists at `path` (→ Boolean).
+
+        A JSON ``null`` counts as present. That is the distinction the ``extract_*``
+        methods cannot express, since an absent path and a JSON ``null`` both extract to
+        SQL null, and the two mean different things in a schema-on-read pipeline.
+
+        Args:
+            path: A JSONPath, e.g. ``"$.user.email"``.
+
+        Returns:
+            A new Boolean expression; null only where the input itself is null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"v": null}', "{}"]})
+                >>> ds.select(r=bt.col("j").json.exists("$.v")).to_pydict()
+                {'r': [True, False]}
+        """
+        return StrFunc("json_exists", self._e, pattern=path)
+
 
 class _MapNamespace:
     """Map-column accessors: ``col("m").map.keys()``, ``.values()``, ``.get(key)``.
@@ -282,7 +398,7 @@ class _ListNamespace:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"a": [[3, 1, 2]]})
             >>> ds.select(bt.col("a").list.sum().alias("s")).to_pydict()
-            {'s': [6.0]}
+            {'s': [6]}
     """
 
     __slots__ = ("_e",)
@@ -333,7 +449,7 @@ class _ListNamespace:
                 >>> ds.select(bt.col("a").list.get(-1).alias("r")).to_pydict()
                 {'r': [2, None, None]}
         """
-        return ListGet(self._e, index)
+        return ListGet(self._e, require_int(index, func="list.get", arg="index"))
 
     def first(self) -> ListGet:
         """Return the first element of each list; null if the list is null or empty.
@@ -906,6 +1022,9 @@ class _ListNamespace:
                 >>> ds.select(bt.col("a").list.slice(1, 2).alias("r")).to_pydict()
                 {'r': [[20, 30]]}
         """
+        offset = require_int(offset, func="list.slice", arg="offset")
+        if length is not None:
+            length = require_int(length, func="list.slice", arg="length")
         return ListSlice(self._e, offset, length)
 
     def head(self, n: int = 5) -> ListSlice:

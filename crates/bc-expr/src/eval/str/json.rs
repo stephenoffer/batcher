@@ -296,37 +296,7 @@ fn compact(raw: &str) -> String {
 /// Object/array leaves keep their **source key/element order** (see [`compact`]) rather
 /// than being re-serialized through `serde_json::Value`, which alphabetizes object keys.
 pub(super) fn extract_string(text: &str, path: &[PathPart]) -> Option<String> {
-    let raw = seek(text, path)?;
-    match serde_json::from_str::<Value>(raw).ok()? {
-        Value::String(s) => Some(s),
-        Value::Null => None,
-        // Compact the original slice so object keys keep their source order.
-        Value::Object(_) | Value::Array(_) => Some(compact(raw)),
-        Value::Number(n) => {
-            // An integer literal larger than u64 (e.g. a 20+ digit id) is parsed by
-            // serde_json as f64, whose Display renders it in lossy scientific form
-            // (`1e+20`). DuckDB keeps the exact digits, so return the source token for
-            // that case; everything representable (i64/u64) or fractional uses serde's
-            // canonical form (which also matches DuckDB: `1.50` -> `1.5`).
-            if n.as_i64().is_none() && n.as_u64().is_none() && is_integer_literal(raw) {
-                // `-0` is an integer literal serde parses as f64 (as_i64/as_u64 both
-                // None); numerically it is zero, and DuckDB canonicalizes it to "0"
-                // rather than keeping the raw "-0". A genuine out-of-i64/u64-range
-                // integer (e.g. `1e20` worth of digits) never has an all-zero magnitude,
-                // so it still keeps its exact digits.
-                let magnitude = raw.strip_prefix('-').unwrap_or(raw);
-                if magnitude.bytes().all(|b| b == b'0') {
-                    Some("0".to_string())
-                } else {
-                    Some(raw.to_string())
-                }
-            } else {
-                Some(n.to_string())
-            }
-        }
-        // Bool has no ordering or precision to preserve.
-        other => Some(other.to_string()),
-    }
+    render_leaf(seek(text, path)?)
 }
 
 /// Whether `s` is a bare JSON integer literal (`-?[0-9]+`, no fraction or exponent).
@@ -389,12 +359,252 @@ pub(super) fn extract_bool(text: &str, path: &[PathPart]) -> Option<bool> {
     }
 }
 
+/// Whether a value exists at `path` (a JSON `null` counts as present — the path is
+/// there, the value is null, which is the distinction `extract_*` cannot express).
+pub(super) fn path_exists(text: &str, path: &[PathPart]) -> bool {
+    seek(text, path).is_some_and(|raw| serde_json::from_str::<Value>(raw).is_ok())
+}
+
+/// The JSON type name at `path`: `object`, `array`, `string`, `number`, `boolean`, or
+/// `null`. `None` on an absent path or a malformed leaf.
+///
+/// Reads only the first non-whitespace byte of the located slice for the container and
+/// scalar-shape cases, so typing a huge sub-object costs no parse; only the `t`/`f`/`n`
+/// literals need confirming, which [`serde_json`] does on a token.
+pub(super) fn value_type(text: &str, path: &[PathPart]) -> Option<&'static str> {
+    let raw = seek(text, path)?.trim();
+    Some(match raw.as_bytes().first()? {
+        b'{' => "object",
+        b'[' => "array",
+        b'"' => "string",
+        b't' | b'f' => {
+            if raw == "true" || raw == "false" {
+                "boolean"
+            } else {
+                return None;
+            }
+        }
+        b'n' => {
+            if raw == "null" {
+                "null"
+            } else {
+                return None;
+            }
+        }
+        _ => {
+            // Confirm it really is a number rather than a malformed token.
+            serde_json::from_str::<serde_json::Number>(raw).ok()?;
+            "number"
+        }
+    })
+}
+
+/// The number of elements in the array at `path`. `None` if the path is absent or the
+/// value there is not an array.
+///
+/// Counts by structural skipping rather than materializing the elements, so the cost is
+/// one pass over the array's bytes with no allocation per element.
+pub(super) fn array_length(text: &str, path: &[PathPart]) -> Option<i64> {
+    let raw = seek(text, path)?;
+    let bytes = raw.as_bytes();
+    if bytes.first()? != &b'[' {
+        return None;
+    }
+    let mut i = skip_ws(bytes, 1);
+    if bytes.get(i)? == &b']' {
+        return Some(0);
+    }
+    let mut n = 0i64;
+    loop {
+        i = skip_value(bytes, i)?;
+        i = skip_ws(bytes, i);
+        n += 1;
+        match bytes.get(i)? {
+            b',' => i = skip_ws(bytes, i + 1),
+            b']' => return Some(n),
+            _ => return None,
+        }
+    }
+}
+
+/// The keys of the object at `path`, **in source order**. `None` if the path is absent
+/// or the value there is not an object.
+///
+/// Source order, not sorted order, because `serde_json`'s default map re-sorts keys and
+/// a caller zipping `keys` against [`array_values`]-style extraction would then get a
+/// different pairing than the document states. The scan skips each value structurally,
+/// so only the keys are decoded.
+pub(super) fn object_keys(text: &str, path: &[PathPart]) -> Option<Vec<String>> {
+    let raw = seek(text, path)?;
+    let bytes = raw.as_bytes();
+    if bytes.first()? != &b'{' {
+        return None;
+    }
+    let mut i = skip_ws(bytes, 1);
+    if bytes.get(i)? == &b'}' {
+        return Some(Vec::new());
+    }
+    let mut keys = Vec::new();
+    loop {
+        let (k, after) = parse_string(bytes, i)?;
+        keys.push(k);
+        i = skip_ws(bytes, after);
+        if bytes.get(i)? != &b':' {
+            return None;
+        }
+        i = skip_value(bytes, skip_ws(bytes, i + 1))?;
+        i = skip_ws(bytes, i);
+        match bytes.get(i)? {
+            b',' => i = skip_ws(bytes, i + 1),
+            b'}' => return Some(keys),
+            _ => return None,
+        }
+    }
+}
+
+/// The elements of the array at `path`, each rendered the way [`extract_string`] renders
+/// a leaf: a string element verbatim, a container compacted, a JSON `null` as `None`.
+/// `None` (the outer option) if the path is absent or the value is not an array.
+///
+/// This is what turns a JSON array column into a Batcher list column, so `explode` and
+/// the whole `.list` namespace apply to it.
+pub(super) fn array_values(text: &str, path: &[PathPart]) -> Option<Vec<Option<String>>> {
+    let raw = seek(text, path)?;
+    let bytes = raw.as_bytes();
+    if bytes.first()? != &b'[' {
+        return None;
+    }
+    let mut i = skip_ws(bytes, 1);
+    if bytes.get(i)? == &b']' {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    loop {
+        let end = skip_value(bytes, i)?;
+        out.push(render_leaf(&raw[i..end]));
+        i = skip_ws(bytes, end);
+        match bytes.get(i)? {
+            b',' => i = skip_ws(bytes, i + 1),
+            b']' => return Some(out),
+            _ => return None,
+        }
+    }
+}
+
+/// Render one already-located JSON value as text: a string leaf verbatim, a container as
+/// its compact JSON, a JSON `null` as `None`, everything else as its canonical form.
+///
+/// The single renderer behind `extract_string` and [`array_values`], so an element pulled
+/// out by `[i]` and the same element seen through `array_values` cannot read differently.
+fn render_leaf(raw: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(raw).ok()? {
+        Value::String(s) => Some(s),
+        Value::Null => None,
+        // Compact the original slice so object keys keep their source order.
+        Value::Object(_) | Value::Array(_) => Some(compact(raw)),
+        Value::Number(n) => {
+            // An integer literal larger than u64 (e.g. a 20+ digit id) is parsed by
+            // serde_json as f64, whose Display renders it in lossy scientific form
+            // (`1e+20`). DuckDB keeps the exact digits, so return the source token for
+            // that case; everything representable (i64/u64) or fractional uses serde's
+            // canonical form (which also matches DuckDB: `1.50` -> `1.5`).
+            if n.as_i64().is_none() && n.as_u64().is_none() && is_integer_literal(raw) {
+                // `-0` is an integer literal serde parses as f64 (as_i64/as_u64 both
+                // None); numerically it is zero, and DuckDB canonicalizes it to "0"
+                // rather than keeping the raw "-0". A genuine out-of-i64/u64-range
+                // integer (e.g. `1e20` worth of digits) never has an all-zero magnitude,
+                // so it still keeps its exact digits.
+                let magnitude = raw.strip_prefix('-').unwrap_or(raw);
+                if magnitude.bytes().all(|b| b == b'0') {
+                    Some("0".to_string())
+                } else {
+                    Some(raw.to_string())
+                }
+            } else {
+                Some(n.to_string())
+            }
+        }
+        // Bool has no ordering or precision to preserve.
+        other => Some(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parts(p: &str) -> Vec<PathPart> {
         parse_path(p)
+    }
+
+    #[test]
+    fn array_length_counts_without_parsing_elements() {
+        assert_eq!(array_length(r#"{"a": [1, 2, 3]}"#, &parts("$.a")), Some(3));
+        assert_eq!(array_length(r#"{"a": []}"#, &parts("$.a")), Some(0));
+        // Nested containers and strings holding brackets do not confuse the scan.
+        assert_eq!(
+            array_length(r#"[{"x": [1,2]}, "a],b", [3]]"#, &parts("$")),
+            Some(3)
+        );
+        assert_eq!(array_length(r#"{"a": 1}"#, &parts("$.a")), None);
+        assert_eq!(array_length(r#"{"a": [1]}"#, &parts("$.missing")), None);
+    }
+
+    #[test]
+    fn object_keys_are_in_source_order() {
+        assert_eq!(
+            object_keys(r#"{"z": 1, "a": 2, "m": 3}"#, &parts("$")),
+            Some(vec!["z".to_string(), "a".to_string(), "m".to_string()])
+        );
+        assert_eq!(object_keys("{}", &parts("$")), Some(vec![]));
+        assert_eq!(object_keys("[1]", &parts("$")), None);
+    }
+
+    #[test]
+    fn array_values_render_like_extract_string() {
+        let doc = r#"{"a": ["x", 1, {"b": 2}, null, true]}"#;
+        assert_eq!(
+            array_values(doc, &parts("$.a")),
+            Some(vec![
+                Some("x".to_string()),
+                Some("1".to_string()),
+                Some(r#"{"b":2}"#.to_string()),
+                None,
+                Some("true".to_string()),
+            ])
+        );
+        // Element i seen through the array must equal element i seen through `[i]`.
+        for i in 0..5 {
+            let via_index = extract_string(doc, &parts(&format!("$.a[{i}]")));
+            let via_values = array_values(doc, &parts("$.a")).unwrap()[i].clone();
+            assert_eq!(via_index, via_values, "element {i} disagreed");
+        }
+    }
+
+    #[test]
+    fn value_type_names_every_json_shape() {
+        let doc = r#"{"o": {}, "a": [], "s": "x", "n": 1.5, "b": false, "z": null}"#;
+        for (path, want) in [
+            ("$.o", "object"),
+            ("$.a", "array"),
+            ("$.s", "string"),
+            ("$.n", "number"),
+            ("$.b", "boolean"),
+            ("$.z", "null"),
+        ] {
+            assert_eq!(value_type(doc, &parts(path)), Some(want), "{path}");
+        }
+        assert_eq!(value_type(doc, &parts("$.missing")), None);
+    }
+
+    #[test]
+    fn path_exists_distinguishes_absent_from_json_null() {
+        let doc = r#"{"z": null}"#;
+        assert!(path_exists(doc, &parts("$.z")));
+        assert!(!path_exists(doc, &parts("$.other")));
+        // `extract_string` cannot tell these apart — that is why `path_exists` exists.
+        assert_eq!(extract_string(doc, &parts("$.z")), None);
+        assert_eq!(extract_string(doc, &parts("$.other")), None);
     }
 
     #[test]

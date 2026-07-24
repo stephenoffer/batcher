@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 mod analyze;
 mod error;
+mod select;
 pub use error::ExprError;
 
 // The per-variant evaluation bodies (and `Expr::eval` itself) live in `eval`; the
@@ -736,6 +737,26 @@ pub enum StrFunc {
     /// Extract the boolean value at JSON `pattern` path; null if absent or
     /// non-boolean. → Boolean.
     JsonExtractBool,
+    /// Number of elements in the JSON array at `pattern` path; null if the path is
+    /// absent or the value there is not an array. Counted by structural skipping, so
+    /// no element is parsed. → Int64.
+    JsonArrayLength,
+    /// The keys of the JSON object at `pattern` path, **in source order**; null if the
+    /// path is absent or the value is not an object. → List<Utf8>.
+    JsonObjectKeys,
+    /// The elements of the JSON array at `pattern` path, each rendered as
+    /// `json_extract_string` renders a leaf (string verbatim, container compacted, JSON
+    /// null as a null element); null if absent or not an array. This is what turns a
+    /// JSON array column into a list column that `explode` and `.list` can work on.
+    /// → List<Utf8>.
+    JsonArrayValues,
+    /// The JSON type at `pattern` path: `object`, `array`, `string`, `number`,
+    /// `boolean`, or `null`; null if the path is absent. → Utf8.
+    JsonType,
+    /// Whether a value exists at `pattern` path. A JSON `null` counts as present — the
+    /// distinction `json_extract_*` cannot express, since both absent and null extract
+    /// to null. → Boolean.
+    JsonExists,
     /// Deterministic FNV-1a 64-bit hash of the UTF-8 bytes (→ Int64; the u64 digest
     /// reinterpreted as i64). Stable across partitions, runs, and machines — the
     /// building block for surrogate keys and slowly-changing-dimension change
@@ -835,6 +856,13 @@ pub enum StrFunc {
     /// and comments, decodes entities, collapses whitespace, and separates elements with
     /// a space. Lenient on malformed markup. Null → null. → Utf8. See `eval::str::html`.
     StripHtml,
+    /// Re-case an identifier into the style named by `pattern`: `snake`, `upper_snake`,
+    /// `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train`.
+    /// One word splitter serves every style (separators, lower→upper transitions, and
+    /// acronym runs), so the styles never disagree about where the words were. Null →
+    /// null; an unknown style is an error, not a silent passthrough. → Utf8.
+    /// See `eval::str::case`.
+    ToCase,
 }
 
 /// Date/time field extractions (→ Int64). Wire tags are snake_case (the contract

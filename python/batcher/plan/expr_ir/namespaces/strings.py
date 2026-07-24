@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.core import Cast, Expr
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
@@ -19,6 +19,22 @@ from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 
 # Where `str.chunk` may end a chunk; mirrors `bc-expr`'s `chunk::Boundary`.
 _CHUNK_BOUNDARIES = frozenset({"char", "word", "sentence", "line"})
+
+# Identifier styles `str.to_case` renders; mirrors `bc-expr`'s `case::STYLES`.
+_CASE_STYLES = frozenset(
+    {
+        "snake",
+        "upper_snake",
+        "camel",
+        "pascal",
+        "kebab",
+        "upper_kebab",
+        "title",
+        "sentence",
+        "dot",
+        "train",
+    }
+)
 
 
 class _StrNamespace:
@@ -323,6 +339,9 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.substr(2, 3).alias("r")).to_pydict()
                 {'r': ['ell']}
         """
+        start = require_int(start, func="str.substr", arg="start")
+        if length is not None:
+            length = require_int(length, func="str.substr", arg="length")
         return StrFunc("substr", self._e, start=start, length=length)
 
     def left(self, n: int) -> StrFunc:
@@ -350,6 +369,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.left(-2).alias("r")).to_pydict()
                 {'r': ['hel']}
         """
+        n = require_int(n, func="str.left", arg="n")
         if n < 0:
             reversed_e = StrFunc("reverse", self._e)
             dropped = StrFunc("right", reversed_e, start=n)
@@ -373,6 +393,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.repeat(3).alias("r")).to_pydict()
                 {'r': ['ababab']}
         """
+        n = require_int(n, func="str.repeat", arg="n")
         return StrFunc("repeat", self._e, start=n)
 
     def lpad(self, width: int, fill: str = " ") -> StrFunc:
@@ -393,6 +414,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.lpad(5, "*").alias("r")).to_pydict()
                 {'r': ['***ab']}
         """
+        width = require_int(width, func="str.lpad", arg="width")
         return StrFunc("lpad", self._e, start=width, pattern=fill)
 
     def rpad(self, width: int, fill: str = " ") -> StrFunc:
@@ -413,6 +435,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.rpad(5, "*").alias("r")).to_pydict()
                 {'r': ['ab***']}
         """
+        width = require_int(width, func="str.rpad", arg="width")
         return StrFunc("rpad", self._e, start=width, pattern=fill)
 
     def zfill(self, width: int) -> StrFunc:
@@ -436,6 +459,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.zfill(4).alias("r")).to_pydict()
                 {'r': ['0007', '0042', '0100']}
         """
+        width = require_int(width, func="str.zfill", arg="width")
         return StrFunc("lpad", self._e, start=width, pattern="0")
 
     def contains_any(self, patterns: Iterable[str]) -> Expr:
@@ -538,7 +562,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.pad_start(5, "*")).to_pydict()
                 {'r': ['***ab']}
         """
-        return self.lpad(width, fill)
+        return self.lpad(require_int(width, func="str.pad_start", arg="width"), fill)
 
     def pad_end(self, width: int, fill: str = " ") -> StrFunc:
         """Right-pad to ``width`` — the Polars ``pad_end`` spelling of :meth:`rpad`.
@@ -558,7 +582,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.pad_end(5, "*")).to_pydict()
                 {'r': ['ab***']}
         """
-        return self.rpad(width, fill)
+        return self.rpad(require_int(width, func="str.pad_end", arg="width"), fill)
 
     def count_matches(self, pattern: str) -> StrFunc:
         """Count regex matches — the Polars ``count_matches`` spelling of :meth:`regexp_count`.
@@ -744,7 +768,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.head(3)).to_pydict()
                 {'r': ['hel']}
         """
-        return self.left(n)
+        return self.left(require_int(n, func="str.head", arg="n"))
 
     def tail(self, n: int) -> StrFunc:
         """Last ``n`` characters — the Polars ``str.tail`` spelling of :meth:`right`.
@@ -763,7 +787,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.tail(3)).to_pydict()
                 {'r': ['llo']}
         """
-        return self.right(n)
+        return self.right(require_int(n, func="str.tail", arg="n"))
 
     def slice(self, offset: int, length: int | None = None) -> StrFunc:
         """0-based substring — the Polars ``str.slice`` spelling over :meth:`substr` (1-based).
@@ -783,6 +807,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.slice(1, 3)).to_pydict()
                 {'r': ['ell']}
         """
+        offset = require_int(offset, func="str.slice", arg="offset")
         return self.substr(offset + 1, length)
 
     def ljust(self, width: int, fill: str = " ") -> StrFunc:
@@ -803,7 +828,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.ljust(5, "*")).to_pydict()
                 {'r': ['ab***']}
         """
-        return self.rpad(width, fill)
+        return self.rpad(require_int(width, func="str.ljust", arg="width"), fill)
 
     def rjust(self, width: int, fill: str = " ") -> StrFunc:
         """Right-justify to ``width`` (pad left) — pandas' ``str.rjust`` (see :meth:`lpad`).
@@ -823,7 +848,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.rjust(5, "*")).to_pydict()
                 {'r': ['***ab']}
         """
-        return self.lpad(width, fill)
+        return self.lpad(require_int(width, func="str.rjust", arg="width"), fill)
 
     # --- text features (the cheap signals a text model or data check consumes) ------
 
@@ -1394,7 +1419,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.truncate_chars(3)).to_pydict()
                 {'r': ['abc']}
         """
-        return self.left(n)
+        return self.left(require_int(n, func="str.truncate_chars", arg="n"))
 
     def truncate_words(self, n: int) -> StrFunc:
         """Keep at most the first `n` whitespace-separated words, without splitting one.
@@ -1419,8 +1444,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.truncate_words(2)).to_pydict()
                 {'r': ['one two']}
         """
-        if n < 1:
-            raise PlanError(f"truncate_words(): n must be >= 1, got {n}")
+        n = require_int(n, func="str.truncate_words", arg="n", minimum=1)
         return self.regexp_extract(r"^(?:\S+\s+){0," + str(n - 1) + r"}\S+", 0)
 
     def has_url(self) -> StrFunc:
@@ -1567,6 +1591,7 @@ class _StrNamespace:
         """
         from batcher.plan.expr_ir.core import Lit
 
+        budget = require_int(budget, func="str.fits_token_budget", arg="budget")
         return self.estimate_tokens(chars_per_token) <= Lit(budget)
 
     def sentence_count(self) -> StrFunc:
@@ -2058,6 +2083,7 @@ class _StrNamespace:
         """
         from batcher.plan.expr_ir.core import Lit
 
+        max_chars = require_int(max_chars, func="str.is_short", arg="max_chars")
         return self.len() <= Lit(max_chars)
 
     def is_long(self, min_chars: int) -> Expr:
@@ -2079,6 +2105,7 @@ class _StrNamespace:
         """
         from batcher.plan.expr_ir.core import Lit
 
+        min_chars = require_int(min_chars, func="str.is_long", arg="min_chars")
         return self.len() >= Lit(min_chars)
 
     def is_question(self) -> StrFunc:
@@ -2411,8 +2438,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.truncate_sentences(2)).to_pydict()
                 {'r': ['One. Two!']}
         """
-        if n < 1:
-            raise PlanError(f"truncate_sentences(): n must be >= 1, got {n}")
+        n = require_int(n, func="str.truncate_sentences", arg="n", minimum=1)
         return self.regexp_extract(r"^(?:[^.!?]*[.!?]){1," + str(n) + r"}", 0)
 
     def avg_sentence_length(self) -> Expr:
@@ -2681,6 +2707,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.substring_index(".", 2).alias("r")).to_pydict()
                 {'r': ['a.b']}
         """
+        count = require_int(count, func="str.substring_index", arg="count")
         return StrFunc("substring_index", self._e, pattern=delimiter, start=count)
 
     def overlay(self, replacement: str, pos: int, length: int | None = None) -> StrFunc:
@@ -2705,6 +2732,9 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.overlay("XY", 2).alias("r")).to_pydict()
                 {'r': ['hXYlo']}
         """
+        pos = require_int(pos, func="str.overlay", arg="pos")
+        if length is not None:
+            length = require_int(length, func="str.overlay", arg="length")
         return StrFunc("overlay", self._e, replacement=replacement, start=pos, length=length)
 
     def regexp_extract_all(self, pattern: str) -> StrFunc:
@@ -2882,6 +2912,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.right(3).alias("r")).to_pydict()
                 {'r': ['llo']}
         """
+        n = require_int(n, func="str.right", arg="n")
         return StrFunc("right", self._e, start=n)
 
     def ascii(self) -> StrFunc:
@@ -3018,8 +3049,8 @@ class _StrNamespace:
                 >>> words.select(r=bt.col("doc").str.chunk(9, boundary="word")).to_pydict()
                 {'r': [['alpha ', 'beta ', 'gamma']]}
         """
-        if size < 1:
-            raise PlanError(f"str.chunk(): size must be >= 1, got {size}")
+        size = require_int(size, func="str.chunk", arg="size", minimum=1)
+        overlap = require_int(overlap, func="str.chunk", arg="overlap", minimum=0)
         if not 0 <= overlap < size:
             raise PlanError(f"str.chunk(): overlap must be in [0, {size}), got {overlap}")
         if boundary not in _CHUNK_BOUNDARIES:
@@ -3031,6 +3062,66 @@ class _StrNamespace:
         # the two scalar slots that `repeat`/`right`/`split_part` already make — and
         # `pattern` carries the boundary mode, which is otherwise unused by `chunk`.
         return StrFunc("chunk", self._e, pattern=boundary, start=overlap, length=size)
+
+    def to_case(self, style: str) -> StrFunc:
+        """Re-case an identifier into `style`, e.g. ``"userID name"`` to ``user_id_name``.
+
+        One word splitter serves every style, so the styles never disagree about where
+        the words were: separators (any non-alphanumeric run) split, a lower-to-upper
+        transition splits, and an acronym run splits before its final capital, so
+        ``parseHTTPResponse`` is three words rather than two or five. Digits stay with
+        the word they touch, which keeps ``sha256`` intact.
+
+        The recognized styles, shown on the input ``"userID name"``:
+
+        =============  ==================
+        Style          Result
+        =============  ==================
+        ``snake``      ``user_id_name``
+        ``upper_snake``  ``USER_ID_NAME``
+        ``camel``      ``userIdName``
+        ``pascal``     ``UserIdName``
+        ``kebab``      ``user-id-name``
+        ``upper_kebab``  ``USER-ID-NAME``
+        ``title``      ``User Id Name``
+        ``sentence``   ``User id name``
+        ``dot``        ``user.id.name``
+        ``train``      ``User-Id-Name``
+        =============  ==================
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["parseHTTPResponse", "hello world"]})
+                >>> ds.select(r=bt.col("s").str.to_case("snake")).to_pydict()
+                {'r': ['parse_http_response', 'hello_world']}
+
+                >>> ds.select(r=bt.col("s").str.to_case("pascal")).to_pydict()
+                {'r': ['ParseHttpResponse', 'HelloWorld']}
+
+        Args:
+            style: One of the styles in the table above.
+
+        Recasing is idempotent in every separator-bearing style. It is not in ``camel``
+        or ``pascal`` when the input has consecutive single-letter words, because those
+        styles join without a separator: ``a_b_c`` becomes ``aBC``, which reads back as
+        two words rather than three. No splitter can recover that, so prefer a separator
+        style when the result will be re-parsed.
+
+        Returns:
+            A new string :class:`~batcher.Expr` re-cased into `style`; null stays null,
+            and an input with no alphanumerics becomes the empty string.
+
+        Raises:
+            PlanError: If `style` is not a recognized style name.
+        """
+        if style not in _CASE_STYLES:
+            raise PlanError(
+                f"str.to_case(): style must be one of {sorted(_CASE_STYLES)}, got {style!r}"
+            )
+        # `pattern` carries the style: `to_case` uses none of the other scalar slots.
+        return StrFunc("to_case", self._e, pattern=style)
 
     def minhash(self, num_perm: int = 128, ngram: int = 5) -> StrFunc:
         """A MinHash signature of the text → List<Int64> of `num_perm` values.
@@ -3303,6 +3394,7 @@ class _StrNamespace:
                 >>> ds.select(bt.col("s").str.split_part("-", 2).alias("r")).to_pydict()
                 {'r': ['b']}
         """
+        n = require_int(n, func="str.split_part", arg="n")
         return StrFunc("split_part", self._e, pattern=delimiter, start=n)
 
     def regexp_replace_all(self, pattern: str, replacement: str) -> StrFunc:

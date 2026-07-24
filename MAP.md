@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 819 Python modules across 124 packages and 157 Rust files across 13 crates.
+Covering 819 Python modules across 124 packages and 158 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -111,7 +111,8 @@ Three families are not where a crate doc would lead you. Follow these, not intui
 | Pair | Difference |
 |---|---|
 | `bc-io/src/store.rs` vs `bc-transport/src/store.rs` | Object-store URI resolution vs. shuffle-ticket registry. Unrelated. |
-| `bc-expr/src/analyze.rs` vs `bc-codegen/src/analyze.rs` | Scheduling predicates over `Expr` vs. JIT-subset validation. |
+| `bc-expr/src/analyze.rs` vs `bc-codegen/src/analyze.rs` | Static answers *about* an `Expr` (cost, columns read, can-a-skipped-row-hide-an-error, contains-media-decode) vs. JIT-subset validation. |
+| `bc-expr/src/select.rs` vs `bc-interp/src/ops/mod.rs` | Computing a filter's keep mask (short-circuiting the `AND` conjuncts) vs. the Filter operator that gathers with it. |
 | `bc-sketches` `countmin` vs `frequent` | *How often is this key* vs. *which keys are heavy*. |
 | `minhash` (`eval/str/`) vs `simhash` (`eval/list_ops/`) | Jaccard over shingles vs. cosine over embeddings. |
 | `plan/expr_rewrite/` vs `kyber/rules/` | The traversal **mechanism** vs. the rewrite **policy**. |
@@ -161,7 +162,7 @@ The public, fluent, lazy, expression-first API surface.
 
 | module | lines | what it is |
 |---|---|---|
-| `_join_helpers.py` | 147 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
+| `_join_helpers.py` | 157 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 279 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 663 | Top-level expression constructors re-exported for the public API. |
 | `groupby.py` | 867 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
@@ -191,7 +192,7 @@ The `Dataset` builder package.
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_window.py` | 105 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 220 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 5534 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 5532 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2713 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 399 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -1292,7 +1293,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | module | lines | what it is |
 |---|---|---|
 | `_csv_diagnostics.py` | 81 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
-| `_parquet_native.py` | 149 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
+| `_parquet_native.py` | 153 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 175 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
 | `avro.py` | 329 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 489 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
@@ -1474,8 +1475,8 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 4563 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 150 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `core.py` | 4628 | The scalar expression base class and its core IR nodes. |
+| `fn_names.py` | 152 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 295 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 291 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -1502,10 +1503,9 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 
 | module | lines | what it is |
 |---|---|---|
-| `_bind.py` | 503 | Shared accessor-generation helper for the namespace families. |
-| `_validate.py` | 48 | Argument validation shared by the accessor namespaces (layer 1, neutral). |
-| `collections.py` | 1191 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 3522 | The `.str` accessor namespace. |
+| `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
+| `collections.py` | 1306 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `strings.py` | 3597 | The `.str` accessor namespace. |
 | `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -1709,6 +1709,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 |---|---|---|
 | `hierarchy.py` | 621 | The Batcher exception hierarchy. |
 | `suggest.py` | 299 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
+| `validate.py` | 52 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
 ## Rust data plane — `crates/`
 
@@ -1848,15 +1849,15 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 375 | Cheap static predicates over `Expr` trees, consulted *before* execution. |
+| `analyze.rs` | 384 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 87 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 638 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 685 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 441 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/date.rs` | 717 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/dispatch.rs` | 370 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
-| `eval/in_list.rs` | 248 | `x IN (lit, lit, …)` — hash-set membership. |
+| `eval/in_list.rs` | 249 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 771 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 108 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/list_hof.rs` | 81 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
@@ -1867,7 +1868,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 141 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 83 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
-| `eval/math.rs` | 428 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 426 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image.rs` | 587 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
@@ -1878,17 +1879,18 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
 | `eval/security/mask.rs` | 35 | Character masking — the redaction primitive behind partial-disclosure policies ("show only the last four digits"). |
 | `eval/security/mod.rs` | 115 | Data-protection string functions: `hmac_sha256`, `aes_encrypt`, `aes_decrypt`, `mask`. |
+| `eval/str/case.rs` | 134 | Identifier case conversion for `StrFunc::ToCase` — one word splitter, ten styles. |
 | `eval/str/chunk.rs` | 182 | `StrFunc::Chunk` — overlapping text windows (the RAG document splitter). |
 | `eval/str/html.rs` | 172 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 80 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
-| `eval/str/json.rs` | 391 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
+| `eval/str/json.rs` | 531 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1236 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1314 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/timezone.rs` | 61 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1018 | `bc-expr` — scalar expression IR and its evaluation. |
-| `select.rs` | 256 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
+| `lib.rs` | 1045 | `bc-expr` — scalar expression IR and its evaluation. |
+| `select.rs` | 253 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
 
@@ -1959,10 +1961,10 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 561 | Aggregate Parquet footer statistics across many files, natively. |
-| `lib.rs` | 525 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 565 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 281 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
-| `row_filter.rs` | 244 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `row_filter.rs` | 345 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `store.rs` | 170 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`

@@ -103,7 +103,9 @@ STR_FNS: Final[frozenset[str]] = frozenset(
     {
         "aes_decrypt", "aes_encrypt", "ascii", "base64", "bit_length", "chunk", "contains",
         "crc32", "ends_with", "from_base64", "hash64", "hex", "hmac_sha256", "ilike",
-        "initcap", "json_extract_bool", "json_extract_float", "json_extract_int",
+        "initcap", "json_array_length", "json_array_values", "json_exists",
+        "json_extract_bool", "json_extract_float", "json_extract_int",
+        "json_object_keys", "json_type",
         "damerau_levenshtein", "jaro_similarity", "jaro_winkler_similarity",
         "json_extract_string", "l_trim",
         "len", "levenshtein", "like", "lower",
@@ -111,8 +113,8 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
         "regexp_replace", "regexp_replace_all", "repeat", "replace", "reverse",
         "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
-        "starts_with", "strip_html", "substr", "substring_index", "translate", "trim",
-        "unhex", "upper", "xxhash64",
+        "starts_with", "strip_html", "substr", "substring_index", "to_case", "translate",
+        "trim", "unhex", "upper", "xxhash64",
     }
 )  # fmt: skip
 
