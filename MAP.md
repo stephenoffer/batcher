@@ -164,7 +164,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 157 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 279 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 671 | Top-level expression constructors re-exported for the public API. |
+| `functions.py` | 673 | Top-level expression constructors re-exported for the public API. |
 | `groupby.py` | 867 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `source_stats.py` | 261 | Per-source statistics collection for the conductor. |
 | `stats.py` | 323 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
@@ -1476,7 +1476,7 @@ The scalar expression algebra.
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 4628 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 166 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `fn_names.py` | 167 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 291 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -1505,7 +1505,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
 | `collections.py` | 1306 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 3679 | The `.str` accessor namespace. |
+| `strings.py` | 3703 | The `.str` accessor namespace. |
 | `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -1541,7 +1541,7 @@ The expression function library, grouped by family.
 | `prompt.py` | 130 | Prompt-construction functions — assemble an LLM prompt from row columns, in the engine. |
 | `quantiles.py` | 181 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 229 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
-| `scalar.py` | 303 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
+| `scalar.py` | 384 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 286 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 442 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `string.py` | 426 | String-building free functions (`concat`, `concat_ws`, `format_string`). |
@@ -1779,7 +1779,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg/accum.rs` | 559 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
+| `agg/accum.rs` | 576 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 97 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
 | `agg/distinct.rs` | 381 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/fused.rs` | 418 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
@@ -1886,13 +1886,13 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 531 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1371 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1393 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/temporal/date.rs` | 717 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 61 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1097 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1101 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`

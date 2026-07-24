@@ -174,6 +174,21 @@ print(out.to_pydict())
 # {'digits': [3, 0, 2], 'found': [['1', '2', '3'], [], ['4', '5']], 'masked': ['a#b#c#', 'xyz', 'p#q#']}
 ```
 
+`regexp_split(pattern)` is the regex counterpart of `split`, for a separator that varies:
+a run of whitespace, one of several punctuation marks, a digit boundary. Empty pieces
+created by a leading or trailing separator are kept, so the piece count stays one more
+than the separator count.
+
+```python
+lines = bt.from_pydict({"s": ["alpha, beta;gamma", "one two   three"]})
+out = lines.select(
+    parts=bt.col("s").str.regexp_split("[,;]\\s*"),
+    words=bt.col("s").str.regexp_split(r"\s+"),
+)
+print(out.to_pydict())
+# {'parts': [['alpha', 'beta', 'gamma'], ['one two   three']], 'words': [['alpha,', 'beta;gamma'], ['one', 'two', 'three']]}
+```
+
 ### Building strings from several columns
 
 Two top-level helpers assemble one string from many expressions.

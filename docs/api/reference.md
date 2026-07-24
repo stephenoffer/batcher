@@ -198,6 +198,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
 | `bt.gcd(a, b)` / `bt.lcm(a, b)` | greatest common divisor / least common multiple |
 | `bt.hypot(a, b)` | Euclidean norm `sqrt(a² + b²)` |
+| `bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km")` | haversine distance between two lat/lon points, in `km`/`m`/`mi`/`nm` |
 | `bt.width_bucket(value, low, high, count)` | histogram bucket index over `[low, high]` |
 | `bt.struct(**fields)` / `bt.named_struct(name, value, ...)` | build a struct column |
 | `bt.sequence(start, stop, step=1)` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |

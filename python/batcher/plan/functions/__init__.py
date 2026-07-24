@@ -42,7 +42,17 @@ from batcher.plan.functions.prompt import (
     truncate_to_token_budget,
     wrap_tag,
 )
-from batcher.plan.functions.scalar import arctan2, gcd, hypot, iff, lcm, log, nanvl, width_bucket
+from batcher.plan.functions.scalar import (
+    arctan2,
+    gcd,
+    great_circle_distance,
+    hypot,
+    iff,
+    lcm,
+    log,
+    nanvl,
+    width_bucket,
+)
 from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
 from batcher.plan.functions.string import (
     concat,
@@ -106,6 +116,7 @@ __all__ = [
     "from_epoch",
     "from_unix_date",
     "gcd",
+    "great_circle_distance",
     "hmac_sha256",
     "hypot",
     "iff",

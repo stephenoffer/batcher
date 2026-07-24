@@ -24,6 +24,7 @@ __all__ = [
     "arctan2",
     "cut",
     "gcd",
+    "great_circle_distance",
     "hypot",
     "iff",
     "lcm",
@@ -219,7 +220,7 @@ def gcd(a: IntoExpr, b: IntoExpr) -> Math2Expr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"a": [12, 15], "b": [18, 20]})
             >>> ds.select(bt.gcd(bt.col("a"), bt.col("b")).alias("r")).to_pydict()
-            {'r': [6.0, 5.0]}
+            {'r': [6, 5]}
     """
     return Math2Expr("gcd", _wrap(a), _wrap(b))
 
@@ -242,7 +243,7 @@ def lcm(a: IntoExpr, b: IntoExpr) -> Math2Expr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"a": [4, 6], "b": [6, 8]})
             >>> ds.select(bt.lcm(bt.col("a"), bt.col("b")).alias("r")).to_pydict()
-            {'r': [12.0, 24.0]}
+            {'r': [12, 24]}
     """
     return Math2Expr("lcm", _wrap(a), _wrap(b))
 
@@ -301,3 +302,83 @@ def width_bucket(value: IntoExpr, low: IntoExpr, high: IntoExpr, count: int) -> 
     numer = ((v - lo) * count).cast("float64")
     raw = MathExpr("floor", Binary("div", numer, (hi - lo))) + 1
     return raw.clip(0, count + 1)
+
+
+# Mean Earth radius (IUGG) in each supported unit. Great-circle distance is a radius
+# times an angle, so the unit is a multiplier and nothing else changes.
+_EARTH_RADIUS = {
+    "km": 6371.0088,
+    "m": 6_371_008.8,
+    "mi": 3958.7613,
+    "nm": 3440.0695,
+}
+
+
+def great_circle_distance(
+    lat1: IntoExpr,
+    lon1: IntoExpr,
+    lat2: IntoExpr,
+    lon2: IntoExpr,
+    unit: str = "km",
+) -> Expr:
+    """Great-circle distance between two lat/lon points, in degrees (→ Float64).
+
+    The haversine formula on a sphere of mean Earth radius. Haversine rather than the
+    law of cosines because the latter loses precision for nearby points, where the
+    cosine of a tiny angle is indistinguishable from 1 in double precision, and nearby
+    points are the interesting case for a proximity filter.
+
+    Composed from existing expression nodes, so the engine evaluates the same arithmetic
+    tree you would have written by hand; there is no new IR and no per-row Python.
+
+    Args:
+        lat1: Latitude of the first point, in degrees.
+        lon1: Longitude of the first point, in degrees.
+        lat2: Latitude of the second point, in degrees.
+        lon2: Longitude of the second point, in degrees.
+        unit: Output unit: ``"km"``, ``"m"``, ``"mi"`` (statute miles), or ``"nm"``
+            (nautical miles).
+
+    Returns:
+        The distance between the two points in `unit`, as a Float64 expression.
+
+    Raises:
+        PlanError: If `unit` is not one of the four recognized units.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict(
+            ...     {
+            ...         "alat": [51.5074],
+            ...         "alon": [-0.1278],
+            ...         "blat": [48.8566],
+            ...         "blon": [2.3522],
+            ...     }
+            ... )
+            >>> out = ds.select(
+            ...     km=bt.great_circle_distance(
+            ...         bt.col("alat"), bt.col("alon"), bt.col("blat"), bt.col("blon")
+            ...     )
+            ... ).to_pydict()
+            >>> round(out["km"][0])  # London to Paris
+            343
+    """
+    if unit not in _EARTH_RADIUS:
+        raise PlanError(
+            f"great_circle_distance(): unit must be one of {sorted(_EARTH_RADIUS)}, got {unit!r}"
+        )
+    phi1 = _wrap(lat1).radians()
+    phi2 = _wrap(lat2).radians()
+    d_phi = (_wrap(lat2) - _wrap(lat1)).radians()
+    d_lambda = (_wrap(lon2) - _wrap(lon1)).radians()
+    # a = sin²(Δφ/2) + cos φ₁ · cos φ₂ · sin²(Δλ/2)
+    sin_half_phi = (d_phi / lit(2.0)).sin()
+    sin_half_lambda = (d_lambda / lit(2.0)).sin()
+    a = sin_half_phi * sin_half_phi + phi1.cos() * phi2.cos() * sin_half_lambda * sin_half_lambda
+    # c = 2·atan2(√a, √(1−a)) — the atan2 form rather than 2·asin(√a) because it stays
+    # defined when rounding pushes `a` a hair above 1 for antipodal points, where `asin`
+    # would produce NaN.
+    central_angle = lit(2.0) * atan2(a.sqrt(), (lit(1.0) - a).sqrt())
+    return lit(_EARTH_RADIUS[unit]) * central_angle

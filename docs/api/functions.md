@@ -26,6 +26,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    atan2
    arctan2
    hypot
+   great_circle_distance
    gcd
    lcm
    log

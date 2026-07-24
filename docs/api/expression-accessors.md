@@ -47,6 +47,7 @@ Each namespace and the methods it carries:
 | `.overlay(replacement, pos, length=None)` | replace `length` chars from 1-based `pos` (SQL `OVERLAY`) |
 | `.regexp_extract_all(pattern)` | every regex match as a `List<Utf8>` (DuckDB `regexp_extract_all`) |
 | `.regexp_count(pattern)` | number of non-overlapping regex matches (→ Int64) |
+| `.regexp_split(pattern)` | split on every regex match into a `List<Utf8>` (DuckDB `regexp_split_to_array`) |
 | `.levenshtein(target)` | edit distance to the constant `target` (DuckDB `levenshtein`, → Int64) |
 | `.damerau_levenshtein(target)` | edit distance to `target` counting an adjacent-swap as one edit (DuckDB `damerau_levenshtein`, → Int64), which handles typos better |
 | `.jaro_similarity(target)` | Jaro similarity to `target`, `[0,1]` (DuckDB `jaro_similarity`, → Float64), for fuzzy matching and record linkage |

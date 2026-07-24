@@ -2972,6 +2972,30 @@ class _StrNamespace:
         """
         return StrFunc("split", self._e, pattern=delimiter)
 
+    def regexp_split(self, pattern: str) -> StrFunc:
+        """Split on every match of the regex `pattern` into a list of strings.
+
+        The regex counterpart of :meth:`split`, whose delimiter is a literal. Use it where
+        the separator varies: a run of whitespace, one of several punctuation marks, a
+        digit boundary.
+
+        Args:
+            pattern: The regular expression matching each separator.
+
+        Returns:
+            A new List<Utf8> :class:`~batcher.Expr` of the pieces between matches; a null
+            input gives a null list, and a string with no match gives a one-element list.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b22c", "no digits here"]})
+                >>> ds.select(r=bt.col("s").str.regexp_split("[0-9]+")).to_pydict()
+                {'r': [['a', 'b', 'c'], ['no digits here']]}
+        """
+        return StrFunc("regexp_split", self._e, pattern=pattern)
+
     def strip_html(self) -> StrFunc:
         """Recover the readable text of an HTML document → Utf8.
 

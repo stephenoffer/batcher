@@ -837,6 +837,10 @@ pub enum StrFunc {
     /// Number of non-overlapping matches of regex `pattern` (DuckDB `regexp_count`).
     /// → Int64.
     RegexpCount,
+    /// Split on every match of regex `pattern` → a `List<Utf8>` of the pieces between
+    /// matches. The regex counterpart of `Split`, whose delimiter is a literal. An empty
+    /// string yields `[""]` and a null input a null list, matching `Split`. → List<Utf8>.
+    RegexpSplit,
     /// Levenshtein edit distance to the literal string `pattern` (DuckDB
     /// `levenshtein` against a constant). → Int64.
     Levenshtein,

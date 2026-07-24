@@ -598,6 +598,28 @@ pub(crate) fn eval_str(
             }
             Arc::new(builder.finish())
         }
+        StrFunc::RegexpSplit => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            let re = compile_regex(pattern, func)?;
+            // The pieces together are at most the input bytes, so both buffers pre-size
+            // from the input the way the literal `Split` does.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
+            for o in s.iter() {
+                match o {
+                    Some(v) => {
+                        for part in re.split(v) {
+                            builder.values().append_value(part);
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
         StrFunc::RegexpCount => {
             let re = compile_regex(pattern, func)?;
             Arc::new(
