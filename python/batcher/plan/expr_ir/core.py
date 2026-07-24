@@ -1481,13 +1481,23 @@ class Expr:
         """The broadcast ``(mean, sample stddev)`` of this column over its window.
 
         The window engine offers `sum`/`avg`/`min`/`max`/`count` but no `stddev`, so the
-        deviation comes from the moments — ``Var = E[x^2] - E[x]^2`` with the Bessel
-        correction ``n / (n - 1)``, exactly as `rolling_var` does over a trailing frame."""
+        deviation is built from window aggregates. It uses the **two-pass** form —
+        ``E[(x - mean)^2]`` against the already-broadcast window mean — rather than
+        ``E[x^2] - E[x]^2``, because the latter subtracts two nearly equal large numbers
+        and loses a digit for every digit by which the mean exceeds the spread. On
+        ``[k+1, ..., k+6]`` it drove `zscore` to `inf` at ``k=1e9`` (the standard deviation
+        cancelled to exactly 0) and to `NaN` at ``k=1e12`` (it cancelled negative, and the
+        square root of a negative is not a number). An epoch-second timestamp is ~1.7e9.
+
+        The mean is a window aggregate broadcast to every row, so ``x - mean`` is an
+        ordinary scalar expression and the second pass costs one more window aggregate over
+        the same partition — which `hoist_windows` shares with the first."""
         keys = list(partition_by)
         n = self.count().over(partition_by=keys).cast("float64")
         mean = self.mean().over(partition_by=keys)
-        mean_sq = (self * self).mean().over(partition_by=keys)
-        std = ((mean_sq - mean * mean) * (n / (n - Lit(1)))).sqrt()
+        deviation = self - mean
+        var_pop = (deviation * deviation).mean().over(partition_by=keys)
+        std = (var_pop * (n / (n - Lit(1)))).sqrt()
         return mean, std
 
     def zscore(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
@@ -2011,11 +2021,24 @@ class Expr:
                 >>> ds.with_columns(v=bt.col("x").expanding_var().round(4)).to_pydict()["v"]
                 [nan, 0.5, 1.0, 1.6667]
         """
+        from batcher.plan.expr_ir.constructors import when
+
         keys, order = list(partition_by), list(order_by)
+        # Centered on the partition mean before the running moments are taken. The identity
+        # `Var(x) = Var(x - k)` makes this exact for any constant `k`, and without it the
+        # `E[x^2] - E[x]^2` difference cancels: on `[k+1, ..., k+6]` the running variance
+        # came back as 0.0 at `k=1e9` and as -161061273 -- a negative variance -- at
+        # `k=1e12`. The partition mean is the constant nearest the data that a window
+        # expression can name; see `_rolling_var`, which carries the same correction.
+        centre = AggExpr("avg", self).over(partition_by=keys)
+        centered = self - centre
         n = self.cum_count(partition_by=keys, order_by=order).cast("float64")
-        mean = self.cum_sum(partition_by=keys, order_by=order) / n
-        mean_sq = (self * self).cum_sum(partition_by=keys, order_by=order) / n
-        var_pop = mean_sq - mean * mean
+        mean = centered.cum_sum(partition_by=keys, order_by=order) / n
+        mean_sq = (centered * centered).cum_sum(partition_by=keys, order_by=order) / n
+        raw = mean_sq - mean * mean
+        # Clamped through a comparison rather than a max(), so a NaN from a non-finite
+        # value still propagates instead of being reported as a confident zero variance.
+        var_pop = when(raw < Lit(0.0)).then(Lit(0.0)).otherwise(raw)
         if ddof == 0:
             return var_pop
         return var_pop * (n / (n - Lit(ddof)))
@@ -3776,13 +3799,46 @@ class Expr:
         """Sample/population variance over the trailing frame, composed from moments.
 
         ``Var = E[x^2] - E[x]^2`` gives the population variance over the frame; the
-        Bessel correction ``n / (n - ddof)`` lifts it to the sample statistic. All three
+        Bessel correction ``n / (n - ddof)`` lifts it to the sample statistic. All the
         terms reuse the tested `_rolling` machinery over the *same* frame, so rolling
         variance adds no new IR and inherits the leading-partial-frame / `min_periods`
-        semantics of :meth:`rolling_sum`."""
-        mean = self._rolling("avg", window_size, min_periods, partition_by, order_by)
-        mean_sq = (self * self)._rolling("avg", window_size, min_periods, partition_by, order_by)
-        var_pop = mean_sq - mean * mean
+        semantics of :meth:`rolling_sum`.
+
+        The values are **centered on the partition mean first**, which the identity
+        ``Var(x) = Var(x - k)`` makes exact for any constant `k`. Without it this is the
+        sum-of-powers formula that `bc-runtime`'s `var_state` was rewritten to escape: it
+        subtracts two nearly equal large numbers, so it loses a digit of precision for
+        every digit by which the mean exceeds the spread. Measured on
+        ``[k+1, k+2, ..., k+6]`` with a 3-wide frame, where the true variance is 1.0:
+
+        ==============  ==================================
+        offset ``k``    ``E[x^2] - E[x]^2`` returned
+        ==============  ==================================
+        ``0``           1.0
+        ``1e6``         0.999939
+        ``1e9``         0.0        (reads as "constant")
+        ``1e12``        -201326592 (a negative variance)
+        ==============  ==================================
+
+        An epoch-second timestamp is ~1.7e9 and a monetary column in cents reaches 1e12,
+        so this is the ordinary case rather than an adversarial one. Centering removes the
+        offset before it can cancel; the partition mean is used because it is the constant
+        nearest the data that a window expression can name.
+
+        The residual is clamped at zero for the rounding that can still put a
+        mathematically non-negative quantity a few ulps below it — via a comparison, so a
+        genuine NaN (a non-finite value in the frame) propagates instead of being clipped
+        to a confident zero."""
+        from batcher.plan.expr_ir.constructors import when
+
+        centre = AggExpr("avg", self).over(partition_by=partition_by)
+        centered = self - centre
+        mean = centered._rolling("avg", window_size, min_periods, partition_by, order_by)
+        mean_sq = (centered * centered)._rolling(
+            "avg", window_size, min_periods, partition_by, order_by
+        )
+        raw = mean_sq - mean * mean
+        var_pop = when(raw < Lit(0.0)).then(Lit(0.0)).otherwise(raw)
         if ddof == 0:
             return var_pop
         count = self._rolling("count", window_size, min_periods, partition_by, order_by).cast(

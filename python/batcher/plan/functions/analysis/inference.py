@@ -68,9 +68,21 @@ def _group_var(value: IntoExpr, group: Expr) -> Expr:
     """The sample variance of `value` over the rows where `group` is true.
 
     ``E[x^2] - E[x]^2`` scaled to the ``n - 1`` denominator. The naive form is used here
-    (rather than the engine's Welford aggregate) because a *conditional* variance cannot be
-    expressed with the aggregate directly; the trade is documented on the callers, which
-    center their inputs implicitly by taking a difference of means.
+    rather than the engine's Welford aggregate because a *conditional* variance cannot be
+    expressed with the aggregate directly, and a window expression -- which is how
+    `Expr.zscore` and `Expr.expanding_var` center their inputs -- is rejected inside an
+    aggregate.
+
+    .. warning::
+
+       The difference of two nearly equal large numbers loses a digit of precision for
+       every digit by which the mean exceeds the spread, and taking a difference of means
+       downstream does **not** recover it: the cancellation has already happened here. On
+       ``[k+1, ..., k+6]`` split into two groups, `welch_t_statistic` returns ``-inf`` at
+       ``k=1e9`` (both variances cancelled to 0) and ``NaN`` at ``k=1e12`` (they cancelled
+       negative). An epoch-second timestamp is ~1.7e9, so subtract a reference point from
+       such a column before testing it. Fixing this properly needs a weighted/conditional
+       Welford aggregate in `bc-runtime`.
     """
     column = _as_column(value)
     kept = group & column.is_not_null()

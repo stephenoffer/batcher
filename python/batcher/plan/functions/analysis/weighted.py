@@ -37,6 +37,16 @@ def weighted_var(value: IntoExpr, weight: IntoExpr) -> Expr:
         value: The measured column.
         weight: The per-row weight column.
 
+    .. warning::
+
+       Computed as ``E_w[x^2] - E_w[x]^2`` in a single pass, which subtracts two nearly
+       equal large numbers when the mean is far from zero: it loses a digit of precision
+       for every digit by which the mean exceeds the spread. On ``[k+1, ..., k+6]`` the
+       true variance is 2.917, and this returns 0.0 at ``k=1e9`` and -134217728 -- a
+       negative variance -- at ``k=1e12``. An epoch-second timestamp is ~1.7e9, so
+       subtract a reference point from such a column first. The unweighted `Expr.var`
+       uses Welford and has no such limit.
+
     Returns:
         The weighted variance over the group.
 
@@ -52,6 +62,10 @@ def weighted_var(value: IntoExpr, weight: IntoExpr) -> Expr:
     total = w.sum()
     mean = (w * x).sum() / total
     mean_square = (w * x * x).sum() / total
+    # `E_w[x^2] - E_w[x]^2` in one pass. It cancels when the mean dwarfs the spread, and
+    # unlike `Expr.zscore` / `Expr.expanding_var` there is no fix available here: centering
+    # needs the mean *before* the sum, and a window expression is rejected inside an
+    # aggregate. See the warning in the docstring.
     return mean_square - mean * mean
 
 
