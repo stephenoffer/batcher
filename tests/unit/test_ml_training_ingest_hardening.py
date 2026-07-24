@@ -424,7 +424,8 @@ def test_resumable_sampler_partitions_across_dataloader_workers(monkeypatch, num
     per_worker = []
     for worker in range(num_workers):
         monkeypatch.setattr(
-            "batcher.ml.streaming_sampler.resumable._worker_stride", lambda w=worker: (w, num_workers)
+            "batcher.ml.streaming_sampler.resumable._worker_stride",
+            lambda w=worker: (w, num_workers),
         )
         per_worker.append(list(ResumableSampler(64, world_size=2, rank=0, seed=7)))
 

@@ -28,6 +28,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import get_logger, note_suppressed
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
@@ -694,7 +695,8 @@ def _learning_hub(hub=None):
         from batcher.core import default_hub
 
         return default_hub()
-    except Exception:  # pragma: no cover - learning is best-effort
+    except Exception as exc:  # pragma: no cover - learning is best-effort
+        note_suppressed("dist", "resolve the learning hub", exc)
         return None
 
 
@@ -717,7 +719,8 @@ def _learned_weight_factor(plan: LogicalPlan, hub=None) -> float:
 
     try:
         factor = learned_cpu_weight_factor(_learning_hub(hub), _plan_family(plan))
-    except Exception:  # pragma: no cover - learning is best-effort
+    except Exception as exc:  # pragma: no cover - learning is best-effort
+        note_suppressed("dist", "read learned task-weight factor", exc)
         factor = None
     return factor if factor is not None else 1.0
 
@@ -822,7 +825,8 @@ def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
             )
             total_bytes = total_rows * width
         return max(1, math.ceil(total_bytes / max(1, opt.target_bytes_per_task)))
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "size the byte-based partition count", exc)
         return 1
 
 
@@ -1146,7 +1150,8 @@ def _drain_gpu_stat(actor) -> float | None:
 
     try:
         return ray.get(actor.gpu_stats.remote())
-    except Exception:  # pragma: no cover - feedback must never break execution
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("dist", "drain a GPU utilization sample", exc)
         return None
 
 
@@ -1160,7 +1165,8 @@ def _drain_gpu_vram(actor) -> float | None:
         return None
     try:
         return ray.get(stat.remote())
-    except Exception:  # pragma: no cover - feedback must never break execution
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("dist", "drain a GPU VRAM sample", exc)
         return None
 
 

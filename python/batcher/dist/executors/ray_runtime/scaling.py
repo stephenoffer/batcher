@@ -147,7 +147,8 @@ def _learned_shuffle_fanout(workers: int) -> int:
 
         learned = learned_shuffle_fanout(default_hub(), None, workers)
         return learned if learned is not None else workers
-    except Exception:  # pragma: no cover - learning is best-effort
+    except Exception as exc:  # pragma: no cover - learning is best-effort
+        note_suppressed("dist", "read learned shuffle fan-out", exc)
         return workers
 
 

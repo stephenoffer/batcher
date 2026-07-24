@@ -150,7 +150,7 @@ def _coerce_integer(value: object) -> int | None:
         try:
             return int(text)  # exact, and keeps precision beyond 2**53
         except ValueError:
-            pass
+            pass  # not an exact integer -> fall through to the float parse below
         value = float(text)
     if isinstance(value, float):
         return int(value) if value.is_integer() else None

@@ -812,7 +812,8 @@ def load_gpu_utilization(hub: MetadataHub | None, key: str) -> float | None:
         return None
     try:
         return hub.load_params(_NAMESPACE).get(key)
-    except Exception:  # pragma: no cover - feedback must never break execution
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("ml", "load GPU utilization feedback", exc)
         return None
 
 
@@ -847,7 +848,8 @@ def load_gpu_peak_vram(hub: MetadataHub | None, key: str) -> float | None:
         return None
     try:
         return hub.load_params(_VRAM_NAMESPACE).get(key)
-    except Exception:  # pragma: no cover - a learned read must never break execution
+    except Exception as exc:  # pragma: no cover - a learned read must never break execution
+        note_suppressed("ml", "load GPU peak-VRAM feedback", exc)
         return None
 
 

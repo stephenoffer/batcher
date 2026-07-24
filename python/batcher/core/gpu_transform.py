@@ -135,7 +135,7 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
 
             return _cudf_groupby_agg(table, key, aggs)
         except ImportError:
-            pass
+            pass  # cudf not installed -> fall through to the next backend, then the CPU
     return _torch_groupby_agg(table, key, aggs, device=device)
 
 

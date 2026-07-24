@@ -31,6 +31,7 @@ import math
 import weakref
 from statistics import median
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import Config, CostCoefficients, active_config
 from batcher.metadata import MetadataHub
 
@@ -159,7 +160,8 @@ def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoef
         return cached[2]
     try:
         coeffs = _calibrate(hub.op_stats_by_kind(), defaults, cfg)
-    except Exception:  # pragma: no cover - calibration must never break planning
+    except Exception as exc:  # pragma: no cover - calibration must never break planning
+        note_suppressed("kyber", "load calibrated cost coefficients", exc)
         coeffs = defaults
     _CALIB_CACHE[hub] = (version, fingerprint, coeffs)
     return coeffs

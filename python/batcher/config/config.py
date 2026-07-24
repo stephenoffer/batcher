@@ -2125,25 +2125,25 @@ def set_config(config: Config) -> None:
 def config_context(config: Config) -> Iterator[Config]:
     """Temporarily activate `config` for the duration of the `with` block.
 
-        Validates `config` on entry (raises `ConfigError` on a bad value).
+    Validates `config` on entry (raises `ConfigError` on a bad value).
 
-        Examples:
-            .. doctest::
+    Examples:
+        .. doctest::
 
-                >>> from batcher.config import Config, ExecutionConfig
-                >>> from batcher.config import active_config, config_context
-                >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
-                >>> with config_context(cfg):
-    ...     active_config().execution.morsel_rows
-                4096
-                >>> active_config().execution.morsel_rows
-                16384
+            >>> from batcher.config import Config, ExecutionConfig
+            >>> from batcher.config import active_config, config_context
+            >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+            >>> with config_context(cfg):
+            ...     active_config().execution.morsel_rows
+            4096
+            >>> active_config().execution.morsel_rows
+            16384
 
-        Args:
-            config: The Config to activate for the block. It is validated on entry.
+    Args:
+        config: The Config to activate for the block. It is validated on entry.
 
-        Yields:
-            The resolved Config that is active inside the block.
+    Yields:
+        The resolved Config that is active inside the block.
     """
     resolved = _resolved(config)
     token = _active.set(resolved)

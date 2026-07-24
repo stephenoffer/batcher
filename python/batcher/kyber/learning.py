@@ -257,7 +257,8 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
         return cached[2]
     try:
         samples = _q_error_samples(hub, window)
-    except Exception:  # pragma: no cover - learning must never break planning
+    except Exception as exc:  # pragma: no cover - learning must never break planning
+        note_suppressed("kyber", "read learned cardinality corrections", exc)
         return {}
     out: dict[str, float] = {}
     for sig, log_qs in samples.items():

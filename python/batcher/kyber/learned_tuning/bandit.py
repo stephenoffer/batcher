@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.kyber import plan_cache
 
 if TYPE_CHECKING:
@@ -87,7 +88,8 @@ def record_arm(
         stats = {a: _decayed(v) for a, v in stored.items() if isinstance(v, dict)}
         stats[arm] = _welford_update(stats.get(arm), reward_ms)
         plan_cache.record_write(hub, namespace, key, stats)
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("kyber", "record a bandit arm observation", exc)
         return
 
 

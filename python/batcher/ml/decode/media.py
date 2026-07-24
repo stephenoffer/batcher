@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher._internal.logging import note_suppressed
 from batcher.ml.decode.stage import _require_size
 
 if TYPE_CHECKING:
@@ -123,6 +124,7 @@ def _decode_audio_bytes(
 def _resample(wave: Any, src_sr: int, dst_sr: int) -> Any:
     try:
         import librosa
-    except ImportError:  # pragma: no cover - resampling is best-effort
+    except ImportError as exc:  # pragma: no cover - resampling is best-effort
+        note_suppressed("ml", "resample audio", exc)
         return wave
     return librosa.resample(wave, orig_sr=src_sr, target_sr=dst_sr)

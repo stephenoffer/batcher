@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from batcher._internal.errors import PlanError
+from batcher._internal.logging import note_suppressed
 from batcher.plan.schema import suggest_columns
 
 if TYPE_CHECKING:
@@ -100,7 +101,8 @@ class MetaBase:
             stats = _source_stats(ds._sources, None)
             stats = enrich_in_memory(ds._sources, stats, ndv=ndv, mean=mean, total=total)
             return facts_for(ds._plan, ds._sources, stats, core.default_hub())
-        except Exception:  # a shortcut must never break a runnable query
+        except Exception as exc:  # a shortcut must never break a runnable query
+            note_suppressed("api", "compute a metadata fact", exc)
             return None
 
     def ask(

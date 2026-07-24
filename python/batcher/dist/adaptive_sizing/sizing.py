@@ -251,7 +251,8 @@ def aggregate_reducer_count(agg, base_reducers: int) -> int:
         from batcher.kyber.signature import plan_signature
 
         rows = learned_signature_rows(default_hub(), plan_signature(agg))
-    except Exception:  # learning is best-effort; a miss keeps the default fan-out
+    except Exception as exc:  # learning is best-effort; a miss keeps the default fan-out
+        note_suppressed("dist", "read learned reducer count", exc)
         return base_reducers
     if rows is None or rows <= 0:
         return base_reducers
@@ -270,5 +271,6 @@ def record_aggregate_cardinality(agg, output_rows: int) -> None:
         from batcher.kyber import record_execution
 
         record_execution(default_hub(), agg, output_rows)
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("dist", "record aggregate cardinality", exc)
         return

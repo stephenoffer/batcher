@@ -19,6 +19,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.nosql.base import (
     PartitionSpec,
@@ -158,7 +159,8 @@ class CouchbaseSource(ScanSource):
             # windows is a routine step of every parallel read, so the leak recurred per read.
             with _closing_cluster(self._cluster()) as cluster:
                 rows = list(cluster.execute_query(stmt).rows())
-        except Exception:  # a count that fails must not fail the read — fall back to serial
+        except Exception as exc:  # a count that fails must not fail the read — fall back to serial
+            note_suppressed("io", "count rows for a parallel read", exc)
             return None
         if not rows:
             return None

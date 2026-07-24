@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import median
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import blend, clamp_factor
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
@@ -289,7 +290,8 @@ def learned_memory_model(
         return cached[2]
     try:
         model = _fit(hub, cfg)
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("carbonite", "load the learned memory model", exc)
         model = _empty_model(cfg)
     _MODEL_CACHE[hub] = (version, fingerprint, model)
     return model

@@ -40,7 +40,7 @@ def cpu_contention() -> dict[str, float]:
         # moment it was pegged and throttled, which is the reading this metric exists to catch.
         out["load_per_core"] = load1 / max(1, available_cpu_count())
     except (OSError, AttributeError):
-        pass
+        pass  # no getloadavg on this platform -> omit the metric rather than guess one
     try:
         stat = pathlib.Path("/sys/fs/cgroup/cpu.stat").read_text()
         fields = dict(line.split(maxsplit=1) for line in stat.splitlines() if " " in line)
@@ -49,7 +49,7 @@ def cpu_contention() -> dict[str, float]:
         if periods > 0:
             out["throttled_share"] = throttled / periods
     except (OSError, ValueError):
-        pass
+        pass  # not running under a cgroup v2 CPU controller -> omit the throttling metric
     return out
 
 

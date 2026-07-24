@@ -21,6 +21,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
+
 __all__ = ["RowGroupBounds", "parquet_row_group_bounds", "surviving_rows_for_range"]
 
 
@@ -60,7 +62,8 @@ def parquet_row_group_bounds(
         try:
             with filesystem.open(path) as fh:
                 return pq.ParquetFile(fh).metadata
-        except Exception:
+        except Exception as exc:
+            note_suppressed("io", "read a parquet footer for row-group pruning", exc)
             return None  # unreadable footer → skipped below (best-effort pruning)
 
     # Read every footer concurrently (each is one round trip); the bounds accumulation

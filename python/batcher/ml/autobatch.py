@@ -45,7 +45,8 @@ def learned_batch_size(hub: MetadataHub | None, signature: str | None) -> int | 
         return None
     try:
         s = hub.get_keyed_param(_LEARN_NS, signature) or {}
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("ml", "read learned batch size", exc)
         return None
     v = s.get("size")
     return int(v) if isinstance(v, (int, float)) and v >= 1 else None

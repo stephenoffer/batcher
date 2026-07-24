@@ -58,7 +58,8 @@ def load_scalar(hub: MetadataHub | None, namespace: str, key: str) -> float | No
         return None
     try:
         stored = hub.get_keyed_param(namespace, key)
-    except Exception:  # pragma: no cover - a learned read must never break a query
+    except Exception as exc:  # pragma: no cover - a learned read must never break a query
+        note_suppressed("metadata", "load a smoothed scalar", exc)
         return None
     return _value_of(stored)
 

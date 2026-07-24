@@ -35,9 +35,11 @@ from batcher.plan.logical.relational import (
 from batcher.plan.logical.reshape import RowId, Unnest, Unpivot
 from batcher.plan.logical.transforms import (
     empty_result_schema,
+    hoist_computed_keys,
     is_cartesian_key_pair,
     is_partition_independent,
     is_streamable,
+    project_columns,
     remap_sources,
 )
 from batcher.plan.logical.window import Window, WindowFrame, WindowFuncSpec
@@ -69,8 +71,10 @@ __all__ = [
     "WindowFrame",
     "WindowFuncSpec",
     "empty_result_schema",
+    "hoist_computed_keys",
     "is_cartesian_key_pair",
     "is_partition_independent",
     "is_streamable",
+    "project_columns",
     "remap_sources",
 ]

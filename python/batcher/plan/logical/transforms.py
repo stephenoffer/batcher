@@ -3,14 +3,18 @@
 `remap_sources` shifts every `Scan.source_id` (used when appending a right side's
 sources after the left's); `is_streamable` reports whether a plan is
 partition-independent (only row-wise operators, no pipeline breaker);
-`empty_result_schema` types a zero-batch result.
+`empty_result_schema` types a zero-batch result; `hoist_computed_keys` and
+`project_columns` materialize a computed shuffle key as a hidden column and project it
+away again, which is what gives an expression-keyed sort or window a distributed path.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pyarrow as pa
 
-from batcher.plan.expr_ir import Col, Lit
+from batcher.plan.expr_ir import Col, Expr, Lit
 from batcher.plan.logical.aggregate import Sort
 from batcher.plan.logical.base import LogicalPlan
 from batcher.plan.logical.join import Join
@@ -20,6 +24,7 @@ from batcher.plan.logical.relational import (
     Limit,
     MapBatches,
     Project,
+    Projection,
     Sample,
     Scan,
 )
@@ -28,9 +33,11 @@ from batcher.plan.schema import placeholder_schema
 
 __all__ = [
     "empty_result_schema",
+    "hoist_computed_keys",
     "is_cartesian_key_pair",
     "is_partition_independent",
     "is_streamable",
+    "project_columns",
     "remap_sources",
 ]
 
@@ -180,6 +187,80 @@ def is_partition_independent(node: LogicalPlan) -> bool:
     if isinstance(node, Sample):
         return node.n is None
     return isinstance(node, (Filter, Project, Unnest, Unpivot))
+
+
+def project_columns(plan: LogicalPlan, columns: Sequence[str]) -> Project:
+    """A `Project` over `plan` selecting exactly `columns`, unchanged and in order.
+
+    The projection every shuffle rewrite needs to restore a relation's user-visible
+    schema after a hidden key column was materialized below it.
+
+    Args:
+        plan: The plan to project.
+        columns: The column names to keep, in output order.
+
+    Returns:
+        A `Project` whose output columns are `columns`.
+    """
+    return Project(input=plan, items=tuple(Projection(alias=c, expr=Col(c)) for c in columns))
+
+
+def hoist_computed_keys(
+    input_plan: LogicalPlan, keys: Sequence[Expr], *, prefix: str
+) -> tuple[LogicalPlan, tuple[Expr, ...]] | None:
+    """Materialize any computed shuffle key as a hidden column, so every key is a `Col`.
+
+    A shuffle partitions on its keys' *values*, which it can only read from a column: the
+    range partitioner splits on the leading sort key, and the hash partitioner reads the
+    window's partition keys by column index. A key that is an expression — `sort(col("a") +
+    col("b"))`, `partition_by=[col("v") % 4]` — therefore has no distributed path at all
+    unless it is computed before the shuffle.
+
+    Computing it once per row in the map prefix is exactly what the single-node operator
+    does internally, so this is a rewrite and not an approximation: the hidden column is
+    materialized below the breaker, drives the partitioning, and is projected away above it
+    by `project_columns`. Callers own that second half, because only they know which
+    columns their operator's output should carry.
+
+    This lives in the neutral `plan` layer with one definition because the distributed and
+    streaming paths both need it, and because the sort already had a private copy — a
+    second one for the window is how the two spellings drift into disagreeing about
+    shadowing or key order.
+
+    Args:
+        input_plan: The relation the keys are evaluated against.
+        keys: The shuffle keys, in order.
+        prefix: Base name for the hidden columns, e.g. ``"__sort_key"``. Underscores are
+            appended until it shadows no existing column.
+
+    Returns:
+        `(input', keys')` where `input'` materializes the computed keys and every entry of
+        `keys'` is a `Col`, or None when every key is already a column (the overwhelmingly
+        common case, left byte-identical rather than wrapped in a no-op `Project`).
+    """
+    if all(isinstance(k, Col) for k in keys):
+        return None
+
+    columns = input_plan.available_columns()
+    taken = set(columns)
+    hidden: list[Projection] = []
+    rewritten: list[Expr] = []
+    for i, key in enumerate(keys):
+        if isinstance(key, Col):
+            rewritten.append(key)
+            continue
+        name = f"{prefix}_{i}"
+        while name in taken:  # never shadow a user column
+            name += "_"
+        taken.add(name)
+        hidden.append(Projection(alias=name, expr=key))
+        rewritten.append(Col(name))
+
+    with_keys = Project(
+        input=input_plan,
+        items=(*(Projection(alias=c, expr=Col(c)) for c in columns), *hidden),
+    )
+    return with_keys, tuple(rewritten)
 
 
 def is_streamable(plan: LogicalPlan) -> bool:

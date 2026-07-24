@@ -18,6 +18,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.carbonite import ResourceManager
 from batcher.dist.adaptive_sizing import aggregate_reducer_count, record_aggregate_cardinality
 from batcher.dist.executor import (
@@ -261,7 +262,8 @@ def _locality_reducer_hosts(actors, n_reducers, workers):
     try:
         nodes = ray.get([actors[i].node_id.remote() for i in range(workers)])
         per_mapper = ray.get([actors[i].published_bucket_bytes.remote() for i in range(workers)])
-    except Exception:  # locality is best-effort; a probe failure keeps default placement
+    except Exception as exc:  # locality is best-effort; a probe failure keeps default placement
+        note_suppressed("dist", "probe reducer host locality", exc)
         return None
     bucket_node_bytes: dict[int, dict[str, int]] = {}
     for i, sizes in enumerate(per_mapper):

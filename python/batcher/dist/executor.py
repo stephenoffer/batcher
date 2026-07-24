@@ -580,40 +580,56 @@ def _hoist_computed_sort_key(sort: Sort):
 
     The distributed sort range-partitions on the leading key's *values*, which it can only
     read from a column, so `df.sort(col("a") + col("b"))` had no distributed path at all.
-    Materializing the key once per row in the map prefix is exactly what the single-node
-    sort does internally, so this is a rewrite, not an approximation: the hidden column is
-    computed before the shuffle, drives the partitioning, and is projected away afterwards.
+    Only the leading key is hoisted: the rest are evaluated by each reducer's local sort,
+    which needs no column. `hoist_computed_keys` owns the materialization itself, shared
+    with the window's partition keys.
     """
-    from batcher.plan.logical import Project, Projection, SortKeySpec
+    from batcher.plan.logical import SortKeySpec, hoist_computed_keys, project_columns
 
     key = sort.keys[0]
-    if isinstance(key.expr, Col):
+    hoisted = hoist_computed_keys(sort.input, [key.expr], prefix="__sort_key")
+    if hoisted is None:
         return None
+    with_key, (hidden,) = hoisted
 
     columns = sort.input.available_columns()
-    hidden = "__sort_key"
-    while hidden in columns:  # never shadow a user column
-        hidden += "_"
-
-    with_key = Project(
-        input=sort.input,
-        items=(
-            *(Projection(alias=c, expr=Col(c)) for c in columns),
-            Projection(alias=hidden, expr=key.expr),
-        ),
-    )
     rewritten = dataclasses.replace(
         sort,
         input=with_key,
         keys=(
-            SortKeySpec(Col(hidden), descending=key.descending, nulls_first=key.nulls_first),
+            SortKeySpec(hidden, descending=key.descending, nulls_first=key.nulls_first),
             *sort.keys[1:],
         ),
     )
-    drop_key = Project(
-        input=rewritten, items=tuple(Projection(alias=c, expr=Col(c)) for c in columns)
-    )
-    return rewritten, drop_key
+    return rewritten, project_columns(rewritten, columns)
+
+
+def _hoist_computed_window_keys(window: Window):
+    """Rewrite `PARTITION BY <expr>, …` so every partition key is a plain column.
+
+    Returns `(window', drop_keys)` — the window over a `Project` that materializes each
+    computed partition key as a hidden column, plus the `Project` that drops those columns
+    again — or `None` when every partition key is already a column.
+
+    The distributed window hash-shuffles rows by the partition keys' column *positions*
+    (`executors/window.py` resolves each key with `cols.index(k.name)`), so a computed key
+    such as `partition_by=[col("v") % 4]` could not be shuffled on and the whole query had
+    no distributed path. This is the window's half of the same rewrite the sort already
+    used, sharing `hoist_computed_keys` rather than restating it.
+
+    The dropped set is the window's ORIGINAL output — its input columns plus the function
+    aliases — so the hidden keys vanish and nothing else does.
+    """
+    from batcher.plan.logical import hoist_computed_keys, project_columns
+
+    hoisted = hoist_computed_keys(window.input, window.partition_keys, prefix="__win_key")
+    if hoisted is None:
+        return None
+    with_keys, keys = hoisted
+
+    output = window.available_columns()
+    rewritten = dataclasses.replace(window, input=with_keys, partition_keys=keys)
+    return rewritten, project_columns(rewritten, output)
 
 
 def _staged_aggregate_over_join(
@@ -938,8 +954,10 @@ def _dispatch(
                 metrics_out=metrics_out,
             )
 
-    # A window partitioned by plain columns over a breaker-free source: hash-shuffle
-    # rows by the partition keys so each partition is computed whole on one reducer.
+    # A partitioned window over a breaker-free source: hash-shuffle rows by the partition
+    # keys so each partition is computed whole on one reducer. A computed partition key
+    # (`partition_by=[col("v") % 4]`) is materialized into a hidden column first, exactly
+    # as the sort hoists a computed leading key, because the shuffle reads keys by column.
     # A window with NO partition keys has nothing to shuffle on; when it is also
     # order-free it is a whole-relation aggregate broadcast, which distributes (an
     # *ordered* global window needs one global row order and still has no path).
@@ -949,7 +967,11 @@ def _dispatch(
         if _single_source(window.input) and not _has_breaker(window.input):
             if _is_broadcastable_global_window(window):
                 return _distributed_global_window(above, window, sources, workers, transport)
-            if window.partition_keys and all(isinstance(k, Col) for k in window.partition_keys):
+            if window.partition_keys:
+                hoisted = _hoist_computed_window_keys(window)
+                if hoisted is not None:
+                    window, drop_keys = hoisted
+                    above = [*above, drop_keys]  # innermost: drops the hidden keys
                 if transport == "flight":
                     from batcher.dist.flight_window import execute_window_flight
 

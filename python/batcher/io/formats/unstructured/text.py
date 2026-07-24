@@ -194,9 +194,7 @@ class TextSource:
             return SourceStatistics(row_count=len(files), byte_size=byte_size, exact_rows=True)
         from batcher.io.stats.row_estimate import estimate_delimited_rows
 
-        rows = estimate_delimited_rows(
-            self._fs, files, has_header=False, total_bytes=byte_size
-        )
+        rows = estimate_delimited_rows(self._fs, files, has_header=False, total_bytes=byte_size)
         if rows is None and byte_size is None:
             return None
         return SourceStatistics(row_count=rows, byte_size=byte_size, exact_rows=False)

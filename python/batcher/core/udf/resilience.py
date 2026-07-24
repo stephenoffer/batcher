@@ -37,6 +37,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.plan.logical import MapBatches
 
 __all__ = ["wants_resilience", "wrap_resilient"]
@@ -133,5 +134,6 @@ def _record_retry(
             fn=fn_name,
             error=f"{type(exc).__name__}: {exc}",
         )
-    except Exception:  # pragma: no cover - observability must never break a query
+    except Exception as exc:  # pragma: no cover - observability must never break a query
+        note_suppressed("core", "record a UDF retry", exc)
         return

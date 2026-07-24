@@ -25,6 +25,7 @@ import warnings
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import ceil_div
 from batcher.plan.logical import MapBatches
 
@@ -112,7 +113,8 @@ def _learning_hub():
         from batcher.core.runtime import default_hub
 
         return default_hub()
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "resolve the learning hub", exc)
         return None
 
 
@@ -124,7 +126,8 @@ def _learned_strategy(key: str) -> dict:
         return {}
     try:
         return hub.get_keyed_param(_LEARN_NS, key) or {}
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "read learned UDF strategy", exc)
         return {}
 
 
@@ -141,7 +144,8 @@ def _persist_strategy(key: str | None, **fields: object) -> None:
     try:
         entry = {**(hub.get_keyed_param(_LEARN_NS, key) or {}), **fields}
         hub.put_keyed_param(_LEARN_NS, key, entry)
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "persist learned UDF strategy", exc)
         return
 
 

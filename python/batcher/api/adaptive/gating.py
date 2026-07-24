@@ -10,6 +10,7 @@ means the gate stays pure and unit-testable without executing a query.
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
 from batcher.api.adaptive.plan_surgery import joins, walk
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Scan, is_streamable
@@ -66,7 +67,8 @@ def _learned_adaptive_helps(plan: LogicalPlan, hub) -> bool:
         from batcher.kyber.signature import plan_signature
 
         return learned_adaptive_helps(hub, plan_signature(plan))
-    except Exception:  # pragma: no cover - a learned read must never break routing
+    except Exception as exc:  # pragma: no cover - a learned read must never break routing
+        note_suppressed("api", "read learned adaptive-routing verdict", exc)
         return False
 
 
@@ -79,7 +81,8 @@ def _record_adaptive_flip(hub, plan: LogicalPlan, flipped: bool) -> None:
         from batcher.kyber.signature import plan_signature
 
         record_adaptive_flip(hub, plan_signature(plan), flipped)
-    except Exception:  # pragma: no cover - recording must never break a query
+    except Exception as exc:  # pragma: no cover - recording must never break a query
+        note_suppressed("api", "record adaptive-routing flip", exc)
         return
 
 

@@ -266,11 +266,17 @@ def test_register_rejects_a_duplicate_active_name():
 
 
 def test_register_allows_reusing_a_stopped_name():
-    from batcher.api.streaming._query import _deregister, _register
+    from batcher.api.streaming._query import _ACTIVE, _deregister, _register
 
     name = "reuse-stopped-test"
-    _register(name, _query(active=False))  # a prior query that has since stopped
+    stopped = _query(active=False)  # a prior query that has since stopped
+    _register(name, stopped)
     try:
-        _register(name, _query(active=True))  # reuse is fine — no active clash
+        replacement = _query(active=True)
+        _register(name, replacement)  # reuse is fine — no active clash
+        # The point of allowing reuse is that the name now resolves to the *new* query;
+        # without this the test passed whether or not the registry was updated at all.
+        assert _ACTIVE[name] is replacement
     finally:
         _deregister(name)
+    assert name not in _ACTIVE

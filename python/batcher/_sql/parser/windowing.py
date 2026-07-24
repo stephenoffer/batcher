@@ -300,7 +300,7 @@ def _const_int(node, ctx: str) -> int:
         try:
             return int(node.to_py())
         except (TypeError, ValueError):
-            pass
+            pass  # a non-constant frame bound -> fall through and reject it below
     raise NotImplementedError(f"window function {ctx!r} requires a constant integer argument")
 
 

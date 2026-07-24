@@ -70,7 +70,8 @@ def learned_output_rows(hub: MetadataHub | None, plan: LogicalPlan) -> float | N
         from batcher.kyber.signature import plan_signature
 
         return learned_signature_rows(hub, plan_signature(plan))
-    except Exception:  # pragma: no cover - learning must never break routing
+    except Exception as exc:  # pragma: no cover - learning must never break routing
+        note_suppressed("api", "read learned output-row estimate", exc)
         return None
 
 
@@ -161,7 +162,8 @@ def learned_partition_seed(hub: MetadataHub | None, plan: LogicalPlan) -> int | 
 
         target = active_config().optimizer.target_rows_per_task
         return learned_partition_count(hub, plan_signature(plan), target)
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("api", "read learned partition seed", exc)
         return None
 
 
@@ -175,7 +177,8 @@ def spill_compression_scope(rm, opt: PhysicalPlan):
     """
     try:
         compress = rm.recommend_spill_compression(opt)
-    except Exception:  # pragma: no cover - a learned read must never break spilling
+    except Exception as exc:  # pragma: no cover - a learned read must never break spilling
+        note_suppressed("api", "read learned spill-compression scope", exc)
         return contextlib.nullcontext()
     if compress is None:
         return contextlib.nullcontext()
@@ -214,7 +217,8 @@ def distributed_grant(
     if derived is None:
         try:
             nodes = int(dist.cluster_topology().get("nodes", 0))
-        except Exception:  # pragma: no cover - topology probe must never break a query
+        except Exception as exc:  # pragma: no cover - topology probe must never break a query
+            note_suppressed("api", "read cluster topology for the distributed grant", exc)
             nodes = 0
         derived = learned_num_workers(ctx.hub, plan, sources, nodes)
     envelope = rm.scheduling_envelope(opt, derived)
@@ -336,7 +340,8 @@ def record_shuffle_outcome(hub: MetadataHub | None, plan: LogicalPlan, credits: 
         from batcher.kyber.signature import plan_signature
 
         record_shuffle_window(hub, plan_signature(plan), int(credits))
-    except Exception:  # pragma: no cover - recording must never break a query
+    except Exception as exc:  # pragma: no cover - recording must never break a query
+        note_suppressed("api", "record shuffle outcome", exc)
         return
 
 

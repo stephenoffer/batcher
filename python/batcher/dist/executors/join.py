@@ -15,6 +15,7 @@ import os
 import pyarrow as pa
 
 from batcher._internal.hardware import l3_cache_bytes
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     _apply_above,
@@ -648,7 +649,8 @@ def _hot_keys_from_column_stats(join, sources, fraction: float, partitions: int)
         from batcher.core import default_hub
 
         return kyber.hot_join_values(join, sources, default_hub(), fraction, partitions)
-    except Exception:  # pragma: no cover - statistics must never break a join
+    except Exception as exc:  # pragma: no cover - statistics must never break a join
+        note_suppressed("dist", "read hot keys from column stats", exc)
         return []
 
 

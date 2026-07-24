@@ -182,7 +182,8 @@ def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
         rows = _agg_input_rows(plan, sources, fallback=int(_estimate(plan, sources, hub)[0] or 0))
         if rows:
             record_backend_timing(hub, "cpu", rows, wall_ms)
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("api", "record the GPU/CPU crossover point", exc)
         return
 
 

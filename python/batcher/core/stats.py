@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.config import active_config
 
@@ -51,7 +52,8 @@ def column_ndv(batches: list[pa.RecordBatch], columns: list[str]) -> dict[str, f
     try:
         _native = engine()
         return _native.column_ndv(list(columns), batches)
-    except Exception:  # pragma: no cover - measurement must never break a query
+    except Exception as exc:  # pragma: no cover - measurement must never break a query
+        note_suppressed("core", "measure column ndv", exc)
         return {}
 
 
@@ -80,7 +82,8 @@ def column_statistics(
         # One sketch pass for both summary stats and quantiles (the native side builds
         # each column's HLL+KLL once), instead of two FFI calls that each rebuilt it.
         stats, quants = _native.column_stats_full(list(columns), batches, list(probs))
-    except Exception:  # pragma: no cover - measurement must never break execution
+    except Exception as exc:  # pragma: no cover - measurement must never break execution
+        note_suppressed("core", "measure column statistics", exc)
         return {}, {}, {}
 
     ndv = {c: d["ndv"] for c, d in stats.items() if d.get("ndv") is not None}
@@ -104,7 +107,8 @@ def tail_quantiles(
     try:
         _native = engine()
         out = _native.tail_quantiles(list(columns), batches, list(probs))
-    except Exception:  # pragma: no cover - measurement must never break execution
+    except Exception as exc:  # pragma: no cover - measurement must never break execution
+        note_suppressed("core", "measure tail quantiles", exc)
         return {}
     return {c: v for c, v in out.items() if v}
 
@@ -118,7 +122,8 @@ def tdigest_partial(batches: list[pa.RecordBatch], column: str) -> bytes | None:
     try:
         _native = engine()
         return _native.tdigest_partial(column, batches)
-    except Exception:  # pragma: no cover - measurement must never break execution
+    except Exception as exc:  # pragma: no cover - measurement must never break execution
+        note_suppressed("core", "build a t-digest partial", exc)
         return None
 
 
@@ -130,7 +135,8 @@ def tdigest_quantile(sketches: list[bytes], q: float) -> float | None:
     try:
         _native = engine()
         return _native.tdigest_quantile(list(sketches), float(q))
-    except Exception:  # pragma: no cover - measurement must never break execution
+    except Exception as exc:  # pragma: no cover - measurement must never break execution
+        note_suppressed("core", "read a t-digest quantile", exc)
         return None
 
 
@@ -148,6 +154,7 @@ def heavy_hitters(
     try:
         _native = engine()
         out = _native.heavy_hitters(list(columns), batches, float(fraction))
-    except Exception:  # pragma: no cover - measurement must never break execution
+    except Exception as exc:  # pragma: no cover - measurement must never break execution
+        note_suppressed("core", "measure heavy hitters", exc)
         return {}
     return {c: [(v, int(n)) for v, n in hits] for c, hits in out.items() if hits}

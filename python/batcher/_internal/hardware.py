@@ -118,7 +118,7 @@ def _cfs_quota_count() -> int | None:
             period = int(f.read().strip())
         return _quota_cores(quota, period)
     except (OSError, ValueError):
-        pass
+        pass  # no cgroup v1 quota files (or unparseable) -> fall through to the next probe
     return None
 
 

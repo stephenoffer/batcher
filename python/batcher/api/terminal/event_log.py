@@ -32,6 +32,7 @@ from itertools import count
 from pathlib import Path
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
 from batcher.plan.profile import ProfileCollector
 
 __all__ = [
@@ -88,7 +89,8 @@ def pipeline_signature(plan: object) -> str:
         from batcher.kyber.signature import plan_signature
 
         return plan_signature(plan)
-    except Exception:  # pragma: no cover - an unsignable plan must not fail the query
+    except Exception as exc:  # pragma: no cover - an unsignable plan must not fail the query
+        note_suppressed("api", "sign the plan for the event log", exc)
         return ""
 
 

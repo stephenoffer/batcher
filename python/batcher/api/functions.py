@@ -159,8 +159,6 @@ from batcher.plan.functions.analysis import (
     welch_df,
     welch_t_statistic,
 )
-from batcher.plan.functions.scalar import cut
-from batcher.plan.functions.scalar import arctan2
 from batcher.plan.functions.metrics import (
     accuracy,
     all_caps_rate,
@@ -326,6 +324,7 @@ from batcher.plan.functions.regression import (
     regr_sxy,
     regr_syy,
 )
+from batcher.plan.functions.scalar import arctan2, cut
 from batcher.plan.functions.statistics import (
     arg_max,
     arg_min,

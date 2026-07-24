@@ -257,11 +257,6 @@ class PressureMonitor:
         """Available RAM, never reported as more than the `total` this monitor budgets to."""
         return min(probe.available_bytes(), total)
 
-    @staticmethod
-    def _read_available_bytes() -> int:
-        """One uncached live reading of available RAM. Kept as a seam tests can replace."""
-        return probe.read_available_bytes()
-
 
 def hysteresis_alpha_from_flap(flap_rate: float | None) -> float | None:
     """The de-escalation smoothing weight implied by a measured `flap_rate`, or `None`.
