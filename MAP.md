@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 819 Python modules across 124 packages and 161 Rust files across 13 crates.
+Covering 820 Python modules across 124 packages and 162 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -1178,11 +1178,12 @@ Multimodal sources — images/audio/video/embeddings as queryable Arrow columns.
 | `_batching.py` | 94 | How a media read is cut into file-batches — bounded by file count *and* bytes. |
 | `_mime.py` | 68 | MIME sniffing for media files — magic bytes first, extension as the fallback. |
 | `_pruning.py` | 114 | Prune media files at plan time using the metadata a listing already knows. |
+| `_split.py` | 79 | One file-batch of a media source, as a worker-side locator. |
 | `audio.py` | 64 | Audio source — list audio files + header-only sample_rate/channels/duration. |
 | `blob.py` | 166 | Blob-by-reference: offload large per-row payloads to a content-addressed store. |
 | `embeddings.py` | 219 | Embedding source — vector files (.npy / .parquet) → an Arrow embedding column. |
 | `images.py` | 59 | Image source — list image files + header-only width/height/mode. |
-| `media.py` | 500 | Multimodal media source base — list files, never decode pixels/frames. |
+| `media.py` | 464 | Multimodal media source base — list files, never decode pixels/frames. |
 | `video.py` | 70 | Video source — list video files + header-only fps/frames/width/height/duration. |
 
 ### `batcher/io/formats/nosql/` — 2 · neutral IO
@@ -1751,7 +1752,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 546 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 241 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1057 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1082 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 214 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -1867,7 +1868,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 84 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
-| `eval/math.rs` | 427 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 426 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image.rs` | 781 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
@@ -1905,7 +1906,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `float_ident.rs` | 154 | The engine's one definition of **float identity**. |
 | `hardware.rs` | 190 | Host CPU capability detection for adaptive execution. |
-| `lib.rs` | 215 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `lib.rs` | 217 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `row_sort.rs` | 115 | A stable multi-column sort permutation over the Arrow row format. |
 
 ### `bc-sketches`
 

@@ -24,7 +24,6 @@ registry; a new media kind is one new file overriding `_meta_fields` /
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import pyarrow as pa
@@ -36,6 +35,7 @@ from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.multimodal._batching import pack_by_count_and_bytes, probe_sizes
 from batcher.io.formats.multimodal._mime import sniff_mime
 from batcher.io.formats.multimodal._pruning import prune_files
+from batcher.io.formats.multimodal._split import MediaSplit
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 
@@ -106,6 +106,7 @@ class MediaSource:
         "_fs",
         "_materialize_bytes",
         "_path",
+        "_size_cache",
         "_with_meta",
     )
 
@@ -135,6 +136,7 @@ class MediaSource:
         self._errors = ErrorPolicy(on_error)
         self._files_cache: list[str] | None = None
         self._chunk_cache: list[list[str]] | None = None
+        self._size_cache: dict[str, int] = {}
 
     # ---- shared, do-not-override ------------------------------------------
     def _files(self) -> list[str]:
@@ -176,7 +178,20 @@ class MediaSource:
         return self._chunk_cache
 
     def _file_sizes(self, files: list[str]) -> list[int]:
-        """Every file's size, probed concurrently (see `_batching.probe_sizes`)."""
+        """Every file's size — from a completed read where possible, else stat-probed.
+
+        A stat is a full object-store round trip per file, and on a corpus of many small
+        files that is not the negligible cost it looks like next to the payload read: it is
+        a second round trip against the same latency. Measured on 100 S3 JPEGs it was 86 ms
+        of a 272 ms read, a third of the whole thing, spent asking for a number the payload
+        read returns anyway.
+
+        So `read()` fetches first and fills `_size_cache` from what came back; this then
+        answers from it. `iter_batches` still probes, and must: it bounds memory *before*
+        fetching, which is the entire point of the byte bound on the streaming path.
+        """
+        if all(f in self._size_cache for f in files):
+            return [self._size_cache[f] for f in files]
         return probe_sizes(files, self._fs.size)
 
     def schema(self) -> pa.Schema:
@@ -193,14 +208,21 @@ class MediaSource:
         concurrent wave (a single thread pool) and slices them into `batch_files`-sized
         batches — removing the per-chunk pool churn + cross-chunk serialization of a fresh
         pool per file-batch that held image/clip ingest under the raw parallel-read rate.
-        `iter_batches` keeps its per-chunk streaming for the larger-than-RAM consumer.
+        The fetch happens *before* chunking so the sizes come from it rather than from a
+        stat per file (see `_file_sizes`). `iter_batches` keeps its per-chunk streaming,
+        and its stat probe, for the larger-than-RAM consumer.
         """
         files = self._files()
-        chunks = self._chunks()
-        if len(chunks) <= 1:
-            return list(self.iter_batches(projection))
         # one concurrent wave over every file, header-only when `bytes` is projected away
         reads = self._read_chunk(files, self._effective_materialize(projection))
+        # Every read reports its file's size, so record them before chunking: `_chunks`
+        # then needs no stat round trip. Chunk *boundaries* are unchanged — this only
+        # changes where the sizes come from, so `read`, `iter_batches` and `splits` still
+        # share the one definition.
+        self._size_cache.update(
+            {f: r[2] for f, r in zip(files, reads, strict=True) if r is not None}
+        )
+        chunks = self._chunks()
         out: list[pa.RecordBatch] = []
         start = 0
         for chunk in chunks:
@@ -440,61 +462,3 @@ class MediaSource:
         Returns a dict keyed by the names in `_meta_fields`.
         """
         return {}
-
-
-@dataclass(frozen=True, slots=True)
-class MediaSplit:
-    """One file-batch of a media source, reconstructed on a worker via `SOURCES`.
-
-    Carries only ``(format_name, files, with_meta)`` — a tuple of file-path
-    locators, never data — so it pickles cheaply to a remote worker that then
-    reads just its files directly from storage. Mirrors the `Split` read surface
-    so a worker treats a split exactly like a source.
-    """
-
-    format_name: str
-    files: tuple[str, ...]
-    with_meta: bool
-    materialize_bytes: bool = True
-
-    @property
-    def rows(self) -> int:
-        """This split's exact row count — one row per file, known with no I/O.
-
-        The distributed planner reads `rows` off a split to size its task fan-out and to
-        weight the partition balance. Without it a media source looked *uncountable*: the
-        fan-out fell back to a blunt worker count and every split weighed the same, so a
-        split of 200 MB videos was balanced against one of thumbnails as if equal.
-        """
-        return len(self.files)
-
-    def _source(self) -> MediaSource:
-        """Rebuild a source restricted to this split's files (no re-listing)."""
-        from batcher.io.formats.base import SOURCES
-
-        cls = SOURCES.get(self.format_name)
-        # Reuse the source's batch assembly but pin its file list to this split's
-        # files; batch_files is set so the whole split assembles as one batch.
-        src: MediaSource = cls(
-            self.files[0],
-            batch_files=len(self.files),
-            with_meta=self.with_meta,
-            materialize_bytes=self.materialize_bytes,
-        )
-        src._files_cache = list(self.files)
-        return src
-
-    def schema(self) -> pa.Schema:
-        return self._source().schema()
-
-    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return self._source().read(projection)
-
-    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        yield from self._source().iter_batches(projection)
-
-    def row_count(self) -> int | None:
-        return len(self.files)
-
-    def identity(self) -> str:
-        return f"{self.format_name}:{self.files[0]}+{len(self.files)}"

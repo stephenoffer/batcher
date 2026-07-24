@@ -380,6 +380,6 @@ class _ImageNamespace:
                 >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
                 >>> small = bt.col("img").image.resize(2, 2)
                 >>> ds.select(d=small.image.decode()).to_pydict()
-                {'d': [{'width': 2, 'height': 2}]}
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
         """
         return ImageFunc("resize", self._e, width=width, height=height)

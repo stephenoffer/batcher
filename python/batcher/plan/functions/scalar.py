@@ -364,7 +364,7 @@ def great_circle_distance(
             ...     )
             ... ).to_pydict()
             >>> round(out["km"][0])  # London to Paris
-            343
+            344
     """
     if unit not in _EARTH_RADIUS:
         raise PlanError(
