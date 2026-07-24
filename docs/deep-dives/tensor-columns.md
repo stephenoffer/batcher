@@ -131,7 +131,7 @@ is a downstream Rust *expression*, never a read-time side effect:
 
 ```text
 col("bytes").image.to_tensor(width, height)   -> FixedSizeList<UInt8> + tensor metadata
-col("bytes").image.decode()                   -> struct {width, height}  (header only)
+col("bytes").image.decode()                   -> struct {width, height, channels, mode}  (header only)
 col("bytes").audio.to_waveform()              -> list<float32>  (variable length: NOT a tensor)
 ```
 

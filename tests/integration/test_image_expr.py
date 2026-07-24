@@ -33,11 +33,24 @@ def _png(width: int, height: int, rgb: tuple[int, int, int] = (255, 0, 0)) -> by
 _PNG_1x1 = _png(1, 1)
 
 
-def test_image_decode_reads_dimensions():
+def test_image_decode_reads_the_header_facts():
     ds = bt.from_arrow(pa.table({"img": pa.array([_PNG_1x1], type=pa.binary())}))
     out = ds.select(dims=bt.col("img").image.decode()).collect()
     dims = out.column("dims")[0].as_py()
-    assert dims == {"width": 1, "height": 1}
+    # One header read yields all four facts; `_png` writes an 8-bit RGB image.
+    assert dims == {"width": 1, "height": 1, "channels": 3, "mode": "RGB"}
+
+
+def test_image_decode_fields_project_individually():
+    # The reason `decode` returns a struct rather than four functions: a caller takes
+    # the field it wants, and the header is still read once.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_PNG_1x1], type=pa.binary())}))
+    decoded = bt.col("img").image.decode()
+    out = ds.select(
+        w=decoded.struct.field("width"),
+        mode=decoded.struct.field("mode"),
+    ).to_pydict()
+    assert out == {"w": [1], "mode": ["RGB"]}
 
 
 def test_image_to_tensor_shape():

@@ -20,7 +20,8 @@ __all__ = ["ImageFunc", "_ImageNamespace"]
 class ImageFunc(IRNode):
     """An image decode op over a binary (image-bytes) sub-expression (via `.image`).
 
-    `decode` reads each image's dimensions; `to_tensor` decodes, resizes to
+    `decode` reads each image's header facts (dimensions, channel count, color mode);
+    `to_tensor` decodes, resizes to
     ``(width, height)``, and flattens to a fixed-size RGB8 pixel list; `to_tensor_f32`
     additionally scales/normalizes to a model-ready ``float32`` tensor; `center_crop`
     crops the centered region; `to_grayscale` converts to a single luma channel.
@@ -58,7 +59,7 @@ class _ImageNamespace:
             >>> from batcher.plan.expr_ir.image import _PNG_1X1
             >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
             >>> ds.select(dims=bt.col("img").image.decode()).to_pydict()
-            {'dims': [{'width': 1, 'height': 1}]}
+            {'dims': [{'width': 1, 'height': 1, 'channels': 4, 'mode': 'RGBA'}]}
     """
 
     __slots__ = ("_e",)
@@ -72,15 +73,22 @@ class _ImageNamespace:
         return f"<.image accessor of {self._e!r}>"
 
     def decode(self) -> ImageFunc:
-        """Read each image's dimensions without materializing its pixels.
+        """Read each image's header facts without materializing its pixels.
 
         Only the image header is parsed, so this succeeds — and is cheap — even for a
         file whose pixel data is truncated or corrupt. Use `to_tensor` when the pixels
         themselves must be valid.
 
+        All four facts come from one header read, so asking for the mode costs nothing
+        beyond asking for the width. Project the one you want with
+        ``.struct.field("width")``. ``mode`` uses Pillow's vocabulary — ``L``, ``LA``,
+        ``RGB``, ``RGBA`` — because that is what the other half of a multimodal pipeline
+        speaks; bit depth is not part of the name, so a 16-bit RGB image is ``RGB`` with
+        3 channels.
+
         Returns:
-            An expression evaluating to a struct ``{width, height}`` of Int32
-            dimensions; null for null or undecodable input.
+            An expression evaluating to a struct ``{width, height, channels, mode}``,
+            the first three Int32 and ``mode`` Utf8; null for null or undecodable input.
 
         Examples:
             .. doctest::
@@ -89,7 +97,10 @@ class _ImageNamespace:
                 >>> from batcher.plan.expr_ir.image import _PNG_1X1
                 >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
                 >>> ds.select(d=bt.col("img").image.decode()).to_pydict()
-                {'d': [{'width': 1, 'height': 1}]}
+                {'d': [{'width': 1, 'height': 1, 'channels': 4, 'mode': 'RGBA'}]}
+
+                >>> ds.select(w=bt.col("img").image.decode().struct.field("width")).to_pydict()
+                {'w': [1]}
         """
         return ImageFunc("decode", self._e)
 

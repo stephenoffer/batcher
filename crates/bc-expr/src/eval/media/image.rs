@@ -248,30 +248,45 @@ fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
-/// `decode` → struct `{width: Int32, height: Int32}` (header read only).
+/// `decode` → struct `{width, height, channels, mode}` (header read only).
+///
+/// All four facts come from **one** header read. Daft spends a separate function call on
+/// each of `image_width`/`image_height`/`image_channel`/`image_mode`, re-reading the
+/// header once per fact; here the reader already has the struct in hand, so the extra two
+/// fields are free. Project the one you want with `.struct.field("width")`.
 fn decode_dims<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<ArrayRef, ExprError> {
+    use arrow::array::StringArray;
+
     // Read each header in parallel (an undecodable/null row → `None`), then unzip into
-    // the three column buffers. The header read is the cost; the unzip is a cheap memcpy.
-    let dims: Vec<Option<(i32, i32)>> = map_rows(bytes.len(), |i| {
+    // the column buffers. The header read is the cost; the unzip is a cheap memcpy.
+    let headers: Vec<Option<(u32, u32, i32, &'static str)>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
             None
         } else {
-            image_dimensions(bytes.value(i)).map(|(w, h)| (w as i32, h as i32))
+            image_header(bytes.value(i))
         }
     });
     let mut widths: Vec<i32> = Vec::with_capacity(bytes.len());
     let mut heights: Vec<i32> = Vec::with_capacity(bytes.len());
+    let mut channels: Vec<i32> = Vec::with_capacity(bytes.len());
+    let mut modes: Vec<&'static str> = Vec::with_capacity(bytes.len());
     let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
-    for dim in dims {
-        match dim {
-            Some((w, h)) => {
-                widths.push(w);
-                heights.push(h);
+    for header in headers {
+        match header {
+            Some((w, h, c, mode)) => {
+                widths.push(w as i32);
+                heights.push(h as i32);
+                channels.push(c);
+                modes.push(mode);
                 valid.push(true);
             }
             None => {
+                // A struct's child arrays stay full length; the row's null bit is what
+                // marks it absent, so the placeholders here are never read.
                 widths.push(0);
                 heights.push(0);
+                channels.push(0);
+                modes.push("");
                 valid.push(false);
             }
         }
@@ -280,10 +295,14 @@ fn decode_dims<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<Arra
     let fields = vec![
         Arc::new(Field::new("width", DataType::Int32, false)),
         Arc::new(Field::new("height", DataType::Int32, false)),
+        Arc::new(Field::new("channels", DataType::Int32, false)),
+        Arc::new(Field::new("mode", DataType::Utf8, false)),
     ];
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int32Array::from(widths)),
         Arc::new(Int32Array::from(heights)),
+        Arc::new(Int32Array::from(channels)),
+        Arc::new(StringArray::from(modes)),
     ];
     let struct_arr = StructArray::new(fields.into(), columns, Some(nulls));
     Ok(Arc::new(struct_arr))
@@ -514,6 +533,41 @@ fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
         .ok()?
         .into_dimensions()
         .ok()
+}
+
+/// Header facts about an image: dimensions, channel count, and color-mode name.
+///
+/// One header read yields all four. Daft spends a separate call on each of
+/// `image_width`/`image_height`/`image_channel`/`image_mode`, which re-reads the header
+/// four times for a struct the reader already had in hand.
+fn image_header(data: &[u8]) -> Option<(u32, u32, i32, &'static str)> {
+    let reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let decoder = reader.into_decoder().ok()?;
+    let (w, h) = image::ImageDecoder::dimensions(&decoder);
+    let (channels, mode) = color_mode(image::ImageDecoder::color_type(&decoder));
+    Some((w, h, channels, mode))
+}
+
+/// `(channel count, mode name)` for a decoded color type.
+///
+/// The mode names follow Pillow's vocabulary (`L`, `LA`, `RGB`, `RGBA`), because that is
+/// what a multimodal pipeline's other half speaks and an unfamiliar third spelling would
+/// help nobody. Bit depth is deliberately not encoded in the name: a 16-bit RGB image is
+/// `RGB` with 3 channels, since a caller branching on the mode cares about the channel
+/// layout, and the depth is the decoder's business.
+fn color_mode(color: image::ColorType) -> (i32, &'static str) {
+    use image::ColorType::{La16, La8, Rgb16, Rgb32F, Rgb8, Rgba16, Rgba32F, Rgba8, L16, L8};
+    match color {
+        L8 | L16 => (1, "L"),
+        La8 | La16 => (2, "LA"),
+        Rgb8 | Rgb16 | Rgb32F => (3, "RGB"),
+        Rgba8 | Rgba16 | Rgba32F => (4, "RGBA"),
+        // `ColorType` is non-exhaustive, so an unknown variant reports its channel count
+        // from the decoder rather than guessing a name.
+        other => (other.channel_count() as i32, "other"),
+    }
 }
 
 /// Decode, resize to `(w, h)`, and flatten to RGB8; `None` on any failure.
@@ -793,6 +847,64 @@ mod tests {
         assert!(s.is_valid(0) && w.value(0) == 2 && h.value(0) == 3);
         assert!(s.is_null(1)); // null bytes → null struct
         assert!(s.is_null(2)); // undecodable bytes → null struct
+    }
+
+    #[test]
+    fn decode_reports_channels_and_mode_from_the_same_header_read() {
+        use arrow::array::StringArray;
+        use image::{ColorType, DynamicImage, GrayImage, RgbImage, RgbaImage};
+
+        // One image per color mode, each encoded to PNG (which preserves the mode).
+        fn png(img: DynamicImage) -> Vec<u8> {
+            let mut buf = Vec::new();
+            img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        }
+        let gray = png(DynamicImage::ImageLuma8(GrayImage::new(2, 2)));
+        let rgb = png(DynamicImage::ImageRgb8(RgbImage::new(2, 2)));
+        let rgba = png(DynamicImage::ImageRgba8(RgbaImage::new(2, 2)));
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(gray.as_slice()),
+            Some(rgb.as_slice()),
+            Some(rgba.as_slice()),
+        ]));
+        let out = ei(ImageFunc::Decode, &arr, None, None).unwrap();
+        let st = out.as_any().downcast_ref::<StructArray>().unwrap();
+        let channels = st.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+        let modes = st.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            (0..3).map(|i| channels.value(i)).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(
+            (0..3).map(|i| modes.value(i)).collect::<Vec<_>>(),
+            vec!["L", "RGB", "RGBA"]
+        );
+    }
+
+    #[test]
+    fn the_channel_count_always_matches_the_mode_name() {
+        use image::ColorType;
+        // The two fields are derived together and must not be able to disagree: a caller
+        // branching on `mode` and one branching on `channels` have to route the same rows.
+        for (color, want) in [
+            (ColorType::L8, ("L", 1)),
+            (ColorType::L16, ("L", 1)),
+            (ColorType::La8, ("LA", 2)),
+            (ColorType::Rgb8, ("RGB", 3)),
+            (ColorType::Rgb16, ("RGB", 3)),
+            (ColorType::Rgba8, ("RGBA", 4)),
+            (ColorType::Rgba32F, ("RGBA", 4)),
+        ] {
+            let (channels, mode) = color_mode(color);
+            assert_eq!((mode, channels), want, "{color:?}");
+            assert_eq!(
+                channels,
+                i32::from(color.channel_count()),
+                "{color:?}: name and count disagree"
+            );
+        }
     }
 
     #[test]
