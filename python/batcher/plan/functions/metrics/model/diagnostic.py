@@ -19,7 +19,7 @@ from typing import Any
 from batcher.plan.expr_ir.constructors import lit
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
-from batcher.plan.functions.metrics.classification import (
+from batcher.plan.functions.metrics.model.classification import (
     false_negatives,
     false_positives,
     recall,

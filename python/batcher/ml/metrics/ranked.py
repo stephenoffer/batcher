@@ -28,7 +28,7 @@ from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.nodes import cume_dist, rank, row_number
 from batcher.plan.functions.aggregate import count_if
 from batcher.plan.functions.aggregate import sum as sum_
-from batcher.plan.functions.metrics.classification import positive_mask
+from batcher.plan.functions.metrics.model.classification import positive_mask
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset

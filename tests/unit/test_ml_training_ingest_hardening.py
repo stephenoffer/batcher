@@ -424,7 +424,7 @@ def test_resumable_sampler_partitions_across_dataloader_workers(monkeypatch, num
     per_worker = []
     for worker in range(num_workers):
         monkeypatch.setattr(
-            "batcher.ml.streaming_sampler._worker_stride", lambda w=worker: (w, num_workers)
+            "batcher.ml.streaming_sampler.resumable._worker_stride", lambda w=worker: (w, num_workers)
         )
         per_worker.append(list(ResumableSampler(64, world_size=2, rank=0, seed=7)))
 
@@ -436,7 +436,7 @@ def test_resumable_sampler_partitions_across_dataloader_workers(monkeypatch, num
 
 
 def test_worker_striding_does_not_disturb_the_resume_position(monkeypatch):
-    monkeypatch.setattr("batcher.ml.streaming_sampler._worker_stride", lambda: (1, 2))
+    monkeypatch.setattr("batcher.ml.streaming_sampler.resumable._worker_stride", lambda: (1, 2))
     sampler = ResumableSampler(16, world_size=2, rank=0, seed=7)
     list(sampler)
     # The global position counts skipped samples too, so a checkpoint means the same thing

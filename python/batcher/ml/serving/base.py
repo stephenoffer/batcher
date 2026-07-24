@@ -225,9 +225,7 @@ def _merge_results(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     # `atleast_1d` so a 0-d (scalar-per-sub-batch) output — e.g. a per-batch summary from
     # a split large batch — concatenates instead of raising "zero-dimensional arrays
     # cannot be concatenated".
-    return {
-        name: np.concatenate([np.atleast_1d(p[name]) for p in parts]) for name in parts[0]
-    }
+    return {name: np.concatenate([np.atleast_1d(p[name]) for p in parts]) for name in parts[0]}
 
 
 def serving_udf(

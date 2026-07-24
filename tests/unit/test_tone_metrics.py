@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import tone
+from batcher.plan.functions.metrics.text import tone
 
 pytestmark = pytest.mark.unit
 

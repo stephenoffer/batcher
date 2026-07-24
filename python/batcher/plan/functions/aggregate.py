@@ -8,7 +8,7 @@ single-node and distributed with no new engine state.
 from __future__ import annotations
 
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
-from batcher.plan.functions.conditional import iff
+from batcher.plan.functions.scalar import iff
 
 
 def corr(x: IntoExpr, y: IntoExpr) -> AggExpr:

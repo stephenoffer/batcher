@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.ml.permutation import _FeistelPermutation, epoch_permutation
-from batcher.ml.streaming_sampler import _rank_positions
+from batcher.ml.streaming_sampler.ordering import _rank_positions
 
 if TYPE_CHECKING:
     import numpy as np

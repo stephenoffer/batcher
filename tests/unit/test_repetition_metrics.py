@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import repetition as rep
+from batcher.plan.functions.metrics.text import diversity as rep
 
 pytestmark = pytest.mark.unit
 

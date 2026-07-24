@@ -1,9 +1,9 @@
-"""Model-evaluation metrics as mergeable aggregate expressions.
+"""Model-evaluation and text-evaluation metrics as mergeable aggregate expressions.
 
-Grouped by what they score: `errors` for regression, `classification` for labels and
-probabilities. Everything here is an `Expr`, so it belongs inside `agg()` — which is what
-turns "evaluate the model" into "evaluate the model per segment, per day, per cohort" at
-no extra cost.
+Two families, split by what is being scored: `model` compares a prediction against a label,
+`text` scores a string on its own terms or against a reference. Everything here is an `Expr`,
+so it belongs inside `agg()` — which is what turns "evaluate the model" into "evaluate the
+model per segment, per day, per cohort" at no extra cost.
 
 The metrics that need a global ordering (ROC AUC, PR AUC, KS) are Dataset functions in
 `batcher.ml.metrics` instead, because a rank is not an aggregate.
@@ -11,18 +11,12 @@ The metrics that need a global ordering (ROC AUC, PR AUC, KS) are Dataset functi
 
 from __future__ import annotations
 
-from batcher.plan.functions.metrics.agreement import (
+from batcher.plan.functions.metrics.model.agreement import (
     concordance_correlation,
     kling_gupta_efficiency,
     nash_sutcliffe_efficiency,
 )
-from batcher.plan.functions.metrics.char_ngram import (
-    char_ngram_f1,
-    char_ngram_jaccard,
-    char_ngram_precision,
-    char_ngram_recall,
-)
-from batcher.plan.functions.metrics.classification import (
+from batcher.plan.functions.metrics.model.classification import (
     accuracy,
     balanced_accuracy,
     cohen_kappa,
@@ -41,20 +35,7 @@ from batcher.plan.functions.metrics.classification import (
     true_negatives,
     true_positives,
 )
-from batcher.plan.functions.metrics.compliance import (
-    boxed_answer_rate,
-    choice_answer_rate,
-    json_present_rate,
-    numeric_answer_rate,
-    tagged_answer_rate,
-    valid_json_rate,
-)
-from batcher.plan.functions.metrics.deviance import (
-    gamma_deviance,
-    poisson_deviance,
-    tweedie_deviance,
-)
-from batcher.plan.functions.metrics.diagnostic import (
+from batcher.plan.functions.metrics.model.diagnostic import (
     diagnostic_odds_ratio,
     false_discovery_rate,
     false_omission_rate,
@@ -68,14 +49,7 @@ from batcher.plan.functions.metrics.diagnostic import (
     positive_likelihood_ratio,
     prevalence_threshold,
 )
-from batcher.plan.functions.metrics.diversity import (
-    distinct_token_ratio,
-    empty_generation_rate,
-    mean_output_tokens,
-    refusal_rate,
-    truncation_rate,
-)
-from batcher.plan.functions.metrics.embedding import (
+from batcher.plan.functions.metrics.model.embedding import (
     mean_angular_distance,
     mean_cosine_distance,
     mean_cosine_similarity,
@@ -87,7 +61,7 @@ from batcher.plan.functions.metrics.embedding import (
     unit_norm_rate,
     zero_vector_rate,
 )
-from batcher.plan.functions.metrics.errors import (
+from batcher.plan.functions.metrics.model.errors import (
     explained_variance,
     huber_loss,
     mae,
@@ -106,15 +80,60 @@ from batcher.plan.functions.metrics.errors import (
     smape,
     wape,
 )
-from batcher.plan.functions.metrics.formatting import (
+from batcher.plan.functions.metrics.model.losses import (
+    brier_score,
+    gamma_deviance,
+    hinge_loss,
+    log_loss,
+    poisson_deviance,
+    squared_hinge_loss,
+    tweedie_deviance,
+)
+from batcher.plan.functions.metrics.text.diversity import (
+    char_repetition_rate,
+    compression_ratio_proxy,
+    distinct_char_ngram_ratio,
+    distinct_token_ratio,
+    empty_generation_rate,
+    mean_output_tokens,
+    refusal_rate,
+    repeated_line_rate,
+    truncation_rate,
+)
+from batcher.plan.functions.metrics.text.formatting import (
+    boxed_answer_rate,
     bullet_list_rate,
+    choice_answer_rate,
     code_block_present_rate,
     heading_rate,
+    json_present_rate,
     markdown_link_rate,
     numbered_list_rate,
+    numeric_answer_rate,
     table_rate,
+    tagged_answer_rate,
+    valid_json_rate,
 )
-from batcher.plan.functions.metrics.generation import (
+from batcher.plan.functions.metrics.text.length import (
+    automated_readability_index,
+    char_length_quantile,
+    char_length_range,
+    long_word_rate,
+    max_char_length,
+    mean_chars_per_word,
+    mean_paragraph_count,
+    mean_words_per_sentence,
+    min_char_length,
+    token_budget_exceed_rate,
+    token_estimate_quantile,
+    total_token_estimate,
+    word_count_quantile,
+)
+from batcher.plan.functions.metrics.text.overlap import (
+    char_ngram_f1,
+    char_ngram_jaccard,
+    char_ngram_precision,
+    char_ngram_recall,
     exact_match,
     length_ratio,
     normalized_exact_match,
@@ -123,8 +142,7 @@ from batcher.plan.functions.metrics.generation import (
     token_set_precision,
     token_set_recall,
 )
-from batcher.plan.functions.metrics.margin import hinge_loss, squared_hinge_loss
-from batcher.plan.functions.metrics.pii_safety import (
+from batcher.plan.functions.metrics.text.pii_safety import (
     contains_any_rate,
     credit_card_like_rate,
     email_rate,
@@ -132,51 +150,38 @@ from batcher.plan.functions.metrics.pii_safety import (
     pii_rate,
     ssn_like_rate,
 )
-from batcher.plan.functions.metrics.probabilistic import brier_score, log_loss
-from batcher.plan.functions.metrics.readability import (
-    automated_readability_index,
-    long_word_rate,
-    mean_chars_per_word,
-    mean_paragraph_count,
-    mean_words_per_sentence,
-)
-from batcher.plan.functions.metrics.repetition import (
-    char_repetition_rate,
-    compression_ratio_proxy,
-    distinct_char_ngram_ratio,
-    repeated_line_rate,
-)
-from batcher.plan.functions.metrics.retrieval import (
-    answer_groundedness,
-    citation_rate,
-    context_utilization,
-    fully_grounded_rate,
-    unsupported_token_rate,
-)
-from batcher.plan.functions.metrics.script import (
-    arabic_rate,
-    cjk_rate,
-    cyrillic_rate,
-    emoji_rate,
-    latin_only_rate,
-)
-from batcher.plan.functions.metrics.text_quality import (
+from batcher.plan.functions.metrics.text.quality import (
     all_caps_rate,
+    blank_line_rate,
     code_block_rate,
+    double_space_rate,
+    empty_or_whitespace_rate,
+    has_tab_rate,
+    leading_whitespace_rate,
     long_output_rate,
     mean_sentence_count,
     mean_word_length,
     non_ascii_rate,
     repeated_punctuation_rate,
     short_output_rate,
+    trailing_whitespace_rate,
     url_rate,
 )
-from batcher.plan.functions.metrics.tokens import (
-    token_budget_exceed_rate,
-    token_estimate_quantile,
-    total_token_estimate,
+from batcher.plan.functions.metrics.text.retrieval import (
+    answer_groundedness,
+    citation_rate,
+    context_utilization,
+    fully_grounded_rate,
+    unsupported_token_rate,
 )
-from batcher.plan.functions.metrics.tone import (
+from batcher.plan.functions.metrics.text.script import (
+    arabic_rate,
+    cjk_rate,
+    cyrillic_rate,
+    emoji_rate,
+    latin_only_rate,
+)
+from batcher.plan.functions.metrics.text.tone import (
     contains_phrase_rate,
     exclamation_rate,
     first_person_rate,
@@ -192,9 +197,12 @@ __all__ = [
     "arabic_rate",
     "automated_readability_index",
     "balanced_accuracy",
+    "blank_line_rate",
     "boxed_answer_rate",
     "brier_score",
     "bullet_list_rate",
+    "char_length_quantile",
+    "char_length_range",
     "char_ngram_f1",
     "char_ngram_jaccard",
     "char_ngram_precision",
@@ -216,9 +224,11 @@ __all__ = [
     "diagnostic_odds_ratio",
     "distinct_char_ngram_ratio",
     "distinct_token_ratio",
+    "double_space_rate",
     "email_rate",
     "emoji_rate",
     "empty_generation_rate",
+    "empty_or_whitespace_rate",
     "exact_match",
     "exclamation_rate",
     "explained_variance",
@@ -236,6 +246,7 @@ __all__ = [
     "gamma_deviance",
     "geometric_mean_score",
     "hamming_loss",
+    "has_tab_rate",
     "heading_rate",
     "hedge_rate",
     "hinge_loss",
@@ -245,6 +256,7 @@ __all__ = [
     "json_present_rate",
     "kling_gupta_efficiency",
     "latin_only_rate",
+    "leading_whitespace_rate",
     "length_ratio",
     "log_loss",
     "long_output_rate",
@@ -254,6 +266,7 @@ __all__ = [
     "markdown_link_rate",
     "markedness",
     "matthews_corrcoef",
+    "max_char_length",
     "max_error",
     "mean_angular_distance",
     "mean_bias",
@@ -272,6 +285,7 @@ __all__ = [
     "mean_word_length",
     "mean_words_per_sentence",
     "medae",
+    "min_char_length",
     "mse",
     "msle",
     "nash_sutcliffe_efficiency",
@@ -313,6 +327,7 @@ __all__ = [
     "token_set_precision",
     "token_set_recall",
     "total_token_estimate",
+    "trailing_whitespace_rate",
     "true_negatives",
     "true_positives",
     "truncation_rate",
@@ -322,5 +337,6 @@ __all__ = [
     "url_rate",
     "valid_json_rate",
     "wape",
+    "word_count_quantile",
     "zero_vector_rate",
 ]

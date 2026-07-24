@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.metrics.tables import calibration_curve
-from batcher.plan.functions.metrics.classification import positive_mask
+from batcher.plan.functions.metrics.model.classification import positive_mask
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset

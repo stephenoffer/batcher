@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import length_dist as ld
+from batcher.plan.functions.metrics.text import length as ld
 
 pytestmark = pytest.mark.unit
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import pii_safety as p
+from batcher.plan.functions.metrics.text import pii_safety as p
 
 pytestmark = pytest.mark.unit
 

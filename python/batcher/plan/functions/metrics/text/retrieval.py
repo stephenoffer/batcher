@@ -21,7 +21,7 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
-from batcher.plan.functions.metrics._text import mean_ratio, tokens
+from batcher.plan.functions.metrics.text._text import mean_ratio, tokens
 
 __all__ = [
     "answer_groundedness",

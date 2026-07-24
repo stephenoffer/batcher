@@ -48,16 +48,16 @@ DIR_ALLOW: dict[str, str] = {
         "sanctioned pattern for the optimizer's large (hundreds-of-rules) rule set"
     ),
     "python/batcher/ml": (
-        "the ML surface's top-level modules are each a public import path users depend on "
-        "(batcher.ml.selection, batcher.ml.splitting, batcher.ml.feature_spec, ...); at 13 "
-        "modules by one, subpackaging would break those documented paths for no navigational "
-        "gain — the deeper structure already lives in ml/preprocessors, ml/metrics, ml/stats, "
-        "ml/tabular subpackages"
+        "OVER BUDGET AND TRACKED: 29 modules against a cap of 12. Each is a public import path "
+        "users depend on (batcher.ml.selection, batcher.ml.linear, batcher.ml.feature_spec, ...), "
+        "so the fix is a subpackage split that keeps those paths re-exported, not a rename. "
+        "Shrink it by moving whole families down the way ml/preprocessors, ml/metrics, ml/stats, "
+        "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "Kyber's cohesive learned-adaptive family (cost/cardinality/calibration/cpu_shares/"
-        "learning/learned_tuning/signature) sits at 13 modules by one; a subpackage split is a "
-        "follow-up refactor, tracked to shrink back under the cap"
+        "OVER BUDGET AND TRACKED: 17 modules against a cap of 12. The learned-adaptive family "
+        "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
+        "to lift out; this entry is debt, not a design"
     ),
     "benchmarks/cluster": (
         "standalone cluster benchmark scripts, run as `python benchmarks/cluster/<x>.py` — so "
@@ -213,10 +213,10 @@ STRUCTURE_ALLOW: dict[str, str] = {
         "thresholds, tables), one name per line so each is discoverable"
     ),
     "python/batcher/plan/functions/metrics/__init__.py": (
-        "the metric-expression facade re-exports ~90 metrics across 7 submodules (errors, "
-        "classification, probabilistic, diagnostic, deviance, agreement, and the __all__), one "
-        "name per line so the docstring linter and editors see each — collapsing them would "
-        "hide the surface for a five-line saving"
+        "the ONE metric-expression facade: it re-exports 148 metrics from the 15 leaf modules of "
+        "the model/ and text/ subpackages, one name per line so the docstring linter and editors "
+        "see each. The subpackages deliberately have no re-export __init__ of their own, so this "
+        "is the single place the surface is declared rather than one of three"
     ),
     # The single top-level expression-function facade: it re-exports every free function
     # reachable as `bt.<name>` (string, conditional, math, aggregate, quantile, regression,
@@ -233,10 +233,11 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # The GPU/accelerator module: vendor-agnostic backend detection plus the per-GPU
     # zero-config *recommendation* family (`recommend_quantization` / `recommend_inference_dtype`
     # / `recommend_num_gpus` / `recommend_gpu_fraction`) and the utilization-feedback loop, all
-    # sharing the same backend-probe / capability / const scaffolding. `ml/` is already at the
-    # 12-file directory cap, so the recommendation family can't move to a sibling module without
-    # breaching it — the dir-size invariant wins (same case as `kyber/rules/joins/order.py`).
-    "python/batcher/ml/gpu.py": "accelerator detect + per-GPU recommendations + feedback + autocast; ml/ at the 12-file dir cap",
+    # sharing the same backend-probe / capability / const scaffolding. `ml/` is already 17 files
+    # past the directory cap, so the recommendation family cannot move to a sibling module without
+    # making that worse — the dir-size invariant wins (same case as `kyber/rules/joins/order.py`).
+    # It gets a home of its own when `ml/` is finally subpackaged.
+    "python/batcher/ml/gpu.py": "accelerator detect + per-GPU recommendations + feedback + autocast; ml/ already over the dir cap",
     # The distributed dispatcher: one cohesive routing hub that inspects a plan's shape
     # and sends it to the matching distributed operator (map / aggregate / join / sort /
     # distinct / window / union / asof), plus the cluster-fill + envelope sizing every
