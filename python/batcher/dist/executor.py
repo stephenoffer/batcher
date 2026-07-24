@@ -571,6 +571,45 @@ def _distributed_global_window(
     return result if not above else _apply_above(above, result)
 
 
+def _range_partitionable_sort_key(sort: Sort) -> bool:
+    """Whether the leading sort key is a type the range partitioner accepts.
+
+    The distributed sort routes rows by comparing the leading key as `f64` against `f64`
+    quantile boundaries, so `bc_runtime::shuffle` takes a numeric key directly and a temporal
+    one through its order-preserving integer backing. It **refuses a string** on purpose, and
+    the reason is a correctness one rather than a missing cast: arrow would read `"12"` as
+    `12.0` and order the buckets numerically, disagreeing with the single-node *lexical* sort.
+
+    Without this check that refusal surfaced as a `RuntimeError` from inside a Ray task —
+    `ORDER BY <string column>` under `distributed=True` crashed rather than ran. Declining to
+    distribute is the honest answer: the query still returns the right rows from the
+    single-node sort, which is a performance limit instead of a failure.
+
+    `None` from either the schema or the inference means "not certain", and the sound answer
+    there is to leave routing exactly as it was — this may only ever *withhold* distribution
+    on a key it is sure about.
+
+    Lifting the limit means giving the FFI a string-boundary entry point:
+    `bc_runtime::shuffle::range_part_of_str` already exists and is what the single-node
+    parallel sample sort (`bc_interp::ops::sample_sort`) uses for exactly this case. The
+    sampling side would need string quantiles too, since `merge_boundaries` is numpy-numeric.
+    """
+    schema = sort.input.available_schema()
+    if schema is None:
+        return True
+    from batcher.plan.types import infer_type
+
+    dtype = infer_type(sort.keys[0].expr, schema)
+    if dtype is None:
+        return True
+    return (
+        pa.types.is_integer(dtype)
+        or pa.types.is_floating(dtype)
+        or pa.types.is_decimal(dtype)
+        or pa.types.is_temporal(dtype)
+    )
+
+
 def _hoist_computed_sort_key(sort: Sort):
     """Rewrite `ORDER BY <expr>, …` so the LEADING key is a plain column.
 
@@ -920,7 +959,12 @@ def _dispatch(
     sort_split = _split_at(plan, Sort)
     if sort_split is not None:
         above, sort = sort_split
-        if _single_source(sort.input) and sort.keys and not _has_breaker(sort.input):
+        if (
+            _single_source(sort.input)
+            and sort.keys
+            and not _has_breaker(sort.input)
+            and _range_partitionable_sort_key(sort)
+        ):
             hoisted = _hoist_computed_sort_key(sort)
             if hoisted is not None:
                 sort, drop_key = hoisted
