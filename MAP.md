@@ -1809,7 +1809,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `keys.rs` | 183 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 35 | `bc-runtime` — the engine's runtime library. |
 | `shuffle.rs` | 934 | Hash repartitioning — the shuffle primitive. |
-| `topn.rs` | 185 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
+| `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window.rs` | 1070 | Window functions — partition, order, and append one column per function. |
 | `window_fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window_frame.rs` | 704 | Explicit `ROWS` window frames — sliding-window aggregates. |
