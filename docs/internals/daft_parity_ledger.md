@@ -43,6 +43,14 @@ the first kind produces work.
 | 18-21 | `timestamp_seconds`/`millis`/`micros` | `from_epoch(expr, unit)` covering `s`/`ms`/`us`/`ns` — one unit more than Daft | same file, vs DuckDB `to_timestamp` / `epoch_ms` |
 | 22 | `date_from_unix_date` | `from_unix_date(expr)` | same file |
 | 23 | *(structure)* `eval/` hit its 12-file cap | `eval/temporal/{date,timezone,make}.rs` subpackage | `just lint-structure`, `just surface-diff` |
+| 24-35 | `compress`, `decompress`, `try_compress`, `try_decompress` over deflate/gzip/zlib | `.str.compress(codec)` / `.str.decompress(codec)` over six codecs — Daft's three plus zstd, brotli, lz4. Decompression is lenient, so no `try_` variants are needed | `tests/differential/test_diff_str_compress.py`, both directions against Python's own codec implementations |
+| 36 | *(interop)* zstd frames were unreadable by one-shot decoders | `bulk::compress` records the content size in the frame header | same file, against `zstandard` |
+| 37 | `regexp_split` | `.str.regexp_split(pattern)` | `tests/differential/test_diff_regexp_split_and_geo.py` vs DuckDB `regexp_split_to_array` |
+| 38-41 | `great_circle_distance` (km) | `bt.great_circle_distance(..., unit)` in km/m/mi/nm | same file, vs an independent haversine and six geodesics fixed by geometry |
+| 42-43 | `image_channel`, `image_mode` | `.image.decode()` now returns `{width, height, channels, mode}` from **one** header read, where Daft spends a call per fact | `crates/bc-expr/.../image.rs`, `tests/integration/test_image_expr.py` |
+| 44 | `crop` | `.image.crop(x, y, w, h)` → PNG bytes, clipped at the edge rather than padded | same files |
+| 45-48 | `encode_image` | `.image.encode(format)` over png/jpeg/bmp/gif | same files |
+| 49 | *(benchmark)* Daft was measured only in the multi-node lineup | Daft added to the single-node default lineup | `benchmarks/engines/lineup.py`; results in this file |
 
 ### Note on the epoch gap
 
@@ -60,16 +68,13 @@ Ranked by value. "Daft" names the Daft function the gap was found from.
 
 | Gap | Daft | Notes |
 |---|---|---|
-| Binary compression codecs | `compress`, `decompress`, `try_*` | gzip / zlib / deflate / brotli / zstd, both directions. Batcher has base64/hex only. |
 | Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | Needed to write a table another engine's Iceberg reader will prune correctly. |
 | Row-identity generators | `monotonically_increasing_id`, `uuid`, `random_int` | Batcher has `with_row_index`; the expression-level forms are absent. |
-| Image ops | `crop`, `convert_image`, `encode_image`, `image_{width,height,mode,channel}` | Batcher has decode/resize/center_crop/to_tensor/dhash; the attribute readers and the encode direction are missing. |
+| Image color conversion | `convert_image` | An explicit mode conversion (RGB to L, RGBA to RGB). `.image.to_grayscale` covers the common case; the general form is open. |
 | Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `video_metadata` | Batcher decodes video but exposes no frame-level accessor. |
 | Audio metadata | `audio_metadata` | Batcher has decode/resample/mel/mfcc but no metadata reader. |
-| File metadata | `file_size`, `file_exists`, `file_path`, `guess_mime_type` | Path-level facts as expressions. |
+| File metadata | `file_size`, `file_exists`, `file_path`, `guess_mime_type` | Path-level facts as expressions. **Costed and deferred:** each is a `stat` per row, which means object-store access from `bc-expr` — a crate that sits under everything and deliberately links no IO. The right home is `bc-io` or the UDF plane, and that is a design decision rather than a function to add. |
 | HDF5 accessors | `hdf5_attrs`, `hdf5_keys`, `hdf5_metadata` | Batcher reads HDF5 as a *format*; the per-row accessors are absent. |
-| Great-circle distance | `great_circle_distance` | Batcher has L1/L2/cosine/hamming/jaccard, no geodesic. |
-| Regex split | `regexp_split` | Batcher's `split` is literal-delimiter only. |
 | Tokenizer round trip | `tokenize_encode`, `tokenize_decode` | Batcher estimates token counts; it cannot produce or consume real BPE ids. Needs a tokenizer dependency in the data plane — costed, not yet decided. |
 | `jq` | `jq` | A full jq engine. Recorded so the gap is honest; the shape accessors above cover the common cases. |
 | Connectors | `write_turbopuffer`, `write_bigtable`, `write_paimon`, WARC, MCAP, HuggingFace | Batcher's connector surface is wider overall (nine categories, 76 registered formats); these six are Daft-only. |

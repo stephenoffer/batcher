@@ -7,7 +7,8 @@ description: Port a Daft workload to Batcher's public Python API — the relatio
 
 Daft and Batcher target the same shape of work: multimodal and ML-first pipelines
 over a native columnar engine, distributed with Ray. The port is mostly mechanical.
-Read `docs/migration/index.md` (the mapping tables and the `from_*`/`to_*` adapters)
+Read `docs/migration/transforming.md` and `docs/migration/reading-and-writing.md`
+(the mapping tables and the `from_*`/`to_*` adapters)
 and `docs/benchmarks/vs-daft.md` (an honest scorecard — Batcher wins multimodal
 ingest and top-N, ties aggregation, and **loses join-heavy TPC-H by 2–12×** and a
 per-batch Python UDF by ~2×) before promising a user a speedup.
@@ -58,13 +59,19 @@ model or does network IO.
 | Daft | Batcher |
 |---|---|
 | `col("url").url.download()` | `ds.ml.download("url", output_column="bytes")` |
-| `col("bytes").image.decode()` | `col("bytes").image.decode()` |
+| `col("bytes").image.decode()` | `col("bytes").image.decode()` — a struct, not just dimensions |
+| `image_width(c)` / `image_height(c)` / `image_channel(c)` / `image_mode(c)` | one `col("c").image.decode()`, then `.struct.field("width" \| "height" \| "channels" \| "mode")`. Daft re-reads the header per call; Batcher reads it once |
 | `col("img").image.resize(w, h)` | `col("img").image.resize(w, h)` |
+| `crop(c, x, y, w, h)` | `col("c").image.crop(x, y, w, h)` — clips at the edge; `center_crop` is the padding one |
+| `encode_image(c, fmt)` | `col("c").image.encode(fmt)` — `png`/`jpeg`/`bmp`/`gif` |
 | image → tensor for a model | `col("img").image.to_tensor()` |
 | audio decode / resample | `col("a").audio.decode()`, `.audio.resample(...)`, `.audio.to_waveform()` |
 | video decode | `col("v").video.decode()` |
 | `daft.read_parquet` over image paths | `bt.read.images(path, decode=True, size=(224, 224))`, `bt.read.video(...)`, `bt.read.point_cloud(...)` |
 | `col("j").json.query(...)` | `col("j").json.extract_string(p)` / `extract_int` / `extract_float` / `extract_bool` |
+| `json_array_length(c, p)` / `json_object_keys(c, p)` | `col("c").json.array_length(p)` / `.json.keys(p)` |
+| `json_tuple(c, *keys)` | `col("c").json.values(p)` then `explode`, or one `extract_*` per key |
+| — | `col("c").json.type_of(p)` and `.json.exists(p)`: route a field whose type varies, and tell an absent key from a JSON `null` |
 | `.struct.get("f")` / map access | `col("s").struct.field("f")`, `col("m").map.get(k)` / `.keys()` / `.values()` |
 | list/embedding ops | `col("e").list.cosine_distance(o)`, `.l2_distance`, `.dot`, `.normalize`, `.mean_pool` |
 | `df.with_column("emb", embed_text(col("t")))` | `ds.ml.embed(model, column="t", output_column="emb", num_gpus=1)` |
@@ -90,6 +97,33 @@ frames = (
 )
 frames.write.parquet("s3://bucket/labels/")
 ```
+
+## Scalar-function translation
+
+The functions where Batcher's spelling differs and the capability does not. Everything
+absent from this table is either the same name or covered by the relational table above.
+
+| Daft | Batcher |
+|---|---|
+| `to_snake_case(c)`, `to_camel_case(c)`, `to_kebab_case(c)`, `to_title_case(c)`, `to_upper_*` | one `col("c").str.to_case(style)`; the styles add `sentence`, `dot`, `train` |
+| `compress(c, codec)` / `decompress(c, codec)` | `col("c").str.compress(codec)` / `.str.decompress(codec)`; adds zstd, brotli, lz4 |
+| `try_compress` / `try_decompress` | not needed — `decompress` is already lenient, so a bad frame is null |
+| `regexp_split(c, p)` | `col("c").str.regexp_split(p)` |
+| `great_circle_distance(a, b, c, d)` | `bt.great_circle_distance(a, b, c, d, unit="km")`; also `m`/`mi`/`nm` |
+| `make_date(y, m, d)` / `make_timestamp(...)` | `bt.make_date(...)` / `bt.make_timestamp(...)` |
+| `timestamp_seconds(c)` / `timestamp_millis(c)` / `timestamp_micros(c)` | `bt.from_epoch(c, "s" \| "ms" \| "us" \| "ns")` |
+| `date_from_unix_date(c)` | `bt.from_unix_date(c)` |
+| `length_bytes(c)` | `col("c").str.len_bytes()` |
+| `eq_null_safe(a, b)` | `a.eq_missing(b)` |
+| `is_inf(c)` / `not_null(c)` | `c.is_infinite()` / `c.is_not_null()` |
+| `columns_sum(...)` / `columns_max(...)` | `bt.sum_horizontal(...)` / `bt.max_horizontal(...)` |
+| `date_format(c, f)` / `datepart(p, c)` / `date_trunc(u, c)` | `col("c").dt.strftime(f)` / `bt.date_part(p, c)` / `col("c").dt.truncate(u)` |
+| `dot_product(a, b)` / `jaccard_similarity(a, b)` | `a.list.dot(b)` / `a.list.jaccard(b)` |
+| `list_sum(c)` / `list_max(c)` / … | `col("c").list.sum()` / `.list.max()` / … |
+
+**Do not reach for an epoch cast.** Daft's `timestamp_seconds` has no Batcher alias on
+purpose: `col("t").cast("timestamp")` compiles, runs, and is wrong, because Arrow reads a
+bare integer as *microseconds*. `bt.from_epoch(c, "s")` is the port.
 
 ## The UDF story
 
@@ -194,7 +228,8 @@ does), plus an exact comparison of the relational columns.
 
 ## See also
 
-- `docs/migration/index.md` — the full mapping tables and `from_*`/`to_*` adapters.
+- `docs/migration/transforming.md`, `docs/migration/reading-and-writing.md` — the full
+  mapping tables and `from_*`/`to_*` adapters.
 - `docs/benchmarks/vs-daft.md`, `docs/benchmarks/multimodal-ingest.md` — the measured
   comparison and the image/point-cloud pipelines.
 - `docs/api/ml.md`, `docs/ml/` — the inference, embedding, and training-feed surface.
