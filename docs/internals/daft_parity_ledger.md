@@ -70,7 +70,8 @@ Ranked by value. "Daft" names the Daft function the gap was found from.
 
 | Gap | Daft | Notes |
 |---|---|---|
-| Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | Needed to write a table another engine's Iceberg reader will prune correctly. |
+| Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | **Lower value than it first looks.** Batcher's Iceberg sink hands each shard to `pyiceberg`, which applies the table's own partition-spec transforms, so a partitioned write is already correct without these. What is left is manual bucketing and bucketed joins. The temporal four compose from existing expressions; only `bucket` needs an exact `murmur3_x86_32`, which is not in the tree. |
+| Group-wise Python apply | `map_groups` | **The largest genuine gap found.** `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
 | Row-identity generators | `monotonically_increasing_id`, `uuid`, `random_int` | Batcher has `with_row_index`; the expression-level forms are absent. |
 | Image color conversion | `convert_image` | An explicit mode conversion (RGB to L, RGBA to RGB). `.image.to_grayscale` covers the common case; the general form is open. |
 | Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx` | `.video.decode()` already covers `video_metadata` (it returns `{width, height, num_frames, duration_secs, fps}`), so the real gap is frame *extraction*, not metadata. Needs the `video` cargo feature (system FFmpeg). |
@@ -123,40 +124,42 @@ The operator suite at TPC-H scale factor 1, best-of-5, on this machine
 (`python benchmarks/run.py --benchmark operators --engines batcher,duckdb,polars,daft
 --scale 1`). `b/daft` below 1 means Batcher is faster by that factor.
 
-:::{warning}
-**The numbers in this table were taken on a `just build` (dev-profile, *unoptimized*)
-engine, against release wheels of Daft, DuckDB and Polars.** They are kept because the
-*direction* is informative — Batcher led on all eleven while carrying that handicap — but
-no ratio here is a measurement, and none should be quoted.
-
-That mistake is why `bc_py` now exports `__engine_profile__` and the benchmark suite
-hard-stops on a debug engine (`benchmarks/run.py::_check_build_profile`). The guard that
-existed at the time was a timing heuristic and passed silently. Re-measuring on release
-is an open item; it needs a window in which no other agent rebuilds the extension, since
-`just build` overwrites the installed `.so` for everyone.
-:::
+The run below printed `release` from `bt.versions()["engine_profile"]` before starting, and
+the suite now refuses to run otherwise (`benchmarks/run.py::_check_build_profile`).
 
 | Query | batcher_ms | duckdb_ms | polars_ms | daft_ms | b/daft |
 |---|---|---|---|---|---|
-| op-groupby-sum | 3.7 | 3.2 | 15.8 | 27.0 | 0.14x |
-| op-groupby-2key | 5.4 | 5.1 | 21.9 | 37.2 | 0.15x |
-| op-global-sum | 0.1 | 1.2 | 1.3 | 3.2 | 0.04x |
-| op-filter-count | 0.2 | 1.3 | 10.8 | 5.6 | 0.04x |
-| op-join-agg | 39.7 | 41.8 | 52.5 | 240.9 | 0.16x |
-| op-sort-limit | 8.6 | 6.1 | 230.8 | 45.8 | 0.19x |
-| op-filter-project | 8.6 | 8.0 | 12.0 | 13.4 | 0.64x |
-| op-window-rank | 43.5 | 121.7 | 908.3 | 7322.4 | 0.01x |
-| op-window-runsum | 43.1 | 251.1 | 821.6 | 6867.1 | 0.01x |
-| op-window-lag | 61.5 | 156.3 | 2679.7 | 6794.5 | 0.01x |
-| op-window-sum-partition | 38.2 | 49.9 | 52.0 | 2535.8 | 0.02x |
+| op-groupby-sum | 3.8 | 3.2 | 15.9 | 26.8 | 0.14x |
+| op-groupby-2key | 7.7 | 5.0 | 19.7 | 36.8 | 0.21x |
+| op-global-sum | 0.1 | 1.5 | 1.2 | 4.0 | 0.04x |
+| op-filter-count | 0.2 | 1.3 | 11.5 | 6.2 | 0.04x |
+| op-join-agg | 39.5 | 43.4 | 50.1 | 238.8 | 0.17x |
+| op-sort-limit | 7.4 | 6.0 | 230.9 | 46.1 | 0.16x |
+| op-filter-project | 9.4 | 7.1 | 16.0 | 13.2 | 0.71x |
+| op-window-rank | 42.4 | 117.9 | 851.7 | 6903.9 | 0.01x |
+| op-window-runsum | 39.4 | 237.9 | 861.9 | 7480.2 | 0.01x |
+| op-window-lag | 61.1 | 150.8 | 2655.5 | 6958.8 | 0.01x |
+| op-window-sum-partition | 35.9 | 44.7 | 49.0 | 2662.5 | 0.01x |
 
-Batcher led on all eleven. Given the build-profile caveat above, the only claim this
-supports is a qualitative one: Batcher is not *behind* Daft on these shapes, since it led
-while unoptimized. The multipliers are not usable, and one of the window rows is not even
-measuring the same computation on both sides — see below.
+Batcher is ahead on all eleven, from 1.4x on the narrowest (`op-filter-project`) to two
+orders of magnitude on the window functions. Discount the window column, though: one of
+those four is not computing the same thing on both sides (below), and the other three
+share its kernel.
 
-Two further limits, which would apply even on a release build: it is one machine and one
-scale factor, and it is the operator suite rather than full TPC-H.
+Three limits on what this supports: one machine, one scale factor, and the operator suite
+rather than full TPC-H. `docs/benchmarks/vs-daft.md` remains the scorecard, and it reports
+Daft ahead on join-heavy TPC-H — nothing here contradicts that, because none of these
+eleven is a multi-join query.
+
+### An oddity worth recording rather than explaining away
+
+An earlier pass of this same suite was run before the build profile was verified, and its
+numbers are within noise of the release ones above. That is not what a dev-profile build
+(`opt-level = 0`, `debug_assertions` on, dependencies unoptimized) should produce, and it
+is the reason the old timing-heuristic guard never fired: on these queries the profile
+barely moved the clock. Why is not established here, and guessing at it would be worse
+than leaving it open. The lesson taken is narrower and solid: **infer the build profile
+from the build, never from a stopwatch.**
 
 ### A correctness divergence in Daft, found by running it
 
@@ -188,7 +191,8 @@ before it could ever have caught it in us.
 
 ## What this ledger does not claim
 
-It does not claim Batcher is faster than Daft. The one table here was taken on an
-unoptimized build and supports a direction, not a number. `competitive_architecture.md` and
-`docs/benchmarks/vs-daft.md` are the files that carry competitive claims; neither is
-amended by this ledger, and a release-profile re-measurement is an open item above.
+It does not claim Batcher is faster than Daft in general. It reports one suite, on one
+machine, at one scale factor, on a verified release build — eleven operator queries, none
+of them a multi-join. `docs/benchmarks/vs-daft.md` is the scorecard, and it says Daft leads
+on join-heavy TPC-H; this ledger does not amend that and should not be quoted as if it
+did.
