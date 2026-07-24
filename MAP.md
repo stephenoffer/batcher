@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 818 Python modules across 124 packages and 157 Rust files across 13 crates.
+Covering 819 Python modules across 124 packages and 157 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -696,7 +696,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `policies.py` | 447 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `reduce.py` | 159 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `scaling.py` | 495 | Live cluster topology and the autoscaler request lifecycle. |
-| `scheduling.py` | 280 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 292 | The metadata-driven scheduling envelope and placement-group machinery. |
 
 ### `batcher/dist/fleet/` — 4 · backend
 
@@ -1010,7 +1010,7 @@ Carbonite fault tolerance: Spark-style recompute-from-lineage on worker loss.
 | `preemption.py` | 225 | Spot-preemption detection so the engine drains proactively, not reactively. |
 | `recovery.py` | 97 | Shuffle recovery — the recompute-on-failure coordination loop. |
 | `replication.py` | 83 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
-| `speculative.py` | 160 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
+| `speculative.py` | 213 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem
 
@@ -1493,7 +1493,7 @@ Ecosystem-compatible spellings bound onto `Expr`.
 | `binder.py` | 38 | Attach the compatibility aliases onto `Expr`. |
 | `guidance.py` | 269 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 | `names.py` | 426 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
-| `namespaces.py` | 301 | Ecosystem-compatible spellings on the typed accessor namespaces. |
+| `namespaces.py` | 307 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 | `operators.py` | 385 | Method-form spellings of the `Expr` operators (the pandas ``Series.add`` family). |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
@@ -1502,10 +1502,11 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 
 | module | lines | what it is |
 |---|---|---|
-| `_bind.py` | 498 | Shared accessor-generation helper for the namespace families. |
-| `collections.py` | 1187 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 3505 | The `.str` accessor namespace. |
-| `temporal.py` | 1002 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `_bind.py` | 503 | Shared accessor-generation helper for the namespace families. |
+| `_validate.py` | 48 | Argument validation shared by the accessor namespaces (layer 1, neutral). |
+| `collections.py` | 1191 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `strings.py` | 3522 | The `.str` accessor namespace. |
+| `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 
@@ -1847,7 +1848,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 312 | Cheap static predicates over `Expr` trees, consulted *before* execution. |
+| `analyze.rs` | 375 | Cheap static predicates over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 87 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 638 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 441 | `cast` evaluation with DuckDB float→int rounding semantics. |
@@ -1886,9 +1887,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/mod.rs` | 1236 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/timezone.rs` | 61 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1019 | `bc-expr` — scalar expression IR and its evaluation. |
-| `scratch_filter_bench.rs` | 3 | TEMPORARY scratch measurement for the short-circuit conjunctive filter. |
-| `select.rs` | 245 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
+| `lib.rs` | 1018 | `bc-expr` — scalar expression IR and its evaluation. |
+| `select.rs` | 256 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
 
@@ -1959,9 +1959,10 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 561 | Aggregate Parquet footer statistics across many files, natively. |
-| `lib.rs` | 426 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 525 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 281 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
+| `row_filter.rs` | 244 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `store.rs` | 170 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`
