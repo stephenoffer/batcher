@@ -20,6 +20,7 @@ __all__ = [
     "shared_scratch_root",
     "write_ipc",
     "write_ipc_round_robin",
+    "write_shuffle_buckets",
 ]
 
 # Cluster-shared mounts, in scope order (narrowest first). On managed Ray clusters these are
@@ -85,6 +86,34 @@ def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
         for b in batches:
             writer.write_batch(b)
     return path
+
+
+def write_shuffle_buckets(
+    buckets: list[list[pa.RecordBatch]], work_dir: str, prefix: str, mapper_id: int
+) -> list[str]:
+    """Write one IPC file per reducer bucket and return their paths, in reducer order.
+
+    The map half of every disk shuffle ends the same way: `partition_batches` hands back one
+    batch list per reducer, and each is written to a file the reducer will later collect by
+    name. The naming is the contract between the two halves — `<prefix><mapper>_r<reducer>` —
+    so it belongs in one place rather than being spelled out in each operator's map task.
+
+    Args:
+        buckets: One batch list per reducer, in reducer order.
+        work_dir: The shuffle scratch directory, shared across the cluster.
+        prefix: Distinguishes concurrent shuffles in the same directory — `"m"` for the
+            aggregate, `"wm"` for the window, `"<side>_m"` for each side of a join.
+        mapper_id: This mapper's index, which makes the filename unique across mappers.
+
+    Returns:
+        The written paths, one per reducer, in reducer order.
+    """
+    paths = []
+    for reducer, bucket in enumerate(buckets):
+        path = os.path.join(work_dir, f"{prefix}{mapper_id}_r{reducer}.arrow")
+        write_ipc(bucket, path)
+        paths.append(path)
+    return paths
 
 
 def write_ipc_round_robin(

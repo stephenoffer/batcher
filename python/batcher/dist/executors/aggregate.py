@@ -162,7 +162,7 @@ def _map_task(
     nat = engine()
     from batcher.dist.executors.partition_io import read_partition
     from batcher.dist.executors.ray_runtime import execute_metered
-    from batcher.dist.shuffle_io import write_ipc
+    from batcher.dist.shuffle_io import write_ipc, write_shuffle_buckets
 
     # Metered: the worker measures its sub-plan's per-operator runtime facts and
     # ships them back so the driver can feed the cost-model calibration loop.
@@ -175,12 +175,7 @@ def _map_task(
         return [path], metrics_json
 
     buckets = nat.partition_batches([partial], list(range(n_keys)), n_reducers)
-    paths = []
-    for r, bucket in enumerate(buckets):
-        path = _os.path.join(work_dir, f"m{mapper_id}_r{r}.arrow")
-        write_ipc(bucket, path)
-        paths.append(path)
-    return paths, metrics_json
+    return write_shuffle_buckets(buckets, work_dir, "m", mapper_id), metrics_json
 
 
 def _reduce_task(

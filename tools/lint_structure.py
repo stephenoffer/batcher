@@ -341,7 +341,25 @@ def class_public_methods(node: ast.ClassDef) -> list[str]:
 
 
 def func_length(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
-    return (node.end_lineno or node.lineno) - node.lineno + 1
+    """Line count excluding the docstring — the Python analogue of `rust_code_lines`.
+
+    The point of this check is "a function that needs a section comment wants that section
+    as a named function", which is a claim about *code*. Public functions here carry a
+    mandatory Google-style docstring with runnable `.. doctest::` examples
+    (`python-quality.md`), so counting it penalizes exactly the documentation the docstring
+    gate demands: `ds.write.__call__` read as 288 lines against 222 of code, and
+    `ds.ml.map_batches` as 217 against 79. Of the 214 functions this check flagged before
+    the fix, 117 were over the line on docstring alone — more than half the report was
+    noise, which is how a warning list stops being read.
+
+    Same reasoning, same shape, as the Rust file check cutting at `#[cfg(test)]`.
+    """
+    total = (node.end_lineno or node.lineno) - node.lineno + 1
+    body = node.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        if isinstance(body[0].value.value, str):
+            total -= body[0].end_lineno - body[0].lineno + 1
+    return total
 
 
 # --- Per-file checks --------------------------------------------------------------

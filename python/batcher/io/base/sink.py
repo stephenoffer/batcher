@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import IO, Any, ClassVar
@@ -180,6 +180,53 @@ class FileSink(ABC):
         """
         from itertools import chain
 
+        def encode(first: pa.RecordBatch, rest: Iterator[pa.RecordBatch], fh: IO[Any]) -> int:
+            rows = 0
+            if (writer := self._open_stream_writer(fh, first.schema)) is None:
+                table = pa.Table.from_batches(list(chain([first], rest)))
+                self._write_file(table, fh)
+                return table.num_rows
+            for batch in chain([first], rest):
+                if batch.num_rows:
+                    self._write_batch(writer, batch)
+                    rows += batch.num_rows
+            self._close_stream_writer(writer)
+            return rows
+
+        return self._stream_to_file(batches, path, schema=schema, resume=resume, encode=encode)
+
+    def _stream_to_file(
+        self,
+        batches: Iterator[pa.RecordBatch],
+        path: str,
+        *,
+        schema: pa.Schema | None,
+        resume: bool,
+        encode: Callable[[pa.RecordBatch, Iterator[pa.RecordBatch], IO[Any]], int],
+    ) -> WrittenFile:
+        """Run `encode` inside the scaffold every single-file streaming write shares.
+
+        Destination normalization, filesystem resolution, the `resume` short-circuit, the
+        atomic writer, the empty-stream case, and the `WrittenFile` accounting are identical
+        for every format; only the encoding differs. A subclass that wants a different
+        encoding strategy (NDJSON straight-through, a parallel CSV window) overrides
+        `write_stream` and calls this with its own `encode` rather than restating the
+        scaffold — which is how two of them came to resolve the filesystem with the
+        module-level `resolve_filesystem`, silently dropping the caller's `storage_options`
+        and `filesystem`, and to skip `_dest`, recording an un-normalized path in the
+        manifest.
+
+        Args:
+            batches: The batches to persist, consumed one at a time.
+            path: Destination file URI, normalized here.
+            schema: Schema used to write a valid empty file when `batches` yields nothing.
+            resume: Leave an already-present (hence complete) file untouched.
+            encode: Given the first batch, the rest of the iterator, and the open file
+                handle, write them and return the row count.
+
+        Returns:
+            The file that was written, with its row count and size on storage.
+        """
         path = self._dest(path)
         fs = self._resolve(path)
         if resume and fs.exists(path):
@@ -193,16 +240,8 @@ class FileSink(ABC):
             if first is None:
                 empty = schema.empty_table() if schema is not None else pa.table({})
                 self._write_file(empty, fh)
-            elif (writer := self._open_stream_writer(fh, first.schema)) is None:
-                table = pa.Table.from_batches(list(chain([first], it)))
-                self._write_file(table, fh)
-                rows = table.num_rows
             else:
-                for batch in chain([first], it):
-                    if batch.num_rows:
-                        self._write_batch(writer, batch)
-                        rows += batch.num_rows
-                self._close_stream_writer(writer)
+                rows = encode(first, it, fh)
         return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any | None:  # noqa: ARG002 (extension-point args used by overrides)

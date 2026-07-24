@@ -705,11 +705,10 @@ def _join_map_task(
     build_bloom=False,
     bloom_expected=0,
 ):
-    import os as _os
 
     nat = engine()
     from batcher.dist.executors.partition_io import read_partition
-    from batcher.dist.shuffle_io import write_ipc
+    from batcher.dist.shuffle_io import write_shuffle_buckets
 
     rows = nat.execute_plan(subplan_ir, [read_partition(part_path)], engine_config)
     schema = rows[0].schema
@@ -732,11 +731,7 @@ def _join_map_task(
     else:
         buckets = nat.partition_batches(rows, key_idx, n_buckets)
 
-    paths = []
-    for r, bucket in enumerate(buckets):
-        path = _os.path.join(work_dir, f"{side}_m{mapper_id}_r{r}.arrow")
-        write_ipc(bucket, path)
-        paths.append(path)
+    paths = write_shuffle_buckets(buckets, work_dir, f"{side}_m", mapper_id)
     # The build side returns a bloom over its keys alongside its buckets, so the
     # driver can merge them and prune the probe side. Built over the full materialized
     # side (pre-bucketing); all mappers size identically so the blooms merge.

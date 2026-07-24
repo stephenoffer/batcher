@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher.ml.llm.channels import finish_reason_sink, usage_sink
-from batcher.ml.llm.engines.base import Engine, EngineFactory
+from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
 
 __all__ = ["anthropic_engine"]
 
@@ -107,7 +107,7 @@ def anthropic_engine(
             headers["x-api-key"] = key
 
         def call_one(request: Any) -> tuple[str, tuple[int | None, int | None], str | None]:
-            prompt, image, overrides = _unpack_request(request)
+            prompt, image, overrides = unpack_request(request, ("max_tokens", "temperature"))
             body = _messages_body(
                 model,
                 prompt,
@@ -145,16 +145,6 @@ def anthropic_engine(
         return engine
 
     return factory
-
-
-def _unpack_request(request: Any) -> tuple[str, Any, dict]:
-    """Split a request into ``(prompt, image, overrides)`` — mirrors the HTTP engine."""
-    if not isinstance(request, dict):
-        return str(request), None, {}
-    prompt = str(request.get("prompt", ""))
-    image = request.get("image")
-    overrides = {k: request[k] for k in ("max_tokens", "temperature") if k in request}
-    return prompt, image, overrides
 
 
 def _messages_body(

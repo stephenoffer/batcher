@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
-from batcher.ml.llm.engines.base import Engine, EngineFactory
+from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
 
 __all__ = ["http_engine"]
 
@@ -130,7 +130,9 @@ def http_engine(
             headers["Authorization"] = f"Bearer {api_key}"
 
         def call_one(request: Any) -> _Result:
-            prompt, image, overrides = _unpack_request(request)
+            prompt, image, overrides = unpack_request(
+                request, ("max_tokens", "temperature", "stop")
+            )
             body = _openai_body(model, prompt, chat, system, defaults, overrides, image)
             try:
                 # Retries with jittered backoff handle the 429 rate limits hosted APIs return.
@@ -211,21 +213,6 @@ class _Result:
         self.usage = usage
         self.finish_reason = finish_reason
         self.logprob = logprob
-
-
-def _unpack_request(request: Any) -> tuple[str, Any, dict]:
-    """Split a request into ``(prompt, image, overrides)``.
-
-    A plain string carries only the prompt. A dict may also carry a vision ``image`` and
-    per-row ``max_tokens`` / ``temperature`` overrides; ``adapter`` is dropped here because
-    a served endpoint selects the model by name, not per request.
-    """
-    if not isinstance(request, dict):
-        return str(request), None, {}
-    prompt = str(request.get("prompt", ""))
-    image = request.get("image")
-    overrides = {k: request[k] for k in ("max_tokens", "temperature", "stop") if k in request}
-    return prompt, image, overrides
 
 
 def _openai_body(

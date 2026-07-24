@@ -28,7 +28,6 @@ import pyarrow as pa
 
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import get_logger, note_suppressed
-from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,

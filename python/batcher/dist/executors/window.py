@@ -111,22 +111,16 @@ def _distributed_window(
 
 
 def _map_task(map_ir, pk_indices_json, part_path, n_reducers, work_dir, mapper_id, engine_config):
-    import os as _os
 
     nat = engine()
     from batcher.dist.executors.partition_io import read_partition
     from batcher.dist.executors.ray_runtime import execute_metered
-    from batcher.dist.shuffle_io import write_ipc
+    from batcher.dist.shuffle_io import write_shuffle_buckets
 
     rows, metrics_json = execute_metered(map_ir, [read_partition(part_path)], engine_config)
     pk_indices = json.loads(pk_indices_json)
     buckets = nat.partition_batches(rows, pk_indices, n_reducers)
-    paths = []
-    for r, bucket in enumerate(buckets):
-        path = _os.path.join(work_dir, f"wm{mapper_id}_r{r}.arrow")
-        write_ipc(bucket, path)
-        paths.append(path)
-    return paths, metrics_json
+    return write_shuffle_buckets(buckets, work_dir, "wm", mapper_id), metrics_json
 
 
 def _reduce_task(win_json, input_paths, work_dir, reducer_id, engine_config):
