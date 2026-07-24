@@ -9,7 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir import Col, Expr, Lit
+from batcher.plan.expr_ir import Col, Expr
+from batcher.plan.expr_ir.core import _wrap
 from batcher.plan.logical import JoinOutputCol, empty_result_schema
 from batcher.plan.schema import placeholder_schema
 
@@ -25,7 +26,16 @@ __all__ = [
 
 
 def _as_expr(value: Any) -> Expr:
-    return value if isinstance(value, Expr) else Lit(value)
+    """Coerce a `select`/`with_columns` value to an `Expr`, lifting a scalar to `Lit`.
+
+    Delegates to `plan.expr_ir`'s `_wrap` rather than re-deciding, because the two
+    disagreed: `_wrap` passes an `AggExpr` through (it is not an `Expr`, but it is a
+    legal leaf of one), while this lifted it into ``Lit(AggExpr)``. A bare
+    ``select(s=col("x").sum())`` therefore skipped both aggregate-misuse guards and
+    failed much later inside the optimizer with ``TypeError: unsupported literal type:
+    AggExpr``. Passing it through reaches `AggExpr.to_ir`, which names the real mistake.
+    """
+    return _wrap(value)
 
 
 def _as_key_expr(value: str | Expr) -> Expr:

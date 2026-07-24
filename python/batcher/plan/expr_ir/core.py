@@ -22,7 +22,7 @@ import math
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float, require_int
 from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import ExprTag
@@ -2071,8 +2071,8 @@ class Expr:
                 >>> ds.select(b=bt.col("k").hash_bucket(4)).to_pydict()
                 {'b': [1, 3, 3, 1]}
         """
-        if buckets < 1:
-            raise PlanError(f"hash_bucket(): buckets must be >= 1, got {buckets}")
+        buckets = require_int(buckets, func="hash_bucket", arg="buckets", minimum=1)
+        seed = require_int(seed, func="hash_bucket", arg="seed")
         return self.hash(seed=seed).abs() % Lit(buckets)
 
     def pct_of_total(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
@@ -2480,7 +2480,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [5]})
                 >>> ds.select(f=bt.col("x").factorial()).to_pydict()
-                {'f': [120.0]}
+                {'f': [120]}
         """
         return MathExpr("factorial", self)
 
@@ -2496,7 +2496,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [7]})
                 >>> ds.select(r=bt.col("x").bit_count()).to_pydict()
-                {'r': [3.0]}
+                {'r': [3]}
         """
         return MathExpr("bit_count", self)
 
@@ -3003,9 +3003,10 @@ class Expr:
         """
         from batcher._internal.errors import PlanError
 
+        q = require_float(q, func="quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"quantile q must be in [0, 1], got {q}")
-        return AggExpr("quantile", self, param=float(q))
+        return AggExpr("quantile", self, param=q)
 
     def count(self) -> AggExpr:
         """Number of non-null values per group (SQL ``COUNT(expr)``; nulls are skipped).
@@ -3095,9 +3096,10 @@ class Expr:
                 >>> r.with_columns(q=bt.col("q").round()).to_pydict()
                 {'g': ['a', 'b'], 'q': [10.0, 20.0]}
         """
+        q = require_float(q, func="approx_quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"approx_quantile(q) requires q in [0, 1], got {q}")
-        return AggExpr("approx_quantile", self, param=float(q))
+        return AggExpr("approx_quantile", self, param=q)
 
     def approx_median(self) -> AggExpr:
         """Approximate median (the 0.5 quantile) via a KLL sketch — see :meth:`approx_quantile`.
@@ -3583,8 +3585,9 @@ class Expr:
         of existing nodes, so rolling adds no IR."""
         from batcher.plan.expr_ir.constructors import nullif, when
 
-        if window_size < 1:
-            raise PlanError(f"rolling_{agg}(): window_size must be >= 1, got {window_size}")
+        window_size = require_int(window_size, func=f"rolling_{agg}", arg="window_size", minimum=1)
+        if min_periods is not None:
+            min_periods = require_int(min_periods, func=f"rolling_{agg}", arg="min_periods")
         if min_periods is not None and not 1 <= min_periods <= window_size:
             raise PlanError(
                 f"rolling_{agg}(): min_periods must be in [1, {window_size}], got {min_periods}"
@@ -4511,6 +4514,70 @@ class AggExpr:
     def __abs__(self) -> Expr:
         """Absolute value ``abs(agg)``."""
         return Expr.__abs__(self)
+
+    # --- comparison and boolean composition over aggregates ---------------
+    # These forward to `Expr` for the same reason the arithmetic ones do, and their
+    # absence was not merely a missing feature. Without `__eq__`, Python fell back to
+    # identity comparison, so ``col("x").sum() == 6`` evaluated to the *bool* `False`
+    # rather than building a predicate — and `with_columns` then wrote that constant
+    # into a column, silently reporting `False` for a sum that really was 6. Every
+    # comparison is defined here so no such fallback remains.
+
+    def __eq__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Equality predicate over this aggregate (``agg == other``)."""
+        return Expr.__eq__(self, other)
+
+    def __ne__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Inequality predicate over this aggregate (``agg != other``)."""
+        return Expr.__ne__(self, other)
+
+    def __lt__(self, other: IntoExpr) -> Expr:
+        """Less-than predicate over this aggregate (``agg < other``)."""
+        return Expr.__lt__(self, other)
+
+    def __le__(self, other: IntoExpr) -> Expr:
+        """Less-or-equal predicate over this aggregate (``agg <= other``)."""
+        return Expr.__le__(self, other)
+
+    def __gt__(self, other: IntoExpr) -> Expr:
+        """Greater-than predicate over this aggregate (``agg > other``)."""
+        return Expr.__gt__(self, other)
+
+    def __ge__(self, other: IntoExpr) -> Expr:
+        """Greater-or-equal predicate over this aggregate (``agg >= other``)."""
+        return Expr.__ge__(self, other)
+
+    def __and__(self, other: IntoExpr) -> Expr:
+        """Boolean conjunction over aggregate predicates (``agg & other``)."""
+        return Expr.__and__(self, other)
+
+    def __rand__(self, other: IntoExpr) -> Expr:
+        """Reflected conjunction so ``other & agg`` works."""
+        return Expr.__rand__(self, other)
+
+    def __or__(self, other: IntoExpr) -> Expr:
+        """Boolean disjunction over aggregate predicates (``agg | other``)."""
+        return Expr.__or__(self, other)
+
+    def __ror__(self, other: IntoExpr) -> Expr:
+        """Reflected disjunction so ``other | agg`` works."""
+        return Expr.__ror__(self, other)
+
+    def __invert__(self) -> Expr:
+        """Boolean negation of an aggregate predicate (``~agg``)."""
+        return Expr.__invert__(self)
+
+    def __hash__(self) -> NoReturn:
+        """Refuse hashing, exactly as `Expr` does — ``==`` now builds a predicate.
+
+        Defining `__eq__` above would otherwise leave `AggExpr` with an inherited
+        `__hash__` whose contract it no longer honors, so a set or dict keyed on
+        aggregates would compare with a predicate and misbehave silently.
+
+        Raises:
+            TypeError: Always — naming the two workable keys.
+        """
+        return Expr.__hash__(self)
 
 
 # Expose `Expr`'s unary/parametric math methods on `AggExpr` so an aggregate result can
