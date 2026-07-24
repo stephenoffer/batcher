@@ -17,7 +17,15 @@ _ORDER_BLIND = re.compile(r"\bassert_same\s*\(")
 #: What makes a test *produce* an ordered result. Matching the test's body rather than its
 #: name matters: `test_sort_merge_join_strategy` names a strategy, not an ordering, and a
 #: join's output order is genuinely unspecified — flagging it would be wrong.
-_ORDERING_CALL = (".sort(", ".top_n(", "order_by", "ORDER BY", "order by")
+_ORDERING_CALL = (".sort(", ".top_n(", "ORDER BY", "order by")
+#: An `order_by=` *keyword* is inner ordering, never result ordering: it picks which row an
+#: aggregate keeps (`col("v").first(order_by=col("t"))`), which duplicate `distinct` survives
+#: (`.distinct(["k"], keep="first", order_by="ts")`), or how a window frame ranks rows
+#: (`col("x").rolling_sum(3, order_by=["id"])`). None of the three says anything about the
+#: order of the result set, so treating the keyword as an ordering call — which is what the
+#: bare `"order_by"` entry above used to do — made every window, first/last, and
+#: keep-first-distinct test read as order-blind. All 32 findings it produced were false.
+_INNER_ORDER_KWARG = re.compile(r"\border_by\s*=")
 #: An `ORDER BY` on the *oracle* side means the expected relation is ordered too, which is
 #: what makes an ordered assertion correct rather than flaky.
 _ORDER_BY_SQL = re.compile(r"ORDER\s+BY", re.I)
@@ -112,10 +120,16 @@ def _asserts_anything(node: _Func, source: str, helpers: set[str]) -> bool:
 
 def _order_finding(node: _Func, source: str, rel: str) -> Finding | None:
     """An order-blindness finding for `node`, or None when its comparison is sound."""
-    outer = _strip_over(source)
+    outer = _INNER_ORDER_KWARG.sub("", _strip_over(source))
     ordered = any(call in outer for call in _ORDERING_CALL)
     explicit = "== [" in source or "assert_same_ordered" in source or ".column(" in source
     if not (ordered and _ORDER_BLIND.search(source) and not explicit):
+        return None
+    # A sorted relation feeding a `GROUP BY`, `UNION`, `DISTINCT` or `INTERSECT` has no
+    # result order to check: the sort chose *which* rows survive or which value an aggregate
+    # keeps, and the consuming operator discarded the row order. `assert_same` is the correct
+    # comparison there, so saying otherwise is noise that buries the real findings.
+    if any(call in outer for call in _ORDER_DESTROYING):
         return None
     # `high` is the unambiguous case only: a real relational sort on the Batcher side *and*
     # an outer `ORDER BY` on the oracle side. Both engines were asked for a specific row
@@ -126,7 +140,6 @@ def _order_finding(node: _Func, source: str, rel: str) -> Finding | None:
     both = (
         any(call in outer for call in _RELATIONAL_SORT)
         and _ORDER_BY_SQL.search(outer) is not None
-        and not any(call in outer for call in _ORDER_DESTROYING)
     )
     return Finding(
         "order-blind-test",
