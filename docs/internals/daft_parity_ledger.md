@@ -122,12 +122,18 @@ The operator suite at TPC-H scale factor 1, best-of-5, on this machine
 (`python benchmarks/run.py --benchmark operators --engines batcher,duckdb,polars,daft
 --scale 1`). `b/daft` below 1 means Batcher is faster by that factor.
 
-**Build profile matters and is easy to get wrong.** `just build` installs the *dev*
-profile, which sets no `opt-level` and leaves `debug_assertions` on — an unoptimized
-engine, and unoptimized third-party crates with it. Daft, DuckDB and Polars are installed
-release wheels. Benchmarking against them from a `just build` tree compares an
-unoptimized Batcher to optimized competitors. Use `just build-release`. The numbers below
-are release-profile; where a first pass was taken on a dev build it is called out.
+:::{warning}
+**The numbers in this table were taken on a `just build` (dev-profile, *unoptimized*)
+engine, against release wheels of Daft, DuckDB and Polars.** They are kept because the
+*direction* is informative — Batcher led on all eleven while carrying that handicap — but
+no ratio here is a measurement, and none should be quoted.
+
+That mistake is why `bc_py` now exports `__engine_profile__` and the benchmark suite
+hard-stops on a debug engine (`benchmarks/run.py::_check_build_profile`). The guard that
+existed at the time was a timing heuristic and passed silently. Re-measuring on release
+is an open item; it needs a window in which no other agent rebuilds the extension, since
+`just build` overwrites the installed `.so` for everyone.
+:::
 
 | Query | batcher_ms | duckdb_ms | polars_ms | daft_ms | b/daft |
 |---|---|---|---|---|---|
@@ -143,13 +149,13 @@ are release-profile; where a first pass was taken on a dev build it is called ou
 | op-window-lag | 61.5 | 156.3 | 2679.7 | 6794.5 | 0.01x |
 | op-window-sum-partition | 38.2 | 49.9 | 52.0 | 2535.8 | 0.02x |
 
-Batcher is faster on all eleven, by 1.6x on the narrowest (`op-filter-project`) and ~100x
-on the window functions. Read the window column with the caveat below, though — one of
-those four is not measuring the same computation on both sides.
+Batcher led on all eleven. Given the build-profile caveat above, the only claim this
+supports is a qualitative one: Batcher is not *behind* Daft on these shapes, since it led
+while unoptimized. The multipliers are not usable, and one of the window rows is not even
+measuring the same computation on both sides — see below.
 
-Two limits on what this table supports: it is one machine and one scale factor, and it is
-the operator suite rather than full TPC-H. It is enough to say Batcher is not *behind*
-Daft on these shapes; it is not enough for a headline multiplier.
+Two further limits, which would apply even on a release build: it is one machine and one
+scale factor, and it is the operator suite rather than full TPC-H.
 
 ### A correctness divergence in Daft, found by running it
 
@@ -181,6 +187,7 @@ before it could ever have caught it in us.
 
 ## What this ledger does not claim
 
-It does not claim Batcher is faster than Daft beyond the table above: one machine, one
-scale factor, one suite. `competitive_architecture.md` is the file that carries competitive
-claims; this one records measurements and the conditions they were taken under.
+It does not claim Batcher is faster than Daft. The one table here was taken on an
+unoptimized build and supports a direction, not a number. `competitive_architecture.md` and
+`docs/benchmarks/vs-daft.md` are the files that carry competitive claims; neither is
+amended by this ledger, and a release-profile re-measurement is an open item above.
