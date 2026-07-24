@@ -144,7 +144,17 @@ def test_strip_prefix_and_suffix_match_duckdb(duck):
 
 
 def test_dt_snake_case_aliases_match_duckdb(duck):
-    t = pa.table({"d": pa.array([datetime.date(2024, 2, 15), None], type=pa.date32())})
+    """The snake_case `.dt` spellings resolve to the DuckDB function they are named for.
+
+    The fixture spans a full week including a Sunday, and `day_of_week` is checked against
+    DuckDB's `dayofweek`. Both details are load-bearing: `day_of_week` delegates to
+    `dayofweek` (Sunday=0), not to `isodow` (Sunday=7), and the two numberings agree on
+    every day *except* Sunday. A single-Thursday fixture compared against `isodow` passes
+    whichever function the alias is bound to, which is how the alias came to be documented
+    as ISO while behaving as Sunday=0.
+    """
+    week = [datetime.date(2024, 2, 12) + datetime.timedelta(days=i) for i in range(7)]
+    t = pa.table({"d": pa.array([*week, None], type=pa.date32())})
     duck.register("t", t)
     got = (
         bt.from_arrow(t)
@@ -155,8 +165,12 @@ def test_dt_snake_case_aliases_match_duckdb(duck):
     )
     assert_same(
         got,
-        duck.execute("SELECT isodow(d) AS a, dayofyear(d) AS b, weekofyear(d) AS c FROM t"),
+        duck.execute("SELECT dayofweek(d) AS a, dayofyear(d) AS b, weekofyear(d) AS c FROM t"),
     )
+    # ...and the ISO spellings really are the other convention, on the day that separates
+    # them. Without this the two families could both be bound to `dayofweek` undetected.
+    iso = bt.from_arrow(t).select(a=col("d").dt.isodow(), b=col("d").dt.weekday()).collect()
+    assert_same(iso, duck.execute("SELECT isodow(d) AS a, isodow(d) AS b FROM t"))
 
 
 def test_list_aliases_match_their_primaries_through_the_engine():

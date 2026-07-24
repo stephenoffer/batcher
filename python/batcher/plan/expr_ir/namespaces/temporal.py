@@ -340,6 +340,10 @@ class _DtNamespace:
     def weekday(self) -> Expr:
         """ISO weekday, Monday=1 … Sunday=7 — the Polars ``weekday`` spelling of ``isodow``.
 
+        Not to be confused with ``dayofweek`` / ``day_of_week``, which use the DuckDB
+        numbering (Sunday=0 … Saturday=6). The two agree on Monday through Saturday and
+        differ only on Sunday, so the example below is a Sunday.
+
         Returns:
             A new Int64 expression of the ISO weekday.
 
@@ -348,9 +352,9 @@ class _DtNamespace:
 
                 >>> import batcher as bt
                 >>> import datetime as dt
-                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18)]})  # a Sunday
                 >>> ds.select(r=bt.col("d").dt.weekday()).to_pydict()
-                {'r': [4]}
+                {'r': [7]}
         """
         return self.isodow()
 

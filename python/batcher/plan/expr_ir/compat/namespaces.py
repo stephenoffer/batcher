@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.errors import require_int
+
 if TYPE_CHECKING:
     from batcher.plan.expr_ir.core import Expr
     from batcher.plan.expr_ir.func_nodes import ListGet, StrFunc
@@ -145,19 +147,22 @@ def strip_suffix(self: object, suffix: str) -> StrFunc:
 
 # --- .dt: the snake_case spellings ---------------------------------------------------
 def day_of_week(self: object) -> Expr:
-    """ISO day of week, Monday=1 to Sunday=7 — the snake_case spelling of `dayofweek`.
+    """Day of week, Sunday=0 to Saturday=6 — the snake_case spelling of `dayofweek`.
+
+    This is the DuckDB ``dayofweek`` convention, not the ISO one. For ISO numbering
+    (Monday=1 to Sunday=7) use :meth:`isodow` or its Polars spelling ``weekday``.
 
     Returns:
-        An Int64 expression of the ISO weekday.
+        An Int64 expression of the day of week.
 
     Examples:
         .. doctest::
 
             >>> import batcher as bt
             >>> import datetime as dt
-            >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
+            >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18)]})  # a Sunday
             >>> ds.select(r=bt.col("d").dt.day_of_week()).to_pydict()
-            {'r': [4]}
+            {'r': [0]}
     """
     return self.dayofweek()  # type: ignore[attr-defined]
 
@@ -233,6 +238,7 @@ def element_at(self: object, index: int) -> ListGet:
             >>> ds.select(r=bt.col("l").list.element_at(1)).to_pydict()
             {'r': [20]}
     """
+    index = require_int(index, func="list.element_at", arg="index")
     return self.get(index)  # type: ignore[attr-defined]
 
 
