@@ -100,7 +100,7 @@ Ranked by value. "Daft" names the Daft function the gap was found from.
 | HDF5 accessors | `hdf5_attrs`, `hdf5_keys`, `hdf5_metadata` | Batcher reads HDF5 as a *format* (`io/formats/ml/hdf5.py`, via h5py). The per-row accessors would need an HDF5 parser in the data plane; routing them through h5py instead would be per-row Python, which the architecture rule forbids on a hot path. Costed, not scheduled. |
 | Tokenizer round trip | `tokenize_encode`, `tokenize_decode` | Batcher estimates token counts; it cannot produce or consume real BPE ids. Needs a tokenizer dependency in the data plane — costed, not yet decided. |
 | `jq` | `jq` | A full jq engine. Recorded so the gap is honest; the shape accessors above cover the common cases. |
-| Connectors | `write_turbopuffer`, `write_bigtable`, `write_paimon`, HuggingFace | Batcher's connector surface is wider overall (ten categories, 77 registered formats); these four remain Daft-only. **MCAP was listed here in error** — it exists in `io/formats/robotics/`, a category the agent guidance itself had omitted. WARC is now closed. |
+| Connectors | `write_turbopuffer`, `write_bigtable`, `write_paimon` | Batcher's connector surface is wider overall (ten categories, 77 registered formats); these three remain Daft-only, all of them *sinks* into hosted services. **Two entries were listed here in error**: MCAP exists in `io/formats/robotics/` (a category the agent guidance itself had omitted), and HuggingFace is largely covered by `bt.from_huggingface(ds)` — what Daft additionally has is a Hub-name reader that streams the Hub's Parquet exports, where Batcher asks you to load the dataset first. WARC is now closed. |
 
 ## Open — spelling gaps only (no API work)
 

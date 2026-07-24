@@ -33,6 +33,8 @@ Both engines are lazy: Daft builds a plan and runs on `collect()`/`show()`; Batc
 | Daft | Batcher |
 |---|---|
 | `daft.read_parquet(p)` | `bt.read.parquet(p)` |
+| `daft.read_warc(p)` | `bt.read.warc(p)` — one row per crawl record; `.warc.gz` transparent |
+| `daft.read_huggingface("user/ds")` | `bt.from_huggingface(datasets.load_dataset("user/ds"))` — load first, then wrap |
 | `daft.from_pydict(d)` | `bt.from_pydict(d)` |
 | `daft.col("a")` | `bt.col("a")` |
 | `df.select("a", "b")` | `ds.select("a", "b")` |
