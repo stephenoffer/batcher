@@ -309,8 +309,9 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             };
             Ok(Arc::new(out))
         }
-        (_, other) => Err(ExprError::ExpectedString {
+        (_, other) => Err(ExprError::ExpectedType {
             func: format!("{func:?}"),
+            want: "a numeric argument",
             got: other.to_string(),
         }),
     }

@@ -32,8 +32,9 @@ pub(crate) fn eval_convert_timezone(
     let ts = arr
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
-        .ok_or_else(|| ExprError::ExpectedString {
+        .ok_or_else(|| ExprError::ExpectedType {
             func: "convert_timezone".into(),
+            want: "a Timestamp argument",
             got: arr.data_type().to_string(),
         })?;
 

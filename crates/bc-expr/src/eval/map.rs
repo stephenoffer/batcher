@@ -23,8 +23,9 @@ pub(crate) fn eval_map(
     let map = arr
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| ExprError::ExpectedString {
+        .ok_or_else(|| ExprError::ExpectedType {
             func: format!("{func:?}"),
+            want: "a Map argument",
             got: arr.data_type().to_string(),
         })?;
     match func {

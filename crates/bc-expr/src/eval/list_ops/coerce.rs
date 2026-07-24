@@ -40,8 +40,9 @@ pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprEr
             )));
             cast(arr, &target).map_err(ExprError::from)
         }
-        other => Err(ExprError::ExpectedString {
+        other => Err(ExprError::ExpectedType {
             func: func.to_string(),
+            want: "a List argument",
             got: other.to_string(),
         }),
     }

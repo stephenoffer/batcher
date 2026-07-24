@@ -18,6 +18,18 @@ pub enum ExprError {
     #[error("string function {func} expected a Utf8 argument, got {got}")]
     ExpectedString { func: String, got: String },
 
+    /// A type mismatch in a function that is *not* a string function. It exists because
+    /// `ExpectedString` was being reused for the list/map/struct/numeric/temporal argument
+    /// checks, which produced messages that were wrong in both halves: `map.keys` on a
+    /// Utf8 column reported "string function MapKeys expected a Utf8 argument, got Utf8" —
+    /// naming the wrong family, and claiming it expected exactly what it had just rejected.
+    #[error("{func} expected {want}, got {got}")]
+    ExpectedType {
+        func: String,
+        want: &'static str,
+        got: String,
+    },
+
     #[error("string function {func} requires a {arg} argument")]
     MissingArgument { func: String, arg: &'static str },
 

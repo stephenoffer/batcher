@@ -197,8 +197,9 @@ pub(crate) fn require_list<'a>(
 ) -> Result<&'a arrow::array::GenericListArray<i32>, ExprError> {
     use arrow::array::AsArray;
     if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedString {
+        return Err(ExprError::ExpectedType {
             func: func.into(),
+            want: "a List argument",
             got: arr.data_type().to_string(),
         });
     }
@@ -318,8 +319,9 @@ pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, 
     use arrow::array::{Array, AsArray};
 
     if !matches!(arr.data_type(), DataType::Struct(_)) {
-        return Err(ExprError::ExpectedString {
+        return Err(ExprError::ExpectedType {
             func: "struct.field".into(),
+            want: "a Struct argument",
             got: arr.data_type().to_string(),
         });
     }
@@ -346,8 +348,9 @@ pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, Expr
     use arrow::compute::take;
 
     if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedString {
+        return Err(ExprError::ExpectedType {
             func: "list.get".into(),
+            want: "a List argument",
             got: arr.data_type().to_string(),
         });
     }

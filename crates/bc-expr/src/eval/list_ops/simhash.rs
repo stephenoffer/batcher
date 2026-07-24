@@ -86,21 +86,23 @@ pub(crate) fn eval_list_simhash(
             reason: format!("num_bits must be in [1, {MAX_BITS}], got {num_bits}"),
         });
     }
-    let list =
-        arr.as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| ExprError::ExpectedString {
-                func: "simhash".into(),
-                got: arr.data_type().to_string(),
-            })?;
+    let list = arr
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| ExprError::ExpectedType {
+            func: "simhash".into(),
+            want: "a List argument",
+            got: arr.data_type().to_string(),
+        })?;
 
     // One numeric read path: cast the flat child once rather than per row.
     let values = arrow::compute::cast(list.values(), &DataType::Float64)?;
     let values = values
         .as_any()
         .downcast_ref::<arrow::array::Float64Array>()
-        .ok_or_else(|| ExprError::ExpectedString {
+        .ok_or_else(|| ExprError::ExpectedType {
             func: "simhash".into(),
+            want: "a numeric list element",
             got: list.values().data_type().to_string(),
         })?;
 

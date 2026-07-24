@@ -80,12 +80,14 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     if let DateFunc::Isodow = func {
         use arrow::array::{Array, Int32Array};
         let part = arrow::compute::kernels::temporal::date_part(arr, DatePart::DayOfWeekMonday0)?;
-        let dow = part.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-            ExprError::ExpectedString {
-                func: "isodow".into(),
-                got: part.data_type().to_string(),
-            }
-        })?;
+        let dow =
+            part.as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| ExprError::ExpectedType {
+                    func: "isodow".into(),
+                    want: "an Int32 day-of-week kernel result",
+                    got: part.data_type().to_string(),
+                })?;
         let out: Int64Array = (0..dow.len())
             .map(|i| (!dow.is_null(i)).then(|| dow.value(i) as i64 + 1))
             .collect();
@@ -102,12 +104,15 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     ) {
         use arrow::array::{Array, Int32Array};
         let years = arrow::compute::kernels::temporal::date_part(arr, DatePart::Year)?;
-        let y = years.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-            ExprError::ExpectedString {
-                func: "century/decade/millennium".into(),
-                got: years.data_type().to_string(),
-            }
-        })?;
+        let y =
+            years
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| ExprError::ExpectedType {
+                    func: "century/decade/millennium".into(),
+                    want: "an Int32 year kernel result",
+                    got: years.data_type().to_string(),
+                })?;
         let out: Int64Array = (0..y.len())
             .map(|i| {
                 (!y.is_null(i)).then(|| {
