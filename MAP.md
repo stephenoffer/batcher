@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 816 Python modules across 123 packages and 154 Rust files across 13 crates.
+Covering 818 Python modules across 124 packages and 157 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -639,7 +639,7 @@ Join lowering for the SQL translator — a façade over the join rewrite modules
 | `flight_join.py` | 353 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 342 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 154 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1043 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1058 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 173 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 99 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 105 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -813,13 +813,21 @@ Kyber rule modules.
 |---|---|---|
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `agg_pushdown.py` | 508 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
-| `algebraic.py` | 525 | Algebraic relational rewrites — small, local, always-correct simplifications. |
 | `fusion.py` | 343 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `ordering.py` | 58 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 699 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 480 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 303 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `zonemap_pruning.py` | 307 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
+
+### `batcher/kyber/rules/algebraic/` — 3 · subsystem
+
+Algebraic rewrites: small, local, unconditionally semantics-preserving simplifications.
+
+| module | lines | what it is |
+|---|---|---|
+| `disjunctions.py` | 223 | Rewrites of a disjunction — factoring an `OR`, and folding one into `IN`. |
+| `identities.py` | 324 | Algebraic relational identities — small, local, always-correct simplifications. |
 
 ### `batcher/kyber/rules/extra/` — 3 · subsystem
 
@@ -1741,7 +1749,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 546 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 241 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1037 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1049 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 214 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -1753,11 +1761,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 2686 | The multi-core executor. |
 | `stream/breaker.rs` | 304 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/builds.rs` | 197 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 212 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 878 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 703 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/parallel.rs` | 808 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
-| `stream/runtime_filter.rs` | 320 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
+| `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `window_spill.rs` | 72 | Bounded-memory window execution via grace partitioning. |
 
 ### `bc-runtime`
@@ -1786,7 +1795,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather.rs` | 212 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 137 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
-| `join/dense.rs` | 131 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/dense.rs` | 146 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1318 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
@@ -1838,7 +1847,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 95 | Cheap static predicates over `Expr` trees, consulted *before* execution. |
+| `analyze.rs` | 312 | Cheap static predicates over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 87 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 638 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 441 | `cast` evaluation with DuckDB float→int rounding semantics. |
@@ -1846,7 +1855,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/dispatch.rs` | 370 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
-| `eval/in_list.rs` | 236 | `x IN (lit, lit, …)` — hash-set membership. |
+| `eval/in_list.rs` | 248 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 771 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 108 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/list_hof.rs` | 81 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
@@ -1877,7 +1886,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/mod.rs` | 1236 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/timezone.rs` | 61 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1017 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1019 | `bc-expr` — scalar expression IR and its evaluation. |
+| `scratch_filter_bench.rs` | 3 | TEMPORARY scratch measurement for the short-circuit conjunctive filter. |
+| `select.rs` | 245 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
 

@@ -206,6 +206,17 @@ pytest
 Or install an unreleased revision directly:
 `pip install "git+https://github.com/stephenoffer/batcher.git"`.
 
+On an ephemeral dev box — an Anyscale workspace, a preemptible VM, a rebuilt container —
+`rustup`'s default install lives in `$HOME` and does not survive the machine being replaced,
+so `cargo` and `just` disappear and the repo stops building for a reason nothing names.
+`tools/bootstrap_env.sh` reinstalls the toolchain onto fast local disk from a tarball cached
+on durable storage and exports `CARGO_HOME`/`RUSTUP_HOME`/`CARGO_TARGET_DIR`. It is a no-op
+once the toolchain is present, so it is safe to source from a shell startup file:
+
+```bash
+source tools/bootstrap_env.sh
+```
+
 ## Layout
 
 - `python/batcher/` — the Python API
