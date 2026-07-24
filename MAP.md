@@ -303,11 +303,11 @@ Session entry points that create `Dataset`s.
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 406 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
-| `generate.py` | 241 | Row generators: `range` and `date_range`. |
+| `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 144 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 388 | The generic read dispatch plus the top-level ``read_*`` shorthands. |
 | `sql.py` | 136 | The default SQL catalog: `bt.sql` and `bt.register_function`. |
-| `versions.py` | 106 | Version and environment reporting (`engine_version`, `show_versions`). |
+| `versions.py` | 125 | Version and environment reporting (`engine_version`, `show_versions`). |
 
 ### `batcher/api/sql_session/` — 5 · conductor
 
@@ -1480,7 +1480,7 @@ The scalar expression algebra.
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 385 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 498 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 235 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 74 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 302 | Structural traversals over the expression tree. |
@@ -1538,14 +1538,14 @@ The expression function library, grouped by family.
 | `aggregate.py` | 475 | Aggregate free functions that compose existing mergeable aggregates. |
 | `collection.py` | 125 | Collection-construction free functions (`struct`, `named_struct`, `sequence`). |
 | `horizontal.py` | 298 | Row-wise ("horizontal") reductions across several columns. |
-| `prompt.py` | 130 | Prompt-construction functions — assemble an LLM prompt from row columns, in the engine. |
+| `prompt.py` | 134 | Prompt-construction functions — assemble an LLM prompt from row columns, in the engine. |
 | `quantiles.py` | 181 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 229 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
-| `scalar.py` | 384 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
+| `scalar.py` | 385 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 286 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 442 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `string.py` | 426 | String-building free functions (`concat`, `concat_ws`, `format_string`). |
-| `temporal.py` | 377 | Temporal free functions. |
+| `temporal.py` | 379 | Temporal free functions. |
 
 ### `batcher/plan/functions/analysis/` — 1 · contract
 
@@ -1591,7 +1591,7 @@ Metrics that score generated or collected text, with no model in the loop.
 | `length.py` | 378 | Length, size, and reading-level metrics — how much text there is and how hard it is. |
 | `overlap.py` | 382 | Lexical-overlap metrics — scoring generated text against a reference, in one pass. |
 | `pii_safety.py` | 175 | PII and safety monitors — did the model leak contact details or emit a banned pattern. |
-| `quality.py` | 405 | Surface-quality metrics — the hygiene of raw text, before anyone judges its meaning. |
+| `quality.py` | 408 | Surface-quality metrics — the hygiene of raw text, before anyone judges its meaning. |
 | `retrieval.py` | 187 | Retrieval-grounding metrics — scoring a generated answer against its retrieved context. |
 | `script.py` | 164 | Script and character-set composition metrics — corpus-level detectors of language drift. |
 | `tone.py` | 191 | Tone and style metrics — how an LLM sounds, measured as corpus rates. |
@@ -1726,7 +1726,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 47 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 406 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `lib.rs` | 641 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 654 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
 | `shuffle.rs` | 548 | Shuffle FFI: partitioners and the concurrent reducer gather. |
