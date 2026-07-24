@@ -52,6 +52,7 @@ the first kind produces work.
 | 45-48 | `encode_image` | `.image.encode(format)` over png/jpeg/bmp/gif | same files |
 | 49 | *(benchmark)* Daft was measured only in the multi-node lineup | Daft added to the single-node default lineup | `benchmarks/engines/lineup.py`; results in this file |
 | 50 | *(process)* the debug-build guard was a timing heuristic that passed silently | `bc_py` exports `__engine_profile__`; the suite hard-stops on a debug engine, and `bt.versions()` reports it | `benchmarks/run.py::_check_build_profile`; `tests/unit/test_toplevel_namespace_ergonomics.py` |
+| 51 | *(perf)* media reads issued a stat per file that the fetch already answered | `read()` fetches first and chunks from the returned sizes; small-corpus image ingest went from 1.8-2.2x behind Daft to 1.14-1.25x | `benchmarks/run.py --benchmark images --scale 10`; numbers below |
 | — | `audio_metadata` | **Already present**, found while triaging: `.audio.decode()` returns `{sample_rate, channels, num_frames, duration_secs}`. Listed here because the ledger claimed it as a gap and was wrong. |
 
 ### Note on the epoch gap
@@ -63,6 +64,15 @@ seconds cast that way silently became January 1970 — a plausible-looking times
 error. The behaviour is pinned in
 `test_a_bare_cast_would_have_read_epoch_seconds_as_microseconds` so the function cannot be
 refactored back into a cast.
+
+### A note on where these commits live
+
+Several of the code changes recorded here were committed by other agents working in the
+same tree, which staged them alongside their own work before this session could. The code
+is in `HEAD` and correct; what would otherwise be lost is the reasoning, which is why this
+ledger carries it at more length than a ledger normally would. Specifically the media
+read-path work (items 51 and the header-parse change before it) has no commit message of
+its own.
 
 ## Open — real capability gaps
 
@@ -161,36 +171,52 @@ barely moved the clock. Why is not established here, and guessing at it would be
 than leaving it open. The lesson taken is narrower and solid: **infer the build profile
 from the build, never from a stopwatch.**
 
-### Where Batcher is behind: small-corpus image ingest
+### Where Batcher was behind: small-corpus image ingest (mostly closed)
 
 The multimodal suite at scale 10 (100 JPEGs from S3), release build, `b/daft` above 1
 meaning Batcher is slower:
 
-| Query | batcher_ms | daft_ms | b/daft |
-|---|---|---|---|
-| img-list | 239.7 | 130.7 | 1.83x |
-| img-decode | 285.5 | 130.8 | 2.18x |
-| img-resize | 253.2 | 158.1 | 1.60x |
+| Query | before | after | daft_ms | b/daft before | b/daft after |
+|---|---|---|---|---|---|
+| img-list | 239.7 | 163.5 | 143.2 | 1.83x | **1.14x** |
+| img-decode | 285.5 | 174.2 | 145.8 | 2.18x | **1.20x** |
+| img-resize | 253.2 | 179.3 | 143.7 | 1.60x | **1.25x** |
 
-The interesting part is the *shape*, not the totals. `img-list` does no image work at all —
-it lists and fetches bytes — and Batcher is already 1.8x behind there. Decode and resize
-then cost Batcher almost nothing on top (`img-resize` is *faster* than `img-decode`, the
-DCT-scaled JPEG path doing its job), while Daft's resize adds ~30 ms. **Batcher's image
-kernels are the better ones; the loss is entirely in per-file fetch.**
+**The cause was a stat per file that the fetch already answers.** `_chunks()` called
+`probe_sizes` to size every file before packing them into batches — one object-store HEAD
+per file — and then the read issued a GET per file that returns the length anyway. Two
+round trips against the same latency where one would do. Instrumented on this corpus it
+was **86 ms of a 272 ms read, 32%**, and the docstring justifying it ("one stat per file is
+negligible next to what a media source already does per file") was reasoning about *bytes
+transferred* when the binding cost is *round trips*.
 
-Two things ruled out, so the next attempt does not re-chase them:
+`read()` now fetches first and fills a size cache from what came back, so `_chunks()` needs
+no stat. `iter_batches` still probes and must: it bounds memory before fetching, which is
+the whole point of a byte bound on the streaming path. Chunk boundaries are unchanged —
+only the source of the sizes moved — so `read`, `iter_batches` and `splits` still share the
+one chunk definition, which the module docstring requires.
 
-1. **Serial header parsing.** Metadata extraction ran in a Python loop after the concurrent
-   fetch — one `PIL.Image.open` per file on one thread. It is now fused into the pool task,
-   which is right on its own terms but moved the number only a few percent
-   (239.7 / 243.1 / 252.0 ms across three runs, inside the spread).
-2. **Benchmark fairness.** The obvious excuse is that Batcher expands a glob while Daft is
+Batcher remains ~1.2x behind, so this is improved rather than won. What is left is inside
+the fetch itself (163 ms for 100 GETs against Daft's 143 ms).
+
+The diagnosis came from the *shape*, not the totals. `img-list` does no image work at all —
+it lists and fetches bytes — and Batcher was 1.8x behind there. Decode and resize then cost
+Batcher almost nothing on top (`img-resize` is *faster* than `img-decode`, the DCT-scaled
+JPEG path doing its job), while Daft's resize adds ~30 ms. That located the whole loss in
+per-file fetch and none of it in the image kernels, which are the better ones.
+
+Also checked along the way, and recorded so nobody re-chases them:
+
+1. **Serial header parsing** — metadata extraction ran in a Python loop after the
+   concurrent fetch, one `PIL.Image.open` per file on one thread. Fusing it into the pool
+   task is right on its own terms but moved the number only a few percent, inside the
+   spread. It was not the cause.
+2. **Benchmark fairness** — the obvious excuse is that Batcher expands a glob while Daft is
    handed a URI list. It does not hold: `ImageCorpus.uris()` calls `open()`, which calls
-   `_list_corpus` with no caching, inside the timed function. Both engines pay for the
-   listing. The gap is real.
+   `_list_corpus` with no caching, inside the timed function. Both engines list.
 
-So the cost is elsewhere in the fetch path, and the next attempt should profile rather than
-guess.
+The lesson for the remaining 1.2x: the first two attempts were hypotheses and both missed;
+the third came from instrumenting the read and reading the clock. Profile first.
 
 This does **not** contradict `docs/benchmarks/vs-daft.md`, which reports Batcher well ahead
 on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regime where

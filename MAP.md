@@ -1868,7 +1868,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 84 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
-| `eval/math.rs` | 426 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 430 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image.rs` | 781 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
@@ -1907,7 +1907,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `float_ident.rs` | 154 | The engine's one definition of **float identity**. |
 | `hardware.rs` | 190 | Host CPU capability detection for adaptive execution. |
 | `lib.rs` | 217 | `bc-arrow` — Arrow building blocks shared across the engine. |
-| `row_sort.rs` | 115 | A stable multi-column sort permutation over the Arrow row format. |
+| `row_sort.rs` | 118 | A stable multi-column sort permutation over the Arrow row format. |
 
 ### `bc-sketches`
 
