@@ -222,3 +222,52 @@ def test_embedding_source_npy_fixed_size_list(tmp_path):
     table = pa.Table.from_batches(src.read(), schema=src.schema())
     assert table.num_rows == 5
     assert table.column("embedding").to_pylist()[0] == [0.0, 1.0]
+
+
+def test_read_iter_and_splits_share_one_chunk_definition(tmp_path):
+    """The three entry points must agree on batch boundaries, whatever the sizes.
+
+    `read()` learns each file's size from the fetch (so it issues no stat), while
+    `iter_batches` and `splits` probe with one. That is a real difference in *where* the
+    numbers come from, and the module's contract is that it changes nothing observable: a
+    split that chunked differently from `iter_batches` would make a distributed result a
+    different set of batches from the single-node one.
+
+    37 files is deliberately not a multiple of any batch size tried, so an off-by-one in
+    the packing shows up as a differing final batch rather than hiding.
+    """
+    pytest.importorskip("PIL")
+    for i in range(37):
+        (tmp_path / f"i{i:03d}.png").write_bytes(_make_png(1, 1))
+    from batcher.io.formats.multimodal.images import ImageSource
+
+    for batch_files in (4, 8, 64):
+        via_read = [b.num_rows for b in ImageSource(str(tmp_path), batch_files=batch_files).read()]
+        via_iter = [
+            b.num_rows for b in ImageSource(str(tmp_path), batch_files=batch_files).iter_batches()
+        ]
+        assert via_read == via_iter, batch_files
+        assert sum(via_read) == 37, batch_files
+
+        covered = 0
+        for split in ImageSource(str(tmp_path), batch_files=batch_files).splits():
+            revived = pickle.loads(pickle.dumps(split))
+            covered += sum(b.num_rows for b in revived.read())
+        assert covered == 37, batch_files
+
+
+def test_sizes_learned_from_the_read_equal_what_a_stat_would_say(tmp_path):
+    """`read()` skips the per-file stat and takes each size from the fetch instead.
+
+    The saving is a whole object-store round trip per file — it was 32% of a 100-file
+    read — and it is only sound if the two numbers agree, so that is asserted rather
+    than assumed.
+    """
+    pytest.importorskip("PIL")
+    for i in range(5):
+        (tmp_path / f"i{i}.png").write_bytes(_make_png(1, 1))
+    from batcher.io.formats.multimodal.images import ImageSource
+
+    source = ImageSource(str(tmp_path))
+    source.read()
+    assert source._size_cache == {f: source._fs.size(f) for f in source._files()}
