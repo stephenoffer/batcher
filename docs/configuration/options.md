@@ -44,7 +44,7 @@ only to tune a known hot path.
 | `bloom_fp_rate` | `0.01` | False-positive rate for the hash-join probe-side bloom pre-filter. |
 | `bloom_min_build_rows` | `65536` | Build-row floor above which the probe bloom pays for itself. |
 | `window_parallel_row_threshold` | `32768` | Window row count above which per-partition sorts run across cores. |
-| `radix_parallel_threshold` | `200000` | Concatenated-input row count above which aggregate `combine` regroups via parallel hash-radix partitioning. |
+| `radix_parallel_threshold` | `0` | Partial-row count above which aggregate `combine` regroups via parallel hash-radix partitioning. `0` derives it from the machine (partitions × 256), so the crossover scales with the core count; a positive value pins it. Performance only, never a different result. |
 | `sort_merge_fanin` | `16` | Maximum runs merged per pass in the external (spilling) sort's k-way merge. |
 | `skew_bucket_factor` | `4` | A join bucket is "hot" when it exceeds this multiple of the average bucket. |
 | `skew_min_bucket_rows` | `65536` | Absolute row floor below which a join bucket is never treated as skewed. |

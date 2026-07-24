@@ -53,16 +53,32 @@ travels as an ordinary Arrow batch across a thread, a spill file, or a network h
 
 ## Step 3: combine
 
-`combine` concatenates the partials' key columns and state columns, regroups by key, and
-merges each aggregate's state with its associative reducer.
+`combine` regroups the partials by key and merges each aggregate's state with its associative
+reducer.
 
-Above `radix_parallel_threshold` (default 200,000 concatenated rows, set on `RuntimeTuning`
-in `bc-arrow` and mirrored on `EngineConfig` in `bc-ir`) it takes the parallel path,
-`combine_radix` (`agg/group/combine.rs`): hash-radix partition the concatenated partials
-by key so every row of a group lands in one partition, then group *and* merge each partition
-independently across threads with **no cross-partition merge**. The otherwise-serial per-group
-accumulate scan, which dominates a many-group combine, becomes a parallel one. Group *order*
-differs from the serial path, which callers already treat as unspecified for a hash aggregate.
+Below `radix_parallel_threshold` it takes the serial path: concatenate the partials' key and
+state columns, then regroup the concatenation once. Above it, the parallel path `combine_radix`
+(`agg/group/combine.rs`) hash-radix partitions by key so every row of a group lands in one
+partition, then groups *and* merges each partition independently across threads with **no
+cross-partition merge**. The otherwise-serial per-group accumulate scan, which dominates a
+many-group combine, becomes a parallel one.
+
+The parallel path never concatenates. Concatenating the partials only to hash and gather them is
+a full copy of the key column that the merge never reads as one array, and on a high-cardinality
+string key that copy is the merge's largest single cost. So `combine_radix` hashes each partial
+in place, flattens the hashes in partial order, and gathers each partition's rows straight from
+the partials through `(partial, row)` pairs. A companion, `combine_partitioned`, stops one step
+earlier and hands the key-disjoint partitions back as separate morsels — the executor's aggregate
+tail emits those directly rather than gluing them into one batch and re-splitting for the next
+operator.
+
+The threshold is `radix_parallel_threshold`, set on `RuntimeTuning` in `bc-arrow` and mirrored on
+`EngineConfig` in `bc-ir`. Its default, `0`, derives the crossover from the machine — `partitions
+× 256` — because the parallel path's overhead is per *partition* (a bucket list, a gather, a hash
+table) while the serial path's is per *row*, so the turn is a fixed number of rows per partition,
+not one absolute count that is too high on a large box and too low on a small one. A positive
+value pins it. Group *order* differs from the serial path either way, which callers already treat
+as unspecified for a hash aggregate.
 
 ## The decision the executor refuses to guess
 
