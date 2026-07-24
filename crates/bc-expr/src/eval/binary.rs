@@ -205,6 +205,7 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
     // by widening to a common scale. Align here only for the comparison arms, so `*`/`+`
     // keep their own scale-propagation rules untouched.
     let (l, r) = if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+        let (l, r) = align_date_timestamp_for_cmp(&l, &r)?;
         let (l, r) = align_decimals_for_cmp(&l, &r)?;
         // Float identity is the engine's, not the raw bits' — see `canon_floats_for_cmp`.
         (canon_float_array(&l), canon_float_array(&r))
@@ -534,6 +535,52 @@ fn floor_div(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
 /// capped at Decimal128's 38 digits. Non-decimal or already-identical operands (and any
 /// pair that isn't two `Decimal128`s — e.g. Decimal256 or a mixed width) pass through
 /// unchanged, deferring to the existing path.
+/// A `DATE` compared against a `TIMESTAMP` column: widen the date to midnight.
+///
+/// `ts = DATE '1995-01-02'` is a query DuckDB answers — it casts the DATE up to TIMESTAMP at
+/// 00:00:00 and compares instants — and arrow's comparison kernels reject outright, raising
+/// "Invalid comparison operation: Timestamp(Microsecond, None) == Date32". That gap is not
+/// hypothetical: the fold rule that builds `InList` is a predicate-*shape* rewrite with no
+/// access to the schema, so `ts IN (DATE …, DATE …)` reaches the engine as exactly this pair,
+/// and `tests/differential/test_diff_in_list.py` pins it against DuckDB.
+///
+/// Casting the *date* up (rather than truncating the timestamp down to a date) is what makes
+/// `ts = DATE '1995-01-02'` false for a timestamp at 12:00 on that day, which is DuckDB's
+/// answer and SQL's. Widening never loses information, so no comparison can flip.
+///
+/// A tz-aware timestamp is handled by casting the date to the *naive* type and letting the
+/// zone-stripping arm of `coerce_numeric` line the two timestamps up: the stored values are
+/// UTC instants either way, and dropping the zone needs no timezone database (casting *to* a
+/// named zone would fail on an arrow build without `chrono-tz`).
+fn align_date_timestamp_for_cmp(
+    l: &ArrayRef,
+    r: &ArrayRef,
+) -> Result<(ArrayRef, ArrayRef), ExprError> {
+    use DataType::{Date32, Date64, Timestamp};
+    let naive = |unit: &arrow::datatypes::TimeUnit| Timestamp(*unit, None);
+    match (l.data_type(), r.data_type()) {
+        (Timestamp(unit, tz), Date32 | Date64) => {
+            let target = naive(unit);
+            let left = if tz.is_some() {
+                cast(l, &target)?
+            } else {
+                l.clone()
+            };
+            Ok((left, cast(r, &target)?))
+        }
+        (Date32 | Date64, Timestamp(unit, tz)) => {
+            let target = naive(unit);
+            let right = if tz.is_some() {
+                cast(r, &target)?
+            } else {
+                r.clone()
+            };
+            Ok((cast(l, &target)?, right))
+        }
+        _ => Ok((l.clone(), r.clone())),
+    }
+}
+
 fn align_decimals_for_cmp(l: &ArrayRef, r: &ArrayRef) -> Result<(ArrayRef, ArrayRef), ExprError> {
     use DataType::Decimal128;
     if let (Decimal128(p1, s1), Decimal128(p2, s2)) = (l.data_type(), r.data_type()) {

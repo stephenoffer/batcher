@@ -152,14 +152,15 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
             let out = arrow::compute::take(&member_over_values, dict.keys(), None)?;
             return Ok(out);
         }
-        // Any other column type — a decimal price against integer literals, a timestamp, a
-        // boolean. The fold rule that emits `InList` is a predicate-*shape* rewrite: it sees
-        // literals, not the column's dtype (which it cannot know without the schema), so it
-        // can hand this kernel a type the typed arms above do not accelerate. Falling back to
-        // the very form it folded from keeps the rewrite unconditionally safe: where `=`
-        // succeeds this answers what the OR chain would have, and where `=` refuses the pair
-        // (`Timestamp = Date32`) it refuses identically rather than inventing an answer the
-        // unfolded query would not have produced.
+        // Any other column type — a timestamp against date literals, a decimal price against
+        // integer literals, a boolean. The fold rule that emits `InList` is a
+        // predicate-*shape* rewrite: it sees literals, not the column's dtype (which it
+        // cannot know without the schema), so it can hand this kernel a type the typed arms
+        // above do not accelerate. Delegating to the very form it folded from is what keeps
+        // the rewrite unconditionally safe — the answer here is `eval_binary`'s, including
+        // its coercions, so `IN` can neither refuse a pair `=` accepts nor invent one it
+        // rejects. Before that arm existed this returned "in_list unsupported for {dtype}",
+        // which failed queries the unfolded chain ran happily.
         _ => return membership_generic(array, set),
     };
     Ok(Arc::new(out))
@@ -300,27 +301,40 @@ mod tests {
         );
     }
 
-    /// Where `=` refuses a column/literal pair, the folded `InList` must refuse it too.
+    /// A timestamp column against date literals — the shape the fold rule emits without
+    /// knowing the dtype (a `date` literal is foldable; the column it is compared to may well
+    /// be a Timestamp). It has no typed arm, so it takes `membership_generic`, which must
+    /// answer what the `col = lit` chain it folded from would have.
     ///
-    /// `Timestamp = Date32` is not a comparison `eval_binary` performs, so the unfolded
-    /// `ts = DATE '1970-01-02' OR ts = DATE '1970-01-06'` raises — and the rewrite is only
-    /// semantics-preserving if the folded form raises as well. Answering it would make
-    /// `IN` succeed on a query its own expansion cannot run, which is the divergence the
-    /// generic arm exists to *avoid*, not to introduce.
+    /// This is the case that pushed the DATE-to-TIMESTAMP widening into `eval_binary`: arrow
+    /// rejects `Timestamp == Date32` outright, so before that both the chain and the folded
+    /// form raised, while DuckDB answers the query. `tests/differential/test_diff_in_list.py`
+    /// pins the end-to-end result against DuckDB; this pins the kernel.
     #[test]
-    fn generic_arm_refuses_exactly_what_the_eq_chain_refuses() {
+    fn timestamp_column_against_date_literals_matches_the_or_chain() {
         use arrow::array::TimestampMicrosecondArray;
+        // 1970-01-02 and 1970-01-03 as microseconds; day 1 is in the set, day 2 is not.
         let day = 86_400_000_000i64;
         let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
             Some(day),
             Some(2 * day),
             None,
         ]));
-        let one = Literal::Date(1);
-        let chain = crate::eval::binary::eval_binary(BinaryOp::Eq, &arr, &one.to_array(3));
-        let folded = eval_in_list(&arr, &[one.clone(), Literal::Date(5)]);
-        assert!(chain.is_err(), "premise: `Timestamp = Date32` must raise");
-        assert!(folded.is_err(), "the folded form must raise where `=` does");
+        let set = [Literal::Date(1), Literal::Date(5)];
+        assert_eq!(run(arr, &set), vec![Some(true), Some(false), None]);
+    }
+
+    /// The widening is to midnight, not a truncation of the timestamp to its date: a stamp
+    /// *within* the matching day is not a member. That is DuckDB's answer and SQL's, and it
+    /// is the direction that cannot lose information.
+    #[test]
+    fn a_timestamp_inside_the_day_is_not_a_member_of_that_date() {
+        use arrow::array::TimestampMicrosecondArray;
+        let day = 86_400_000_000i64;
+        let noon = day + day / 2;
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(noon), Some(day)]));
+        let set = [Literal::Date(1), Literal::Date(5)];
+        assert_eq!(run(arr, &set), vec![Some(false), Some(true)]);
     }
 
     /// The generic arm must be bit-identical to the typed one where both apply, so the
