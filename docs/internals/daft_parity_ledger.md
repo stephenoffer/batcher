@@ -61,6 +61,8 @@ number as progress; track the closed table.
 | 45-48 | `encode_image` | `.image.encode(format)` over png/jpeg/bmp/gif | same files |
 | 49 | *(benchmark)* Daft was measured only in the multi-node lineup | Daft added to the single-node default lineup | `benchmarks/engines/lineup.py`; results in this file |
 | 50 | *(process)* the debug-build guard was a timing heuristic that passed silently | `bc_py` exports `__engine_profile__`; the suite hard-stops on a debug engine, and `bt.versions()` reports it | `benchmarks/run.py::_check_build_profile`; `tests/unit/test_toplevel_namespace_ergonomics.py` |
+| 56 | WARC (`daft-warc`) | `bt.read.warc(path)` — one row per crawl record, named headers typed, the rest as JSON in `warc_headers`, `.warc.gz` including per-record gzip members. No third-party dependency | `tests/io/test_warc.py` (18 tests) |
+| 57 | *(guidance)* the IO category list omitted `robotics` | `maintainability.md` and the connector skill now list ten categories | `just lint-guardrails`; `io/formats/robotics/` |
 | 52-55 | `convert_image` | `.image.convert(mode)` over `L`/`LA`/`RGB`/`RGBA`. **Batcher's image namespace now covers Daft's completely.** Writing it surfaced a divergence: `image`'s `into_luma8` weights Rec. 709 while `to_grayscale` and `dhash` weight Rec. 601, so the three would have disagreed about grey (147 vs 124 on RGB(10,200,30)). One `rec601` now serves all three, asserted | `crates/bc-expr/.../image/`, `tests/integration/test_image_expr.py` |
 | 51 | *(perf)* media reads issued a stat per file that the fetch already answered | `read()` fetches first and chunks from the returned sizes; small-corpus image ingest went from 1.8-2.2x behind Daft to 1.14-1.25x | `benchmarks/run.py --benchmark images --scale 10`; numbers below |
 | — | `audio_metadata` | **Already present**, found while triaging: `.audio.decode()` returns `{sample_rate, channels, num_frames, duration_secs}`. Listed here because the ledger claimed it as a gap and was wrong. |
@@ -98,7 +100,7 @@ Ranked by value. "Daft" names the Daft function the gap was found from.
 | HDF5 accessors | `hdf5_attrs`, `hdf5_keys`, `hdf5_metadata` | Batcher reads HDF5 as a *format* (`io/formats/ml/hdf5.py`, via h5py). The per-row accessors would need an HDF5 parser in the data plane; routing them through h5py instead would be per-row Python, which the architecture rule forbids on a hot path. Costed, not scheduled. |
 | Tokenizer round trip | `tokenize_encode`, `tokenize_decode` | Batcher estimates token counts; it cannot produce or consume real BPE ids. Needs a tokenizer dependency in the data plane — costed, not yet decided. |
 | `jq` | `jq` | A full jq engine. Recorded so the gap is honest; the shape accessors above cover the common cases. |
-| Connectors | `write_turbopuffer`, `write_bigtable`, `write_paimon`, WARC, MCAP, HuggingFace | Batcher's connector surface is wider overall (nine categories, 76 registered formats); these six are Daft-only. |
+| Connectors | `write_turbopuffer`, `write_bigtable`, `write_paimon`, HuggingFace | Batcher's connector surface is wider overall (ten categories, 77 registered formats); these four remain Daft-only. **MCAP was listed here in error** — it exists in `io/formats/robotics/`, a category the agent guidance itself had omitted. WARC is now closed. |
 
 ## Open — spelling gaps only (no API work)
 

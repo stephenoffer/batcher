@@ -63,6 +63,8 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".txt": "text",
     ".text": "text",
     ".pdf": "documents",
+    # `.warc.gz` resolves here too: `_ext` strips the compression suffix first.
+    ".warc": "warc",
     ".npy": "numpy",
     ".npz": "numpy",
     ".tfrecord": "tfrecord",

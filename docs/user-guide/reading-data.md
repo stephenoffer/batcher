@@ -136,6 +136,7 @@ take their connection as keyword options rather than a path.
 | --- | --- | --- |
 | `read.parquet_dataset(dir)` | A Hive-partitioned Parquet directory, partition columns recovered from the layout | nothing extra |
 | `read.webdataset(path)` | WebDataset `.tar` shards, one row per sample | nothing extra |
+| `read.warc(path)` | Web-archive (WARC) files, one row per crawl record; `.warc.gz` read transparently | nothing extra |
 | `read.tfrecord(path)` | TFRecord files from Waymo, TFDS, or RLDS, one row per record | nothing extra |
 | `read.excel(path)` | Excel workbooks via python-calamine | `[excel]` |
 | `read.hdf5(path)` | HDF5 files, datasets as columns | `[hdf5]` |
@@ -165,6 +166,50 @@ events = bt.read.mongo(uri="mongodb://localhost:27017", database="app", collecti
 shared = bt.read.delta_sharing("config.share#share.schema.table")
 grids = bt.read.zarr("s3://bucket/array.zarr")
 ```
+
+### Web crawls (WARC)
+
+`bt.read.warc(path)` reads the format every web-scale crawler ships, Common Crawl
+included. Each record becomes a row: the named WARC headers as typed columns, every other
+header as JSON in `warc_headers`, and the payload as `warc_content`. `.warc.gz` is read
+transparently, including the per-record gzip members a crawler normally writes.
+
+That makes a corpus-building pass a plain query. Filter to the response records, decode
+the payload, and hand it to the string accessors.
+
+```python
+import gzip
+import os
+import tempfile
+
+# Build a two-record crawl so the example runs without a download.
+def _record(kind, uri, body):
+    head = (
+        f"WARC/1.0\r\nWARC-Type: {kind}\r\nWARC-Target-URI: {uri}\r\n"
+        f"WARC-Date: 2024-03-15T13:45:30Z\r\nContent-Length: {len(body)}\r\n\r\n"
+    ).encode()
+    return head + body + b"\r\n\r\n"
+
+crawl = os.path.join(tempfile.mkdtemp(), "segment.warc")
+with open(crawl, "wb") as fh:
+    fh.write(_record("response", "https://example.com/a", b"<html><p>Hello</p></html>"))
+    fh.write(_record("request", "https://example.com/a", b"GET /a HTTP/1.1"))
+
+pages = (
+    bt.read.warc(crawl)
+    .filter(bt.col("warc_type") == "response")
+    .select(
+        url=bt.col("warc_target_uri"),
+        text=bt.col("warc_content").cast("string").str.strip_html(),
+    )
+)
+print(pages.to_pydict())
+# {'url': ['https://example.com/a'], 'text': ['Hello']}
+```
+
+A WARC carries no index, so a reader cannot start in the middle of one: each file is one
+split. Parallelism therefore comes from the number of files, which is how crawls are
+published anyway, in many segments rather than one archive.
 
 ### Avro unions
 

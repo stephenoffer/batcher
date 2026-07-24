@@ -40,7 +40,8 @@ directory blows the ≤12-files limit (`.claude/rules/maintainability.md`):
 clickhouse, databricks, odbc, connectorx) · `nosql` (mongo, dynamodb, cassandra, redis,
 elasticsearch, hbase, neo4j, couchbase) · `streaming` (kafka, kinesis, pubsub, pulsar,
 eventhubs, autoloader) · `ml` (tfrecord, webdataset, numpy, hdf5, zarr, tensor,
-point_cloud, shards) · `multimodal` (images, audio, video, embeddings, blob).
+point_cloud, shards) · `multimodal` (images, audio, video, embeddings, blob) ·
+`robotics` (mcap, mdf).
 
 A format that outgrows one module becomes a package (`parquet/`, `delta/`,
 `iceberg/`) — never a flattened `fmt_source.py` / `fmt_sink.py` pair in the parent.

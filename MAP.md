@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 820 Python modules across 124 packages and 163 Rust files across 13 crates.
+Covering 821 Python modules across 124 packages and 164 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -252,7 +252,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 188 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 155 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1380 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1417 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1240 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
@@ -1086,7 +1086,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `_file_cache.py` | 137 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 177 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
-| `detect.py` | 268 | Format auto-detection for the generic `read(path, format=None)` entry point. |
+| `detect.py` | 270 | Format auto-detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 370 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 332 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
@@ -1332,6 +1332,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `binary.py` | 170 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
 | `documents.py` | 142 | Document format — PDF text extraction via `pypdf`, to Arrow. |
 | `text.py` | 217 | Plain-text source — one row per line or one row per whole file. |
+| `warc.py` | 245 | WARC source — web-archive records (ISO 28500) as Arrow rows. |
 
 ### `batcher/io/schema/` — 2 · neutral IO
 
@@ -1752,7 +1753,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 546 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 241 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1082 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1117 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 214 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -1806,8 +1807,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/sort_merge.rs` | 180 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 210 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 183 | The one canonical form for grouping/partitioning keys. |
-| `lib.rs` | 34 | `bc-runtime` — the engine's runtime library. |
+| `lib.rs` | 35 | `bc-runtime` — the engine's runtime library. |
 | `shuffle.rs` | 934 | Hash repartitioning — the shuffle primitive. |
+| `topn.rs` | 185 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window.rs` | 1070 | Window functions — partition, order, and append one column per function. |
 | `window_fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window_frame.rs` | 704 | Explicit `ROWS` window frames — sliding-window aggregates. |

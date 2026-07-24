@@ -19,5 +19,6 @@ from __future__ import annotations
 from batcher.io.formats.unstructured.binary import BinarySource
 from batcher.io.formats.unstructured.documents import DocumentSource
 from batcher.io.formats.unstructured.text import TextSource
+from batcher.io.formats.unstructured.warc import WARC_SCHEMA, WarcSource
 
-__all__ = ["BinarySource", "DocumentSource", "TextSource"]
+__all__ = ["WARC_SCHEMA", "BinarySource", "DocumentSource", "TextSource", "WarcSource"]
