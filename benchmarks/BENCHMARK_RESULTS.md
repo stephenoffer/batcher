@@ -1377,7 +1377,7 @@ instrument a worker's RSS through q5 at sf10 — **on a quiet box, with nothing 
 is the mistake that produced the retracted claim above. Note the scan is *not* the suspect: q6 does
 60M rows at sf10 in 189 ms, so the cluster reads this data fast; q3's 11.7 s is the join/shuffle.
 
-### OPEN BUG: sf10 q5 distributed kills a worker mid-shuffle (reproducible)### OPEN BUG: sf10 q5 distributed kills a worker mid-shuffle (reproducible)
+### OPEN BUG: sf10 q5 distributed kills a worker mid-shuffle (reproducible)
 
 ```
 RayTaskError(RetryableShuffleError): ray::_FlightWorker.map_publish_join()
@@ -1395,9 +1395,23 @@ connection drops. Three findings, in order of how much they should worry us:
    still gets OOM-killed. `ray_runtime/lifecycle.py` only folds a budget into the worker's
    `memory_budget_bytes` when a `SchedulingEnvelope` is in force *or* a global cap is set, and its
    docstring promises this is "the distributed arm of the *Carbonite protects against OOM*
-   invariant". On this path the promise does not hold: something is allocating outside the budget
-   (the Flight actor's buffers and the shuffle's receive side are the first suspects — the cap is
-   handed to `execute_plan`, not to the transport).
+   invariant". On this path the promise does not hold, and the reason is now read off the code
+   rather than guessed at. `bc_py::prepare_exec` installs the budget as an Arrow memory pool
+   **for the duration of `execute_plan` only**, so on the map side of a shuffle the three largest
+   things a worker holds are all outside it:
+
+   - the materialized result of `execute_plan` (`map_publish_raw`'s `rows`), which outlives the
+     call that was bounded;
+   - the partitioned copy of it. `nat.partition_batches` gathers each row into fresh buffers —
+     measured: zero buffer addresses shared with the input — so the mapper holds the whole
+     mapped output **twice** while it publishes. *(Fixed: `rows` is now dropped once the buckets
+     exist, and each bucket once it is published.)*
+   - every published bucket, until a reducer fetches it. `bc_transport`'s `PartitionStore` is a
+     plain `HashMap<ticket, Vec<RecordBatch>>` with no byte accounting and no cap, and
+     `map_publish_join` publishes its whole left side before it even computes the right — so a
+     join mapper's floor is both sides of its partition, resident, unbounded. **This is the
+     remaining hole**, and closing it means the store has to have a byte budget it can push back
+     on or spill against, not just the executor.
 2. **A 32 GB worker OOMs on q5 at sf10 at all.** q5 is one of the three deep join trees this file
    already records as peaking at 133 GB at sf100 — the exact shape the streaming executor exists to
    bound. Bounded per *worker* is what makes the mergeable claim true at scale.

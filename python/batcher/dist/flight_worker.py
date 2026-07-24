@@ -531,15 +531,30 @@ try:
             )
             if not rows:
                 buckets = []
+            elif n_buckets == 1:
+                buckets = [rows]
             else:
                 key_idx = [rows[0].schema.get_field_index(k) for k in key_names]
-                buckets = (
-                    [rows] if n_buckets == 1 else nat.partition_batches(rows, key_idx, n_buckets)
-                )
+                buckets = nat.partition_batches(rows, key_idx, n_buckets)
+                # `partition_batches` gathers each row into a *new* buffer — the buckets do
+                # not alias the input — so from here `rows` is a second, complete copy of
+                # this mapper's output with no remaining reader. Holding it across the
+                # publish loop doubled the map side's peak footprint, and this is the path
+                # the memory envelope does not cover: `memory_budget_bytes` bounds
+                # allocations inside `execute_plan`, not what the worker keeps afterwards
+                # or what the Flight store holds until a reducer fetches it. That gap is
+                # what OOM-kills a shuffle worker (BENCHMARK_RESULTS.md, sf10 q5).
+                del rows
             for r in range(n_buckets):
                 self.session.publish(
                     _ticket(stage, src, r, epoch), buckets[r] if r < len(buckets) else []
                 )
+                # `publish` is synchronous and moves the batches into the store's own
+                # `Vec<RecordBatch>`, so the mapper's reference is redundant the moment it
+                # returns. Dropping it here means the peak is one bucket past what the
+                # store already holds, instead of every bucket until the last is sent.
+                if r < len(buckets):
+                    buckets[r] = []
             return self.session.addr
 
         def map_publish_join(self, left, right, n_buckets, src=None, epoch=0, plan_id=None) -> str:
