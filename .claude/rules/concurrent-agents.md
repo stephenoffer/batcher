@@ -29,6 +29,34 @@ agent's work here:
   you own** (`ruff format path/to/your/file.py`).
 - **`git commit -a`** — commits everyone's work under your message.
 
+## `just build` crashes every other session's running tests
+
+`maturin develop` overwrites `python/batcher/_native.abi3.so` **in place**. Every Python
+process that has already imported the engine holds that file memory-mapped, so replacing it
+pulls the pages out from under running code. The result is not a test failure — it is a
+`Fatal Python error: Bus error` (exit 135) or a segfault, with a 300-line dump of loaded
+extension modules and no indication of the cause.
+
+This happened three times in one session here, twice killing a full-suite run partway
+(64 tests in, and 18 tests in) and once corrupting a benchmark. Each time the tell was the
+same: compare the `.so`'s mtime against the run's start.
+
+```
+ls -la python/batcher/_native.abi3.so   # mtime inside your run window?  that is why
+```
+
+What to do about it:
+
+- **Don't diagnose a Bus error / exit 135 / 139 as your bug** until you have checked that
+  mtime. It almost never is.
+- **Prefer targeted suites over the full run** while others are active — a two-minute run
+  has a small window, a twenty-minute one is nearly certain to be hit.
+- **Re-run before reporting.** A crashed run has no result, not a bad one.
+- If you must run the whole suite, do it right after your own build, and expect to repeat.
+
+The same swap is why a benchmark can silently measure the *other* agent's build: check
+`bt.versions()["engine_profile"]`, which the suite now does for you.
+
 ## Prove "pre-existing", never assume it
 
 Reporting another agent's in-flight breakage as "pre-existing and unrelated" is the
