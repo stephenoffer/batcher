@@ -22,6 +22,13 @@ def test_distinct_token_ratio_is_unique_over_total_averaged() -> None:
     assert got == pytest.approx(0.625)
 
 
+def test_distinct_token_ratio_drops_articles_before_counting() -> None:
+    # "the cat sat" -> "the" dropped -> ["cat","sat"] -> 1.0; "dog dog dog" -> 1/3.
+    ds = bt.from_pydict({"o": ["the cat sat", "dog dog dog"]})
+    got = ds.agg(d=bt.distinct_token_ratio("o")).to_pydict()["d"][0]
+    assert got == pytest.approx((1.0 + 1 / 3) / 2)
+
+
 def test_distinct_token_ratio_normalizes_case_and_punctuation() -> None:
     # SQuAD normalization folds case and strips punctuation, so these are one repeated token.
     ds = bt.from_pydict({"o": ["Cat, cat. CAT!"]})

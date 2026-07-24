@@ -17,6 +17,7 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import require_fitted
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.functions.horizontal import max_horizontal, sum_horizontal
 
@@ -294,8 +295,7 @@ class GaussianMixture:
         Returns:
             A new lazy `Dataset` with the component-label column appended.
         """
-        if not self.means_:
-            raise PlanError("GaussianMixture must be fitted before predict.")
+        require_fitted(self, self.means_)
         scores = [
             lit(math.log(self.weights_[k]))
             + self._component_log_density(self.means_[k], self.covariances_[k])
@@ -329,8 +329,7 @@ class GaussianMixture:
         Returns:
             A new lazy `Dataset` with the per-row log-likelihood appended.
         """
-        if not self.means_:
-            raise PlanError("GaussianMixture must be fitted before score_samples.")
+        require_fitted(self, self.means_, "score_samples")
         log_terms = [
             lit(math.log(self.weights_[k]))
             + self._component_log_density(self.means_[k], self.covariances_[k])

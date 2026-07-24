@@ -406,7 +406,8 @@ def extract_choice(text: str | Expr) -> Expr:
     A model answering a multiple-choice question replies "The answer is B" or just "B". This pulls
     the first letter that stands on its own as a choice, so a benchmark answer becomes a clean label
     column to compare against the gold choice. The class stops at H so the standalone pronoun "I" is
-    not mistaken for a choice; widen the pattern yourself for a question with more than eight options.
+    not mistaken for a choice. Widen the pattern yourself for a question with more than eight
+    options.
 
     Args:
         text: The generated-text column.

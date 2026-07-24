@@ -17,6 +17,7 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import argmax_prediction, require_fitted
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -25,18 +26,6 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["BernoulliNB", "GaussianNB", "MultinomialNB"]
-
-
-def _argmax_prediction(labels, score_of):
-    """The label whose score expression is largest per row, as a nested-conditional expression."""
-    prediction = lit(labels[0])
-    best = score_of(labels[0])
-    for label in labels[1:]:
-        score = score_of(label)
-        closer = score > best
-        prediction = when(closer).then(lit(label)).otherwise(prediction)
-        best = when(closer).then(score).otherwise(best)
-    return prediction
 
 
 class GaussianNB:
@@ -189,9 +178,8 @@ class GaussianNB:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("GaussianNB must be fitted before predict.")
-        prediction = _argmax_prediction(self.classes_, self._log_likelihood)
+        require_fitted(self, self.classes_)
+        prediction = argmax_prediction(self.classes_, self._log_likelihood)
         return ds.with_columns(**{self.output_column: prediction})
 
 
@@ -318,10 +306,9 @@ class MultinomialNB:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("MultinomialNB must be fitted before predict.")
+        require_fitted(self, self.classes_)
         return ds.with_columns(
-            **{self.output_column: _argmax_prediction(self.classes_, self._score)}
+            **{self.output_column: argmax_prediction(self.classes_, self._score)}
         )
 
 
@@ -465,10 +452,9 @@ class BernoulliNB:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("BernoulliNB must be fitted before predict.")
+        require_fitted(self, self.classes_)
         return ds.with_columns(
-            **{self.output_column: _argmax_prediction(self.classes_, self._score)}
+            **{self.output_column: argmax_prediction(self.classes_, self._score)}
         )
 
 

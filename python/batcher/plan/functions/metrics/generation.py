@@ -18,6 +18,7 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
+from batcher.plan.functions.metrics._text import mean_ratio, normalize, tokens
 
 __all__ = [
     "exact_match",
@@ -28,19 +29,6 @@ __all__ = [
     "token_set_precision",
     "token_set_recall",
 ]
-
-
-def _normalize(text: Expr) -> Expr:
-    """The SQuAD answer normalization: lowercase, drop articles and punctuation, collapse spaces."""
-    lowered = text.str.lower()
-    without_articles = lowered.str.regexp_replace_all(r"\b(a|an|the)\b", " ")
-    without_punct = without_articles.str.remove_punctuation()
-    return without_punct.str.normalize_whitespace().str.strip()
-
-
-def _tokens(text: Expr) -> Expr:
-    """The normalized whitespace-delimited tokens of a text column, as a list."""
-    return _normalize(text).str.split(" ")
 
 
 def exact_match(prediction: IntoExpr, reference: IntoExpr) -> Expr:
@@ -94,8 +82,8 @@ def normalized_exact_match(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> ds.agg(em=bt.normalized_exact_match("p", "r")).to_pydict()["em"][0]
             0.5
     """
-    predicted = _normalize(_as_column(prediction))
-    gold = _normalize(_as_column(reference))
+    predicted = normalize(_as_column(prediction))
+    gold = normalize(_as_column(reference))
     return count_if(predicted == gold) / count_if(lit(True))
 
 
@@ -121,11 +109,9 @@ def token_set_precision(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> ds.agg(p=bt.token_set_precision("p", "r")).to_pydict()["p"][0]
             1.0
     """
-    predicted, gold = _tokens(_as_column(prediction)), _tokens(_as_column(reference))
+    predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
     intersection = predicted.list.set_intersection(gold).list.len()
-    predicted_size = predicted.list.n_unique()
-    ratio = when(predicted_size > lit(0)).then(intersection / predicted_size).otherwise(lit(0.0))
-    return ratio.mean()
+    return mean_ratio(intersection, predicted.list.n_unique())
 
 
 def token_set_recall(prediction: IntoExpr, reference: IntoExpr) -> Expr:
@@ -150,11 +136,9 @@ def token_set_recall(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> ds.agg(r=bt.token_set_recall("p", "r")).to_pydict()["r"][0]
             1.0
     """
-    predicted, gold = _tokens(_as_column(prediction)), _tokens(_as_column(reference))
+    predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
     intersection = predicted.list.set_intersection(gold).list.len()
-    gold_size = gold.list.n_unique()
-    ratio = when(gold_size > lit(0)).then(intersection / gold_size).otherwise(lit(0.0))
-    return ratio.mean()
+    return mean_ratio(intersection, gold.list.n_unique())
 
 
 def token_set_f1(prediction: IntoExpr, reference: IntoExpr) -> Expr:
@@ -182,7 +166,7 @@ def token_set_f1(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> round(ds.agg(f=bt.token_set_f1("p", "r")).to_pydict()["f"][0], 4)
             0.6667
     """
-    predicted, gold = _tokens(_as_column(prediction)), _tokens(_as_column(reference))
+    predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
     intersection = predicted.list.set_intersection(gold).list.len()
     total = predicted.list.n_unique() + gold.list.n_unique()
     ratio = when(total > lit(0)).then(lit(2.0) * intersection / total).otherwise(lit(0.0))
@@ -214,7 +198,7 @@ def token_set_jaccard(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> round(ds.agg(j=bt.token_set_jaccard("p", "r")).to_pydict()["j"][0], 4)
             0.5
     """
-    predicted, gold = _tokens(_as_column(prediction)), _tokens(_as_column(reference))
+    predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
     intersection = predicted.list.set_intersection(gold).list.len()
     union = predicted.list.set_union(gold).list.len()
     ratio = when(union > lit(0)).then(intersection / union).otherwise(lit(0.0))

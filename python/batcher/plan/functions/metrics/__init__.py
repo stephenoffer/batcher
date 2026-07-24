@@ -145,7 +145,6 @@ from batcher.plan.functions.metrics.repetition import (
     compression_ratio_proxy,
     distinct_char_ngram_ratio,
     repeated_line_rate,
-    word_type_token_ratio,
 )
 from batcher.plan.functions.metrics.retrieval import (
     answer_groundedness,
@@ -323,6 +322,5 @@ __all__ = [
     "url_rate",
     "valid_json_rate",
     "wape",
-    "word_type_token_ratio",
     "zero_vector_rate",
 ]

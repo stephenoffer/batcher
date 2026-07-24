@@ -534,7 +534,6 @@ producing new content.
 
    distinct_char_ngram_ratio
    char_repetition_rate
-   word_type_token_ratio
    repeated_line_rate
    compression_ratio_proxy
 ```

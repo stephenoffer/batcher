@@ -10,10 +10,10 @@ break the number down per model, per prompt template, or per day.
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.constructors import lit, when
+from batcher.plan.expr_ir.constructors import lit
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
-from batcher.plan.functions.metrics.generation import _tokens
+from batcher.plan.functions.metrics._text import mean_ratio, tokens
 from batcher.plan.functions.string import is_refusal
 
 __all__ = [
@@ -48,10 +48,8 @@ def distinct_token_ratio(text: IntoExpr) -> Expr:
             >>> round(ds.agg(d=bt.distinct_token_ratio("o")).to_pydict()["d"][0], 4)
             0.625
     """
-    tokens = _tokens(_as_column(text))
-    total = tokens.list.len()
-    ratio = when(total > lit(0)).then(tokens.list.n_unique() / total).otherwise(lit(0.0))
-    return ratio.mean()
+    toks = tokens(_as_column(text))
+    return mean_ratio(toks.list.n_unique(), toks.list.len())
 
 
 def mean_output_tokens(text: IntoExpr, chars_per_token: float = 4.0) -> Expr:

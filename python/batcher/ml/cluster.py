@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import argmax_prediction, require_fitted
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -209,8 +210,7 @@ class KMeans:
         Returns:
             A new lazy `Dataset` with the cluster-label column appended.
         """
-        if not self.centroids_:
-            raise PlanError("KMeans must be fitted before predict.")
+        require_fitted(self, self.centroids_)
         return ds.with_columns(**{self.output_column: _assignment(self.columns, self.centroids_)})
 
     def fit_predict(self, ds: Dataset) -> Dataset:
@@ -336,13 +336,11 @@ class NearestCentroid:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.centroids_:
-            raise PlanError("NearestCentroid must be fitted before predict.")
-        distances = [_squared_distance(self.features, c) for c in self.centroids_]
-        prediction = lit(self.classes_[0])
-        best = distances[0]
-        for index in range(1, len(self.centroids_)):
-            closer = distances[index] < best
-            prediction = when(closer).then(lit(self.classes_[index])).otherwise(prediction)
-            best = when(closer).then(distances[index]).otherwise(best)
+        require_fitted(self, self.centroids_)
+        # Nearest centroid is argmin over distance, which is argmax over its negation.
+        nearness = {
+            label: -_squared_distance(self.features, centroid)
+            for label, centroid in zip(self.classes_, self.centroids_, strict=True)
+        }
+        prediction = argmax_prediction(self.classes_, nearness.__getitem__)
         return ds.with_columns(**{self.output_column: prediction})

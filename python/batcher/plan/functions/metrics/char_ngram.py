@@ -17,6 +17,7 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column
+from batcher.plan.functions.metrics._text import char_ngrams
 
 __all__ = [
     "char_ngram_f1",
@@ -24,12 +25,6 @@ __all__ = [
     "char_ngram_precision",
     "char_ngram_recall",
 ]
-
-
-def _char_ngrams(text: Expr, n: int) -> Expr:
-    """The set of character n-grams of a case-folded, space-collapsed text column, as a list."""
-    normalized = text.str.lower().str.normalize_whitespace().str.strip()
-    return normalized.str.chunk(n, overlap=n - 1)
 
 
 def _validate_n(n: int) -> None:
@@ -63,7 +58,7 @@ def char_ngram_precision(prediction: IntoExpr, reference: IntoExpr, n: int = 3) 
             0.6667
     """
     _validate_n(n)
-    pred, gold = _char_ngrams(_as_column(prediction), n), _char_ngrams(_as_column(reference), n)
+    pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
     intersection = pred.list.set_intersection(gold).list.len()
     size = pred.list.n_unique()
     return when(size > lit(0)).then(intersection / size).otherwise(lit(0.0)).mean()
@@ -94,7 +89,7 @@ def char_ngram_recall(prediction: IntoExpr, reference: IntoExpr, n: int = 3) -> 
             0.6667
     """
     _validate_n(n)
-    pred, gold = _char_ngrams(_as_column(prediction), n), _char_ngrams(_as_column(reference), n)
+    pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
     intersection = pred.list.set_intersection(gold).list.len()
     size = gold.list.n_unique()
     return when(size > lit(0)).then(intersection / size).otherwise(lit(0.0)).mean()
@@ -126,7 +121,7 @@ def char_ngram_f1(prediction: IntoExpr, reference: IntoExpr, n: int = 3) -> Expr
             1.0
     """
     _validate_n(n)
-    pred, gold = _char_ngrams(_as_column(prediction), n), _char_ngrams(_as_column(reference), n)
+    pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
     intersection = pred.list.set_intersection(gold).list.len()
     precision = (
         when(pred.list.n_unique() > lit(0))
@@ -171,7 +166,7 @@ def char_ngram_jaccard(prediction: IntoExpr, reference: IntoExpr, n: int = 3) ->
             0.5
     """
     _validate_n(n)
-    pred, gold = _char_ngrams(_as_column(prediction), n), _char_ngrams(_as_column(reference), n)
+    pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
     intersection = pred.list.set_intersection(gold).list.len()
     union = pred.list.set_union(gold).list.len()
     return when(union > lit(0)).then(intersection / union).otherwise(lit(0.0)).mean()

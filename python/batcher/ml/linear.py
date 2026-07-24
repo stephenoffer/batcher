@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import argmax_prediction, linear_score, require_fitted
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -137,11 +138,8 @@ class LinearRegression:
         Returns:
             A new lazy `Dataset` with the prediction column appended.
         """
-        if not self.coef_:
-            raise PlanError("LinearRegression must be fitted before predict.")
-        expression = lit(self.intercept_)
-        for weight, name in zip(self.coef_, self.features, strict=True):
-            expression = expression + lit(weight) * col(name)
+        require_fitted(self, self.coef_)
+        expression = linear_score(self.features, self.coef_, self.intercept_)
         return ds.with_columns(**{self.output_column: expression})
 
 
@@ -337,8 +335,7 @@ class LogisticRegression:
         Returns:
             A new lazy `Dataset` with the probability column appended.
         """
-        if not self.coef_:
-            raise PlanError("LogisticRegression must be fitted before predict.")
+        require_fitted(self, self.coef_)
         eta = self._linear_predictor(self.coef_, self.intercept_)
         probability = lit(1.0) / (lit(1.0) + (-eta).exp())
         return ds.with_columns(**{self.output_column: probability})
@@ -362,8 +359,7 @@ class LogisticRegression:
         Returns:
             A new lazy `Dataset` with the 0/1 label column appended.
         """
-        if not self.coef_:
-            raise PlanError("LogisticRegression must be fitted before predict.")
+        require_fitted(self, self.coef_)
         eta = self._linear_predictor(self.coef_, self.intercept_)
         label = when(eta >= lit(0.0)).then(lit(1)).otherwise(lit(0))
         return ds.with_columns(**{self.output_column: label})
@@ -461,10 +457,7 @@ class RidgeClassifier:
 
     def _score(self, label: object):
         """The ridge regression score expression for one class."""
-        expression = lit(self.bias_[label])
-        for weight, name in zip(self.weights_[label], self.features, strict=True):
-            expression = expression + lit(weight) * col(name)
-        return expression
+        return linear_score(self.features, self.weights_[label], self.bias_[label])
 
     def predict(self, ds: Dataset) -> Dataset:
         """Append the highest-scoring class label for each row.
@@ -485,13 +478,6 @@ class RidgeClassifier:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("RidgeClassifier must be fitted before predict.")
-        prediction = lit(self.classes_[0])
-        best = self._score(self.classes_[0])
-        for label in self.classes_[1:]:
-            score = self._score(label)
-            closer = score > best
-            prediction = when(closer).then(lit(label)).otherwise(prediction)
-            best = when(closer).then(score).otherwise(best)
+        require_fitted(self, self.classes_)
+        prediction = argmax_prediction(self.classes_, self._score)
         return ds.with_columns(**{self.output_column: prediction})

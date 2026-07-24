@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import linear_score, require_fitted
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -99,10 +100,7 @@ class TweedieRegressor:
 
     def _eta(self, coefficients: list[float], intercept: float):
         """The linear predictor expression ``intercept + beta . x``."""
-        expression = lit(intercept)
-        for weight, name in zip(coefficients, self.features, strict=True):
-            expression = expression + lit(weight) * col(name)
-        return expression
+        return linear_score(self.features, coefficients, intercept)
 
     def fit(self, ds: Dataset) -> TweedieRegressor:
         """Fit the coefficients by Fisher-scoring iteratively reweighted least squares.
@@ -189,8 +187,7 @@ class TweedieRegressor:
         Returns:
             A new lazy `Dataset` with the predicted-mean column appended.
         """
-        if not self.coef_:
-            raise PlanError(f"{type(self).__name__} must be fitted before predict.")
+        require_fitted(self, self.coef_)
         return ds.with_columns(**{self.output_column: self._eta(self.coef_, self.intercept_).exp()})
 
 

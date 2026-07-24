@@ -16,21 +16,14 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
-from batcher.plan.functions.metrics.generation import _tokens
+from batcher.plan.functions.metrics._text import char_ngrams
 
 __all__ = [
     "char_repetition_rate",
     "compression_ratio_proxy",
     "distinct_char_ngram_ratio",
     "repeated_line_rate",
-    "word_type_token_ratio",
 ]
-
-
-def _char_ngrams(text: Expr, n: int) -> Expr:
-    """The character n-grams of a case-folded, space-collapsed text column, as a list."""
-    normalized = text.str.lower().str.normalize_whitespace().str.strip()
-    return normalized.str.chunk(n, overlap=n - 1)
 
 
 def distinct_char_ngram_ratio(text: IntoExpr, n: int = 3) -> Expr:
@@ -56,7 +49,7 @@ def distinct_char_ngram_ratio(text: IntoExpr, n: int = 3) -> Expr:
             >>> round(ds.agg(d=bt.distinct_char_ngram_ratio("o", n=2)).to_pydict()["d"][0], 4)
             0.3333
     """
-    ngrams = _char_ngrams(_as_column(text), n)
+    ngrams = char_ngrams(_as_column(text), n)
     total = ngrams.list.len()
     ratio = when(total > lit(0)).then(ngrams.list.n_unique() / total).otherwise(lit(0.0))
     return ratio.mean()
@@ -85,38 +78,10 @@ def char_repetition_rate(text: IntoExpr, n: int = 3) -> Expr:
             >>> round(ds.agg(r=bt.char_repetition_rate("o", n=2)).to_pydict()["r"][0], 4)
             0.6667
     """
-    ngrams = _char_ngrams(_as_column(text), n)
+    ngrams = char_ngrams(_as_column(text), n)
     total = ngrams.list.len()
     rate = when(total > lit(0)).then(lit(1.0) - ngrams.list.n_unique() / total).otherwise(lit(0.0))
     return rate.mean()
-
-
-def word_type_token_ratio(text: IntoExpr) -> Expr:
-    """The mean fraction of distinct word tokens per output — the word-level type-token ratio.
-
-    For each output, the count of unique tokens over the total token count, averaged over the
-    corpus. It is the word-level diversity signal: a healthy generation scores near 1, and a model
-    repeating words ("the the the ...") collapses toward 0. Tokens are the SQuAD-normalized
-    whitespace tokens, so casing, punctuation, and articles do not distort the count.
-
-    Args:
-        text: The generated-text column (name or expression).
-
-    Returns:
-        The mean word type-token ratio over the corpus, in ``[0, 1]``.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"o": ["the cat sat", "dog dog dog"]})
-            >>> round(ds.agg(w=bt.word_type_token_ratio("o")).to_pydict()["w"][0], 4)
-            0.6667
-    """
-    tokens = _tokens(_as_column(text))
-    total = tokens.list.len()
-    ratio = when(total > lit(0)).then(tokens.list.n_unique() / total).otherwise(lit(0.0))
-    return ratio.mean()
 
 
 def repeated_line_rate(text: IntoExpr) -> Expr:
@@ -169,7 +134,7 @@ def compression_ratio_proxy(text: IntoExpr, n: int = 3) -> Expr:
             >>> round(ds.agg(c=bt.compression_ratio_proxy("o", n=2)).to_pydict()["c"][0], 4)
             3.0
     """
-    ngrams = _char_ngrams(_as_column(text), n)
+    ngrams = char_ngrams(_as_column(text), n)
     unique = ngrams.list.n_unique()
     ratio = when(unique > lit(0)).then(ngrams.list.len() / unique).otherwise(lit(0.0))
     return ratio.mean()

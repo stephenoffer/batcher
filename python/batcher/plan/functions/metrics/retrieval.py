@@ -18,10 +18,10 @@ cheap first-pass filter before a more expensive model-based faithfulness check.
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.constructors import lit, when
+from batcher.plan.expr_ir.constructors import lit
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
-from batcher.plan.functions.metrics.generation import _tokens
+from batcher.plan.functions.metrics._text import mean_ratio, tokens
 
 __all__ = [
     "answer_groundedness",
@@ -61,11 +61,9 @@ def answer_groundedness(answer: IntoExpr, context: IntoExpr) -> Expr:
             >>> round(ds.agg(g=bt.answer_groundedness("a", "c")).to_pydict()["g"][0], 4)
             0.5
     """
-    ans, ctx = _tokens(_as_column(answer)), _tokens(_as_column(context))
+    ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
     intersection = ans.list.set_intersection(ctx).list.len()
-    answer_size = ans.list.n_unique()
-    ratio = when(answer_size > lit(0)).then(intersection / answer_size).otherwise(lit(0.0))
-    return ratio.mean()
+    return mean_ratio(intersection, ans.list.n_unique())
 
 
 def context_utilization(answer: IntoExpr, context: IntoExpr) -> Expr:
@@ -92,11 +90,9 @@ def context_utilization(answer: IntoExpr, context: IntoExpr) -> Expr:
             >>> round(ds.agg(u=bt.context_utilization("a", "c")).to_pydict()["u"][0], 4)
             0.5
     """
-    ans, ctx = _tokens(_as_column(answer)), _tokens(_as_column(context))
+    ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
     intersection = ans.list.set_intersection(ctx).list.len()
-    context_size = ctx.list.n_unique()
-    ratio = when(context_size > lit(0)).then(intersection / context_size).otherwise(lit(0.0))
-    return ratio.mean()
+    return mean_ratio(intersection, ctx.list.n_unique())
 
 
 def unsupported_token_rate(answer: IntoExpr, context: IntoExpr) -> Expr:
@@ -124,11 +120,9 @@ def unsupported_token_rate(answer: IntoExpr, context: IntoExpr) -> Expr:
             >>> round(ds.agg(h=bt.unsupported_token_rate("a", "c")).to_pydict()["h"][0], 4)
             0.6667
     """
-    ans, ctx = _tokens(_as_column(answer)), _tokens(_as_column(context))
+    ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
     unsupported = ans.list.set_difference(ctx).list.len()
-    answer_size = ans.list.n_unique()
-    ratio = when(answer_size > lit(0)).then(unsupported / answer_size).otherwise(lit(0.0))
-    return ratio.mean()
+    return mean_ratio(unsupported, ans.list.n_unique())
 
 
 def fully_grounded_rate(answer: IntoExpr, context: IntoExpr) -> Expr:
@@ -160,7 +154,7 @@ def fully_grounded_rate(answer: IntoExpr, context: IntoExpr) -> Expr:
             >>> ds.agg(f=bt.fully_grounded_rate("a", "c")).to_pydict()["f"][0]
             0.5
     """
-    ans, ctx = _tokens(_as_column(answer)), _tokens(_as_column(context))
+    ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
     unsupported = ans.list.set_difference(ctx).list.len()
     non_empty = ans.list.len() > lit(0)
     grounded = (unsupported == lit(0)) & non_empty

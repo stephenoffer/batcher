@@ -688,7 +688,7 @@ For reading level, `bt.automated_readability_index` is the ARI grade, with `bt.m
 behind it.
 
 For degeneration, `bt.distinct_char_ngram_ratio` and its complement `bt.char_repetition_rate` catch a
-model looping at the character level, `bt.word_type_token_ratio` at the word level,
+model looping at the character level, `bt.distinct_token_ratio` at the word level,
 `bt.repeated_line_rate` catches duplicated lines, and `bt.compression_ratio_proxy` is a cheap
 gzip-style repetition score.
 

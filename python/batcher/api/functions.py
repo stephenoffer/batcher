@@ -298,7 +298,6 @@ from batcher.plan.functions.metrics import (
     url_rate,
     valid_json_rate,
     wape,
-    word_type_token_ratio,
     zero_vector_rate,
 )
 from batcher.plan.functions.prompt import (
@@ -660,7 +659,6 @@ __all__ = [
     "when",
     "width_bucket",
     "window",
-    "word_type_token_ratio",
     "wrap_tag",
     "zero_vector_rate",
 ]
