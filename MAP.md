@@ -1560,7 +1560,7 @@ Statistical analysis expressions — robust spread, distribution shape, associat
 | `inference.py` | 331 | Two-sample comparison and interval estimation as single-pass aggregates. |
 | `moments.py` | 146 | Dispersion ratios — spread expressed relative to level, in one pass. |
 | `shape.py` | 130 | Distribution shape — skew, tail weight, and how far from normal a column is. |
-| `weighted.py` | 138 | Weighted statistics — a mean, variance, and correlation where rows carry different weights. |
+| `weighted.py` | 152 | Weighted statistics — a mean, variance, and correlation where rows carry different weights. |
 
 ### `batcher/plan/functions/metrics/` — 1 · contract
 

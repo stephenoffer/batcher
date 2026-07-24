@@ -104,12 +104,14 @@ training, where Batcher does not compete — see ceilings):
 
 - **Daft** is the closest. It has native URL-download, image decode/resize/crop/`to_mode`,
   a variable-shape tensor type, and embedding/cosine expressions — a strong multimodal surface.
-  Batcher now matches its **image center-crop** (`.image.center_crop`) and **grayscale
-  color-convert** (`.image.to_grayscale`), and leads on **audio**: Daft has **no native
+  Batcher's image surface now **covers Daft's completely**: center-crop, offset `crop`,
+  `encode` (png/jpeg/bmp/gif), and `convert` over the full `L`/`LA`/`RGB`/`RGBA` palette,
+  with the four header facts (`width`/`height`/`channels`/`mode`) from **one** read where
+  Daft spends a call per fact. It leads on **audio**: Daft has **no native
   mel-spectrogram / MFCC** (per-row UDFs), which Batcher does in-engine (both torchaudio-matched).
-  Daft still leads on the
-  **variable-shape tensor type** (ceiling below) and richer color-mode conversions (Batcher
-  has grayscale, not the full `to_mode` palette).
+  Daft still leads on the **variable-shape tensor type** (ceiling below). The
+  color-conversion gap this bullet used to record is closed; see
+  `daft_parity_ledger.md`.
 - **Ray Data** has good CPU preprocessors (scalers/encoders/imputers) and a tensor type, but
   multimodal decode is a torch/PIL **UDF per batch**, not an engine expression; **no native
   mel-spectrogram**; fuzzy-match/minhash are user code.
@@ -189,6 +191,34 @@ operand orders, null keys, and null dictionary *values*.
 
 Still open on this axis: `StringView`, dictionary survival through project/join, and a
 dictionary-aware string join key. Filters and group-by are now dict-native; the rest is not.
+
+**Also closed this pass, for conjunctive filters.** Batcher evaluated *every* conjunct of an
+`AND` over *every* row and `and_kleene`'d the masks, so a five-predicate filter that kept 1.65%
+of its rows paid five full-width passes. DuckDB does not: `ExpressionExecutor::Select` walks
+the conjuncts against a selection vector so conjunct *n+1* sees only what conjunct *n* kept.
+`Expr::short_circuit_filter_mask` (`bc-expr/src/select.rs`) is the Arrow-shaped equivalent —
+evaluate the cheapest conjunct at full width, then *compact* (gather the survivors of only the
+columns the remaining conjuncts name) and evaluate the rest against that. Measured over 64
+morsels of a 17-column lineitem shape, whole Filter operator including the gather both paths
+pay: **TPC-H q6 1.50x, a `LIKE` behind a cheap guard 2.03x, a `regexp_matches` behind one
+5.73x.** The mask alone is 1.90x / 2.92x / 8.75x.
+
+It is bit-identical by construction rather than by measurement, and the guard is the
+interesting part: only conjuncts whose failures are *schema*-driven, never *row*-driven, may
+be skipped (`Expr::is_infallible_predicate`, exhaustive with no wildcard arm). Checked
+arithmetic, `Div`, a strict `CAST` and every string-*producing* function can raise on one row
+and not its neighbour, so their predicates take the old path untouched; the six
+boolean-returning string predicates cannot, and are admitted — but only over a column that is
+already UTF-8, since evaluating one over `Binary` casts it and *that* rejects a row's bytes one
+at a time. The equivalence is pinned by
+`crates/bc-expr/tests/short_circuit_filter.rs`, which asserts mask-for-mask agreement with
+whole-batch evaluation on every predicate shape above before it reports a timing.
+
+What DuckDB still has here that Batcher does not is the *online* half: `AdaptiveFilter` is a
+randomized hill-climb over the conjunct order on measured time, which is what corrects a
+static cost model that ordered a cheap unselective predicate ahead of an expensive selective
+one. See `competitor_technique_review.md` for the mechanism and the four call sites that need
+a per-operator state slot.
 
 ### 3. Shuffle is RAM-only, and the fix is written but never called
 
