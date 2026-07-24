@@ -35,7 +35,14 @@ _ADAPTERS: dict[str, Engine] = {
 
 # Default lineups per tier. Batcher leads (it is the system under test); Spark is
 # omitted from every default and added only when explicitly requested.
-_DEFAULT_SINGLE = ("batcher", "duckdb", "polars", "pyarrow")
+#
+# Daft is in *both* tiers. It was previously multi-node only, on the assumption that it is
+# a distributed engine — but Daft's single-node runner is its default and the one most
+# users meet, and `performance.md` names Daft as a system Batcher claims to beat. A claim
+# nobody's default run measures is a claim nobody checks, which is exactly how a regression
+# against it would survive. It costs one more column; `resolve` drops it where Daft is not
+# installed, so a partial environment is unaffected.
+_DEFAULT_SINGLE = ("batcher", "duckdb", "polars", "pyarrow", "daft")
 _DEFAULT_MULTI = ("batcher", "ray", "daft")
 
 

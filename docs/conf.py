@@ -153,6 +153,10 @@ exclude_patterns = [
     # user-supplied UDFs and callables (map_batches/map, class model UDFs, the batch-inference
     # plane, and the threads/processes/GPU scheduling beneath). A working record, not a user page.
     "internals/udf_improvements_ledger.md",
+    # The running record of the Daft-versus-Batcher capability gap: what was measured, what
+    # closed, what is open, and where the comparison runs the other way. A contributor
+    # working document (and deliberately blunt about what it does not claim), not a site page.
+    "internals/daft_parity_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
@@ -168,6 +172,11 @@ exclude_patterns = [
     # structural ceilings, and the claims the code does not support. A working record for
     # contributors (and deliberately blunt about our own marketing), not a site page.
     "internals/competitive_architecture.md",
+    # The parts list behind that scorecard: which specific mechanisms DuckDB / Polars /
+    # DataFusion / Spark / Daft / Ray Data have that Batcher does not, each cited to the
+    # competitor file it was read from, plus the ranked build order. A contributor working
+    # record, not a site page.
+    "internals/competitor_technique_review.md",
     # A code-checked parity scorecard against the Databricks stack (Catalyst/AQE, Photon,
     # Reyden/Lakehouse//RT) covering the optimizer, vectorized execution, the distributed
     # path, and the enterprise surface — plus the Databricks claims that are secondary-
