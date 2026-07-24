@@ -136,6 +136,15 @@ pub enum Expr {
         std: Option<Vec<f64>>,
         #[serde(default)]
         channels_first: bool,
+        /// `Crop` only: the top-left corner of the window. `#[serde(default)]`, so every
+        /// other image op's IR round-trips unchanged.
+        #[serde(default)]
+        x: Option<i64>,
+        #[serde(default)]
+        y: Option<i64>,
+        /// `Encode` only: the target container format.
+        #[serde(default)]
+        format: Option<String>,
     },
 
     /// An audio decode op over a binary (audio-bytes) sub-expression. Library-backed
@@ -474,6 +483,17 @@ pub enum ImageFunc {
     /// `resize(width, height)` → re-encoded PNG bytes at the new size (Daft
     /// `image.resize`). Null/undecodable input → null. → Binary.
     Resize,
+    /// `crop(x, y, width, height)` → the requested region, re-encoded as PNG bytes. The
+    /// arbitrary-offset counterpart of `CenterCrop`, for pulling a detection's bounding box
+    /// out of a frame and keeping it as an image rather than as a tensor. A window that
+    /// runs past an edge is clipped to the image, so the output can be smaller than
+    /// requested; a window entirely outside it is null. Null/undecodable input → null.
+    /// → Binary.
+    Crop,
+    /// `encode(format)` → the image re-encoded in `format` (`png`, `jpeg`, `bmp`, `gif`),
+    /// pixels unchanged. Normalizes a mixed-format corpus to one codec, or trades a PNG
+    /// for a smaller JPEG. Null/undecodable input → null. → Binary.
+    Encode,
     /// `dhash()` → a 64-bit *difference hash*: the perceptual fingerprint that makes
     /// image near-duplicate detection expressible. Two visually similar images differ
     /// in few bits, so `bit_count(a ^ b)` is their Hamming distance and a threshold on

@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import base64
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
 __all__ = ["ImageFunc", "_ImageNamespace"]
+
+# Container formats `.image.encode` can write; mirrors `bc-expr`'s `ENCODE_FORMATS`.
+# WebP is readable but not writable by the underlying decoder, so it is deliberately
+# absent: accepting the name at plan build and failing at run time would be worse than
+# rejecting it here.
+_IMAGE_FORMATS = frozenset({"png", "jpeg", "bmp", "gif"})
 
 
 @expr_node
@@ -37,6 +44,12 @@ class ImageFunc(IRNode):
     mean: list[float] | None = scalar(omit_none=True, default=None)
     std: list[float] | None = scalar(omit_none=True, default=None)
     channels_first: bool = scalar(omit_falsy=True, default=False)
+    # `crop` only: the window's top-left corner. `encode` only: the target container.
+    # All three are omitted from the IR unless set, so every other image op's wire shape
+    # is byte-identical to what it was.
+    x: int | None = scalar(omit_none=True, default=None)
+    y: int | None = scalar(omit_none=True, default=None)
+    format: str | None = scalar(omit_none=True, default=None)
 
 
 # A 1x1 red PNG. Exported so the doctests here (and the docs) have a real image to
@@ -103,6 +116,76 @@ class _ImageNamespace:
                 {'w': [1]}
         """
         return ImageFunc("decode", self._e)
+
+    def crop(self, x: int, y: int, width: int, height: int) -> ImageFunc:
+        """Cut the window at ``(x, y)`` out of each image, as PNG bytes.
+
+        The arbitrary-offset counterpart of :meth:`center_crop`, and the shape a detection
+        pipeline needs: pull a bounding box out of a frame and keep it as an *image* rather
+        than as a tensor.
+
+        A window that runs past an edge is **clipped**, so the result can be smaller than
+        requested. That is the opposite of :meth:`center_crop`, which zero-pads, and the
+        difference is deliberate: `center_crop` feeds a model that needs a fixed input
+        size, while a cropped image is something a person or another tool will look at,
+        and inventing black pixels there would be inventing data. A window that starts
+        past the image entirely is null.
+
+        Args:
+            x: Left edge of the window, in pixels from the left of the image.
+            y: Top edge of the window, in pixels from the top of the image.
+            width: Window width in pixels.
+            height: Window height in pixels.
+
+        Returns:
+            An expression evaluating to PNG bytes of the cropped region; null for null,
+            undecodable, or entirely-out-of-bounds input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> region = bt.col("img").image.crop(0, 0, 1, 1)
+                >>> ds.select(d=region.image.decode().struct.field("width")).to_pydict()
+                {'d': [1]}
+        """
+        return ImageFunc("crop", self._e, width=width, height=height, x=x, y=y)
+
+    def encode(self, format: str) -> ImageFunc:
+        """Re-encode each image in `format`, pixels unchanged.
+
+        Normalizes a mixed-format corpus onto one codec, or trades a PNG for a smaller
+        JPEG. Because JPEG has no alpha channel, an RGBA source is flattened to RGB rather
+        than failing the row, which would otherwise drop every transparent image.
+
+        Args:
+            format: One of ``"png"``, ``"jpeg"``, ``"bmp"``, or ``"gif"``. WebP is
+                readable but not writable, so it is not offered.
+
+        Returns:
+            An expression evaluating to the re-encoded bytes; null for null or
+            undecodable input.
+
+        Raises:
+            PlanError: If `format` is not a writable format.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> jpeg = bt.col("img").image.encode("jpeg")
+                >>> ds.select(m=jpeg.image.decode().struct.field("mode")).to_pydict()
+                {'m': ['RGB']}
+        """
+        if format not in _IMAGE_FORMATS:
+            raise PlanError(
+                f"image.encode(): format must be one of {sorted(_IMAGE_FORMATS)}, got {format!r}"
+            )
+        return ImageFunc("encode", self._e, format=format)
 
     def to_tensor(self, width: int, height: int) -> ImageFunc:
         """Decode and resize to ``(width, height)``, flattened to RGB8 pixels.

@@ -406,6 +406,9 @@ mod tests {
             mean: None,
             std: None,
             channels_first: false,
+            x: None,
+            y: None,
+            format: None,
         };
         assert!(bare.contains_media_decode());
 

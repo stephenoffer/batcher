@@ -26,20 +26,33 @@ use crate::{ExprError, ImageFunc};
 /// `LargeBinary`: 32-bit offsets cap one array at 2 GB in total, which a batch of
 /// ordinary video or high-resolution image files reaches. Accepting only `Binary` made
 /// `.image.decode()` fail on exactly the inputs the namespace exists for.
-#[allow(clippy::too_many_arguments)]
+/// The scalar arguments an image function may carry, gathered into one struct.
+///
+/// They arrived as seven positional parameters, which had already earned an
+/// `#[allow(clippy::too_many_arguments)]`; `crop` and `encode` would have made it ten, at
+/// which point a caller swapping `x` and `y` is a silent bug the compiler cannot see.
+/// Named fields make each call site read as what it is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageArgs<'a> {
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub mean: Option<&'a [f64]>,
+    pub std: Option<&'a [f64]>,
+    pub channels_first: bool,
+    pub x: Option<i64>,
+    pub y: Option<i64>,
+    pub format: Option<&'a str>,
+}
+
 pub(crate) fn eval_image(
     func: ImageFunc,
     arr: &ArrayRef,
-    width: Option<i64>,
-    height: Option<i64>,
-    mean: Option<&[f64]>,
-    std: Option<&[f64]>,
-    channels_first: bool,
+    args: ImageArgs<'_>,
 ) -> Result<ArrayRef, ExprError> {
-    let norm = Normalization::resolve(func, mean, std, channels_first)?;
+    let norm = Normalization::resolve(func, args.mean, args.std, args.channels_first)?;
     match arr.data_type() {
-        DataType::Binary => eval_image_sized::<i32>(func, arr, width, height, norm),
-        DataType::LargeBinary => eval_image_sized::<i64>(func, arr, width, height, norm),
+        DataType::Binary => eval_image_sized::<i32>(func, arr, args, norm),
+        DataType::LargeBinary => eval_image_sized::<i64>(func, arr, args, norm),
         other => Err(ExprError::ExpectedBinary {
             func: format!("{func:?}"),
             got: other.to_string(),
@@ -110,10 +123,10 @@ impl Normalization {
 fn eval_image_sized<O: OffsetSizeTrait>(
     func: ImageFunc,
     arr: &ArrayRef,
-    width: Option<i64>,
-    height: Option<i64>,
+    args: ImageArgs<'_>,
     norm: Normalization,
 ) -> Result<ArrayRef, ExprError> {
+    let (width, height) = (args.width, args.height);
     // The match above already established the offset width, so this cannot fail.
     let bytes = arr
         .as_any()
@@ -129,6 +142,8 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         ImageFunc::CenterCrop => center_crop(bytes, width, height),
         ImageFunc::ToGrayscale => to_grayscale(bytes, width, height),
         ImageFunc::Resize => resize(bytes, width, height),
+        ImageFunc::Crop => crop(bytes, args),
+        ImageFunc::Encode => encode(bytes, args.format),
         ImageFunc::Dhash => dhash(bytes),
     }
 }
@@ -246,6 +261,140 @@ fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
         .write_to(&mut buf, image::ImageFormat::Png)
         .ok()?;
     Some(buf.into_inner())
+}
+
+/// The container formats `encode` can write. Mirrored by `_IMAGE_FORMATS` in
+/// `plan/expr_ir/image.py`, which rejects a typo at plan-build time.
+///
+/// WebP is decodable but not listed: `image` 0.25 reads WebP and does not write it, so
+/// offering it would fail at run time on a name the plan accepted.
+pub(crate) const ENCODE_FORMATS: [&str; 4] = ["png", "jpeg", "bmp", "gif"];
+
+fn encode_format(name: &str) -> Option<image::ImageFormat> {
+    Some(match name {
+        "png" => image::ImageFormat::Png,
+        "jpeg" => image::ImageFormat::Jpeg,
+        "bmp" => image::ImageFormat::Bmp,
+        "gif" => image::ImageFormat::Gif,
+        _ => return None,
+    })
+}
+
+/// `encode(format)` → the same pixels re-encoded in `format`.
+fn encode<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    format: Option<&str>,
+) -> Result<ArrayRef, ExprError> {
+    let name = format.ok_or(ExprError::MissingImageArg {
+        func: "encode".to_string(),
+        arg: "format",
+    })?;
+    // Validate once, before any row: an unknown format is a plan error, and raising it
+    // per row would emit the same message n times.
+    let fmt = encode_format(name).ok_or_else(|| ExprError::InvalidArgument {
+        func: "encode".to_string(),
+        reason: format!(
+            "unknown image format {name:?}; expected one of {}",
+            ENCODE_FORMATS.join(", ")
+        ),
+    })?;
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let img = image::load_from_memory(bytes.value(i)).ok()?;
+        // JPEG has no alpha channel, so an RGBA source is flattened to RGB rather than
+        // failing the row. Every other target keeps whatever the decoder produced.
+        let img = if matches!(fmt, image::ImageFormat::Jpeg) {
+            image::DynamicImage::ImageRgb8(img.into_rgb8())
+        } else {
+            img
+        };
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), fmt).ok()?;
+        Some(out)
+    });
+    Ok(assemble_binary(rows))
+}
+
+/// `crop(x, y, width, height)` → the requested region, re-encoded as PNG bytes.
+///
+/// The arbitrary-offset counterpart of `center_crop`, and the shape a detection pipeline
+/// needs: pull a bounding box out of a frame and keep it as an *image*, not as a tensor.
+///
+/// A window that runs past an edge is **clipped** to the image rather than zero-padded,
+/// which is the opposite of `center_crop`'s choice and deliberate. `center_crop` feeds a
+/// model that needs a fixed input size, so padding preserves the shape contract; `crop`
+/// produces an image a human or another tool will look at, and inventing black pixels
+/// there would be inventing data. A window entirely outside the image yields null.
+fn crop<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    args: ImageArgs<'_>,
+) -> Result<ArrayRef, ExprError> {
+    let w = dim("crop", "width", args.width)?;
+    let h = dim("crop", "height", args.height)?;
+    // `x`/`y` may be zero (unlike a dimension), so they are read directly rather than
+    // through `dim`, which rejects zero.
+    let x = offset("crop", "x", args.x)?;
+    let y = offset("crop", "y", args.y)?;
+    if (w as u64) * (h as u64) * 3 > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: "crop".to_string(),
+            reason: format!(
+                "crop of {w}x{h}x3 bytes exceeds the maximum of {}",
+                i32::MAX
+            ),
+        });
+    }
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let img = image::load_from_memory(bytes.value(i)).ok()?;
+        let (sw, sh) = (img.width(), img.height());
+        if x >= sw || y >= sh {
+            return None; // the window starts past the image entirely
+        }
+        let cw = w.min(sw - x);
+        let ch = h.min(sh - y);
+        let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(cropped)
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .ok()?;
+        Some(out)
+    });
+    Ok(assemble_binary(rows))
+}
+
+/// A non-negative pixel offset narrowed to `u32`.
+///
+/// Separate from [`dim`] because zero is a valid offset and an invalid dimension, and
+/// because a negative offset must be rejected rather than wrapped to ~4 billion.
+fn offset(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprError> {
+    let value = value.ok_or(ExprError::MissingImageArg {
+        func: func.to_string(),
+        arg,
+    })?;
+    u32::try_from(value).map_err(|_| ExprError::InvalidImageDim {
+        func: func.to_string(),
+        arg,
+        value,
+        max: u32::MAX,
+    })
+}
+
+/// Collect per-row byte buffers into a `Binary` column (`None` → null).
+fn assemble_binary(rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
+    use arrow::array::BinaryBuilder;
+    let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 512);
+    for row in rows {
+        match row {
+            Some(v) => b.append_value(v),
+            None => b.append_null(),
+        }
+    }
+    Arc::new(b.finish())
 }
 
 /// `decode` → struct `{width, height, channels, mode}` (header read only).
@@ -644,7 +793,21 @@ mod tests {
         w: Option<i64>,
         h: Option<i64>,
     ) -> Result<ArrayRef, ExprError> {
-        eval_image(func, arr, w, h, None, None, false)
+        eval_image(func, arr, args(w, h))
+    }
+
+    /// The default `ImageArgs` for a test: just a width and a height.
+    fn args<'a>(w: Option<i64>, h: Option<i64>) -> ImageArgs<'a> {
+        ImageArgs {
+            width: w,
+            height: h,
+            mean: None,
+            std: None,
+            channels_first: false,
+            x: None,
+            y: None,
+            format: None,
+        }
     }
 
     /// A 2×3 red PNG, encoded once so the test has no I/O.
@@ -841,6 +1004,189 @@ mod tests {
     }
 
     #[test]
+    fn crop_takes_the_named_window_not_the_middle() {
+        use image::{Rgb, RgbImage};
+        // An 8x8 image, left half red and right half green: a crop at x=0 must be all
+        // red, and one at x=4 all green. A centered crop could not tell them apart, which
+        // is the whole reason `crop` exists beside `center_crop`.
+        let mut img = RgbImage::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                img.put_pixel(
+                    x,
+                    y,
+                    if x < 4 {
+                        Rgb([255, 0, 0])
+                    } else {
+                        Rgb([0, 255, 0])
+                    },
+                );
+            }
+        }
+        let mut src = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut src, image::ImageFormat::Png)
+            .unwrap();
+        let src = src.into_inner();
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(src.as_slice())]));
+
+        for (x, want) in [(0u32, [255u8, 0, 0]), (4, [0, 255, 0])] {
+            let out = eval_image(
+                ImageFunc::Crop,
+                &arr,
+                ImageArgs {
+                    x: Some(i64::from(x)),
+                    y: Some(0),
+                    ..args(Some(4), Some(8))
+                },
+            )
+            .unwrap();
+            let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let got = image::load_from_memory(b.value(0)).unwrap().into_rgb8();
+            assert_eq!((got.width(), got.height()), (4, 8), "x={x}");
+            assert_eq!(got.get_pixel(0, 0).0, want, "x={x}");
+        }
+    }
+
+    #[test]
+    fn crop_clips_at_the_edge_rather_than_padding() {
+        // The deliberate difference from `center_crop`, which zero-pads: `crop` produces
+        // an image someone will look at, and inventing black pixels there invents data.
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(8, 8).as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        let out = eval_image(
+            ImageFunc::Crop,
+            &arr,
+            ImageArgs {
+                x: Some(6),
+                y: Some(6),
+                ..args(Some(100), Some(100))
+            },
+        )
+        .unwrap();
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let got = image::load_from_memory(b.value(0)).unwrap();
+        assert_eq!(
+            (got.width(), got.height()),
+            (2, 2),
+            "clipped to what exists"
+        );
+        assert!(b.is_null(1) && b.is_null(2));
+    }
+
+    #[test]
+    fn a_crop_window_entirely_outside_the_image_is_null() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(8, 8).as_slice())]));
+        let out = eval_image(
+            ImageFunc::Crop,
+            &arr,
+            ImageArgs {
+                x: Some(8),
+                y: Some(0),
+                ..args(Some(4), Some(4))
+            },
+        )
+        .unwrap();
+        assert!(out
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .is_null(0));
+    }
+
+    #[test]
+    fn a_negative_crop_offset_is_rejected_not_wrapped() {
+        // `as u32` would turn -1 into ~4 billion, i.e. a window past every image, and
+        // every row would silently become null instead of the query failing.
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(8, 8).as_slice())]));
+        assert!(eval_image(
+            ImageFunc::Crop,
+            &arr,
+            ImageArgs {
+                x: Some(-1),
+                y: Some(0),
+                ..args(Some(4), Some(4))
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn encode_rewrites_the_container_and_keeps_the_pixels() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(4, 4).as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        for format in ENCODE_FORMATS {
+            let out = eval_image(
+                ImageFunc::Encode,
+                &arr,
+                ImageArgs {
+                    format: Some(format),
+                    ..args(None, None)
+                },
+            )
+            .unwrap();
+            let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let got = image::load_from_memory(b.value(0)).unwrap();
+            assert_eq!((got.width(), got.height()), (4, 4), "{format}");
+            // Solid red survives every lossless target; JPEG is lossy, so allow a margin.
+            let px = got.into_rgb8();
+            let [r, g, bl] = px.get_pixel(0, 0).0;
+            assert!(r > 200 && g < 60 && bl < 60, "{format}: {r},{g},{bl}");
+            assert!(b.is_null(1) && b.is_null(2), "{format}");
+        }
+    }
+
+    #[test]
+    fn encode_to_jpeg_flattens_an_alpha_channel_rather_than_failing() {
+        // JPEG has no alpha. Failing the row would drop every RGBA image in a corpus.
+        use image::RgbaImage;
+        let mut src = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 128])))
+            .write_to(&mut src, image::ImageFormat::Png)
+            .unwrap();
+        let src = src.into_inner();
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(src.as_slice())]));
+        let out = eval_image(
+            ImageFunc::Encode,
+            &arr,
+            ImageArgs {
+                format: Some("jpeg"),
+                ..args(None, None)
+            },
+        )
+        .unwrap();
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(b.is_valid(0));
+        assert_eq!(
+            image::load_from_memory(b.value(0))
+                .unwrap()
+                .color()
+                .channel_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_unknown_encode_format_is_an_error_not_a_null_column() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
+        assert!(eval_image(
+            ImageFunc::Encode,
+            &arr,
+            ImageArgs {
+                format: Some("webp"),
+                ..args(None, None)
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
     fn decode_reports_channels_and_mode_from_the_same_header_read() {
         use arrow::array::StringArray;
         use image::{DynamicImage, GrayImage, RgbImage, RgbaImage};
@@ -984,16 +1330,7 @@ mod tests {
         ]));
 
         // Bare: just /255. Solid red → first pixel (1.0, 0.0, 0.0), HWC.
-        let out = eval_image(
-            ImageFunc::ToTensorF32,
-            &arr,
-            Some(2),
-            Some(2),
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let out = eval_image(ImageFunc::ToTensorF32, &arr, args(Some(2), Some(2))).unwrap();
         let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(fsl.value_length(), 2 * 2 * 3);
         assert!(fsl.is_valid(0) && fsl.is_null(1));
@@ -1010,11 +1347,12 @@ mod tests {
         let out = eval_image(
             ImageFunc::ToTensorF32,
             &arr,
-            Some(2),
-            Some(2),
-            Some(&mean),
-            Some(&std),
-            true,
+            ImageArgs {
+                mean: Some(&mean),
+                std: Some(&std),
+                channels_first: true,
+                ..args(Some(2), Some(2))
+            },
         )
         .unwrap();
         let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
@@ -1036,11 +1374,10 @@ mod tests {
         assert!(eval_image(
             ImageFunc::ToTensorF32,
             &arr,
-            Some(2),
-            Some(2),
-            Some(&bad_mean),
-            None,
-            false
+            ImageArgs {
+                mean: Some(&bad_mean),
+                ..args(Some(2), Some(2))
+            }
         )
         .is_err());
         // Zero std.
@@ -1048,11 +1385,10 @@ mod tests {
         assert!(eval_image(
             ImageFunc::ToTensorF32,
             &arr,
-            Some(2),
-            Some(2),
-            None,
-            Some(&zero_std),
-            false
+            ImageArgs {
+                std: Some(&zero_std),
+                ..args(Some(2), Some(2))
+            }
         )
         .is_err());
         // Normalization params on a non-f32 op are rejected, not silently ignored.
@@ -1060,11 +1396,10 @@ mod tests {
         assert!(eval_image(
             ImageFunc::ToTensor,
             &arr,
-            Some(2),
-            Some(2),
-            Some(&mean),
-            None,
-            false
+            ImageArgs {
+                mean: Some(&mean),
+                ..args(Some(2), Some(2))
+            }
         )
         .is_err());
     }

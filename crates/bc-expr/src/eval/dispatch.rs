@@ -25,6 +25,7 @@ use crate::eval::map::eval_map;
 use crate::eval::math::{
     eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
 };
+use crate::eval::media::image::ImageArgs;
 use crate::eval::media::{eval_audio, eval_image, eval_video};
 use crate::eval::str::{eval_str, try_dict_str};
 use crate::eval::temporal::date::{
@@ -177,16 +178,24 @@ impl Expr {
                 mean,
                 std,
                 channels_first,
+                x,
+                y,
+                format,
             } => {
                 let arr = input.eval(batch)?;
                 eval_image(
                     *func,
                     &arr,
-                    *width,
-                    *height,
-                    mean.as_deref(),
-                    std.as_deref(),
-                    *channels_first,
+                    ImageArgs {
+                        width: *width,
+                        height: *height,
+                        mean: mean.as_deref(),
+                        std: std.as_deref(),
+                        channels_first: *channels_first,
+                        x: *x,
+                        y: *y,
+                        format: format.as_deref(),
+                    },
                 )
             }
             Expr::Audio {

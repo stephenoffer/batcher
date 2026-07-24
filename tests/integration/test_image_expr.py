@@ -53,6 +53,42 @@ def test_image_decode_fields_project_individually():
     assert out == {"w": [1], "mode": ["RGB"]}
 
 
+def test_image_crop_takes_the_named_window():
+    # A 4x4 image cropped to its top-left 2x2 comes back at 2x2, through the engine.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
+    region = bt.col("img").image.crop(0, 0, 2, 2)
+    out = ds.select(d=region.image.decode()).to_pydict()
+    assert out["d"][0]["width"] == 2
+    assert out["d"][0]["height"] == 2
+
+
+def test_image_crop_clips_instead_of_padding():
+    # `center_crop` pads; `crop` clips. A window larger than what remains at the offset
+    # yields the smaller real region rather than inventing black pixels.
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
+    region = bt.col("img").image.crop(3, 3, 10, 10)
+    out = ds.select(d=region.image.decode()).to_pydict()
+    assert out["d"][0] == {"width": 1, "height": 1, "channels": 4, "mode": "RGBA"}
+
+
+def test_image_encode_changes_the_container():
+    ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
+    out = ds.select(
+        png=bt.col("img").image.encode("png").image.decode().struct.field("mode"),
+        jpeg=bt.col("img").image.encode("jpeg").image.decode().struct.field("mode"),
+    ).to_pydict()
+    # PNG keeps whatever the source had; JPEG has no alpha, so RGBA flattens to RGB.
+    assert out["jpeg"] == ["RGB"]
+    assert out["png"] == ["RGB"]
+
+
+def test_image_encode_rejects_an_unwritable_format():
+    from batcher._internal.errors import PlanError
+
+    with pytest.raises(PlanError, match="format must be one of"):
+        bt.col("img").image.encode("webp")
+
+
 def test_image_to_tensor_shape():
     ds = bt.from_arrow(pa.table({"img": pa.array([_png(4, 4)], type=pa.binary())}))
     out = ds.select(t=bt.col("img").image.to_tensor(2, 2)).collect()
