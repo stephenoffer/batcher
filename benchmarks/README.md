@@ -247,8 +247,16 @@ def groupby_sum(ctx):
 ```bash
 source .venv/bin/activate
 pip install -e '.[bench]'    # duckdb, polars, pyarrow, ray, daft, pyspark
-just build                   # or: maturin develop --release
+just build-release           # NOT `just build` — see below
 ```
+
+**Use `just build-release`.** `just build` installs the *dev* profile, which sets no
+`opt-level` and leaves `debug_assertions` on, so both Batcher and every third-party crate
+it links are unoptimized. Every comparator is an installed release wheel. Timing a dev
+build against them compares an unoptimized engine to optimized ones, and the resulting
+ratios are not a measurement of anything — in one direction they understate Batcher, and
+where a competitor still wins you cannot tell whether the gap is real. The harness cannot
+detect the profile from Python, so this is on you.
 
 ### Competitor engines (comparators)
 

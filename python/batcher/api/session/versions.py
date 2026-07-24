@@ -51,6 +51,19 @@ def engine_version() -> str:
     return str(engine().__engine_version__)
 
 
+def _engine_profile() -> str:
+    """The Cargo profile the loaded engine was built with: ``release`` or ``debug``.
+
+    Not public on its own — it is a row in `versions`, which is where someone diagnosing
+    a slow pipeline or filing a bug report will look. It is worth reporting because a
+    ``just build`` (dev-profile) engine is unoptimized and dramatically slower, and
+    nothing else about a running query says so.
+    """
+    from batcher._internal.native import engine
+
+    return str(getattr(engine(), "__engine_profile__", "unknown"))
+
+
 def versions() -> dict[str, str]:
     """Return the Batcher, engine, Python, platform, and optional-backend versions.
 
@@ -58,6 +71,10 @@ def versions() -> dict[str, str]:
     assert on it in a test that needs a particular backend present. Optional
     integrations that are not installed map to ``"not installed"`` rather than
     being omitted, so a missing key always means an unknown package.
+
+    ``engine_profile`` is ``release`` or ``debug``. A ``debug`` engine — what ``just
+    build`` installs — is unoptimized, and nothing else about a running query says so, so
+    it is the first thing to check when a pipeline is unexpectedly slow.
 
     Returns:
         A mapping of component name to version string.
@@ -74,6 +91,8 @@ def versions() -> dict[str, str]:
     out = {
         "batcher": batcher.__version__,
         "engine": engine_version(),
+        # `debug` here is the answer to "why is this slow?" more often than any plan.
+        "engine_profile": _engine_profile(),
         "python": sys.version.split()[0],
         "platform": platform.platform(),
     }

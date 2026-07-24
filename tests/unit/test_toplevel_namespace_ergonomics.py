@@ -288,6 +288,13 @@ def test_versions_reports_batcher_and_the_engine():
     assert "pyarrow" in info
 
 
+def test_versions_reports_the_engine_build_profile():
+    # The row that answers "why is this slow?" when the answer is an unoptimized engine.
+    # `unknown` is not acceptable here: it would mean the engine stopped reporting the
+    # attribute, which is exactly the silent regression this row exists to prevent.
+    assert bt.versions()["engine_profile"] in ("release", "debug")
+
+
 def test_show_versions_prints_a_report(capsys):
     bt.show_versions()
     assert "batcher" in capsys.readouterr().out

@@ -592,6 +592,19 @@ impl MemoryPool {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
+    // The build profile, so the benchmark harness can refuse to report a timing taken
+    // against an unoptimized engine. `just build` (the dev profile) sets no `opt-level`
+    // and leaves `debug_assertions` on, while every comparator is an installed release
+    // wheel — timing one against the other measures the profile, not the engine. Nothing
+    // on the Python side can see this, which is why the engine has to say so.
+    m.add(
+        "__engine_profile__",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    )?;
     m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;

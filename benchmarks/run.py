@@ -123,6 +123,11 @@ def _parse_args() -> argparse.Namespace:
         "pointing at canonical-named parquet.",
     )
     p.add_argument("--list", action="store_true", help="list registered benchmarks and exit")
+    p.add_argument(
+        "--allow-debug-build",
+        action="store_true",
+        help="time an unoptimized (dev-profile) engine anyway; the ratios are not comparable",
+    )
     return p.parse_args()
 
 
@@ -190,47 +195,43 @@ def _run_aux(which: str, args: argparse.Namespace) -> int:
     return shuffle_vs_object_store.main()
 
 
-def _warn_if_debug_build() -> None:
-    """Loudly warn when Batcher looks built in debug mode (a huge, silent perf trap).
+def _check_build_profile() -> None:
+    """Refuse to let a debug-build timing pass for a measurement.
 
-    ``maturin develop`` (and ``just build``) build the Rust engine UNOPTIMIZED — 3-30x
-    slower than a release build, with debug bounds/overflow checks in every hot loop.
-    Benchmarking that build makes Batcher look far slower than it is (e.g. an aggregate
-    reading ~8x slower than DuckDB that actually *beats* it on release). Since the timing
-    is only meaningful on a release engine, calibrate once against a trivial in-memory
-    reduction and warn if throughput is in debug territory — the numbers below are then
-    not to be trusted until rebuilt with ``maturin develop --release`` (``just
-    build-release``). Best-effort: never blocks the run.
+    ``just build`` (``maturin develop``) builds the engine with the *dev* profile: no
+    ``opt-level``, ``debug_assertions`` on, and every third-party crate unoptimized with
+    it. Every comparator here is an installed release wheel, so timing a dev build against
+    them measures the profile rather than the engine.
+
+    This used to be a *timing heuristic* — sum 4M integers and warn if it took over 60 ms.
+    That guard silently passed on a real dev-build benchmark run: the sum came in under the
+    threshold, the suite printed a clean table, and the ratios in it were meaningless. A
+    heuristic cannot see a build profile; the engine can, so it now reports one
+    (``_native.__engine_profile__``) and this reads it.
+
+    A dev build is a hard stop rather than a warning. A warning above a table of numbers is
+    a warning that gets copied into a document without its warning.
     """
-    import time
+    from batcher._internal.native import engine
 
-    import pyarrow as pa
-
-    try:
-        n = 4_000_000
-        tbl = pa.table({"x": pa.array(range(n), type=pa.int64())})
-        ds = bt.from_arrow(tbl)
-        best = float("inf")
-        for _ in range(3):
-            t0 = time.perf_counter()
-            ds.agg(s=bt.col("x").sum()).collect()
-            best = min(best, time.perf_counter() - t0)
-    except Exception:
+    profile = getattr(engine(), "__engine_profile__", None)
+    if profile == "release":
         return
-    # Release sums 4M i64 in well under 20 ms even on modest cores; a debug build takes
-    # 100 ms+. The 60 ms gate sits in the wide gap between them, so it flags debug without
-    # false-positiving on slow hardware.
-    if best > 0.060:
+    if profile is None:
+        # An engine too old to report its profile. Say so rather than assume either way.
         print(
-            "\n" + "!" * 78,
-            f"\nWARNING: Batcher looks built in DEBUG mode (a {best * 1000:.0f} ms 4M-row sum;"
-            " release is <20 ms).",
-            "\n         The engine is 3-30x slower unoptimized — these timings are NOT"
-            " trustworthy.",
-            "\n         Rebuild with:  maturin develop --release   (or: just build-release)\n",
-            "!" * 78 + "\n",
-            sep="",
+            "WARNING: this engine does not report its build profile; if it was built with"
+            " `just build` the timings below are not measurements.\n"
         )
+        return
+    raise SystemExit(
+        "\n"
+        + "!" * 78
+        + f"\nThe installed engine is a {profile.upper()} build, so any timing here would"
+        "\ncompare an unoptimized Batcher against release competitors.\n"
+        "\nRebuild first:   just build-release\n"
+        "\nTo time a debug build deliberately, pass --allow-debug-build.\n" + "!" * 78
+    )
 
 
 def main() -> int:
@@ -248,7 +249,8 @@ def main() -> int:
     engines = engines_mod.resolve([n.strip() for n in names])
     print(f"Batcher benchmark suite  (engine {bt.engine_version()})")
     print(f"engines: {', '.join(e.name for e in engines)}\n")
-    _warn_if_debug_build()
+    if not args.allow_debug_build:
+        _check_build_profile()
 
     datasets = ALL_DATASETS if args.benchmark == "all" else (args.benchmark,)
     all_results = []

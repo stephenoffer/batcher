@@ -122,6 +122,13 @@ The operator suite at TPC-H scale factor 1, best-of-5, on this machine
 (`python benchmarks/run.py --benchmark operators --engines batcher,duckdb,polars,daft
 --scale 1`). `b/daft` below 1 means Batcher is faster by that factor.
 
+**Build profile matters and is easy to get wrong.** `just build` installs the *dev*
+profile, which sets no `opt-level` and leaves `debug_assertions` on — an unoptimized
+engine, and unoptimized third-party crates with it. Daft, DuckDB and Polars are installed
+release wheels. Benchmarking against them from a `just build` tree compares an
+unoptimized Batcher to optimized competitors. Use `just build-release`. The numbers below
+are release-profile; where a first pass was taken on a dev build it is called out.
+
 | Query | batcher_ms | duckdb_ms | polars_ms | daft_ms | b/daft |
 |---|---|---|---|---|---|
 | op-groupby-sum | 3.7 | 3.2 | 15.8 | 27.0 | 0.14x |

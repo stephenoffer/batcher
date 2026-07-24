@@ -208,6 +208,23 @@ For a multimodal pipeline, comparing decoded pixels is fragile — gate on **fra
 counts and output tensor shapes** (that is what `benchmarks/scenarios/image_decode.py`
 does), plus an exact comparison of the relational columns.
 
+### When the two engines disagree, check which one is right
+
+A ported query whose results differ is not automatically a porting bug. Two places where
+Daft is the one that departs from SQL, both found by running it against DuckDB:
+
+- **`sum(x) OVER (PARTITION BY k ORDER BY o)`.** SQL's default frame with an `ORDER BY`
+  is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` — a *running* aggregate. Daft
+  0.7.21 applies the whole partition instead, so on `v = [10, 20, 30]` it returns
+  `60, 60, 60` where DuckDB and Batcher return `10, 30, 60`. A port of such a query will
+  legitimately produce different numbers, and the new ones are the correct ones. Tell the
+  user; do not "fix" the port to reproduce the old output.
+- **TPC-H q6's float folding.** Daft folds `0.06 + 0.01` to `0.06999999999999999` and
+  drops every `l_discount = 0.07` row (see `docs/benchmarks/vs-daft.md`).
+
+The general move: when a ported result differs, run the same query through DuckDB before
+assuming the port is wrong.
+
 ## Gotchas / do-not
 
 - **Do not port a per-row Python UDF as a per-row Python UDF.** `ds.map` / `flat_map`
