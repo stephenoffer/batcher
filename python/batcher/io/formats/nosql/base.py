@@ -29,7 +29,7 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher.config import active_config
 
-__all__ = ["ScanSource", "offset_windows", "rows_to_batches"]
+__all__ = ["ScanSource", "offset_windows", "rows_to_batches", "schema_from_rows"]
 
 # An opaque, picklable partition locator (token range, segment id, offset, …).
 # It is connector-defined; the base treats it as a black box it round-trips to
@@ -92,6 +92,30 @@ def rows_to_batches(
             buffer = []
     if buffer:
         yield pa.RecordBatch.from_pylist(buffer, schema=schema)
+
+
+def schema_from_rows(rows: list[dict[str, Any]]) -> pa.Schema:
+    """Infer an Arrow schema from a list of sampled row dicts.
+
+    This is the schema half of the row->Arrow bridge: `_infer_schema` samples a
+    handful of rows from the store (usually a single ``LIMIT 1`` row) and needs
+    the Arrow schema those rows imply. Arrow derives it from the sample the same
+    way `rows_to_batches` builds data batches, so both halves agree by
+    construction.
+
+    An empty sample carries no type information, so the result is the empty
+    schema (`pa.schema([])`). A connector that has a meaningful schema for the
+    empty case (a fixed key column, say) must keep its own guard rather than
+    call this.
+
+    Args:
+        rows: The sampled row dictionaries (column name -> scalar value). Pass a
+            single-element list to infer from one sampled row.
+
+    Returns:
+        The Arrow schema the sample implies; the empty schema when `rows` is empty.
+    """
+    return pa.schema([]) if not rows else pa.RecordBatch.from_pylist(rows).schema
 
 
 @dataclass(frozen=True, slots=True)

@@ -256,10 +256,54 @@ impl KllSketch {
         if self.n == 0 {
             return 0.0;
         }
+        if x < self.min {
+            return 0.0;
+        }
+        if x >= self.max {
+            return 1.0;
+        }
         let items = self.weighted_items();
         let total: u64 = items.iter().map(|(_, w)| w).sum();
-        let below: u64 = items.iter().filter(|(v, _)| *v <= x).map(|(_, w)| w).sum();
-        below as f64 / total as f64
+        if total == 0 {
+            return 0.0;
+        }
+        // The retained items are a *sample*, so summing the weights at or below `x` makes the
+        // estimated CDF a step function with one step per retained item — and each step is a
+        // whole item's weight, which after a few compactions is `2^h` rows. A predicate landing
+        // between two retained values then reports the rank of whichever side it fell on,
+        // which for a selectivity estimate is an error of up to one full step regardless of
+        // how close `x` was to the boundary.
+        //
+        // Interpolating instead treats the sample as what it is: `total` mass distributed over
+        // the retained values, with each item's *rank centre* at the middle of its own weight
+        // (the same convention t-digest's quantile interpolation uses, so the two are mutual
+        // inverses rather than off by half a bucket). Between two centres the CDF is linear in
+        // value; below the first and above the last it runs to the exactly-tracked min and max.
+        let mut cum = 0u64;
+        let mut prev: Option<(f64, f64)> = None; // (value, rank at its centre)
+        for &(v, w) in &items {
+            let centre = (cum as f64 + w as f64 / 2.0) / total as f64;
+            if x < v {
+                let (pv, pr) = prev.unwrap_or((self.min, 0.0));
+                return Self::lerp(x, pv, pr, v, centre);
+            }
+            cum += w;
+            prev = Some((v, centre));
+        }
+        let (pv, pr) = prev.unwrap_or((self.min, 0.0));
+        Self::lerp(x, pv, pr, self.max, 1.0)
+    }
+
+    /// Linear interpolation of a rank between two `(value, rank)` anchors.
+    ///
+    /// A zero-width span (two anchors at the same value, which repeated data produces) takes
+    /// the upper anchor rather than dividing by zero.
+    fn lerp(x: f64, lo_v: f64, lo_r: f64, hi_v: f64, hi_r: f64) -> f64 {
+        if hi_v <= lo_v {
+            return hi_r.clamp(0.0, 1.0);
+        }
+        let t = ((x - lo_v) / (hi_v - lo_v)).clamp(0.0, 1.0);
+        (lo_r + t * (hi_r - lo_r)).clamp(0.0, 1.0)
     }
 
     /// Approximate value at quantile `q ∈ [0, 1]` (`None` if empty). `q=0`/`q=1`
@@ -269,8 +313,8 @@ impl KllSketch {
             return None;
         }
         let items = self.weighted_items();
-        let total: u64 = items.iter().map(|(_, w)| w).sum();
-        self.quantile_from(&items, total, q)
+        let (cumulative, total) = Self::prefix_sums(&items);
+        self.quantile_from(&items, &cumulative, total, q)
     }
 
     /// Batch quantile lookup: answers every `q` from a **single** sorted pass over
@@ -282,14 +326,35 @@ impl KllSketch {
             return vec![None; qs.len()];
         }
         let items = self.weighted_items();
-        let total: u64 = items.iter().map(|(_, w)| w).sum();
+        let (cumulative, total) = Self::prefix_sums(&items);
         qs.iter()
-            .map(|&q| self.quantile_from(&items, total, q))
+            .map(|&q| self.quantile_from(&items, &cumulative, total, q))
             .collect()
     }
 
+    /// Inclusive prefix sums of the retained weights, and their total.
+    ///
+    /// Built once per batch of lookups so each quantile is a binary search rather than a
+    /// scan. Monotone non-decreasing by construction, which is what makes `partition_point`
+    /// the right search.
+    fn prefix_sums(items: &[(f64, u64)]) -> (Vec<u64>, u64) {
+        let mut cumulative = Vec::with_capacity(items.len());
+        let mut total = 0u64;
+        for &(_, w) in items {
+            total += w;
+            cumulative.push(total);
+        }
+        (cumulative, total)
+    }
+
     /// Resolve one quantile against pre-sorted `(value, weight)` items.
-    fn quantile_from(&self, items: &[(f64, u64)], total: u64, q: f64) -> Option<f64> {
+    fn quantile_from(
+        &self,
+        items: &[(f64, u64)],
+        cumulative: &[u64],
+        total: u64,
+        q: f64,
+    ) -> Option<f64> {
         let q = q.clamp(0.0, 1.0);
         if q <= 0.0 {
             return Some(self.min);
@@ -298,14 +363,13 @@ impl KllSketch {
             return Some(self.max);
         }
         let target = (q * total as f64).ceil() as u64;
-        let mut cum = 0u64;
-        for &(v, w) in items {
-            cum += w;
-            if cum >= target {
-                return Some(v);
-            }
-        }
-        Some(self.max)
+        // Binary search the inclusive prefix sums, which are monotone by construction.
+        // `quantiles()` answers a whole histogram grid off one sketch — `buckets + 1` lookups
+        // — and the grid is built once per `EXPLAIN`/optimize, so an O(retained) scan per
+        // quantile made an equi-depth histogram quadratic in the retained item count. The
+        // answer is identical: the first item whose cumulative weight reaches `target`.
+        let idx = cumulative.partition_point(|&c| c < target);
+        items.get(idx).map(|&(v, _)| v).or(Some(self.max))
     }
 
     /// Convenience: the median.
@@ -766,6 +830,76 @@ mod tests {
                     "trial {trial}: k={k} n={n} q={q} merged={merged_v} single={single_v} rank_err={rank_err} (eps={eps})"
                 );
             }
+        }
+    }
+
+    /// The estimated CDF must be *continuous*, not a staircase.
+    ///
+    /// After compaction each retained item stands for `2^h` rows, so a step-function rank
+    /// jumps by a whole item's weight at each retained value: two predicates a hair apart get
+    /// ranks a full step apart, and the selectivity estimate they feed is wrong by that step
+    /// however close the literal was to the boundary.
+    #[test]
+    fn rank_is_continuous_across_a_retained_value() {
+        let mut s = KllSketch::new(64);
+        for i in 0..100_000u64 {
+            s.add(i as f64);
+        }
+        // March across the middle of the distribution; no adjacent pair may jump by more than
+        // a small fraction, and the sequence must be non-decreasing.
+        let mut prev = s.rank(40_000.0);
+        let mut x = 40_000.0;
+        while x < 60_000.0 {
+            x += 25.0;
+            let r = s.rank(x);
+            assert!(r >= prev - 1e-12, "rank went backwards at {x}");
+            assert!(r - prev < 0.01, "rank jumped by {} at {x}", r - prev);
+            prev = r;
+        }
+    }
+
+    /// The interpolation must not cost accuracy: the rank of a known quantile is still right.
+    #[test]
+    fn interpolated_rank_stays_accurate() {
+        let mut s = KllSketch::new(200);
+        for i in 0..100_000u64 {
+            s.add(i as f64);
+        }
+        for (x, expected) in [(10_000.0, 0.1), (50_000.0, 0.5), (90_000.0, 0.9)] {
+            let got = s.rank(x);
+            assert!(
+                (got - expected).abs() < 0.02,
+                "rank({x}) = {got}, want {expected}"
+            );
+        }
+    }
+
+    /// Outside the observed range the CDF is exactly 0 and 1 — the min and max are tracked
+    /// exactly, so there is nothing to interpolate.
+    #[test]
+    fn rank_saturates_outside_the_observed_range() {
+        let mut s = KllSketch::new(64);
+        for i in 10..100u64 {
+            s.add(i as f64);
+        }
+        assert_eq!(s.rank(9.0), 0.0);
+        assert_eq!(s.rank(-1e9), 0.0);
+        assert_eq!(s.rank(99.0), 1.0);
+        assert_eq!(s.rank(1e9), 1.0);
+    }
+
+    /// A batch of quantiles must agree exactly with the same quantiles asked one at a time —
+    /// the prefix-sum search and the single-lookup path are the same computation.
+    #[test]
+    fn batched_and_single_quantiles_agree() {
+        let mut s = KllSketch::new(128);
+        for i in 0..50_000u64 {
+            s.add(((i * 2_654_435_761) % 100_000) as f64);
+        }
+        let qs: Vec<f64> = (0..=20).map(|i| i as f64 / 20.0).collect();
+        let batch = s.quantiles(&qs);
+        for (q, got) in qs.iter().zip(batch) {
+            assert_eq!(got, s.quantile(*q), "disagreement at q = {q}");
         }
     }
 }

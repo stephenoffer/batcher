@@ -40,6 +40,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
@@ -269,7 +270,8 @@ class HudiSource:
         ):
             try:
                 return list(attempt())
-            except Exception:
+            except Exception as exc:
+                note_suppressed("io", "list file slices", exc)
                 continue
         return list(table.get_file_slices())
 

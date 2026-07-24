@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import IO, Any, ClassVar, TypeVar
 
@@ -23,6 +23,7 @@ import pyarrow as pa
 from batcher._internal.errors import FormatError, IOError, SchemaError, unknown_value
 from batcher._internal.hardware import available_cpu_count
 from batcher.io._backend import _scheme
+from batcher.io._concurrent import total_file_bytes
 from batcher.io.base._options import BASE_SOURCE_ALIASES, BASE_SOURCE_OPTIONS
 from batcher.io.base._paths import normalize_source_path
 from batcher.io.base._readahead import ordered_readahead
@@ -32,6 +33,7 @@ from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.splits import FileSplit, Split
 from batcher.io.stats.file_identity import files_version
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["FileSource"]
 
@@ -299,8 +301,58 @@ class FileSource(ABC):
             The Arrow schema every batch this source produces conforms to.
         """
         if self._schema_cache is None:
-            self._schema_cache = self._select(self._read_full_schema())
+            full = self._read_full_schema()
+            self._warn_if_dropping_partition_columns(full)
+            self._schema_cache = self._select(full)
         return self._schema_cache
+
+    def _warn_if_dropping_partition_columns(self, schema: pa.Schema) -> None:
+        """Warn when the files sit in ``col=val/`` directories this reader will not recover.
+
+        Writing with ``partition_by=`` and reading the result back the obvious way loses
+        the partition columns outright: they live in the directory names, not in the
+        files, and a plain file source only ever reads files. The row count is unchanged
+        and no error is raised, so the loss is invisible in the result — the reader's
+        answer looks exactly like a correct answer for a table that never had the column.
+
+        DuckDB detects the layout and recovers the columns; `read.parquet_dataset` is the
+        reader here that does the same. This does not silently reroute to it, because it
+        takes none of this source's options (`on_error`, `schema_mode`, `columns`,
+        `n_rows`) and switching readers would drop the caller's explicit settings — a
+        second silent behavior change to paper over the first. So the loss is made loud
+        and the working reader named.
+        """
+        import warnings
+
+        from batcher._internal.errors import DataWarning
+        from batcher.io.base._paths import hive_segment
+
+        files = self._files()
+        if not files:
+            return
+        # Every file in a Hive tree carries the same partition keys, so one path answers
+        # this — the check must not cost an O(files) walk on a million-file source.
+        known = set(schema.names)
+        parts = files[0].rsplit("/", 1)[0].split("/")
+        missing = [
+            seg[0] for d in parts if (seg := hive_segment(d)) is not None and seg[0] not in known
+        ]
+        if not missing:
+            return
+        # Only Parquet has a partition-aware reader to point at; for the rest the useful
+        # half of the message is still the first half — that the columns are gone.
+        fix = (
+            "Use bt.read.parquet_dataset(...) to recover them"
+            if self.format_name == "parquet"
+            else "Re-derive them from the path, or write them into the files"
+        )
+        warnings.warn(
+            f"{self._path!r} is laid out as a partitioned directory, but this reader does "
+            f"not recover partition columns, so {missing} will be missing from the result "
+            f"while every row is still returned. {fix}.",
+            DataWarning,
+            stacklevel=3,
+        )
 
     def _effective_projection(self, projection: list[str] | None) -> list[str] | None:
         """The columns to actually read: the engine's pushed projection, else `columns=`.
@@ -360,21 +412,75 @@ class FileSource(ABC):
         return None if self._n_rows is not None else stats
 
     def _read_full_schema(self) -> pa.Schema:
-        """The source's schema before `columns=` narrows it."""
+        """The source's schema before `columns=` narrows it.
+
+        Under `on_error="skip"` an unreadable file contributes no schema, exactly as it
+        will contribute no rows. Without that, the policy was defeated by the very case it
+        exists for: inferring the schema is the *first* thing a read does, so one truncated
+        object aborted the query before `ErrorPolicy` was ever consulted — in strict mode
+        whenever it sorted first, and in evolution mode always.
+        """
         files = self._files()
         if self._schema_mode == "strict":
-            return self._file_schema(files[0])
+            # File 0 stands for all of them, so only its schema is read — but "file 0"
+            # means the first *readable* file when unreadable ones are being tolerated.
+            for f in files:
+                try:
+                    return self._file_schema(f)
+                except Exception as exc:
+                    self._errors.tolerate(f, exc, format_name=self.format_name)
+            raise self._all_files_unreadable(len(files))
         from batcher.io.schema import unify_schemas
 
         # Schema evolution reads every file's schema; read them concurrently (each a
         # GIL-releasing metadata round trip) so a many-file unify isn't serialized.
         if len(files) <= 1:
-            schemas = [self._file_schema(f) for f in files]
+            pairs = [(f, self._tolerant_file_schema(f)) for f in files]
         else:
             cap = min(_FOOTER_READ_CONCURRENCY, len(files))
             with ThreadPoolExecutor(max_workers=cap) as pool:
-                schemas = list(pool.map(self._file_schema, files))
+                pairs = list(zip(files, pool.map(self._tolerant_file_schema, files), strict=True))
+        schemas = [s for _, s in pairs if s is not None]
+        if not schemas:
+            raise self._all_files_unreadable(len(files))
         return unify_schemas(schemas, self._schema_mode)
+
+    def _all_files_unreadable(self, n_files: int) -> SchemaError:
+        """The error when `on_error="skip"` has skipped the entire source.
+
+        Tolerance is meant to lose a few members of a corpus, not all of them, and a
+        source with no readable file has no schema to infer — so this says that plainly
+        rather than surfacing whichever unrelated error the empty schema list would cause.
+        """
+        return SchemaError(
+            f"cannot infer a schema for {self._path!r}: every one of its {n_files} file(s) "
+            "was unreadable and skipped by on_error='skip'. Check the paths and the "
+            "format; source.corrupt_files() lists what was dropped."
+        )
+
+    def _tolerant_file_schema(self, path: str) -> pa.Schema | None:
+        """`_file_schema`, or None when `on_error` says this file may be dropped."""
+        try:
+            return self._file_schema(path)
+        except Exception as exc:
+            self._errors.tolerate(path, exc, format_name=self.format_name)
+            return None
+
+    def _tolerant_file_row_count(self, path: str) -> int | None:
+        """`_file_row_count`, counting a tolerated unreadable file as the 0 rows it yields.
+
+        A file `on_error="skip"` drops contributes no rows to the read, so 0 is what the
+        metadata path must report for it — and reporting it is what keeps `row_count()`
+        from *raising*. That mattered more than it looks: `row_count()` is called from the
+        post-run learned-stats loop, so an unreadable file killed the query **after** the
+        result had been computed and every operator had succeeded, from a code path whose
+        only job is to record statistics for the next run.
+        """
+        try:
+            return self._file_row_count(path)
+        except Exception as exc:
+            self._errors.tolerate(path, exc, format_name=self.format_name)
+            return 0
 
     def _read_by_path(
         self,
@@ -420,15 +526,14 @@ class FileSource(ABC):
                 proj = self._file_proj(f, projection)
                 batches = self._read_by_path(f, proj)
                 if batches is not None:
-                    return list(self._normalize(batches, projection))
+                    return list(self._normalize(batches, projection, f))
                 with self._open(f) as fh:
-                    return list(self._normalize(self._read_file(fh, proj), projection))
+                    return list(self._normalize(self._read_file(fh, proj), projection, f))
 
             try:
                 return self._read_with_retry(_once)
             except Exception as exc:
-                if not self._errors.tolerate(f, exc, format_name=self.format_name):
-                    raise
+                self._errors.tolerate(f, exc, format_name=self.format_name)
                 return []
 
         # Read the files concurrently: the decode runs in the C++ layer with the GIL
@@ -475,10 +580,13 @@ class FileSource(ABC):
         projection = self._effective_projection(projection)
         files = self._files()
         if len(files) <= 1:
+            # `_tolerant_iter_file`, not the raw `_iter_file`, so a single unreadable file
+            # under `on_error="skip"` yields nothing rather than raising — the same answer
+            # `read()` gives it. The multi-file path below already goes through the tolerant
+            # reader; the single-file path used the raw one, so `iter_batches()` raised on a
+            # corrupt file while `collect()` returned empty. One source, two answers.
             for f in files:
-                yield from self._normalize(
-                    self._iter_file(f, self._file_proj(f, projection)), projection
-                )
+                yield from self._normalize(self._tolerant_iter_file(f, projection), projection, f)
             return
 
         # Bounded, order-preserving parallel read-ahead: keep ~`depth` files decoding
@@ -493,14 +601,14 @@ class FileSource(ABC):
         # 200 MB video. `ordered_readahead` streams batches instead, so a 1 GB shard and
         # a 4 KB one cost the same. Files are still yielded in order, so a downstream
         # that assumes file order is unaffected.
-        yield from self._normalize(
-            ordered_readahead(
-                files,
-                lambda f: self._tolerant_iter_file(f, projection),
-                depth=self._iter_readahead_depth(len(files)),
-                max_bytes=_ITER_READAHEAD_BYTES,
-            ),
-            projection,
+        # Each file is conformed to the declared schema *inside* its own read-ahead worker
+        # rather than over the merged stream, so a mismatch names the file it came from —
+        # over the merged stream the batches are interleaved and the path is already lost.
+        yield from ordered_readahead(
+            files,
+            lambda f: self._normalize(self._tolerant_iter_file(f, projection), projection, f),
+            depth=self._iter_readahead_depth(len(files)),
+            max_bytes=_ITER_READAHEAD_BYTES,
         )
 
     def _iter_readahead_depth(self, n_files: int) -> int:
@@ -567,8 +675,7 @@ class FileSource(ABC):
                 yield first
                 yield from it  # past the first batch: a failure here is tolerated, not retried
         except Exception as exc:
-            if not self._errors.tolerate(path, exc, format_name=self.format_name):
-                raise
+            self._errors.tolerate(path, exc, format_name=self.format_name)
 
     def corrupt_files(self) -> list[str]:
         """The paths this source skipped, in failure order (empty unless `on_error="skip"`).
@@ -601,20 +708,45 @@ class FileSource(ABC):
         self,
         batches: Iterator[pa.RecordBatch] | list[pa.RecordBatch],
         projection: list[str] | None,
+        path: str,
     ) -> Iterator[pa.RecordBatch]:
-        """In non-strict mode, reshape each batch to the unified (optionally
-        projected) schema — adding missing columns as nulls and casting promoted
-        types — so files with differing schemas concatenate cleanly."""
-        if self._schema_mode == "strict":
-            yield from batches
-            return
-        from batcher.io.schema import normalize_batch
+        """Make every batch match the schema this source declared.
 
-        target = self.schema()
-        if projection is not None:
-            target = pa.schema([target.field(c) for c in projection])
+        The two schema modes differ in how the declared schema was *derived*, not in
+        whether batches must match it — `schema()` is the plan's output schema, so a batch
+        that disagrees with it is a contract violation either way. In evolution mode the
+        declaration is the union of every file, and a batch is reshaped toward it (missing
+        columns become typed nulls, promoted types are cast). In strict mode it is file
+        0's schema, and a batch that disagrees is an *error* rather than something to
+        reconcile — see `io.schema.conform_batch` for the rules and why they match
+        DuckDB's non-``union_by_name`` reader.
+
+        Strict mode used to pass batches through untouched, which left the declaration
+        unchecked: a file with an extra column had it silently dropped downstream, and a
+        file with a differing type failed at the final concat as a bare
+        `pyarrow.lib.ArrowInvalid` naming neither the file nor the fix.
+
+        `path` is required rather than defaulted, because it is the whole difference
+        between an error a user can act on and one they cannot — and every read path here
+        knows which file it is holding at the point it calls this.
+
+        The target schema is resolved on the *first* batch, not up front. A stream that
+        yields nothing — every file tolerated away under `on_error="skip"` — must yield
+        nothing, not raise: `schema()` on an all-unreadable source has no schema to give
+        and says so, and calling it eagerly here would turn a clean empty `iter_batches`
+        into that error while `read()` (which never reaches this on an empty file) returns
+        `[]`. One source, two answers is exactly the divergence to avoid.
+        """
+        from batcher.io.schema import conform_batch, normalize_batch
+
+        strict = self._schema_mode == "strict"
+        target: pa.Schema | None = None
         for b in batches:
-            yield normalize_batch(b, target)
+            if target is None:
+                target = self.schema()
+                if projection is not None:
+                    target = pa.schema([target.field(c) for c in projection])
+            yield conform_batch(b, target, path=path) if strict else normalize_batch(b, target)
 
     def row_count(self) -> int | None:
         """The summed row count when every file knows its own cheaply, else None.
@@ -638,10 +770,10 @@ class FileSource(ABC):
         # dominates a distributed query's driver phase, so read them concurrently on a
         # small pool — exactly as `splits()` does. A single file skips the pool.
         if len(files) <= 1:
-            counts = [self._file_row_count(f) for f in files]
+            counts = [self._tolerant_file_row_count(f) for f in files]
         else:
             with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
-                counts = list(pool.map(self._file_row_count, files))
+                counts = list(pool.map(self._tolerant_file_row_count, files))
         if any(c is None for c in counts):
             return None
         total: int = sum(counts)  # type: ignore[arg-type]
@@ -674,6 +806,92 @@ class FileSource(ABC):
             the caller must not cache, having no way to notice a later change.
         """
         return files_version(self._files(), self._fs)
+
+    def statistics(self) -> SourceStatistics | None:
+        """Generic file-level metadata every file format can state without a data scan.
+
+        Two facts are available from the filesystem and the format's own cheap counters,
+        and until now only the two formats that override this (Parquet, ORC) surfaced
+        either — every other file source reported nothing, so a plain CSV/JSON/Avro/Arrow
+        read reached the estimator with no size and no count at all:
+
+        - **`byte_size`** — the summed on-disk size of the files, from `fs.size`. It feeds
+          read-cost prediction (`io_stats.predicted_read_seconds`), `meta.storage.total_bytes`,
+          and broadcast/spill sizing, none of which need a row count to be useful. A wide CSV
+          scan can now be *cost-estimated* before it runs.
+        - **`row_count`** — `self.row_count()`, which is exact when every file knows its own
+          count cheaply (a footer format such as Arrow IPC, or a header-counted one) and
+          None otherwise. A footerless CSV/JSON stays None here and pays nothing to find out
+          — `_file_row_count` returns None without I/O — so this adds no per-file work for the
+          formats that cannot answer it.
+
+        A format with richer footer statistics (Parquet's column bounds, ORC's stripe count)
+        overrides this with its own `statistics()`; this base is the floor beneath them. A
+        capped (`n_rows`) read advertises nothing, via `_stats_apply` — the cap invalidates
+        both the count and any file-derived size. Best-effort throughout: any failure yields
+        None and planning proceeds on defaults.
+
+        Examples:
+            .. doctest::
+
+                >>> source.statistics()  # doctest: +SKIP
+                SourceStatistics(byte_size=1048576, row_count=None)
+
+        Returns:
+            The file-level `SourceStatistics` (byte size, and row count when cheaply
+            known), or None when nothing could be determined without a data scan.
+        """
+        # The on-disk size is computed once here and threaded into the row estimate, so a
+        # footerless format that scales rows by total bytes does not sweep every file's size
+        # a second time — one O(files) `size` fan-out per source, not two.
+        size = self._total_byte_size()
+        try:
+            rows = self.row_count()
+        except Exception:
+            rows = None
+        # An exact footer count is authoritative; only when there is none does a footerless
+        # format fall back to its advisory byte-sample estimate. `exact_rows` tracks which
+        # one answered, so an estimate never answers an exact `count()`.
+        exact = rows is not None
+        if rows is None:
+            rows = self._estimated_row_count(size)
+        if rows is None and size is None:
+            return None
+        stats = SourceStatistics(row_count=rows, byte_size=size, exact_rows=exact)
+        return self._stats_apply(stats)
+
+    def _estimated_row_count(self, byte_total: int | None) -> int | None:  # noqa: ARG002
+        """An advisory row-count estimate for a footerless format, or None (the default).
+
+        A columnar format answers `row_count()` exactly from its footer and never reaches
+        here. A footerless text format (CSV, line-delimited JSON) has no exact count, so it
+        overrides this to extrapolate one from a byte sample (`io.stats.row_estimate`) — far
+        better than the planner's blind default for sizing a join, and always advisory
+        (`statistics()` marks it `exact_rows=False`). The base returns None: a format that
+        cannot estimate cheaply simply reports no count, exactly as before.
+
+        `byte_total` is the dataset's on-disk size, already computed by `statistics()` and
+        passed in so an estimator that scales by it need not re-sweep every file's size.
+        """
+        return None
+
+    def _total_byte_size(self) -> int | None:
+        """The summed on-disk byte size of every file, or None if it can't be stated whole.
+
+        A *partial* total is worse than none: `total_bytes` and the read-cost predictor sum
+        across sources, so one unreadable size would silently under-report the whole query.
+        Any file whose size cannot be read voids the figure rather than skewing it.
+
+        Skipped above `_MAX_FOOTER_PLAN_FILES` — the same ceiling `splits()` uses to stop
+        reading a footer per file. Past it, an O(files) sweep of size round trips on the
+        driver costs more than a byte-size estimate is worth, and the read is already
+        amply parallel. The sizes are read concurrently for a remote store (each is one
+        latency-bound HEAD) and serially for local disk, via `read_each_file`.
+        """
+        files = self._files()
+        if len(files) > _MAX_FOOTER_PLAN_FILES:
+            return None
+        return total_file_bytes(self._fs, files)
 
     def identity(self) -> str:
         """The ``format:path`` key this source's learned statistics are stored under.
@@ -715,6 +933,29 @@ class FileSource(ABC):
             return base
         digest = hashlib.sha256(" || ".join(parts).encode()).hexdigest()[:16]
         return f"{base}#{digest}"
+
+    @staticmethod
+    def _subset_identity(base: str, label: str, values: Iterable[str] | None) -> str:
+        """`base` narrowed by a named subset restriction (MCAP `topics`, MDF `signals`).
+
+        A source pinned to some of a container's channels is a *different relation* from the
+        whole file, so it needs its own statistics key — the reason `identity` spells out.
+        Takes `base` rather than calling `self.identity()` because every caller is inside its
+        own `identity()` override, where `self` would recurse.
+
+        Args:
+            base: The unrestricted identity, normally ``super().identity()``.
+            label: The restriction's name, used as the suffix key, e.g. ``"topics"``.
+            values: The restricting subset, or ``None`` for an unrestricted source.
+
+        Returns:
+            `base`, suffixed with a digest of the sorted subset when one is set.
+        """
+        if values is None:
+            return base
+        digest = hashlib.sha256("\n".join(sorted(values)).encode()).hexdigest()[:16]
+        sep = "&" if "#" in base else "#"
+        return f"{base}{sep}{label}={digest}"
 
     def splits(self, target_size: int | None = None, predicate: dict | None = None) -> list[Split]:
         """Independently-readable slices — one per file, or finer where the format allows.
@@ -804,8 +1045,7 @@ class FileSource(ABC):
         try:
             return list(self._file_splits(path, target_size, predicate))
         except Exception as exc:
-            if not self._errors.tolerate(path, exc, format_name=self.format_name):
-                raise
+            self._errors.tolerate(path, exc, format_name=self.format_name)
             return []
 
     # ---- override points --------------------------------------------------

@@ -239,11 +239,20 @@ class StreamingQueryEngine:
         return list(self._progress)
 
     def status(self) -> StreamingQueryStatus:
+        if self._active:
+            message = "Waiting for data"
+        elif self._error is not None:
+            # A failed query is stopped too, so `is_active=False` alone read identically to a
+            # clean stop. Name the failure in the message so a caller polling `status` — not
+            # just one that calls `await_termination` — can see the query died and why.
+            message = f"Failed: {type(self._error).__name__}: {self._error}"
+        else:
+            message = "Stopped"
         return StreamingQueryStatus(
             is_active=self._active,
             is_data_available=bool(self._progress) and self._progress[-1].num_input_rows > 0,
             is_trigger_active=self._active and not self._stop.is_set(),
-            message="Waiting for data" if self._active else "Stopped",
+            message=message,
             batches_processed=self._batches,
         )
 
@@ -396,6 +405,9 @@ class StreamingQueryEngine:
         # snapshot) instead of accumulating one file per micro-batch forever.
         if snap is not None:
             self._checkpoint.prune_state(self._batches)
+        # The offset/commit logs grow one row per micro-batch even for a *stateless* stream;
+        # recovery consults only the last committed batch, so bound them the same way.
+        self._checkpoint.prune_logs(self._batches)
 
 
 def make_processor(

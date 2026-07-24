@@ -223,15 +223,23 @@ def test_uniform_join_is_the_selinger_estimate():
 
 
 def test_shared_hot_key_floors_the_estimate_above_selinger():
-    # Value 7 at 50% on both sides contributes (0.5·1000)·(0.5·1000) = 250000 by itself.
+    # Value 7 at 50% on both sides contributes (0.5·1000)·(0.5·1000) = 250000 by itself, and
+    # the 99 unlisted values on each side add the residual term m_L·m_R/max(n) · |L|·|R| =
+    # 0.5·0.5/99 · 10^6. The decomposition is the sum of the two, not just the larger.
     got = _skew_join({"7": 0.5}, {"7": 0.5})
-    assert got == pytest.approx(250000.0)
+    assert got == pytest.approx(250_000.0 + 0.25 / 99 * 1_000_000)
     assert got > 1000 * 1000 / 100  # far above the uniform estimate
 
 
-def test_disjoint_hot_keys_do_not_inflate():
-    # Hot values that don't match across sides contribute nothing to the join.
-    assert _skew_join({"7": 0.5}, {"3": 0.5}) == pytest.approx(1000 * 1000 / 100)
+def test_disjoint_hot_keys_deflate_below_uniform():
+    # Anti-correlated skew: value 7 is half the left and value 3 half the right, and neither
+    # is hot on the other side. A hot value still joins against the *residual* frequency of
+    # its counterpart, so the two cross terms carry the estimate — and the total lands well
+    # below the uniform 10,000, which is the whole point: assuming uniformity over a key whose
+    # heavy hitters do not line up over-estimates the join by ~4x here.
+    cross = 2 * (0.5 * 0.5 / 99)  # left-hot × right-residual, plus the mirror image
+    residual = 0.5 * 0.5 / 99  # both sides unlisted
+    assert _skew_join({"7": 0.5}, {"3": 0.5}) == pytest.approx((cross + residual) * 1_000_000)
 
 
 def test_skew_floor_is_capped_at_the_cartesian_bound():

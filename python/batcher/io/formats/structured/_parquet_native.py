@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 
 __all__ = [
@@ -66,7 +67,8 @@ def read_row_groups_filtered(
         return _native.read_parquet_filtered(
             uri, row_groups, projection, batch_size, json.dumps(native_pred)
         )
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "read parquet natively", exc)
         return None
 
 

@@ -7,6 +7,8 @@ use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::compute::{cast, is_null};
 use arrow::datatypes::DataType;
 
+use bc_arrow::float_total_cmp;
+
 use crate::eval::binary::eval_binary;
 use crate::eval::list_ops::{accumulate_pair, as_var_list};
 use crate::{BinaryOp, Expr, ExprError, ListBinaryFunc, ListFunc, Literal};
@@ -100,60 +102,25 @@ fn array_common_type(arrays: &[ArrayRef]) -> DataType {
     ty
 }
 
-/// Total order over `f64`, matching the order the engine's sorts, `min`/`max` and
-/// `GROUP BY` already use (`bc_runtime::keys::float_total_cmp` — the two cannot import
-/// each other, the crate DAG points the other way).
-///
-/// Raw IEEE comparison is not a total order: every comparison with NaN is false, so a
-/// `max` written as `v > cur` silently *ignores* NaN. `f64::total_cmp` is a total order
-/// but a *different* one: it ranks by sign bit, so `-NaN` sorts below `-inf`. SQL (and
-/// DuckDB) treat every NaN as one value, greater than every number.
-#[inline]
-pub(crate) fn float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a.is_nan(), b.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-    }
-}
-
-/// The canonical `f64` for equality/hashing: one NaN, and `-0.0` folded into `0.0`
-/// (`bc_runtime::keys::canon_f64`, expressed as the float those bits denote).
-#[inline]
-fn canon_f64(v: f64) -> f64 {
-    if v.is_nan() {
-        f64::NAN // the one canonical quiet NaN
-    } else if v == 0.0 {
-        0.0 // folds -0.0 into +0.0
-    } else {
-        v
-    }
-}
-
 /// A copy of a list's child in which float elements are canonicalized, for use as a
 /// *comparison key* only — the values themselves are still taken from the original.
 ///
 /// Arrow's `RowConverter` (and `f64::to_bits`) encode `-0.0` and `0.0` differently, and
 /// every NaN payload differently again, so a naive dedup/set-op over floats splits values
-/// that `=`, `GROUP BY` and the join keys all consider equal. Canonicalizing the key
-/// column up front is exactly what the shuffle does (`keys::canonicalize_float_keys`).
-/// Non-float children need no rewrite and are returned as-is.
+/// that `=`, `GROUP BY` and the join keys all consider equal. Non-float children need no
+/// rewrite and are returned as-is.
+///
+/// The `Float32` case is widened to `Float64` first so a list of one element type compares
+/// against a list of the other; canonicalization itself is
+/// [`bc_arrow::canon_float_array`], the engine's single definition of float identity.
 pub(crate) fn float_canonical_key(child: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use arrow::array::{AsArray, Float64Array};
-    use arrow::datatypes::Float64Type;
-
     if !matches!(child.data_type(), DataType::Float64 | DataType::Float32) {
         return Ok(child.clone());
     }
-    let f = cast(child, &DataType::Float64)?;
-    let canon: Float64Array = f
-        .as_primitive::<Float64Type>()
-        .iter()
-        .map(|v| v.map(canon_f64))
-        .collect();
-    Ok(Arc::new(canon))
+    Ok(bc_arrow::canon_float_array(&cast(
+        child,
+        &DataType::Float64,
+    )?))
 }
 
 /// The type a list's child and a comparison literal must both be promoted to so that

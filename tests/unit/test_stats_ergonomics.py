@@ -53,7 +53,9 @@ def _stats() -> RunStats:
 
 
 def test_op_stat_to_dict_is_json_encodable():
-    json.dumps(_stats().ops[0].to_dict())
+    """The dict is what reaches a JSON profile artifact, so it must survive the round trip."""
+    d = _stats().ops[0].to_dict()
+    assert json.loads(json.dumps(d)) == d
 
 
 def test_op_stat_to_dict_includes_the_derived_fields():
@@ -191,7 +193,9 @@ def test_metrics_snapshot_shape(clean_metrics):
 
 
 def test_metrics_snapshot_is_json_encodable(clean_metrics):
-    json.dumps(metrics_snapshot())
+    """The snapshot is served over HTTP as JSON, so every value must be encodable."""
+    snap = metrics_snapshot()
+    assert json.loads(json.dumps(snap)) == snap
 
 
 def test_metrics_count_a_finished_query(clean_metrics):
@@ -235,10 +239,11 @@ def test_metrics_count_scanned_rows_and_bytes(clean_metrics):
 
 def test_duration_histogram_buckets_are_cumulative(clean_metrics):
     events.publish(events.QUERY_END, query_id="q1", name="q", ok=True, total_ms=7.0, rows=0)
+    # Keys are strings: the snapshot is JSON, and JSON object keys are strings.
     buckets = metrics_snapshot()["queries"]["duration_ms_buckets"]
-    assert buckets[1] == 0
-    assert buckets[10] == 1
-    assert buckets[1000] == 1
+    assert buckets["1"] == 0
+    assert buckets["10"] == 1
+    assert buckets["1000"] == 1
 
 
 def test_reset_metrics_zeroes_the_counters(clean_metrics):
@@ -266,9 +271,9 @@ def test_prometheus_text_emits_a_well_formed_histogram(clean_metrics):
 
 def test_prometheus_every_sample_line_has_a_numeric_value(clean_metrics):
     events.publish(events.QUERY_END, query_id="q1", name="q", ok=True, total_ms=3.0, rows=1)
-    for line in prometheus_text().splitlines():
-        if line.startswith("#") or not line:
-            continue
+    samples = [ln for ln in prometheus_text().splitlines() if ln and not ln.startswith("#")]
+    assert samples  # an exposition with no samples would pass the loop vacuously
+    for line in samples:
         float(line.rsplit(" ", 1)[1])
 
 

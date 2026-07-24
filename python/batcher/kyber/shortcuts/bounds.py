@@ -13,9 +13,9 @@ describes a column that isn't there.
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
+from batcher._internal.mathx import is_nan
 from batcher.kyber.shortcuts.facts import ColumnFacts, Facts
 from batcher.plan.stats import ambiguous_float_bound
 
@@ -73,7 +73,7 @@ def orderable(facts: Facts, column: str) -> ColumnFacts | None:
 
 def _is_nan(value: Any) -> bool:
     """True iff `value` is a floating NaN."""
-    return isinstance(value, float) and math.isnan(value)
+    return is_nan(value)
 
 
 def _is_ambiguous_float(value: Any) -> bool:

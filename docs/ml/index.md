@@ -27,6 +27,12 @@ Batched inference over Arrow, on CPU or GPU.
 Feature transforms, media decode, tokenization.
 :::
 
+:::{grid-item-card} {octicon}`graph;1.1em` Measure the model
+:link: evaluation
+:link-type: doc
+Metrics, per-segment scoring, drift.
+:::
+
 :::{grid-item-card} {octicon}`search;1.1em` Embeddings and retrieval
 :link: embeddings
 :link-type: doc
@@ -47,6 +53,7 @@ over batches, reusing one loaded model across the whole scan rather than reloadi
 call. Everything else in this section is about where that work runs and how it is fed.
 
 - {doc}`inference`: the core loop, batch-first UDFs, and model reuse.
+- {doc}`tabular-models`: scoring a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model.
 - {doc}`gpu`: placing work on devices, sizing batches, and keeping the GPU busy.
 - {doc}`batch-scoring`: the offline scoring job end to end.
 - {doc}`pytorch`: handing batches straight to Torch with zero copies.
@@ -61,6 +68,15 @@ distribute like everything else.
 - {doc}`preprocessors`: scalers, encoders, imputers, binning, and composition.
 - {doc}`multimodal`: decoding images, audio, and video into tensor columns.
 - {doc}`tokenization`: tokenizing as a pipeline stage, and packing sequences.
+
+## Measure what the model does
+
+A model is only as trustworthy as the numbers around it, and those numbers are queries.
+Every metric here is an expression the engine evaluates, so a report over a billion scored
+rows is one pass and the same report *per segment* costs the same.
+
+- {doc}`evaluation`: metrics, per-segment scoring, and the diagnostic tables.
+- {doc}`statistics-and-drift`: statistical expressions, input drift, and honest splits.
 
 ## Embeddings, retrieval, and generation
 
@@ -99,10 +115,19 @@ training covers feeding a loop that lives elsewhere. Both keep the data plane in
 :caption: Run a model
 
 inference
+tabular-models
 gpu
 batch-scoring
 pytorch
 streaming
+```
+
+```{toctree}
+:hidden:
+:caption: Measure what the model does
+
+evaluation
+statistics-and-drift
 ```
 
 ```{toctree}

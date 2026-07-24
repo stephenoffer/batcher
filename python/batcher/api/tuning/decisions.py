@@ -23,6 +23,7 @@ import dataclasses
 import math
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config, config_context
 from batcher.plan.logical import Aggregate, Distinct, Join, Sort, Union, Window
 
@@ -105,7 +106,8 @@ def learned_num_workers(
         if target <= 0:
             return None
         return min(max(1, math.ceil(rows / target)), cluster_nodes)
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("api", "size worker count", exc)
         return None
 
 
@@ -139,7 +141,8 @@ def auto_num_partitions(plan: LogicalPlan, sources: list[Source], hub: MetadataH
         width = est.row_width(plan, opt.row_bytes)
         byte_parts = math.ceil(rows * width / max(1, opt.target_bytes_per_task))
         return _clamp_partitions(max(row_parts, byte_parts))
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("api", "size partitions", exc)
         return DEFAULT_PARTITIONS
 
 
@@ -252,8 +255,8 @@ def record_run_feedback(
         if isinstance(plan, Aggregate) and plan.group_keys and input_rows:
             record_group_reduction(hub, plan_signature(plan), float(out_rows), float(input_rows))
         record_join_outcomes(hub, logical_opt, decisions, wall_ms)
-    except Exception:  # pragma: no cover - recording must never break a query
-        return
+    except Exception as exc:  # pragma: no cover - recording must never break a query
+        note_suppressed("api", "record run feedback", exc)
 
 
 def record_join_outcomes(
@@ -315,8 +318,8 @@ def record_join_outcomes(
         if distributed and dec.build_bytes > 0.0:
             arm = "broadcast" if dec.broadcast else "shuffle"
             record_broadcast_timing(hub, arm, float(dec.build_bytes), wall_ms)
-    except Exception:  # pragma: no cover - recording must never break a query
-        return
+    except Exception as exc:  # pragma: no cover - recording must never break a query
+        note_suppressed("api", "record join outcomes", exc)
 
 
 def record_shuffle_outcome(hub: MetadataHub | None, plan: LogicalPlan, credits: int) -> None:

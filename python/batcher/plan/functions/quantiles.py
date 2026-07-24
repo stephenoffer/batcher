@@ -5,6 +5,10 @@ The SQL-style top-level spellings of the distribution aggregates — the same sh
 (DDSketch/KLL) and `approx_n_unique` (HyperLogLog) trade a little accuracy for bounded
 memory, and `histogram` builds a value→count map. The sketch-backed ones are mergeable, so
 the estimate is identical single-node and distributed.
+
+The named quartiles `q1`/`q3` and their difference `iqr` live here too: they are the
+0.25/0.75 quantiles under a friendlier name, so `quantile`'s semantics — exactness, null
+handling, the type of the result — are theirs by construction rather than by coincidence.
 """
 
 from __future__ import annotations
@@ -115,3 +119,63 @@ def histogram(column: str | Expr) -> AggExpr:
             {'h': [[(1, 2), (2, 1)]]}
     """
     return _as_column(column).histogram()
+
+
+def q1(column: str | Expr) -> AggExpr:
+    """First quartile — the 0.25 quantile of a column.
+
+    Args:
+        column: The column (or expression) to summarize.
+
+    Returns:
+        An aggregate expression of the first quartile.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
+            >>> ds.agg(v=bt.q1("x")).to_pydict()
+            {'v': [2.75]}
+    """
+    return _as_column(column).quantile(0.25)
+
+
+def q3(column: str | Expr) -> AggExpr:
+    """Third quartile — the 0.75 quantile of a column.
+
+    Args:
+        column: The column (or expression) to summarize.
+
+    Returns:
+        An aggregate expression of the third quartile.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
+            >>> ds.agg(v=bt.q3("x")).to_pydict()
+            {'v': [6.25]}
+    """
+    return _as_column(column).quantile(0.75)
+
+
+def iqr(column: str | Expr) -> Expr:
+    """Interquartile range — ``q3 - q1``, the robust spread used for outlier fences.
+
+    Args:
+        column: The column (or expression) to summarize.
+
+    Returns:
+        The interquartile range per group.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
+            >>> ds.agg(v=bt.iqr("x")).to_pydict()
+            {'v': [3.5]}
+    """
+    return q3(column) - q1(column)

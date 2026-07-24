@@ -15,7 +15,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
-__all__ = ["is_local_path", "read_each_file"]
+__all__ = ["is_local_path", "read_each_file", "total_file_bytes"]
 
 T = TypeVar("T")
 
@@ -56,3 +56,25 @@ def read_each_file(fs: Any, files: list[str], read_one: Callable[[Any, str], T])
     workers = min(len(files), _CONCURRENCY)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(lambda path: read_one(fs, path), files))  # order preserved
+
+
+def total_file_bytes(fs: Any, files: list[str]) -> int | None:
+    """The summed on-disk byte size of every file, or None if it can't be stated whole.
+
+    A *partial* total is worse than none: read-cost prediction and `total_bytes` sum across
+    sources, so one unreadable size would silently under-report the whole query. Any file
+    whose size cannot be read voids the figure rather than skewing it. Sizes are read
+    concurrently for a remote store (each is one latency-bound HEAD) via :func:`read_each_file`.
+
+    One home for the "sum sizes, void on any gap" rule, shared by `FileSource.statistics`, the
+    delimited row estimator, and the standalone text source — it was pasted into all three.
+    """
+    if not files:
+        return None
+    try:
+        sizes = read_each_file(fs, files, lambda filesystem, path: filesystem.size(path))
+    except Exception:
+        return None
+    if any(s is None for s in sizes):
+        return None
+    return sum(sizes) or None

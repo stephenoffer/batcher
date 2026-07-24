@@ -18,6 +18,7 @@ corruption; when in doubt this returns `None`.
 
 from __future__ import annotations
 
+from batcher._internal.mathx import is_nan
 from batcher.config import Config
 from batcher.kyber.learning import load_learned_stats
 from batcher.kyber.metadata_answer import _root_stats, exact_null_count
@@ -317,9 +318,7 @@ def _bloom_absent(stat: ColumnStat, value) -> bool:
 
 def _is_nan(value) -> bool:
     """Whether `value` is a float NaN (comparisons against which prove nothing)."""
-    import math
-
-    return isinstance(value, float) and math.isnan(value)
+    return is_nan(value)
 
 
 def _is_zero_float(value) -> bool:

@@ -48,9 +48,7 @@ def test_packing_is_always_an_exact_ordered_cover() -> None:
         n = rng.randint(0, 40)
         files = [f"f{i}" for i in range(n)]
         sizes = [rng.randint(0, 300) for _ in range(n)]
-        groups = pack_by_count_and_bytes(
-            files, sizes, rng.randint(1, 8), rng.randint(1, 400)
-        )
+        groups = pack_by_count_and_bytes(files, sizes, rng.randint(1, 8), rng.randint(1, 400))
         assert [f for g in groups for f in g] == files, "not an exact, ordered cover"
         assert all(g for g in groups), "emitted an empty group"
 

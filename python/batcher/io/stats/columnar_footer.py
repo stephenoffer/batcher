@@ -28,11 +28,11 @@ executing:
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.mathx import is_nan
 from batcher.io._concurrent import read_each_file
 from batcher.io.stats.sortedness import proved_sorted_by
 from batcher.plan.source_stats import SourceStatistics
@@ -115,11 +115,6 @@ def is_exact_minmax_type(arrow_type: pa.DataType) -> bool:
     one provenance rule.
     """
     return any(pred(arrow_type) for pred in _EXACT_MINMAX_TYPES)
-
-
-def _is_nan(value: Any) -> bool:
-    """True iff `value` is a floating NaN (unordered → an unusable min/max bound)."""
-    return isinstance(value, float) and math.isnan(value)
 
 
 def _native_accumulators(stats: Any) -> dict[str, _ColAcc]:
@@ -326,7 +321,7 @@ def _accumulate(acc: _ColAcc, column) -> None:
         acc.null_known = False
     if getattr(stats, "has_min_max", False):
         cmin, cmax = stats.min, stats.max
-        if _is_nan(cmin) or _is_nan(cmax):
+        if is_nan(cmin) or is_nan(cmax):
             # A NaN bound is unordered; poison this column's min/max (kept null so
             # an exact min()/max() falls back rather than returning a wrong value).
             acc.nan_seen = True

@@ -172,7 +172,9 @@ def test_to_dict_from_dict_round_trip_is_idempotent():
 
 
 def test_to_dict_is_json_encodable():
-    json.dumps(Config().to_dict())
+    """The dict has to survive a JSON round trip: it is how a config reaches a Ray worker."""
+    encoded = json.dumps(Config().to_dict())
+    assert json.loads(encoded) == Config().to_dict()
 
 
 def test_to_dict_only_non_default_is_minimal():

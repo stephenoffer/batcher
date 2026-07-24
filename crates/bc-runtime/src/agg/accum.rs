@@ -7,7 +7,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Decimal128Array, Float64Array, Int64Array,
     LargeBinaryArray, LargeStringArray, StringArray, UInt32Array,
 };
-use arrow::compute::{concat, take};
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int64Type};
 
 use super::{accumulate, arg_extreme_state, covar_state, AggCall, AggFunc, Partial};
@@ -512,11 +512,15 @@ pub(crate) fn masked_f64(vals: Vec<f64>, valid: Vec<bool>) -> Float64Array {
     Float64Array::from_iter(vals.into_iter().zip(valid).map(|(v, ok)| ok.then_some(v)))
 }
 
+/// Concatenate the partials' columns for a `combine`.
+///
+/// Through [`crate::gather::concat_columns`], not arrow's `concat` directly — on a
+/// high-cardinality string key this is the copy that dominates the whole combine.
 pub(crate) fn concat_col<'a>(
     it: impl Iterator<Item = &'a ArrayRef>,
 ) -> Result<ArrayRef, RuntimeError> {
     let cols: Vec<&dyn Array> = it.map(|a| a.as_ref()).collect();
-    Ok(concat(&cols)?)
+    crate::gather::concat_columns(&cols)
 }
 
 pub(crate) fn require(values: Option<&ArrayRef>, func: AggFunc) -> Result<&ArrayRef, RuntimeError> {

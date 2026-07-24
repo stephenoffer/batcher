@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.kyber.learning import load_learned_stats
+from batcher.kyber.stats.distribution import mcv_join_rows
 from batcher.kyber.stats.estimator import StatsEstimator
 from batcher.plan.stats import RelStats
 
@@ -41,16 +42,63 @@ if TYPE_CHECKING:
 __all__ = ["hot_join_values"]
 
 
-def _hot(stats: RelStats, key: str, min_fraction: float) -> set[str]:
-    """The values of `key` measured to hold at least `min_fraction` of the relation's rows.
+def _frequencies(stats: RelStats, key: str) -> dict[str, float]:
+    """`{value: measured share of rows}` for `key`.
 
     Read off the relation's *propagated* column statistics, so a key that reaches the join
     through filters and projections is still answered by the statistics of the column it
     actually came from — and by the right table's, not another table's column of the same
     name.
     """
-    mcv = stats.column(key).mcv or {}
-    return {value for value, fraction in mcv.items() if fraction >= min_fraction}
+    return dict(stats.column(key).mcv or {})
+
+
+def _hot(stats: RelStats, key: str, min_fraction: float) -> set[str]:
+    """The values of `key` measured to hold at least `min_fraction` of the relation's rows."""
+    return {v for v, fraction in _frequencies(stats, key).items() if fraction >= min_fraction}
+
+
+def _overloading(
+    left_freq: dict[str, float],
+    right_freq: dict[str, float],
+    left_ndv: float | None,
+    right_ndv: float | None,
+    partitions: int,
+) -> set[str]:
+    """Values whose reducer would carry more than its share of the shuffle, at `partitions` wide.
+
+    A fixed fraction is the wrong test for skew, twice over.
+
+    **It ignores the shuffle's width.** Every reducer's fair share is `1/P` of the work, so a
+    value at 5% is harmless across 4 reducers and a 10x straggler across 200. The threshold
+    that matters is `f > 1/P`, and it moves with the cluster.
+
+    **It ignores that a join multiplies.** The reducer owning `v` receives
+    `f_L(v)|L| + f_R(v)|R|` input rows but *emits* `f_L(v)·f_R(v)·|L||R|`, and the join's whole
+    output is `S·|L||R|` where `S = Σ_u f_L(u)f_R(u)` is the total match probability — a number
+    far below 1 (about `1/d` for a uniform key). So `v`'s share of the output is
+    `f_L(v)·f_R(v)/S`, which for a key with a million distinct values is amplified by six
+    orders of magnitude relative to the raw product. Two frequencies that look unremarkable on
+    their own inputs can therefore hand one reducer most of the join's output, and no test on
+    either side alone can see it — which is exactly the straggler that only appears at scale.
+
+    `S` is the same skew-plus-residual total the cardinality estimator computes for this join
+    (`mcv_join_rows` at unit sizes), so the two cannot disagree about how big the join is.
+    Without a frequency table on both sides there is no product to evaluate and only the input
+    test applies.
+    """
+    if partitions <= 1:
+        return set()
+    share = 1.0 / partitions
+    hot = {v for v, f in left_freq.items() if f > share}
+    hot |= {v for v, f in right_freq.items() if f > share}
+    total = mcv_join_rows(1.0, 1.0, left_freq, right_freq, left_ndv, right_ndv)
+    if total is not None and total > 0.0:
+        for value, f_left in left_freq.items():
+            f_right = right_freq.get(value)
+            if f_right is not None and (f_left * f_right) / total > share:
+                hot.add(value)  # unremarkable inputs, an overloaded output
+    return hot
 
 
 def hot_join_values(
@@ -58,6 +106,7 @@ def hot_join_values(
     sources: list,
     hub: MetadataHub | None,
     min_fraction: float,
+    partitions: int | None = None,
 ) -> list[str]:
     """The known-hot values of a single-key join's key, from measured column statistics.
 
@@ -70,6 +119,10 @@ def hot_join_values(
         sources: The bound inputs, indexed by a `Scan`'s `source_id`.
         hub: The metadata hub holding the measured column statistics.
         min_fraction: The share of rows a value must hold to count as hot.
+        partitions: How many reduce partitions the shuffle fans into. When given, a value
+            also counts as hot if it would overload one reducer relative to an even split —
+            including through the *product* of two individually unremarkable frequencies
+            (see `_overloading`). Omitting it keeps the plain fraction test.
 
     Returns:
         The hot key values, sorted, as strings; empty when none are known.
@@ -83,7 +136,14 @@ def hot_join_values(
     except Exception:  # pragma: no cover - a statistics failure must never fail a join
         return []
     # Either side being skewed overloads the reducer that owns the key, so both count.
-    hot = _hot(left, join.left_keys[0], min_fraction) | _hot(
-        right, join.right_keys[0], min_fraction
-    )
+    lk, rk = join.left_keys[0], join.right_keys[0]
+    hot = _hot(left, lk, min_fraction) | _hot(right, rk, min_fraction)
+    if partitions is not None:
+        hot |= _overloading(
+            _frequencies(left, lk),
+            _frequencies(right, rk),
+            left.column(lk).ndv,
+            right.column(rk).ndv,
+            partitions,
+        )
     return sorted(hot)

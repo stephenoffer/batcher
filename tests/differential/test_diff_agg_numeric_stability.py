@@ -35,7 +35,7 @@ def _approx_matches(out, duck, cols):
     # bit-for-bit, so compare with a relative tolerance. This still catches the old
     # cancelling formula, which returned 0.0 or NULL — off by ~100%, not ~1e-9.
     got = out.to_pydict()
-    want = {k: v for k, v in zip(cols, duck.fetchone(), strict=True)}
+    want = dict(zip(cols, duck.fetchone(), strict=True))
     for k in cols:
         assert got[k][0] == pytest.approx(want[k], rel=1e-7), f"{k}: {got[k][0]} vs {want[k]}"
 
@@ -59,7 +59,8 @@ def test_skewness_kurtosis_stable_at_large_offset(duck):
     # Enough points (asymmetric) that kurtosis is defined (n >= 4) and non-trivial.
     base = (1.0, 2.0, 3.0, 4.0, 10.0, 1.0, 2.0)
     xs = [_OFF + v for v in base]
-    out = bt.from_arrow(pa.table({"x": xs})).agg(s=col("x").skewness(), k=col("x").kurtosis()).collect()
+    ds = bt.from_arrow(pa.table({"x": xs}))
+    out = ds.agg(s=col("x").skewness(), k=col("x").kurtosis()).collect()
     # Skewness/kurtosis are translation-invariant, so the oracle is DuckDB on the
     # *un-offset* data — where DuckDB is stable. (At `_OFF` DuckDB's own sum-of-powers
     # formula catastrophically cancels and returns NaN, so it cannot be the oracle there;

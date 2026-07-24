@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array};
 use arrow::compute::{cast_with_options, CastOptions};
+use arrow::datatypes::{Float32Type, Float64Type, Int8Type, Int64Type};
 use arrow::error::ArrowError;
 
 use crate::ExprError;
@@ -113,10 +114,7 @@ pub(crate) fn cast_expr(
         // Round half-to-even first (DuckDB DOUBLE→BIGINT), then cast the now-integral
         // floats. `f64::round_ties_even` is banker's rounding.
         let f = cast_with_options(arr, &Float64, &opts)?;
-        let f = f
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("cast to Float64 yields Float64Array");
+        let f = f.as_primitive::<Float64Type>();
         let rounded: Float64Array = f.iter().map(|o| o.map(f64::round_ties_even)).collect();
         let rounded: ArrayRef = Arc::new(rounded);
         return Ok(cast_with_options(&rounded, target, &opts)?);
@@ -135,15 +133,9 @@ pub(crate) fn cast_expr(
     if narrowing_float {
         let out = cast_with_options(arr, target, &opts)?;
         let src64 = cast_with_options(arr, &Float64, &opts)?;
-        let src64 = src64
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("cast to Float64 yields Float64Array");
+        let src64 = src64.as_primitive::<Float64Type>();
         let out64 = cast_with_options(&out, &Float64, &opts)?;
-        let out64 = out64
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("cast to Float64 yields Float64Array");
+        let out64 = out64.as_primitive::<Float64Type>();
         let overflow: BooleanArray = (0..src64.len())
             .map(|i| {
                 Some(
@@ -188,7 +180,7 @@ fn parse_bool_token(s: &str) -> Option<bool> {
 /// [`parse_bool_token`]). Nulls pass through; an unrecognized token becomes NULL when
 /// `try_cast`, else errors the cast (DuckDB strict `CAST`).
 fn parse_string_to_bool(arr: &ArrayRef, try_cast: bool) -> Result<ArrayRef, ExprError> {
-    use arrow::array::{BooleanBuilder, LargeStringArray, StringArray};
+    use arrow::array::BooleanBuilder;
     use arrow::datatypes::DataType;
     let mut builder = BooleanBuilder::with_capacity(arr.len());
     let mut push = |opt: Option<&str>| -> Result<(), ExprError> {
@@ -208,19 +200,13 @@ fn parse_string_to_bool(arr: &ArrayRef, try_cast: bool) -> Result<ArrayRef, Expr
     };
     match arr.data_type() {
         DataType::Utf8 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Utf8 array");
+            let a = arr.as_string::<i32>();
             for o in a.iter() {
                 push(o)?;
             }
         }
         DataType::LargeUtf8 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("LargeUtf8 array");
+            let a = arr.as_string::<i64>();
             for o in a.iter() {
                 push(o)?;
             }
@@ -383,10 +369,7 @@ fn parse_string_to_int(
     // Float fallback for the rest: parse as f64, round half-away (`f64::round`), then to the
     // integer type (which NULLs an out-of-range or non-finite value under `safe`).
     let f = cast_with_options(trimmed, &arrow::datatypes::DataType::Float64, &safe)?;
-    let f = f
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .expect("cast to Float64 yields Float64Array");
+    let f = f.as_primitive::<Float64Type>();
     let rounded: Float64Array = f.iter().map(|o| o.map(f64::round)).collect();
     let fallback = cast_with_options(&(Arc::new(rounded) as ArrayRef), target, &safe)?;
     // Prefer the exact parse; use the rounded double only where the exact parse yielded NULL.
@@ -427,10 +410,7 @@ fn float_to_string(
     use arrow::datatypes::DataType;
     let strs = cast_with_options(arr, target, opts)?;
     let f = cast_with_options(arr, &DataType::Float64, opts)?;
-    let f = f
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .expect("cast to Float64 yields Float64Array");
+    let f = f.as_primitive::<Float64Type>();
     // Map arrow's string for row `i` to DuckDB's, given the row's float value.
     let fix = |i: usize, s: &str| -> String {
         let v = f.value(i);
@@ -442,17 +422,14 @@ fn float_to_string(
     };
     match target {
         DataType::Utf8 => {
-            let a = strs.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            let a = strs.as_string::<i32>();
             let out: StringArray = (0..a.len())
                 .map(|i| (!a.is_null(i)).then(|| fix(i, a.value(i))))
                 .collect();
             Ok(Arc::new(out) as ArrayRef)
         }
         DataType::LargeUtf8 => {
-            let a = strs
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("LargeUtf8");
+            let a = strs.as_string::<i64>();
             let out: LargeStringArray = (0..a.len())
                 .map(|i| (!a.is_null(i)).then(|| fix(i, a.value(i))))
                 .collect();
@@ -465,7 +442,6 @@ fn float_to_string(
 #[cfg(test)]
 mod narrowing_float_tests {
     use super::*;
-    use arrow::array::Float32Array;
     use arrow::datatypes::DataType;
 
     fn f64arr(v: Vec<Option<f64>>) -> ArrayRef {
@@ -486,7 +462,7 @@ mod narrowing_float_tests {
             None,
         ]);
         let out = cast_expr(&src, &DataType::Float32, true).unwrap();
-        let out = out.as_any().downcast_ref::<Float32Array>().unwrap();
+        let out = out.as_primitive::<Float32Type>();
         let got: Vec<Option<f32>> = (0..out.len())
             .map(|i| (!out.is_null(i)).then(|| out.value(i)))
             .collect();
@@ -519,7 +495,7 @@ mod narrowing_float_tests {
     /// while `2.4 → 2` and `2.6 → 3` are unambiguous. Nulls pass through.
     #[test]
     fn decimal_to_int_rounds_half_away_from_zero() {
-        use arrow::array::{Decimal128Array, Int64Array};
+        use arrow::array::Decimal128Array;
         let src: ArrayRef = Arc::new(
             Decimal128Array::from(vec![
                 Some(25),  // 2.5
@@ -535,7 +511,7 @@ mod narrowing_float_tests {
             .unwrap(),
         );
         let out = cast_expr(&src, &DataType::Int64, false).unwrap();
-        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let out = out.as_primitive::<Int64Type>();
         let got: Vec<Option<i64>> = (0..out.len())
             .map(|i| (!out.is_null(i)).then(|| out.value(i)))
             .collect();
@@ -561,7 +537,7 @@ mod narrowing_float_tests {
     /// empty string still fails (→ NULL under try_cast); an internal space still fails.
     #[test]
     fn string_to_number_trims_surrounding_whitespace() {
-        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::array::StringArray;
         use arrow::datatypes::DataType;
         let src: ArrayRef = Arc::new(StringArray::from(vec![
             Some("  12  "),
@@ -575,7 +551,7 @@ mod narrowing_float_tests {
         ]));
         // try_cast → NULL where the trimmed value still won't parse.
         let out = cast_expr(&src, &DataType::Int64, true).unwrap();
-        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let out = out.as_primitive::<Int64Type>();
         let got: Vec<Option<i64>> = (0..out.len())
             .map(|i| (!out.is_null(i)).then(|| out.value(i)))
             .collect();
@@ -586,7 +562,7 @@ mod narrowing_float_tests {
         // Float target trims too.
         let fsrc: ArrayRef = Arc::new(StringArray::from(vec![Some(" 2.75 "), Some("  -0.5")]));
         let fout = cast_expr(&fsrc, &DataType::Float64, false).unwrap();
-        let fout = fout.as_any().downcast_ref::<Float64Array>().unwrap();
+        let fout = fout.as_primitive::<Float64Type>();
         assert_eq!(fout.value(0), 2.75);
         assert_eq!(fout.value(1), -0.5);
         // A clean padded value parses under strict cast (no error).
@@ -596,10 +572,7 @@ mod narrowing_float_tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            ok.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
-            42
-        );
+        assert_eq!(ok.as_primitive::<Int64Type>().value(0), 42);
     }
 
     /// String→Boolean matches DuckDB's exact set. Arrow's kernel trims whitespace, accepts
@@ -630,7 +603,7 @@ mod narrowing_float_tests {
             None,
         ]));
         let out = cast_expr(&src, &DataType::Boolean, true).unwrap();
-        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let out = out.as_boolean();
         let got: Vec<Option<bool>> = (0..out.len())
             .map(|i| (!out.is_null(i)).then(|| out.value(i)))
             .collect();
@@ -662,21 +635,21 @@ mod narrowing_float_tests {
         // A clean token still parses under strict cast.
         let ok: ArrayRef = Arc::new(StringArray::from(vec![Some("t")]));
         let ok = cast_expr(&ok, &DataType::Boolean, false).unwrap();
-        assert!(ok.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
+        assert!(ok.as_boolean().value(0));
     }
 }
 
 #[cfg(test)]
 mod string_to_int_tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::StringArray;
     use arrow::datatypes::DataType;
 
     fn strs(v: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(v))
     }
     fn as_i64_opt(a: &ArrayRef) -> Vec<Option<i64>> {
-        let a = a.as_any().downcast_ref::<Int64Array>().expect("i64");
+        let a = a.as_primitive::<Int64Type>();
         (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i)))
             .collect()
@@ -769,10 +742,9 @@ mod string_to_int_tests {
     /// (NULL/try, error/strict) while an in-range fractional value rounds and fits.
     #[test]
     fn string_to_narrow_int_range_checks() {
-        use arrow::array::Int8Array;
         let src = strs(vec![Some("300"), Some("12.5"), Some("-5.5")]);
         let out = cast_expr(&src, &DataType::Int8, true).unwrap();
-        let a = out.as_any().downcast_ref::<Int8Array>().unwrap();
+        let a = out.as_primitive::<Int8Type>();
         let got: Vec<Option<i8>> = (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i)))
             .collect();
@@ -783,7 +755,7 @@ mod string_to_int_tests {
 #[cfg(test)]
 mod float_to_string_tests {
     use super::*;
-    use arrow::array::{Float64Array, StringArray};
+    use arrow::array::Float64Array;
     use arrow::datatypes::DataType;
 
     /// DuckDB renders a float NaN as `nan`, where arrow's formatter emits `NaN`; that one
@@ -809,7 +781,7 @@ mod float_to_string_tests {
             None,
         ]));
         let out = cast_expr(&src, &DataType::Utf8, false).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let out = out.as_string::<i32>();
         let got: Vec<Option<&str>> = (0..out.len())
             .map(|i| (!out.is_null(i)).then(|| out.value(i)))
             .collect();

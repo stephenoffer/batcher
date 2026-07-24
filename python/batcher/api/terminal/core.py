@@ -12,6 +12,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError, PlanError
+from batcher._internal.mathx import ceil_div
 from batcher.api.orchestration import with_auto_config
 from batcher.api.terminal.metadata_answer import (
     metadata_aggregate_table,
@@ -601,7 +602,7 @@ def _write(
     # `target_bytes_per_file` using the materialized byte size.
     if max_rows_per_file is None and table.num_rows:
         if num_files is not None:
-            max_rows_per_file = -(-table.num_rows // num_files)  # ceil-divide
+            max_rows_per_file = ceil_div(table.num_rows, num_files)
         elif target_bytes_per_file is not None and table.nbytes:
             rows = table.num_rows * target_bytes_per_file // table.nbytes
             max_rows_per_file = max(1, int(rows))

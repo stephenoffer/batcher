@@ -296,18 +296,22 @@ def _local_columns(tr, select_node):
     return cols
 
 
-def _correlation_pair(leaf, local: set[str], local_cols: set[str] | None = None):
-    """If `leaf` is `outer.col = inner.col`, return `(outer_col, inner_col)`.
+def _correlation_pair(leaf, local: set[str], local_cols: set[str] | None = None, *, op=None):
+    """If `leaf` is `outer.col <op> inner.col`, return `(outer_col, inner_col)`.
 
     Exactly one side must be an outer reference; the other is local. A side is outer
     when it is qualified by a table outside `local`, or — for an unqualified column
     when `local_cols` is known — when its name is not among the local tables' columns
     (TPC-H references outer columns unqualified, e.g. ``l_orderkey = o_orderkey``).
     Otherwise return None (a local predicate).
+
+    `op` is the sqlglot comparison class the leaf must be, defaulting to `exp.EQ`. The
+    `<>` decorrelation in `subquery_neq` passes `exp.NEQ`: the outer-reference analysis is
+    identical for both, and it was a verbatim copy until it was parameterized here.
     """
     from sqlglot import expressions as exp
 
-    if not isinstance(leaf, exp.EQ):
+    if not isinstance(leaf, op or exp.EQ):
         return None
     lhs, rhs = leaf.this, leaf.expression
     if not (isinstance(lhs, exp.Column) and isinstance(rhs, exp.Column)):

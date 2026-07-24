@@ -211,7 +211,19 @@ class LanceSource:
         yield from self._dataset().scanner(columns=projection, filter=flt).to_batches()
 
     def row_count(self) -> int | None:
-        return self._dataset().count_rows()
+        """The exact row count from the Lance manifest, honoring the source's own filter.
+
+        `count_rows` reads the manifest (no scan) and accepts the constructor `predicate`, so
+        a source built with ``predicate=`` reports its *filtered* cardinality. Passing the
+        filter is a correctness requirement, not an optimization: `row_count()` seeds an EXACT
+        `SourceStatistics`, from which a terminal ``count()`` may be answered without
+        executing — so an unfiltered count here would answer ``count()`` for a predicated
+        source with the whole dataset's size, an exact-looking result that is simply wrong.
+
+        Kyber's separately pushed *read-time* predicates are not baked into the source and are
+        correctly excluded, exactly as a Scan leaf's statistics describe the base relation.
+        """
+        return self._dataset().count_rows(self._predicate)
 
     def identity(self) -> str:
         return f"lance:{self._uri}"

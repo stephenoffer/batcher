@@ -168,7 +168,7 @@ def test_machine_memory_takes_the_min_of_host_and_cgroup(monkeypatch):
     monkeypatch.setattr(hardware, "cgroup_v2_dirs", lambda: ["/sys/fs/cgroup"])
     monkeypatch.setattr(hardware, "read_cgroup_bytes", lambda p: 8 << 30)
     monkeypatch.setattr(
-        hardware.os, "sysconf", lambda name: (4096 if "PHYS" not in name else (64 << 30) // 4096)
+        hardware.os, "sysconf", lambda name: 4096 if "PHYS" not in name else (64 << 30) // 4096
     )
     assert hardware.machine_memory_bytes() == 8 << 30
     hardware.machine_memory_bytes.cache_clear()

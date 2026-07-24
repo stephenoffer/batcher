@@ -26,7 +26,38 @@ from typing import Any
 
 from batcher._internal.errors import IOError as _IOError
 
-__all__ = ["normalize_path", "normalize_source_path"]
+__all__ = ["hive_segment", "normalize_path", "normalize_source_path"]
+
+
+def hive_segment(name: str) -> tuple[str, str] | None:
+    """Parse a ``col=val`` directory basename, or None if it isn't one.
+
+    Lives here rather than beside either reader because both the Hive-aware dataset
+    source (which *uses* the partition columns) and the plain file source (which must
+    notice it is about to *lose* them) have to agree on what a partition directory is.
+    Two copies of this rule would drift into one reader warning about a layout the other
+    does not treat as partitioned.
+
+    Args:
+        name: A directory name or path whose last segment is examined.
+
+    Returns:
+        The ``(column, value)`` pair, or None when the segment is not ``col=val``.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.base._paths import hive_segment
+            >>> hive_segment("dt=2024-01-01")
+            ('dt', '2024-01-01')
+            >>> hive_segment("plain") is None
+            True
+    """
+    base = name.rstrip("/").rsplit("/", 1)[-1]
+    if "=" not in base:
+        return None
+    col, _, val = base.partition("=")
+    return (col, val) if col else None
 
 
 def _scheme_of(path: str) -> str:

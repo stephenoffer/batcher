@@ -34,6 +34,7 @@ from collections import deque
 
 import pyarrow as pa
 
+from batcher._internal.mathx import clamp
 from batcher.config import active_config
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -145,7 +146,7 @@ def _consumer_pool_size(gpu_stage, workers: int, num_partitions: int) -> int:
         resources=dict(getattr(gpu_stage, "resources", ()) or ()),
     )
     size = _resolve_pool_size(gpu_stage.concurrency, num_partitions, default)
-    return max(1, min(size, num_partitions))
+    return clamp(num_partitions, 1, size)
 
 
 def stream_distributed_pipeline(
@@ -182,7 +183,7 @@ def stream_distributed_pipeline(
         return pa.table({})
 
     credits = max(1, active_config().flow_control.default_credits)
-    n_producers = max(1, min(workers, n))
+    n_producers = clamp(n, 1, workers)
     n_consumers = _consumer_pool_size(gpu_stage, workers, n)
     gpu_opts = _gpu_options(gpu_stage.num_gpus, gpu_stage.accelerator_type)
 

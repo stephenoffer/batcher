@@ -81,16 +81,29 @@ def test_nullif_carries_the_column_bounds():
     assert stat.null_count is None  # NULLIF adds nulls
 
 
-def test_greatest_least_use_the_bounding_box():
+def test_greatest_and_least_bounds_are_tight_not_a_union_box():
+    """Which argument wins is known, so one end of each interval is much tighter than the box.
+
+    The union box `[min(mins), max(maxes)]` is a valid superset for both, but it throws away
+    the defining property: a `least` can never exceed the smallest of its arguments' maxima,
+    and a `greatest` can never fall below the largest of their minima.
+    """
     from batcher.plan.expr_ir import Col, Greatest, Least, Lit
 
     child = _child(0, 100)  # only column x ∈ [0, 100]
-    # greatest(x, 200): every value is x or 200 → box [0, 200].
+    # greatest(x, 200) is always 200 here: it cannot be below max(0, 200).
     g = derived_projection_stat(Greatest(inputs=[Col("x"), Lit(200)]), child)
-    assert g is not None and (g.min, g.max) == (0, 200)
-    # least(x, -5): box [-5, 100].
+    assert g is not None and (g.min, g.max) == (200, 200)
+    # least(x, -5) is always -5, for the mirrored reason.
     least = derived_projection_stat(Least(inputs=[Col("x"), Lit(-5)]), child)
-    assert least is not None and (least.min, least.max) == (-5, 100)
+    assert least is not None and (least.min, least.max) == (-5, -5)
+
+    # The clamping shape this exists for: `least(x, 50)` caps the column at 50, so a
+    # downstream `> 60` is provably empty rather than estimated at a third of the table.
+    capped = derived_projection_stat(Least(inputs=[Col("x"), Lit(50)]), child)
+    assert capped is not None and (capped.min, capped.max) == (0, 50)
+    floored = derived_projection_stat(Greatest(inputs=[Col("x"), Lit(50)]), child)
+    assert floored is not None and (floored.min, floored.max) == (50, 100)
 
 
 def test_greatest_of_unbounded_argument_is_unknown():
@@ -98,3 +111,69 @@ def test_greatest_of_unbounded_argument_is_unknown():
 
     # `y` has no bounds in the child → cannot bound the greatest.
     assert derived_projection_stat(Greatest(inputs=[Col("x"), Col("y")]), _child(0, 100)) is None
+
+
+def test_a_monotonic_projection_carries_the_quantile_grid_through():
+    """`F_y(g(x)) = F_x(x)` for a strictly increasing `g`, so the values move and the
+    probabilities do not — which is what keeps a range filter on a derived column sharp."""
+    from batcher.plan.expr_ir import Binary, Col, Lit
+    from batcher.plan.stats import ColumnStat, Provenance, RelStats
+
+    grid = {"probs": [0.0, 0.5, 1.0], "values": [0.0, 10.0, 100.0]}
+    child = RelStats(
+        1000.0,
+        Provenance.EXACT,
+        {"x": ColumnStat(min=0, max=100, quantiles=grid, provenance=Provenance.EXACT)},
+    )
+    scaled = derived_projection_stat(Binary("mul", Col("x"), Lit(100)), child)
+    assert scaled is not None and scaled.quantiles is not None
+    assert scaled.quantiles["values"] == [0.0, 1000.0, 10000.0]
+    assert scaled.quantiles["probs"] == [0.0, 0.5, 1.0]
+
+
+def test_a_decreasing_projection_reverses_the_grid_and_complements_the_probabilities():
+    from batcher.plan.expr_ir import Binary, Col, Lit
+    from batcher.plan.stats import ColumnStat, Provenance, RelStats
+
+    grid = {"probs": [0.0, 0.25, 1.0], "values": [0.0, 10.0, 100.0]}
+    child = RelStats(
+        1000.0,
+        Provenance.EXACT,
+        {"x": ColumnStat(min=0, max=100, quantiles=grid, provenance=Provenance.EXACT)},
+    )
+    negated = derived_projection_stat(Binary("mul", Col("x"), Lit(-1)), child)
+    assert negated is not None and negated.quantiles is not None
+    # The interpolator needs an ascending grid, so the values reverse and the probabilities
+    # become their complements.
+    assert negated.quantiles["values"] == [-100.0, -10.0, -0.0]
+    assert negated.quantiles["probs"] == [0.0, 0.75, 1.0]
+
+
+def test_a_monotonic_projection_carries_measured_skew_to_the_image_value():
+    """The map is injective, so no two values collide and every frequency transfers."""
+    from batcher.plan.expr_ir import Binary, Col, Lit
+    from batcher.plan.stats import ColumnStat, Provenance, RelStats
+
+    child = RelStats(
+        1000.0,
+        Provenance.EXACT,
+        {"x": ColumnStat(min=0, max=100, mcv={"7": 0.4}, provenance=Provenance.EXACT)},
+    )
+    shifted = derived_projection_stat(Binary("add", Col("x"), Lit(10)), child)
+    assert shifted is not None and shifted.mcv is not None
+    assert shifted.mcv == {"17.0": 0.4}
+
+
+def test_an_affine_projection_shifts_the_mean_exactly():
+    from batcher.plan.expr_ir import Binary, Col, Lit
+    from batcher.plan.stats import ColumnStat, Provenance, RelStats
+
+    child = RelStats(
+        1000.0,
+        Provenance.EXACT,
+        {"x": ColumnStat(min=0, max=100, mean=25.0, provenance=Provenance.EXACT)},
+    )
+    doubled = derived_projection_stat(Binary("mul", Col("x"), Lit(2)), child)
+    assert doubled is not None and doubled.mean == pytest.approx(50.0)
+    shifted = derived_projection_stat(Binary("sub", Col("x"), Lit(5)), child)
+    assert shifted is not None and shifted.mean == pytest.approx(20.0)

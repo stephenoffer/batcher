@@ -8,7 +8,9 @@ from `_DT_FIELDS` (data, not code).
 from __future__ import annotations
 
 import re
+from typing import Any
 
+from batcher.plan.expr_ir.compat.guidance import DT_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.func_nodes import (
     ConvertTimezone,
@@ -96,6 +98,24 @@ class _DtNamespace:
     def __repr__(self) -> str:
         """Show the accessor and its parent, e.g. ``<.dt accessor of col('ts')>``."""
         return f"<.dt accessor of {self._e!r}>"
+
+    def __getattr__(self, name: str) -> Any:
+        """Point a pandas/Polars ``.dt`` idiom at its Batcher spelling.
+
+        Only reached when normal lookup fails, so it never shadows a real ``.dt``
+        method. ``.dt.tz_convert``, ``.dt.round``, ``.dt.to_period`` come back naming
+        ``.dt.convert_timezone``, ``.dt.truncate``/``.dt.floor`` — see
+        `batcher.plan.expr_ir.compat.guidance`.
+
+        Args:
+            name: The attribute name that was not found.
+
+        Raises:
+            AttributeError: Always, with guidance for `name`.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise accessor_attribute_error(self, "'.dt' accessor", name, DT_UNSUPPORTED)
 
     def truncate(self, unit: str) -> DateTrunc:
         """Truncate each timestamp down to the start of ``unit``.

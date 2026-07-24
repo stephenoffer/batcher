@@ -9,6 +9,7 @@ before any work is scheduled).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import pyarrow as pa
@@ -91,3 +92,29 @@ class SchemaRef:
     @classmethod
     def from_arrow(cls, schema: pa.Schema) -> SchemaRef:
         return cls(schema)
+
+    @classmethod
+    def from_typed_fields(
+        cls, fields: Iterable[tuple[str, pa.DataType | None]]
+    ) -> SchemaRef | None:
+        """Build a schema from `(name, type)` pairs, or `None` if any type is unknown.
+
+        The all-or-nothing rule is the point, and it is why this is shared rather than
+        written per node: `available_schema` promises names *and* types, so one column whose
+        type cannot be inferred makes the whole schema unknown. A node that instead dropped
+        the uncertain column would hand callers a plausible schema that is missing a field,
+        and they would plan against it rather than falling back to a zero-row execution.
+        `Projection` and `Aggregate` each had their own copy of that loop.
+
+        Args:
+            fields: `(name, type)` pairs in output order; a `None` type means "not inferable".
+
+        Returns:
+            The schema, or `None` when any pair's type is `None`.
+        """
+        out: list[pa.Field] = []
+        for name, dtype in fields:
+            if dtype is None:
+                return None
+            out.append(pa.field(name, dtype))
+        return cls.from_arrow(pa.schema(out))

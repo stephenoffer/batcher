@@ -17,6 +17,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.mathx import safe_div
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.multimodal.media import MediaSource
 
@@ -44,7 +45,7 @@ class AudioSource(MediaSource):
         # `soundfile.info` reads only the header (frames/samplerate/channels);
         # the audio samples are never read.
         info = sf.info(io.BytesIO(data))
-        duration = info.frames / info.samplerate if info.samplerate else None
+        duration = safe_div(info.frames, info.samplerate, None)
         return {
             "sample_rate": int(info.samplerate),
             "channels": int(info.channels),

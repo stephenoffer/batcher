@@ -19,9 +19,9 @@ any pair whose literals are not mutually comparable.
 from __future__ import annotations
 
 import json
-import math
 import operator
 
+from batcher._internal.mathx import is_nan
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
@@ -63,7 +63,7 @@ def _key(expr: Expr) -> str:
 
 def _bad_literal(value: object) -> bool:
     """Whether a literal is NaN — unsafe to reason about by value (never equal to itself)."""
-    return isinstance(value, float) and math.isnan(value)
+    return is_nan(value)
 
 
 def _col_op_lit(conj: Expr) -> tuple[str, str, object] | None:

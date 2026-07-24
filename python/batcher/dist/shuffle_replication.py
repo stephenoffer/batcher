@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 
+from batcher._internal.logging import note_suppressed
 from batcher.dist.flight_worker import current_plan_id
 
 __all__ = ["replicate_shuffle_output"]
@@ -92,6 +93,7 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
     for (src, _host), ref in refs.items():
         try:
             replicas[src].append(ray.get(ref))
-        except Exception:  # unacked ⇒ never advertised; that source keeps recompute
+        except Exception as exc:  # unacked ⇒ never advertised; that source keeps recompute
+            note_suppressed("dist", "collect a replica acknowledgement", exc)
             continue
     return replicas if any(replicas) else None

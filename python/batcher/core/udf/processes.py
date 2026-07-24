@@ -20,6 +20,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
+from batcher._internal.mathx import ceil_div
 
 __all__ = ["run_map_processes", "shutdown_pool"]
 
@@ -129,7 +130,7 @@ def _input_shards(batches: list[pa.RecordBatch], nshards: int) -> tuple[list[str
     _SHM_COUNTER += 1
     root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
     stem = os.path.join(root, f"bcudf_{os.getpid()}_{_SHM_COUNTER}")
-    shard_size = -(-len(batches) // nshards)  # ceil-divide
+    shard_size = ceil_div(len(batches), nshards)
     groups = [batches[g : g + shard_size] for g in range(0, len(batches), shard_size)]
     paths = [f"{stem}_{g}.arrow" for g in range(len(groups))]
     with ThreadPoolExecutor(max_workers=min(len(groups), available_cpu_count())) as pool:

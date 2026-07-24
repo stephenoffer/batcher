@@ -10,9 +10,11 @@ store, completing the RAG loop (embed → write Lance → ANN search).
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
+from batcher.ml._embed_dedup import embed_unique
 from batcher.ml.inference import InferencePool
 
 if TYPE_CHECKING:
@@ -285,6 +287,7 @@ def embed(
     chunk_size: int | None = None,
     chunk_overlap: int = 0,
     output_type: str = "tensor",
+    dedup: bool = False,
     **pool_kwargs: object,
 ) -> Iterator[pa.RecordBatch]:
     """Append an embedding column produced from `text_column`.
@@ -329,6 +332,7 @@ def embed(
         chunk_overlap: characters shared between consecutive windows.
         output_type: ``"tensor"`` for a fixed-shape-tensor column, or
             ``"fixed_size_list"`` for the ``fixed_size_list<float32>`` Lance indexes.
+        dedup: encode each repeated text once per batch and reuse its vector (same result).
         pool_kwargs: further `InferencePool` options (e.g. ``target_latency_ms``).
 
     Raises:
@@ -352,11 +356,13 @@ def embed(
     def make_worker() -> Callable[[pa.RecordBatch], pa.RecordBatch]:
         encoder = encoder_factory()
 
+        encode = functools.partial(
+            _embed_matrix, encoder, pooling=pooling, chunk_size=chunk_size, overlap=chunk_overlap
+        )
+
         def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
             texts = batch.column(text_column).to_pylist()
-            matrix = _embed_matrix(
-                encoder, texts, pooling=pooling, chunk_size=chunk_size, overlap=chunk_overlap
-            )
+            matrix = embed_unique(texts, encode) if dedup else encode(texts)
             if normalize:
                 matrix = _l2_normalize(matrix)
             embeddings = _embedding_column(matrix, output_type)

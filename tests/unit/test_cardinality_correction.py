@@ -4,8 +4,9 @@ Every relational engine estimates cardinality structurally and gets it wrong. Ba
 distinguishing claim is that it *measures* how wrong, per operator shape, and folds that
 back into the next plan. This file pins the contract of that loop:
 
-* the factor is the **geometric** mean of `actual / estimated` (multiplicative, so a 4x
-  over- and a 4x under-estimate cancel),
+* the factor is a **geometric** average of `actual / estimated` (multiplicative, so a 4x
+  over- and a 4x under-estimate cancel), recency-weighted and shrunk toward "no correction"
+  by how much the samples agree — a consistent bias passes through, a noisy one does not,
 * only the most recent `window` samples count (the structural estimator sharpens over
   time, so a stale correction must decay),
 * an operator whose estimate did not come from the structural estimator contributes no
@@ -22,6 +23,7 @@ import pytest
 
 import batcher as bt
 from batcher.config import Config, active_config
+from batcher.kyber.correction import correction_factor
 from batcher.kyber.learning import CARDINALITY_CORRECTION_KEY, load_learned_stats
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata import MetadataHub
@@ -71,21 +73,39 @@ def test_no_correction_below_min_samples():
 
 
 @pytest.mark.unit
-def test_factor_is_the_geometric_mean_of_q_errors():
+def test_a_consistent_bias_passes_through_as_the_geometric_mean():
     hub = _hub()
-    _feed(hub, "sig", est=100, actual=400)  # q = 4
-    _feed(hub, "sig", est=100, actual=1600)  # q = 16
-    # geometric mean of 4 and 16 is 8; the arithmetic mean would be 10.
-    assert _corrections(hub)["sig"] == pytest.approx(8.0)
+    for _ in range(6):
+        _feed(hub, "sig", est=100, actual=800)  # q = 8, every time
+    # Samples that agree carry no uncertainty to shrink against, so the factor is the
+    # geometric mean itself. (The arithmetic mean of q-errors would be the wrong average:
+    # it does not make a 4x over- and a 4x under-estimate cancel.)
+    assert _corrections(hub)["sig"] == pytest.approx(8.0, rel=1e-6)
 
 
 @pytest.mark.unit
-def test_symmetric_errors_cancel_to_no_correction():
+def test_scattered_samples_are_shrunk_toward_no_correction():
+    # The same *average* error as above, but the runs disagree wildly about it. The mean of
+    # a scattered sample is mostly noise, so it must not be stamped onto the next plan at
+    # full strength: the correction lands between 1.0 and the raw geometric mean.
     hub = _hub()
-    _feed(hub, "sig", est=100, actual=400)  # q = 4
-    _feed(hub, "sig", est=100, actual=25)  # q = 1/4
-    # Exactly 1.0 means "the estimator is unbiased here" and is dropped entirely.
-    assert "sig" not in _corrections(hub)
+    for q in (0.5, 128.0, 1.0, 64.0, 0.25, 256.0):
+        _feed(hub, "sig", est=100, actual=int(100 * q))
+    raw = math.exp(sum(math.log(q) for q in (0.5, 128.0, 1.0, 64.0, 0.25, 256.0)) / 6)
+    factor = _corrections(hub)["sig"]
+    assert 1.0 < factor < raw, f"expected shrinkage below the raw geometric mean {raw}"
+
+
+@pytest.mark.unit
+def test_symmetric_errors_leave_essentially_no_correction():
+    hub = _hub()
+    for _ in range(3):
+        _feed(hub, "sig", est=100, actual=400)  # q = 4
+        _feed(hub, "sig", est=100, actual=25)  # q = 1/4
+    # The log q-errors average to zero, and what recency weighting leaves of the imbalance
+    # is shrunk away by how much the samples disagree. An unbiased estimator must not
+    # acquire a correction from its own noise.
+    assert _corrections(hub).get("sig", 1.0) == pytest.approx(1.0, abs=0.05)
 
 
 @pytest.mark.unit
@@ -130,7 +150,13 @@ def test_stale_samples_outside_the_window_are_dropped(narrow_window):
     _feed(hub, "sig", est=100, actual=100)  # accurate, then evicted
     _feed(hub, "sig", est=100, actual=400)  # q = 4
     _feed(hub, "sig", est=100, actual=1600)  # q = 16
-    assert _corrections(hub)["sig"] == pytest.approx(8.0)  # geomean(4, 16), not (1,4,16)
+    # Only the last two samples are in the window, so the factor is what those two imply —
+    # strictly above what all three would (the evicted accurate run would pull it down).
+    windowed = _corrections(hub)["sig"]
+    assert windowed == pytest.approx(correction_factor([math.log(4.0), math.log(16.0)], 2, 100.0))
+    assert windowed > correction_factor([0.0, math.log(4.0), math.log(16.0)], 2, 100.0), (
+        "an evicted accurate sample must not still be damping the correction"
+    )
 
 
 @pytest.mark.unit
@@ -252,10 +278,27 @@ def test_measured_absolute_rows_suppress_the_correction_sample():
 
 
 @pytest.mark.unit
-def test_geometric_mean_matches_an_explicit_computation():
+def test_factor_matches_the_estimator_applied_to_the_same_logs():
     hub = _hub()
     qs = [0.5, 2.0, 8.0]
     for q in qs:
         _feed(hub, "sig", est=1000, actual=int(1000 * q))
-    expected = math.exp(sum(math.log(q) for q in qs) / len(qs))
+    expected = correction_factor(
+        [math.log(q) for q in qs],
+        active_config().optimizer.cardinality_correction_min_samples,
+        active_config().optimizer.cardinality_correction_max_factor,
+    )
     assert _corrections(hub)["sig"] == pytest.approx(expected, rel=1e-6)
+    # And it sits between no correction and the raw geometric mean, in that direction.
+    raw = math.exp(sum(math.log(q) for q in qs) / len(qs))
+    assert 1.0 < _corrections(hub)["sig"] < raw
+
+
+@pytest.mark.unit
+def test_one_absurd_run_cannot_dominate_the_window():
+    # A UDF that exploded once produces a single astronomically large q-error. Clipping the
+    # *sample* (not just the final factor) bounds its influence to one window slot, so five
+    # accurate runs still hold the correction near 1.0. Without input clipping the single
+    # outlier drags the mean all the way to the clamp and pins it there.
+    logs = [0.0] * 5 + [math.log(1e9)]
+    assert correction_factor(logs, 2, 10.0) < 3.0

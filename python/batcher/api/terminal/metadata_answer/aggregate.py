@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.api.terminal.metadata_answer._core import (
     _has_row_limiter,
     _metadata_answerable,
@@ -202,7 +203,8 @@ def metadata_aggregate_table(
             # ORIGINAL node, whose `count_distinct(col)` derives directly from the (enriched)
             # EXACT ndv — the min/max/count path is unchanged, this only adds count-distinct.
             answer = _answer_keyless_aggregate_direct(plan, sources, stats)
-    except Exception:  # the metadata shortcut must never break a runnable query
+    except Exception as exc:  # the metadata shortcut must never break a runnable query
+        note_suppressed("api", "answer aggregate from metadata", exc)
         return None
     if answer is None:
         return None

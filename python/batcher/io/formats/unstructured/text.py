@@ -167,7 +167,39 @@ class TextSource:
         return batch.select(projection) if projection is not None else batch
 
     def row_count(self) -> int | None:
-        return None
+        """The exact row count in file mode (one row per file), else None.
+
+        In ``mode="file"`` a row *is* a whole file, so the count is exactly the number of
+        files — known from the listing, with no read. In line mode an exact count needs a
+        scan, so the honest answer is None and `statistics()` supplies an estimate instead.
+        """
+        return len(self._files()) if self._mode == "file" else None
+
+    def statistics(self):  # type: ignore[no-untyped-def]
+        """Cheap metadata for a text scan: exact rows in file mode, a line estimate otherwise.
+
+        A text source reached the estimator with no size and no count, so a join against one
+        was sized from the planner's default. File mode gives an exact row count (the file
+        count) and byte size; line mode gives a byte-sample line estimate (advisory) and byte
+        size. Best-effort — a byte size that cannot be read is simply omitted.
+        """
+        from batcher.io._concurrent import total_file_bytes
+        from batcher.plan.source_stats import SourceStatistics
+
+        files = self._files()
+        if not files:
+            return None
+        byte_size = total_file_bytes(self._fs, files)
+        if self._mode == "file":
+            return SourceStatistics(row_count=len(files), byte_size=byte_size, exact_rows=True)
+        from batcher.io.stats.row_estimate import estimate_delimited_rows
+
+        rows = estimate_delimited_rows(
+            self._fs, files, has_header=False, total_bytes=byte_size
+        )
+        if rows is None and byte_size is None:
+            return None
+        return SourceStatistics(row_count=rows, byte_size=byte_size, exact_rows=False)
 
     def identity(self) -> str:
         # `encoding` decides how bytes become text, so the same path read as utf-8 vs

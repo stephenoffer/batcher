@@ -642,3 +642,27 @@ def test_close_is_safe_on_a_source_that_never_opened_a_client():
 
     for source in (KafkaSource("t"), EventHubsSource("h"), PulsarSource("t")):
         source.close()  # must not raise, and must not dial a broker
+        source.close()  # and closing twice is still a no-op
+        # No client was ever constructed, so `close` had nothing to tear down. The
+        # per-connector handle attribute is the evidence: it is still unset.
+        #
+        # Read the names off `__slots__` rather than `vars()`: the broker sources are
+        # slotted, so they carry no `__dict__` and `vars()` raises on them. Falling back
+        # to `__dict__` keeps this working if a connector is ever unslotted again.
+        #
+        # `_client_obj` is in the suffix list because Event Hubs spells its handle that
+        # way. Matching only `_consumer`/`_client` found nothing on that source, and an
+        # empty handle list makes `all(...)` vacuously true — so the one connector whose
+        # AMQP link this test exists to check was the one it silently skipped. The
+        # `assert handles` below is what keeps that from coming back.
+        suffixes = ("_consumer", "_client", "_client_obj")
+        names = {
+            name
+            for cls in type(source).__mro__
+            for name in getattr(cls, "__slots__", ())
+            if name.endswith(suffixes)
+        }
+        names.update(k for k in getattr(source, "__dict__", {}) if k.endswith(suffixes))
+        handles = [getattr(source, name, None) for name in sorted(names)]
+        assert handles, f"no handle attribute found on {type(source).__name__}"
+        assert all(h is None for h in handles), handles

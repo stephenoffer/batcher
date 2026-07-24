@@ -9,7 +9,6 @@ query without recomputing from the start of the stream.
 
 from __future__ import annotations
 
-import json
 import os
 
 import pyarrow as pa
@@ -30,16 +29,18 @@ class StateStore:
     def _path(self, batch_id: int) -> str:
         return os.path.join(self._dir, f"batch-{batch_id:08d}.arrow")
 
-    def snapshot(self, batch_id: int, state: pa.RecordBatch, meta: dict | None = None) -> None:
-        """Atomically write the running `state` for `batch_id` (temp file + rename)."""
+    def snapshot(self, batch_id: int, state: pa.RecordBatch) -> None:
+        """Atomically write the running `state` for `batch_id` (temp file + rename).
+
+        Any scalar that must ride with the state (the windowed fold's watermark) travels in
+        the batch's Arrow schema metadata, which IPC persists — so there is no separate
+        sidecar to keep consistent with the ``.arrow`` file.
+        """
         path = self._path(batch_id)
         tmp = f"{path}.tmp"
         with ipc.new_file(tmp, state.schema) as writer:
             writer.write_batch(state)
         os.replace(tmp, path)
-        if meta is not None:
-            with open(f"{path}.meta.json", "w") as fh:
-                json.dump(meta, fh)
 
     def restore(self, batch_id: int) -> pa.RecordBatch | None:
         """Reload the running state snapshot for `batch_id`, or None if absent."""
@@ -62,6 +63,3 @@ class StateStore:
                 continue
             if bid < keep_through:
                 os.remove(os.path.join(self._dir, name))
-                meta = os.path.join(self._dir, f"{name}.meta.json")
-                if os.path.exists(meta):
-                    os.remove(meta)

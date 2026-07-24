@@ -3,12 +3,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, RecordBatch,
+};
 use arrow::compute::kernels::arity::try_binary;
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{cast, is_not_null};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::error::ArrowError;
 
 use crate::eval::binary::coerce_numeric;
@@ -22,10 +24,7 @@ use crate::{Expr, ExprError, Math2Func, MathFunc};
 /// flag a NaN. The Tier-1 JIT does not compile `IsNan` and falls back here.
 pub(crate) fn eval_is_nan(array: &ArrayRef) -> Result<ArrayRef, ExprError> {
     let f = cast(array, &DataType::Float64)?;
-    let a = f
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .expect("cast to f64");
+    let a = f.as_primitive::<Float64Type>();
     let out: BooleanArray = if a.null_count() == 0 {
         a.values().iter().map(|&x| Some(x.is_nan())).collect()
     } else {
@@ -40,10 +39,7 @@ pub(crate) fn eval_is_nan(array: &ArrayRef) -> Result<ArrayRef, ExprError> {
 /// `eval_is_nan` (cast to f64, per-element predicate, validity preserved).
 pub(crate) fn eval_is_inf(array: &ArrayRef) -> Result<ArrayRef, ExprError> {
     let f = cast(array, &DataType::Float64)?;
-    let a = f
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .expect("cast to f64");
+    let a = f.as_primitive::<Float64Type>();
     let out: BooleanArray = if a.null_count() == 0 {
         a.values().iter().map(|&x| Some(x.is_infinite())).collect()
     } else {
@@ -78,8 +74,8 @@ pub(crate) fn eval_math2(
     }
     let lf = cast(l, &DataType::Float64)?;
     let rf = cast(r, &DataType::Float64)?;
-    let a = lf.as_any().downcast_ref::<Float64Array>().expect("f64");
-    let b = rf.as_any().downcast_ref::<Float64Array>().expect("f64");
+    let a = lf.as_primitive::<Float64Type>();
+    let b = rf.as_primitive::<Float64Type>();
     let out: Float64Array = if a.null_count() == 0 && b.null_count() == 0 {
         // No-null fast path: walk both raw slices, no per-element validity branch.
         a.values()
@@ -120,8 +116,8 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
 /// intermediate cannot overflow on the way.
 fn round_int(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
     let ri = cast(r, &DataType::Int64)?;
-    let a = l.as_any().downcast_ref::<Int64Array>().expect("i64");
-    let b = ri.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let a = l.as_primitive::<Int64Type>();
+    let b = ri.as_primitive::<Int64Type>();
     let out: Int64Array = (0..a.len())
         .map(|i| (!a.is_null(i) && !b.is_null(i)).then(|| round_i64(a.value(i), b.value(i))))
         .collect();
@@ -154,8 +150,8 @@ fn round_i64(x: i64, digits: i64) -> i64 {
 fn eval_int_math2(func: Math2Func, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
     let li = cast(l, &DataType::Int64)?;
     let ri = cast(r, &DataType::Int64)?;
-    let a = li.as_any().downcast_ref::<Int64Array>().expect("i64");
-    let b = ri.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let a = li.as_primitive::<Int64Type>();
+    let b = ri.as_primitive::<Int64Type>();
     let out: Int64Array = match func {
         Math2Func::Gcd => {
             if a.null_count() == 0 && b.null_count() == 0 {
@@ -282,7 +278,7 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     }
     match (func, arr.data_type()) {
         (Abs, DataType::Int64) => {
-            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            let a = arr.as_primitive::<Int64Type>();
             // `i64::MIN.abs()` overflows (no positive i64 exists for it): `v.abs()` panicked
             // in debug and returned i64::MIN — a *negative* "absolute value" — in release.
             // `saturating_abs` maps i64::MIN → i64::MAX: no panic, always non-negative, and
@@ -305,7 +301,7 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             eval_math(func, &f)
         }
         (_, DataType::Float64) => {
-            let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+            let a = arr.as_primitive::<Float64Type>();
             // No-null fast path: map the raw slice (no per-element validity branch,
             // so the simple ops auto-vectorize); otherwise propagate nulls.
             let out: Float64Array = if a.null_count() == 0 {
@@ -377,7 +373,7 @@ fn apply_unary(func: MathFunc, v: f64) -> f64 {
 fn eval_int_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
     use MathFunc::*;
     let i = cast(arr, &DataType::Int64)?;
-    let a = i.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let a = i.as_primitive::<Int64Type>();
     let out: Int64Array = match func {
         BitCount => {
             if a.null_count() == 0 {
@@ -439,7 +435,7 @@ mod int_math_tests {
     }
 
     fn as_i64(a: &ArrayRef) -> Vec<Option<i64>> {
-        let a = a.as_any().downcast_ref::<Int64Array>().expect("i64 out");
+        let a = a.as_primitive::<Int64Type>();
         (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i)))
             .collect()

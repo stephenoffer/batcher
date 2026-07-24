@@ -26,7 +26,7 @@ pub use hardware::{usable_cores, HardwareProfile, SimdOverride};
 pub mod float_ident;
 pub use float_ident::{
     canon_f32, canon_f32_bits, canon_f64, canon_f64_bits, canon_float_array, float_total_cmp,
-    CANONICAL_NAN_BITS_F32, CANONICAL_NAN_BITS_F64,
+    needs_canon_f32, needs_canon_f64, CANONICAL_NAN_BITS_F32, CANONICAL_NAN_BITS_F64,
 };
 
 /// A unit of data flow between operators: an Arrow `RecordBatch`.
@@ -204,7 +204,7 @@ impl Default for RuntimeTuning {
             bloom_fp_rate: 0.01,
             bloom_min_build_rows: 1 << 16,
             window_parallel_row_threshold: 1 << 15,
-            radix_parallel_threshold: 200_000,
+            radix_parallel_threshold: 0,
             sort_merge_fanin: 16,
             skew_bucket_factor: 4,
             skew_min_bucket_rows: 4 * DEFAULT_MORSEL_ROWS,
@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(t.bloom_fp_rate, 0.01);
         assert_eq!(t.bloom_min_build_rows, 1 << 16);
         assert_eq!(t.window_parallel_row_threshold, 1 << 15);
-        assert_eq!(t.radix_parallel_threshold, 200_000);
+        assert_eq!(t.radix_parallel_threshold, 0);
         assert_eq!(t.sort_merge_fanin, 16);
         assert_eq!(t.skew_bucket_factor, 4);
         assert_eq!(t.skew_min_bucket_rows, 4 * DEFAULT_MORSEL_ROWS);

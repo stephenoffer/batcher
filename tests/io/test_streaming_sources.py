@@ -67,6 +67,26 @@ def test_seen_store_mark_is_idempotent(tmp_path):
     store.close()
 
 
+def test_seen_store_mark_many_matches_repeated_mark(tmp_path):
+    # `mark_many` is `mark` per record in one transaction: same visibility, one commit.
+    store = SeenStore(str(tmp_path / "seen.sqlite"))
+    store.mark_many([("a.parquet", 1, 1.0), ("b.parquet", 2, 2.0), ("c.parquet", 3, 3.0)])
+    assert store.unseen(["a.parquet", "b.parquet", "c.parquet", "d.parquet"]) == ["d.parquet"]
+    # Idempotent + durable across reopen, exactly like `mark`.
+    store.mark_many([("a.parquet", 9, 9.0)])  # ON CONFLICT update, not error
+    store.close()
+    reopened = SeenStore(str(tmp_path / "seen.sqlite"))
+    assert reopened.unseen(["a.parquet"]) == []
+    reopened.close()
+
+
+def test_seen_store_mark_many_empty_is_noop(tmp_path):
+    store = SeenStore(str(tmp_path / "seen.sqlite"))
+    store.mark_many([])  # must not raise or open a transaction
+    assert store.max_seen() is None
+    store.close()
+
+
 # --------------------------------------------------------------------------
 # IncrementalFileSource — Auto Loader analog over a local temp dir.
 # --------------------------------------------------------------------------
@@ -107,6 +127,34 @@ def test_incremental_file_source_exactly_once_discovery(tmp_path):
 
     # And once more: nothing new again.
     assert _rows(make_source()) == []
+
+
+def test_incremental_file_source_max_files_per_trigger_backpressures(tmp_path):
+    data_dir = tmp_path / "incoming"
+    data_dir.mkdir()
+    state_dir = tmp_path / "state"
+    for i in range(1, 6):
+        _write_parquet(data_dir / f"{i:04d}.parquet", pa.table({"id": [i]}))
+
+    def make_source():
+        return IncrementalFileSource(
+            str(data_dir), "parquet", state_dir=str(state_dir), max_files_per_trigger=2
+        )
+
+    # A 5-file backlog drains two-at-a-time (oldest names first), not in one giant epoch.
+    assert sorted(r["id"] for r in _rows(make_source())) == [1, 2]
+    assert sorted(r["id"] for r in _rows(make_source())) == [3, 4]
+    assert sorted(r["id"] for r in _rows(make_source())) == [5]
+    assert _rows(make_source()) == []  # backlog fully drained, nothing re-read
+
+
+def test_incremental_file_source_rejects_bad_max_files(tmp_path):
+    from batcher._internal.errors import PlanError
+
+    with pytest.raises(PlanError, match="max_files_per_trigger must be >= 1"):
+        IncrementalFileSource(
+            str(tmp_path), "parquet", state_dir=str(tmp_path / "s"), max_files_per_trigger=0
+        )
 
 
 def test_incremental_file_source_schema_and_registry(tmp_path):
@@ -160,6 +208,47 @@ def test_broker_make_batch_assembles_fixed_schema():
     assert batch.column("value").to_pylist() == [b"a", b"b"]
     assert batch.column("key").to_pylist() == [b"k", None]
     assert batch.column("offset").to_pylist() == [10, 11]
+
+
+def test_broker_backs_off_on_empty_polls(monkeypatch):
+    # A fast-empty broker (Kinesis returns immediately with no records) must not spin the
+    # poll loop: empty polls back off with a growing, capped sleep, reset after real data.
+    import time
+
+    from batcher.io.formats.streaming.broker import BrokerSource
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+    class _EmptyThenData(BrokerSource):
+        format_name = "empty_then_data"
+        __slots__ = ("_calls",)
+
+        def __init__(self):
+            super().__init__("t", poll_size=5)
+            self._calls = 0
+
+        def _discover_partitions(self):
+            return [0]
+
+        def _poll(self):
+            self._calls += 1
+            data = {
+                4: [BrokerMessage(value=b"a", partition=0, offset=0, timestamp=0, topic="t")],
+                7: [BrokerMessage(value=b"b", partition=0, offset=1, timestamp=1, topic="t")],
+            }
+            if self._calls in data:
+                return data[self._calls]
+            if self._calls > 8:
+                return None  # end of stream
+            return []  # an idle poll
+
+    out = list(_EmptyThenData().iter_batches())
+    assert len(out) == 2  # the two non-empty polls yielded a batch each
+    # First idle streak grows geometrically; after real data the back-off resets to the floor.
+    assert sleeps[:3] == [0.01, 0.02, 0.04]
+    assert sleeps[3] == 0.01  # reset after the batch at poll 4
+    assert max(sleeps) <= 0.25  # capped
 
 
 class _BoundedTestBroker(BrokerSource):
@@ -236,6 +325,92 @@ def test_broker_resume_token_overrides_offset_in_snapshot():
     assert broker.snapshot_position() == {"offsets": {"0": "seq-abc"}}
 
 
+class _FakeEvent:
+    """A stand-in for azure ``EventData`` — no ``azure-eventhub`` install needed."""
+
+    def __init__(self, body, key, offset="7", ts=123):
+        self._body = body
+        self.partition_key = key
+        self.offset = offset
+        self.enqueued_time_utc_ms = ts
+
+    def body_as_bytes(self):
+        return self._body
+
+
+def test_eventhubs_event_preserves_binary_body_and_coerces_key():
+    from batcher.io.formats.streaming.broker import broker_schema
+    from batcher.io.formats.streaming.eventhubs import _event_to_message
+
+    # A binary (non-UTF-8) payload must survive verbatim, and a str partition key must
+    # coerce to the bytes the fixed broker schema declares.
+    raw = b"\xff\x00protobuf\x80"
+    msg = _event_to_message(_FakeEvent(raw, key="tenant-9"), partition_id=2, topic="hub")
+    assert msg.value == raw  # not decoded/re-encoded
+    assert msg.key == b"tenant-9"
+    assert msg.partition == 2 and msg.offset == 7 and msg.timestamp == 123
+    # And the message assembles cleanly into the binary broker schema (would raise before).
+    from batcher.io.formats.streaming.broker import BrokerSource
+
+    batch = BrokerSource._make_batch([msg])
+    assert batch.schema.equals(broker_schema())
+    assert batch.column("value")[0].as_py() == raw
+
+
+def test_eventhubs_event_handles_none_key_and_offset():
+    from batcher.io.formats.streaming.eventhubs import _event_to_message
+
+    msg = _event_to_message(_FakeEvent(b"x", key=None, offset=None), partition_id=0, topic="h")
+    assert msg.key is None
+    assert msg.offset == 0  # a null offset maps to 0, never raises
+    assert msg.resume_token is None
+
+
+class _FakeEHConsumer:
+    def __init__(self, events):
+        self._events = events
+
+    def receive_message_batch(self, max_batch_size, max_wait_time):
+        return self._events
+
+    def close(self):
+        pass
+
+
+class _FakeEHClient:
+    def __init__(self, events_by_partition):
+        self._events = events_by_partition
+        self.created: list[tuple[str, str]] = []
+
+    def get_partition_ids(self):
+        return [str(p) for p in self._events]
+
+    def _create_consumer(self, consumer_group, partition_id, event_position, on_event_received):
+        self.created.append((partition_id, event_position))
+        return _FakeEHConsumer(self._events.get(int(partition_id), []))
+
+
+def test_eventhubs_resumes_from_checkpointed_offset():
+    from batcher.io.formats.streaming.eventhubs import EventHubsSource
+
+    src = EventHubsSource("hub", partitions=[0], connection_str="x")
+    fake = _FakeEHClient({0: [_FakeEvent(b"a", key=None, offset="100")]})
+    src._client_obj = fake
+
+    # Fresh: no checkpoint, so the configured starting_position ("-1") is used.
+    msgs = src._poll()
+    assert fake.created == [("0", "-1")]
+    assert msgs[0].resume_token == "100"  # the exact offset string, for seeking
+    src._track_positions(msgs)
+    assert src.snapshot_position() == {"offsets": {"0": "100"}}
+
+    # Recover: seek then poll resumes strictly after the checkpointed offset, not from start.
+    src.seek({"offsets": {"0": "100"}})
+    fake.created.clear()
+    src._poll()
+    assert fake.created == [("0", "100")]
+
+
 def test_broker_split_is_picklable():
     import pickle
 
@@ -262,6 +437,86 @@ def test_broker_split_is_picklable():
 )
 def test_streaming_sources_registered(name):
     assert name in SOURCES
+
+
+def test_pubsub_idle_pull_timeout_is_an_empty_poll_not_a_failure():
+    """A pull that hits its deadline on an idle subscription yields [], not an exception."""
+    from batcher.io.formats.streaming.pubsub import PubSubSource, _is_pull_timeout
+
+    class DeadlineExceeded(Exception):  # mimics google.api_core.exceptions by name
+        pass
+
+    class _FakeSub:
+        def pull(self, request, timeout):
+            raise DeadlineExceeded("no messages")
+
+    assert _is_pull_timeout(DeadlineExceeded("x")) is True
+    assert _is_pull_timeout(ValueError("real error")) is False
+
+    src = PubSubSource("projects/p/subscriptions/s", pull_timeout=0.1)
+    src._client_obj = _FakeSub()
+    assert src._poll() == []  # idle, not a crash
+
+
+def test_pubsub_non_timeout_error_propagates():
+    from batcher.io.formats.streaming.pubsub import PubSubSource
+
+    class _AngrySub:
+        def pull(self, request, timeout):
+            raise RuntimeError("auth failed")
+
+    src = PubSubSource("projects/p/subscriptions/s")
+    src._client_obj = _AngrySub()
+    with pytest.raises(RuntimeError, match="auth failed"):
+        src._poll()
+
+
+def test_kafka_poll_timeout_is_configurable():
+    """`poll_timeout` reaches `consume()` and is kept out of the confluent-kafka config."""
+    from batcher.io.formats.streaming.kafka import KafkaSource
+
+    class _FakeConsumer:
+        def __init__(self):
+            self.timeouts: list[float] = []
+
+        def consume(self, num_messages, timeout):
+            self.timeouts.append(timeout)
+            return []
+
+    src = KafkaSource("t", poll_timeout=0.25)
+    # `poll_timeout` must not have leaked into the broker options (→ a bogus `poll.timeout`).
+    assert "poll_timeout" not in src._options
+    fake = _FakeConsumer()
+    src._consumer = fake  # `_client()` returns this instead of building a real one
+    assert src._poll() == []
+    assert fake.timeouts == [0.25]
+
+
+def test_pulsar_receive_timeout_is_configurable(monkeypatch):
+    """`receive_timeout_millis` reaches `receive()` and stays out of the client options."""
+    from batcher.io.formats.streaming import pulsar as pmod
+
+    class _Timeout(Exception):
+        pass
+
+    class _FakePulsar:
+        Timeout = _Timeout
+
+    class _FakeConsumer:
+        def __init__(self):
+            self.timeouts = []
+
+        def receive(self, timeout_millis):
+            self.timeouts.append(timeout_millis)
+            raise _Timeout()  # idle topic -> empty poll
+
+    src = pmod.PulsarSource("t", receive_timeout_millis=250)
+    assert "receive_timeout_millis" not in src._options
+    monkeypatch.setattr(pmod, "_import_pulsar", lambda: _FakePulsar)
+    src._client_obj = object()  # skip real client build
+    src._consumer = _FakeConsumer()  # `_client()` returns this
+    assert src._poll() == []
+    assert src._consumer.timeouts == [250]
 
 
 def test_kafka_deferred_dependency_raises_backend_error():

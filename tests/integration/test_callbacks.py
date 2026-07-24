@@ -56,3 +56,33 @@ def test_udf_per_row_and_batch():
         return batch.append_column("x", pa.array([v.as_py() * 100 for v in batch.column("a")]))
 
     assert scale(_ds()).collect().to_pydict()["x"] == [100, 200, 300]
+
+
+def test_udf_forwards_resilience_config():
+    """`@udf(max_retries=...)` forwards the resilience knobs to `map_batches`, so a decorated
+    transform retries a transient failure like any other."""
+    state = {"n": 0}
+
+    @udf(max_retries=3, retry_backoff=0.0)
+    def flaky(batch):
+        state["n"] += 1
+        if state["n"] < 2:
+            raise ConnectionError("transient")
+        return batch
+
+    assert flaky(_ds()).collect().to_pydict()["a"] == [1, 2, 3]
+    assert state["n"] == 2
+
+
+def test_udf_composes_with_async():
+    """`@udf` over an async fn routes through the concurrent event-loop path."""
+    import asyncio
+
+    @udf(max_concurrency=4)
+    async def enrich(batch):
+        await asyncio.sleep(0.001)
+        return batch.append_column(
+            "c", __import__("pyarrow").array([v.as_py() + 1 for v in batch.column("a")])
+        )
+
+    assert enrich(_ds()).collect().to_pydict()["c"] == [2, 3, 4]

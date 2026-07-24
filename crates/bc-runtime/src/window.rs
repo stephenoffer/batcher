@@ -1228,8 +1228,8 @@ mod tests {
         for call in cases {
             let funcs = [call];
             // threshold 1 forces the parallel path; usize::MAX keeps the serial oracle.
-            let par = window_with(&[part.clone()], &order, &funcs, n, 1).unwrap();
-            let ser = window_serial(&[part.clone()], &order, &funcs, n).unwrap();
+            let par = window_with(std::slice::from_ref(&part), &order, &funcs, n, 1).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &order, &funcs, n).unwrap();
             assert_eq!(
                 opt_ints(&par[0]),
                 opt_ints(&ser[0]),
@@ -1256,8 +1256,8 @@ mod tests {
                 frame: None,
             }];
             // threshold 1 forces the parallel bucket path; usize::MAX keeps the oracle.
-            let par = window_with(&[part.clone()], &[], &funcs, n, 1).unwrap();
-            let ser = window_serial(&[part.clone()], &[], &funcs, n).unwrap();
+            let par = window_with(std::slice::from_ref(&part), &[], &funcs, n, 1).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &[], &funcs, n).unwrap();
             assert_eq!(
                 ints(&par[0]),
                 ints(&ser[0]),
@@ -1795,8 +1795,9 @@ mod tests {
                 frame: None,
             }];
             let order = [asc(ord.clone())];
-            let serial = window_with(&[part.clone()], &order, &funcs, n, usize::MAX).unwrap();
-            let parallel = window_with(&[part.clone()], &order, &funcs, n, 1).unwrap();
+            let serial =
+                window_with(std::slice::from_ref(&part), &order, &funcs, n, usize::MAX).unwrap();
+            let parallel = window_with(std::slice::from_ref(&part), &order, &funcs, n, 1).unwrap();
             assert_eq!(opt_ints(&serial[0]), opt_ints(&parallel[0]), "{func:?}");
         }
     }

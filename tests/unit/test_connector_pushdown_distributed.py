@@ -106,6 +106,10 @@ def test_dynamodb_sends_a_filter_expression_on_the_worker_path(monkeypatch) -> N
     Drives the *worker* path — `_read_partition` on a source rebuilt from a split — because
     that is the one that used to lose the filter.
     """
+    # The DynamoDB filter is built with `boto3.dynamodb.conditions`, so the worker path
+    # imports boto3 even though the client itself is mocked below. ci.yml runs `.[dev]`
+    # without boto3, so skip there — matching how the other nosql tests guard their drivers.
+    pytest.importorskip("boto3")
     from batcher.io.formats.nosql import dynamodb as dyn
 
     sent: list[dict] = []

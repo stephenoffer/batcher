@@ -6,7 +6,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.projection_scan
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 
@@ -38,7 +38,7 @@ def test_sort_before_full_sample(duck):
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").sample(fraction=1.0).collect()
-    assert_same(out, duck.sql("SELECT * FROM t"))
+    assert_same_ordered(out, duck.sql("SELECT * FROM t"))
 
 
 # --- schema NOT-NULL null checks ---------------------------------------------

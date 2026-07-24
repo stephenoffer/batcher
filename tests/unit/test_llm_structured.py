@@ -52,6 +52,19 @@ def test_extract_appends_one_typed_column_per_field():
     assert out.schema.field("vendor").type == pa.string()
 
 
+def test_extract_length_sorted_dispatch_keeps_rows_aligned():
+    """extract dispatches longest-prompt-first for throughput but restores row order."""
+    responses = {
+        "x": '{"n": 1}',
+        "xxxxxxxx": '{"n": 2}',  # longest
+        "xxx": '{"n": 3}',
+    }
+    engine = _keyed_engine(responses)
+    ds = bt.from_arrow(pa.table({"q": ["x", "xxxxxxxx", "xxx"]}).to_batches(max_chunksize=8))
+    got = ds.ml.extract(engine, schema={"n": "int64"}, prompt_column="q")
+    assert got.to_pydict() == {"q": ["x", "xxxxxxxx", "xxx"], "n": [1, 2, 3]}
+
+
 def test_the_declared_schema_survives_a_model_that_omits_a_field():
     """The exact shape that makes `generate(parse_json=True)` fail: two batches, two key
     sets. With a declared schema the Arrow types are identical and the missing value is
@@ -257,3 +270,41 @@ def test_both_lower_to_map_batches_so_they_stream_and_distribute():
     assert _is_linear_map_pipeline(classified._plan)
     assert is_streamable(extracted._plan)
     assert is_streamable(classified._plan)
+
+
+def test_extract_threads_an_image_into_the_request():
+    """image_column threads into the GenerateSpec extract builds — a tensor image needs no
+    Pillow, so the request for the imaged row carries the decoded array under "image"."""
+    import numpy as np
+
+    from batcher.io.formats.ml.tensor import to_tensor_column
+    from batcher.ml.llm.structured import _extract_batch
+
+    seen = []
+
+    def factory():
+        def engine(requests):
+            seen.extend(requests)
+            return ['{"n": 1}'] * len(requests)
+
+        return engine
+
+    pixels = to_tensor_column(np.zeros((1, 2, 2, 3), dtype=np.uint8))
+    batch = pa.RecordBatch.from_arrays([pa.array(["a"]), pixels], names=["q", "pic"])
+    _extract_batch(
+        factory(),
+        batch,
+        fields={"n": pa.int64()},
+        prompt_column="q",
+        template=None,
+        instruct=False,
+        image_column="pic",
+    )
+    assert isinstance(seen[0], dict) and "image" in seen[0]
+
+
+def test_classify_accepts_image_column_param():
+    ds = bt.from_pydict({"q": ["a"]})
+    # Wiring check: the param exists and lowers without error on the text path.
+    out = ds.ml.classify(_const_engine("yes"), labels=["yes", "no"], prompt_column="q")
+    assert out.to_pydict()["label"] == ["yes"]

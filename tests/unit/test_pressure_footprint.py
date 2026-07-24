@@ -8,15 +8,15 @@ These assert the off-pool footprint (cgroup current / RSS) drives the level.
 
 from __future__ import annotations
 
-from batcher.carbonite.memory import pressure
+from batcher.carbonite.memory import pressure, probe
 from batcher.carbonite.memory.pressure import PressureLevel, PressureMonitor
 
 
 def test_footprint_drives_pressure_when_pool_is_idle(monkeypatch):
     total = pressure.total_memory_bytes()
     # No cgroup; RSS reports ~96% of the ceiling (off-pool memory the pool can't see).
-    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: None)
-    monkeypatch.setattr(pressure, "_process_rss_bytes", lambda: int(total * 0.96))
+    monkeypatch.setattr(probe, "cgroup_current_bytes", lambda: None)
+    monkeypatch.setattr(probe, "process_rss_bytes", lambda: int(total * 0.96))
     # No pool initialized, so the pool term contributes nothing.
     monkeypatch.setattr("batcher.carbonite.memory.pool.current_process_pool", lambda: None)
 
@@ -27,8 +27,8 @@ def test_footprint_drives_pressure_when_pool_is_idle(monkeypatch):
 
 def test_cgroup_current_preferred_over_rss(monkeypatch):
     total = pressure.total_memory_bytes()
-    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: int(total * 0.88))
-    monkeypatch.setattr(pressure, "_process_rss_bytes", lambda: int(total * 0.10))
+    monkeypatch.setattr(probe, "cgroup_current_bytes", lambda: int(total * 0.88))
+    monkeypatch.setattr(probe, "process_rss_bytes", lambda: int(total * 0.10))
     monkeypatch.setattr("batcher.carbonite.memory.pool.current_process_pool", lambda: None)
     frac = PressureMonitor._engine_used_fraction()
     assert 0.85 <= frac <= 0.91  # the cgroup figure, not the lower RSS one
@@ -36,8 +36,8 @@ def test_cgroup_current_preferred_over_rss(monkeypatch):
 
 def test_no_footprint_reading_does_not_crash(monkeypatch):
     # Neither cgroup nor RSS available, no pool → falls back, never raises.
-    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: None)
-    monkeypatch.setattr(pressure, "_process_rss_bytes", lambda: None)
+    monkeypatch.setattr(probe, "cgroup_current_bytes", lambda: None)
+    monkeypatch.setattr(probe, "process_rss_bytes", lambda: None)
     monkeypatch.setattr("batcher.carbonite.memory.pool.current_process_pool", lambda: None)
     frac = PressureMonitor._engine_used_fraction()
     assert 0.0 <= frac <= 1.0

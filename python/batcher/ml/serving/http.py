@@ -69,7 +69,17 @@ def post_json(
         req = urllib.request.Request(url, data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read())
+                raw = resp.read()
+            try:
+                return json.loads(raw)
+            except ValueError as exc:
+                # A 200 with a non-JSON body is almost always a proxy/load-balancer error
+                # page or an HTML redirect; surface that as an actionable BackendError
+                # rather than an opaque JSONDecodeError far from the call site.
+                raise BackendError(
+                    f"inference endpoint {url} returned a non-JSON body "
+                    f"(first 200 bytes: {raw[:200]!r})"
+                ) from exc
         except urllib.error.HTTPError as exc:
             last = exc
             if exc.code not in (408, 425, 429, 500, 502, 503, 504):
@@ -111,12 +121,33 @@ def _decode_value(value: Any) -> np.ndarray:
     """
     import numpy as np
 
-    if isinstance(value, dict) and {"dtype", "shape", "data"} <= set(value):
+    if _is_tensor_envelope(value):
         import base64
 
         raw = base64.b64decode(value["data"])
         return np.frombuffer(raw, dtype=np.dtype(value["dtype"])).reshape(value["shape"])
     return np.asarray(value)
+
+
+def _is_tensor_envelope(value: Any) -> bool:
+    """Whether `value` is a binary tensor envelope, not just a dict that resembles one.
+
+    The `__tensor__` marker is authoritative. Without it, a marker-less server is still
+    accepted, but only when the three fields have the *shapes* an envelope has — a base64
+    ``data`` string, a list/tuple ``shape``, and a string ``dtype`` — so a legitimate model
+    output dict that happens to carry ``dtype``/``shape``/``data`` keys with other value
+    types is no longer decoded as a tensor and mangled.
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get(_TENSOR_KEY) is True:
+        return True
+    return (
+        {"dtype", "shape", "data"} <= set(value)
+        and isinstance(value["data"], str)
+        and isinstance(value["shape"], (list, tuple))
+        and isinstance(value["dtype"], str)
+    )
 
 
 def http_client(

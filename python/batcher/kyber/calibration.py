@@ -299,6 +299,16 @@ def _shrink(measured: float, prior: float, n_samples: int, prior_strength: float
     `n / (n + prior_strength)`. With little evidence the default dominates (a cold or noisy
     store never degrades the model); with plenty it converges to the measurement.
 
+    The blend is **geometric**, `prior · (measured/prior)^w`, not the arithmetic
+    `w·measured + (1-w)·prior`. A cost coefficient is a positive *scale*: what matters about
+    it is the ratio to its prior, and the two blends disagree about the midpoint of a ratio.
+    At `w = 0.5` a measurement 10x the prior blends to 5.5x arithmetically and 3.16x
+    geometrically — and only the geometric one is consistent, because a measurement at 0.1x
+    must blend to the reciprocal (0.316x), which the arithmetic form puts at 0.55x. The
+    asymmetry biases every coefficient upward whenever the measurements straddle the prior,
+    and it is the same reason the q-error correction averages geometrically. It also matches
+    `_clamp`, which already bounds the result multiplicatively.
+
     Args:
         measured: The coefficient the samples imply.
         prior: The shipped default.
@@ -311,7 +321,11 @@ def _shrink(measured: float, prior: float, n_samples: int, prior_strength: float
     if n_samples <= 0:
         return prior
     weight = n_samples / (n_samples + max(0.0, prior_strength))
-    return weight * measured + (1.0 - weight) * prior
+    if measured <= 0.0 or prior <= 0.0:
+        # A non-positive coefficient has no logarithm and no meaningful ratio; fall back to
+        # the arithmetic blend rather than dropping the measurement entirely.
+        return weight * measured + (1.0 - weight) * prior
+    return math.exp(weight * math.log(measured) + (1.0 - weight) * math.log(prior))
 
 
 def _clamp(value: float, default: float, factor: float) -> float:

@@ -6,7 +6,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 
 
 def _t(duck):
@@ -22,7 +22,9 @@ def test_filter_over_empty(duck):
 
 def test_sort_filter_over_empty(duck):
     out = _t(duck).limit(0).sort("x").filter(bt.col("x") > 2).collect()
-    assert_same(out, duck.sql("SELECT * FROM (SELECT * FROM t LIMIT 0) s WHERE x > 2 ORDER BY x"))
+    assert_same_ordered(
+        out, duck.sql("SELECT * FROM (SELECT * FROM t LIMIT 0) s WHERE x > 2 ORDER BY x")
+    )
 
 
 def test_union_with_empty_branch(duck):

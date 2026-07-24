@@ -428,6 +428,54 @@ fn distinct_matches_the_oracle() {
     assert_multiset(&json, &[facts()]);
 }
 
+/// A `DISTINCT` is sharded across workers like a root aggregate: each shard dedups its own rows
+/// and the driver merges. What makes that sound is that dedup is a mergeable group-by, so the
+/// merge of per-shard survivors is the relation's distinct set — and what would make it *unsound*
+/// is a shard answering for itself, which shows up as duplicate rows the oracle does not have.
+///
+/// Two columns of different kinds (an integer and a string), because the shard partitioner and
+/// the dedup take different paths per key type and a single-integer key exercises neither the
+/// mixed-key hash nor the byte comparison.
+#[test]
+fn a_multi_column_distinct_shards_and_matches_the_oracle() {
+    let proj = format!(
+        r#"{{"op":"project","input":{SCAN},"exprs":[
+            {{"expr":{},"alias":"k"}},{{"expr":{},"alias":"s"}}]}}"#,
+        col("k"),
+        col("s")
+    );
+    let json = format!(r#"{{"op":"distinct","input":{proj}}}"#);
+    assert_multiset(&json, &[facts()]);
+}
+
+/// The shape Kyber lowers a grouped `COUNT(DISTINCT x)` to: `count(*)` over `DISTINCT (k, x)`,
+/// with a filter underneath. This is what serialized on the streaming executor — the dedup was
+/// refused a shard, so the scan and filter feeding it ran on one core — and it is the plan the
+/// ClickBench q10/q11/q13 timings come from, so it is pinned as a plan and not just as an
+/// operator.
+#[test]
+fn a_grouped_count_distinct_over_a_filter_matches_the_oracle() {
+    let filter = format!(
+        r#"{{"op":"filter","input":{SCAN},"predicate":{{"e":"binary","op":"ge",
+            "left":{},"right":{{"e":"lit","value":{{"int":10}}}}}}}}"#,
+        col("k")
+    );
+    let proj = format!(
+        r#"{{"op":"project","input":{filter},"exprs":[
+            {{"expr":{},"alias":"k"}},{{"expr":{},"alias":"s"}}]}}"#,
+        col("k"),
+        col("s")
+    );
+    let distinct = format!(r#"{{"op":"distinct","input":{proj}}}"#);
+    let json = format!(
+        r#"{{"op":"aggregate","input":{distinct},
+            "group_keys":[{{"expr":{},"alias":"k"}}],
+            "aggregates":[{{"func":"count_star","alias":"n"}}]}}"#,
+        col("k")
+    );
+    assert_multiset(&json, &[facts()]);
+}
+
 #[test]
 fn union_matches_the_oracle() {
     let json = format!(r#"{{"op":"union","inputs":[{SCAN},{SCAN}],"distinct":false}}"#);
@@ -514,7 +562,7 @@ fn limit_does_not_evaluate_rows_it_will_never_return() {
     let p = plan(&json);
 
     assert!(
-        execute(&p, &[src.clone()]).is_err(),
+        execute(&p, std::slice::from_ref(&src)).is_err(),
         "the oracle projects the whole relation and must hit the bad cast"
     );
     let got = execute_streaming(&p, &[src], 0).expect("streaming stops before the bad batch");

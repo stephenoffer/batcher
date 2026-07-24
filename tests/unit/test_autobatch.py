@@ -103,3 +103,21 @@ def test_growth_proceeds_when_predicted_vram_safe():
     # vram=0.5 → 0.5*1.5 = 0.75 <= 0.85 → safe to grow.
     nxt = c.update(1000.0, vram_fraction=0.5)
     assert nxt > 1000
+
+
+def test_throughput_controller_recovers_from_a_durable_regression():
+    """After a plateau, a sustained throughput drop must eventually re-explore instead of
+    staying pinned at a stale optimum the environment no longer supports."""
+    c = ThroughputController(min_rows=1, max_rows=10_000, initial=100, stale_limit=3)
+    for t in (100.0, 200.0, 400.0, 400.0, 400.0):  # climb, then plateau
+        c.update(t)
+    settled = c.best_size()
+
+    # A durable regression: throughput now well below best; without recovery the size
+    # would be pinned at `settled` forever.
+    grew_again = False
+    for _ in range(6):
+        size = c.update(50.0)
+        if size > settled:
+            grew_again = True
+    assert grew_again, "controller never re-explored after a durable regression"

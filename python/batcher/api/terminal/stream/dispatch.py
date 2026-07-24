@@ -120,6 +120,20 @@ def _iter_batches(
     if isinstance(plan, WatermarkStreamJoin) and len(sources) == 2:
         yield from stream_stream_join(plan, sources, batch_size)
         return
+    # A WatermarkStreamJoin only ever reaches this router with more than two stream
+    # sources when `join_stream` calls were nested (`a.join_stream(b).join_stream(c)`).
+    # The buffered symmetric hash join drives exactly two sides, so name the limit
+    # rather than falling through to the generic "must materialize" error below.
+    if isinstance(plan, WatermarkStreamJoin):
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            f"join_stream() joins exactly two streams, but this plan chains "
+            f"{len(sources)} stream sources through nested join_stream calls. A 3+-way "
+            "stream-stream interval join is not supported. Materialize an intermediate "
+            "result to a bounded source before joining the next stream, or restructure "
+            "to a single two-stream join."
+        )
 
     if len(sources) == 1:
         if is_streamable(plan):
@@ -276,10 +290,11 @@ def _iter_batches(
         from batcher._internal.errors import PlanError
 
         raise PlanError(
-            "this pipeline has an unbounded (streaming) source but a plan that must "
-            "materialize (e.g. sort / join / window / multi-source), which cannot be "
-            "streamed in bounded memory. Restructure to a streamable shape (filter / "
-            "project / map_batches, or a single top-level aggregate / distinct / top-N)."
+            f"this pipeline has an unbounded (streaming) source but its top-level "
+            f"{type(plan).__name__} forces the plan to materialize (a pipeline breaker "
+            "such as sort / join / window / multi-source), which cannot be streamed in "
+            "bounded memory. Restructure to a streamable shape (filter / project / "
+            "map_batches, or a single top-level aggregate / distinct / top-N)."
         )
     from batcher.api.terminal.core import _collect
 

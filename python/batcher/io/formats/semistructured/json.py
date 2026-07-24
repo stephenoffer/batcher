@@ -159,6 +159,22 @@ class JSONSource(FileSource):
             )
         super().__init__(path, **base_kwargs)
 
+    def _estimated_row_count(self, byte_total: int | None) -> int | None:
+        """An advisory row count from a byte sample — NDJSON has no footer to count.
+
+        Every line is exactly one record (NDJSON has no header), so the shared delimited
+        estimator extrapolates a count from the first file's average line width and the
+        dataset's on-disk size. Advisory (`statistics()` marks it `exact_rows=False`) and
+        O(1) I/O at plan time — enough to size a join against a JSON source, which otherwise
+        reached the estimator with no cardinality at all. `byte_total` is the size
+        `statistics()` already computed, reused so the file sizes are not swept twice.
+        """
+        from batcher.io.stats.row_estimate import estimate_delimited_rows
+
+        return estimate_delimited_rows(
+            self._fs, self._files(), has_header=False, total_bytes=byte_total
+        )
+
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         import pyarrow.json as pajson
 

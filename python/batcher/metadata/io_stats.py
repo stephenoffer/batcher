@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.config import active_config
 from batcher.metadata.hub import MetadataHub
+from batcher.metadata.smoothed import load_scalar, record_smoothed_scalar
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -89,27 +89,17 @@ def record_source_io(
     Best-effort and non-blocking: a bad measurement (zero bytes/time) or any failure is
     dropped, never raised into the read path.
     """
-    if hub is None or not identity or byte_count <= 0 or elapsed_ms <= 0:
+    if not identity or byte_count <= 0 or elapsed_ms <= 0:
         return
-    try:
-        mbps = (byte_count / (1024 * 1024)) / (elapsed_ms / 1000.0)
-        alpha = active_config().optimizer.learning_smoothing_alpha
-        prior = hub.get_keyed_param(_NAMESPACE, identity)
-        smoothed = mbps if prior is None else alpha * mbps + (1.0 - alpha) * float(prior)
-        hub.put_keyed_param(_NAMESPACE, identity, smoothed)
-    except Exception:  # pragma: no cover - metadata capture must never break a read
-        pass
+    mbps = (byte_count / (1024 * 1024)) / (elapsed_ms / 1000.0)
+    record_smoothed_scalar(hub, _NAMESPACE, identity, mbps)
 
 
 def load_source_throughput_mbps(hub: MetadataHub | None, identity: str) -> float | None:
     """The learned read throughput (MB/s) for source `identity`, or `None` (cold/unavailable)."""
-    if hub is None or not identity:
+    if not identity:
         return None
-    try:
-        value = hub.get_keyed_param(_NAMESPACE, identity)
-    except Exception:  # pragma: no cover - a learned read must never break planning
-        return None
-    return float(value) if value is not None else None
+    return load_scalar(hub, _NAMESPACE, identity)
 
 
 def predicted_read_seconds(hub: MetadataHub | None, identity: str, byte_count: int) -> float | None:

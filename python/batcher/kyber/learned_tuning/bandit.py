@@ -31,9 +31,16 @@ __all__ = [
 # plan. `plan_cache.record_write` applies the materiality test and does the write; routing
 # every write through it means a writer cannot forget to invalidate.
 
-# v2: arm rewards are now size-normalized (ms per million input rows), not raw wall ms.
-# A fresh namespace so a hub carrying ms-scale history cannot mix the two scales.
-_NS_ARM = "tuning.join_arm_v2"  # per-signature bandit arm statistics
+# v3: arm statistics are stored as a discounted Welford state `(n, mean, m2)` rather than
+# `(n, sum, sumsq)`. A fresh namespace so a hub carrying the older shape cannot be misread.
+#
+# The change is two fixes in one record. `sumsq` recovers the variance as `E[x²] - E[x]²`, a
+# subtraction of two nearly equal large numbers: with rewards around 1000 and a spread of 1,
+# both terms are ~1e6 and the difference is noise — the same catastrophic cancellation the
+# `var`/`covar` aggregates were rewritten to avoid. And an undiscounted sum remembers every
+# run forever, so a machine that got faster, or data that changed shape, leaves an arm with a
+# permanently stale mean that the bandit will not revisit.
+_NS_ARM = "tuning.join_arm_v3"  # per-signature bandit arm statistics
 
 # The discrete join-algorithm arms the bandit ranges over — all equivalent relations.
 _JOIN_ARMS: tuple[str, ...] = ("hash", "broadcast", "sort_merge")
@@ -46,6 +53,17 @@ _MIN_ARM_TOTAL = 3
 # observed spread (every run identical, or one sample per arm) would otherwise get a zero
 # exploration radius and freeze on whichever arm was measured first.
 _UCB_SCALE_FLOOR = 0.25
+# Per-observation discount applied to every arm's accumulated evidence — the discounted-UCB
+# of Garivier & Moulines, which is the standard answer to a *non-stationary* bandit.
+#
+# UCB1 assumes each arm's reward distribution is fixed forever. A join's is not: the hardware
+# changes, the data grows a skew, a release makes one strategy faster. With undiscounted
+# statistics an arm measured badly a thousand runs ago carries that mean with a confidence
+# radius that has shrunk to nothing, so the bandit can never re-examine it — it is not
+# converged, it is stuck. Discounting gives the evidence an effective horizon of about
+# `1/(1-gamma)` observations (~40 here), after which a genuinely changed arm is re-explored,
+# while still averaging over enough runs to be immune to a single slow one.
+_ARM_DISCOUNT = 0.975
 
 
 # Reusable primitive 1 — a deterministic UCB1 bandit over a fixed arm set.
@@ -54,23 +72,63 @@ def record_arm(
 ) -> None:
     """Fold one measured `reward_ms` for `arm` into the per-`key` bandit statistics.
 
-    Stores `(n, sum, sumsq)` per arm under one keyed param so a record touches only its own
-    signature. `reward_ms` is a latency (lower is better); the bandit minimizes it.
+    Stores a discounted Welford state `(n, mean, m2)` per arm under one keyed param, so a
+    record touches only its own signature. `reward_ms` is a latency (lower is better); the
+    bandit minimizes it.
     """
     if hub is None or reward_ms <= 0.0 or not arm:
         return
     try:
-        stats = dict(hub.get_keyed_param(namespace, key) or {})
-        a = dict(stats.get(arm, {}))
-        n = int(a.get("n", 0)) + 1
-        stats[arm] = {
-            "n": n,
-            "sum": float(a.get("sum", 0.0)) + reward_ms,
-            "sumsq": float(a.get("sumsq", 0.0)) + reward_ms * reward_ms,
-        }
+        stored = hub.get_keyed_param(namespace, key) or {}
+        # Every arm's evidence decays on every observation, not just the arm that ran. Decaying
+        # only the observed arm would make the discount a function of how often an arm happens
+        # to be chosen, so a rarely-picked arm would keep its ancient mean at full strength —
+        # exactly the arm whose evidence is most likely to be stale.
+        stats = {a: _decayed(v) for a, v in stored.items() if isinstance(v, dict)}
+        stats[arm] = _welford_update(stats.get(arm), reward_ms)
         plan_cache.record_write(hub, namespace, key, stats)
     except Exception:  # pragma: no cover - learning must never break a query
         return
+
+
+def _decayed(state: dict) -> dict:
+    """One arm's statistics after a single discount step.
+
+    The mean is a location and is *not* decayed — decaying it would drag every arm toward
+    zero. What decays is the *weight of evidence* behind it: the effective sample count and
+    the accumulated squared deviation, which together are what the confidence radius is
+    computed from. So an arm not chosen for a long time keeps its estimate but loses its
+    certainty, which is what lets the bandit go back and check.
+    """
+    return {
+        "n": float(state.get("n", 0.0)) * _ARM_DISCOUNT,
+        "mean": float(state.get("mean", 0.0)),
+        "m2": float(state.get("m2", 0.0)) * _ARM_DISCOUNT,
+    }
+
+
+def _welford_update(state: dict | None, reward: float) -> dict:
+    """Fold one reward into a (possibly discounted, possibly absent) Welford state.
+
+    `m2` accumulates the squared deviations from the running mean directly, so the variance
+    is never recovered by subtracting two large nearly-equal numbers.
+    """
+    n = float((state or {}).get("n", 0.0)) + 1.0
+    mean = float((state or {}).get("mean", 0.0))
+    m2 = float((state or {}).get("m2", 0.0))
+    if n <= 1.0:
+        return {"n": 1.0, "mean": reward, "m2": 0.0}
+    delta = reward - mean
+    mean += delta / n
+    return {"n": n, "mean": mean, "m2": m2 + delta * (reward - mean)}
+
+
+def _arm_variance(state: dict) -> float | None:
+    """An arm's own reward variance, or None when a single observation cannot establish one."""
+    n = float(state.get("n", 0.0))
+    if n <= 1.0:
+        return None
+    return max(0.0, float(state.get("m2", 0.0)) / n)
 
 
 def _reward_scale(tried: dict) -> float:
@@ -91,14 +149,31 @@ def _reward_scale(tried: dict) -> float:
 
     Floored at `_UCB_SCALE_FLOOR * |mean|` so a history with no observed spread still explores.
     """
-    total = sum(int(s["n"]) for s in tried.values())
-    if total <= 0:
+    total = sum(float(s["n"]) for s in tried.values())
+    if total <= 0.0:
         return 0.0
-    s_sum = sum(float(s.get("sum", 0.0)) for s in tried.values())
-    s_sumsq = sum(float(s.get("sumsq", 0.0)) for s in tried.values())
-    mean = s_sum / total
-    variance = max(0.0, s_sumsq / total - mean * mean)
-    return max(math.sqrt(variance), _UCB_SCALE_FLOOR * abs(mean))
+    # Pool the per-arm Welford states with Chan's parallel formula, which is the same
+    # cancellation-free combine the variance aggregate uses. Pooling the *within-arm* spreads
+    # and the *between-arm* mean differences separately is also what makes this a spread and
+    # not a measure of how far apart the arms are.
+    pooled_n = 0.0
+    pooled_mean = 0.0
+    pooled_m2 = 0.0
+    for a in sorted(tried):
+        s = tried[a]
+        nb = float(s["n"])
+        mb = float(s.get("mean", 0.0))
+        m2b = float(s.get("m2", 0.0))
+        if pooled_n <= 0.0:
+            pooled_n, pooled_mean, pooled_m2 = nb, mb, m2b
+            continue
+        n = pooled_n + nb
+        delta = mb - pooled_mean
+        pooled_mean += delta * nb / n
+        pooled_m2 += m2b + delta * delta * pooled_n * nb / n
+        pooled_n = n
+    variance = max(0.0, pooled_m2 / pooled_n) if pooled_n > 0.0 else 0.0
+    return max(math.sqrt(variance), _UCB_SCALE_FLOOR * abs(pooled_mean))
 
 
 def ucb1_best_arm(arm_stats: dict, arms: tuple[str, ...], *, c: float = _UCB_C) -> str | None:
@@ -111,22 +186,40 @@ def ucb1_best_arm(arm_stats: dict, arms: tuple[str, ...], *, c: float = _UCB_C) 
     `sd` is the pooled reward spread (`_reward_scale`), which is what keeps the radius commensurate
     with the mean it is subtracted from.
     """
-    tried = {a: s for a, s in arm_stats.items() if a in arms and int(s.get("n", 0)) > 0}
+    tried = {
+        a: s
+        for a, s in arm_stats.items()
+        if a in arms and isinstance(s, dict) and float(s.get("n", 0.0)) > 0.0
+    }
     if not tried:
         return None
-    total = sum(int(s["n"]) for s in tried.values())
+    total = sum(float(s["n"]) for s in tried.values())
     untried = sorted(a for a in arms if a not in tried)
     # Give an untried arm a turn once the tried arms have a little evidence — bounded exploration.
     if untried and total >= len(tried):
         return untried[0]
-    scale = _reward_scale(tried)
+    pooled = _reward_scale(tried)
     best: str | None = None
     best_lcb = math.inf
     for a in sorted(tried):
         s = tried[a]
-        n = int(s["n"])
-        mean = float(s["sum"]) / n
-        lcb = mean - c * scale * math.sqrt(2.0 * math.log(max(2, total)) / n)
+        n = float(s["n"])
+        mean = float(s.get("mean", 0.0))
+        # UCB-V: the radius uses **this arm's own** spread, falling back to the pooled one
+        # only where a single observation cannot supply it. The pooled spread charges a
+        # consistently-fast, low-variance arm the same exploration cost as an erratic one, so
+        # a strategy that wins every single time keeps being second-guessed by whichever arm
+        # happens to be noisy — which is the opposite of what the noise says.
+        arm_variance = _arm_variance(s)
+        scale = pooled if arm_variance is None else math.sqrt(arm_variance)
+        # Floored against the *pooled* spread, not against the arm's own mean. An arm whose
+        # every run came back identical has no observed spread, but "no spread observed" is
+        # not "no spread exists", so it still needs some radius. Taking a fraction of what the
+        # workload's rewards actually vary by keeps that residual exploration on the same
+        # scale as the evidence — and, unlike a fraction of the mean, it stays small enough
+        # that a genuinely consistent arm is cheaper to be confident about than an erratic one.
+        scale = max(scale, _UCB_SCALE_FLOOR * pooled)
+        lcb = mean - c * scale * math.sqrt(2.0 * math.log(max(2.0, total)) / n)
         if lcb < best_lcb:
             best_lcb, best = lcb, a
     return best
@@ -149,7 +242,7 @@ def learned_arm(
         return None
     try:
         stats = hub.get_keyed_param(namespace, key) or {}
-        total = sum(int(s.get("n", 0)) for s in stats.values() if isinstance(s, dict))
+        total = sum(float(s.get("n", 0.0)) for s in stats.values() if isinstance(s, dict))
         if total < min_total:
             return None
         return ucb1_best_arm(stats, arms)

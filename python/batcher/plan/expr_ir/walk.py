@@ -11,61 +11,19 @@ from __future__ import annotations
 import dataclasses
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir.audio import AudioFunc
 from batcher.plan.expr_ir.core import (
     AggExpr,
     Aliased,
-    Binary,
-    Cast,
-    Coalesce,
     Expr,
     InList,
-    IsInf,
-    IsNan,
-    IsNotNull,
-    IsNull,
-    Math2Expr,
-    MathExpr,
-    Not,
 )
-from batcher.plan.expr_ir.func_nodes import WindowBuckets, WindowStart
-from batcher.plan.expr_ir.image import ImageFunc
-from batcher.plan.expr_ir.namespaces import (
-    ConvertTimezone,
-    DateFunc,
-    DateOffset,
-    DateTrunc,
-    ListBinary,
-    ListContains,
-    ListFilter,
-    ListFunc,
-    ListGet,
-    ListPosition,
-    ListSet,
-    ListSimhash,
-    ListSlice,
-    ListTransform,
-    ListZip,
-    MapFunc,
-    Strftime,
-    StrFunc,
-    Strptime,
-    StructField,
-)
+from batcher.plan.expr_ir.func_nodes import ListFilter, ListTransform
 from batcher.plan.expr_ir.node_base import IRNode, child_fields
 from batcher.plan.expr_ir.nodes import (
-    Array,
     Case,
     Col,
-    Greatest,
-    HashRows,
-    Least,
-    ListJoin,
     MakeStruct,
-    NullIf,
-    Sequence,
 )
-from batcher.plan.expr_ir.video import VideoFunc
 
 
 def column_occurrence_counts(exprs: list[Expr]) -> dict[str, int]:
@@ -127,79 +85,46 @@ def referenced_columns(expr: Expr) -> set[str]:
 
 
 def _referenced_columns_impl(expr: Expr) -> set[str]:
+    # The set of columns an expression reads is the union of what its sub-expressions
+    # read, and an `IRNode` already declares which of its fields are sub-expressions. So
+    # this walks that declaration rather than enumerating node types: a per-type cascade
+    # silently returns the empty set for any node nobody added an arm for, which prunes a
+    # real column and fails the query with "unknown column" — a bug the old `Aliased` arm
+    # was added to fix, and one that cannot recur here.
     if isinstance(expr, Col):
         return {expr.name}
     if isinstance(expr, Aliased):
-        # A mid-expression alias (``(col("x").alias("y") + 1)``) is transparent — it
-        # reads whatever its wrapped expression reads. Missing this arm pruned the
-        # underlying column and failed the query with "unknown column".
+        # A mid-expression alias (``(col("x").alias("y") + 1)``) is transparent: it reads
+        # whatever its wrapped expression reads. Not an `IRNode`, so handled here.
         return referenced_columns(expr.inner)
-    if isinstance(expr, Binary):
-        return referenced_columns(expr.left) | referenced_columns(expr.right)
-    if isinstance(
-        expr,
-        (
-            Not,
-            Cast,
-            InList,
-            IsNull,
-            IsNotNull,
-            IsNan,
-            IsInf,
-            StrFunc,
-            Strftime,
-            Strptime,
-            ConvertTimezone,
-            DateFunc,
-            DateOffset,
-            DateTrunc,
-            ImageFunc,
-            AudioFunc,
-            VideoFunc,
-            MathExpr,
-            ListFunc,
-            ListGet,
-            ListSimhash,
-            ListContains,
-            ListPosition,
-            ListTransform,
-            ListFilter,
-            ListSlice,
-            ListJoin,
-            StructField,
-            MapFunc,
-            WindowStart,
-            WindowBuckets,
-        ),
-    ):
+    if isinstance(expr, InList):
+        return referenced_columns(expr.input)  # `values` are literals, not sub-expressions
+    if isinstance(expr, (ListTransform, ListFilter)):
+        # A higher-order list op reads its input list column. Its body (`func`/`pred`) is
+        # evaluated in a *scope of its own* over the list's flattened elements, where the
+        # only free name is the `element()` placeholder — a bound variable, not a column
+        # read from this operator's input. The generic field-walk below would descend into
+        # that body and surface `element` as an unknown column, which is exactly what
+        # failed the list-HOF differential tests. Column references stop at the input.
         return referenced_columns(expr.input)
-    if isinstance(expr, (Coalesce, Greatest, HashRows, Least)):
-        cols: set[str] = set()
-        for e in expr.inputs:
-            cols |= referenced_columns(e)
-        return cols
-    if isinstance(expr, Array):
-        out: set[str] = set()
-        for e in expr.elements:
-            out |= referenced_columns(e)
-        return out
-    if isinstance(expr, MakeStruct):
-        cols: set[str] = set()
-        for _name, value in expr.fields:
-            cols |= referenced_columns(value)
-        return cols
-    if isinstance(expr, Sequence):
-        return (
-            referenced_columns(expr.start)
-            | referenced_columns(expr.stop)
-            | referenced_columns(expr.step)
-        )
-    if isinstance(expr, (NullIf, Math2Expr, ListBinary, ListSet, ListZip)):
-        return referenced_columns(expr.left) | referenced_columns(expr.right)
     if isinstance(expr, Case):
         cols = referenced_columns(expr.otherwise)
         for cond, then in expr.branches:
             cols |= referenced_columns(cond) | referenced_columns(then)
+        return cols
+    if isinstance(expr, MakeStruct):
+        cols = set()
+        for _name, value in expr.fields:
+            cols |= referenced_columns(value)
+        return cols
+    if isinstance(expr, IRNode):
+        cols = set()
+        for name, is_list in child_fields(expr):
+            value = getattr(expr, name)
+            if value is None:
+                continue
+            for sub in value if is_list else (value,):
+                cols |= referenced_columns(sub)
         return cols
     return set()  # Lit and other leaves reference nothing
 
@@ -207,148 +132,55 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
 def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
     """Return a copy of `expr` with column names rewritten via `mapping`.
 
-    Used to push a predicate through a join: a conjunct phrased in the join's
-    output names is rewritten into one side's source names before being attached
-    below the join.
+    Used to push a predicate through a join: a conjunct phrased in the join's output
+    names is rewritten into one side's source names before being attached below the join.
+
+    Node types are not enumerated here. An `IRNode` already declares which of its fields
+    hold sub-expressions (`child`/`children`), so the rewrite reads that declaration and
+    rebuilds the node generically. That is not only shorter than a per-type cascade: a
+    cascade silently *skips* any node nobody added an arm for, and skipping means the
+    pushed predicate keeps the join's output column names, which reference columns the
+    source below the join does not have. Adding an `Expr` node must not be able to
+    introduce that, so nothing here has to be updated when one is.
+
+    The handful of nodes handled explicitly are the ones whose sub-expressions are not
+    plain fields: `Col` is the rewrite itself, and `Case`/`MakeStruct` nest theirs inside
+    tuples.
     """
+
+    def rewrite(e: Expr) -> Expr:
+        return remap_columns(e, mapping)
+
     if isinstance(expr, Col):
         return Col(mapping.get(expr.name, expr.name))
     if isinstance(expr, Aliased):
-        return Aliased(remap_columns(expr.inner, mapping), expr.name)
-    if isinstance(expr, Binary):
-        return Binary(
-            expr.op, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
-        )
-    if isinstance(expr, Not):
-        return Not(remap_columns(expr.input, mapping))
-    if isinstance(expr, Cast):
-        return Cast(remap_columns(expr.input, mapping), expr.dtype, try_cast=expr.try_cast)
+        return Aliased(rewrite(expr.inner), expr.name)
     if isinstance(expr, InList):
-        return InList(remap_columns(expr.input, mapping), expr.values)
-    if isinstance(expr, IsNull):
-        return IsNull(remap_columns(expr.input, mapping))
-    if isinstance(expr, IsNotNull):
-        return IsNotNull(remap_columns(expr.input, mapping))
-    if isinstance(expr, IsNan):
-        return IsNan(remap_columns(expr.input, mapping))
-    if isinstance(expr, IsInf):
-        return IsInf(remap_columns(expr.input, mapping))
-    if isinstance(expr, StrFunc):
-        return StrFunc(
-            expr.fn,
-            remap_columns(expr.input, mapping),
-            pattern=expr.pattern,
-            replacement=expr.replacement,
-            start=expr.start,
-            length=expr.length,
-        )
-    if isinstance(expr, DateFunc):
-        return DateFunc(expr.fn, remap_columns(expr.input, mapping))
-    if isinstance(expr, ImageFunc):
-        return ImageFunc(
-            expr.fn,
-            remap_columns(expr.input, mapping),
-            width=expr.width,
-            height=expr.height,
-            mean=expr.mean,
-            std=expr.std,
-            channels_first=expr.channels_first,
-        )
-    if isinstance(expr, AudioFunc):
-        return AudioFunc(
-            expr.fn,
-            remap_columns(expr.input, mapping),
-            rate=expr.rate,
-            n_fft=expr.n_fft,
-            hop_length=expr.hop_length,
-            n_mels=expr.n_mels,
-        )
-    if isinstance(expr, VideoFunc):
-        return VideoFunc(expr.fn, remap_columns(expr.input, mapping))
-    if isinstance(expr, DateTrunc):
-        return DateTrunc(remap_columns(expr.input, mapping), expr.unit)
-    if isinstance(expr, Strftime):
-        return Strftime(remap_columns(expr.input, mapping), expr.format)
-    if isinstance(expr, Strptime):
-        return Strptime(remap_columns(expr.input, mapping), expr.format)
-    if isinstance(expr, ConvertTimezone):
-        return ConvertTimezone(remap_columns(expr.input, mapping), expr.from_tz, expr.to_tz)
-    if isinstance(expr, DateOffset):
-        return DateOffset(remap_columns(expr.input, mapping), expr.months, expr.days, expr.micros)
-    if isinstance(expr, WindowStart):
-        return WindowStart(
-            remap_columns(expr.input, mapping), expr.width_micros, expr.origin_micros
-        )
-    if isinstance(expr, WindowBuckets):
-        return WindowBuckets(
-            remap_columns(expr.input, mapping), expr.width_micros, expr.slide_micros
-        )
-    if isinstance(expr, MathExpr):
-        return MathExpr(expr.fn, remap_columns(expr.input, mapping))
-    if isinstance(expr, ListFunc):
-        return ListFunc(expr.fn, remap_columns(expr.input, mapping))
-    if isinstance(expr, ListGet):
-        return ListGet(remap_columns(expr.input, mapping), expr.index)
-    if isinstance(expr, ListSimhash):
-        return ListSimhash(remap_columns(expr.input, mapping), expr.num_bits, expr.seed)
-    if isinstance(expr, ListContains):
-        return ListContains(remap_columns(expr.input, mapping), expr.value)
-    if isinstance(expr, ListPosition):
-        return ListPosition(remap_columns(expr.input, mapping), expr.value)
+        return InList(rewrite(expr.input), expr.values)
     if isinstance(expr, ListTransform):
-        return ListTransform(remap_columns(expr.input, mapping), expr.func)
+        # Only the input list column is a column reference (see `_referenced_columns_impl`).
+        # The body binds `element()` in its own scope, so rewriting it under a join's
+        # output→source mapping is at best a no-op and at worst rebinds the placeholder;
+        # leave it intact, exactly as the reference walk refuses to read columns from it.
+        return ListTransform(rewrite(expr.input), expr.func)
     if isinstance(expr, ListFilter):
-        return ListFilter(remap_columns(expr.input, mapping), expr.pred)
-    if isinstance(expr, ListSlice):
-        return ListSlice(remap_columns(expr.input, mapping), expr.offset, expr.length)
-    if isinstance(expr, StructField):
-        return StructField(remap_columns(expr.input, mapping), expr.field)
-    if isinstance(expr, MapFunc):
-        return MapFunc(expr.fn, remap_columns(expr.input, mapping), expr.key)
-    if isinstance(expr, ListJoin):
-        return ListJoin(remap_columns(expr.input, mapping), expr.separator)
-    if isinstance(expr, ListBinary):
-        return ListBinary(
-            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
-        )
-    if isinstance(expr, ListSet):
-        return ListSet(
-            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
-        )
-    if isinstance(expr, ListZip):
-        return ListZip(
-            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
-        )
-    if isinstance(expr, Array):
-        return Array([remap_columns(e, mapping) for e in expr.elements])
-    if isinstance(expr, MakeStruct):
-        return MakeStruct([(n, remap_columns(v, mapping)) for n, v in expr.fields])
-    if isinstance(expr, Sequence):
-        return Sequence(
-            remap_columns(expr.start, mapping),
-            remap_columns(expr.stop, mapping),
-            remap_columns(expr.step, mapping),
-        )
-    if isinstance(expr, Coalesce):
-        return Coalesce([remap_columns(e, mapping) for e in expr.inputs])
-    if isinstance(expr, Greatest):
-        return Greatest([remap_columns(e, mapping) for e in expr.inputs])
-    if isinstance(expr, HashRows):
-        return HashRows([remap_columns(e, mapping) for e in expr.inputs], expr.seed)
-    if isinstance(expr, Least):
-        return Least([remap_columns(e, mapping) for e in expr.inputs])
-    if isinstance(expr, NullIf):
-        return NullIf(remap_columns(expr.left, mapping), remap_columns(expr.right, mapping))
-    if isinstance(expr, Math2Expr):
-        return Math2Expr(
-            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
-        )
+        return ListFilter(rewrite(expr.input), expr.pred)
     if isinstance(expr, Case):
         return Case(
-            [(remap_columns(c, mapping), remap_columns(t, mapping)) for c, t in expr.branches],
-            remap_columns(expr.otherwise, mapping),
+            [(rewrite(cond), rewrite(then)) for cond, then in expr.branches],
+            rewrite(expr.otherwise),
         )
-    return expr  # literals unchanged
+    if isinstance(expr, MakeStruct):
+        return MakeStruct([(name, rewrite(value)) for name, value in expr.fields])
+    if isinstance(expr, IRNode):
+        updates = {}
+        for name, is_list in child_fields(expr):
+            value = getattr(expr, name)
+            if value is None:
+                continue  # an optional sub-expression that was not given
+            updates[name] = [rewrite(e) for e in value] if is_list else rewrite(value)
+        return dataclasses.replace(expr, **updates) if updates else expr
+    return expr  # literals and other leaves reference no column
 
 
 # --- Aggregate-expression splitting -----------------------------------------------

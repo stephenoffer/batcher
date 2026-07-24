@@ -21,6 +21,7 @@ from __future__ import annotations
 import itertools
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import Config
 from batcher.kyber.learning import QUANTILES_KEY, columns_for, load_learned_stats
 from batcher.kyber.optimizer import optimize_logical
@@ -178,7 +179,8 @@ def _has_float_column(columns: set[str], sources: list) -> bool:
     for src in sources:
         try:
             schema = src.schema()
-        except Exception:  # pragma: no cover - a source that cannot describe itself
+        except Exception as exc:  # pragma: no cover - a source that cannot describe itself
+            note_suppressed("kyber", "read a source schema", exc)
             continue
         for name in columns:
             idx = schema.get_field_index(name)

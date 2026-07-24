@@ -25,6 +25,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
 if TYPE_CHECKING:
@@ -403,20 +404,25 @@ def gpu_vram_gb() -> float | None:
     if handle is not None:  # NVML reports total memory without allocating a CUDA context
         try:
             return _nvml().nvmlDeviceGetMemoryInfo(handle).total / (1 << 30)
-        except Exception:
-            pass
+        except Exception as exc:
+            note_suppressed("ml", "read total VRAM from NVML", exc)
     try:
         import torch
 
         if torch.cuda.is_available():
             return torch.cuda.get_device_properties(0).total_memory / (1 << 30)
+        # Intel XPU: `cuda.is_available()` is False here, so without this branch the
+        # docstring's XPU claim was empty and an Intel GPU packed nothing.
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and xpu.is_available():
+            return xpu.get_device_properties(0).total_memory / (1 << 30)
         # Apple MPS shares unified memory; `recommended_max_memory` is the working
         # budget torch will use before paging — the right number to pack against.
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and mps.is_available():
             return torch.mps.recommended_max_memory() / (1 << 30)
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("ml", "read total accelerator memory", exc)
     return None
 
 
@@ -492,8 +498,8 @@ def sample_gpu_vram_fraction() -> float | None:
         try:
             info = _nvml().nvmlDeviceGetMemoryInfo(handle)
             return info.used / info.total if info.total else None
-        except Exception:
-            pass
+        except Exception as exc:
+            note_suppressed("ml", "read used VRAM from NVML", exc)
     try:
         import torch
 
@@ -502,13 +508,19 @@ def sample_gpu_vram_fraction() -> float | None:
             # torch's reserved bytes are already this process's own allocator, so this
             # path needs no per-process attribution.
             return torch.cuda.memory_reserved(0) / total if total else None
+        # Intel XPU: without this branch the predictive VRAM cap was inert on Intel GPUs,
+        # so the throughput hill-climb grew until a hard OOM — the failure the cap prevents.
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and xpu.is_available():
+            total = xpu.get_device_properties(0).total_memory
+            return xpu.memory_reserved(0) / total if total else None
         # MPS unified memory: current allocation against the recommended budget.
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and mps.is_available():
             total = torch.mps.recommended_max_memory()
             return torch.mps.current_allocated_memory() / total if total else None
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("ml", "read accelerator memory in use", exc)
     return None
 
 
@@ -818,8 +830,8 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
             else alpha * float(util_fraction) + (1.0 - alpha) * float(prior)
         )
         hub.save_params(_NAMESPACE, stats)
-    except Exception:  # pragma: no cover - feedback must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("ml", "persist learned GPU utilization", exc)
 
 
 _VRAM_NAMESPACE = "ml.gpu.peak_vram"
@@ -853,8 +865,8 @@ def record_gpu_peak_vram(hub: MetadataHub | None, key: str, vram_fraction: float
             else alpha * float(vram_fraction) + (1.0 - alpha) * float(prior)
         )
         hub.save_params(_VRAM_NAMESPACE, stats)
-    except Exception:  # pragma: no cover - feedback must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("ml", "persist learned VRAM utilization", exc)
 
 
 def actors_per_gpu_from_learned_vram(

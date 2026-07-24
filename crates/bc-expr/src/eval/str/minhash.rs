@@ -147,14 +147,15 @@ fn shingle_hashes(text: &str, ngram: usize, offsets: &mut Vec<usize>) -> Vec<u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int64Array, ListArray};
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::Int64Type;
 
     fn sig(text: &str, num_perm: i64, ngram: i64) -> Vec<i64> {
         let arr = StringArray::from(vec![Some(text)]);
         let out = eval_minhash(&arr, Some(ngram), Some(num_perm)).unwrap();
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         let vals = list.value(0);
-        let vals = vals.as_any().downcast_ref::<Int64Array>().unwrap();
+        let vals = vals.as_primitive::<Int64Type>();
         (0..vals.len()).map(|i| vals.value(i)).collect()
     }
 
@@ -257,7 +258,7 @@ mod tests {
     fn nulls_yield_null_signatures() {
         let arr = StringArray::from(vec![Some("a"), None]);
         let out = eval_minhash(&arr, Some(3), Some(8)).unwrap();
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         assert!(!list.is_null(0));
         assert!(list.is_null(1));
     }

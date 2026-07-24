@@ -25,6 +25,7 @@ import difflib
 from collections.abc import Iterable
 
 __all__ = [
+    "absent_error",
     "candidate_list",
     "did_you_mean",
     "suggestion",
@@ -250,3 +251,49 @@ def unknown_message(
     if hint:
         parts.append(hint)
     return " ".join(parts)
+
+
+def absent_error(
+    label: str,
+    name: str,
+    table: dict[str, str],
+    members: Iterable[str],
+) -> AttributeError:
+    """The `AttributeError` for a failed attribute lookup, with migration guidance.
+
+    A migrant types the method they know from pandas, Polars, or PySpark, the normal
+    lookup fails, and the traceback is the only documentation they read at that moment.
+    `Dataset`, `Expr`, and `GroupBy` all render that traceback through this one function,
+    so the phrasing never drifts between them: a name in `table` gets its curated "why it
+    is absent, what to type instead" sentence, and anything else gets a `Did you mean
+    ...?` computed against the object's real members.
+
+    Args:
+        label: The type name for the message, e.g. ``"Dataset"``, ``"Expr"``.
+        name: The attribute name that was not found.
+        table: The known-absent ecosystem APIs, mapping the name a migrant types to the
+            guidance half of the message.
+        members: The object's real public attribute names, for the did-you-mean fallback.
+
+    Returns:
+        An `AttributeError`. For a name in `table`, the curated guidance; otherwise the
+        bare "no attribute" line plus a `Did you mean ...?` when a close member exists.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import absent_error
+            >>> raise absent_error("Expr", "map_elements", {"map_elements": "Use bt.udf."}, [])
+            Traceback (most recent call last):
+            AttributeError: Expr has no attribute 'map_elements'. Use bt.udf.
+            >>> raise absent_error("Expr", "meen", {}, ["mean", "count"])
+            Traceback (most recent call last):
+            AttributeError: Expr has no attribute 'meen'. Did you mean 'mean'?
+    """
+    if name in table:
+        return AttributeError(f"{label} has no attribute {name!r}. {table[name]}")
+    msg = f"{label} has no attribute {name!r}."
+    phrase = suggestion(name, members)
+    if phrase:
+        msg += " " + phrase
+    return AttributeError(msg)

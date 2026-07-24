@@ -13,6 +13,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 
 __all__ = ["arrow_type", "reconcile", "rows_to_batch"]
 
@@ -48,7 +49,8 @@ def arrow_type(module: Any, type_code: Any) -> pa.DataType | None:
             return pa.binary()
         if type_code == getattr(module, "DATETIME", object()):
             return pa.timestamp("us")
-    except Exception:  # pragma: no cover - a driver whose type codes reject ==
+    except Exception as exc:  # pragma: no cover - a driver whose type codes reject ==
+        note_suppressed("io", "map dbapi type code", exc)
         return None
     return None
 

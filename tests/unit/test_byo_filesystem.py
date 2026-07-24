@@ -44,7 +44,7 @@ def test_a_non_filesystem_object_is_rejected_clearly():
     from batcher._internal.errors import IOError as BatcherIOError
     from batcher.io.filesystem import resolve_filesystem
 
-    with pytest.raises(BatcherIOError, match="must be a pyarrow.fs.FileSystem or an fsspec"):
+    with pytest.raises(BatcherIOError, match=r"must be a pyarrow\.fs\.FileSystem or an fsspec"):
         resolve_filesystem("s3://b/k", filesystem=object())
 
 

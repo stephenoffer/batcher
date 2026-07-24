@@ -21,7 +21,8 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher.io.stats.columnar_footer import _is_nan, _read_footers
+from batcher._internal.mathx import is_nan
+from batcher.io.stats.columnar_footer import _read_footers
 
 __all__ = ["parquet_file_manifest"]
 
@@ -139,7 +140,7 @@ def _file_bounds(meta: Any, columns: list[str]) -> dict[str, tuple[Any, Any, int
             if stats is None or not getattr(stats, "has_min_max", False):
                 known = False
                 break
-            if _is_nan(stats.min) or _is_nan(stats.max):
+            if is_nan(stats.min) or is_nan(stats.max):
                 known = False  # an unordered bound cannot prune
                 break
             low = stats.min if low is None else min(low, stats.min)

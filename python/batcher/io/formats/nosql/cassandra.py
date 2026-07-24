@@ -26,6 +26,7 @@ from batcher.io.formats.nosql.base import (
     ScanSource,
     require_driver,
     rows_to_batches,
+    schema_from_rows,
 )
 
 __all__ = ["CassandraSource"]
@@ -135,9 +136,7 @@ class _CassandraSourceBase(ScanSource):
             rows = list(session.execute(stmt))
         finally:
             cluster.shutdown()
-        if not rows:
-            return pa.schema([])
-        return pa.RecordBatch.from_pylist([dict(rows[0]._asdict())]).schema
+        return schema_from_rows([dict(rows[0]._asdict())] if rows else [])
 
     def _enumerate_partitions(self) -> list[_TokenRange]:
         return _token_ranges(max(1, self._partition_spec.segments))

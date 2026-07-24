@@ -39,16 +39,46 @@ impl BloomFilter {
 
     /// Size a bloom for `expected_items` with false-positive rate `fp_rate`.
     ///
-    /// Uses the standard optimum: `m = -n·ln p / (ln 2)²` bits and
-    /// `k = (m/n)·ln 2` hashes. Clamps to sane minimums so a tiny/empty side still
-    /// yields a usable (if generous) filter.
+    /// The textbook formulas — `m = -n·ln p / (ln 2)²` bits, `k = (m/n)·ln 2` hashes — are
+    /// derived for a *real-valued* `k`, and a filter has to use an integer one. Rounding `k`
+    /// after fixing `m` silently misses the target: at `n = 1000, p = 0.01` it gives
+    /// `m = 9586, k = 7`, whose actual rate is `(1 - e^(-kn/m))^k = 1.01%` — over the rate
+    /// that was asked for. A runtime join filter sized that way passes slightly more probe
+    /// rows than the cost model was promised.
+    ///
+    /// So the integer `k` is chosen first, then `m` is solved for *that* `k`:
+    ///
+    /// ``p = (1 - e^(-kn/m))^k  ⟹  m = -k·n / ln(1 - p^(1/k))``
+    ///
+    /// Both integers bracketing the real optimum are evaluated and the one needing fewer bits
+    /// wins, so the filter meets its target rate at the smallest size that can. Clamps to sane
+    /// minimums so a tiny or empty build side still yields a usable (if generous) filter.
     pub fn with_params(expected_items: u64, fp_rate: f64) -> Self {
         let n = expected_items.max(1) as f64;
         let p = fp_rate.clamp(1e-6, 0.5);
-        let ln2 = std::f64::consts::LN_2;
-        let m = (-n * p.ln() / (ln2 * ln2)).ceil().max(64.0);
-        let k = ((m / n) * ln2).round().max(1.0);
-        Self::new(m as u64, k as u32)
+        let ideal = -p.ln() / std::f64::consts::LN_2; // the real-valued optimum for k
+        let (mut best_bits, mut best_k) = (f64::INFINITY, 1u32);
+        for k in [ideal.floor().max(1.0) as u32, ideal.ceil().max(1.0) as u32] {
+            let bits = Self::bits_for(n, p, k);
+            if bits < best_bits {
+                best_bits = bits;
+                best_k = k;
+            }
+        }
+        Self::new(best_bits.ceil().max(64.0) as u64, best_k)
+    }
+
+    /// Bits needed so that `k` hashes over `n` items achieve false-positive rate `p`.
+    ///
+    /// Inverts `p = (1 - e^(-kn/m))^k`. A `k` too small for the target (`p^(1/k)` reaching 1)
+    /// cannot achieve it at any size, and is reported as infinitely expensive so the caller
+    /// picks the other candidate.
+    fn bits_for(n: f64, p: f64, k: u32) -> f64 {
+        let root = p.powf(1.0 / k as f64);
+        if root >= 1.0 {
+            return f64::INFINITY;
+        }
+        -(k as f64) * n / (1.0 - root).ln()
     }
 
     /// Add a pre-hashed key.
@@ -86,8 +116,14 @@ impl BloomFilter {
     // The `(word, bit)` positions a key maps to, via Kirsch–Mitzenmacher double
     // hashing (`h1 + i·h2`) — `num_hashes` independent-enough indices from one hash.
     // Takes the dimensions by value so it borrows nothing (callers mutate `bits`).
+    //
+    // `h1` is the **whole** 64-bit hash, not its low half. Truncating it to 32 bits caps the
+    // reachable index at `2^32` for the `i = 0` probe, so every bit above 512 MB of filter was
+    // only ever reachable through the `i·h2` terms — the addressable space collapses exactly
+    // when the build side is large enough to need it. The full width costs nothing and is
+    // uniform over `num_bits` to within the negligible modulo bias of a 64-bit value.
     fn positions(hash: u64, num_bits: u64, num_hashes: u32) -> impl Iterator<Item = (usize, u32)> {
-        let h1 = hash as u32 as u64;
+        let h1 = hash;
         let h2 = (hash >> 32) | 1; // odd → full period
         (0..num_hashes as u64).map(move |i| {
             let pos = h1.wrapping_add(i.wrapping_mul(h2)) % num_bits;
@@ -231,6 +267,64 @@ mod tests {
         assert!(
             BloomFilter::from_bytes(&bytes).is_none(),
             "num_hashes == 0 must be rejected, not become a match-everything filter"
+        );
+    }
+
+    /// The sizing must actually **meet** the false-positive rate it was asked for.
+    ///
+    /// Fixing `m` from the real-valued optimum and then rounding `k` overshoots: at
+    /// `n = 1000, p = 1%` it produced `m = 9586, k = 7`, whose analytic rate is 1.008% — a
+    /// filter that quietly passes more probe rows than the join cost model assumed. Solving
+    /// for `m` given the integer `k` closes it. Checked analytically (the closed form) and
+    /// empirically (a measured miss rate over keys never added).
+    #[test]
+    fn achieves_the_requested_false_positive_rate() {
+        for (n, p) in [
+            (1_000u64, 0.01),
+            (10_000, 0.01),
+            (1_000, 0.001),
+            (50_000, 0.05),
+        ] {
+            let f = BloomFilter::with_params(n, p);
+            let k = f.num_hashes() as f64;
+            let analytic = (1.0 - (-k * n as f64 / f.num_bits() as f64).exp()).powf(k);
+            assert!(
+                analytic <= p * 1.000_001,
+                "n={n} p={p}: analytic rate {analytic} exceeds the target"
+            );
+        }
+
+        let mut f = BloomFilter::with_params(10_000, 0.01);
+        for i in 0..10_000u64 {
+            f.add(&i);
+        }
+        let probes = 200_000u64;
+        let hits = (0..probes).filter(|i| f.contains(&(i + 1_000_000))).count();
+        let measured = hits as f64 / probes as f64;
+        assert!(measured < 0.013, "measured false-positive rate {measured}");
+    }
+
+    /// A filter larger than 512 MB must still address all of its bits.
+    ///
+    /// With `h1` truncated to 32 bits the first probe could only ever land in the first
+    /// `2^32` bit positions, so the tail of a large filter was reachable by fewer hash
+    /// functions than it was sized for — the false-positive rate degrades exactly where the
+    /// build side is big enough to need the filter most.
+    #[test]
+    fn probes_reach_the_whole_address_space_of_a_large_filter() {
+        let num_bits = (1u64 << 33) + 64; // > 2^32 bits
+        let mut high = 0usize;
+        for i in 0..20_000u64 {
+            let (word, _) = BloomFilter::positions(crate::hash_one(&i), num_bits, 1)
+                .next()
+                .expect("one probe");
+            if (word as u64) * 64 >= (1u64 << 32) {
+                high += 1;
+            }
+        }
+        assert!(
+            high > 8_000,
+            "only {high}/20000 first probes landed above 2^32 bits; expected about half"
         );
     }
 }

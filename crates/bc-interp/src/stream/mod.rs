@@ -61,7 +61,9 @@ mod meter;
 mod parallel;
 mod pipeline;
 
-pub use parallel::{execute_streaming_parallel, execute_streaming_parallel_metered};
+pub use parallel::{
+    execute_streaming_parallel, execute_streaming_parallel_metered, streaming_parallelizes,
+};
 
 use breaker::{drain, exec_breaker};
 pub(crate) use meter::Meter;
@@ -738,11 +740,25 @@ pub(crate) fn fold_partial(
     input: Morsels<'_>,
     group_keys: &[bc_ir::ProjectionItem],
     aggregates: &[bc_ir::AggregateItem],
+    jit: &std::sync::OnceLock<ops::AggJit>,
 ) -> Result<(Option<agg::Partial>, u64), InterpError> {
     let funcs = ops::agg_funcs(aggregates);
     let mut partials: Vec<agg::Partial> = Vec::new();
     let mut folded: Option<agg::Partial> = None;
     let mut rows_in: u64 = 0;
+    // Compile the computed group-key and aggregate-input expressions once, from the first
+    // morsel that carries rows — the JIT fast path the materializing executor already uses,
+    // so arithmetic in aggregate inputs (`SUM(price * (1 - discount) * (1 + tax))`, the whole
+    // TPC-H q1 shape) is compiled once and reused across morsels instead of interpreted per
+    // row. `eval_jit` is bit-identical to the interpreter on its supported subset and falls
+    // back to it otherwise, so this changes throughput only — the streaming-oracle tests pin
+    // it against the same interpreter.
+    //
+    // The `OnceLock` is **shared across the shards** by the caller: `compile_agg` is a pure
+    // function of the plan and the schema, and every shard's post-child morsel has the same
+    // schema, so one compile serves all of them. Compiling per shard instead paid Cranelift's
+    // per-expression cost once per core (~90× on a big box), which measured as a real fraction
+    // of a low-cardinality aggregate — this hoists it to exactly one compile per query.
 
     for morsel in input {
         let morsel = morsel?;
@@ -750,7 +766,8 @@ pub(crate) fn fold_partial(
             continue;
         }
         rows_in += morsel.num_rows() as u64;
-        partials.push(ops::eval_partial(&morsel, group_keys, aggregates)?);
+        let jit = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &morsel));
+        partials.push(ops::eval_partial_jit(&morsel, group_keys, aggregates, jit)?);
         // Bounded: without this the "streaming" aggregate quietly re-materializes its input as a
         // heap of per-morsel partials. Combining on *every* morsel would instead re-hash the
         // whole running state once per morsel; batching the fold keeps state at O(groups).
@@ -795,6 +812,15 @@ pub(crate) fn combine_and_finalize(
     aggregates: &[bc_ir::AggregateItem],
 ) -> Result<Vec<RecordBatch>, InterpError> {
     let funcs = ops::agg_funcs(aggregates);
-    let merged = agg::combine(partials, &funcs)?;
-    finalize_partial(&merged, group_keys, aggregates)
+    // Keep the merge's hash-radix partitions as separate morsels rather than concatenating
+    // them into one. They are key-disjoint, so the rows and their order are exactly what one
+    // combined `Partial` would finalize to — but the concat is a second full copy of the
+    // grouped relation (on a high-cardinality string key, the largest term in the merge), and
+    // the next operator gets a batch per partition to fan back out over instead of one.
+    let merged = agg::combine_partitioned(partials, &funcs, 0)?;
+    let mut out = Vec::with_capacity(merged.len());
+    for part in &merged {
+        out.extend(finalize_partial(part, group_keys, aggregates)?);
+    }
+    Ok(out)
 }

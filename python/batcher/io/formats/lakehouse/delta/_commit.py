@@ -37,6 +37,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import CommitError
+from batcher._internal.logging import note_suppressed
 from batcher.io.formats.lakehouse.delta._snapshot import require_deltalake
 from batcher.io.manifest import WriteManifest, WrittenFile
 
@@ -92,7 +93,8 @@ def collect_file_stats(table: pa.Table) -> dict[str, Any]:
         try:
             bounds = pc.min_max(column)
             low, high = bounds["min"].as_py(), bounds["max"].as_py()
-        except Exception:
+        except Exception as exc:
+            note_suppressed("io", "compute column bounds for the commit", exc)
             continue  # a type the kernel will not order — no stat is a safe stat
         if low is not None and high is not None:
             mins[field.name] = low
@@ -227,7 +229,8 @@ def _schema_from_written(files: list[WrittenFile]) -> pa.Schema | None:
             else:
                 with fs.open(written.path) as fh:
                     data = pq.ParquetFile(fh).schema_arrow
-        except Exception:
+        except Exception as exc:
+            note_suppressed("io", "read a written file's schema", exc)
             continue
         partitions = [
             pa.field(name, pa.array([value]).type)

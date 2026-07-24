@@ -202,29 +202,56 @@ pub(crate) fn compile_agg(
 
 /// Partition-local partial aggregation of one batch (interpreter only — the
 /// sequential oracle and callers without a compiled plan).
-pub(crate) fn eval_partial(
+/// The shared body of partial aggregation: evaluate the group keys and each aggregate's
+/// input(s), then hand them to `agg::partial`. The *only* thing the interpreter and the JIT
+/// differ on is how a single expression is evaluated, so that is the one thing passed in —
+/// `eval_group`/`eval_input`/`eval_input2` receive `(aggregate_index, expr)`. Keeping the
+/// assembly here rather than in two twin functions is what makes invariant #6 (interp and
+/// JIT are bit-for-bit identical) structural rather than a promise: there is one way to
+/// build the `Partial`, and the two callers cannot drift apart on grouping, on the
+/// arg_min/arg_max ordering key, or on the row count.
+fn eval_partial_with(
     batch: &RecordBatch,
     group_keys: &[ProjectionItem],
     aggregates: &[AggregateItem],
+    mut eval_group: impl FnMut(usize, &bc_expr::Expr) -> Result<ArrayRef, InterpError>,
+    mut eval_input: impl FnMut(usize, &bc_expr::Expr) -> Result<ArrayRef, InterpError>,
+    mut eval_input2: impl FnMut(usize, &bc_expr::Expr) -> Result<ArrayRef, InterpError>,
 ) -> Result<agg::Partial, InterpError> {
     let group_arrays: Vec<ArrayRef> = group_keys
         .iter()
-        .map(|k| k.expr.eval(batch))
+        .enumerate()
+        .map(|(i, k)| eval_group(i, &k.expr))
         .collect::<Result<_, _>>()?;
     let mut calls = Vec::with_capacity(aggregates.len());
-    for item in aggregates {
+    for (i, item) in aggregates.iter().enumerate() {
         let values = match &item.input {
-            Some(expr) => Some(expr.eval(batch)?),
+            Some(expr) => Some(eval_input(i, expr)?),
             None => None,
         };
         // The ordering key for arg_min/arg_max (the aggregate's second input).
         let key = match &item.input2 {
-            Some(expr) => Some(expr.eval(batch)?),
+            Some(expr) => Some(eval_input2(i, expr)?),
             None => None,
         };
         calls.push(AggCall::with_key(map_agg_func(item), values, key));
     }
     Ok(agg::partial(&group_arrays, &calls, batch.num_rows())?)
+}
+
+pub(crate) fn eval_partial(
+    batch: &RecordBatch,
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+) -> Result<agg::Partial, InterpError> {
+    eval_partial_with(
+        batch,
+        group_keys,
+        aggregates,
+        |_, e| e.eval(batch).map_err(Into::into),
+        |_, e| e.eval(batch).map_err(Into::into),
+        |_, e| e.eval(batch).map_err(Into::into),
+    )
 }
 
 /// Partial aggregation using the per-operator compiled expressions ([`compile_agg`]).
@@ -236,24 +263,14 @@ pub(crate) fn eval_partial_jit(
     aggregates: &[AggregateItem],
     jit: &AggJit,
 ) -> Result<agg::Partial, InterpError> {
-    let group_arrays: Vec<ArrayRef> = group_keys
-        .iter()
-        .zip(&jit.group)
-        .map(|(k, j)| eval_jit(j, &k.expr, batch))
-        .collect::<Result<_, _>>()?;
-    let mut calls = Vec::with_capacity(aggregates.len());
-    for (i, item) in aggregates.iter().enumerate() {
-        let values = match &item.input {
-            Some(expr) => Some(eval_jit(&jit.input[i], expr, batch)?),
-            None => None,
-        };
-        let key = match &item.input2 {
-            Some(expr) => Some(eval_jit(&jit.input2[i], expr, batch)?),
-            None => None,
-        };
-        calls.push(AggCall::with_key(map_agg_func(item), values, key));
-    }
-    Ok(agg::partial(&group_arrays, &calls, batch.num_rows())?)
+    eval_partial_with(
+        batch,
+        group_keys,
+        aggregates,
+        |i, e| eval_jit(&jit.group[i], e, batch),
+        |i, e| eval_jit(&jit.input[i], e, batch),
+        |i, e| eval_jit(&jit.input2[i], e, batch),
+    )
 }
 
 /// Assemble the output batch from finalized group + aggregate columns.

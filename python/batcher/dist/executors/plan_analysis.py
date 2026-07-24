@@ -12,6 +12,7 @@ import dataclasses
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -96,7 +97,10 @@ def _single_source(plan: LogicalPlan) -> bool:
 def _relabel_single_source(plan: LogicalPlan) -> tuple[LogicalPlan, int]:
     """Rewrite a single-source subplan so its scan reads source 0; return its id."""
     ids = _source_ids(plan)
-    assert len(ids) == 1, "expected a single-source subplan"
+    if len(ids) != 1:
+        raise PlanError(
+            f"expected a single-source subplan to relabel, found {len(ids)} sources: {sorted(ids)}"
+        )
     sid = next(iter(ids))
     return remap_sources(plan, -sid), sid
 

@@ -34,14 +34,21 @@ from batcher.observe.analytics import (
     pipeline_report,
     throughput_series,
 )
-from batcher.observe.dag import build_dag
+from batcher.observe.dag import build_dag, explain_rows, plan_diff
+from batcher.observe.inference import InferenceProgress
 from batcher.observe.insights import derive_insights
+from batcher.observe.pipelines import PipelineRegistry, group_pipelines
 
 __all__ = ["ActivityStore", "QueryRecord", "StageRecord"]
 
 #: How many finished queries and log lines the ring buffers retain.
 DEFAULT_MAX_QUERIES = 100
 DEFAULT_MAX_LOGS = 2000
+
+#: Event kinds that describe *how the work is being executed* rather than what the query
+#: did — partition completion, GPU load, inference throughput, dropped rows, actor pool
+#: size. They are folded by `InferenceProgress`, not by the query record.
+_LIVE_KINDS = frozenset({events.PARTITION, events.GPU, events.INFER, events.SKIPPED, events.POOL})
 
 
 @dataclass(slots=True)
@@ -101,6 +108,7 @@ class QueryRecord:
         detail: bool = False,
         baseline: dict[str, Any] | None = None,
         siblings: list[dict[str, Any]] | None = None,
+        live: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """The query as JSON. `detail` adds the per-stage, decision, and profile payload.
 
@@ -128,23 +136,35 @@ class QueryRecord:
         }
         if not detail:
             return summary
+        profile = self.profile or {}
+        ops = profile.get("ops", [])
+        logical_ir, optimized_ir = profile.get("logical_ir"), profile.get("optimized_ir")
         return {
             **summary,
             "stages": [s.to_dict() for s in sorted(self.stages.values(), key=lambda s: s.op_id)],
             "decisions": list(self.decisions),
             "profile": self.profile,
-            # Derived on read, not on ingest: both are pure functions of the profile, and
-            # computing them while the query was still running would spend engine time on a
-            # view nobody may open.
-            "dag": build_dag(
-                (self.profile or {}).get("optimized_ir"), (self.profile or {}).get("ops", [])
-            ),
+            # Derived on read, not on ingest: all of these are pure functions of the profile,
+            # and computing them while the query was still running would spend engine time on
+            # a view nobody may open.
+            "dag": build_dag(optimized_ir, ops),
+            # The plan *as written*, alongside the plan that ran. Both documents are already
+            # on the profile; showing only the second one hides the optimizer's whole
+            # contribution, which is the thing this engine is built around.
+            "logical_dag": build_dag(logical_ir, []),
+            "plan_diff": plan_diff(logical_ir, optimized_ir),
+            "explain": explain_rows(optimized_ir, ops),
+            "logical_explain": explain_rows(logical_ir, []),
             "insights": derive_insights(self.profile),
             "baseline": baseline,
             # The pipeline's other runs, so the run page can offer prev/next and a compare
             # picker without a second request — and without the caller having to know that
             # "the same pipeline" means "the same signature".
             "siblings": siblings or [],
+            # Distributed / batch-inference telemetry for this run: partitions done, GPU
+            # load, actor pool, rows dropped. `None` for an ordinary single-node query,
+            # which is the common case and must not render an empty accelerator panel.
+            "live": live,
         }
 
 
@@ -160,11 +180,21 @@ class ActivityStore:
         *,
         max_queries: int = DEFAULT_MAX_QUERIES,
         max_logs: int = DEFAULT_MAX_LOGS,
+        registry: PipelineRegistry | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._queries: deque[QueryRecord] = deque(maxlen=max_queries)
         self._by_id: dict[str, QueryRecord] = {}
         self._logs: deque[dict[str, Any]] = deque(maxlen=max_logs)
+        # The one piece of durable, writable state the dashboard owns: what a person named a
+        # pipeline, keyed by the same signature Kyber keys learned stats on. Injectable so a
+        # test can point it at a tmp file instead of `$BATCHER_HOME`.
+        self._registry = registry if registry is not None else PipelineRegistry()
+        # Composed, not reimplemented: `InferenceProgress` already folds the distributed
+        # and accelerator event kinds into a bounded per-job view, and a second fold of the
+        # same events is exactly the copy-paste that lets two panels disagree about how many
+        # partitions finished. This store routes those kinds to it and reads its snapshot.
+        self._live = InferenceProgress()
         # Total lines ever appended (not `len(self._logs)`, which stops growing once the
         # ring is full). This is the cursor space `logs` reports against, so a poller can
         # tell "nothing new" apart from "everything I had was evicted".
@@ -182,6 +212,12 @@ class ActivityStore:
         """Fold one bus event into the store. This is the sink handed to `subscribe`."""
         if event.kind == events.LOG:
             self._add_log(event)
+            return
+        if event.kind in _LIVE_KINDS:
+            # Distributed and accelerator telemetry. Handed straight on: these kinds carry no
+            # query-record state, and they arrive from worker threads at a sampling interval
+            # rather than at the query lifecycle points the rest of this method folds.
+            self._live.handle(event)
             return
         with self._lock:
             if event.kind == events.QUERY_START:
@@ -299,7 +335,19 @@ class ActivityStore:
                 for q in self._queries
                 if q.signature and q.signature == record.signature
             ]
-            return record.to_dict(detail=True, baseline=baseline, siblings=siblings)
+            live = self._live.snapshot(query_id)
+            return record.to_dict(detail=True, baseline=baseline, siblings=siblings, live=live)
+
+    def live(self, query_id: str | None = None) -> dict[str, Any] | None:
+        """Distributed and accelerator telemetry for a job, or the most recently active one.
+
+        Args:
+            query_id: The run to read, or None for whichever job last reported.
+
+        Returns:
+            The live snapshot, or None when no distributed or inference work has been seen.
+        """
+        return self._live.snapshot(query_id)
 
     def logs(self, *, since: int = 0, limit: int = 200) -> dict[str, Any]:
         """Log lines from cursor `since`, plus the cursor to pass on the next poll.
@@ -335,40 +383,28 @@ class ActivityStore:
         """
         with self._lock:
             queries = list(self._queries)
-        groups: dict[str, list[QueryRecord]] = {}
-        for query in queries:
-            # An unsigned query is its own pipeline rather than joining a shared "" bucket,
-            # which would lump every unsignable plan into one meaningless group.
-            groups.setdefault(query.signature or f"~{query.query_id}", []).append(query)
+        # The grouping and enrichment live with the pipeline identity code, so the store
+        # stays the run buffer and does not also own what "a pipeline" means across runs.
+        return group_pipelines(queries, self._registry)
 
-        out: list[dict[str, Any]] = []
-        for signature, runs in groups.items():
-            done = [r for r in runs if r.status != "running"]
-            durations = [r.total_ms for r in done]
-            out.append(
-                {
-                    "signature": signature,
-                    "label": runs[-1].label,
-                    "runs": len(runs),
-                    "n_running": sum(1 for r in runs if r.status == "running"),
-                    "n_failed": sum(1 for r in runs if r.status == "error"),
-                    "total_ms": sum(durations),
-                    "median_ms": median(durations) if durations else 0.0,
-                    "min_ms": min(durations, default=0.0),
-                    "max_ms": max(durations, default=0.0),
-                    "total_rows": sum(r.rows for r in done),
-                    "last_wall": max((r.started_wall for r in runs), default=0.0),
-                    "last_status": runs[-1].status,
-                    "recent_ms": durations[-20:],
-                    "percentiles": percentiles(durations),
-                    "rows_per_run": [r.rows for r in done][-20:],
-                    "slowest_id": max(done, key=lambda r: r.total_ms).query_id if done else "",
-                    "fastest_id": min(done, key=lambda r: r.total_ms).query_id if done else "",
-                    "query_ids": [r.query_id for r in runs][-50:],
-                }
-            )
-        out.sort(key=lambda p: p["total_ms"], reverse=True)
-        return out
+    def set_pipeline_meta(
+        self, pipeline_id: str, *, name: str | None = None, note: str | None = None
+    ) -> dict[str, Any]:
+        """Name or annotate a pipeline, persisting it across restarts.
+
+        This is the dashboard's one write. It touches only the pipeline registry — a small
+        JSON file of names and notes — never the engine or a run, so it cannot affect a
+        result or a measurement.
+
+        Args:
+            pipeline_id: The pipeline's stable id (its plan signature).
+            name: A new human name, or None to leave it unchanged.
+            note: A new free-text note, or None to leave it unchanged.
+
+        Returns:
+            The updated metadata as a dict.
+        """
+        return self._registry.set_meta(pipeline_id, name=name, note=note).to_dict()
 
     def details(self) -> list[dict[str, Any]]:
         """Full documents for every retained run, for the cross-run analyses.

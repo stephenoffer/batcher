@@ -15,12 +15,86 @@ Learning *within* a single test (multiple `collect()`s in one function) is prese
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
 import pytest
 
 _DOCS_TESTS = Path(__file__).parent / "docs"
+
+# The heavy optional backends `ci.yml` deliberately does NOT install (it runs `.[dev]`):
+# its own comment says the tests that need them "skip via importorskip", so the
+# deterministic core gate must stay green with them absent. Any test that reaches one of
+# these only at runtime — `collect(distributed=True)`, a `torch` autocast helper, a bare
+# `import ray` in the body — fails instead of skipping unless guarded, and many are not.
+_OPTIONAL_BACKENDS = ("ray", "torch", "tensorflow", "vllm", "cuda")
+
+
+def _backend_available(name: str) -> bool:
+    # `find_spec` rather than import (these are heavy) and tolerate a blocking meta-path
+    # finder raising instead of returning None.
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+_MISSING_BACKENDS = frozenset(b for b in _OPTIONAL_BACKENDS if not _backend_available(b))
+
+
+def _is_absent_backend_error(exc: BaseException | None) -> bool:
+    """True if `exc`, or an error it wraps, is "an absent optional backend is not installed".
+
+    Three shapes reach here: a bare ``import torch``/``import ray`` raises
+    ``ModuleNotFoundError`` (``.name`` set by the import system); ``collect(distributed=True)``
+    and the ML autocast/loader paths raise batcher's typed ``BackendError`` /
+    ``MissingDependencyError`` naming the extra; and the same wrapped as the cause of a
+    later error. Matched by class name + module name so this file imports nothing from
+    ``batcher``. Only backends confirmed *absent* count, so a test failing for a real reason
+    while the backend is installed is never silently skipped.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ModuleNotFoundError):
+            root = (exc.name or "").split(".")[0]
+            if root in _MISSING_BACKENDS:
+                return True
+        if type(exc).__name__ in {"BackendError", "MissingDependencyError"}:
+            msg = str(exc).lower()
+            if any(b in msg for b in _MISSING_BACKENDS):
+                return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Turn an absent-optional-backend failure into a skip, per ci.yml's stated intent.
+
+    The distributed / GPU / autoscale / torch-loader tests need a heavy backend `ci.yml`
+    does not install. Most guard with ``importorskip``, but the ones that reach the backend
+    only at runtime (``collect(distributed=True)``, a torch autocast helper, a bare
+    ``import ray``) do not, so without it they *fail* rather than skip — reddening the exact
+    core gate ci.yml runs. Converting that one error class to a skip here covers every such
+    test (including modules that mix single-node and distributed cases, where a module-level
+    ``importorskip`` would wrongly skip the single-node ones) from one place. It keys off
+    backends *proven absent* at startup, so it is inert wherever the backend is installed —
+    the dev env, the bench lineup, CI's own backend-bearing jobs — and a real regression
+    there still fails.
+    """
+    outcome = yield
+    if not _MISSING_BACKENDS or call.excinfo is None:
+        return
+    if not _is_absent_backend_error(call.excinfo.value):
+        return
+    report = outcome.get_result()
+    if report.outcome == "failed":
+        report.outcome = "skipped"
+        absent = ", ".join(sorted(_MISSING_BACKENDS))
+        reason = f"Skipped: optional backend not installed ({absent})"
+        report.longrepr = (str(item.fspath), item.location[1] or 0, reason)
 
 
 def pytest_configure(config):

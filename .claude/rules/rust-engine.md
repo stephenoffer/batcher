@@ -123,7 +123,7 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
 - **Docs**: module-level `//!` states the crate's single responsibility and
   contract; item `///` explains the *why*, not the *what*. Match the existing
   density — these crates are heavily, purposefully documented.
-- **Lint clean**: `cargo clippy --workspace --exclude bc-py -- -D warnings` MUST
+- **Lint clean**: `cargo clippy --workspace --exclude bc-py --all-targets -- -D warnings` MUST
   pass. `cargo fmt --all` before done.
 
 ## Gate before "done"

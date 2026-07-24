@@ -89,6 +89,17 @@ class OffsetLog(_LogTable):
         )
         return {sid: json.loads(pos) for sid, pos in cur.fetchall()}
 
+    def prune(self, keep_through: int) -> None:
+        """Delete offset rows for batches strictly before ``keep_through``.
+
+        Recovery only ever seeks to the *last committed* batch's position, so every earlier
+        offset row is dead weight. Without this the offset log grew one row per source per
+        micro-batch forever — a per-second stream accumulates millions of rows over a month.
+        ``keep_through`` is the last committed batch, whose row must survive for recovery.
+        """
+        self._conn.execute("DELETE FROM offsets WHERE batch_id < ?", (keep_through,))
+        self._conn.commit()
+
 
 _COMMIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS commits (
@@ -122,3 +133,14 @@ class CommitLog(_LogTable):
         """Whether ``batch_id`` has been committed."""
         cur = self._conn.execute("SELECT 1 FROM commits WHERE batch_id = ?", (batch_id,))
         return cur.fetchone() is not None
+
+    def prune(self, keep_through: int) -> None:
+        """Delete commit rows for batches strictly before ``keep_through``.
+
+        Recovery reads only ``last_committed()`` (the max) and the in-flight batch's
+        absence, so older commit rows are never consulted. Keeping the ``keep_through`` row
+        preserves the max; earlier rows are pruned to bound the commit log the same way the
+        offset log and state store are bounded.
+        """
+        self._conn.execute("DELETE FROM commits WHERE batch_id < ?", (keep_through,))
+        self._conn.commit()

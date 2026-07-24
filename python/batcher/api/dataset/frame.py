@@ -1104,6 +1104,11 @@ class Dataset:
         batch_format: str = "pyarrow",
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
+        max_concurrency: int = 0,
     ) -> Dataset:
         """Apply a Python function to each Arrow batch (sugar for `ds.ml.map_batches`).
 
@@ -1128,6 +1133,11 @@ class Dataset:
             batch_format: The batch type passed to `fn` (``"pyarrow"`` by default).
             multiprocessing: Use processes instead of threads for a CPU-bound `fn`.
             max_errored_rows: How many per-row errors to tolerate before failing.
+            timeout: Wall-clock ceiling (seconds) for one `fn` call; 0 = no timeout.
+            max_retries: Times to retry a batch whose `fn` raises before failing.
+            retry_backoff: Base retry backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
+            max_concurrency: Max in-flight batches for an ``async def`` `fn`; 0 = a default.
 
         Returns:
             A new `Dataset` of the transformed batches.
@@ -1154,6 +1164,11 @@ class Dataset:
             batch_format=batch_format,
             multiprocessing=multiprocessing,
             max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
+            max_concurrency=max_concurrency,
         )
 
     def offload_blobs(
@@ -1251,14 +1266,27 @@ class Dataset:
             output_columns=out_cols,
         )
 
-    def map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
+    def map(
+        self,
+        fn: Callable,
+        *,
+        output_columns: list[str] | None = None,
+        batch_size: int | None = None,
+        num_workers: int | str = "auto",
+        max_concurrency: int = 0,
+    ) -> Dataset:
         """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``).
 
         Sugar for `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`.
+        Pass an ``async def`` `fn` for a per-row I/O-bound call (a per-row LLM/API request):
+        each batch's rows are awaited concurrently, up to `max_concurrency`.
 
         Args:
-            fn: A callable mapping one row dict to a new row dict.
+            fn: A callable (or ``async def``) mapping one row dict to a new row dict.
             output_columns: The output column names when `fn` changes the schema.
+            batch_size: Rebatch to this many rows before processing.
+            num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
+            max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
 
         Returns:
             A new `Dataset` of the mapped rows.
@@ -1271,16 +1299,34 @@ class Dataset:
                 >>> ds.map(lambda row: {"x": row["x"] * 2}).to_pydict()
                 {'x': [2, 4, 6]}
         """
-        return self.ml.map(fn, output_columns=output_columns)
+        return self.ml.map(
+            fn,
+            output_columns=output_columns,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            max_concurrency=max_concurrency,
+        )
 
-    def flat_map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
+    def flat_map(
+        self,
+        fn: Callable,
+        *,
+        output_columns: list[str] | None = None,
+        batch_size: int | None = None,
+        num_workers: int | str = "auto",
+        max_concurrency: int = 0,
+    ) -> Dataset:
         """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten.
 
-        The Ray Data ``flat_map`` — sugar for `ds.ml.flat_map`; see `ds.ml`.
+        The Ray Data ``flat_map`` — sugar for `ds.ml.flat_map`; see `ds.ml`. An ``async def``
+        `fn` has its rows awaited concurrently within a batch.
 
         Args:
-            fn: A callable mapping one row dict to an iterable of row dicts.
+            fn: A callable (or ``async def``) mapping one row dict to an iterable of row dicts.
             output_columns: The output column names when `fn` changes the schema.
+            batch_size: Rebatch to this many rows before processing.
+            num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
+            max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
 
         Returns:
             A new `Dataset` of the flattened rows.
@@ -1293,7 +1339,13 @@ class Dataset:
                 >>> ds.flat_map(lambda row: [{"x": row["x"]}, {"x": row["x"]}]).to_pydict()
                 {'x': [1, 1, 2, 2]}
         """
-        return self.ml.flat_map(fn, output_columns=output_columns)
+        return self.ml.flat_map(
+            fn,
+            output_columns=output_columns,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            max_concurrency=max_concurrency,
+        )
 
     def sql(self, query: str, *, table_name: str = "self", dialect: str | None = None) -> Dataset:
         """Run a SQL query with this dataset bound to `table_name` (default ``self``).

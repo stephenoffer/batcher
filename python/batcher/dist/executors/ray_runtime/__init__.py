@@ -35,6 +35,7 @@ from .policies import (
     skew_join_salt,
     speculation_policy,
 )
+from .reduce import run_bucket_reduce
 from .scaling import (
     alive_node_count,
     await_autoscale,
@@ -85,6 +86,7 @@ __all__ = [
     "request_autoscale",
     "reset_scheduling_envelope",
     "resolve_transport",
+    "run_bucket_reduce",
     "runtime_bloom_join",
     "set_scheduling_envelope",
     "shuffle_partitions",

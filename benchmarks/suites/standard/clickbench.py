@@ -34,24 +34,24 @@ _Q29 = (
 )
 
 QUERIES: dict[str, str] = {
-    "cb-q00": "SELECT COUNT(*) FROM hits",
-    "cb-q01": "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0",
-    "cb-q02": "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
-    "cb-q03": "SELECT AVG(UserID) FROM hits",
-    "cb-q04": "SELECT COUNT(DISTINCT UserID) FROM hits",
-    "cb-q05": "SELECT COUNT(DISTINCT SearchPhrase) FROM hits",
-    "cb-q06": "SELECT MIN(EventDate), MAX(EventDate) FROM hits",
+    "cb-q00": "SELECT COUNT(*) AS c FROM hits",
+    "cb-q01": "SELECT COUNT(*) AS c FROM hits WHERE AdvEngineID <> 0",
+    "cb-q02": ("SELECT SUM(AdvEngineID) AS s, COUNT(*) AS c, AVG(ResolutionWidth) AS a FROM hits"),
+    "cb-q03": "SELECT AVG(UserID) AS a FROM hits",
+    "cb-q04": "SELECT COUNT(DISTINCT UserID) AS u FROM hits",
+    "cb-q05": "SELECT COUNT(DISTINCT SearchPhrase) AS u FROM hits",
+    "cb-q06": "SELECT MIN(EventDate) AS lo, MAX(EventDate) AS hi FROM hits",
     "cb-q07": (
-        "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 "
-        "GROUP BY AdvEngineID ORDER BY COUNT(*) DESC"
+        "SELECT AdvEngineID, COUNT(*) AS c FROM hits WHERE AdvEngineID <> 0 "
+        "GROUP BY AdvEngineID ORDER BY c DESC, AdvEngineID"
     ),
     "cb-q08": (
         "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits "
         "GROUP BY RegionID ORDER BY u DESC, RegionID LIMIT 10"
     ),
     "cb-q09": (
-        "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), "
-        "COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 10"
+        "SELECT RegionID, SUM(AdvEngineID) AS s, COUNT(*) AS c, AVG(ResolutionWidth) AS a, "
+        "COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 10"
     ),
     "cb-q10": (
         "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits "
@@ -77,29 +77,30 @@ QUERIES: dict[str, str] = {
         "ORDER BY c DESC, SearchEngineID, SearchPhrase LIMIT 10"
     ),
     "cb-q15": (
-        "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC, UserID LIMIT 10"
+        "SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID ORDER BY c DESC, UserID LIMIT 10"
     ),
     "cb-q16": (
-        "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase "
-        "ORDER BY COUNT(*) DESC, UserID, SearchPhrase LIMIT 10"
+        "SELECT UserID, SearchPhrase, COUNT(*) AS c FROM hits GROUP BY UserID, SearchPhrase "
+        "ORDER BY c DESC, UserID, SearchPhrase LIMIT 10"
     ),
     "cb-q17": (
-        "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase "
+        "SELECT UserID, SearchPhrase, COUNT(*) AS c FROM hits GROUP BY UserID, SearchPhrase "
         "ORDER BY UserID, SearchPhrase LIMIT 10"
     ),
     "cb-q18": (
-        "SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits "
-        "GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC, UserID, m, SearchPhrase LIMIT 10"
+        "SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) AS c FROM hits "
+        "GROUP BY UserID, m, SearchPhrase ORDER BY c DESC, UserID, m, SearchPhrase LIMIT 10"
     ),
     "cb-q19": "SELECT UserID FROM hits WHERE UserID = 435090932899640449",
-    "cb-q20": "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'",
+    "cb-q20": "SELECT COUNT(*) AS c FROM hits WHERE URL LIKE '%google%'",
     "cb-q21": (
-        "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits "
+        "SELECT SearchPhrase, MIN(URL) AS min_url, COUNT(*) AS c FROM hits "
         "WHERE URL LIKE '%google%' AND SearchPhrase <> '' "
         "GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase LIMIT 10"
     ),
     "cb-q22": (
-        "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) "
+        "SELECT SearchPhrase, MIN(URL) AS min_url, MIN(Title) AS min_title, COUNT(*) AS c, "
+        "COUNT(DISTINCT UserID) AS u "
         "FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' "
         "AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase LIMIT 10"
     ),
@@ -128,22 +129,24 @@ QUERIES: dict[str, str] = {
     ),
     "cb-q29": _Q29,
     "cb-q30": (
-        "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) "
+        "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS r, "
+        "AVG(ResolutionWidth) AS a "
         "FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP "
         "ORDER BY c DESC, SearchEngineID, ClientIP LIMIT 10"
     ),
     "cb-q31": (
-        "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) "
+        "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS r, AVG(ResolutionWidth) AS a "
         "FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP "
         "ORDER BY c DESC, WatchID, ClientIP LIMIT 10"
     ),
     "cb-q32": (
-        "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) "
+        "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS r, AVG(ResolutionWidth) AS a "
         "FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC, WatchID, ClientIP LIMIT 10"
     ),
     "cb-q33": "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC, URL LIMIT 10",
     "cb-q34": (
-        "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC, URL LIMIT 10"
+        "SELECT 1 AS one, URL, COUNT(*) AS c FROM hits "
+        "GROUP BY 1, URL ORDER BY c DESC, URL LIMIT 10"
     ),
     "cb-q35": (
         "SELECT ClientIP, ClientIP - 1 AS ip1, ClientIP - 2 AS ip2, ClientIP - 3 AS ip3, "

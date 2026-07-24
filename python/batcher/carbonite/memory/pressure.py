@@ -13,15 +13,14 @@ level to throttle / spill / pause. The monitor only *measures* — it never acts
 
 from __future__ import annotations
 
-import functools
-import os
-import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
-from batcher._internal.hardware import cgroup_v2_dirs, read_cgroup_bytes
+from batcher.carbonite.memory import probe
+from batcher.carbonite.memory.probe import reset_memory_sampling, total_memory_bytes
 from batcher.config import Config, active_config
+from batcher.metadata.smoothed import load_scalar, record_smoothed_scalar
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -35,35 +34,6 @@ __all__ = [
     "reset_memory_sampling",
     "total_memory_bytes",
 ]
-
-# How long a live OS memory reading (`psutil.virtual_memory().available`) is reused
-# before it is re-sampled. Reading it costs a `/proc` parse (~60 µs) — a real slice of
-# the control plane's per-query cost on sub-second queries — yet the figure it returns
-# does not move on a µs/ms timescale, and every Carbonite memory decision reacts at
-# pipeline-breaker granularity (coarser than this by orders of magnitude). Sharing one
-# sample across the decisions of a query, and across the back-to-back queries of an
-# interactive session, therefore costs nothing in accuracy: a change is still observed
-# within one window, and the live buffer-pool / footprint pressure reads (cheap, and
-# left un-cached) still catch a real spike instantly. A stale reading can only make
-# admission a touch conservative (older = smaller available), never over-admit unsafely.
-_SAMPLE_TTL_SECONDS = 0.05
-
-# Process-constant host RAM (`SC_PAGE_SIZE * SC_PHYS_PAGES`), memoized on first read: it
-# cannot change for the process's lifetime, so re-running the two syscalls per call is
-# pure waste. `None` until first read / when sysconf is unavailable.
-_host_ram_bytes: int | None = None
-
-# Single-slot TTL cache for the live available-bytes reading: `(monotonic_deadline, value)`.
-_available_cache: tuple[float, int] | None = None
-
-
-def reset_memory_sampling() -> None:
-    """Drop the memoized host RAM and the live-reading TTL cache. For tests that
-    patch the underlying OS readers and need the next sample to re-read them."""
-    global _host_ram_bytes, _available_cache
-    _host_ram_bytes = None
-    _available_cache = None
-
 
 # Learned-parameter namespace + key for the measured pressure-level flap rate (fraction
 # of samples that reversed direction). One process-wide figure; the hysteresis adapts to it.
@@ -88,157 +58,6 @@ class PressureLevel(IntEnum):
     ELEVATED = 1  # approaching the soft limit — prefer spill-friendly plans
     SPILL = 2  # past the soft limit — spill stateful operators to disk
     CRITICAL = 3  # past the hard limit — pause producers, only drain
-
-
-@functools.lru_cache(maxsize=1)
-def _cgroup_limit_bytes() -> int | None:
-    """The container memory limit from cgroup v2 (`memory.max`) or v1
-    (`memory.limit_in_bytes`), or `None` when unlimited / not in a cgroup.
-
-    A container's cgroup cap is the *real* ceiling — the host's RAM is not — so
-    honoring it is what stops the engine over-admitting and getting OOM-killed by
-    the kernel (C25).
-
-    Cached for the process: the cgroup cap is fixed for a container's lifetime, while
-    this is read on every admission check — re-opening `memory.max` per query is pure
-    hot-path I/O. (The *current* usage, which does change, is read live and uncached.)
-
-    Like the CPU quota, the limit can be set at any level of the cgroup v2 hierarchy — the
-    process's own leaf (a namespaced pod), a parent slice (a non-namespaced Ray worker), or
-    the mount root — so the effective cap is the tightest `memory.max` across the whole
-    ancestry (`cgroup_v2_dirs`), not just the root. v1 keeps its single well-known path.
-    """
-    limits = [
-        v for d in cgroup_v2_dirs() if (v := read_cgroup_bytes(os.path.join(d, "memory.max")))
-    ]
-    if limits:
-        return min(limits)
-    return read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
-
-
-def _cgroup_file_cache_bytes() -> int:
-    """Page cache charged to this cgroup — `file` (v2) or `total_cache` (v1); 0 if unknown."""
-    for path, key in (
-        ("/sys/fs/cgroup/memory.stat", "file"),
-        ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
-    ):
-        try:
-            with open(path) as f:
-                lines = f.read().splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            field, _, raw = line.partition(" ")
-            if field == key:
-                try:
-                    return max(0, int(raw))
-                except ValueError:
-                    return 0
-    return 0
-
-
-def _cgroup_current_bytes() -> int | None:
-    """The cgroup's *unreclaimable* memory, or `None` when not in a cgroup.
-
-    `memory.current` is routinely mistaken for the OOM number, and is not: it counts
-    anonymous memory **plus every clean file page the kernel happens to be caching**. Cache is
-    reclaimable — dropped long before anything is OOM-killed — so charging it as pressure
-    reads a box that has merely *read files* as one about to die. Measured on a 30 GiB host
-    after loading TPC-H: 24.3 GiB "current", of which 15.3 GiB was cache. That pinned the
-    monitor at ELEVATED, which halves every morsel (`_MORSEL_PRESSURE_FACTORS`) — a 7%
-    throughput loss for the whole run, invisible to every correctness test.
-
-    Subtracting `file` costs the guard nothing, because the two are disjoint: what it exists
-    to see (the Flight shuffle store, off-pool pyarrow buffers) is **anonymous** and stays
-    counted; what is subtracted is cache that was never the engine's. The remainder
-    (anon + slab + sock) is what the kernel cannot get back — the figure the OOM-killer acts on.
-    """
-    total = _cgroup_total_bytes()
-    if total is None:
-        return None
-    return max(0, total - _cgroup_file_cache_bytes())
-
-
-def _cgroup_total_bytes() -> int | None:
-    """The raw cgroup charge, anonymous **and** cached — `memory.current` / `usage_in_bytes`.
-
-    Not a pressure signal on its own; see `_cgroup_current_bytes`.
-    """
-    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
-        value = read_cgroup_bytes(path)
-        if value is not None:
-            return value
-    return None
-
-
-def _cap_to_cgroup_headroom(host_available: int) -> int:
-    """Clamp a host-wide available figure to what this container may still allocate.
-
-    `psutil`/`/proc` report the *machine's* free RAM, but a cgroup-limited container (the norm
-    under Kubernetes/Ray) OOMs at `memory.max`, not at host exhaustion — on a 184 GB host an
-    8 GB container would otherwise read ~180 GB free and over-admit into a kill. The real
-    headroom is `limit - current`, where `current` excludes the reclaimable page cache (see
-    `_cgroup_current_bytes`) — cache the kernel will evict on demand is headroom, not usage.
-    Take the smaller of that and the host figure. No cgroup cap (bare metal / unlimited)
-    leaves the reading untouched.
-    """
-    limit = _cgroup_limit_bytes()
-    if limit is None:
-        return host_available
-    current = _cgroup_current_bytes()
-    if current is None:
-        return host_available
-    return min(host_available, max(0, limit - current))
-
-
-def _process_rss_bytes() -> int | None:
-    """This process's resident set size (RSS) via `psutil`, or `None` without it.
-
-    RSS captures the engine's true footprint — the Flight `PartitionStore`, pyarrow
-    buffers, everything — not just the buffer pool's accounted reservations."""
-    try:
-        import psutil
-    except ImportError:
-        return None
-    try:
-        return int(psutil.Process().memory_info().rss)
-    except Exception:
-        return None
-
-
-def total_memory_bytes() -> int:
-    """The memory ceiling: the min of host RAM and any cgroup/container limit.
-
-    Falls back to `MemoryConfig.default_total_bytes` (one home for the fallback)
-    when the OS won't report host RAM. Host RAM and the cgroup cap are both fixed for
-    the process's lifetime, so both are memoized — this is read on every admission /
-    pressure check, and re-running the syscalls each time is hot-path waste.
-    """
-    global _host_ram_bytes
-    host = _host_ram_bytes
-    if host is None:
-        try:
-            host = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            _host_ram_bytes = host
-        except (ValueError, OSError, AttributeError):
-            host = active_config().memory.default_total_bytes  # not memoized (config-derived)
-    cgroup = _cgroup_limit_bytes()
-    return min(host, cgroup) if cgroup is not None else host
-
-
-def _proc_meminfo_available() -> int | None:
-    """`MemAvailable` from `/proc/meminfo` (Linux), or `None` if unreadable.
-
-    The without-psutil fallback so memory governance still senses real pressure on
-    Linux containers where the optional dep isn't installed (C26)."""
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024  # kB → bytes
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,18 +109,18 @@ class PressureMonitor:
 
     def snapshot(self) -> MemorySnapshot:
         """Take a current reading of total/available memory and budget usage."""
-        total = total_memory_bytes()
+        total = probe.total_memory_bytes()
         available = self._available_bytes(total)
         used_fraction = 1.0 - (available / total) if total else 1.0
         return MemorySnapshot(total=total, available=available, used_fraction=used_fraction)
 
     def available_bytes(self) -> int:
         """Bytes of RAM available right now (psutil) or total RAM as a fallback."""
-        return self._available_bytes(total_memory_bytes())
+        return self._available_bytes(probe.total_memory_bytes())
 
     def budget_bytes(self) -> int:
         """The soft envelope: the share of total RAM the engine aims to stay under."""
-        return int(total_memory_bytes() * self._config.memory.soft_limit)
+        return int(probe.total_memory_bytes() * self._config.memory.soft_limit)
 
     def envelope_bytes(self) -> int:
         """The raw memory a query may draw on: the configured hard cap if set
@@ -417,9 +236,9 @@ class PressureMonitor:
         pool = current_process_pool()
         if pool is not None and pool.limit > 0:
             candidates.append(pool.used / pool.limit)
-        total = total_memory_bytes()
+        total = probe.total_memory_bytes()
         if total:
-            footprint = _cgroup_current_bytes() or _process_rss_bytes()
+            footprint = probe.cgroup_current_bytes() or probe.process_rss_bytes()
             if footprint is not None:
                 candidates.append(footprint / total)
         if candidates:
@@ -435,38 +254,13 @@ class PressureMonitor:
 
     @staticmethod
     def _available_bytes(total: int) -> int:
-        """Available RAM, served from a short-TTL sample (see `_SAMPLE_TTL_SECONDS`).
-
-        The underlying `psutil.virtual_memory()` (or `/proc` fallback) read is the
-        single most expensive step in a per-query Carbonite decision; a change is still
-        picked up within one TTL window, so amortizing the read across a query's
-        decisions and a session's queries is free accuracy-wise (a stale reading only
-        makes admission slightly conservative, never over-admits).
-        """
-        global _available_cache
-        now = time.monotonic()
-        cached = _available_cache
-        if cached is not None and now < cached[0]:
-            return min(cached[1], total)
-        value = PressureMonitor._read_available_bytes()
-        _available_cache = (now + _SAMPLE_TTL_SECONDS, value)
-        return min(value, total)
+        """Available RAM, never reported as more than the `total` this monitor budgets to."""
+        return min(probe.available_bytes(), total)
 
     @staticmethod
     def _read_available_bytes() -> int:
-        """One live reading of *available* RAM (uncached), capped to the container's cgroup
-        headroom. `psutil` when present, else Linux `/proc/meminfo`, else a large sentinel
-        meaning 'assume headroom'."""
-        try:
-            import psutil
-
-            host = int(psutil.virtual_memory().available)
-        except ImportError:
-            # No psutil: read a real figure from /proc on Linux (C26); only as a
-            # last resort assume the machine is otherwise idle.
-            proc = _proc_meminfo_available()
-            host = proc if proc is not None else (1 << 62)
-        return _cap_to_cgroup_headroom(host)
+        """One uncached live reading of available RAM. Kept as a seam tests can replace."""
+        return probe.read_available_bytes()
 
 
 def hysteresis_alpha_from_flap(flap_rate: float | None) -> float | None:
@@ -490,13 +284,7 @@ def load_flap_rate(hub: MetadataHub | None) -> float | None:
 
     Best-effort: any read failure yields `None`, so the hysteresis keeps its static
     default and behavior is unchanged."""
-    if hub is None:
-        return None
-    try:
-        value = hub.get_keyed_param(_FLAP_NS, _FLAP_KEY)
-    except Exception:  # pragma: no cover - metadata must never break a query
-        return None
-    return float(value) if value is not None else None
+    return load_scalar(hub, _FLAP_NS, _FLAP_KEY)
 
 
 def record_flap_rate(
@@ -507,13 +295,5 @@ def record_flap_rate(
     Core measures how often the pressure level reversed direction over a run and reports
     it here; the value is smoothed so a single noisy run doesn't jerk the hysteresis. A
     scheduling signal only — never a result."""
-    if hub is None:
-        return
-    try:
-        rate = min(1.0, max(0.0, flap_rate))
-        alpha = (config or active_config()).optimizer.learning_smoothing_alpha
-        prior = hub.get_keyed_param(_FLAP_NS, _FLAP_KEY)
-        smoothed = rate if prior is None else alpha * rate + (1.0 - alpha) * float(prior)
-        hub.put_keyed_param(_FLAP_NS, _FLAP_KEY, smoothed)
-    except Exception:  # pragma: no cover - metadata must never break a query
-        pass
+    rate = min(1.0, max(0.0, flap_rate))
+    record_smoothed_scalar(hub, _FLAP_NS, _FLAP_KEY, rate, config)

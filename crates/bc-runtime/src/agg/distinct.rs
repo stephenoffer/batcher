@@ -177,19 +177,25 @@ pub(crate) fn distinct_state(
 
 /// Merge per-group distinct lists across partitions: flatten to `(group, value)`
 /// pairs, dedup, re-bucket. `combine` has already concatenated the list columns.
-pub(crate) fn merge_distinct(
+/// Flatten a `List` aggregation state into per-element `(group_id, value)` columns.
+///
+/// COUNT(DISTINCT) and MEDIAN/QUANTILE both combine by concatenating each group's partial
+/// value lists, then flattening the result to feed a per-group bucketer. The concatenated
+/// child already holds every value in list-row order, so when the list offsets are
+/// contiguous (`0, len0, len0+len1, ...`) flattening in row order visits child element `e`
+/// exactly at output position `e` -- the flattened value column *is* the child, and the
+/// obvious "build `0..child.len()` and `take` through it" is a full copy of every value
+/// (~tens of millions on a low-cardinality aggregate) that reorders nothing. This skips it,
+/// falling back to an explicit gather only for a sliced/offset child.
+///
+/// Returns the per-element group ids and the flat value column; the caller buckets them.
+pub(crate) fn flatten_list_state(
     state: &ArrayRef,
     group_ids: &[u32],
-    num_groups: usize,
-) -> Result<ArrayRef, RuntimeError> {
+) -> Result<(Int64Array, ArrayRef), RuntimeError> {
     let list = state.as_list::<i32>();
     let offsets = list.value_offsets();
     let child = list.values();
-    // The concatenated child holds every partial list's values in list-row order with contiguous
-    // offsets, so flattening in row order visits child element `e` at output position `e` — the
-    // index would be `0..child.len()` and take-ing through it just copies every value (~tens of
-    // millions on a big COUNT(DISTINCT)) without reordering. Expand only the per-element group id
-    // and hand the child straight to the deduping bucketer.
     let contiguous = offsets.first().copied().unwrap_or(0) == 0
         && offsets.last().map(|&o| o as usize) == Some(child.len());
     let mut elem_groups: Vec<i64> = Vec::with_capacity(child.len());
@@ -198,17 +204,25 @@ pub(crate) fn merge_distinct(
         let g = group_ids[row] as i64;
         elem_groups.extend(std::iter::repeat_n(g, n));
     }
-    let group_col: ArrayRef = Arc::new(Int64Array::from(elem_groups));
+    let elem_groups = Int64Array::from(elem_groups);
     if contiguous {
-        return distinct_pairs_to_list(group_col, child.clone(), num_groups);
+        return Ok((elem_groups, child.clone()));
     }
     let elem_idx: Vec<u32> = (0..list.len())
         .flat_map(|row| offsets[row] as u32..offsets[row + 1] as u32)
         .collect();
     let values = take(child.as_ref(), &UInt32Array::from(elem_idx), None)?;
-    distinct_pairs_to_list(group_col, values, num_groups)
+    Ok((elem_groups, values))
 }
 
+pub(crate) fn merge_distinct(
+    state: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    let (elem_groups, values) = flatten_list_state(state, group_ids)?;
+    distinct_pairs_to_list(Arc::new(elem_groups), values, num_groups)
+}
 /// Dedup `(group, value)` pairs and bucket the distinct values into a per-group
 /// `List` column — the shared core of the distinct partial and merge steps.
 /// Dedup `(group, value)` `i64` pairs across cores by hash-partitioning them, then deduping

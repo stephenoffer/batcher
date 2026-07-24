@@ -1,5 +1,136 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## A self-join fell to the single-threaded streaming path — TPC-H q21 3.2x → 1.5x (2026-07-23)
+
+TPC-H q21 was the worst-remaining single-node query (3.2x DuckDB, 211 ms), and the cause was
+the *executor*, not a kernel. Its correlated `EXISTS`/`NOT EXISTS` decorrelate into self-joins
+over `lineitem` — the same source scanned three times. The streaming parallel executor refuses
+to shard a plan that reads a source more than once (sharding the driving scan would hand a build
+side a shard instead of the whole relation), so the entire query fell to the **single-threaded
+sequential streaming pipeline**, where the joins probe one morsel at a time. The materializing
+executor's `join_partitioned` spreads the probe across every core: q21 measured **251 ms
+streaming vs 92 ms materializing** at sf1.
+
+`bc_interp::streaming_parallelizes(plan)` reports whether the streaming executor can spread a
+plan (false iff a source is read twice). The single-node FFI dispatch now prefers the
+materializing executor for such a plan **when its input is a small fraction of the memory
+envelope** (`src_bytes × 8 < budget`). Streaming's value on a self-join is bounded *intermediate*
+memory — the join outputs it never holds in full — so it is given up only when those intermediates
+cannot approach the cap, and the materializing breakers spill on top of that. Verified both ways:
+an ample envelope routes q21 to materializing (156 ms), a 1 GB cap keeps it streaming (243 ms,
+bounded). The distributed path is untouched — it composes the `dist` primitives, not this
+dispatch — and both executors are checked against the same sequential oracle, so this trades only
+memory headroom for speed.
+
+| TPC-H sf1 q21 vs DuckDB | ms | ratio |
+|---|---:|---:|
+| before (streaming, single-threaded) | 211 | 3.2x |
+| after (materializing, per-core join) | 112 | 1.5x |
+
+Landed with a companion fix that compiles the streaming aggregate's JIT **once per query** rather
+than once per shard (a 92-core box was paying Cranelift's per-expression compile ~90 times):
+`fold_partial` takes a caller-shared `OnceLock<AggJit>`. 1081 Rust tests, the 224 differential
+join/subquery tests (`correlated_exists`, `sql_correlated`, `sql_subquery`), and clippy pass.
+
+## The streaming aggregate interpreted its arithmetic inputs — TPC-H sf1 8/22 → 12/22 (2026-07-23)
+
+The streaming executor is the default, but its aggregate fold (`stream::fold_partial`) evaluated
+each aggregate's input expression through the interpreter, while the materializing executor
+(`par.rs`) already compiled them with the Cranelift JIT via `eval_partial_jit`. So the arithmetic
+inside an aggregate — `SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax))`, the shape at the
+heart of TPC-H q1/q12/q17 — was evaluated per row on the interpreter, on the path almost every
+query takes. Arrow computes that chain as a sequence of separate kernel passes, each allocating a
+temporary column; the JIT fuses it into one pass over the values.
+
+`fold_partial` now compiles the computed group-key and aggregate-input expressions once, from the
+first morsel that carries rows, and reuses the JIT across the fold — the same thing the
+materializing path does. `eval_jit` is bit-identical to the interpreter on its supported subset
+and falls back to it otherwise, so the change is throughput only; the streaming-oracle aggregate
+tests pin it against that interpreter, the 264-case `{collect, spill, iter_batches}` matrix and
+1080 Rust tests pass, and each parallel shard compiles its own functions so nothing crosses a
+thread.
+
+| TPC-H sf1 vs DuckDB | before | after |
+|---|---:|---:|
+| wins (of 22) | 8 | 12 |
+| q7  | 1.05x | 0.98x |
+| q12 | 1.30x | 0.76x |
+| q13 | 1.04x | 0.86x |
+| q17 | 1.02x | 0.67x |
+
+The arithmetic-heavy aggregates flipped; q9/q10/q19 deepened. The streaming **filter/project** are
+deliberately left interpreted — arrow's compare/boolean kernels are already SIMD, and JIT there
+measured 1.01x over TPC-H with five queries *slower*, so only the arithmetic-chain aggregate
+inputs benefit from fusion.
+
+The queries still trailing DuckDB at sf1 are the bandwidth-bound scan+filter+low-cardinality
+shapes (q1, q3–q6 at 1.05–1.45x), q21 (a correlated `EXISTS`/`NOT EXISTS` DuckDB decorrelates
+especially well), and q22. Those are the structural gap — DuckDB's on-the-fly decompression and
+vector-at-a-time selection — not a contained fix, and closing them is the SIMD-kernel work the
+`README` names as open.
+
+## High-cardinality grouping was the systematic loss; four fixes closed it (2026-07-23)
+
+The 2026-07-19 ClickBench sweep named one target for "the single most valuable finding of the
+whole sweep": every 2x+ loss to DuckDB was **high-cardinality grouping and `COUNT(DISTINCT)` over
+string or near-unique keys**. This session took that apart into four independent causes, each
+measured and fixed. All 43 ClickBench, 22 TPC-H, 7 TPC-DS, 11 operator and 5 JSON cases pass the
+DuckDB correctness gate after; 1080 Rust tests and the differential suite pass.
+
+Measured on a 92-core box, sf1, `batcher / duckdb` (< 1.00 = Batcher faster):
+
+| query | before | after | cause |
+|---|---:|---:|---|
+| cb-q10 `COUNT(DISTINCT) GROUP BY MobilePhoneModel` | 6.27x | 0.83x | DISTINCT not sharded |
+| cb-q11 | 5.75x | 0.98x | " |
+| cb-q13 `… GROUP BY SearchPhrase`                   | 4.16x | 1.54x | " |
+| cb-q33 `GROUP BY URL`                              | 1.99x | 0.60x | combine copied the key twice |
+| cb-q34                                             | 1.64x | 0.63x | " |
+| cb-q32 `GROUP BY WatchID, ClientIP`                | 2.29x | 1.19x | " |
+| cb-q39                                             | 5.34x | 0.87x | " |
+| cb-q36 `GROUP BY URL` under a 5-predicate filter   | 2.55x | 0.84x | radix threshold too high |
+| cb-q28 `REGEXP_REPLACE(...) GROUP BY`              | 2.64x | 1.07x | one Regex shared by 92 cores |
+
+**1. `DISTINCT` was refused a shard.** The streaming executor's `spine_is_shardable` allows a
+root `Aggregate` (each worker's `Partial` is combined, never finalized) but not a root
+`Distinct`, so the whole scan/filter pipeline under a dedup ran on one core. `Distinct` is a
+mergeable all-column group-by, so it gets the same allowance. Kyber rewrites `COUNT(DISTINCT x)
+GROUP BY k` into `count(*)` over `DISTINCT (k, x)`, so this serialized *every* grouped
+`COUNT(DISTINCT)` — the q10/q11/q13 family, where 22 of 25 ms was the single-threaded scan+filter.
+
+**2. The combine copied its key column twice.** `combine` concatenated the partials into one
+array to hash them, then concatenated the radix partitions' outputs back into one `Partial`.
+Neither copy is read as a single array — the regroup addresses rows as `(partial, row)` and the
+caller re-morselizes the result — yet on a high-cardinality string key each copy is the merge's
+largest term (q33: 60 ms of a 70 ms combine). The merge now hashes each partial in place and
+gathers per partition with `interleave`; `combine_partitioned` hands the key-disjoint partitions
+back as separate morsels. And arrow's `concat` is per-row for byte arrays (the same defect its
+`take` has, which the engine already routes around), so `gather::concat_columns` sums the lengths
+into the offset buffer and copies each input's bytes into its own disjoint output slice across
+cores. q33 combine: 70 ms → 15 ms.
+
+**3. The radix-merge threshold was a constant where the crossover is per-partition.** `combine`
+chose the parallel hash-radix regroup over the serial one at a fixed 200,000 partial rows, but the
+crossover is rows *per partition* (the parallel overhead is per-partition; the serial cost is
+per-row and single-threaded). q36 landed at 181,962 rows — just under — and paid 38 ms of serial
+`assign_groups` over a string key for work the parallel path does in 5. The threshold now resolves
+to `partitions × 256`.
+
+**4. One `Regex` shared across every worker inverts past ~8 cores.** A `regex::Regex` owns an
+internal scratch pool that falls off its lock-free path onto a mutex under contention, so a shared
+automaton turns a per-row match into a critical section: `REGEXP_REPLACE` over 921 k rows ran
+1170 ms on 1 core, 208 ms on 8, and 318 ms on 92. The process-wide cache still memoizes the
+compile; a thread-local map now hands each worker a *clone* (shared program, fresh pool). 318 ms →
+164 ms.
+
+Each fix is result-invariant and distribution-safe by construction: (1) and (2) are the mergeable
+algebra (`partial`/`combine`/`finalize`) that already backs single-node == distributed, pinned by
+a new `combine_partitioned_is_combine_split_by_key` invariant test and two streaming-oracle cases;
+(3) only schedules the same merge; (4) a `Regex` clone matches its source. The remaining honest
+gaps are TPC-H q21 (a correlated `EXISTS`/`NOT EXISTS` DuckDB decorrelates especially well) and
+the sub-5 ms point/tiny-sort queries where fixed control-plane overhead, not a kernel, sets the
+ratio.
+
 ## Eager aggregation pre-aggregated 6M rows to feed a 5,514-row join — TPC-H Q17 8.7x → 1.6x (2026-07-20)
 
 Q17 was the TPC-H suite's worst row by a wide margin: **155.2 ms against DuckDB's 17.9 and

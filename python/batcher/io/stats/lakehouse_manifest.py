@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
 from batcher.io.stats.columnar_footer import is_exact_minmax_type
 from batcher.io.stats.file_skipping import (
     MAX_PREFIX as _MAX_PREFIX,
@@ -72,7 +73,8 @@ def manifest_statistics(add_actions: Any) -> SourceStatistics | None:
         total = int(pc.sum(add_actions.column("num_records")).as_py() or 0)
         columns = _delta_columns(add_actions, names, pa, pc)
         return SourceStatistics(row_count=total, columns=columns, exact_rows=True)
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "extract manifest stats", exc)
         return None
 
 
@@ -166,7 +168,8 @@ def _agg_bound(add_actions: Any, name: str | None, pc: Any, how: str) -> tuple[A
         if how == "max":
             return pc.max(col).as_py(), complete
         return pc.sum(col).as_py(), complete
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "aggregate manifest bound", exc)
         return None, False
 
 

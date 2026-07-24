@@ -329,7 +329,10 @@ fn run_with_cache(
     // `sources` view its worker will scan. Built *before* the parallel loop so they outlive the
     // morsel streams that borrow them (a stream is a `Box<dyn Iterator + 'a>`, and `'a` has to
     // outlive the closure that produced it).
-    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = shard(&sources[driving], workers)
+    // Capped so no shard is under a morsel (see `effective_shard_count`) — else a medium
+    // relation's sub-morsel shards run the parallel path slower than sequential.
+    let shard_workers = effective_shard_count(workers, driving_rows);
+    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = shard(&sources[driving], shard_workers)
         .into_iter()
         .map(|sh| swap(sources, driving, sh))
         .collect();
@@ -348,11 +351,15 @@ fn run_with_cache(
             // `finalize` once is the mergeable algebra (invariant #7) — the very same fold the
             // distributed path runs across *nodes*. One implementation, one set of semantics.
             let t = std::time::Instant::now();
+            // One compiled JIT for the aggregate's expressions, shared by every shard — the
+            // schema is identical across shards, so `compile_agg` runs exactly once (the first
+            // shard to see a row) rather than once per core.
+            let jit: std::sync::OnceLock<ops::AggJit> = std::sync::OnceLock::new();
             let folded: Vec<(Option<agg::Partial>, u64)> = shard_sources
                 .par_iter()
                 .map(|srcs| {
                     let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
-                    fold_partial(build_with(input, ctx)?, group_keys, aggregates)
+                    fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
 
@@ -387,6 +394,55 @@ fn run_with_cache(
                     rows_in,
                     0,
                     state,
+                    &out,
+                    t.elapsed().as_nanos() as u64,
+                );
+            }
+            Ok(out)
+        }
+        // `DISTINCT` over a shard is a *partial* dedup, so each worker runs the pipeline below the
+        // dedup and the driver dedups the union — the same `partial → combine` the aggregate arm
+        // above runs, with the empty aggregate list.
+        //
+        // The result is identical to the unsharded path, not merely equivalent. Shards are
+        // contiguous in-order row ranges, so flattening them in shard order reproduces the
+        // relation in the oracle's row order; `parallel_distinct` then sees the same rows in the
+        // same order, differing only in where the morsel boundaries fall. Its `combine` keeps
+        // first-seen order across the concatenated partials, and first-seen order over a sequence
+        // does not depend on how that sequence is cut into morsels.
+        //
+        // Peak memory is what the sequential streaming breaker already held (it `drain`s its
+        // input), so this buys the parallelism without widening the envelope.
+        RelOp::Distinct { input } => {
+            let t = std::time::Instant::now();
+            let parts: Vec<Vec<RecordBatch>> = shard_sources
+                .par_iter()
+                .map(|srcs| {
+                    let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                    build_with(input, ctx)?.collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, InterpError>>()?;
+            let batches: Vec<RecordBatch> = parts.into_iter().flatten().collect();
+            if batches.is_empty() {
+                // No shard saw a row. The oracle owns the correctly-typed empty relation.
+                return crate::execute(plan, sources);
+            }
+            let rows_in = crate::count_rows(&batches);
+            let held = crate::batch_bytes(&batches);
+            if budget > 0 && held as usize > budget {
+                return Err(InterpError::MemoryBudgetExceeded {
+                    needed: held as usize,
+                    budget,
+                    reason: "the streaming distinct does not spill",
+                });
+            }
+            let out = ops::parallel_distinct(&batches)?;
+            if let Some(m) = meter {
+                m.breaker(
+                    m.id(plan),
+                    rows_in,
+                    0,
+                    held,
                     &out,
                     t.elapsed().as_nanos() as u64,
                 );
@@ -488,6 +544,19 @@ fn swap(
     out
 }
 
+/// Shards to split the driving relation into: `workers`, capped so no shard is under a morsel.
+///
+/// Splitting a medium relation across every core gives sub-morsel shards whose per-shard
+/// dispatch + `combine` (~15 µs) dwarf their work. `driving_rows / MORSEL_ROWS` (floor — `shard`
+/// spreads rows evenly, so ceiling would push the split back below a morsel) keeps every worker
+/// at ≥ one morsel; a relation with ≥ `workers` morsels still fills every core. Scheduling only:
+/// `combine` is associative + commutative over contiguous in-order shards, so the result stands.
+fn effective_shard_count(workers: usize, driving_rows: usize) -> usize {
+    workers
+        .min(driving_rows / bc_arrow::DEFAULT_MORSEL_ROWS)
+        .max(1)
+}
+
 /// Split a relation into `workers` contiguous, in-order shards of whole morsels.
 fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -542,8 +611,15 @@ fn shardable_source(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>) -
     // answer — *unless* it is the root, where each worker's `Partial` is combined rather than
     // finalized. So the root aggregate is allowed and checked through to its input; an aggregate
     // anywhere *below* is not, and `spine_is_shardable` refuses it.
+    //
+    // `Distinct` is the same shape and gets the same allowance: it is a mergeable all-column
+    // group-by with no aggregates, so a worker's shard produces a *partial* dedup that merges
+    // with the others exactly as an aggregate's `Partial` does. Without this the whole subtree
+    // under a `DISTINCT` ran on one core — and since Kyber rewrites `COUNT(DISTINCT x) GROUP BY
+    // k` into `count(*)` over `DISTINCT (k, x)`, that serialized every grouped `COUNT(DISTINCT)`
+    // (ClickBench q10/q11/q13: 22 of 25 ms was the single-threaded scan+filter below the dedup).
     let spine = match plan {
-        RelOp::Aggregate { input, .. } => input,
+        RelOp::Aggregate { input, .. } | RelOp::Distinct { input } => input,
         other => other,
     };
     if !spine_is_shardable(spine, cache, mats) {
@@ -709,9 +785,58 @@ fn count_scans(plan: &RelOp, counts: &mut HashMap<usize, usize>) {
     }
 }
 
+/// Whether the streaming parallel executor can spread this plan across cores.
+///
+/// It cannot when a source is scanned **more than once** — a self-join or a correlated
+/// subquery (TPC-H q21's `EXISTS`/`NOT EXISTS` over `lineitem`, q22's over `orders`). Sharding
+/// the driving scan would hand a *build* side a shard instead of the whole relation, so
+/// `shardable_source` refuses those plans and the entire query falls to the single-threaded
+/// sequential streaming pipeline — where the joins probe one morsel at a time on one core,
+/// while the materializing executor's `join_partitioned` spreads the probe across all of them.
+/// Measured at sf1, q21 was 251 ms streaming vs 92 ms materializing for exactly this reason.
+///
+/// The caller uses this to prefer the materializing parallel executor for such a plan **only
+/// when memory is unbounded** (`budget == 0`): with no memory cap the input already fits in RAM
+/// and the far faster per-core join wins, while a capped run (large scale, distributed) keeps
+/// the bounded-memory streaming path. Correctness is identical either way — both executors are
+/// checked against the sequential oracle — so this only trades memory for speed.
+pub fn streaming_parallelizes(plan: &RelOp) -> bool {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    count_scans(plan, &mut counts);
+    counts.values().all(|&c| c <= 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `streaming_parallelizes` is the routing predicate: false exactly when a source is read
+    /// more than once, because that is what makes the streaming executor decline to shard and
+    /// fall to its single-threaded pipeline. A plain scan and a two-*different*-source join are
+    /// parallelizable; a self-join (same `source_id` twice) is not.
+    #[test]
+    fn streaming_parallelizes_is_false_only_for_a_repeated_source() {
+        let scan = |sid| RelOp::Scan { source_id: sid };
+        assert!(streaming_parallelizes(&scan(0)), "a bare scan shards");
+
+        let join = |l, r| RelOp::HashJoin {
+            left: Box::new(l),
+            right: Box::new(r),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: bc_ir::JoinType::Inner,
+            output: vec![],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        assert!(
+            streaming_parallelizes(&join(scan(0), scan(1))),
+            "a join of two distinct sources shards (only the probe side is on the spine)"
+        );
+        assert!(
+            !streaming_parallelizes(&join(scan(0), scan(0))),
+            "a self-join reads source 0 twice, so the streaming executor cannot shard it"
+        );
+    }
 
     /// The streaming executor's body must run on a pool of the width it was asked for, never
     /// rayon's global pool.
@@ -747,5 +872,34 @@ mod tests {
         assert_eq!(opts.parallelism, 0, "default is 'all cores'");
         let expected = bc_arrow::usable_cores();
         assert_eq!(opts.workers(), expected);
+    }
+
+    /// The shard count never produces a sub-morsel shard, and a relation big enough to fill
+    /// every worker still fans out fully. Without the cap, a 96-core box split a 200k-row
+    /// relation (~12 morsels) into 96 ~2k-row shards and the dispatch/`combine` overhead ran
+    /// the parallel path *slower* than sequential.
+    #[test]
+    fn shard_count_never_goes_below_one_morsel() {
+        let m = bc_arrow::DEFAULT_MORSEL_ROWS;
+        // A medium relation is capped by its whole-morsel count, not the machine width.
+        assert_eq!(effective_shard_count(96, 200_000), 200_000 / m);
+        // Exactly the shard threshold (4 morsels) yields at most 4 shards, not 96.
+        assert_eq!(effective_shard_count(96, 4 * m), 4);
+        // A relation with ≥ `workers` morsels still uses every worker.
+        assert_eq!(effective_shard_count(96, 200 * m), 96);
+        // Degenerate inputs never yield zero shards.
+        assert_eq!(effective_shard_count(96, 0), 1);
+        assert_eq!(effective_shard_count(1, 200 * m), 1);
+        // Every shard of a capped split holds at least one full morsel's worth of rows — the
+        // whole point of the cap. `shard` spreads rows evenly, so the smallest shard is
+        // `rows / shards` (floored), which must still clear a morsel.
+        for rows in [4 * m, 65_536, 100_000, 200_000, 500_000, 96 * m + 1] {
+            let shards = effective_shard_count(96, rows);
+            assert!(
+                rows / shards >= m,
+                "{rows} rows split into {shards} shards gives a sub-morsel shard of {} rows",
+                rows / shards
+            );
+        }
     }
 }

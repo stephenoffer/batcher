@@ -64,3 +64,19 @@ _CONFIG_EXPORTS = [
 ]
 
 __all__ = [*_api.__all__, *_CONFIG_EXPORTS, "udf", "__version__"]
+
+
+def __getattr__(name: str) -> object:
+    """Turn a failed ``bt.<name>`` lookup into migration guidance (PEP 562).
+
+    A migrant types the top-level name they know from pandas, Polars, or PySpark
+    (``bt.DataFrame``, ``bt.SparkSession``, ``bt.scan_csv``); the traceback names the
+    Batcher spelling instead of a bare ``module 'batcher' has no attribute``. Only
+    reached for names not already bound above, so it never shadows the real surface.
+    """
+    # Dunder and private probes (import machinery, IPython, copy) must fail plainly.
+    if name.startswith("_"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from batcher.api.session.onboarding import top_level_attribute_error
+
+    raise top_level_attribute_error(name, __all__)

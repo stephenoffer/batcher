@@ -20,6 +20,7 @@ import functools
 from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import accelerator_backend, gpu_devices_absent
+from batcher._internal.logging import note_suppressed
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -70,7 +71,8 @@ def gpu_available() -> bool:
             return bool(xpu is not None and xpu.is_available())
         mps = getattr(torch.backends, "mps", None)  # device == "mps"
         return bool(mps is not None and mps.is_available())
-    except Exception:
+    except Exception as exc:
+        note_suppressed("core", "probe gpu", exc)
         return False
 
 

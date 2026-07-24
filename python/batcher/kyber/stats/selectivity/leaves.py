@@ -13,6 +13,7 @@ import math
 from typing import Any
 
 from batcher.config import CardinalityConfig
+from batcher.kyber.stats.distribution import mcv_join_rows, residual_eq_frequency
 from batcher.kyber.stats.selectivity.scalars import (
     _FLIP_OP,
     _column_of_comparison,
@@ -97,12 +98,13 @@ def _like_selectivity(
         # No wildcards → `LIKE` is `=`. Reuse the equality estimate over the literal.
         if isinstance(expr.input, Col):
             name = expr.input.name
-            freq = _mcv_lookup((mcv or {}).get(name), pat)
+            col_mcv = (mcv or {}).get(name)
+            freq = _mcv_lookup(col_mcv, pat)
             if freq is not None:
                 return freq
             d = ndv.get(name)
             if d and d > 0:
-                return 1.0 / d
+                return residual_eq_frequency(d, col_mcv, cfg.eq_selectivity)
         return cfg.eq_selectivity
     if "_" not in pat:
         body = pat.strip("%")
@@ -152,8 +154,11 @@ def _in_list_selectivity(
         if not distinct:
             return 0.0
     column_ndv = ndv.get(name)
-    uniform = 1.0 / column_ndv if column_ndv and column_ndv > 0 else cfg.eq_selectivity
     col_mcv = (mcv or {}).get(name)
+    # A literal the MCV table does not list gets the *residual* uniform frequency — what is
+    # left once the measured top values have taken their mass — not the whole column's
+    # `1/ndv`, which prices a rare value as if it were average (see `residual_eq_frequency`).
+    uniform = residual_eq_frequency(column_ndv, col_mcv, cfg.eq_selectivity)
     total = 0.0
     for value in distinct:
         freq = _mcv_lookup(col_mcv, value)
@@ -388,10 +393,42 @@ def _equality_selectivity(
     if period is not None:
         return 1.0 / period
     if isinstance(expr.left, Col) and isinstance(expr.right, Col):
-        counts = [ndv[c] for c in (expr.left.name, expr.right.name) if c in ndv and ndv[c] > 0]
-        if counts:
-            return 1.0 / max(counts)
+        return _column_pair_equality(expr.left.name, expr.right.name, ndv, cfg, mcv)
     col = _column_of_comparison(expr)
     if col is not None and col in ndv and ndv[col] > 0:
-        return 1.0 / ndv[col]
+        # Not a listed most-common value (that branch returned above), so the literal draws
+        # from the residual mass the MCV table leaves — strictly below `1/ndv` on any skewed
+        # column, which is exactly where the uniform estimate is most wrong.
+        return residual_eq_frequency(ndv[col], mcv.get(col), cfg.eq_selectivity)
     return cfg.eq_selectivity
+
+
+def _column_pair_equality(
+    left: str,
+    right: str,
+    ndv: dict[str, float],
+    cfg: CardinalityConfig,
+    mcv: dict[str, dict[str, float]],
+) -> float:
+    """`col_a = col_b` selectivity over one relation, sharpened by measured skew.
+
+    Under containment and uniformity the match fraction is ``1 / max(d_a, d_b)``. When both
+    columns have a measured frequency table that is an under-estimate on skewed data, for the
+    same reason a skewed join is: two columns that *share* a hot value agree on it far more
+    often than uniformity allows. Decomposing into the shared-MCV term plus the uniform
+    residual — ``Σ_v f_a(v)·f_b(v) + m_a·m_b/max(d_a - k_a, d_b - k_b)`` — is the same
+    identity `mcv_join_rows` applies to a join, evaluated here as a fraction rather than a
+    row count. It can only be used when *both* tables are present; otherwise the plain
+    containment ratio stands.
+    """
+    counts = [ndv[c] for c in (left, right) if c in ndv and ndv[c] > 0]
+    if not counts:
+        return cfg.eq_selectivity
+    uniform = 1.0 / max(counts)
+    left_mcv, right_mcv = mcv.get(left), mcv.get(right)
+    if not left_mcv or not right_mcv or left not in ndv or right not in ndv:
+        return uniform
+    joint = mcv_join_rows(1.0, 1.0, left_mcv, right_mcv, ndv[left], ndv[right])
+    if joint is None:
+        return uniform
+    return max(uniform, min(1.0, joint))

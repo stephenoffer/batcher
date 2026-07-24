@@ -48,6 +48,7 @@ def audio_dataset(
     output_column: str = "waveform",
     sample_rate: int | None = None,
     mono: bool = True,
+    on_error: str = "raise",
 ) -> Dataset:
     """Decode an audio-bytes column into a ``list<float32>`` waveform column.
 
@@ -57,7 +58,18 @@ def audio_dataset(
     (multi-channel output) falls back to the `soundfile`/`librosa` Python path
     (``batcher-engine[audio]``). Waveforms are variable length, so the output is a
     ``list<float32>`` column (one per row).
+
+    `on_error` gives the multi-channel path the same dirty-data tolerance
+    `ds.ml.download` has: ``"raise"`` (the default) fails the batch on a corrupt/undecodable
+    row, ``"null"`` decodes it to null and continues — so one truncated file in a large
+    corpus does not kill a long ingest. It applies to the ``mono=False`` fallback only; the
+    native mono kernel has its own handling.
+
+    Raises:
+        PlanError: if `on_error` is not ``"raise"`` or ``"null"``.
     """
+    if on_error not in ("raise", "null"):
+        raise PlanError(f"on_error must be 'raise' or 'null', got {on_error!r}")
     # Native path: mono decode (and, with a target rate, sinc resample) is exactly what
     # the Rust kernels produce, so the bytes never cross into Python per-row.
     if mono:
@@ -73,7 +85,7 @@ def audio_dataset(
         import pyarrow as pa
 
         raw = batch.column(source_column).to_pylist()
-        waves = [_decode_audio_bytes(b, sample_rate, mono) for b in raw]
+        waves = [_decode_audio_bytes(b, sample_rate, mono, on_error) for b in raw]
         col = pa.array(
             [None if w is None else np.asarray(w, dtype=np.float32) for w in waves],
             type=pa.list_(pa.float32()),
@@ -83,7 +95,9 @@ def audio_dataset(
     return ds.map_batches(_decode, output_columns=[*list(ds.columns), output_column])
 
 
-def _decode_audio_bytes(data: bytes | None, sample_rate: int | None, mono: bool) -> Any:
+def _decode_audio_bytes(
+    data: bytes | None, sample_rate: int | None, mono: bool, on_error: str = "raise"
+) -> Any:
     if data is None:
         return None
     import io
@@ -92,7 +106,13 @@ def _decode_audio_bytes(data: bytes | None, sample_rate: int | None, mono: bool)
         import soundfile as sf
     except ImportError as exc:  # pragma: no cover - optional extra
         raise PlanError("audio needs soundfile: pip install 'batcher-engine[audio]'") from exc
-    wave, native_sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    try:
+        wave, native_sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    except Exception:
+        # A truncated/corrupt row: null it (on_error="null") rather than kill the batch.
+        if on_error == "raise":
+            raise
+        return None
     if mono:
         wave = wave.mean(axis=1)
     if sample_rate is not None and sample_rate != native_sr:

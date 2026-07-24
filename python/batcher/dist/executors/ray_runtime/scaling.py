@@ -18,6 +18,7 @@ from batcher._internal.accelerators import (
     binding_gpu_memory_bytes,
     is_accelerator_node,
 )
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.plan.resource import HardwareProfile
 
@@ -224,7 +225,8 @@ def node_classes() -> list[dict]:
                 }
             )
         return out
-    except Exception:
+    except Exception as exc:
+        note_suppressed("dist", "read node classes", exc)
         return []
 
 

@@ -127,3 +127,37 @@ def test_windowed_default_cap_does_not_break_normal_stream():
     # The generous derived default cap never trips on a normally-advancing watermark.
     streamed = pa.Table.from_batches(list(_windowed(_stream()).iter_batches()))
     assert streamed.num_rows > 0
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_windowed_watermark_handles_any_timestamp_resolution(unit):
+    # The watermark, window widths, and `window_start` all live in microseconds, but the
+    # event-time column may be any resolution. `_advance_watermark`/`push` normalize to us
+    # first; reading a non-`us` column's raw int64 ticks would scale the watermark by 1000x
+    # and drop every row (or overflow the literal). This pins that normalization per unit.
+    schema = pa.schema([("ts", pa.timestamp(unit)), ("v", pa.int64())])
+
+    def at(minute: int, v: int) -> dict:
+        return {"ts": _BASE + dt.timedelta(minutes=minute), "v": v}
+
+    def batches():
+        yield pa.RecordBatch.from_pylist([at(0, 1), at(30, 2)], schema=schema)
+        yield pa.RecordBatch.from_pylist([at(65, 5), at(90, 3)], schema=schema)
+        yield pa.RecordBatch.from_pylist([at(150, 4)], schema=schema)
+        yield pa.RecordBatch.from_pylist([at(200, 6)], schema=schema)
+
+    ds = (
+        bt.from_batches(batches, schema, bounded=False)
+        .with_watermark("ts", "5m")
+        .group_by(w=bt.window(col("ts"), "1h"))
+        .agg(total=col("v").sum())
+    )
+    out = pa.Table.from_batches(list(ds.iter_batches())).to_pydict()
+    got = dict(zip(out["w"], out["total"], strict=True))
+    assert got == {
+        _BASE: 3,
+        _BASE + dt.timedelta(hours=1): 8,
+        _BASE + dt.timedelta(hours=2): 4,
+        _BASE + dt.timedelta(hours=3): 6,
+    }

@@ -33,6 +33,32 @@ def _next_name() -> str:
         return f"query-{_COUNTER}"
 
 
+def _register(name: str, query: StreamingQuery) -> None:
+    """Add `query` to the active registry, rejecting a duplicate *active* name.
+
+    Two active queries under one name would leave the first unreachable through
+    `bt.streams` while it kept running — unstoppable and still writing to its sink. Spark
+    rejects a duplicate active name; this is the one place that enforces it. A name whose
+    prior query has already stopped is free to reuse.
+    """
+    from batcher._internal.errors import PlanError
+
+    with _LOCK:
+        existing = _ACTIVE.get(name)
+        if existing is not None and existing.is_active:
+            raise PlanError(
+                f"a streaming query named {name!r} is already active; stop it first or "
+                "pass a distinct name= to write(...)"
+            )
+        _ACTIVE[name] = query
+
+
+def _deregister(name: str) -> None:
+    """Drop `name` from the active registry (a stopped or failed-to-start query)."""
+    with _LOCK:
+        _ACTIVE.pop(name, None)
+
+
 def _warn_if_checkpoint_not_durable(location: str) -> None:
     """Under ``resilience="spot"``, warn when the checkpoint location looks node-local.
 

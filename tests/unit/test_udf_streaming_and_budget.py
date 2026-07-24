@@ -24,10 +24,11 @@ from typing import ClassVar
 import pyarrow as pa
 import pytest
 
+from batcher.core.udf import apply as udf_apply
 from batcher.core.udf import execute as udf_execute
 from batcher.core.udf import strategy as udf_strategy
 from batcher.core.udf import stream as udf_stream
-from batcher.plan.logical import MapBatches, Scan
+from batcher.plan.logical import Limit, MapBatches, Scan
 from batcher.plan.schema import SchemaRef
 
 pytestmark = pytest.mark.unit
@@ -141,6 +142,110 @@ def test_reconcile_stream_widens_a_drifting_schema():
     assert pa.Table.from_batches(out[1:]).column("y").to_pylist() == [5, 6]
 
 
+def test_reconcile_stream_backfills_a_column_a_later_batch_drops():
+    """After a widening, a batch that reverts to the narrow schema is backfilled to the union.
+
+    The running schema only grows, so once a field appears every later batch is normalized to
+    carry it (as a typed null when absent) — otherwise the stream would emit a batch narrower
+    than the ones before it and break the downstream concat the widening exists to enable.
+    """
+    batches = [
+        pa.record_batch({"x": [1]}),
+        pa.record_batch({"x": [2], "y": [9]}),  # widens the running schema to {x, y}
+        pa.record_batch({"x": [3]}),  # narrows again -> y must come back as a typed null
+    ]
+    out = list(udf_stream.reconcile_stream(iter(batches)))
+    assert out[2].schema.names == ["x", "y"]
+    assert out[2].column("y").to_pylist() == [None]
+
+
+def test_reconcile_stream_of_an_empty_source_yields_nothing():
+    assert list(udf_stream.reconcile_stream(iter([]))) == []
+
+
+# ---------------------------------------------------------------------------
+# An explicit batch_size must survive the parallel (num_workers > 1) CPU stage
+# ---------------------------------------------------------------------------
+
+
+def test_cpu_workers_respect_an_explicit_batch_size():
+    """A parallel CPU stage must not re-slice an explicit `batch_size` to fill its pool.
+
+    `_parallel_units` splits a morsel into `workers` even slices so a *zero-config* decode
+    stage uses every spare core. When the user set a `batch_size`, doing that silently changes
+    the batch boundaries the `fn` sees — violating the "explicit batch_size always wins" rule
+    and handing a batch-boundary-sensitive `fn` the wrong-sized batches on the streaming path.
+    """
+    seen: list[int] = []
+
+    def record(batch: pa.RecordBatch) -> pa.RecordBatch:
+        seen.append(batch.num_rows)
+        return batch
+
+    op = MapBatches(
+        input=Scan(0, SchemaRef.from_arrow(_SCHEMA)), fn=record, batch_size=100, num_workers=4
+    )
+    big = pa.record_batch({"x": list(range(200))}, schema=_SCHEMA)
+
+    out = list(udf_stream._apply_udf_stream(iter([big]), op))
+
+    # 200 rows at batch_size=100 -> exactly two 100-row calls, NOT four 50-row slices.
+    assert sorted(seen) == [100, 100]
+    # ...and the rows survive in order (pool.map preserves order).
+    assert pa.Table.from_batches(out).column("x").to_pylist() == list(range(200))
+
+
+# ---------------------------------------------------------------------------
+# stream_eligible / linear_map_chain: the routing contract that picks the path
+# ---------------------------------------------------------------------------
+
+
+def _stage(**kwargs) -> MapBatches:
+    return MapBatches(input=Scan(0, SchemaRef.from_arrow(_SCHEMA)), fn=_identity, **kwargs)
+
+
+def test_stream_eligible_lone_gpu_stage_needs_a_batch_size():
+    assert udf_stream.stream_eligible([_stage(num_gpus=1, batch_size=4)]) is True
+    # A zero-config lone GPU stage stays on the autobatch (hill-climbing) path instead.
+    assert udf_stream.stream_eligible([_stage(num_gpus=1)]) is False
+
+
+def test_stream_eligible_rejects_a_cpu_only_chain():
+    assert udf_stream.stream_eligible([_stage()]) is False
+    assert udf_stream.stream_eligible([_stage(), _stage()]) is False
+
+
+def test_stream_eligible_accepts_a_multi_stage_chain_with_a_gpu():
+    assert udf_stream.stream_eligible([_stage(), _stage(num_gpus=1)]) is True
+
+
+def test_stream_eligible_rejects_a_multiprocessing_stage():
+    # A multiprocessing stage runs across processes -> the materializing path regardless.
+    assert udf_stream.stream_eligible([_stage(multiprocessing=True), _stage(num_gpus=1)]) is False
+
+
+def test_linear_map_chain_returns_stages_bottom_up():
+    scan = Scan(0, SchemaRef.from_arrow(_SCHEMA))
+    inner = MapBatches(input=scan, fn=_identity)
+    outer = MapBatches(input=inner, fn=_identity)
+    got = udf_stream.linear_map_chain(outer)
+    assert got is not None
+    root, stages = got
+    assert root is scan
+    assert stages == [inner, outer]  # bottom-up, so stage order matches execution order
+
+
+def test_linear_map_chain_rejects_a_plan_with_no_map():
+    scan = Scan(0, SchemaRef.from_arrow(_SCHEMA))
+    assert udf_stream.linear_map_chain(scan) is None
+
+
+def test_linear_map_chain_rejects_a_non_scan_root():
+    scan = Scan(0, SchemaRef.from_arrow(_SCHEMA))
+    plan = MapBatches(input=Limit(input=scan, n=3), fn=_identity)  # a relational node breaks it
+    assert udf_stream.linear_map_chain(plan) is None
+
+
 # ---------------------------------------------------------------------------
 # 2. The error budget is one allowance per worker, not one per call
 # ---------------------------------------------------------------------------
@@ -161,9 +266,9 @@ def test_error_budget_is_shared_across_calls_not_reset_per_call():
     )
     batch = pa.record_batch({"x": [1, 2, 3, 4]}, schema=_SCHEMA)
 
-    assert udf_execute._apply_udf([batch], op) == []  # 4 rows dropped, budget now 0
+    assert udf_apply.apply_udf([batch], op) == []  # 4 rows dropped, budget now 0
     with pytest.raises(ValueError):
-        udf_execute._apply_udf([batch], op)  # a fresh budget would have swallowed these too
+        udf_apply.apply_udf([batch], op)  # a fresh budget would have swallowed these too
 
 
 def _also_raises(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -293,7 +398,7 @@ def test_autobatch_seeds_from_the_learned_gpu_batch_size(monkeypatch):
 
     op = MapBatches(input=Scan(0, SchemaRef.from_arrow(_SCHEMA)), fn=_autobatch_fn, num_gpus=1)
     batch = pa.record_batch({"x": [1, 2, 3, 4]}, schema=_SCHEMA)
-    out = udf_execute._apply_udf_autobatch(op, [batch])
+    out = udf_apply._apply_udf_autobatch(op, [batch])
 
     assert pa.Table.from_batches(out).column("x").to_pylist() == [1, 2, 3, 4]
     assert _RecordingPool.last["target_batch_rows"] == udf_stream._learned_gpu_cap(op) == 64
@@ -307,6 +412,6 @@ def test_autobatch_gets_the_same_forward_overlap_as_the_streaming_path(monkeypat
 
     op = MapBatches(input=Scan(0, SchemaRef.from_arrow(_SCHEMA)), fn=_autobatch_fn, num_gpus=1)
     assert op.num_workers <= 1  # the condition that used to disable overlap entirely
-    udf_execute._apply_udf_autobatch(op, [pa.record_batch({"x": [1]}, schema=_SCHEMA)])
+    udf_apply._apply_udf_autobatch(op, [pa.record_batch({"x": [1]}, schema=_SCHEMA)])
 
     assert _RecordingPool.last["num_workers"] == udf_stream._GPU_SOLO_PIPELINE_DEPTH > 1

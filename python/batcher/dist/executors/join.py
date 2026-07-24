@@ -258,10 +258,10 @@ def _shuffle_join(
             #     buys that with an extra pass over the data, so it stays opt-in (`salt > 0`)
             #     and its result is persisted so it is paid at most once per shape.
             from batcher.dist.skew import (
-                DEFAULT_LEARNED_SALT,
                 join_skew_key,
                 load_learned_hot_keys,
                 persist_hot_keys,
+                salt_factor,
             )
 
             shape_key = join_skew_key(left_ir, right_ir, join)
@@ -269,7 +269,7 @@ def _shuffle_join(
             if learned is not None:
                 hot = learned
             else:
-                hot = _hot_keys_from_column_stats(join, sources, frac)
+                hot = _hot_keys_from_column_stats(join, sources, frac, workers)
                 if not hot and salt > 0:
                     lk, rk = join.left_keys[0], join.right_keys[0]
                     left_hot = _detect_hot_keys(left_parts, left_ir, lk, frac, cfg_json)
@@ -277,9 +277,12 @@ def _shuffle_join(
                     hot = sorted(left_hot | right_hot)
                     persist_hot_keys(shape_key, hot)
             # A known-skewed key engages salting even when the config left it off: the skew
-            # is measured, and salting cannot regress a plain shuffle.
+            # is measured, and salting cannot regress a plain shuffle. The fan-out is sized
+            # from how badly the hot key actually overloads *this* shuffle's reducers
+            # (`salt_factor`), not a constant — the overload is `fraction x partitions`, so
+            # the right fan-out grows with the cluster.
             if hot and salt <= 0:
-                salt = DEFAULT_LEARNED_SALT
+                salt = salt_factor(frac, workers)
         salt = salt if hot else 0  # no hot key → plain co-partition
 
         # Runtime bloom reduction: build a bloom over the (smaller) build/right side's
@@ -632,7 +635,7 @@ def _byte_chunks(batches, target_bytes: int):
         yield chunk
 
 
-def _hot_keys_from_column_stats(join, sources, fraction: float) -> list[str]:
+def _hot_keys_from_column_stats(join, sources, fraction: float, partitions: int) -> list[str]:
     """The join key's hot values as Kyber already measured them — no pass over the data.
 
     Kyber owns the column statistics (`Core` measures, `Kyber` decides), so the decision of
@@ -644,7 +647,7 @@ def _hot_keys_from_column_stats(join, sources, fraction: float) -> list[str]:
         from batcher import kyber
         from batcher.core import default_hub
 
-        return kyber.hot_join_values(join, sources, default_hub(), fraction)
+        return kyber.hot_join_values(join, sources, default_hub(), fraction, partitions)
     except Exception:  # pragma: no cover - statistics must never break a join
         return []
 

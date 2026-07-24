@@ -28,7 +28,7 @@ import batcher as bt
 
 # Importing the package registers its rules into the default registry.
 import batcher.kyber.rules.extra.runtime_filters
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.io.source import InMemorySource, source_statistics
@@ -476,4 +476,6 @@ def test_asof_with_null_on_and_null_by_keys(duck, direction):
                  ORDER BY r.t {order} LIMIT 1) AS w
           FROM aj_l l WHERE l.g IS NOT NULL AND l.t IS NOT NULL
     """
-    assert_same(ds.filter(col("g").is_not_null() & col("t").is_not_null()).collect(), duck.sql(sql))
+    assert_same_ordered(
+        ds.filter(col("g").is_not_null() & col("t").is_not_null()).collect(), duck.sql(sql)
+    )

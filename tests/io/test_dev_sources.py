@@ -39,6 +39,23 @@ def test_rate_source_unbounded_read_raises():
         RateSource(rows_per_second=1).read()
 
 
+@pytest.mark.parametrize("rps", [1, 2, 7, 1000])
+def test_rate_source_timestamps_are_exact_value_times_step(rps):
+    # Pins the vectorized batch builder against the closed form: timestamp = value * step_us
+    # microseconds since the epoch, where step_us = 1_000_000 // rps.
+    import datetime
+
+    src = RateSource(rows_per_second=rps, num_rows=None, start_value=3, pace=False)
+    batch = src._make_batch(3, 5)
+    step_us = 1_000_000 // rps
+    epoch = datetime.datetime(1970, 1, 1)
+    assert batch.column("value").to_pylist() == [3, 4, 5, 6, 7]
+    assert batch.column("timestamp").to_pylist() == [
+        epoch + datetime.timedelta(microseconds=v * step_us) for v in range(3, 8)
+    ]
+    assert batch.schema.field("timestamp").type == pa.timestamp("us")
+
+
 def test_rate_through_pipeline_streams():
     # The rate source flows through the normal relational engine; an unbounded
     # source streams via iter_batches (count() would refuse to materialize it).
@@ -67,3 +84,24 @@ def test_socket_source_reads_lines():
     rows = pa.Table.from_batches(list(ds.iter_batches()))
     t.join(timeout=5)
     assert rows.column("value").to_pylist() == ["alpha", "beta", "gamma"]
+
+
+def test_socket_source_strips_crlf_line_endings():
+    # A Windows/HTTP-style producer sends `\r\n`; the value must not keep a trailing `\r`.
+    lines = [b"alpha\r\n", b"beta\r\n"]
+    srv = socket.create_server(("localhost", 0))
+    port = srv.getsockname()[1]
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            for line in lines:
+                conn.sendall(line)
+        srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    ds = bt.read.socket("localhost", port)
+    rows = pa.Table.from_batches(list(ds.iter_batches()))
+    t.join(timeout=5)
+    assert rows.column("value").to_pylist() == ["alpha", "beta"]  # no trailing '\r'

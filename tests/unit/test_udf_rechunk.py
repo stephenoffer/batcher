@@ -13,7 +13,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from batcher.core.udf.execute import _rechunk
+from batcher.core.udf.apply import rechunk as _rechunk
 
 pytestmark = pytest.mark.unit
 

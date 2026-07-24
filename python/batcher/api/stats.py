@@ -15,6 +15,8 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from batcher._internal.mathx import safe_div
+
 if TYPE_CHECKING:
     from batcher.plan.profile import QueryProfile
 
@@ -46,7 +48,7 @@ class OpStat:
     @property
     def selectivity(self) -> float:
         """``rows_out / rows_in`` (1.0 when the operator had no input rows)."""
-        return self.rows_out / self.rows_in if self.rows_in else 1.0
+        return safe_div(self.rows_out, self.rows_in, 1.0)
 
     @property
     def est_error(self) -> float:

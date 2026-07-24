@@ -124,7 +124,8 @@ fn coerce_children(lc: &ArrayRef, rc: &ArrayRef) -> Result<(ArrayRef, ArrayRef),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, Int64Builder, ListBuilder};
+    use arrow::array::{AsArray, Int64Builder, ListBuilder};
+    use arrow::datatypes::{Float64Type, Int64Type};
 
     fn list(rows: &[Option<&[i64]>]) -> ArrayRef {
         let mut b = ListBuilder::new(Int64Builder::new());
@@ -143,13 +144,9 @@ mod tests {
     }
 
     fn row(out: &ArrayRef, i: usize) -> Vec<i64> {
-        let l = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let l = out.as_list::<i32>();
         let v = l.value(i);
-        v.as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec()
+        v.as_primitive::<Int64Type>().values().to_vec()
     }
 
     #[test]
@@ -164,16 +161,12 @@ mod tests {
         assert_eq!(row(&exc, 1), vec![5, 6]);
         assert_eq!(row(&uni, 0), vec![1, 2, 3, 4]); // left distinct ++ right-only
         assert_eq!(row(&uni, 1), vec![5, 6, 7]);
-        assert!(inter
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .is_null(2)); // null left → null
+        assert!(inter.as_list::<i32>().is_null(2)); // null left → null
     }
 
     #[test]
     fn intersect_folds_negative_zero_into_zero() {
-        use arrow::array::{Float64Array, Float64Builder};
+        use arrow::array::Float64Builder;
         fn flist(rows: &[&[f64]]) -> ArrayRef {
             let mut b = ListBuilder::new(Float64Builder::new());
             for r in rows {
@@ -190,16 +183,16 @@ mod tests {
         let a = flist(&[&[0.0]]);
         let b = flist(&[&[-0.0]]);
         let out = eval_list_set(ListSetOp::Intersect, &a, &b).unwrap();
-        let l = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let l = out.as_list::<i32>();
         let v = l.value(0);
-        let f = v.as_any().downcast_ref::<Float64Array>().unwrap();
+        let f = v.as_primitive::<Float64Type>();
         assert_eq!(f.len(), 1);
         assert_eq!(f.value(0), 0.0);
     }
 
     #[test]
     fn set_op_coerces_mismatched_numeric_children() {
-        use arrow::array::{Float64Array, Float64Builder};
+        use arrow::array::Float64Builder;
         fn flist(rows: &[&[f64]]) -> ArrayRef {
             let mut b = ListBuilder::new(Float64Builder::new());
             for r in rows {
@@ -216,16 +209,16 @@ mod tests {
         let ints = list(&[Some(&[1, 2, 3])]);
         let floats = flist(&[&[2.0, 3.0, 4.0]]);
         let out = eval_list_set(ListSetOp::Intersect, &ints, &floats).unwrap();
-        let l = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let l = out.as_list::<i32>();
         let v = l.value(0);
-        let f = v.as_any().downcast_ref::<Float64Array>().unwrap();
+        let f = v.as_primitive::<Float64Type>();
         assert_eq!(f.values().to_vec(), vec![2.0, 3.0]);
 
         // Union likewise: left (promoted) distinct ++ right-only.
         let uni = eval_list_set(ListSetOp::Union, &ints, &floats).unwrap();
-        let ul = uni.as_any().downcast_ref::<ListArray>().unwrap();
+        let ul = uni.as_list::<i32>();
         let uv = ul.value(0);
-        let uf = uv.as_any().downcast_ref::<Float64Array>().unwrap();
+        let uf = uv.as_primitive::<Float64Type>();
         assert_eq!(uf.values().to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

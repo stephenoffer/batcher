@@ -22,6 +22,8 @@ import signal
 import threading
 from collections.abc import Callable
 
+from batcher._internal.logging import note_suppressed
+
 __all__ = ["PreemptionMonitor", "cloud_preemption_probe", "preemption_monitor"]
 
 # Link-local metadata endpoints answer in microseconds; a tight timeout keeps a
@@ -82,7 +84,12 @@ def cloud_preemption_probe() -> bool:
             with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
                 if resp.status == 200 and is_drain(resp.read().decode("utf-8", "replace")):
                     return True
-        except Exception:
+        except Exception as exc:
+            # A probe that cannot be reached is the normal case off the matching cloud, so
+            # it must not raise. Recording it is what separates "not on EC2" from "the
+            # metadata endpoint has been unreachable since the VPC change", which otherwise
+            # looks identical: a fleet that silently never sees a preemption notice.
+            note_suppressed("carbonite", f"probe preemption endpoint {url}", exc)
             continue
     return False
 

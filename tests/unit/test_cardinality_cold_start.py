@@ -144,10 +144,15 @@ def _stats(ndv: float, rows: float) -> RelStats:
 
 def test_join_carries_ndv_forward_capped_by_output_rows():
     """A join invents no values, so `ndv_out <= min(ndv_in, rows_out)` — and that bound
-    is what a join *above* this one needs to estimate its own cardinality."""
+    is what a join *above* this one needs to estimate its own cardinality.
+
+    For an equi-**key** the bound is tighter still: a value survives only if it appears on
+    *both* sides, so the surviving distinct count is at most `min(d_L, d_R)` — 10,000 here,
+    not the left side's own 200,000. Both key columns therefore carry the same bound, which
+    is what an equality between them means."""
     node = _join_of()
     cols = join_columns(node, _stats(200_000, 6_000_000), _stats(10_000, 10), out_rows=320_000)
-    assert cols["lk"].ndv == pytest.approx(200_000)  # below the row cap: unchanged
+    assert cols["lk"].ndv == pytest.approx(10_000)  # containment: min(d_L, d_R)
     assert cols["rk"].ndv == pytest.approx(10_000)
 
 

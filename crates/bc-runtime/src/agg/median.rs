@@ -8,7 +8,7 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, SortField};
 
-use super::bucket_values_into_list;
+use super::{bucket_values_into_list, flatten_list_state};
 use crate::error::RuntimeError;
 
 /// Partial state for MEDIAN: each group's non-null values as one `List` column.
@@ -100,34 +100,9 @@ pub(crate) fn merge_median(
     group_ids: &[u32],
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
-    let list = state.as_list::<i32>();
-    let offsets = list.value_offsets();
-    let child = list.values();
-    // The concatenated child holds every partial list's values in list-row order, and the list
-    // offsets are contiguous (0, len0, len0+len1, …), so flattening in row order visits child
-    // element `e` exactly at output position `e`. The old code therefore built an identity index
-    // `0..child.len()` and `take`d the child through it — a full copy of every value (~60M on a
-    // low-cardinality MEDIAN/QUANTILE) for no reordering. Skip it: expand only the per-element
-    // group id and hand the child straight to the bucketer, which does the one real gather.
-    let contiguous = offsets.first().copied().unwrap_or(0) == 0
-        && offsets.last().map(|&o| o as usize) == Some(child.len());
-    let mut elem_groups: Vec<i64> = Vec::with_capacity(child.len());
-    for row in 0..list.len() {
-        let n = (offsets[row + 1] - offsets[row]) as usize;
-        let g = group_ids[row] as i64;
-        elem_groups.extend(std::iter::repeat_n(g, n));
-    }
-    if contiguous {
-        return bucket_values_into_list(&Int64Array::from(elem_groups), child, num_groups);
-    }
-    // Defensive fallback (a sliced/offset child): gather through the explicit element indices.
-    let elem_idx: Vec<u32> = (0..list.len())
-        .flat_map(|row| offsets[row] as u32..offsets[row + 1] as u32)
-        .collect();
-    let values = take(child.as_ref(), &UInt32Array::from(elem_idx), None)?;
-    bucket_values_into_list(&Int64Array::from(elem_groups), &values, num_groups)
+    let (elem_groups, values) = flatten_list_state(state, group_ids)?;
+    bucket_values_into_list(&elem_groups, &values, num_groups)
 }
-
 /// Median per group: the middle value (averaging the two middle for an even count).
 /// Always yields Float64; empty groups → null. (Median is the `q=0.5` quantile.)
 pub(crate) fn finalize_median(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {

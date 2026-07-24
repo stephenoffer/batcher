@@ -10,8 +10,8 @@ skippable one.
 from __future__ import annotations
 
 import datetime as _dt
-import math
 
+from batcher._internal.mathx import is_nan
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, plan_rule
@@ -237,7 +237,7 @@ def _bad_range_literal(value: object) -> bool:
     """
     if value is None or isinstance(value, bool):
         return True
-    return isinstance(value, float) and math.isnan(value)
+    return is_nan(value)
 
 
 @rule(name="or_to_in_and_range", phase=Phase.NORMALIZE, matches=(Filter,))

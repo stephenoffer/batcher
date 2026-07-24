@@ -26,7 +26,7 @@ pub(crate) struct InflightGauge {
 impl InflightGauge {
     /// Producer is about to send one more batch: bump in-flight and the max.
     ///
-    /// The high-water update uses `AcqRel` (C58): the gauge is read to *prove* the
+    /// The high-water update uses `AcqRel`: the gauge is read to *prove* the
     /// credit bound was honored, so the max must not be under-reported on a weak
     /// memory model. It is off the per-batch data path, so the stronger ordering is
     /// negligible.

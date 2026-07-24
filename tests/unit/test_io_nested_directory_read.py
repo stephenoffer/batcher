@@ -55,5 +55,5 @@ def test_a_flat_directory_still_reads_without_descending(tmp_path):
 def test_an_empty_directory_still_raises_an_actionable_error(tmp_path):
     root = tmp_path / "empty"
     (root / "sub").mkdir(parents=True)
-    with pytest.raises(Exception, match="no .parquet files found"):
+    with pytest.raises(Exception, match=r"no \.parquet files found"):
         bt.read(str(root), format="parquet").collect()

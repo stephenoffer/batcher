@@ -37,6 +37,7 @@ from __future__ import annotations
 import weakref
 from statistics import median
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 
@@ -141,7 +142,8 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
                 med = median(utils)
                 p = prior.get(tag)
                 out[tag] = med if p is None else _SMOOTH_ALPHA * med + (1.0 - _SMOOTH_ALPHA) * p
-    except Exception:  # pragma: no cover - planning must never break on bad feedback
+    except Exception as exc:  # pragma: no cover - planning must never break on bad feedback
+        note_suppressed("kyber", "load cpu utilization", exc)
         out = {}
     _CPU_CACHE[hub] = (version, min_samples, out)
     return out

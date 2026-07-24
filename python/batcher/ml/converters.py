@@ -60,6 +60,26 @@ def _worker_stride() -> tuple[int, int]:
     return int(info.id), int(info.num_workers)
 
 
+def _warn_dropped_non_numeric(arrays: dict[str, np.ndarray], kinds: str = "biufc") -> None:
+    """Warn about non-numeric columns a tensor conversion silently drops.
+
+    The loader warns about exactly this (`loader.tensors.warn_dropped_columns`); the
+    converters used to drop a string ``label``/``id`` with no signal, so a training loop
+    read a `KeyError` or, worse, trained on the features with the target column gone.
+    """
+    dropped = sorted(n for n, a in arrays.items() if a.dtype.kind not in kinds)
+    if dropped:
+        import warnings
+
+        warnings.warn(
+            f"converter is dropping non-numeric column(s) {dropped}: they cannot become "
+            "tensors and will be missing from every batch. Pass `columns=` to select the "
+            "numeric columns you want.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def arrays_to_torch(arrays: dict[str, np.ndarray], *, zero_copy: bool = False) -> dict[str, Any]:
     """Convert a `{column: np.ndarray}` dict to `{column: torch.Tensor}`.
 
@@ -202,8 +222,12 @@ def to_torch_iterable(
     class _ArrowIterable(IterableDataset):  # type: ignore[misc]
         def __iter__(self) -> Iterator[dict[str, Any]]:
             offset, stride = _worker_stride()
+            warned = False
             for i, arrays in enumerate(to_numpy_batches(source, columns=select)):
                 if i % stride == offset:
+                    if not warned:  # warn once, on the first batch this worker yields
+                        _warn_dropped_non_numeric(arrays)
+                        warned = True
                     yield arrays_to_torch(arrays)
 
     return _ArrowIterable()
@@ -253,6 +277,7 @@ def to_tf_dataset(
     first_arrays = next(remaining, None)
     if first_arrays is None:
         return tf.data.Dataset.from_tensor_slices({})
+    _warn_dropped_non_numeric(first_arrays, kinds="biuf")
     first = _numeric(first_arrays)
 
     def _gen() -> Iterator[dict[str, Any]]:

@@ -27,7 +27,6 @@ time-alignment step every perception and ADAS pipeline starts with.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterator
 from typing import IO, Any, ClassVar
 
@@ -133,12 +132,7 @@ class MCAPSource(FileSource):
             The base file identity, suffixed with a digest of the sorted topic set when
             `topics` is set.
         """
-        base = super().identity()
-        if self._topics is None:
-            return base
-        digest = hashlib.sha256("\n".join(sorted(self._topics)).encode()).hexdigest()[:16]
-        sep = "&" if "#" in base else "#"
-        return f"{base}{sep}topics={digest}"
+        return self._subset_identity(super().identity(), "topics", self._topics)
 
     # ---- reading ----------------------------------------------------------
     def read(
@@ -201,8 +195,7 @@ class MCAPSource(FileSource):
         try:
             yield from self._iter_messages(path, projection, topics, start, end)
         except Exception as exc:
-            if not self._errors.tolerate(path, exc, format_name=self.format_name):
-                raise
+            self._errors.tolerate(path, exc, format_name=self.format_name)
 
     def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
         """The unpushed streaming path (the `FileSource` template's entry point)."""

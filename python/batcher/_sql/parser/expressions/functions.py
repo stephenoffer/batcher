@@ -13,6 +13,8 @@ from batcher._sql.parser.expressions.literals import (
     _EXTRACT_PART,
     _UNARY_MATH,
     _UNARY_STR,
+    _const_int_arg,
+    _const_str_arg,
     _int_literal,
 )
 from batcher.plan.expr_ir import Cast, Expr, lit
@@ -27,9 +29,7 @@ def _scalar_function(tr, node):
         # `trunc(x, n)` truncates to `n` decimal places; the one-arg `.trunc()`
         # ignores `n` and silently truncated to a whole number. Scale, truncate,
         # unscale so `trunc(2.567, 1)` is `2.5`, not `2.0`.
-        digits = _int_literal(node.args["decimals"])
-        if digits is None:
-            raise NotImplementedError("trunc(x, n): n must be an integer literal")
+        digits = _const_int_arg(node.args["decimals"], "trunc(x, n): n")
         factor = lit(10.0**digits)
         return (tr._scalar(node.this) * factor).trunc() / factor
     if name in _UNARY_MATH:
@@ -43,10 +43,7 @@ def _scalar_function(tr, node):
         decimals = node.args.get("decimals")
         if decimals is None:
             return tr._scalar(node.this).round()
-        digits = _int_literal(decimals)
-        if digits is None:
-            raise NotImplementedError("ROUND(x, n): n must be an integer literal")
-        return tr._scalar(node.this).round(digits)
+        return tr._scalar(node.this).round(_const_int_arg(decimals, "ROUND(x, n): n"))
     if name == "Log":
         # log(x) → log10(x); log10(x)/log2(x) parse as log(base, value) with
         # the base in `this` and the value in `expression`.
@@ -74,25 +71,18 @@ def _scalar_function(tr, node):
             return base.rstrip(chars)
         return base.trim(chars)
     if name == "Replace":
-        pat, repl = node.expression, node.args.get("replacement")
-        if not (isinstance(pat, exp.Literal) and pat.is_string):
-            raise NotImplementedError("replace() requires a constant string pattern")
-        if not (isinstance(repl, exp.Literal) and repl.is_string):
-            raise NotImplementedError("replace() requires a constant string replacement")
-        return tr._scalar(node.this).str.replace(pat.this, repl.this)
+        pat = _const_str_arg(node.expression, "replace()", "pattern")
+        repl = _const_str_arg(node.args.get("replacement"), "replace()", "replacement")
+        return tr._scalar(node.this).str.replace(pat, repl)
     if name == "SplitPart":
-        delim, part = node.args.get("delimiter"), node.args.get("part_index")
-        if not (isinstance(delim, exp.Literal) and delim.is_string):
-            raise NotImplementedError("split_part() requires a constant string delimiter")
-        idx = _int_literal(part)
+        delim = _const_str_arg(node.args.get("delimiter"), "split_part()", "delimiter")
+        idx = _int_literal(node.args.get("part_index"))
         if idx is None:
             raise NotImplementedError("split_part() requires an integer field index")
-        return tr._scalar(node.this).str.split_part(delim.this, idx)
+        return tr._scalar(node.this).str.split_part(delim, idx)
     if name == "StartsWith":
-        pat = node.expression
-        if not (isinstance(pat, exp.Literal) and pat.is_string):
-            raise NotImplementedError("starts_with() requires a constant string prefix")
-        return tr._scalar(node.this).str.starts_with(pat.this)
+        pat = _const_str_arg(node.expression, "starts_with()", "prefix")
+        return tr._scalar(node.this).str.starts_with(pat)
     if name == "Repeat":
         times = _int_literal(node.args.get("times"))
         if times is None:
@@ -104,36 +94,24 @@ def _scalar_function(tr, node):
         # `int(node.args["start"].this)` then raised a TypeError. `_int_literal`
         # folds the sign; the engine's `.substr` handles negative offsets (matching
         # DuckDB: it counts from the string end).
-        start = _int_literal(node.args["start"])
-        if start is None:
-            raise NotImplementedError("substr(): start must be an integer literal")
+        start = _const_int_arg(node.args["start"], "substr(): start")
         length_node = node.args.get("length")
         if length_node is None:
             return base.substr(start)
-        length = _int_literal(length_node)
-        if length is None:
-            raise NotImplementedError("substr(): length must be an integer literal")
-        return base.substr(start, length)
+        return base.substr(start, _const_int_arg(length_node, "substr(): length"))
     if name in ("Left", "Right"):
-        n = _int_literal(node.expression)
-        if n is None:
-            raise NotImplementedError(f"{name.lower()}(): length must be an integer literal")
+        n = _const_int_arg(node.expression, f"{name.lower()}(): length")
         method = "left" if name == "Left" else "right"
         return getattr(tr._scalar(node.this).str, method)(n)
     if name in ("EndsWith", "Contains"):
-        pat = node.expression
-        if not (isinstance(pat, exp.Literal) and pat.is_string):
-            raise NotImplementedError(f"{name.lower()}() requires a constant string argument")
+        pat = _const_str_arg(node.expression, f"{name.lower()}()")
         method = "ends_with" if name == "EndsWith" else "contains"
-        return getattr(tr._scalar(node.this).str, method)(pat.this)
+        return getattr(tr._scalar(node.this).str, method)(pat)
     if name == "RegexpExtract":
-        pat = node.expression
-        if not (isinstance(pat, exp.Literal) and pat.is_string):
-            raise NotImplementedError("regexp_extract() requires a constant string pattern")
-        group = _int_literal(node.args.get("group")) if node.args.get("group") is not None else 0
-        if group is None:
-            raise NotImplementedError("regexp_extract() capture group must be an integer literal")
-        return tr._scalar(node.this).str.regexp_extract(pat.this, group)
+        pat = _const_str_arg(node.expression, "regexp_extract()", "pattern")
+        grp = node.args.get("group")
+        group = _const_int_arg(grp, "regexp_extract() capture group") if grp is not None else 0
+        return tr._scalar(node.this).str.regexp_extract(pat, group)
     if name == "StrPosition":
         pat = node.args["substr"]
         if not isinstance(pat, exp.Literal) or not pat.is_string:
@@ -144,9 +122,7 @@ def _scalar_function(tr, node):
         # literal, so `int(node.args["expression"].this)` raised a TypeError on the
         # `Neg` node. `_int_literal` folds the sign; the engine's `.lpad`/`.rpad`
         # clamp a non-positive width to the empty string, matching DuckDB.
-        width = _int_literal(node.args["expression"])
-        if width is None:
-            raise NotImplementedError("lpad()/rpad(): width must be an integer literal")
+        width = _const_int_arg(node.args["expression"], "lpad()/rpad(): width")
         fill_node = node.args.get("fill_pattern")
         fill = fill_node.this if fill_node is not None else " "
         base = tr._scalar(node.this).str
@@ -299,12 +275,8 @@ def _regexp_replace(tr, node) -> Expr:
 
     from batcher._sql.parser.expressions.literals import _regexp_flags_prefix
 
-    pat = node.expression
-    repl = node.args.get("replacement")
-    if not (isinstance(pat, exp.Literal) and pat.is_string):
-        raise NotImplementedError("regexp_replace requires a constant string pattern")
-    if not (isinstance(repl, exp.Literal) and repl.is_string):
-        raise NotImplementedError("regexp_replace requires a constant string replacement")
+    pat = _const_str_arg(node.expression, "regexp_replace", "pattern")
+    repl = _const_str_arg(node.args.get("replacement"), "regexp_replace", "replacement")
     mods = node.args.get("modifiers")
     global_replace = False
     prefix = ""
@@ -318,8 +290,8 @@ def _regexp_replace(tr, node) -> Expr:
         prefix = _regexp_flags_prefix(flags.replace("g", ""))
     s = tr._scalar(node.this)
     if global_replace:
-        return s.str.regexp_replace_all(prefix + pat.this, repl.this)
-    return s.str.regexp_replace(prefix + pat.this, repl.this)
+        return s.str.regexp_replace_all(prefix + pat, repl)
+    return s.str.regexp_replace(prefix + pat, repl)
 
 
 def _date_diff(tr, node) -> Expr:

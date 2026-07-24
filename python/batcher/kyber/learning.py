@@ -15,7 +15,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.kyber.correction import correction_factor
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
 from batcher.plan.logical import LogicalPlan
@@ -222,7 +224,9 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
 
     The average is **geometric**, because q-error is multiplicative and symmetric: a 4x
     over-estimate and a 4x under-estimate must cancel to 1.0, which an arithmetic mean
-    would not (it would give 2.125).
+    would not (it would give 2.125). It is also recency-weighted and shrunk toward "no
+    correction" by how much the samples actually agree — see `kyber.correction`, which owns
+    that estimator.
 
     Only the most recent `cardinality_correction_window` samples of each signature count.
     The structural estimator is not static — it sharpens as the column-statistics loop
@@ -257,10 +261,7 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
         return {}
     out: dict[str, float] = {}
     for sig, log_qs in samples.items():
-        if len(log_qs) < min_samples:
-            continue
-        factor = math.exp(sum(log_qs) / len(log_qs))  # geometric mean of the q-errors
-        factor = min(max_factor, max(1.0 / max_factor, factor))
+        factor = correction_factor(list(log_qs), min_samples, max_factor)
         if factor != 1.0:
             out[sig] = factor
     _CORRECTION_CACHE[hub] = (hub.version, fingerprint, out)
@@ -340,8 +341,8 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
         )
         entry["n_obs"] = entry.get("n_obs", 0) + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - learning must never break execution
+        note_suppressed("kyber", "persist a learned row count", exc)
 
 
 def record_selectivity(
@@ -373,8 +374,8 @@ def record_selectivity(
         entry["selectivity"] = sel if prior is None else _smooth(prior, sel, n_obs)
         entry["sel_n_obs"] = n_obs + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - learning must never break execution
+        note_suppressed("kyber", "persist a learned selectivity", exc)
 
 
 def _filter_over_scan(plan: LogicalPlan):
@@ -451,5 +452,5 @@ def record_column_stats(
             col_mcv = dict(hub.get_keyed_param(_NAMESPACE, MCV_KEY) or {})
             col_mcv.update(keyed(mcv))
             hub.put_keyed_param(_NAMESPACE, MCV_KEY, col_mcv)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+    except Exception as exc:  # pragma: no cover - learning must never break execution
+        note_suppressed("kyber", "persist learned column statistics", exc)

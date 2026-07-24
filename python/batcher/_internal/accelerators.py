@@ -48,6 +48,7 @@ def has_gaudi_device() -> bool:
     """Intel Gaudi (Habana) via its `/dev/hl*` device nodes."""
     return bool(glob.glob("/dev/hl[0-9]*"))
 
+
 _GIB = 1 << 30
 
 #: Ray custom-resource names for accelerators that are *not* reported as `GPU`. Ray advertises

@@ -10,10 +10,39 @@ reusable, configured transform (Ray Data / Daft ``@udf``).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterable
 from typing import Any
 
 import pyarrow as pa
+
+# In-flight per-row awaits within one batch for an async row `fn` with no explicit bound. An
+# I/O-bound row callback (a per-row LLM / API / vector-DB call) wants many concurrent awaits; 32
+# overlaps latency well without hammering a remote service by default.
+_DEFAULT_ROW_CONCURRENCY = 32
+
+
+def _gather_rows(fn: Callable, rows: list[dict[str, Any]], limit: int) -> list[Any]:
+    """Await `fn(row)` over every row concurrently on one event loop, bounded and in order.
+
+    The per-row analog of the async `map_batches` runner: a per-row `async def` callback (a
+    per-row LLM/API call) issues up to `limit` concurrent requests within a batch, instead of
+    awaiting them one at a time. Runs a fresh loop per batch (the sync batch path holds no
+    running loop), so the whole adapter stays a plain synchronous batch callable to the engine.
+    """
+    from batcher.core.udf.async_udf import run_coroutine_blocking
+
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def _one(row: dict[str, Any]) -> Any:
+        async with sem:
+            return await fn(row)
+
+    async def _run() -> list[Any]:
+        return await asyncio.gather(*(_one(r) for r in rows))
+
+    # Safe inside an already-running loop (Jupyter / async app), where `asyncio.run` would raise.
+    return run_coroutine_blocking(_run)
 
 
 def _to_table(
@@ -75,6 +104,54 @@ class _RowFlatMap:
         out: list[dict[str, Any]] = []
         for row in batch.to_pylist():
             out.extend(self.fn(row))
+        return _to_table(out, batch, self.out_columns)
+
+
+class _AsyncRowMap:
+    """Apply an async ``fn(row_dict) -> row_dict`` over a batch's rows, gathered concurrently.
+
+    The event loop runs inside `__call__` (a synchronous batch callable to the engine), so an
+    async per-row callback rides the normal thread path while its per-row awaits overlap up to
+    `limit` at a time — the per-row LLM/API-enrichment pattern.
+    """
+
+    __slots__ = ("fn", "limit", "out_columns")
+
+    def __init__(
+        self,
+        fn: Callable[[dict[str, Any]], Any],
+        out_columns: tuple[str, ...] | None = None,
+        limit: int = _DEFAULT_ROW_CONCURRENCY,
+    ) -> None:
+        self.fn = fn
+        self.out_columns = out_columns
+        self.limit = limit
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.Table:
+        rows = _gather_rows(self.fn, batch.to_pylist(), self.limit)
+        return _to_table(rows, batch, self.out_columns)
+
+
+class _AsyncRowFlatMap:
+    """Apply an async ``fn(row_dict) -> iterable[row_dict]`` per row and flatten the results."""
+
+    __slots__ = ("fn", "limit", "out_columns")
+
+    def __init__(
+        self,
+        fn: Callable[[dict[str, Any]], Iterable[dict[str, Any]]],
+        out_columns: tuple[str, ...] | None = None,
+        limit: int = _DEFAULT_ROW_CONCURRENCY,
+    ) -> None:
+        self.fn = fn
+        self.out_columns = out_columns
+        self.limit = limit
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.Table:
+        per_row = _gather_rows(self.fn, batch.to_pylist(), self.limit)
+        out: list[dict[str, Any]] = []
+        for rows in per_row:
+            out.extend(rows)
         return _to_table(out, batch, self.out_columns)
 
 

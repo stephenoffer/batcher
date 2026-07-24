@@ -13,6 +13,7 @@ a `Trigger` and an `OutputMode` are optional inputs to the same `ds.write(...)`.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import timedelta
@@ -111,6 +112,13 @@ def parse_interval_seconds(interval: float | int | str | timedelta) -> float:
             f"interval must be a number, a string like '5 seconds', or a timedelta, "
             f"not {type(interval).__name__} ({interval!r})"
         )
+    # A NaN or infinite interval slips past every check below (`nan < 0` is False, and
+    # `inf` is "non-negative"), then poisons the loop that consumes it: a NaN trigger
+    # cadence makes `remaining > 0` always False and busy-loops the micro-batch thread,
+    # and an infinite lateness overflows the microsecond literal it lowers to. Reject it
+    # here, at the one gate every duration flows through.
+    if not math.isfinite(seconds):
+        raise PlanError(f"interval must be a finite duration, got {seconds} (from {interval!r})")
     if seconds < 0:
         raise PlanError(f"interval must be non-negative, got {seconds}")
     return seconds
@@ -384,6 +392,16 @@ class StreamingQueryProgress:
     def input_rows_per_second(self) -> float:
         """Throughput for this micro-batch (rows / second), 0 if it took no time."""
         return self.num_input_rows / (self.duration_ms / 1000.0) if self.duration_ms else 0.0
+
+    @property
+    def output_rows_per_second(self) -> float:
+        """Emission throughput for this micro-batch (output rows / second), 0 if instant.
+
+        Distinct from `input_rows_per_second`: a filter or a windowed aggregate emits far
+        fewer rows than it consumes, so this measures how fast the query *produces* results
+        rather than how fast it *reads* input.
+        """
+        return self.num_output_rows / (self.duration_ms / 1000.0) if self.duration_ms else 0.0
 
     def __str__(self) -> str:
         """A one-line human summary: batch id, rows in/out, duration, throughput."""

@@ -7,19 +7,13 @@ object storage take over for shared clusters behind the same protocol.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Iterator
 
 from batcher._internal.errors import ConfigError
-from batcher.metadata.store import Key
+from batcher.metadata.store import Key, decode_key, encode_key
 
 __all__ = ["SQLiteBackend"]
-
-
-def _encode_key(key: Key) -> str:
-    # JSON with a fixed separator gives a deterministic, prefix-comparable string.
-    return json.dumps(list(key), separators=(",", ":"))
 
 
 class SQLiteBackend:
@@ -67,14 +61,14 @@ class SQLiteBackend:
 
     def get(self, table: str, key: Key) -> bytes | None:
         row = self._conn.execute(
-            "SELECT value FROM kv WHERE tbl = ? AND key = ?", (table, _encode_key(key))
+            "SELECT value FROM kv WHERE tbl = ? AND key = ?", (table, encode_key(key))
         ).fetchone()
         return row[0] if row else None
 
     def put(self, table: str, key: Key, value: bytes) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO kv (tbl, key, value) VALUES (?, ?, ?)",
-            (table, _encode_key(key), value),
+            (table, encode_key(key), value),
         )
         self._conn.commit()
 
@@ -84,13 +78,13 @@ class SQLiteBackend:
         ).fetchall()
         plen = len(prefix)
         for enc_key, value in rows:
-            key = tuple(json.loads(enc_key))
+            key = decode_key(enc_key)
             if key[:plen] == prefix:
                 yield key, value
 
     def batch_put(self, table: str, items: list[tuple[Key, bytes]]) -> None:
         self._conn.executemany(
             "INSERT OR REPLACE INTO kv (tbl, key, value) VALUES (?, ?, ?)",
-            [(table, _encode_key(k), v) for k, v in items],
+            [(table, encode_key(k), v) for k, v in items],
         )
         self._conn.commit()

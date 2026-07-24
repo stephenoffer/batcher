@@ -105,6 +105,82 @@ def test_streaming_write_is_chosen_only_for_lazy_sources(tmp_path):
 
 
 @pytest.mark.integration
+def test_unbounded_breaker_error_names_offending_node():
+    """An unbounded source under a breaker that must materialize raises a `PlanError`
+    that names the offending top-level operator, so the message is actionable rather
+    than a generic "must materialize"."""
+    from batcher._internal.errors import PlanError
+
+    def factory():
+        yield pa.RecordBatch.from_pydict({"x": [3, 1, 2]})
+
+    ds = bt.from_batches(factory, pa.schema([("x", pa.int64())]), bounded=False).sort("x")
+    with pytest.raises(PlanError, match="top-level Sort"):
+        list(ds.iter_batches())
+
+
+@pytest.mark.integration
+def test_streaming_topn_over_unbounded_source():
+    # `sort + limit` over an unbounded source streams via `stream_topn`, keeping only the
+    # running best N rows — the global top-N, identical to sorting the whole input then
+    # taking the first N.
+    def factory():
+        yield pa.RecordBatch.from_pydict({"x": [5, 2, 8]})
+        yield pa.RecordBatch.from_pydict({"x": [1, 9, 3]})
+        yield pa.RecordBatch.from_pydict({"x": [7, 4, 6]})
+
+    ds = bt.from_batches(factory, pa.schema([("x", pa.int64())]), bounded=False).sort("x").limit(4)
+    out = pa.Table.from_batches(list(ds.iter_batches())).column("x").to_pylist()
+    assert out == [1, 2, 3, 4]  # global top-4 ascending, not per-batch
+
+
+@pytest.mark.integration
+def test_streaming_limit_short_circuits_over_unbounded_source():
+    # `limit(n)` over an unbounded source reads only until n rows are produced, then stops —
+    # it must not drain the whole (endless) source.
+    consumed: list[int] = []
+
+    def factory():
+        for i in range(1000):
+            consumed.append(i)
+            yield pa.RecordBatch.from_pydict({"x": [i]})
+
+    ds = bt.from_batches(factory, pa.schema([("x", pa.int64())]), bounded=False).limit(3)
+    out = pa.Table.from_batches(list(ds.iter_batches())).column("x").to_pylist()
+    assert out == [0, 1, 2]
+    assert len(consumed) < 10  # short-circuited, did not read all 1000 batches
+
+
+@pytest.mark.integration
+def test_streaming_global_aggregate_over_empty_stream_yields_one_row():
+    # A keyless aggregate over an empty stream still yields exactly one row (COUNT=0,
+    # SUM=NULL) — what SQL/DuckDB/collect() produce. The incremental fold has no partial to
+    # finalize (it skips empty batches), so it falls back to the engine's empty-input result
+    # rather than silently yielding zero rows.
+    def factory():
+        yield pa.RecordBatch.from_pydict({"v": pa.array([], type=pa.int64())})
+
+    ds = bt.from_batches(factory, pa.schema([("v", pa.int64())]), bounded=False).agg(
+        n=bt.col("v").count(), s=bt.col("v").sum()
+    )
+    out = pa.Table.from_batches(list(ds.iter_batches())).to_pydict()
+    assert out == {"n": [0], "s": [None]}
+
+
+@pytest.mark.integration
+def test_streaming_distinct_over_unbounded_source():
+    # `distinct()` over an unbounded source folds identical rows into one running group
+    # (state bounded by the distinct-row count), yielding the exact set once drained.
+    def factory():
+        yield pa.RecordBatch.from_pydict({"k": ["a", "b", "a"]})
+        yield pa.RecordBatch.from_pydict({"k": ["b", "c", "a"]})
+
+    ds = bt.from_batches(factory, pa.schema([("k", pa.string())]), bounded=False).distinct()
+    out = sorted(pa.Table.from_batches(list(ds.iter_batches())).column("k").to_pylist())
+    assert out == ["a", "b", "c"]
+
+
+@pytest.mark.integration
 def test_streaming_write_empty_result_keeps_schema(tmp_path):
     """A streamable write whose filter removes every row still writes a valid empty
     file with the right columns (the empty-stream path)."""

@@ -62,8 +62,8 @@ def test_group_by_list_of_float_unifies_nan(duck) -> None:
     got = bt.from_arrow(table).group_by("k").agg(s=bt.col("v").sum()).collect().to_pydict()
     # Two groups: the unified-NaN group and the 1.0 group, each summing to 3.
     assert len(got["k"]) == 2, f"NaN patterns must unify to one group: {got}"
-    nan_sum = next(s for k, s in zip(got["k"], got["s"]) if math.isnan(k[0]))
-    one_sum = next(s for k, s in zip(got["k"], got["s"]) if not math.isnan(k[0]))
+    nan_sum = next(s for k, s in zip(got["k"], got["s"], strict=True) if math.isnan(k[0]))
+    one_sum = next(s for k, s in zip(got["k"], got["s"], strict=True) if not math.isnan(k[0]))
     assert nan_sum == 3, f"both NaN rows must fold together (1+2): {got}"
     assert one_sum == 3
 

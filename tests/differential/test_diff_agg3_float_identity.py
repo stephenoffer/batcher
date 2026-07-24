@@ -21,9 +21,10 @@ pytestmark = pytest.mark.differential
 def test_mode_folds_signed_zero(duck):
     """mode must fold -0.0/0.0 into one value before racing frequencies.
 
-    With `-0.0`×2 and `0.0`×2 counted as one value (total 4) they beat `7.0`×3, so the
-    mode is a zero. Before the fix the two zero signs were separate (2 and 2), `7.0`
-    won, and the mode was 7.0 — disagreeing with DuckDB (which returns a zero).
+    With `-0.0` twice and `0.0` twice counted as one value (total 4) they beat three
+    `7.0`s, so the mode is a zero. Before the fix the two zero signs were separate
+    (2 and 2), `7.0` won, and the mode was 7.0 - disagreeing with DuckDB (which
+    returns a zero).
     """
     t = pa.table(
         {

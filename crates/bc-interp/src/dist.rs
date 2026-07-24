@@ -445,6 +445,12 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::DataType;
 
+    /// One input chunk as `(key column, value column)`, nulls included. The partition
+    /// tests build relations chunk by chunk to prove that how a relation happens to be
+    /// morselized never changes which reducer a key lands on.
+    type FloatChunk = (Vec<Option<f64>>, Vec<Option<f64>>);
+    type IntChunk = (Vec<Option<i64>>, Vec<Option<i64>>);
+
     fn batch(n_cols: usize) -> RecordBatch {
         let fields: Vec<Field> = (0..n_cols)
             .map(|i| Field::new(format!("c{i}"), DataType::Int64, true))
@@ -840,7 +846,7 @@ mod tests {
             Field::new("v", DataType::Float64, true),
         ]));
         let nan = f64::NAN;
-        let chunks: Vec<(Vec<Option<f64>>, Vec<Option<f64>>)> = vec![
+        let chunks: Vec<FloatChunk> = vec![
             (
                 vec![Some(0.0), Some(-0.0), Some(nan), None, Some(1.0)],
                 vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(5.0)],
@@ -902,7 +908,7 @@ mod tests {
         ]));
         // Repeating keys, nulls, and uneven morsel sizes — the shapes a shuffle must
         // route identically no matter how the relation happens to be chunked.
-        let chunks: Vec<(Vec<Option<i64>>, Vec<Option<i64>>)> = vec![
+        let chunks: Vec<IntChunk> = vec![
             (
                 vec![Some(1), Some(2), None, Some(3), Some(2)],
                 vec![Some(10), Some(20), Some(30), Some(40), Some(50)],

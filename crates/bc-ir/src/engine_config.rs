@@ -141,7 +141,7 @@ impl Default for EngineConfig {
             bloom_fp_rate: 0.01,
             bloom_min_build_rows: 1 << 16,
             window_parallel_row_threshold: 1 << 15,
-            radix_parallel_threshold: 200_000,
+            radix_parallel_threshold: 0,
             sort_merge_fanin: 16,
             skew_bucket_factor: 4,
             skew_min_bucket_rows: 4 * bc_arrow::DEFAULT_MORSEL_ROWS,

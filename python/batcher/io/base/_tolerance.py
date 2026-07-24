@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import logging
 
-from batcher._internal.errors import ConfigError
+from batcher._internal.errors import ConfigError, FormatError, SchemaError
+from batcher._internal.errors import IOError as BatcherIOError
 from batcher._internal.logging import get_logger, log_kv
 
 __all__ = ["ON_ERROR_MODES", "ErrorPolicy"]
@@ -31,13 +32,18 @@ ON_ERROR_MODES = frozenset({"raise", "skip"})
 class ErrorPolicy:
     """Decides whether an unreadable file aborts the read, and remembers the ones dropped."""
 
-    __slots__ = ("_mode", "_skipped")
+    __slots__ = ("_mode", "_seen", "_skipped")
 
     def __init__(self, mode: str) -> None:
         if mode not in ON_ERROR_MODES:
             raise ConfigError(f"on_error must be one of {sorted(ON_ERROR_MODES)}, got {mode!r}")
         self._mode = mode
+        # The list keeps failure order (what `skipped()` promises); the set answers "already
+        # recorded?" in O(1). A list membership test would be O(files skipped) per skip, and
+        # a corpus that is largely unreadable is exactly when this runs most — quadratic on
+        # the one path whose whole purpose is surviving a bad corpus at scale.
         self._skipped: list[str] = []
+        self._seen: set[str] = set()
 
     @property
     def mode(self) -> str:
@@ -50,7 +56,13 @@ class ErrorPolicy:
         return self._mode
 
     def tolerate(self, path: str, exc: Exception, *, format_name: str) -> bool:
-        """Record and swallow a per-file failure, or report that it must propagate.
+        """Record and swallow a per-file failure, or raise it as a typed error.
+
+        A `SchemaError` is never tolerated, whatever the mode. `on_error` answers "this
+        file's *bytes* are unreadable, may I drop it?", and a file whose schema disagrees
+        with the source's is perfectly readable — dropping it would silently delete rows
+        the user has every reason to think were read. That is the same silent data loss
+        strict-mode conformance exists to catch, so it must not be reintroduced here.
 
         Args:
             path: The file that could not be read.
@@ -58,11 +70,35 @@ class ErrorPolicy:
             format_name: The reader's format, for the log record.
 
         Returns:
-            True when the caller should drop this file and continue; False when the
-            exception must be re-raised.
+            True, meaning the caller should drop this file and continue. The failure is
+            raised rather than returned when it must propagate, so a caller never has to
+            re-raise (and cannot forget to).
+
+        Raises:
+            SchemaError: If `exc` is one — it is about the data, not the file's health.
+            FormatError: Under ``on_error="raise"``, wrapping `exc` with the path, the
+                format, and the flag that would tolerate it.
         """
+        if isinstance(exc, SchemaError):
+            raise exc
         if self._mode != "skip":
-            return False
+            if isinstance(exc, BatcherIOError):
+                # The format already diagnosed this in its own vocabulary (the CSV reader's
+                # invalid-UTF-8 message, say). Wrapping it would bury the specific advice
+                # under a generic one, so the better error is the one already raised.
+                raise exc
+            raise FormatError(
+                f"could not read {path!r} as {format_name}: {type(exc).__name__}: {exc}. "
+                "Pass on_error='skip' to drop unreadable files and read the rest "
+                "(source.corrupt_files() then lists what was dropped)."
+            ) from exc
+        if path in self._seen:
+            # One unreadable file is met more than once per query — schema inference, the
+            # footer row count, split planning and the read itself each touch it — and
+            # `corrupt_files()` answers "which files were dropped", not "how many times did
+            # a drop happen". Recording it once also keeps the warning to one line per file.
+            return True
+        self._seen.add(path)
         self._skipped.append(path)
         log_kv(
             _LOG,

@@ -73,7 +73,33 @@ def test_doc_examples(path: Path) -> None:
         try:
             exec(compile(block, f"{path}#block{index}", "exec"), namespace)
         except Exception as exc:  # surface the failing block to the test report
+            if _is_optional_backend_absence(exc):
+                # A block that uses an optional backend (`iter_torch_batches`, a Ray
+                # cluster) skips when that backend is absent, matching ci.yml's design:
+                # it runs `.[dev]` without torch/ray, so these examples cannot execute and
+                # must not fail the gate. When the backend *is* installed the block runs in
+                # full, so a real breakage in the example still fails.
+                pytest.skip(f"{path.relative_to(DOCS_ROOT)} block {index}: {exc}")
             pytest.fail(
                 f"{path.relative_to(DOCS_ROOT)} block {index} failed: "
                 f"{type(exc).__name__}: {exc}\n--- block ---\n{block}"
             )
+
+
+# Optional backends ci.yml does not install; a block needing one skips rather than fails.
+_OPTIONAL_BACKENDS = ("ray", "torch", "tensorflow", "vllm", "cuda")
+
+
+def _is_optional_backend_absence(exc: BaseException) -> bool:
+    """True if `exc` means an optional backend the block needs is not installed.
+
+    ``MissingDependencyError`` is batcher's own typed error for a missing optional extra,
+    so it is *never* a documentation typo — always safe to treat as skip. A bare ``import
+    torch`` raises ``ModuleNotFoundError`` whose ``name`` the import system sets; a real
+    typo (``import batcher.nonexistent``) names a non-backend module and still fails.
+    """
+    if type(exc).__name__ == "MissingDependencyError":
+        return True
+    if isinstance(exc, ModuleNotFoundError):
+        return (exc.name or "").split(".")[0] in _OPTIONAL_BACKENDS
+    return False

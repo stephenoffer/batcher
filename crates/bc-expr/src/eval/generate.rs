@@ -47,7 +47,7 @@ pub(crate) fn eval_sequence(
         }
         let (s, e, d) = (start.value(i), stop.value(i), step.value(i));
         if d == 0 {
-            return Err(ExprError::DivideByZero);
+            return Err(ExprError::ZeroSequenceStep);
         }
         // Bound the allocation up front (in `i128` to dodge `e - s` overflow). The series
         // is empty when `d` points away from `s → e`; otherwise it has

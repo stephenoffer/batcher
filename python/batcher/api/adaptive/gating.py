@@ -160,7 +160,14 @@ def _estimate_accurate(actual: int, estimate: int, reopt_error: float) -> bool:
     bounded by 1 for any over-estimate, so it called every over-estimate accurate — and an
     over-estimate is exactly what this loop exists to catch. Error is multiplicative, so the
     band is too. A positive estimate that produced nothing is a total miss.
+
+    Zero against zero is the one case the ratio cannot express, and it is a *perfect*
+    estimate, not a miss: the optimizer predicted an empty intermediate and got one, so the
+    residual plan re-plans to the same shape. Calling it inaccurate forced a re-optimization
+    pass — and another pipeline break — on exactly the query whose estimates were right.
     """
+    if estimate <= 0 and actual <= 0:
+        return True
     if estimate <= 0 or actual <= 0:
         return False
     return max(actual / estimate, estimate / actual) <= 1.0 + reopt_error

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.io.source import Source
 
@@ -242,8 +243,8 @@ def persist_written_source_stats(table: pa.Table, path: str, fmt: str) -> None:
             row_count=table.num_rows, byte_size=table.nbytes, columns=columns, exact_rows=True
         )
         save_source_stats(core.default_hub(), f"{fmt}:{path}", stats)
-    except Exception:  # pragma: no cover - persistence must never break a write
-        pass
+    except Exception as exc:  # pragma: no cover - persistence must never break a write
+        note_suppressed("api", "persist source statistics", exc)
 
 
 def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:

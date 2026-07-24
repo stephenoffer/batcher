@@ -13,6 +13,7 @@ worse than no byte count at all.
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
 from batcher.api.dataset.meta._facts import MetaBase
 from batcher.kyber.shortcuts import storage
 
@@ -210,7 +211,8 @@ class StorageMeta(MetaBase):
             if callable(paths):
                 try:
                     found.extend(str(p) for p in paths())
-                except Exception:  # a source that cannot list itself contributes nothing
+                except Exception as exc:  # a source that cannot list itself contributes nothing
+                    note_suppressed("api", "list a source's files", exc)
                     continue
         return found
 

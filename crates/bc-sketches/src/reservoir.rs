@@ -75,20 +75,44 @@ impl XorShift64 {
         }
         self.next_u64() % bound
     }
+
+    /// A uniform float in the **open** interval `(0, 1)`.
+    ///
+    /// Open at both ends because every caller feeds it to a logarithm: `ln(0)` is `-inf`
+    /// and would turn a skip length into an infinity, while `ln(1)` is 0 and would make the
+    /// exponential jump distribution degenerate. Built from the top 53 bits (the mantissa
+    /// width of an `f64`), then nudged off zero, so the value is uniform to full precision.
+    fn unit(&mut self) -> f64 {
+        let bits = self.next_u64() >> 11; // 53 significant bits
+        let u = (bits as f64 + 0.5) / (1u64 << 53) as f64;
+        u.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON / 2.0)
+    }
 }
 
-/// A fixed-capacity uniform random sample of a stream (Vitter's Algorithm R).
+/// A fixed-capacity uniform random sample of a stream (Li's **Algorithm L**).
 ///
 /// After any number of [`add`](ReservoirSample::add) calls, [`sample`] holds
 /// `min(total_seen, capacity)` items drawn uniformly at random from everything
 /// seen so far. Deterministic given the fixed PRNG seed.
+///
+/// Algorithm L draws the same distribution as the textbook Algorithm R — every seen item is
+/// retained with probability `k/n`, exactly — but reaches it with `O(k(1 + log(n/k)))` random
+/// draws instead of one per item. Algorithm R rolls a die for every row it sees and discards
+/// almost all of them; L instead draws how many rows to *skip* from the geometric
+/// distribution those dice would have produced, and touches the RNG only when a replacement
+/// actually happens. Sampling 1,000 rows from 10 million goes from 10 million random draws to
+/// roughly 30 thousand, which matters because this sits on the scan path.
 #[derive(Clone)]
 pub struct ReservoirSample<T: Clone> {
     capacity: usize,
     items: Vec<T>,
-    /// Total number of items ever offered via `add` (the `n` of Algorithm R).
+    /// Total number of items ever offered via `add` (the `n` of the algorithm).
     seen: u64,
     rng: XorShift64,
+    /// Algorithm L's running acceptance parameter — the product of `k`-th roots of uniforms.
+    w: f64,
+    /// The value of `seen` at which the next item will be accepted into the reservoir.
+    next_accept: u64,
 }
 
 impl<T: Clone> ReservoirSample<T> {
@@ -115,15 +139,19 @@ impl<T: Clone> ReservoirSample<T> {
             items: Vec::with_capacity(capacity),
             seen: 0,
             rng: XorShift64::new(mix64(seed)),
+            w: 1.0,
+            next_accept: u64::MAX,
         }
     }
 
-    /// Offer one item to the reservoir (Algorithm R).
+    /// Offer one item to the reservoir (Algorithm L).
     ///
-    /// While fewer than `capacity` items have been seen, the item is always kept.
-    /// Afterwards it replaces a uniformly random existing slot with probability
-    /// `capacity / n`, where `n` is the number of items seen *including* this one
-    /// — which keeps every seen item present with equal probability.
+    /// While fewer than `capacity` items have been seen, the item is always kept. Once the
+    /// reservoir is full, the *index of the next item to be accepted* is drawn ahead of time
+    /// and every item before it is skipped without touching the RNG. Each accepted item
+    /// replaces a uniformly random slot, which keeps every seen item present with probability
+    /// exactly `capacity / n` — the same guarantee Algorithm R gives, at a fraction of the
+    /// random draws.
     pub fn add(&mut self, item: T) {
         self.seen += 1;
 
@@ -133,16 +161,44 @@ impl<T: Clone> ReservoirSample<T> {
 
         if self.items.len() < self.capacity {
             self.items.push(item);
+            if self.items.len() == self.capacity {
+                // The reservoir just filled: initialise the jump process.
+                self.w = self.rng.unit().powf(1.0 / self.capacity as f64);
+                self.next_accept = self.seen + self.skip() + 1;
+            }
             return;
         }
 
-        // Reservoir full: keep this item with probability capacity / seen by
-        // choosing a uniform slot in 0..seen and replacing only if it lands inside
-        // the reservoir.
-        let slot = self.rng.below(self.seen);
-        if (slot as usize) < self.capacity {
-            self.items[slot as usize] = item;
+        if self.seen < self.next_accept {
+            return; // skipped without a random draw — the whole point of Algorithm L
         }
+        let slot = self.rng.below(self.capacity as u64) as usize;
+        self.items[slot] = item;
+        self.w *= self.rng.unit().powf(1.0 / self.capacity as f64);
+        self.next_accept = self.seen + self.skip() + 1;
+    }
+
+    /// How many items to discard before the next acceptance.
+    ///
+    /// The number of consecutive rejections before an acceptance is geometric, and its
+    /// inverse-CDF sample is `floor(ln(u) / ln(1 - w))`. `w` is the running product of `k`-th
+    /// roots of uniforms, which is exactly the acceptance probability Algorithm R would apply
+    /// at this point in the stream — which is why the two algorithms sample the same
+    /// distribution rather than merely similar ones.
+    ///
+    /// Saturating: once `w` underflows toward zero, `ln(1 - w)` approaches zero and the skip
+    /// diverges, which is correct (an enormous stream accepts almost nothing) but must not
+    /// overflow the counter.
+    fn skip(&mut self) -> u64 {
+        let denom = (1.0 - self.w).ln();
+        if !denom.is_finite() || denom >= 0.0 {
+            return u64::MAX / 2; // w has underflowed: effectively never accept again
+        }
+        let s = self.rng.unit().ln() / denom;
+        if !s.is_finite() || s < 0.0 {
+            return 0;
+        }
+        (s as u64).min(u64::MAX / 2)
     }
 
     /// The current reservoir contents — a uniform sample of everything seen.
@@ -628,5 +684,62 @@ mod tests {
             (sample_mean - true_mean).abs() < 0.1 * 40_000.0,
             "merged sample_mean {sample_mean} too far from {true_mean}"
         );
+    }
+
+    /// Algorithm L must sample **uniformly**: over many independent streams, every position
+    /// of the input should appear in the reservoir about `k/n` of the time.
+    ///
+    /// This is the property the switch from Algorithm R had to preserve exactly, and it is
+    /// not something the speedup can be traded against — a biased sample silently biases
+    /// every statistic computed from it.
+    #[test]
+    fn algorithm_l_samples_uniformly() {
+        let (n, k, trials) = (500usize, 10usize, 4_000usize);
+        let mut hits = vec![0u32; n];
+        for t in 0..trials {
+            let mut r = ReservoirSample::with_seed(k, t as u64);
+            for i in 0..n {
+                r.add(i);
+            }
+            for &i in r.sample() {
+                hits[i] += 1;
+            }
+        }
+        let expected = trials as f64 * k as f64 / n as f64;
+        // Each position's count is Binomial(trials, k/n); its sd is sqrt(trials·p·(1-p)).
+        let sd = (trials as f64 * (k as f64 / n as f64) * (1.0 - k as f64 / n as f64)).sqrt();
+        for (i, &h) in hits.iter().enumerate() {
+            let z = (h as f64 - expected) / sd;
+            assert!(
+                z.abs() < 5.0,
+                "position {i}: {h} hits, expected {expected:.1} (z = {z:.2})"
+            );
+        }
+        // And the mean over all positions must land essentially on the expectation.
+        let mean = hits.iter().map(|&h| h as f64).sum::<f64>() / n as f64;
+        assert!((mean - expected).abs() < 0.5, "mean {mean} vs {expected}");
+    }
+
+    /// A reservoir that never fills keeps everything, and the jump process must not fire.
+    #[test]
+    fn a_stream_shorter_than_the_reservoir_is_kept_whole() {
+        let mut r = ReservoirSample::with_seed(100, 7);
+        for i in 0..100u32 {
+            r.add(i);
+        }
+        let mut got: Vec<u32> = r.sample().to_vec();
+        got.sort_unstable();
+        assert_eq!(got, (0..100).collect::<Vec<_>>());
+    }
+
+    /// The unit generator feeds logarithms, so it must never return 0 or 1.
+    #[test]
+    fn unit_stays_strictly_inside_the_open_interval() {
+        let mut rng = XorShift64::new(mix64(3));
+        for _ in 0..100_000 {
+            let u = rng.unit();
+            assert!(u > 0.0 && u < 1.0, "unit produced {u}");
+            assert!(u.ln().is_finite() && (1.0 - u).ln().is_finite());
+        }
     }
 }

@@ -163,36 +163,36 @@ def test_available_capped_to_cgroup_headroom(monkeypatch):
     """A cgroup-limited container must not read the host's free RAM as its own headroom —
     on a big host it would over-admit and OOM at the cgroup cap. The available reading is
     clamped to `limit - current`."""
-    from batcher.carbonite.memory import pressure
+    from batcher.carbonite.memory import probe
 
     # Big host (180 GB free) but an 8 GB container already using 3 GB → 5 GB real headroom.
-    monkeypatch.setattr(pressure, "_cgroup_limit_bytes", lambda: 8 * 1024**3)
-    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: 3 * 1024**3)
-    assert pressure._cap_to_cgroup_headroom(180 * 1024**3) == 5 * 1024**3
+    monkeypatch.setattr(probe, "cgroup_limit_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(probe, "cgroup_current_bytes", lambda: 3 * 1024**3)
+    assert probe.cap_to_cgroup_headroom(180 * 1024**3) == 5 * 1024**3
     # When the host figure is already below the cgroup headroom, it wins (no inflation).
-    assert pressure._cap_to_cgroup_headroom(2 * 1024**3) == 2 * 1024**3
+    assert probe.cap_to_cgroup_headroom(2 * 1024**3) == 2 * 1024**3
     # Over-budget container (current > limit) clamps to 0, never negative.
-    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: 9 * 1024**3)
-    assert pressure._cap_to_cgroup_headroom(180 * 1024**3) == 0
+    monkeypatch.setattr(probe, "cgroup_current_bytes", lambda: 9 * 1024**3)
+    assert probe.cap_to_cgroup_headroom(180 * 1024**3) == 0
     # No cgroup cap (bare metal) leaves the host reading untouched.
-    monkeypatch.setattr(pressure, "_cgroup_limit_bytes", lambda: None)
-    assert pressure._cap_to_cgroup_headroom(180 * 1024**3) == 180 * 1024**3
+    monkeypatch.setattr(probe, "cgroup_limit_bytes", lambda: None)
+    assert probe.cap_to_cgroup_headroom(180 * 1024**3) == 180 * 1024**3
 
 
 def test_available_reading_is_shared_within_the_ttl(monkeypatch):
     """The expensive live OS read is sampled once per TTL window and reused, so the
     per-query control-plane cost does not pay it on every decision / back-to-back query.
     """
-    from batcher.carbonite.memory import pressure
+    from batcher.carbonite.memory import pressure, probe
 
-    pressure.reset_memory_sampling()
+    probe.reset_memory_sampling()
     calls = {"n": 0}
 
     def _counting_read() -> int:
         calls["n"] += 1
         return 8 * 1024**3
 
-    monkeypatch.setattr(pressure.PressureMonitor, "_read_available_bytes", _counting_read)
+    monkeypatch.setattr(probe, "read_available_bytes", _counting_read)
     mon = pressure.PressureMonitor()
     # Many reads across fresh monitors — all served from the one cached sample.
     for _ in range(50):
@@ -210,17 +210,17 @@ def test_available_reading_is_shared_within_the_ttl(monkeypatch):
 def test_host_ram_is_memoized(monkeypatch):
     """Host RAM is process-constant, so `total_memory_bytes` must not re-run syscalls
     on every call — only the (cheap, live) container-usage figure stays uncached."""
-    from batcher.carbonite.memory import pressure
+    from batcher.carbonite.memory import pressure, probe
 
     pressure.reset_memory_sampling()
     sysconf_calls = {"n": 0}
-    real_sysconf = pressure.os.sysconf
+    real_sysconf = probe.os.sysconf
 
     def _counting_sysconf(name):
         sysconf_calls["n"] += 1
         return real_sysconf(name)
 
-    monkeypatch.setattr(pressure.os, "sysconf", _counting_sysconf)
+    monkeypatch.setattr(probe.os, "sysconf", _counting_sysconf)
     first = pressure.total_memory_bytes()
     for _ in range(100):
         assert pressure.total_memory_bytes() == first

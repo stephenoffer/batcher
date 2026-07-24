@@ -105,14 +105,24 @@ const VIEWS = (() => {
     const rates = buckets.map((b) => b.rows_per_sec);
     const runs = buckets.map((b) => b.runs);
     const peak = Math.max(...rates);
+    // Bucket index rather than a wall clock on the x axis: the series is bucketed evenly
+    // across the session, so the ends are the honest labels and inventing a timestamp per
+    // bucket would imply a resolution the bucketing does not have.
+    const span = series.end - series.start;
+    const values = rates.map((v, i) => ({
+      x: series.start + (span * (i / Math.max(1, rates.length - 1))), y: v,
+    }));
+    // The time axis already carries the start and end clock under the plot, so the foot
+    // says only what the axis cannot: how many runs and how long a span it covers.
     host.innerHTML =
       `<div class="chart-head"><span>Rows per second across the session</span>` +
-      `<span class="mono dim">peak ${count(peak)}/s</span></div>` +
-      sparkline(rates, { width: 520, height: 64, label: 'rows per second', unit: '/s' }) +
-      `<div class="chart-foot"><span>${clock(series.start)}</span>` +
-      `<span class="dim">${runs.reduce((a, b) => a + b, 0)} runs · ` +
-      `${duration(series.end - series.start)} span</span>` +
-      `<span>${clock(series.end)}</span></div>`;
+      `<span class="mono dim">peak ${count(peak)}/s</span></div><div class="chart-slot"></div>` +
+      `<div class="chart-foot"><span class="dim">${runs.reduce((a, b) => a + b, 0)} runs ` +
+      `over ${duration(span)}</span></div>`;
+    CHARTS.timeSeries(host.querySelector('.chart-slot'),
+      [{ key: 'rows', label: 'rows per second', values }],
+      { width: 620, height: 170, format: 'rate', xFormat: 'clock',
+        label: 'rows processed per second across the session' });
   }
 
   function operatorRollup(rows) {
@@ -125,18 +135,29 @@ const VIEWS = (() => {
       });
       return;
     }
+    // Capped at six: the tail is almost always sub-1% noise, and an unbounded list made this
+    // panel tower over the "cost by pipeline" panel beside it — the page's worst imbalance.
+    const TOP = 6;
+    const shown = rows.slice(0, TOP);
+    const restMs = rows.slice(TOP).reduce((s, r) => s + r.total_ms, 0);
     $('op-rollup').innerHTML =
       `<p class="hint">Where the engine spent its time this session, by step type — the ` +
       `workload's shape, which no single run can show.</p>` +
-      rows.map((r) => (
-        `<div class="rollup-row"><span class="rollup-name">${esc(friendly(r.kind))}</span>` +
-        `<span class="rollup-track"><i style="width:${(r.share * 100).toFixed(1)}%"></i></span>` +
-        `<span class="rollup-val mono">${ms(r.total_ms)}</span>` +
-        `<span class="rollup-pct mono dim">${pct(r.share)}</span></div>` +
-        `<div class="rollup-sub dim">${r.runs} step(s) · mean ${ms(r.mean_ms)} · slowest ${ms(r.max_ms)}` +
-        `${r.spilled ? ` · ${r.spilled} spilled ${bytes(r.spill_bytes)}` : ''}` +
-        (r.slowest_run ? `<button class="xref" data-run="${esc(r.slowest_run)}" type="button">slowest run</button>` : '') +
-        `</div>`)).join('');
+      CHARTS.bars(shown.map((r) => ({
+        label: friendly(r.kind),
+        value: r.total_ms,
+        sub: `${r.runs} step${r.runs === 1 ? '' : 's'} · mean ${ms(r.mean_ms)} · ` +
+             `slowest ${ms(r.max_ms)}`,
+        tone: r.spilled ? 'serious' : '',
+        note: (r.spilled ? `<span class="chip is-serious">${r.spilled} spilled ${bytes(r.spill_bytes)}</span>` : '') +
+              (r.slowest_run
+                ? `<button class="xref" data-run="${esc(r.slowest_run)}" type="button">slowest run</button>`
+                : ''),
+      })), { format: 'ms' }) +
+      (rows.length > TOP
+        ? `<p class="hint dim">+ ${rows.length - TOP} more step type${rows.length - TOP === 1 ? '' : 's'} ` +
+          `totalling ${ms(restMs)}.</p>`
+        : '');
   }
 
   function timeSplit(pipelines) {
@@ -149,16 +170,20 @@ const VIEWS = (() => {
       });
       return;
     }
-    $('time-split').innerHTML =
-      `<div class="stack">` + pipelines.map((p, i) => (
-        `<i class="stack-seg seq-${Math.min(i + 1, 5)}" style="width:${(p.total_ms / total) * 100}%" ` +
-        `title="${esc(friendly(p.label))} · ${ms(p.total_ms)}"></i>`)).join('') + `</div>` +
-      pipelines.slice(0, 6).map((p, i) => (
-        `<div class="split-row" data-pipe="${esc(p.signature)}" role="button" tabindex="0">` +
-        `<i class="swatch seq-${Math.min(i + 1, 5)}"></i>` +
-        `<span class="split-name">${esc(friendly(p.label))}</span>` +
-        `<span class="split-bar-val mono">${ms(p.total_ms)}</span>` +
-        `<span class="split-pct mono">${((p.total_ms / total) * 100).toFixed(0)}%</span></div>`)).join('');
+    const host = $('time-split');
+    host.innerHTML =
+      `<p class="hint">One expensive pipeline and fifty cheap ones are the same total and ` +
+      `completely different problems. This says which you have.</p>` +
+      // `link: 'pipe'` makes every segment and key a `data-pipe`, which the page's one
+      // cross-reference listener already turns into navigation. A chart that names a
+      // pipeline and cannot take you to it makes the reader go and find it by hand.
+      // Named by the pipeline's *name*, not its terminal-op label: two pipelines that both
+      // end in an aggregate were otherwise both listed as "Group & aggregate", so the split
+      // read as one pipeline appearing twice. The name (or the plan-shape chain) is unique.
+      CHARTS.proportion(pipelines.map((p) => ({
+        label: pipeName(p), value: p.total_ms, id: p.signature,
+      })), { format: 'ms', max: 6, link: 'pipe',
+             label: 'session time split across pipelines' });
   }
 
   function attention(queries, insights) {
@@ -274,9 +299,11 @@ const VIEWS = (() => {
         if (!c || c.elapsed_ms == null) {
           return `<td class="grid-cell is-absent" title="not measured in this run"></td>`;
         }
-        // Five buckets rather than a continuous ramp: adjacent cells must be tellable apart.
+        // Five buckets rather than a continuous ramp: adjacent cells must be tellable
+        // apart. The banding lives in `CHARTS.heat` so this grid and any other heat map
+        // put the same reading in the same band.
         const ratio = c.ratio ?? 1;
-        const level = ratio >= 2 ? 5 : ratio >= 1.35 ? 4 : ratio >= 0.85 ? 3 : ratio >= 0.5 ? 2 : 1;
+        const level = CHARTS.heat(ratio);
         // A grid cell is a real button target: clickable to open the run, and reachable by
         // keyboard (a `<td>` is not focusable on its own). `data-col` drives the crosshair;
         // `data-run` carries the query id the click opens.
@@ -310,15 +337,32 @@ const VIEWS = (() => {
 
   /* ═══════════ pipelines ═══════════ */
 
-  function pipelines(list, { onOpen, onPin, sort, needle }) {
+  /* A pipeline's display name: what a person called it, or a name generated from its plan
+   * shape. Every pipeline therefore has a name even before anyone types one, and the two are
+   * distinguishable — a custom name reads plainly, a generated one shows the plan as a chain. */
+  const pipeName = (p) => DAG.pipelineName(p.plan_shape, p.name);
+  /* The short, copyable form of the id (the plan signature). The full value copies. */
+  const pipeShortId = (p) => String(p.pipeline_id || p.signature || '').slice(0, 8);
+
+  /* The pipelines list, one lane per pipeline, each led by a thumbnail of its plan.
+   *
+   * This is the answer to "which pipeline is which": the plan's shape is drawn at the left of
+   * every lane, so a reader recognises a pipeline by its structure the way you know a face
+   * before you read the name — then the name, the id, the trend, and the verdict follow. The
+   * old compact grid packed four pipelines into a row and made exactly that recognition hard.
+   */
+  function pipelines(list, { onOpen, onPin, onRename, sort, needle }) {
     let shown = [...list];
-    if (needle) shown = shown.filter((p) => UI.fuzzy(needle, friendly(p.label) + p.signature));
+    if (needle) {
+      shown = shown.filter((p) => UI.fuzzy(needle,
+        `${pipeName(p)} ${p.note || ''} ${p.pipeline_id || p.signature}`));
+    }
     const sorters = {
       time: (a, b) => b.total_ms - a.total_ms,
       runs: (a, b) => b.runs - a.runs,
       slowest: (a, b) => b.median_ms - a.median_ms,
       recent: (a, b) => b.last_wall - a.last_wall,
-      name: (a, b) => friendly(a.label).localeCompare(friendly(b.label)),
+      name: (a, b) => pipeName(a).localeCompare(pipeName(b)),
     };
     shown.sort(sorters[sort] || sorters.time);
     // Pinned first, order otherwise preserved — a pin is a bookmark, not a re-ranking.
@@ -336,58 +380,160 @@ const VIEWS = (() => {
               `${list.length} pipelines.`,
       });
     }
-    $('pipeline-cards').innerHTML = shown.map((p) => {
-      const pc = p.percentiles || {};
-      const recent = p.recent_ms || [];
-      const drift = recent.length > 2 ? recent[recent.length - 1] / (median(recent.slice(0, -1)) || 1) : 1;
-      const driftChip = recent.length > 2
-        ? (drift > 1.3 ? `<span class="chip is-warn">${drift.toFixed(1)}x slower than usual</span>`
-          : drift < 0.77 ? `<span class="chip is-good">${(1 / drift).toFixed(1)}x faster</span>`
-          : `<span class="chip">steady</span>`) : '';
-      const health = p.n_failed ? 'critical' : (drift > 1.3 ? 'warn' : 'ok');
-      return `<article class="pcard has-ribbon is-${health}" data-sig="${esc(p.signature)}" ` +
-        `tabindex="0" role="button" aria-label="Open pipeline ${esc(friendly(p.label))}">` +
-        `<div class="pcard-head"><span class="dot dot-${esc(p.last_status)}"></span>` +
-        `<span class="pcard-name">${esc(friendly(p.label))}</span>` +
-        `<button class="pin${UI.isPinned(p.signature) ? ' is-on' : ''}" data-pin="${esc(p.signature)}" ` +
-        `type="button" title="Pin this pipeline" aria-label="Pin ${esc(friendly(p.label))}">★</button></div>` +
-        `<div class="pcard-metrics">` +
-        `<span class="metric"><b>${p.runs}</b><span>runs</span></span>` +
-        `<span class="metric"><b>${ms(pc.p50 ?? p.median_ms)}</b><span>${term('p95', 'p50')}</span></span>` +
-        `<span class="metric"><b>${ms(pc.p95 ?? p.max_ms)}</b><span>p95</span></span>` +
-        `<span class="metric${p.n_failed ? ' is-critical' : ''}"><b>${p.n_failed}</b><span>failed</span></span>` +
-        `</div>` +
-        (recent.length > 1
-          ? `<div class="pcard-charts"><div class="chartlet"><span class="chartlet-label">trend</span>` +
-            sparkline(recent, { width: 150, height: 34, label: 'recent durations', unit: 'ms' }) + `</div>` +
-            (recent.length > 3 ? `<div class="chartlet"><span class="chartlet-label">spread</span>` +
-              histogram(recent, { width: 150, height: 34 }) + `</div>` : '') + `</div>`
-          : `<p class="hint">Run it again to see a trend.</p>`) +
-        `<div class="pcard-foot">${driftChip}` +
-        `<span class="dim">${count(p.total_rows)} rows · ${ago(p.last_wall)}</span></div>` +
-        `<div class="pcard-actions"><span class="dim">Open pipeline →</span></div></article>`;
-    }).join('');
+    $('pipeline-cards').innerHTML = shown.map((p) => lane(p)).join('');
 
-    for (const b of $('pipeline-cards').querySelectorAll('[data-pin]')) {
+    const host = $('pipeline-cards');
+    for (const b of host.querySelectorAll('[data-pin]')) {
       b.addEventListener('click', (e) => { e.stopPropagation(); onPin(b.dataset.pin); });
     }
-    for (const card of $('pipeline-cards').querySelectorAll('[data-sig]')) {
-      card.addEventListener('click', () => onOpen(card.dataset.sig));
-      // A card that opens on click must open on Enter/Space too, or the footer's
-      // "Open pipeline →" is a promise the keyboard cannot keep.
-      card.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(card.dataset.sig); }
+    for (const b of host.querySelectorAll('[data-rename]')) {
+      b.addEventListener('click', (e) => { e.stopPropagation(); startRename(b, onRename); });
+    }
+    for (const el of host.querySelectorAll('.plane')) {
+      const open = (e) => {
+        // A click that lands on a control inside the lane is that control's, not the lane's.
+        if (e.target.closest('button, input, [data-copyable]')) return;
+        onOpen(el.dataset.sig);
+      };
+      el.addEventListener('click', open);
+      el.addEventListener('keydown', (e) => {
+        if ((e.key === 'Enter' || e.key === ' ') && e.target === el) { e.preventDefault(); onOpen(el.dataset.sig); }
       });
     }
     $('pipeline-count').textContent = shown.length;
     return shown;
   }
 
+  /* How a pipeline's latest run compares to its typical, as words a person can trust.
+   *
+   * A first cold-JIT run makes the "usual" a tiny number, so a warmed-up run reads as
+   * "171x faster than usual" — which sounds like a miracle rather than what it is: warmup.
+   * Past a handful of x's the honest label is "faster once warmed up", not a giant multiple.
+   * Returns the tone class and the words, or an empty label when there is nothing to say. */
+  function driftText(drift) {
+    if (drift == null || !Number.isFinite(drift)) return { cls: '', label: '' };
+    if (drift > 1.3) return { cls: 'is-warn', label: `${drift.toFixed(1)}x slower than usual` };
+    if (drift < 0.77) {
+      const factor = 1 / drift;
+      return factor > 5
+        ? { cls: 'is-good', label: 'faster once warmed up' }
+        : { cls: 'is-good', label: `${factor.toFixed(1)}x faster than usual` };
+    }
+    return { cls: '', label: 'steady' };
+  }
+
+  function lane(p) {
+    const pc = p.percentiles || {};
+    const recent = p.recent_ms || [];
+    const drift = recent.length > 2 ? recent[recent.length - 1] / (median(recent.slice(0, -1)) || 1) : 1;
+    const d = recent.length > 2 ? driftText(drift) : { cls: '', label: '' };
+    const driftChip = d.label ? `<span class="chip ${d.cls}">${d.label}</span>` : '';
+    const health = p.n_failed ? 'critical' : (drift > 1.3 ? 'warn' : 'ok');
+    const name = pipeName(p);
+    const generated = !p.name;   // showing a plan-derived name, not one a person typed
+    return `<article class="plane has-ribbon is-${health}" data-sig="${esc(p.signature)}" ` +
+      `tabindex="0" role="button" aria-label="Open pipeline ${esc(name)}">` +
+      `<div class="plane-thumb" aria-hidden="true">${DAG.thumbnail(p.plan_shape)}</div>` +
+      `<div class="plane-body">` +
+      `<div class="plane-head">` +
+      `<span class="dot dot-${esc(p.last_status)}"></span>` +
+      `<h3 class="plane-name${generated ? ' is-generated' : ''}" data-name>${esc(name)}</h3>` +
+      `<button class="linkish plane-rename" data-rename="${esc(p.signature)}" type="button" ` +
+      `title="Name this pipeline" aria-label="Name pipeline ${esc(name)}">✎</button>` +
+      `<span class="plane-id mono" data-copyable data-copy-value="${esc(p.pipeline_id || p.signature)}" ` +
+      `tabindex="0" title="Pipeline id — click to copy the full signature">#${esc(pipeShortId(p))}</span>` +
+      `<span class="spacer"></span>${driftChip}` +
+      `<button class="pin${UI.isPinned(p.signature) ? ' is-on' : ''}" data-pin="${esc(p.signature)}" ` +
+      `type="button" title="Pin this pipeline" aria-label="Pin ${esc(name)}">★</button></div>` +
+      (p.note ? `<p class="plane-note">${esc(p.note)}</p>` : '') +
+      `<div class="plane-stats">` +
+      `<span class="metric"><b>${p.runs}</b><span>runs</span></span>` +
+      `<span class="metric"><b>${ms(pc.p50 ?? p.median_ms)}</b><span>${term('p95', 'p50')}</span></span>` +
+      `<span class="metric"><b>${ms(pc.p95 ?? p.max_ms)}</b><span>p95</span></span>` +
+      `<span class="metric${p.n_failed ? ' is-critical' : ''}"><b>${p.n_failed}</b><span>failed</span></span>` +
+      `<span class="metric"><b>${count(p.total_rows)}</b><span>rows</span></span>` +
+      `</div>` +
+      `<div class="plane-foot"><span class="dim">last ${ago(p.last_wall)}</span>` +
+      `<span class="plane-open">Open pipeline →</span></div>` +
+      `</div>` +
+      // The trend gets its own anchored rail on the right rather than floating in the stats
+      // row with a lake of empty space between the numbers and the sparkline.
+      `<div class="plane-rail">` +
+      (recent.length > 1
+        ? `<span class="plane-rail-label">Duration trend</span>` +
+          sparkline(recent, { width: 200, height: 44, label: 'recent durations', unit: 'ms' })
+        : `<span class="plane-rail-label">Trend</span><span class="hint">Run again to see it</span>`) +
+      `</div></article>`;
+  }
+
+  /* Inline rename, in place, so naming a pipeline never leaves the list. The heading becomes
+   * an input seeded with the current name; Enter or blur commits, Escape abandons. The commit
+   * goes through `onRename`, which persists it to the registry — the one thing about a
+   * pipeline that is meant to outlive the session. */
+  function startRename(button, onRename) {
+    const lane = button.closest('.plane');
+    const heading = lane && lane.querySelector('[data-name]');
+    if (!heading || lane.querySelector('.plane-name-input')) return;
+    const sig = button.dataset.rename;
+    const current = heading.classList.contains('is-generated') ? '' : heading.textContent;
+    const input = document.createElement('input');
+    input.className = 'plane-name-input';
+    input.value = current;
+    input.placeholder = heading.textContent;
+    input.setAttribute('aria-label', 'Pipeline name');
+    input.maxLength = 200;
+    heading.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const commit = (save) => {
+      if (done) return;
+      done = true;
+      if (save) onRename(sig, input.value.trim());
+      else input.replaceWith(heading);   // Escape: restore the heading untouched
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    });
+    input.addEventListener('blur', () => commit(true));
+  }
+
+  /* The same inline rename, for the pipeline page's own heading. The header re-renders on
+   * the next poll from the persisted name, so this only has to hold until then. */
+  function startRenameHeading(titleEl, p, onRename) {
+    const heading = titleEl.querySelector('[data-name]');
+    if (!heading || titleEl.querySelector('.plane-name-input')) return;
+    const current = heading.classList.contains('is-generated') ? '' : heading.textContent;
+    const input = document.createElement('input');
+    input.className = 'plane-name-input is-large';
+    input.value = current;
+    input.placeholder = heading.textContent;
+    input.maxLength = 200;
+    input.setAttribute('aria-label', 'Pipeline name');
+    heading.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const commit = (save) => {
+      if (done) return;
+      done = true;
+      if (save) onRename(p.signature, input.value.trim());
+      else input.replaceWith(heading);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    });
+    input.addEventListener('blur', () => commit(true));
+  }
+
   /** The same pipelines as a dense table, for someone scanning twenty of them. */
   function pipelineTable(list, onOpen) {
     const columns = [
-      { label: 'Pipeline', value: (p) => friendly(p.label),
-        render: (p) => `<span class="dot dot-${esc(p.last_status)}"></span> ${esc(friendly(p.label))}` +
+      { label: 'Pipeline', value: (p) => pipeName(p),
+        render: (p) => `<span class="dot dot-${esc(p.last_status)}"></span> ${esc(pipeName(p))}` +
+                       ` <span class="plane-id mono">#${esc(pipeShortId(p))}</span>` +
                        (UI.isPinned(p.signature) ? ' <span class="pin is-on">★</span>' : '') },
       { label: 'Runs', num: true, value: (p) => p.runs },
       { label: 'p50', num: true, value: (p) => (p.percentiles || {}).p50 ?? p.median_ms,
@@ -416,23 +562,37 @@ const VIEWS = (() => {
   /* ═══════════ one pipeline ═══════════ */
 
   /** The header numbers for a single pipeline — its behaviour, not the engine's. */
-  function pipelineDetail(p, runs, { onOpenRun, onCompare }) {
+  function pipelineDetail(p, runs, { onOpenRun, onCompare, onRename }) {
     const pc = p.percentiles || {};
-    $('p-title').textContent = friendly(p.label);
+    // The header carries the pipeline's identity: the name (a person's, or one from the plan
+    // shape) with an inline edit, and the id — the plan signature Kyber keys learned stats
+    // on, truncated to fit but copyable in full, so it is the thing pasted into an issue.
+    const name = pipeName(p);
+    $('p-title').innerHTML =
+      `<span data-name class="${p.name ? '' : 'is-generated'}">${esc(name)}</span>` +
+      `<button class="linkish p-rename" type="button" title="Name this pipeline" ` +
+      `aria-label="Name this pipeline">✎</button>`;
+    const rename = $('p-title').querySelector('.p-rename');
+    if (rename && onRename) {
+      rename.addEventListener('click', () => startRenameHeading($('p-title'), p, onRename));
+    }
     $('p-sub').innerHTML =
       `${p.runs} run${p.runs === 1 ? '' : 's'} · last ${ago(p.last_wall)} · ` +
-      `<span class="mono dim">${esc(p.signature.slice(0, 12))}</span>`;
+      `<span class="mono dim" data-copyable data-copy-value="${esc(p.pipeline_id || p.signature)}" ` +
+      `tabindex="0" title="Pipeline id — click to copy the full signature">` +
+      `#${esc((p.pipeline_id || p.signature).slice(0, 12))}…</span>` +
+      (p.note ? ` · <span class="dim">${esc(p.note)}</span>` : '');
     $('p-pin').classList.toggle('is-on', UI.isPinned(p.signature));
     $('p-pin').textContent = UI.isPinned(p.signature) ? '★ Pinned' : '★ Pin';
 
     const recent = p.recent_ms || [];
     const drift = recent.length > 2 ? recent[recent.length - 1] / (median(recent.slice(0, -1)) || 1) : null;
     const badge = $('p-verdict');
-    if (drift == null) { badge.hidden = true; } else {
+    const d = drift == null ? null : driftText(drift);
+    if (!d || !d.label) { badge.hidden = true; } else {
       badge.hidden = false;
-      if (drift > 1.3) { badge.className = 'verdict is-warn'; badge.textContent = `getting slower — ${drift.toFixed(1)}x`; }
-      else if (drift < 0.77) { badge.className = 'verdict is-good'; badge.textContent = `getting faster — ${(1 / drift).toFixed(1)}x`; }
-      else { badge.className = 'verdict is-good'; badge.textContent = 'steady'; }
+      badge.className = `verdict ${d.cls || 'is-good'}`;
+      badge.textContent = d.label;
     }
 
     const cells = [
@@ -449,19 +609,26 @@ const VIEWS = (() => {
       `<div class="stat"><span class="stat-label">${esc(k)}</span>` +
       `<span class="stat-value">${esc(String(v))}</span><span class="stat-note">${esc(note)}</span></div>`)).join('');
 
+    // A trend from one point is a dot, not a trend. Say so rather than drawing nothing —
+    // and say it *instead of* the chart, not before being overwritten by an empty one.
     if (recent.length <= 1) {
-      // A trend from one point is a dot, not a trend. Say so rather than drawing nothing.
       $('p-trend').innerHTML = UI.emptyState({
         glyph: 'clock', title: 'Not enough runs for a trend',
-        body: 'Run this pipeline once more and its duration over time appears here.',
+        body: 'Run this pipeline once more and its duration over time appears here, oldest ' +
+              'to newest, so a pipeline that is degrading is a slope rather than a number ' +
+              'you have to remember.',
       });
+    } else {
+      // A real value axis, not a sparkline: this is the panel where someone reads *how
+      // slow* a run was, and a decorative line with no scale cannot answer that.
+      CHARTS.timeSeries($('p-trend'),
+        [{ key: 'dur', label: 'duration', values: recent.map((v, i) => ({ x: i + 1, y: v })) }],
+        { width: 560, height: 190, format: 'ms', label: 'duration of each run, oldest to newest' });
+      $('p-trend').insertAdjacentHTML('beforeend',
+        `<div class="chart-foot"><span>oldest</span>` +
+        `<span class="dim">${recent.length} runs · ${ms(p.min_ms)} – ${ms(p.max_ms)}</span>` +
+        `<span>newest</span></div>`);
     }
-    $('p-trend').innerHTML = recent.length > 1
-      ? `<div class="chart-head"><span>Each bar is one run</span>` +
-        `<span class="mono dim">${ms(p.min_ms)} – ${ms(p.max_ms)}</span></div>` +
-        sparkline(recent, { width: 420, height: 70, label: 'duration over time', unit: 'ms' }) +
-        `<div class="chart-foot"><span>oldest</span><span>newest</span></div>`
-      : '<p class="empty">Run it again to see a trend.</p>';
 
     if (recent.length <= 3) {
       // Percentiles over three samples are the max wearing a lab coat.
@@ -470,13 +637,20 @@ const VIEWS = (() => {
         body: 'A distribution needs a handful of runs before it describes anything. ' +
               'This fills in at four.',
       });
-    }
-    $('p-spread').innerHTML = recent.length > 3
-      ? `<div class="chart-head"><span>How often it lands where</span>` +
+    } else {
+      const sorted = [...recent].sort((a, b) => a - b);
+      const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+      $('p-spread').innerHTML =
+        `<div class="chart-head"><span>How often it lands where</span>` +
         `<span class="mono dim">${(pc.p95 / (pc.p50 || 1)).toFixed(1)}x spread</span></div>` +
         histogram(recent, { width: 420, height: 70 }) +
-        `<div class="chart-foot"><span>${ms(p.min_ms)}</span><span>${ms(p.max_ms)}</span></div>`
-      : '<p class="empty">A few more runs and the spread appears here.</p>';
+        // The box says what the histogram's shape means in numbers: half of runs land
+        // inside the box, and the median is the line — not the mean, which for a latency
+        // distribution is a value no run ever took.
+        CHARTS.box({ p5: at(0.05), p25: at(0.25), p50: pc.p50 ?? at(0.5),
+                     p75: at(0.75), p95: pc.p95 ?? at(0.95),
+                     min: p.min_ms, max: p.max_ms, format: 'ms' });
+    }
 
     $('p-dag-note').innerHTML =
       `This pipeline always runs the same plan — that is what makes it one pipeline. Each ` +
@@ -553,7 +727,10 @@ const VIEWS = (() => {
       el.title = 'This run did not complete.';
       return;
     }
-    if (!b || !b.ratio) {
+    // `== null`, not falsy. A run that finished faster than the timer's resolution has a
+    // real ratio of 0, and treating that as "no baseline" told the reader this was the
+    // first run of a pipeline they had just watched run five times.
+    if (!b || b.ratio == null) {
       el.hidden = false; el.className = 'verdict';
       // Not silence: "we cannot judge yet" is itself information. A first run has nothing to
       // compare against, and saying so beats an empty space the reader has to interpret.
@@ -741,6 +918,62 @@ const VIEWS = (() => {
         'sit idle, or a scan reads far more than a filter keeps.</p>';
   }
 
+  /* Where the engine changed its mind mid-query.
+   *
+   * This is the thing Batcher is built around and the dashboard has never shown: at a
+   * pipeline breaker the engine has *counted* the rows it just produced, so it can compare
+   * that against what the optimizer predicted and re-plan what is left. A static optimizer
+   * cannot do this, and a stage-boundary one only gets the chance at a shuffle.
+   *
+   * Rendered as prediction against measurement, per stage, because the size of the miss is
+   * the whole reason the re-plan was worth doing. An empty list is not a failure — most
+   * queries are estimated well enough that there is nothing to revise, and the panel says
+   * so rather than looking broken.
+   */
+  function adaptive(d) {
+    const host = $('adaptive');
+    if (!host) return;
+    const stages = (d.profile || {}).adaptive_stages || [];
+    if (!stages.length) {
+      host.innerHTML = UI.emptyState({
+        glyph: 'check', title: 'The engine did not need to re-plan',
+        body: 'At every pipeline breaker — a sort, a grouping, a join build — the engine ' +
+              'compares the rows it just counted against the rows the optimizer predicted, ' +
+              'and revises the rest of the plan if the two disagree badly enough to matter. ' +
+              'Nothing was revised in this run, which means the estimates held.',
+        hint: 'Re-optimization is off below 20M rows by default, so a small query will ' +
+              'always land here.',
+      });
+      return;
+    }
+    host.innerHTML =
+      `<p class="hint">At each of these points the engine had <b>counted</b> the rows, not ` +
+      `estimated them, and re-planned the rest of the query on the measurement.</p>` +
+      stages.map((s) => {
+        const est = Number(s.est_rows) || 0;
+        const actual = Number(s.actual_rows) || 0;
+        const ratio = est > 0 ? actual / est : null;
+        const bad = ratio != null && (ratio > 10 || ratio < 0.1);
+        return `<div class="adapt${bad ? ' is-warn' : ''}" data-op="${esc(String(s.op_id ?? ''))}" ` +
+          `role="button" tabindex="0">` +
+          `<div class="adapt-head">${DAG.glyphMarkup(s.kind || '', 14)}` +
+          `<b>${esc(friendly(s.kind || 'step'))}</b>` +
+          `<span class="mono dim">op ${esc(String(s.op_id ?? '?'))}</span>` +
+          (ratio == null ? '' :
+            `<span class="chip${bad ? ' is-warn' : ''}">${ratio.toFixed(ratio < 10 ? 1 : 0)}x ` +
+            `${ratio >= 1 ? 'more' : 'fewer'} rows than predicted</span>`) + `</div>` +
+          `<div class="adapt-nums">` +
+          `<span class="adapt-num"><span class="adapt-label">predicted</span>` +
+          `<span class="adapt-value">${count(est)}</span></span>` +
+          `<span class="adapt-arrow" aria-hidden="true">→</span>` +
+          `<span class="adapt-num"><span class="adapt-label">counted</span>` +
+          `<span class="adapt-value">${count(actual)}</span></span>` +
+          `</div>` +
+          `<p class="adapt-action"><b>So the engine</b> ${esc(s.action || 'revised the plan')}.</p>` +
+          `</div>`;
+      }).join('');
+  }
+
   function decisions(list) {
     const badge = $('decision-count');
     badge.hidden = list.length === 0;
@@ -767,30 +1000,48 @@ const VIEWS = (() => {
       host.innerHTML = `<p class="empty">${esc(cmp.reason)}</p>` + totalsTable(cmp.totals, aLabel, bLabel);
       return;
     }
+    const biggest = Math.max(1, ...cmp.steps.map((s) => Math.abs(s.delta_ms || 0)));
     host.innerHTML =
+      compareHeadline(cmp, aLabel, bLabel) +
       `<p class="hint">Steps are matched by their position in the plan, so the same step is ` +
       `compared against itself. Sorted by the biggest change.</p>` +
       totalsTable(cmp.totals, aLabel, bLabel) +
-      `<table class="dense"><thead><tr><th>Step</th><th class="num">${esc(aLabel)}</th>` +
-      `<th class="num">${esc(bLabel)}</th><th class="num">Change</th><th class="num">Ratio</th></tr></thead><tbody>` +
-      (function(){
-        const biggest = Math.max(1, ...cmp.steps.map((s) => Math.abs(s.delta_ms || 0)));
-        return cmp.steps.map((s) => {
-          const delta = s.delta_ms || 0;
-          const worse = delta > 0;
-          // Arrow = direction of change; colour = whether that direction is good. Slower is
-          // bad, faster is good, and both are shown so an improvement is as visible as a
-          // regression.
-          const arrow = s.delta_ms == null ? '' : worse ? '\u25b2' : '\u25bc';
-          const cls = s.delta_ms == null ? '' : worse ? 'is-warn' : 'is-good';
-          const barW = (Math.abs(delta) / biggest) * 100;
-          return `<tr><td>${esc(friendly(s.kind))}<span class="mono dim"> ${esc(s.detail || '')}</span></td>` +
-            `<td class="num">${ms(s.a_ms)}</td><td class="num">${ms(s.b_ms)}</td>` +
-            `<td class="num ${cls}"><span class="cmp-bar"><i class="${cls}" style="width:${barW.toFixed(0)}%"></i>` +
-            `<b>${s.delta_ms == null ? '\u2014' : `${arrow} ${Math.abs(delta).toFixed(1)}ms`}</b></span></td>` +
-            `<td class="num">${s.ratio == null ? '\u2014' : `${s.ratio.toFixed(2)}x`}</td></tr>`;
-        }).join('');
-      })() + `</tbody></table>`;
+      `<table class="dense"><thead><tr><th scope="col">Step</th>` +
+      `<th scope="col" class="num">${esc(aLabel)}</th>` +
+      `<th scope="col" class="num">${esc(bLabel)}</th>` +
+      `<th scope="col" class="num">Change</th>` +
+      `<th scope="col" class="num">Ratio</th></tr></thead><tbody>` +
+      cmp.steps.map((s) => {
+        const delta = s.delta_ms;
+        return `<tr><td>${esc(friendly(s.kind))}<span class="mono dim"> ${esc(s.detail || '')}</span></td>` +
+          `<td class="num">${ms(s.a_ms)}</td><td class="num">${ms(s.b_ms)}</td>` +
+          `<td class="num">${delta == null ? '\u2014' : CHARTS.delta(delta, biggest, { format: 'ms' })}</td>` +
+          `<td class="num">${s.ratio == null ? '\u2014' : `${s.ratio.toFixed(2)}x`}</td></tr>`;
+      }).join('') + `</tbody></table>`;
+  }
+
+  /* The answer before the table.
+   *
+   * A step-by-step diff is the evidence, but the question underneath it is "what accounts
+   * for the difference", and that is one step almost every time. Naming it up front means
+   * the table is something you read to confirm rather than something you have to mine. */
+  function compareHeadline(cmp, aLabel, bLabel) {
+    const changed = (cmp.steps || []).filter((s) => s.delta_ms != null && s.delta_ms !== 0);
+    if (!changed.length) {
+      return `<p class="cmp-headline">Every matched step took the same time in both runs.</p>`;
+    }
+    const total = changed.reduce((sum, s) => sum + Math.abs(s.delta_ms), 0) || 1;
+    const worst = changed.reduce((a, b) => (Math.abs(a.delta_ms) > Math.abs(b.delta_ms) ? a : b));
+    const share = Math.abs(worst.delta_ms) / total;
+    const slower = worst.delta_ms > 0;
+    const verb = slower ? 'slower' : 'faster';
+    return `<p class="cmp-headline">` +
+      (share > 0.5
+        ? `<b>${esc(friendly(worst.kind))}</b> accounts for ${pct(share)} of the difference: ` +
+          `${ms(Math.abs(worst.delta_ms))} ${verb} in ${esc(bLabel)} than in ${esc(aLabel)}.`
+        : `No single step explains the difference \u2014 it is spread across ` +
+          `${changed.length} steps, the largest being <b>${esc(friendly(worst.kind))}</b> at ` +
+          `${ms(Math.abs(worst.delta_ms))} ${verb}.`) + `</p>`;
   }
 
   function totalsTable(totals, aLabel, bLabel) {
@@ -831,7 +1082,41 @@ const VIEWS = (() => {
     $('meta').innerHTML = groups.map(([title, rows]) => (
       `<div class="meta-group"><h3>${esc(title)}</h3><dl>` +
       rows.map(([k, v]) => `<div class="meta-row"><dt>${esc(k)}</dt><dd>${esc(String(v ?? '—'))}</dd></div>`).join('') +
-      `</dl></div>`)).join('');
+      `</dl></div>`)).join('') +
+      carboniteBlock(p) + workerBlock(p);
+  }
+
+  /* What the resource manager concluded. One sentence the engine wrote about its own memory
+   * envelope, which was on every profile and displayed nowhere. */
+  function carboniteBlock(p) {
+    if (!p.carbonite_summary) return '';
+    return `<div class="meta-note"><h3>Resources</h3>` +
+      `<p>${esc(p.carbonite_summary)}</p></div>`;
+  }
+
+  /* The distributed map sub-plan.
+   *
+   * A distributed run has two operator trees: the driver's, which the plan graph draws, and
+   * the one every worker executed, summed across workers. They live in *separate* op-id
+   * spaces, which is why they are a separate table rather than merged rows in the step
+   * table — joining them would label one tree's operators with the other's numbers. Absent
+   * entirely for a single-node run, which is the common case.
+   */
+  function workerBlock(p) {
+    const ops = p.worker_ops || [];
+    if (!ops.length) return '';
+    const total = ops.reduce((s, o) => s + (o.elapsed_ms || 0), 0) || 1;
+    return `<div class="meta-note"><h3>What the workers ran</h3>` +
+      `<p class="hint">The map sub-plan every worker executed, summed across them. Its step ` +
+      `numbering is its own — these are not the steps in the graph above.</p>` +
+      CHARTS.bars(ops.map((o) => ({
+        label: friendly(o.kind),
+        value: o.elapsed_ms || 0,
+        sub: `${count(o.rows_out)} rows out` + (o.spilled ? ' · spilled' : ''),
+        tone: o.spilled ? 'serious' : '',
+      })), { format: 'ms', dense: true }) +
+      `<p class="dim">${ms(total)} of worker time across ${ops.length} step` +
+      `${ops.length === 1 ? '' : 's'}.</p></div>`;
   }
 
   /* ═══════════ system ═══════════ */
@@ -1033,15 +1318,26 @@ const VIEWS = (() => {
   /* One log line. The level is a left stripe rather than a coloured row: a wall of red text
    * is unreadable, and the stripe survives being scanned at speed. Structured fields are
    * buttons, because the value you can see is the value you want to filter by. */
-  function logLine(l, index) {
+  /* `seq` is the line's position in the *unfiltered* stream, and everything identifying is
+   * keyed on it rather than on the row's index in the current render.
+   *
+   * Two bugs come from keying on the index. A permalink copied while a filter was on
+   * pointed at whichever line happened to sit at that index next time, which is a link that
+   * quietly lies. And the context panel re-renders the same lines inside the list, so
+   * `id="L<index>"` produced duplicate element ids and `#L4` resolved to whichever came
+   * first. The context panel therefore renders without ids at all \u2014 it is a transient view,
+   * not a link target.
+   */
+  function logLine(l, index, { anchored = true } = {}) {
     const kv = Object.entries(l.fields || {}).map(([k, v]) => (
       `<button class="log-kv-item" type="button" data-field="${esc(k)}" ` +
       `data-value="${esc(String(v))}" title="Filter to ${esc(k)}=${esc(String(v))}">` +
       `<span class="log-kv-k">${esc(k)}</span>=<span class="log-kv-v">${esc(String(v))}</span>` +
       `</button>`)).join('');
     const seq = l.seq != null ? l.seq : index;
-    return `<div class="logline lvl-${esc(l.level)}" data-line="${index}" data-seq="${seq}" id="L${index}">` +
-      `<button class="log-time" type="button" data-permalink="${index}" ` +
+    return `<div class="logline lvl-${esc(l.level)}" data-seq="${seq}"` +
+      (anchored ? ` id="L${seq}"` : '') + `>` +
+      `<button class="log-time" type="button" data-permalink="${seq}" ` +
       `aria-label="Copy a link to the line logged at ${esc(clock(l.wall))}">` +
       `${esc(clock(l.wall))}</button>` +
       `<span class="log-level">${esc(l.level)}</span>` +
@@ -1053,7 +1349,7 @@ const VIEWS = (() => {
   }
 
   return { logHistogram, logLine, costliest, timeBar, health, kpis, throughput, operatorRollup, timeSplit, attention, recentTable,
-           failures, pipelineReport, runGrid,
+           failures, pipelineReport, runGrid, adaptive,
            pipelines, pipelineTable, pipelineDetail, pipelineRuns,
            verdict, statStrip, story, timeline, operators, insights, decisions,
            comparison, meta, system, card, term, OPERATOR_COLUMNS };

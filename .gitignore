@@ -33,3 +33,6 @@ docs/_static/diagrams/*.dot
 
 # Local working notes, one-off comparison scripts, and their output
 scratchpad/
+
+dist/
+wt-build.sh

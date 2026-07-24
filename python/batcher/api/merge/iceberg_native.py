@@ -23,6 +23,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError, PlanError
+from batcher._internal.logging import note_suppressed
 from batcher.api.merge.clauses import MATCHED, NOT_MATCHED, MergeClause
 from batcher.io.manifest import WriteManifest, WrittenFile
 
@@ -128,7 +129,8 @@ def _snapshot_manifest(catalog: Any, identifier: str) -> WriteManifest:
         paths = added.column("file_path").to_pylist()
         rows = added.column("record_count").to_pylist()
         sizes = added.column("file_size_in_bytes").to_pylist()
-    except Exception:
+    except Exception as exc:
+        note_suppressed("api", "read iceberg snapshot", exc)
         return WriteManifest()
     return WriteManifest(
         tuple(

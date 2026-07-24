@@ -207,4 +207,20 @@ def _worth_it(node: Join, agg: Aggregate, ctx: OptimizerContext) -> bool:
     if left_rows <= 0:
         return False
     groups = ctx.estimator.estimate(agg).rows
-    return groups / left_rows >= _MIN_GROUP_REDUCTION
+    if groups / left_rows < _MIN_GROUP_REDUCTION:
+        return False
+    # The rewrite recomputes the restricting side (`node.left`) a second time — once for the
+    # semi-join's build, once for the outer join it already fed. That is free when the side is a
+    # filtered dimension but ruinous when it is *itself* the expensive relation: on Q21 the
+    # "restricting side" is the whole `supplier ⋈ lineitem ⋈ orders ⋈ nation` spine (a 6M-row
+    # `lineitem` scan + three joins), whose second evaluation costs *more than the aggregate the
+    # semi-join is shrinking*, so the fewer-groups win it scored on cardinality alone is a net
+    # ~2x loss in wall time (measured 201 ms → 94 ms with the rule removed). The group-reduction
+    # ratio above cannot see this: it prices only how many groups drop, never what recomputing
+    # `node.left` costs to drop them. A semi-join can save at most the aggregate's own work, so
+    # once the recompute meets or exceeds `cost(agg)` the extra pass alone eats the entire
+    # possible saving — refuse. A cheap restricting side (the intended case) stays far below this
+    # and still fires. Cost-based and semantics-neutral: refusing only ever falls back to the
+    # already-correct un-pushed plan.
+    costs = ctx.costs()
+    return costs.cost(node.left).total() < costs.cost(agg).total()

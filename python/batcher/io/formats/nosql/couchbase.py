@@ -26,6 +26,7 @@ from batcher.io.formats.nosql.base import (
     offset_windows,
     require_driver,
     rows_to_batches,
+    schema_from_rows,
 )
 
 __all__ = ["CouchbaseSource"]
@@ -127,9 +128,7 @@ class CouchbaseSource(ScanSource):
         stmt = f"SELECT VALUE c FROM {self._from_clause()} c LIMIT 1"
         with _closing_cluster(self._cluster()) as cluster:
             rows = list(cluster.execute_query(stmt).rows())
-        if not rows:
-            return pa.schema([])
-        return pa.RecordBatch.from_pylist([rows[0]]).schema
+        return schema_from_rows([rows[0]] if rows else [])
 
     def _enumerate_partitions(self) -> list[_Window]:
         """Offset windows that cover the whole collection — see `offset_windows`.

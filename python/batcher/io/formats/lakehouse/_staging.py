@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from typing import Any
 
 import pyarrow as pa
 
+from batcher.io.base import _safe_size
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.manifest import WrittenFile
 
@@ -137,10 +137,3 @@ def cleanup_staging(files: list[WrittenFile], staging: str) -> None:
     if inner is not None:
         with contextlib.suppress(Exception):
             inner.delete_dir(fs._p(staging))
-
-
-def _safe_size(fs: Any, path: str) -> int:
-    try:
-        return fs.size(path)
-    except (OSError, ValueError):
-        return 0

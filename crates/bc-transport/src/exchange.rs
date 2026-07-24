@@ -109,7 +109,7 @@ impl ShuffleExchange {
         Self::bind_secured(bind, advertise_host, None).await
     }
 
-    /// Like [`Self::bind_advertised`] but requires `token` for incoming fetches (N5).
+    /// Like [`Self::bind_advertised`] but requires `token` for incoming fetches.
     pub async fn bind_secured(
         bind: &str,
         advertise_host: Option<&str>,
@@ -245,7 +245,7 @@ impl ShuffleExchange {
         Self::fetch_with_credits(addr, ticket, DEFAULT_CREDITS).await
     }
 
-    /// As [`Self::fetch_with_credits`], presenting `token` to an auth-gated peer (N5).
+    /// As [`Self::fetch_with_credits`], presenting `token` to an auth-gated peer.
     pub async fn fetch_secured(
         addr: &str,
         ticket: &ShuffleTicket,
@@ -392,7 +392,7 @@ async fn credit_exchange_inner(
     let mut pending: u32 = 0;
     let mut batches = Vec::new();
     loop {
-        // Idle timeout (C24): a hung/dead peer must not block the reducer forever.
+        // Idle timeout: a hung/dead peer must not block the reducer forever.
         // The bound is between batches, not on the whole transfer, so a large but
         // healthy partition is never cut off mid-stream. Configurable per process
         // (Carbonite); a timeout is a *retryable* fault (recompute + re-fetch).
@@ -405,7 +405,7 @@ async fn credit_exchange_inner(
         let Some(batch) = batch else { break };
         batches.push(batch);
         // A slot freed. Grant back in bulk once we've drained the low watermark. Use
-        // `send().await` rather than `try_send` (C28) so a momentarily-full control
+        // `send().await` rather than `try_send` so a momentarily-full control
         // channel never *drops* a grant — a dropped grant would stall the credit-gated
         // producer. A closed channel means the producer already finished; benign.
         pending += 1;
@@ -541,7 +541,7 @@ impl ClientPool {
     ///
     /// If the cached connections are stale (the peer restarted), the first attempt
     /// fails with a transport/connect error; the peer's pool is then reset and the
-    /// fetch is retried once on a fresh connection (C49). A `NotFound` (empty bucket)
+    /// fetch is retried once on a fresh connection. A `NotFound` (empty bucket)
     /// is not a connection fault and is returned as-is.
     pub async fn fetch_with_credits(
         &self,
@@ -552,7 +552,7 @@ impl ClientPool {
         self.fetch_secured(addr, ticket, credits, None).await
     }
 
-    /// As [`Self::fetch_with_credits`], presenting `token` to an auth-gated peer (N5).
+    /// As [`Self::fetch_with_credits`], presenting `token` to an auth-gated peer.
     pub async fn fetch_secured(
         &self,
         addr: &str,

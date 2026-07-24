@@ -210,20 +210,72 @@ bt.start_ui()                    # returns 'http://127.0.0.1:4040'
 bt.start_ui(port=8080, open_browser=True)
 ```
 
-The dashboard shows:
+The dashboard is a drill-down: every pipeline, then one pipeline, then one run.
 
-- **Summary tiles**: queries run, how many are in flight, aggregate throughput, median
-  latency, and failures.
-- **Query list**: every recent query, live, with status and elapsed time.
-- **Timeline**: one bar per operator, on a shared scale, so the expensive operator is
-  the obvious one. Spilled operators are called out. A table view carries the same
-  numbers for copying or for a screen reader.
-- **Plan DAG**: the executed plan, annotated with rows out, elapsed time, and the
-  estimate Kyber planned for. Hovering an operator shows actual against estimate, the
-  single most useful number when a query is slow for a reason the plan did not predict.
-- **Decisions**: what Kyber and Carbonite chose and why, covering join order, build side,
-  pushdown, and spill verdicts.
-- **Logs**: the live stream, filterable by level and by text.
+- **Pipelines**: every distinct query shape, one lane each. A lane is led by a thumbnail
+  of the pipeline's plan, so you recognize a pipeline by its *shape* before you read its
+  name. Re-running a query builds a baseline rather than a pile of unrelated entries, so
+  "was this run slow?" has an answer.
+- **One pipeline**: how it behaves over time, its step history as a matrix of runs
+  against steps, and what holds true across all of its runs rather than in one.
+- **One run**: five renderings of the same per-step data, plus the plan as a document.
+
+### What a pipeline is
+
+A *pipeline* is every run of one plan shape. Its identity is the *plan signature* — the
+same fingerprint Kyber keys learned statistics on, so "the dashboard's pipeline" and "the
+thing the optimizer learned about" are the same thing. Two runs over different data share a
+pipeline; a structurally different query starts a new one.
+
+Each pipeline has an **id** (that signature, shown as `#` and the first characters, copyable
+in full) and a **name**. Until you name it, the name is generated from the plan shape —
+`Read → Filter → Join → Group` — which is more telling than the raw operator tag. Click the
+pencil on a lane, or on the pipeline page heading, to give it a real name such as `nightly
+rollup`, and a note beside it.
+
+A name is the one thing about a pipeline that outlives the process. It is written to
+`$BATCHER_HOME/pipelines.json` (default `~/.batcher/pipelines.json`), so a pipeline you
+named is still named after a restart. Everything else on the dashboard is a measurement
+that ages out of memory; the name is a fact about the pipeline as a thing you return to.
+
+Within a run, **Steps** offers the plan graph, the pipeline stages, a flame view, a
+ranked list, and a sortable table. Each is annotated with rows out, elapsed time, spill
+volume, and the estimate Kyber planned for. Actual against estimate is the single most
+useful number when a query is slow for a reason the plan did not predict.
+
+**Query** shows the plan as a document, in three forms:
+
+- **Explain**: the plan as a text tree, annotated with what each step measured. Toggle
+  "Show the plan as written" to see the plan before the optimizer touched it.
+- **What the optimizer changed**: the two plans compared. A pushdown is reported as one
+  rewrite, with the steps it dragged past it listed separately rather than as four equal
+  findings. This has no direct equivalent in other engines' UIs, which show one plan at
+  a time.
+- **Plan document**: the exact JSON IR that crossed into the Rust engine, for when the
+  rendering is the thing under suspicion.
+
+**Findings** carries what the engine concluded: the per-run insights, the optimizer and
+resource-manager decisions, and any **adaptive re-optimization** — the points where the
+engine had counted the rows rather than estimated them and re-planned what was left.
+
+**Live** is the forward-looking page, for work measured in minutes rather than
+milliseconds: partition progress with a real denominator where the engine reports one,
+per-device GPU utilization and VRAM against their target bands, inference throughput and
+blocked time, actor-pool size, and any rows dropped under `on_read_error="skip"`.
+
+**Logs** is the live stream, with a volume histogram you can drag a time window out of,
+level and regex filtering, structured-field filters, and per-line permalinks.
+
+```{note}
+Nothing on the dashboard is inferred. A run with no measured step timings shows no
+timings rather than zeroes, a partition count with no reported total shows no percentage,
+and there is no Gantt chart of operator start times because the engine records how long
+each operator took, not when it began.
+```
+
+New to the dashboard, or arriving from another engine? The **Learn** page maps the panel
+you already know — a Spark UI tab, an Airflow view, a DuckDB `EXPLAIN` — to its
+equivalent here.
 
 `start_ui` is idempotent. Calling it again returns the URL of the dashboard already
 running rather than binding a second port. Ask for that URL at any time with `bt.ui_url()`,
@@ -298,8 +350,25 @@ from batcher.observe import metrics_snapshot
 
 snap = metrics_snapshot()
 print(sorted(snap))
-# ['bytes', 'logs', 'operators', 'queries', 'rows', 'spills', 'uptime_seconds']
+# ['bytes', 'gpu', 'inference', 'logs', 'operators', 'partitions', 'queries', 'rows',
+#  'skipped', 'spills', 'uptime_seconds']
 ```
+
+The last four fill in only for work that reports them: `partitions` and `skipped` for a
+distributed read, `inference` and `gpu` for a batch-inference pass. A single-node
+relational query leaves them at zero rather than absent, so a scraper never has to handle
+a changing key set.
+
+If the dashboard is already running, the same counters are served from it, so a scrape
+loop needs no code of yours at all:
+
+```bash
+curl -s http://127.0.0.1:4040/metrics        # Prometheus text exposition
+curl -s http://127.0.0.1:4040/api/metrics    # the same numbers as JSON
+```
+
+The whole read-only API lists itself at `/api`, and every route there is a `GET` over what
+the dashboard is showing.
 
 Counters are cumulative from the moment collection starts, the convention every metrics
 backend expects, so a scrape loop differences successive snapshots to get rates. Collecting

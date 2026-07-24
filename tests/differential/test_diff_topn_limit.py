@@ -14,7 +14,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.topn_limit
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 
 
 def _tbl(n=5):
@@ -62,7 +62,7 @@ def test_push_limit_through_row_index(duck):
     t = _tbl(6)
     duck.register("tr", t)
     out = bt.from_arrow(t).sort("k").with_row_index("idx").limit(3).collect()
-    assert_same(
+    assert_same_ordered(
         out,
         duck.sql(
             "SELECT k, v, idx FROM ("
@@ -77,7 +77,7 @@ def test_push_limit_through_row_index_with_offset(duck):
     duck.register("tr2", t)
     out = bt.from_arrow(t).sort("k").with_row_index("idx", offset=10).limit(2, offset=1).collect()
     # idx = 10 + row-position; the window [offset 1, +2) is the 2nd and 3rd sorted rows.
-    assert_same(
+    assert_same_ordered(
         out,
         duck.sql(
             "SELECT k, v, idx FROM ("

@@ -50,7 +50,7 @@ test: check test-rust build test-py cov-gate
 # Format + lint.
 fmt:
     cargo fmt --all
-    cargo clippy --workspace --exclude bc-py -- -D warnings
+    cargo clippy --workspace --exclude bc-py --all-targets -- -D warnings
 
 # Lint + format-check the Python control plane (ruff).
 lint-py:
@@ -112,6 +112,13 @@ lint-duplication:
 # worse than none — the agent invents a new home for the code instead.
 lint-guardrails:
     python tools/lint_guardrails.py
+
+# Codebase-health report: dead code, near-duplicates, swallowed errors, do-nothing bodies,
+# tests that cannot fail, and ordered results asserted order-independently. A *report*, not a
+# gate — every detector is a heuristic, so the output is triage. Drives the
+# `audit-codebase-health` skill; run it periodically, and compare the scorecard to last time.
+audit-health args="":
+    python tools/audit_health.py {{args}}
 
 # Public-API docstring style: one-line summary, `.. doctest::` examples, typeless
 # Args/Returns. Needs the engine built (it introspects the live objects). The

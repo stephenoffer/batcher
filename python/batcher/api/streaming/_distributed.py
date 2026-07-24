@@ -18,10 +18,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.api.streaming._query import (
-    _ACTIVE,
-    _LOCK,
     StreamingQuery,
+    _deregister,
     _next_name,
+    _register,
     _warn_if_checkpoint_not_durable,
 )
 from batcher.plan.streaming import (
@@ -121,9 +121,12 @@ def start_distributed_stream(
         runner_factory=make_runner,
     )
     query = StreamingQuery(query_name, engine)
-    with _LOCK:
-        _ACTIVE[query_name] = query
-    engine.start()
+    _register(query_name, query)
+    try:
+        engine.start()
+    except BaseException:
+        _deregister(query_name)
+        raise
     return query
 
 
@@ -224,8 +227,7 @@ def start_distributed_stream_drain(
     )
     query_name = name or _next_name()
     query = StreamingQuery(query_name, _DrainEngine(progress))  # type: ignore[arg-type]
-    with _LOCK:
-        _ACTIVE[query_name] = query
+    _register(query_name, query)
     return query
 
 

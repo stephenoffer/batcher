@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
+
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
 
@@ -64,7 +66,8 @@ def record_batch_size(hub: MetadataHub | None, signature: str | None, size: int)
         new = float(size)
         smoothed = new if prior is None else alpha * new + (1.0 - alpha) * float(prior)
         hub.put_keyed_param(_LEARN_NS, signature, {"size": smoothed})
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("ml", "record autobatch size", exc)
         return
 
 
@@ -94,6 +97,7 @@ class ThroughputController:
         grow: float = 1.5,
         shrink: float = 0.7,
         plateau_ratio: float = 1.02,
+        stale_limit: int = 8,
         hub: MetadataHub | None = None,
         signature: str | None = None,
     ) -> None:
@@ -107,6 +111,8 @@ class ThroughputController:
         self._grow = grow
         self._shrink = shrink
         self._plateau = plateau_ratio
+        self._stale_limit = max(1, stale_limit)
+        self._stale = 0
         self._hub = hub
         self._signature = signature
         # Warm-start the climb from the learned plateau when one exists (clamped to bounds).
@@ -131,6 +137,7 @@ class ThroughputController:
 
         improving = self._best_throughput is None or t > self._best_throughput * self._plateau
         if improving:
+            self._stale = 0
             self._best_throughput = t
             self._best_size = self._cur
             # Persist the new plateau so the next run warm-starts here (best-effort, no-op
@@ -145,8 +152,19 @@ class ThroughputController:
             if vram_fraction is None or vram_fraction * self._grow <= self._vram_cap:
                 self._cur = min(float(self._max), self._cur * self._grow)
         elif self._best_size is not None:
-            # Plateaued or regressed: settle back at the best size observed.
-            self._cur = self._best_size
+            # Plateaued or regressed: settle back at the best size observed. But a *durable*
+            # regression (a co-tenant landed, sequences got longer, a slower shard) makes
+            # that stale optimum unreachable forever — `improving` can never fire again
+            # against a `best` the environment no longer supports. After `stale_limit`
+            # consecutive non-improving observations, forget the plateau and re-explore
+            # from the current size so the controller can find the new optimum.
+            self._stale += 1
+            if self._stale >= self._stale_limit:
+                self._stale = 0
+                self._best_throughput = None
+                self._best_size = None
+            else:
+                self._cur = self._best_size
         return self.current()
 
     def current(self) -> int:

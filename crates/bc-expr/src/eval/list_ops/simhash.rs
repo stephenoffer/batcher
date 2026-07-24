@@ -142,7 +142,8 @@ pub(crate) fn eval_list_simhash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Builder, Int64Array, ListBuilder as LB};
+    use arrow::array::{AsArray, Float64Builder, ListBuilder as LB};
+    use arrow::datatypes::Int64Type;
 
     fn list_of(rows: &[Option<Vec<f64>>]) -> ArrayRef {
         let mut b = LB::new(Float64Builder::new());
@@ -161,12 +162,12 @@ mod tests {
     }
 
     fn signature(out: &ArrayRef, row: usize) -> Option<Vec<i64>> {
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         if list.is_null(row) {
             return None;
         }
         let v = list.value(row);
-        let v = v.as_any().downcast_ref::<Int64Array>().unwrap();
+        let v = v.as_primitive::<Int64Type>();
         Some((0..v.len()).map(|i| v.value(i)).collect())
     }
 

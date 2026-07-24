@@ -12,7 +12,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.adaptive_meta  # registers the rules into DEFAULT_REGISTRY
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 
@@ -72,7 +72,7 @@ def test_filter_sort_over_empty_source(duck):
     empty = pa.table({"x": pa.array([], pa.int64()), "y": pa.array([], pa.int64())})
     ds = _reg(duck, "e1", empty)
     out = ds.filter(col("x") > 1).sort("x").collect()
-    assert_same(out, duck.sql("SELECT * FROM e1 WHERE x > 1 ORDER BY x"))
+    assert_same_ordered(out, duck.sql("SELECT * FROM e1 WHERE x > 1 ORDER BY x"))
 
 
 def test_distinct_over_empty_source(duck):

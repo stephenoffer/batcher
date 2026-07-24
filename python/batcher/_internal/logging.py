@@ -28,6 +28,7 @@ __all__ = [
     "get_logger",
     "log_kv",
     "native_tracing_settings",
+    "note_suppressed",
     "suppress_console_handler",
 ]
 
@@ -66,6 +67,34 @@ def log_kv(logger: logging.Logger, level: int, msg: str, /, **fields: object) ->
     """
     if logger.isEnabledFor(level):
         logger.log(level, msg, extra={_FIELDS_ATTR: fields})
+
+
+def note_suppressed(subsystem: str, step: str, exc: BaseException) -> None:
+    """Record a failure on a best-effort path that is deliberately not propagated.
+
+    Several paths here must never break a query when they fail: persisting learned stats,
+    reading a footer to prune a file, probing for a GPU, cleaning up a temp directory. That
+    decision is right. Writing it as ``except Exception: pass`` is not — it makes the
+    difference between "this optimization did not apply" and "this optimization has been
+    broken since March" unobservable, and the learned-stats loop is the thing that is
+    supposed to make plans improve across runs.
+
+    DEBUG level, because a best-effort failure is not the user's problem; but it is on the
+    record for whoever asks why the plans stopped improving.
+
+    Args:
+        subsystem: The `batcher.<name>` logger to record on, e.g. ``"kyber"``.
+        step: A short, stable name for what was attempted, e.g. ``"persist row-count"``.
+        exc: The exception being suppressed.
+    """
+    log_kv(
+        get_logger(subsystem),
+        logging.DEBUG,
+        "best-effort step failed",
+        step=step,
+        error=type(exc).__name__,
+        detail=str(exc),
+    )
 
 
 def ensure_configured() -> None:

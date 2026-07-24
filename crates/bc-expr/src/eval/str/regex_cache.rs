@@ -16,9 +16,21 @@
 //! cannot hand back an automaton built from a different pattern. `None` records a
 //! *known-invalid* pattern, so a bad regex costs one failed parse rather than one per morsel.
 //!
+//! **Each thread gets its own handle to that automaton, not a shared one.** A `regex::Regex`
+//! carries an internal pool of mutable scratch space for the match engines, and past a handful
+//! of concurrent users that pool falls off its lock-free path onto a mutex — so one `Regex`
+//! shared by every worker turns a per-row match into a contended critical section. It does not
+//! merely stop scaling, it *inverts*: a `REGEXP_REPLACE` over 921 k rows measured 1170 ms on
+//! one core, 208 ms on eight, and **318 ms on 92** — the extra 84 cores made it slower. Cloning
+//! a compiled `Regex` shares the program behind an `Arc` and allocates a fresh pool, which is
+//! what the crate recommends for exactly this, and is orders of magnitude cheaper than
+//! re-parsing. So the process-wide map memoizes the *compile*, and a thread-local map hands each
+//! worker its own clone.
+//!
 //! This changes throughput only: a cached `Regex` matches exactly what a freshly-compiled one
-//! does, so the interpreter stays the oracle.
+//! does, and a clone matches what it was cloned from, so the interpreter stays the oracle.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -37,11 +49,37 @@ fn cache() -> &'static RwLock<HashMap<String, Entry>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// `Regex::new(source)`, memoized. `None` means the source does not compile.
+thread_local! {
+    /// This thread's own clones of the shared automata — see the module note on pool contention.
+    static LOCAL: RefCell<HashMap<String, Entry>> = RefCell::new(HashMap::new());
+}
+
+/// `Regex::new(source)`, memoized, returning a handle **owned by the calling thread**.
 ///
 /// Callers map `None` onto their own error (`ExprError::InvalidRegex`) so the message can name
 /// the *user's* pattern rather than the desugared source a `LIKE` produces.
 pub(super) fn compile_cached(source: &str) -> Entry {
+    if let Some(hit) = LOCAL.with(|m| m.borrow().get(source).cloned()) {
+        return hit;
+    }
+    // Cloning is what makes the handle this thread's own: it shares the compiled program and
+    // takes a fresh scratch pool. `None` (an invalid pattern) is remembered per thread too, so a
+    // bad regex still costs one failed parse rather than one per morsel.
+    let local = compile_shared(source).map(|re| Arc::new((*re).clone()));
+    LOCAL.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded exactly as the shared map is, and for the same reason.
+        if m.len() >= MAX_ENTRIES {
+            m.clear();
+        }
+        m.insert(source.to_string(), local.clone());
+    });
+    local
+}
+
+/// The process-wide memo of *compiled* automata. Every thread's clone comes from here, so a
+/// pattern is parsed once per process rather than once per thread.
+fn compile_shared(source: &str) -> Entry {
     if let Ok(map) = cache().read() {
         if let Some(hit) = map.get(source) {
             return hit.clone();

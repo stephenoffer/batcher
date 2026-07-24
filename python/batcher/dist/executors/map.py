@@ -27,7 +27,7 @@ from collections import deque
 import pyarrow as pa
 
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
-from batcher._internal.logging import get_logger
+from batcher._internal.logging import get_logger, note_suppressed
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
@@ -668,8 +668,8 @@ def _placeable_node_cores() -> float:
         cores = [c for c in cores if c > 0]
         if cores:
             return float(int(min(cores)))
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("dist", "read cluster node CPU counts", exc)
     return float(available_cpu_count())
 
 

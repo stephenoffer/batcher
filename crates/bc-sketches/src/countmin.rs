@@ -82,10 +82,55 @@ impl CountMinSketch {
         self.estimate_hash(hash_one(key))
     }
 
-    /// Whether a key's estimated frequency exceeds `fraction · N` — the test for
-    /// "this key is skewed enough to salt".
+    /// A **debiased** frequency estimate — the count-mean-min estimator.
+    ///
+    /// `estimate` takes the minimum across rows, which is an upper bound and never
+    /// under-counts, but it is biased *high*: every cell holds the key's own count plus the
+    /// counts of every other key that collided into it. The expected collision noise in one
+    /// cell of a row is `(N - c) / (w - 1)` — the rest of the stream spread over the row's
+    /// other counters — so subtracting it from each row's reading and taking the median of
+    /// those corrected readings removes most of the bias while staying robust to the one or
+    /// two rows that collided with something enormous.
+    ///
+    /// Clamped into `[0, estimate]`: the min stays a hard upper bound (it is a true one), and
+    /// a negative reading means the noise model over-explained the cell, which is evidence of
+    /// a rare key, not of a negative frequency.
+    ///
+    /// This is what a *decision* should read. The raw minimum is what a caller needing the
+    /// guaranteed no-under-count bound should read.
+    pub fn estimate_debiased_hash(&self, hash: u64) -> f64 {
+        let upper = self.estimate_hash(hash) as f64;
+        if self.width < 2 || self.total == 0 {
+            return upper;
+        }
+        let noise_divisor = (self.width - 1) as f64;
+        let mut corrected: Vec<f64> = (0..self.depth)
+            .map(|row| {
+                let cell = self.counts[self.index(hash, row)] as f64;
+                cell - (self.total as f64 - cell) / noise_divisor
+            })
+            .collect();
+        corrected.sort_by(|a, b| a.partial_cmp(b).expect("counts are finite"));
+        let mid = corrected.len() / 2;
+        let median = if corrected.len() % 2 == 0 {
+            (corrected[mid - 1] + corrected[mid]) / 2.0
+        } else {
+            corrected[mid]
+        };
+        median.clamp(0.0, upper)
+    }
+
+    /// Whether a key's frequency exceeds `fraction · N` — the test for "this key is skewed
+    /// enough to salt".
+    ///
+    /// Reads the debiased estimate, not the raw minimum. The distinction matters because the
+    /// minimum's bias is proportional to `N/w`, so on a wide stream every key looks a little
+    /// hot: with `w = 2718` (ε = 0.001) and a 1% heaviness threshold, the collision noise
+    /// alone is ~4% of the threshold, and it is *systematic* — it pushes keys over the line in
+    /// one direction only. Salting a key that is not actually hot costs a real fan-out of the
+    /// shuffle for no benefit, which is the failure this correction removes.
     pub fn is_heavy<T: Hash + ?Sized>(&self, key: &T, fraction: f64) -> bool {
-        self.total > 0 && (self.estimate(key) as f64) > fraction * self.total as f64
+        self.total > 0 && self.estimate_debiased_hash(hash_one(key)) > fraction * self.total as f64
     }
 
     /// Serialize to a byte blob. Layout (all little-endian):
@@ -322,5 +367,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The debiased estimator must beat the raw minimum on a stream with heavy collision
+    /// noise, and must never claim more than the minimum (which is a true upper bound).
+    #[test]
+    fn debiasing_removes_the_collision_inflation() {
+        // A narrow sketch over many distinct keys: every cell collects real noise.
+        let mut cm = CountMinSketch::new(64, 5);
+        for i in 0..20_000u64 {
+            cm.add(&i);
+        }
+        let (mut min_err, mut debiased_err) = (0.0f64, 0.0f64);
+        for i in 0..2_000u64 {
+            let truth = 1.0;
+            min_err += cm.estimate(&i) as f64 - truth;
+            debiased_err += (cm.estimate_debiased_hash(hash_one(&i)) - truth).abs();
+            assert!(
+                cm.estimate_debiased_hash(hash_one(&i)) <= cm.estimate(&i) as f64,
+                "the debiased estimate must not exceed the guaranteed upper bound"
+            );
+        }
+        assert!(
+            debiased_err < min_err / 4.0,
+            "debiased total error {debiased_err} should be far below the raw minimum's {min_err}"
+        );
+    }
+
+    /// A genuinely hot key must still be found — debiasing removes noise, not signal.
+    #[test]
+    fn a_hot_key_is_still_heavy_after_debiasing() {
+        let mut cm = CountMinSketch::with_error(0.001, 0.01);
+        for i in 0..100_000u64 {
+            cm.add(&i);
+        }
+        for _ in 0..50_000 {
+            cm.add(&"hot");
+        }
+        assert!(
+            cm.is_heavy(&"hot", 0.1),
+            "a key at 33% of the stream is heavy"
+        );
+        assert!(!cm.is_heavy(&7u64, 0.01), "a singleton key is not heavy");
+    }
+
+    /// An empty sketch has no heavy keys and no negative estimates.
+    #[test]
+    fn empty_sketch_has_no_heavy_keys() {
+        let cm = CountMinSketch::new(64, 4);
+        assert!(!cm.is_heavy(&1u64, 0.0));
+        assert_eq!(cm.estimate_debiased_hash(hash_one(&1u64)), 0.0);
     }
 }

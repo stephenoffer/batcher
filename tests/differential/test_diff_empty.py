@@ -11,7 +11,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col, count
 
 _SCHEMA = pa.schema([("dept", pa.string()), ("salary", pa.int64()), ("bonus", pa.float64())])
@@ -70,4 +70,4 @@ def test_empty_distinct_sort_limit_vs_duckdb(duck):
     duck.register("t", t)
     out = bt.from_arrow(t).select("dept", "salary").distinct().sort("salary").limit(5).collect()
     expected = duck.sql("SELECT DISTINCT dept, salary FROM t ORDER BY salary LIMIT 5")
-    assert_same(out, expected)
+    assert_same_ordered(out, expected)

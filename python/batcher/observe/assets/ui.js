@@ -95,6 +95,10 @@ const UI = (() => {
   }
 
   function duration(secs) {
+    // A clock skew or a not-yet-started run can hand this a negative or a NaN, and both
+    // reach the page as a duration a reader will try to interpret ("-3s left").
+    if (secs == null || !Number.isFinite(secs) || secs < 0) return '—';
+    if (secs < 1) return '<1s';
     if (secs < 60) return `${Math.round(secs)}s`;
     if (secs < 3600) return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
     return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
@@ -541,7 +545,6 @@ const UI = (() => {
     const body = panel.querySelector('.panel-body, .scroll-x');
     const id = panel.dataset.panel;
     if (!head || !body || !id) return;
-    const key = `collapsed:${id}`;
     const apply = (on) => {
       body.hidden = on;
       panel.classList.toggle('is-collapsed', on);
@@ -562,7 +565,6 @@ const UI = (() => {
         e.preventDefault(); toggle();
       }
     });
-    void key;
   }
 
   /* ---------- misc ---------- */

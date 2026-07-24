@@ -116,10 +116,13 @@ def test_a_key_reference_is_stored_verbatim_and_not_validated(ref):
 
 
 def test_a_reference_does_not_warn():
+    """A key given by reference is never embedded, so there is nothing to warn about."""
     with warnings.catch_warnings():
         warnings.simplefilter("error", SecurityWarning)
-        bt.aes_encrypt(bt.col("x"), "env:MY_KEY")
-        bt.hmac_sha256(bt.col("x"), "file:/k")
+        encrypted = bt.aes_encrypt(bt.col("x"), "env:MY_KEY")
+        signed = bt.hmac_sha256(bt.col("x"), "file:/k")
+    assert encrypted.to_ir()["pattern"] == "env:MY_KEY"
+    assert signed.to_ir()["pattern"] == "file:/k"
 
 
 def test_an_inline_literal_warns_that_it_is_embedded():

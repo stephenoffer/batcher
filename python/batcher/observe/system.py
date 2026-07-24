@@ -108,10 +108,10 @@ def _engine() -> dict[str, Any]:
     # depend on all of them — the exact edge the `observe is a neutral sink layer` contract
     # exists to forbid, and one the import graph does catch.
     try:
-        from importlib.metadata import version
+        from importlib.metadata import PackageNotFoundError, version
 
         info["version"] = version("batcher-engine")
-    except Exception:  # pragma: no cover - running from a source tree, not an install
+    except PackageNotFoundError:  # pragma: no cover - running from a source tree
         pass
     # Through `_internal.native`, never `batcher._native` and never `api.session` — the
     # first would forge a phantom import cycle, the second would reach up two layers.

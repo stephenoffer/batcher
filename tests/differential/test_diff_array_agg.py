@@ -95,11 +95,7 @@ def test_array_agg_over_filtered_to_empty_is_null(duck):
     tbl = pa.table({"v": pa.array([1, 2, 3], type=pa.int64())})
     duck.register("f", tbl)
     got = (
-        bt.from_arrow(tbl)
-        .filter(col("v") > 100)
-        .agg(a=col("v").array_agg())
-        .collect()
-        .to_pylist()
+        bt.from_arrow(tbl).filter(col("v") > 100).agg(a=col("v").array_agg()).collect().to_pylist()
     )
     exp = duck.sql("SELECT array_agg(v) a FROM f WHERE v > 100").to_arrow_table().to_pylist()
     assert got == exp == [{"a": None}]

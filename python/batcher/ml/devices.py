@@ -39,6 +39,14 @@ _DEVICE_BACKENDS = {
     "xpu": "xpu",
     "tpu": "tpu",
     "xla": "tpu",
+    # AWS Trainium/Inferentia (torch-neuronx → XLA) and Intel Gaudi (habana → hpu):
+    # `torch_device` already maps these backends, so let a user name them explicitly
+    # rather than only reaching them through auto-detection.
+    "neuron": "neuron",
+    "trainium": "neuron",
+    "inferentia": "neuron",
+    "hpu": "hpu",
+    "gaudi": "hpu",
 }
 
 #: Canonical torch dtype names, plus the abbreviations the ecosystem uses
@@ -62,6 +70,14 @@ _DTYPE_ALIASES = {
     "long": "int64",
     "uint8": "uint8",
     "bool": "bool",
+    # FP8 for H100/L40S serving — the memory/throughput tier the hardware layer already
+    # detects (`gpu.recommend_quantization`) but that the dtype surface could not name.
+    "fp8": "float8_e4m3fn",
+    "float8": "float8_e4m3fn",
+    "float8_e4m3fn": "float8_e4m3fn",
+    "e4m3": "float8_e4m3fn",
+    "float8_e5m2": "float8_e5m2",
+    "e5m2": "float8_e5m2",
 }
 
 
@@ -218,13 +234,19 @@ def default_dtype(device: str | None = None) -> str:
 
     Half precision roughly doubles inference throughput and halves memory on a GPU with
     negligible accuracy loss for most models, while CPU kernels are typically slower in
-    ``float16`` than ``float32``, so the default follows the device.
+    ``float16`` than ``float32``, so the default follows the device. On an accelerator the
+    *kind* of half comes from `recommend_inference_dtype`, so an Ampere-or-newer GPU gets
+    ``"bfloat16"`` — whose FP32 exponent range does not overflow/underflow the activations
+    that FP16's narrow exponent can — rather than the blanket ``"float16"`` this used to
+    return, which disagreed with the rest of the accelerator layer and was a silent
+    numerical-stability regression on exactly the GPUs most training runs use.
 
     Args:
         device: The target device (detected when ``None``).
 
     Returns:
-        ``"float16"`` on an accelerator, ``"float32"`` on CPU.
+        ``"bfloat16"`` on an Ampere+ accelerator, ``"float16"`` on an older one, and
+        ``"float32"`` on CPU.
 
     Examples:
         .. doctest::
@@ -234,7 +256,12 @@ def default_dtype(device: str | None = None) -> str:
             'float32'
     """
     resolved = resolve_device(device if device is not None else "auto")
-    return "float32" if resolved == "cpu" else "float16"
+    if resolved == "cpu":
+        return "float32"
+    from batcher.ml.gpu import detect_backend, recommend_inference_dtype
+
+    # `recommend_inference_dtype` returns None when half gives no benefit; fall back to fp16.
+    return recommend_inference_dtype(detect_backend()) or "float16"
 
 
 def default_batch_size(*, device: str | None = None) -> int:

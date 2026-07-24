@@ -345,8 +345,8 @@ mod tests {
         ];
         for call in cases {
             let f = [call];
-            let par = window_with(&[part.clone()], &order, &f, n, 1).unwrap();
-            let ser = window_serial(&[part.clone()], &order, &f, n).unwrap();
+            let par = window_with(std::slice::from_ref(&part), &order, &f, n, 1).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &order, &f, n).unwrap();
             assert_eq!(par[0].as_ref(), ser[0].as_ref(), "{:?}", f[0].func);
         }
     }

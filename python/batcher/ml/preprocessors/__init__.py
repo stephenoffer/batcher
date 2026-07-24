@@ -17,15 +17,37 @@ from __future__ import annotations
 from batcher.ml.preprocessors.base import Preprocessor
 from batcher.ml.preprocessors.binning import KBinsDiscretizer
 from batcher.ml.preprocessors.chain import Chain
+from batcher.ml.preprocessors.derived import (
+    PCA,
+    Binarizer,
+    ColumnDropper,
+    ColumnSelector,
+    GroupImputer,
+    GroupStatEncoder,
+    InteractionFeatures,
+    LabelBinarizer,
+    MultiLabelBinarizer,
+    RankTransformer,
+    RatioFeatures,
+    TruncatedSVD,
+    VarianceThreshold,
+)
 from batcher.ml.preprocessors.encoders import (
+    BinaryEncoder,
+    FrequencyEncoder,
+    HashingEncoder,
     LabelEncoder,
     MultiHotEncoder,
     OneHotEncoder,
     OrdinalEncoder,
+    RareCategoryEncoder,
     TargetEncoder,
+    WOEEncoder,
 )
 from batcher.ml.preprocessors.imputers import SimpleImputer
+from batcher.ml.preprocessors.persistence import from_dict, load, save, to_dict
 from batcher.ml.preprocessors.polynomial import PolynomialFeatures
+from batcher.ml.preprocessors.power import BoxCoxTransformer, PowerTransformer
 from batcher.ml.preprocessors.scalers import (
     MaxAbsScaler,
     MinMaxScaler,
@@ -34,23 +56,69 @@ from batcher.ml.preprocessors.scalers import (
     StandardScaler,
 )
 from batcher.ml.preprocessors.text import Concatenator, Tokenizer
+from batcher.ml.preprocessors.text_features import TextStatFeaturizer
+from batcher.ml.preprocessors.timeseries import (
+    CyclicalEncoder,
+    DateTimeFeaturizer,
+    LagFeaturizer,
+    RollingFeaturizer,
+)
+from batcher.ml.preprocessors.transforms import (
+    Clipper,
+    LogTransformer,
+    MissingIndicator,
+    QuantileTransformer,
+)
 
 __all__ = [
+    "PCA",
+    "Binarizer",
+    "BinaryEncoder",
+    "BoxCoxTransformer",
     "Chain",
+    "Clipper",
+    "ColumnDropper",
+    "ColumnSelector",
     "Concatenator",
+    "CyclicalEncoder",
+    "DateTimeFeaturizer",
+    "FrequencyEncoder",
+    "GroupImputer",
+    "GroupStatEncoder",
+    "HashingEncoder",
+    "InteractionFeatures",
     "KBinsDiscretizer",
+    "LabelBinarizer",
     "LabelEncoder",
+    "LagFeaturizer",
+    "LogTransformer",
     "MaxAbsScaler",
     "MinMaxScaler",
+    "MissingIndicator",
     "MultiHotEncoder",
+    "MultiLabelBinarizer",
     "Normalizer",
     "OneHotEncoder",
     "OrdinalEncoder",
     "PolynomialFeatures",
+    "PowerTransformer",
     "Preprocessor",
+    "QuantileTransformer",
+    "RankTransformer",
+    "RareCategoryEncoder",
+    "RatioFeatures",
     "RobustScaler",
+    "RollingFeaturizer",
     "SimpleImputer",
     "StandardScaler",
     "TargetEncoder",
+    "TextStatFeaturizer",
     "Tokenizer",
+    "TruncatedSVD",
+    "VarianceThreshold",
+    "WOEEncoder",
+    "from_dict",
+    "load",
+    "save",
+    "to_dict",
 ]

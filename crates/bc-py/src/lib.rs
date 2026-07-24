@@ -194,12 +194,33 @@ fn prepare_exec(
     if cfg.memory_budget_bytes > 0 {
         opts.pool = Some(shared_memory_pool(cfg.memory_budget_bytes));
     }
-    let streaming = use_streaming(&cfg);
     let budget = stream_budget(&cfg);
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
         .map(|relation| relation.into_iter().map(|b| b.0).collect())
         .collect();
+    // Use the streaming executor when configured — except for a plan it cannot spread across
+    // cores whose input is small enough that the faster materializing executor is safe.
+    //
+    // A self-join / correlated subquery (a source scanned more than once) makes the streaming
+    // executor fall to its single-threaded sequential pipeline, where the joins probe one morsel
+    // at a time; the materializing executor partitions the probe across every core instead
+    // (TPC-H q21 measured 251 ms streaming vs 92 ms materializing at sf1). Streaming's own value
+    // on such a plan is bounded *intermediate* memory — the join outputs it never holds in full —
+    // so it can only be given up when those intermediates cannot approach the envelope. The
+    // guard is the input footprint: with the input at well under the budget, a few× blow-up
+    // still fits, and the materializing executor's breakers spill on top of that; a large input
+    // keeps the bounded streaming path. Correctness is identical either way (both executors are
+    // checked against the sequential oracle) — this trades only memory headroom for speed.
+    let src_bytes: usize = sources
+        .iter()
+        .flatten()
+        .map(|b| b.get_array_memory_size())
+        .sum();
+    let materialize_is_safe_and_faster = !bc_interp::streaming_parallelizes(&plan)
+        && budget > 0
+        && src_bytes.saturating_mul(8) < budget;
+    let streaming = use_streaming(&cfg) && !materialize_is_safe_and_faster;
     // Record pre-widening source widths *before* normalization (which widens them
     // away), and only when output re-narrowing is requested; an empty map makes
     // `narrow_output` a no-op (the default fast path).

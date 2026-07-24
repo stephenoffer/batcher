@@ -282,6 +282,10 @@ mod fuzz_tests {
         }
     }
 
+    /// One matched row as `((left key col a, col b), (right key col a, col b))`, with
+    /// `None` standing for the unmatched side of an outer join.
+    type KeyPair2 = ((Option<i64>, Option<i64>), (Option<i64>, Option<i64>));
+
     /// Reconstruct value pairs for a two-column i64 key.
     fn value_pairs_i64x2(
         idx: &crate::join::JoinIndices,
@@ -289,7 +293,7 @@ mod fuzz_tests {
         lb: &[Option<i64>],
         ra: &[Option<i64>],
         rb: &[Option<i64>],
-    ) -> Vec<((Option<i64>, Option<i64>), (Option<i64>, Option<i64>))> {
+    ) -> Vec<KeyPair2> {
         use arrow::array::Array;
         let mut out: Vec<_> = (0..idx.left.len())
             .map(|k| {

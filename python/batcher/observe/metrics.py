@@ -155,7 +155,11 @@ class _Collector:
                     "duration_ms_mean": (
                         self.query_ms_total / self.queries_total if self.queries_total else 0.0
                     ),
-                    "duration_ms_buckets": dict(self._buckets),
+                    # String keys, because the snapshot is served as JSON and JSON object
+                    # keys are strings: an int-keyed dict came back from `json.loads` with
+                    # string keys, so a consumer that read its own snapshot back saw a
+                    # different shape than the one it was handed.
+                    "duration_ms_buckets": {str(edge): n for edge, n in self._buckets.items()},
                 },
                 "rows": {
                     "scanned_total": self.rows_scanned_total,

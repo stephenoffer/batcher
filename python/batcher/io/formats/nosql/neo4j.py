@@ -26,6 +26,7 @@ from batcher.io.formats.nosql.base import (
     offset_windows,
     require_driver,
     rows_to_batches,
+    schema_from_rows,
 )
 from batcher.io.formats.sql.uri import redact_uri
 
@@ -119,9 +120,7 @@ class Neo4jSource(ScanSource):
             rows = list(self._run(driver, f"{self._conn_kwargs['cypher']} LIMIT 1"))
         finally:
             driver.close()
-        if not rows:
-            return pa.schema([])
-        return pa.RecordBatch.from_pylist(rows).schema
+        return schema_from_rows(rows)
 
     def _enumerate_partitions(self) -> list[_Window]:
         """SKIP/LIMIT windows that cover the whole result — see `offset_windows`.

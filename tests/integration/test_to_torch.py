@@ -45,10 +45,12 @@ def test_to_torch_is_reiterable_across_epochs():
 
 
 def test_to_torch_tensors_are_writable():
-    # Training mutates batches in place; the buffer must be owned/writable.
+    """Training mutates batches in place, so the buffer must be owned, not Arrow-backed."""
     td = _ds().to_torch()
     first = next(iter(td))
-    first["x"] += 1  # must not raise on a read-only Arrow-backed buffer
+    before = first["x"].tolist()
+    first["x"] += 1
+    assert first["x"].tolist() == [v + 1 for v in before]
 
 
 def test_to_torch_dataloader_iterates():

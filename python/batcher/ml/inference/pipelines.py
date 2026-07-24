@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
 if TYPE_CHECKING:
@@ -168,8 +169,10 @@ def _maybe_compile_pipeline(pipe: Any) -> None:
         if not any(isinstance(m, torch.nn.Conv2d) for m in model.modules()):
             return  # not a CNN — compile regresses dynamic-shape text models, so skip
         pipe.model = torch.compile(model.to(memory_format=torch.channels_last))
-    except Exception:
-        pass  # eager fallback — never break inference for a perf optimization
+    except Exception as exc:
+        note_suppressed(
+            "ml", "compile the inference model", exc
+        )  # eager fallback — never break inference for a perf optimization
 
 
 @functools.cache
@@ -252,9 +255,20 @@ def transformers_pipeline_encoder(
 
 
 def _primary_output(result: Any) -> Any:
-    """The single salient value of one pipeline result row (label / text / scalar)."""
-    if isinstance(result, list):  # token/aggregated pipelines nest a list per row
-        result = result[0] if result else None
+    """The single salient value of one pipeline result row (label / text / scalar).
+
+    A one-element list is the common wrapper text-generation and summarization pipelines
+    return, so it is unwrapped. A **multi**-element list is a genuinely multi-valued result
+    — every entity a token-classification/NER pipeline found, or every candidate label —
+    and each element's salient value is kept as a list, rather than silently discarding all
+    but the first (the old ``result[0]``, which dropped every NER entity after the first).
+    """
+    if isinstance(result, list):
+        if not result:
+            return None
+        if len(result) > 1:
+            return [_primary_output(item) for item in result]
+        result = result[0]
     if isinstance(result, dict):
         for key in ("label", "generated_text", "summary_text", "translation_text", "answer"):
             if key in result:

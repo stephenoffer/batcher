@@ -181,4 +181,55 @@ def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Col
                     avg_bytes=src.avg_bytes,
                     quantiles=src.quantiles,
                 )
+    out.update(_grouped_aggregate_bounds(node, child))
+    return out
+
+
+# Aggregates whose per-group value is always one of the input column's own values, or lies
+# between them: `min`/`max` return an actual value, and an average of values inside `[lo, hi]`
+# is inside `[lo, hi]`. So the child column's bounds bound the aggregate's output too.
+_ORDER_BOUNDED_AGGS = frozenset({"min", "max", "mean", "avg", "median"})
+_COUNTING_AGGS = frozenset({"count", "count_star", "count_distinct"})
+
+
+def _grouped_aggregate_bounds(node: Aggregate, child: RelStats) -> dict[str, ColumnStat]:
+    """Bounds for a grouped aggregate's *value* outputs — not constants, but not unknown.
+
+    A grouped aggregate's outputs vary by group, so none of them is the provable constant a
+    global aggregate produces. That is not the same as knowing nothing about them, and the
+    difference matters because a `HAVING` clause (or any filter above the aggregate) is a
+    predicate on exactly these columns. With no statistics at all it falls to a flat constant;
+    with bounds it can interpolate, and a `HAVING max(v) > 10^6` over a column whose maximum
+    is 1,000 is *provably* empty without executing anything.
+
+    Two families are bounded without any assumption:
+
+    * **order-bounded** — `min`/`max`/`avg`/`median` of a column return a value inside that
+      column's own `[min, max]`, whatever the grouping is;
+    * **counting** — a group has at least one row and at most all of them, so a per-group
+      count lies in `[1, |child|]`.
+
+    Always `DEFAULT` provenance: these are bounds on a *set* of values, so nothing here may
+    answer an exact terminal — and a group's actual extreme is generally strictly inside them.
+    """
+    out: dict[str, ColumnStat] = {}
+    for spec in node.aggregates:
+        func = spec.agg.func
+        if func in _COUNTING_AGGS:
+            hi = child.rows if child.rows > 0 else None
+            out[spec.alias] = ColumnStat(
+                min=1 if func != "count" else 0,  # count(col) is 0 for an all-null group
+                max=int(hi) if hi is not None else None,
+                null_count=0,
+                provenance=Provenance.DEFAULT,
+            )
+            continue
+        if func not in _ORDER_BOUNDED_AGGS or not isinstance(spec.agg.input, Col):
+            continue
+        src = child.columns.get(spec.agg.input.name)
+        if src is None or src.min is None or src.max is None:
+            continue
+        out[spec.alias] = ColumnStat(
+            min=src.min, max=src.max, provenance=Provenance.DEFAULT, avg_bytes=src.avg_bytes
+        )
     return out

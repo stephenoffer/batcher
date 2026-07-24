@@ -22,6 +22,7 @@ import os
 import threading
 from inspect import signature
 
+from batcher._internal.logging import note_suppressed
 from batcher.io.splits import Split
 
 # Splits a worker reads ahead concurrently while folding the current one. A distributed
@@ -94,8 +95,8 @@ def _scan_cache_siblings() -> int:
                     cpus = int(node.get("Resources", {}).get("CPU", 0))
                     if cpus > 0:
                         return cpus
-    except Exception:
-        pass
+    except Exception as exc:
+        note_suppressed("dist", "read local node CPU count", exc)
     # The cgroup/affinity-aware count, not `os.cpu_count()`'s host total. A worker container
     # limited to 4 of a host's 64 cores runs ~4 sibling processes, not 64, so dividing the RAM
     # budget by the host count shrinks each process's cache ~16x below its real share.
@@ -168,6 +169,8 @@ def _record_skipped(split, exc: Exception) -> None:
         ident = getattr(split, "path", None) or getattr(split, "identity", lambda: split)()
         get_logger("dist.scan").warning("skipping unreadable split %s: %s", ident, exc)
     except Exception:  # pragma: no cover - logging must never break the scan
+        # Deliberately the one handler that stays silent: this *is* the logging path, so
+        # anything it could report would take the same route that just failed.
         pass
 
 

@@ -109,7 +109,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, Float64Array, ListArray};
+    use arrow::array::{
+        ArrayRef, AsArray, FixedSizeListArray, Float32Array, Float64Array, ListArray,
+    };
     use arrow::datatypes::{Float32Type, Float64Type};
 
     fn fsl(values: Vec<f32>, size: i32) -> ArrayRef {
@@ -122,7 +124,7 @@ mod tests {
     fn fixed_size_list_normalizes_to_list() {
         let out = as_var_list(&fsl(vec![1.0, 2.0, 3.0, 4.0], 2), "list.Dot").unwrap();
         assert!(matches!(out.data_type(), DataType::List(_)));
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         assert_eq!(list.len(), 2);
         assert_eq!(list.value_offsets(), &[0, 2, 4]);
     }

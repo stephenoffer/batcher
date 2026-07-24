@@ -3,8 +3,11 @@
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -41,11 +44,22 @@ extensions = [
     "sphinx_copybutton",  # one-click copy on code blocks
 ]
 
-# Doctests run real queries; turn the per-query event log off so the docs build doesn't
-# write JSON files into the builder's ~/.batcher/logs (tests/conftest.py does the same for
-# pytest, but that fixture doesn't apply to the Sphinx doctest builder).
-doctest_global_setup = """
-import dataclasses
+# Doctests run real queries against real files, so they need two things the Sphinx doctest
+# builder does not give them (tests/conftest.py does the equivalent for pytest, but that
+# fixture does not apply here):
+#
+# 1. A scratch working directory. Examples that write a file use a bare relative name
+#    (``bt.read.csv("late.csv")``), and without this every one of them drops an artifact
+#    into whatever directory the build was launched from. Four such files were committed
+#    to the repository root before this chdir existed.
+# 2. The per-query event log turned off, so the build does not write JSON into the
+#    builder's ``~/.batcher/logs``.
+_DOCTEST_SCRATCH = tempfile.mkdtemp(prefix="batcher-doctest-")
+atexit.register(shutil.rmtree, _DOCTEST_SCRATCH, True)
+
+doctest_global_setup = f"""
+import dataclasses, os
+os.chdir({_DOCTEST_SCRATCH!r})
 from batcher.config import active_config, set_config
 _c = active_config()
 set_config(_c.replace(observability=dataclasses.replace(_c.observability, event_log=False)))
@@ -127,6 +141,18 @@ exclude_patterns = [
     # The same again: the running ledger of the engine-wide defect hunt (found / fixed /
     # open). A contributor's working record, not a site page.
     "internals/bug_hunt_ledger.md",
+    # The running index of improvements to the estimators' mathematics (cardinality,
+    # sketches, cost, learning, resource control). A working record for anyone touching
+    # one of those closed forms, not a page a user reads.
+    "internals/math_improvements_ledger.md",
+    # The running index of improvements/fixes/features that harden Batcher's streaming
+    # workloads (triggers, watermarks, windowed/stateful aggregation, checkpointing,
+    # sources/sinks, the morsel-streaming executor). A working record, not a user page.
+    "internals/streaming_improvements_ledger.md",
+    # The running index of improvements/features that make Batcher better at running
+    # user-supplied UDFs and callables (map_batches/map, class model UDFs, the batch-inference
+    # plane, and the threads/processes/GPU scheduling beneath). A working record, not a user page.
+    "internals/udf_improvements_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
@@ -230,7 +256,16 @@ autodoc_mock_imports = [
 # backticks don't need an explicit role, and suppress the docutils inline-markup
 # warnings those Markdown-isms (e.g. `Dataset`s) would otherwise raise under -W.
 default_role = "literal"
-suppress_warnings = ["docutils"]
+# `docutils`: the Markdown-ism inline-markup warnings the light docstring style raises.
+# `sphinx_autodoc_typehints.forward_reference`: the whole codebase uses
+# `from __future__ import annotations` plus `if TYPE_CHECKING:` imports (mandated by
+# CLAUDE.md), so a signature like `Iterator[dict[str, np.ndarray]]` carries names that
+# exist only for type checkers. sphinx-autodoc-typehints cannot resolve those at build
+# time and warns once per name — under `-W` that fails the build for using a correct,
+# required Python idiom. The annotation still renders as its source text; only the
+# cross-link is lost. Suppressing the category keeps the docs build robust as new modules
+# adopt the same idiom, instead of breaking on each newly-referenced type name.
+suppress_warnings = ["docutils", "sphinx_autodoc_typehints.forward_reference"]
 autodoc_member_order = "groupwise"
 autodoc_typehints = "description"
 autodoc_class_signature = "separated"

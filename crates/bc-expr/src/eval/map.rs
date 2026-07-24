@@ -84,7 +84,8 @@ fn element_at(map: &MapArray, key: Option<&Literal>) -> Result<ArrayRef, ExprErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Builder, Int64Array, Int64Builder, MapBuilder, StringBuilder};
+    use arrow::array::{AsArray, Int32Builder, Int64Builder, MapBuilder, StringBuilder};
+    use arrow::datatypes::Int64Type;
 
     fn sample_map() -> ArrayRef {
         // Rows: {a:1, b:2}, {c:3}, null.
@@ -105,7 +106,7 @@ mod tests {
     fn element_at_finds_value_or_null() {
         let m = sample_map();
         let out = eval_map(MapFunc::ElementAt, &m, Some(&Literal::Str("a".into()))).unwrap();
-        let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let a = out.as_primitive::<Int64Type>();
         assert_eq!(a.value(0), 1); // {a:1,b:2} → 1
         assert!(a.is_null(1)); // {c:3} has no 'a'
         assert!(a.is_null(2)); // null map → null
@@ -123,22 +124,18 @@ mod tests {
         b.append(true).unwrap();
         let m: ArrayRef = Arc::new(b.finish());
         let out = eval_map(MapFunc::ElementAt, &m, Some(&Literal::Int(2))).unwrap();
-        let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let a = out.as_primitive::<Int64Type>();
         assert_eq!(a.value(0), 20);
         // A key that is not present is still null.
         let miss = eval_map(MapFunc::ElementAt, &m, Some(&Literal::Int(9))).unwrap();
-        assert!(miss
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .is_null(0));
+        assert!(miss.as_primitive::<Int64Type>().is_null(0));
     }
 
     #[test]
     fn map_keys_wraps_under_offsets() {
         let m = sample_map();
         let out = eval_map(MapFunc::MapKeys, &m, None).unwrap();
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         assert_eq!(list.value_length(0), 2); // 2 keys in row 0
         assert_eq!(list.value_length(1), 1); // 1 key in row 1
         assert!(list.is_null(2)); // null map → null list

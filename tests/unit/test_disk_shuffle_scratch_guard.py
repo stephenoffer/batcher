@@ -36,13 +36,13 @@ def test_multi_node_without_shared_scratch_is_refused(cluster):
 
 def test_multi_node_with_a_shared_mount_is_allowed(cluster):
     cluster(nodes=4, shared="/mnt/cluster_storage/batcher_shuffle")
-    EX._require_shared_scratch("asof_join")  # must not raise
+    assert EX._require_shared_scratch("asof_join") is None
 
 
 def test_single_node_is_always_allowed(cluster):
     """One node: a driver-local tempdir is reachable by every task, so disk is correct."""
     cluster(nodes=1, shared=None)
-    EX._require_shared_scratch("asof_join")
+    assert EX._require_shared_scratch("asof_join") is None
 
 
 def test_the_error_names_the_operator_and_the_fix(cluster):

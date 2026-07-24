@@ -275,7 +275,7 @@ def test_build_vector_index_reports_a_missing_column() -> None:
 
 def test_build_vector_index_accepts_a_fixed_size_list_of_floats() -> None:
     schema = pa.schema([pa.field("embedding", pa.list_(pa.float32(), 4))])
-    _validate_vector_field(schema, "embedding")
+    assert _validate_vector_field(schema, "embedding") is None
 
 
 # ----------------------------------------------------- 6. bounded parallel decode

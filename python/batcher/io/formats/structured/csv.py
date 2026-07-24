@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -10,13 +9,16 @@ from typing import IO, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import SchemaError
 from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
 from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.formats.structured._csv_diagnostics import (
+    invalid_utf8_error,
+    mismatch_reported,
+)
 from batcher.io.formats.structured._csv_options import (
     CSVReadOptions,
     resolve_read_options,
@@ -120,26 +122,6 @@ class CSVRangeSplit:
         return f"csv:{self.path}:{self.start}-{self.end}"
 
 
-@contextlib.contextmanager
-def _mismatch_reported(source: CSVSource):
-    """Turn pyarrow's conversion error into one that says what to do about it.
-
-    A CSV column is typed from the first block, so a value further down that does not fit
-    is not a corrupt file — it is inference having been shown too little. The raw error
-    names the offending value but not the inferred type, nor that the type is declarable,
-    which is the whole of the fix.
-    """
-    try:
-        yield
-    except pa.ArrowInvalid as exc:
-        raise SchemaError(
-            f"CSV value does not fit the inferred column type in {source._path!r}: {exc}. "
-            "The schema is inferred from the file's first block, so a value further down "
-            "may not fit it. Declare the type instead — "
-            'bt.read.csv(path, schema=pa.schema([("col", pa.string()), ...])).'
-        ) from exc
-
-
 @SOURCES.register("csv")
 class CSVSource(FileSource):
     """One or more CSV files (single file, directory, or glob).
@@ -217,6 +199,20 @@ class CSVSource(FileSource):
         # never inside a read path, which is how the three of them would drift apart again.
         return self._options.resolve_schema(super().schema())
 
+    def _estimated_row_count(self, byte_total: int | None) -> int | None:
+        """An advisory row count extrapolated from a byte sample (CSV has no footer).
+
+        CSV reaches the estimator with no row count, so a join against one was sized from the
+        planner's default. Scaling the first file's average row width by the dataset's on-disk
+        size gives a far better cardinality — advisory (`exact_rows=False`), O(1) I/O. The
+        header is discounted; `byte_total` (already computed by `statistics()`) is reused.
+        """
+        from batcher.io.stats.row_estimate import estimate_delimited_rows
+
+        return estimate_delimited_rows(
+            self._fs, self._files(), has_header=self._options.has_header, total_bytes=byte_total
+        )
+
     def _reader_kwargs(self) -> dict[str, object]:
         """Every option that changes what a parse produces, so a worker rebuilds it exactly.
 
@@ -263,7 +259,17 @@ class CSVSource(FileSource):
         # runs during planning, so reading a multi-GB CSV end-to-end here would read it once
         # for the schema and again for the data. First-block inference is what pyarrow's own
         # streaming read commits to (and what DuckDB/Polars sample), so the schema matches.
-        return pacsv.open_csv(fh, **self._parse_kwargs(None, pin_types=False)).schema
+        schema = pacsv.open_csv(fh, **self._parse_kwargs(None, pin_types=False)).schema
+        # pyarrow reports undecodable bytes by *typing the column `binary`* rather than by
+        # failing, which turns a corrupt file into a successful read of a differently-typed
+        # table. Nothing downstream can tell that apart from a column of genuine bytes, so
+        # the refusal has to happen here, where the choice was made.
+        binary_cols = [f.name for f in schema if pa.types.is_binary(f.type)]
+        if binary_cols:
+            raise invalid_utf8_error(
+                self._path, f"column(s) {binary_cols} could not be decoded as text"
+            )
+        return schema
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         import pyarrow.csv as pacsv
@@ -272,7 +278,7 @@ class CSVSource(FileSource):
         # *converts* the wanted columns, and the types are pinned so this path cannot
         # disagree with `schema()` — it used to re-infer over the whole file and return a
         # widened type the engine had not planned for.
-        with _mismatch_reported(self):
+        with mismatch_reported(self._path):
             table = pacsv.read_csv(fh, **self._parse_kwargs(projection, pin_types=True))
         return table.to_batches()
 
@@ -289,7 +295,7 @@ class CSVSource(FileSource):
         # `_open` rather than `_fs.open`, so `events.csv.gz` streams here too.
         with self._open(path) as fh:
             reader = pacsv.open_csv(fh, **self._parse_kwargs(projection, pin_types=True))
-            with _mismatch_reported(self):
+            with mismatch_reported(self._path):
                 yield from reader
 
     def _file_splits(

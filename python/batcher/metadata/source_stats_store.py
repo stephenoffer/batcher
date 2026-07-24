@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
@@ -39,7 +40,8 @@ def load_source_stats(hub: MetadataHub, identity: str) -> SourceStatistics | Non
     """Load persisted statistics for a source `identity`, or None if absent."""
     try:
         blob = hub.load_params(f"{_NAMESPACE}:{identity}")
-    except Exception:
+    except Exception as exc:
+        note_suppressed("metadata", "load source stats", exc)
         return None
     return _decode(blob) if blob else None
 
@@ -100,7 +102,8 @@ def _decode(blob: dict[str, Any]) -> SourceStatistics | None:
             partition_keys=tuple(blob.get("partition_keys", ())),
             exact_rows=bool(blob.get("exact_rows", True)),
         )
-    except Exception:
+    except Exception as exc:
+        note_suppressed("metadata", "decode source stats", exc)
         return None
 
 

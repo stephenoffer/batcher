@@ -256,26 +256,18 @@ mod tests {
         right_by: &[Vec<Option<i64>>],
         backward: bool,
     ) -> Vec<Option<u32>> {
+        // Any null in a `by` column means the row has no group at all, so the whole key
+        // is `None` rather than a key with a hole in it.
         let by_of = |cols: &[Vec<Option<i64>>], row: usize| -> Option<Vec<i64>> {
-            let mut k = Vec::with_capacity(cols.len());
-            for c in cols {
-                match c[row] {
-                    Some(v) => k.push(v),
-                    None => return None, // any null by -> no group
-                }
-            }
-            Some(k)
+            cols.iter().map(|c| c[row]).collect()
         };
         (0..left_on.len())
             .map(|i| {
                 let lon = left_on[i]?;
                 let lby = by_of(left_by, i)?;
                 let mut best: Option<(i64, u32)> = None;
-                for j in 0..right_on.len() {
-                    let ron = match right_on[j] {
-                        Some(v) => v,
-                        None => continue,
-                    };
+                for (j, right) in right_on.iter().enumerate() {
+                    let Some(ron) = *right else { continue };
                     let rby = match by_of(right_by, j) {
                         Some(k) => k,
                         None => continue,

@@ -34,8 +34,42 @@ from batcher.io.formats.sql._common import require_module
 
 if TYPE_CHECKING:
     from batcher.io.splits import Split
+    from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["BigQuerySource"]
+
+
+def _tables_statistics(rows: list[Any]) -> SourceStatistics | None:
+    """Map a ``__TABLES__`` result row to `SourceStatistics`, or None.
+
+    ``__TABLES__`` is BigQuery's per-dataset metadata table: `row_count` and `size_bytes`
+    are maintained by the service for every base table and read for free (a metadata query
+    scans no bytes). The count is authoritative — it is what BigQuery's own ``COUNT(*)``
+    returns — so it is `exact_rows=True`; a view or absent table yields no row and None here.
+    """
+    if not rows:
+        return None
+    row = rows[0]
+    row_count = _bq_field(row, "row_count")
+    size_bytes = _bq_field(row, "size_bytes")
+    if row_count is None and size_bytes is None:
+        return None
+    from batcher.plan.source_stats import SourceStatistics
+
+    return SourceStatistics(
+        row_count=int(row_count) if row_count is not None else None,
+        byte_size=int(size_bytes) if size_bytes else None,
+        exact_rows=row_count is not None,
+    )
+
+
+def _bq_field(row: Any, name: str) -> Any:
+    """Read `name` from a BigQuery ``Row`` (mapping access) or a plain dict, tolerantly."""
+    try:
+        return row[name]
+    except (KeyError, TypeError, IndexError):
+        return getattr(row, name, None)
+
 
 _EXTRA = "bigquery"
 _STORAGE_MODULE = "google.cloud.bigquery_storage_v1"
@@ -289,6 +323,43 @@ class BigQuerySource:
 
     def row_count(self) -> int | None:
         return None
+
+    def statistics(self) -> SourceStatistics | None:
+        """Exact row count and on-disk byte size from ``__TABLES__`` for a `table=` read.
+
+        A ``project.dataset.table`` read has a free metadata entry — BigQuery's per-dataset
+        ``__TABLES__`` view records `row_count` and `size_bytes`, maintained by the service
+        and read without scanning a byte. So a BigQuery table reaches Kyber with an exact
+        cardinality and size for the price of one metadata query, instead of nothing. A
+        `query=` read is an arbitrary expression with no such entry and declares None.
+        Best-effort — any failure (permission, a view, the client absent) yields None.
+        """
+        if self.table is None:
+            return None
+        parts = self.table.split(".")
+        if len(parts) != 3:
+            return None  # not a fully-qualified project.dataset.table
+        project, dataset, table = parts
+        sql = (
+            f"SELECT row_count, size_bytes FROM `{project}.{dataset}.__TABLES__` "
+            f"WHERE table_id = '{table}'"
+        )
+        try:
+            rows = self._run_metadata_query(sql)
+        except Exception:
+            return None
+        return _tables_statistics(rows)
+
+    def _run_metadata_query(self, sql: str) -> list[Any]:
+        """Run a metadata query through the BigQuery client, returning its rows.
+
+        A seam of its own so the statistics path is testable without a live BigQuery: the
+        real implementation opens a client and submits `sql`; a test overrides it with the
+        rows ``__TABLES__`` would return. ``__TABLES__`` scans no bytes, so this is cheap.
+        """
+        bq = require_module(_BQ_MODULE, extra=_EXTRA)
+        client = bq.Client(project=self.project)
+        return list(client.query(sql).result())
 
     def identity(self) -> str:
         return f"bigquery:{self.project}:{self.query or self.table}"

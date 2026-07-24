@@ -70,7 +70,7 @@ def test_the_channel_byte_budget_is_held_under_a_share_of_real_memory(monkeypatc
     the RAM of a 16 GiB one. Admission was already memory-aware; backpressure was not, so a
     node could be admitted for a query and then OOM'd by the transit buffers carrying it.
     """
-    import batcher.carbonite.policies as policies
+    from batcher.carbonite.policies import flow_control as policies
     from batcher.config import active_config
 
     cfg = active_config()
@@ -97,7 +97,7 @@ def test_the_channel_byte_budget_is_held_under_a_share_of_real_memory(monkeypatc
 
 def test_a_small_node_lowers_the_credit_ceiling_itself(monkeypatch):
     """The headroom cap has to reach the ceiling callers actually use, not just the helper."""
-    import batcher.carbonite.policies as policies
+    from batcher.carbonite.policies import flow_control as policies
     from batcher.config import active_config
 
     cfg = active_config()

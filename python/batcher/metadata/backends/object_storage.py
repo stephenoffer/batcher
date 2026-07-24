@@ -16,20 +16,20 @@ import json
 from collections.abc import Iterator
 
 from batcher._internal.errors import MissingDependencyError
-from batcher.metadata.store import Key, require_uri
+from batcher.metadata.store import Key, decode_key, encode_key, require_uri
 
 __all__ = ["ObjectStorageBackend"]
 
 
 def _encode_name(key: Key) -> str:
     """A URL-safe object basename for `key` (reversible by `_decode_name`)."""
-    raw = json.dumps(list(key), separators=(",", ":")).encode("utf-8")
+    raw = encode_key(key).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
 def _decode_name(name: str) -> Key:
     raw = base64.urlsafe_b64decode(name.encode("ascii"))
-    return tuple(json.loads(raw))
+    return decode_key(raw.decode("utf-8"))
 
 
 class ObjectStorageBackend:

@@ -315,7 +315,7 @@ class ShuffleClient:
     ) -> list[pa.RecordBatch]:
         """Fetch a remote partition over a credit-bounded stream on a pooled channel.
 
-        `token` is the shuffle auth secret presented to an auth-gated peer (N5).
+        `token` is the shuffle auth secret presented to an auth-gated peer.
         """
         global _BYTES_FETCHED
         if credits is None:

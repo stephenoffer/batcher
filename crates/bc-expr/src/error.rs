@@ -44,6 +44,12 @@ pub enum ExprError {
     #[error("integer division or modulo by zero")]
     DivideByZero,
 
+    /// A zero step in `sequence`/`range`. Reported separately from `DivideByZero`: a user
+    /// who writes `sequence(1, 5, 0)` performed no division, so "integer division or modulo
+    /// by zero" sends them looking for an arithmetic expression they never wrote.
+    #[error("sequence: step must be non-zero")]
+    ZeroSequenceStep,
+
     #[error("invalid regular expression: {pattern}")]
     InvalidRegex { pattern: String },
 

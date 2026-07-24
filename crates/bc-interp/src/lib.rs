@@ -37,7 +37,7 @@ pub use par::{
 };
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,
-    execute_streaming_parallel_metered,
+    execute_streaming_parallel_metered, streaming_parallelizes,
 };
 
 use metrics::{IdGen, Stopwatch};

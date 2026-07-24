@@ -1,0 +1,259 @@
+"""What this process may actually allocate — host RAM, the cgroup cap, and live headroom.
+
+"How much memory is there" is three different questions on a modern box, and conflating
+them has bitten the engine each way. The host's RAM is not the ceiling when a cgroup limit
+is lower. `memory.current` is not usage, because it counts reclaimable page cache. And the
+free figure `psutil` reports is the *machine's*, not the container's.
+
+Each answer is cached at the lifetime it is stable for: host RAM and the cgroup cap cannot
+change for the process, so both are memoized; the live available reading is re-sampled on a
+short TTL; the current charge is read fresh every time.
+
+Separated from `pressure` so the classification ladder there reads as policy, with the OS
+archaeology it rests on in one place beneath it.
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import time
+
+from batcher._internal.hardware import cgroup_v2_dirs, read_cgroup_bytes
+from batcher.config import active_config
+
+__all__ = [
+    "SAMPLE_TTL_SECONDS",
+    "available_bytes",
+    "cap_to_cgroup_headroom",
+    "cgroup_current_bytes",
+    "cgroup_limit_bytes",
+    "proc_meminfo_available",
+    "process_rss_bytes",
+    "read_available_bytes",
+    "reset_memory_sampling",
+    "total_memory_bytes",
+]
+
+# How long a live OS memory reading (`psutil.virtual_memory().available`) is reused
+# before it is re-sampled. Reading it costs a `/proc` parse (~60 µs) — a real slice of
+# the control plane's per-query cost on sub-second queries — yet the figure it returns
+# does not move on a µs/ms timescale, and every Carbonite memory decision reacts at
+# pipeline-breaker granularity (coarser than this by orders of magnitude). Sharing one
+# sample across the decisions of a query, and across the back-to-back queries of an
+# interactive session, therefore costs nothing in accuracy: a change is still observed
+# within one window, and the live buffer-pool / footprint pressure reads (cheap, and
+# left un-cached) still catch a real spike instantly. A stale reading can only make
+# admission a touch conservative (older = smaller available), never over-admit unsafely.
+SAMPLE_TTL_SECONDS = 0.05
+
+# Process-constant host RAM (`SC_PAGE_SIZE * SC_PHYS_PAGES`), memoized on first read: it
+# cannot change for the process's lifetime, so re-running the two syscalls per call is
+# pure waste. `None` until first read / when sysconf is unavailable.
+_host_ram_bytes: int | None = None
+
+# Single-slot TTL cache for the live available-bytes reading: `(monotonic_deadline, value)`.
+_available_cache: tuple[float, int] | None = None
+
+
+def reset_memory_sampling() -> None:
+    """Drop the memoized host RAM and the live-reading TTL cache. For tests that
+    patch the underlying OS readers and need the next sample to re-read them."""
+    global _host_ram_bytes, _available_cache
+    _host_ram_bytes = None
+    _available_cache = None
+
+
+@functools.lru_cache(maxsize=1)
+def cgroup_limit_bytes() -> int | None:
+    """The container memory limit from cgroup v2 (`memory.max`) or v1
+    (`memory.limit_in_bytes`), or `None` when unlimited / not in a cgroup.
+
+    A container's cgroup cap is the *real* ceiling — the host's RAM is not — so
+    honoring it is what stops the engine over-admitting and getting OOM-killed by
+    the kernel.
+
+    Cached for the process: the cgroup cap is fixed for a container's lifetime, while
+    this is read on every admission check — re-opening `memory.max` per query is pure
+    hot-path I/O. (The *current* usage, which does change, is read live and uncached.)
+
+    Like the CPU quota, the limit can be set at any level of the cgroup v2 hierarchy — the
+    process's own leaf (a namespaced pod), a parent slice (a non-namespaced Ray worker), or
+    the mount root — so the effective cap is the tightest `memory.max` across the whole
+    ancestry (`cgroup_v2_dirs`), not just the root. v1 keeps its single well-known path.
+    """
+    limits = [
+        v for d in cgroup_v2_dirs() if (v := read_cgroup_bytes(os.path.join(d, "memory.max")))
+    ]
+    if limits:
+        return min(limits)
+    return read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
+
+
+def _cgroup_file_cache_bytes() -> int:
+    """Page cache charged to this cgroup — `file` (v2) or `total_cache` (v1); 0 if unknown."""
+    for path, key in (
+        ("/sys/fs/cgroup/memory.stat", "file"),
+        ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
+    ):
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            # Not this cgroup version, or not in a cgroup at all. Both paths being absent
+            # is the normal case off Linux, so trying the next one is the answer rather
+            # than a reportable failure.
+            continue
+        for line in lines:
+            field, _, raw = line.partition(" ")
+            if field == key:
+                try:
+                    return max(0, int(raw))
+                except ValueError:
+                    return 0
+    return 0
+
+
+def cgroup_current_bytes() -> int | None:
+    """The cgroup's *unreclaimable* memory, or `None` when not in a cgroup.
+
+    `memory.current` is routinely mistaken for the OOM number, and is not: it counts
+    anonymous memory **plus every clean file page the kernel happens to be caching**. Cache is
+    reclaimable — dropped long before anything is OOM-killed — so charging it as pressure
+    reads a box that has merely *read files* as one about to die. Measured on a 30 GiB host
+    after loading TPC-H: 24.3 GiB "current", of which 15.3 GiB was cache. That pinned the
+    monitor at ELEVATED, which halves every morsel (`_MORSEL_PRESSURE_FACTORS`) — a 7%
+    throughput loss for the whole run, invisible to every correctness test.
+
+    Subtracting `file` costs the guard nothing, because the two are disjoint: what it exists
+    to see (the Flight shuffle store, off-pool pyarrow buffers) is **anonymous** and stays
+    counted; what is subtracted is cache that was never the engine's. The remainder
+    (anon + slab + sock) is what the kernel cannot get back — the figure the OOM-killer acts on.
+    """
+    total = _cgroup_total_bytes()
+    if total is None:
+        return None
+    return max(0, total - _cgroup_file_cache_bytes())
+
+
+def _cgroup_total_bytes() -> int | None:
+    """The raw cgroup charge, anonymous **and** cached — `memory.current` / `usage_in_bytes`.
+
+    Not a pressure signal on its own; see `cgroup_current_bytes`.
+    """
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        value = read_cgroup_bytes(path)
+        if value is not None:
+            return value
+    return None
+
+
+def cap_to_cgroup_headroom(host_available: int) -> int:
+    """Clamp a host-wide available figure to what this container may still allocate.
+
+    `psutil`/`/proc` report the *machine's* free RAM, but a cgroup-limited container (the norm
+    under Kubernetes/Ray) OOMs at `memory.max`, not at host exhaustion — on a 184 GB host an
+    8 GB container would otherwise read ~180 GB free and over-admit into a kill. The real
+    headroom is `limit - current`, where `current` excludes the reclaimable page cache (see
+    `cgroup_current_bytes`) — cache the kernel will evict on demand is headroom, not usage.
+    Take the smaller of that and the host figure. No cgroup cap (bare metal / unlimited)
+    leaves the reading untouched.
+    """
+    limit = cgroup_limit_bytes()
+    if limit is None:
+        return host_available
+    current = cgroup_current_bytes()
+    if current is None:
+        return host_available
+    return min(host_available, max(0, limit - current))
+
+
+def process_rss_bytes() -> int | None:
+    """This process's resident set size (RSS) via `psutil`, or `None` without it.
+
+    RSS captures the engine's true footprint — the Flight `PartitionStore`, pyarrow
+    buffers, everything — not just the buffer pool's accounted reservations."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return None
+
+
+def total_memory_bytes() -> int:
+    """The memory ceiling: the min of host RAM and any cgroup/container limit.
+
+    Falls back to `MemoryConfig.default_total_bytes` (one home for the fallback)
+    when the OS won't report host RAM. Host RAM and the cgroup cap are both fixed for
+    the process's lifetime, so both are memoized — this is read on every admission /
+    pressure check, and re-running the syscalls each time is hot-path waste.
+    """
+    global _host_ram_bytes
+    host = _host_ram_bytes
+    if host is None:
+        try:
+            host = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            _host_ram_bytes = host
+        except (ValueError, OSError, AttributeError):
+            host = active_config().memory.default_total_bytes  # not memoized (config-derived)
+    cgroup = cgroup_limit_bytes()
+    return min(host, cgroup) if cgroup is not None else host
+
+
+def proc_meminfo_available() -> int | None:
+    """`MemAvailable` from `/proc/meminfo` (Linux), or `None` if unreadable.
+
+    The without-psutil fallback so memory governance still senses real pressure on
+    Linux containers where the optional dep isn't installed."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024  # kB → bytes
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def available_bytes() -> int:
+    """Available RAM, served from a short-TTL sample (see `SAMPLE_TTL_SECONDS`).
+
+    The underlying `psutil.virtual_memory()` (or `/proc` fallback) read is the single most
+    expensive step in a per-query Carbonite decision. A change is still picked up within one
+    TTL window, so amortizing the read across a query's decisions — and across a session's
+    back-to-back queries — costs nothing in accuracy: a stale reading is an older, smaller
+    figure, which makes admission slightly conservative and can never over-admit.
+
+    Returns:
+        Available bytes, capped to this container's cgroup headroom.
+    """
+    global _available_cache
+    now = time.monotonic()
+    cached = _available_cache
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    value = read_available_bytes()
+    _available_cache = (now + SAMPLE_TTL_SECONDS, value)
+    return value
+
+
+def read_available_bytes() -> int:
+    """One live, uncached reading of available RAM, capped to the cgroup headroom.
+
+    `psutil` when present, else Linux `/proc/meminfo`, else a large sentinel meaning
+    "assume headroom" so a platform that reports nothing does not read as full.
+
+    Returns:
+        Available bytes for this process.
+    """
+    try:
+        import psutil
+
+        host = int(psutil.virtual_memory().available)
+    except ImportError:
+        proc = proc_meminfo_available()
+        host = proc if proc is not None else (1 << 62)
+    return cap_to_cgroup_headroom(host)

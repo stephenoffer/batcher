@@ -294,6 +294,61 @@ class Preprocessor(abc.ABC):
         """
         return self.fit(ds).transform(ds)
 
+    def save(self, path: str) -> None:
+        """Write this fitted preprocessor to `path` as readable JSON.
+
+        The state has to outlive the process that fitted it, or the scaler standardizing a
+        request at serving time uses the request's own mean instead of the training set's.
+        JSON rather than a pickle so the file is reviewable, diffable, portable to another
+        language, and safe to load from a store you do not fully control. Accepts a cloud
+        URI as well as a local path.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> pre = StandardScaler("x").fit(bt.from_pydict({"x": [1.0, 3.0]}))
+                >>> target = os.path.join(tempfile.mkdtemp(), "scaler.json")
+                >>> pre.save(target)
+                >>> StandardScaler.load(target).mean_
+                {'x': 2.0}
+
+        Args:
+            path: Where to write it; a local path or a cloud URI.
+        """
+        from batcher.ml.preprocessors.persistence import save
+
+        save(self, path)
+
+    @staticmethod
+    def load(path: str) -> Preprocessor:
+        """Read a preprocessor written by `save`, learned state included.
+
+        A static method on the base class rather than on each subclass: the document names
+        its own class, so the caller never has to know which one to ask.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> from batcher.ml.preprocessors import MinMaxScaler, Preprocessor
+                >>> pre = MinMaxScaler("x").fit(bt.from_pydict({"x": [0.0, 10.0]}))
+                >>> target = os.path.join(tempfile.mkdtemp(), "scaler.json")
+                >>> pre.save(target)
+                >>> type(Preprocessor.load(target)).__name__
+                'MinMaxScaler'
+
+        Args:
+            path: The local path or cloud URI to read.
+
+        Returns:
+            The reconstructed preprocessor, fitted if the saved one was.
+        """
+        from batcher.ml.preprocessors.persistence import load
+
+        return load(path)
+
     def _require_fitted(self) -> None:
         if not self._fitted:
             raise PlanError(

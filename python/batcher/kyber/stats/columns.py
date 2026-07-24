@@ -14,7 +14,7 @@ changes, so nothing can silently over-claim.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from batcher.kyber.stats.aggregate_columns import (
     global_aggregate_columns,
@@ -22,8 +22,14 @@ from batcher.kyber.stats.aggregate_columns import (
 )
 from batcher.kyber.stats.constants import constant_projection_stat
 from batcher.kyber.stats.derived import derived_projection_stat
+from batcher.kyber.stats.distribution import (
+    distinct_after_selection,
+    merge_quantile_grids,
+    union_ndv,
+)
+from batcher.kyber.stats.join_columns import asof_join_columns, join_columns
 from batcher.plan.expr_ir import Cast, Col, Lit
-from batcher.plan.logical import AsofJoin, Join, Projection
+from batcher.plan.logical import Projection
 from batcher.plan.schema import SchemaRef
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, weakest
 from batcher.plan.types import DTYPE_REGISTRY
@@ -154,7 +160,9 @@ def _identity_cast_column(
     return child.columns.get(cast.input.name)
 
 
-def filter_columns(child: RelStats, max_ndv: float | None = None) -> dict[str, ColumnStat]:
+def filter_columns(
+    child: RelStats, max_ndv: float | None = None, shrink_ndv: bool = True
+) -> dict[str, ColumnStat]:
     """Filter output column stats: min/max survive as *bounds* (a filter can only
     shrink the value range), but provenance drops to `DEFAULT` because the
     extremes may have been removed. null_count becomes unknown; ndv is an upper bound.
@@ -167,17 +175,27 @@ def filter_columns(child: RelStats, max_ndv: float | None = None) -> dict[str, C
     statistics the metadata loop measured (a `WHERE` clause would cost a wide string column
     at the flat 64-byte default and forfeit its broadcast join).
 
-    `max_ndv` (the operator's surviving row count) caps each column's distinct count: a
-    learned ndv reflects the *unfiltered* source and can exceed the rows a selective filter
-    leaves, and a stale-large ndv deflates a downstream join estimate (`|L||R|/max(ndv)`) —
-    an under-budget risk. Capping only *lowers* ndv, which *raises* that estimate (the safe
-    direction), exactly as `join_columns` already caps a preserved column at the output rows.
+    `max_ndv` (the operator's surviving row count) bounds each column's distinct count, and
+    with `shrink_ndv` the bound is sharpened to the *expected* surviving count rather than
+    the trivial `min(ndv, rows)`. Both matter, in the same direction: a learned ndv reflects
+    the **unfiltered** source, and a stale-large ndv deflates a downstream join estimate
+    (`|L||R|/max(ndv)`) — an under-budget risk. A 1%-selective predicate over 1M distinct
+    values leaves ~95K of them, not 1M and not the 100K row cap, and the difference steers
+    every group-by, `DISTINCT`, and join above the filter (`distinct_after_selection`).
+
+    `shrink_ndv=False` keeps the plain cap, for a row-shrinking operator whose surviving rows
+    are **not** a uniform random subset — a `Limit` takes a *prefix*, which over a sorted or
+    clustered relation can hold far fewer distinct values than Yao's random-subset model
+    predicts, so only the sound `min(ndv, rows)` upper bound may be claimed there.
     """
     out: dict[str, ColumnStat] = {}
     for name, stat in child.columns.items():
         ndv = stat.ndv
-        if max_ndv is not None and ndv is not None and ndv > max_ndv:
-            ndv = max(1.0, max_ndv)
+        if max_ndv is not None and ndv is not None:
+            if shrink_ndv:
+                ndv = distinct_after_selection(ndv, child.rows, max_ndv)
+            elif ndv > max_ndv:
+                ndv = max(1.0, max_ndv)
         out[name] = dataclasses.replace(
             stat.downgrade(Provenance.DEFAULT),
             null_count=None,  # filter may drop nulls; count no longer known
@@ -189,15 +207,24 @@ def filter_columns(child: RelStats, max_ndv: float | None = None) -> dict[str, C
 def limit_columns(child: RelStats, max_ndv: float | None = None) -> dict[str, ColumnStat]:
     """Limit output column stats: like a filter, min/max are retained as bounds
     but downgraded (a prefix of rows may exclude the extremes). `max_ndv` caps the
-    distinct count at the surviving rows (see `filter_columns`)."""
-    return filter_columns(child, max_ndv)
+    distinct count at the surviving rows.
+
+    Deliberately the plain cap and not the random-subset shrinkage a filter gets: a `LIMIT`
+    takes the *first* rows, and over a relation sorted or clustered on the column those rows
+    can share far fewer distinct values than a uniform sample would, so only the sound
+    `min(ndv, rows)` upper bound may be claimed here (see `filter_columns`)."""
+    return filter_columns(child, max_ndv, shrink_ndv=False)
 
 
 def sample_columns(child: RelStats, max_ndv: float | None = None) -> dict[str, ColumnStat]:
     """Sample output column stats: a sample is a row-shrinking operator, so min/max
     survive only as *bounds* and are downgraded from `EXACT` (the sampled subset may
-    drop the extremes), exactly like a filter/limit. `max_ndv` caps the distinct count
-    at the sampled rows — a 1% sample cannot hold the source's full distinct count."""
+    drop the extremes), exactly like a filter/limit.
+
+    A sample is the one operator whose surviving rows really are a uniform random subset, so
+    its distinct count follows Yao's formula exactly rather than the trivial row cap: a 1%
+    sample of a column whose values repeat ~100 times keeps ~63% of them, while a 1% sample
+    of a unique key keeps one distinct value per row."""
     return filter_columns(child, max_ndv)
 
 
@@ -279,12 +306,13 @@ def union_columns(children: list[RelStats], output_names: list[str]) -> dict[str
 
     For each output column, min = min over branches, max = max over branches;
     null_count = sum over branches. Each is `EXACT` only when every branch's
-    corresponding stat is `EXACT` and present. ndv is left unknown (distinct
-    values may overlap across branches).
+    corresponding stat is `EXACT` and present. The distributional statistics merge by the
+    identities `UNION ALL` makes available — see `_merge_union_column`.
     """
     out: dict[str, ColumnStat] = {}
     # Resolve each branch's columns in its own output order, aligned by position.
     branch_cols = [list(c.columns.values()) for c in children]
+    rows = [c.rows for c in children]
     for pos, name in enumerate(output_names):
         stats: list[ColumnStat] = []
         for bi, branch in enumerate(children):
@@ -295,106 +323,78 @@ def union_columns(children: list[RelStats], output_names: list[str]) -> dict[str
                 stats.append(branch_cols[bi][pos])
         if len(stats) != len(children):
             continue  # a branch lacks this column → can't combine safely
-        out[name] = _merge_union_column(stats)
+        out[name] = _merge_union_column(stats, rows)
     return out
 
 
-def _merge_union_column(stats: list[ColumnStat]) -> ColumnStat:
+def _merge_union_column(stats: list[ColumnStat], rows: list[float]) -> ColumnStat:
+    """Combine one column's per-branch statistics into the `UNION ALL` output's.
+
+    Concatenation is the operator that preserves the most: every branch's rows appear
+    unchanged, so several statistics merge *exactly* rather than being dropped.
+
+    * **min/max** — the extremes over the branches.
+    * **null_count / total_sum** — additive over branches, exactly.
+    * **mean** — the row-weighted mean ``Σ nᵢ μᵢ / Σ nᵢ``, which is the concatenation's true
+      mean; averaging the branch means unweighted is only right when the branches are the
+      same size.
+    * **ndv** — bounded below by the largest branch's and above by the sum; `union_ndv`
+      interpolates between those Fréchet bounds under an independent-membership model. It
+      carries its **own** `DEFAULT` tag, because it is an estimate even when every branch's
+      count is exact — the branches' overlap is unmeasured.
+      Dropping it (the previous behaviour) made every join above a partition-union fall back
+      to `max(|L|, |R|)`, which is the estimate a partitioned fact table can least afford.
+    * **quantiles** — the union's CDF is the row-weighted mixture of the branches' CDFs, an
+      exact identity; `merge_quantile_grids` re-grids that mixture.
+    * **avg_bytes** — the row-weighted mean width, which is what the concatenation's average
+      row actually costs (the widest branch over-charges a union whose wide branch is tiny).
+    * **mcv** — dropped. A frequency table merges only if every branch lists the value, and
+      absence from a branch's top-k is not evidence of a low frequency there, so any merged
+      figure could understate the skew — the one direction that risks an under-sized join.
+    """
     prov = weakest(*(s.provenance for s in stats))
     mins = [s.min for s in stats if s.min is not None]
     maxs = [s.max for s in stats if s.max is not None]
     nulls = [s.null_count for s in stats]
-    widths = [s.avg_bytes for s in stats if s.avg_bytes is not None]
+    sums = [s.total_sum for s in stats]
     all_min = len(mins) == len(stats)
     all_max = len(maxs) == len(stats)
     all_null = all(n is not None for n in nulls)
+    total_rows = sum(r for r in rows if r > 0.0)
     return ColumnStat(
         min=_safe_min(mins) if all_min else None,
         max=_safe_max(maxs) if all_max else None,
         null_count=sum(n for n in nulls if n is not None) if all_null else None,
-        ndv=None,
+        total_sum=(
+            sum(s for s in sums if s is not None) if all(s is not None for s in sums) else None
+        ),
+        mean=_row_weighted((s.mean for s in stats), rows, total_rows),
+        ndv=union_ndv([s.ndv for s in stats if s.ndv is not None], total_rows or None),
+        # The union's distinct count is an *estimate* however exact the branches are — two
+        # branches' value sets may overlap by any amount, and nothing here measures which.
+        # Without its own tag it would inherit an EXACT bundle provenance and let
+        # `count_distinct` answer a `UNION ALL` from a model, which is the one thing the
+        # provenance discipline exists to prevent.
+        ndv_provenance=Provenance.DEFAULT,
         provenance=prov,
-        # A width is a per-row property, so the union's is the widest branch's — the safe
-        # direction for the memory/broadcast sizing it feeds. Quantiles and MCVs describe a
-        # *distribution* and do not merge by any sound rule here, so they are dropped.
-        avg_bytes=max(widths) if widths else None,
+        avg_bytes=_row_weighted((s.avg_bytes for s in stats), rows, total_rows),
+        quantiles=merge_quantile_grids([s.quantiles for s in stats], rows),
     )
 
 
-def join_columns(
-    node: Join, left: RelStats, right: RelStats, out_rows: float | None = None
-) -> dict[str, ColumnStat]:
-    """Column stats for a join's output: each side's values as downgraded *bounds*.
+def _row_weighted(
+    values: Iterable[float | None], rows: list[float], total_rows: float
+) -> float | None:
+    """The row-weighted mean of a per-branch statistic, or None unless every branch has one.
 
-    A join only removes rows from a side or repeats them (an FK match), never invents
-    a new value, so a preserved column's `min`/`max` stay valid *bounds* — but the
-    extremes may be dropped and provenance must fall from `EXACT` (a join is a
-    row-shrinking/duplicating operator). `null_count` is dropped (a match may duplicate
-    rows or an outer join add nulls). The membership bloom survives — a value absent
-    from a side stays absent in any join output of it.
-
-    `ndv` is carried forward as `min(ndv_in, out_rows)`. Because a join invents no
-    values, the output's distinct count for a preserved column can only *fall* (rows
-    are dropped) — never rise — and it is trivially bounded by the output row count;
-    the minimum of the two is therefore a sound upper bound and the standard Selinger
-    estimate. Dropping it instead (the previous behaviour) left every join *above* a
-    join with no key NDV, so `_estimate_join` fell back to `max(|L|, |R|)` and could
-    not see that an upstream selective join shrinks the pipeline — which is what
-    steered TPC-H Q9 into multi-gigabyte `lineitem ⋈ partsupp ⋈ orders` intermediates
-    before joining the 5%-selective `part`. `out_rows` is the join's estimated output
-    cardinality; when unknown, `ndv` is dropped as before.
+    Requiring every branch is what keeps this sound: a mean or width computed over the
+    branches that happen to have measured one is not the concatenation's, it is a different
+    relation's.
     """
-    out: dict[str, ColumnStat] = {}
-    for o in node.output:
-        side = left if o.side == "left" else right
-        src = side.columns.get(o.name)
-        if src is not None:
-            out[o.alias] = dataclasses.replace(
-                src.downgrade(Provenance.DEFAULT),
-                null_count=None,
-                ndv=_join_ndv(src.ndv, out_rows),
-                total_sum=None,  # matching duplicates rows, so a recorded sum no longer holds
-                mean=None,
-                # The measured *width* survives — a join changes which rows are present, not
-                # how many bytes one holds — and it is what keeps byte-true memory and
-                # broadcast sizing alive above a join. Frequencies (mcv) do not: a join
-                # re-weights the value distribution by its match multiplicity.
-                mcv=None,
-            )
-    return out
-
-
-def asof_join_columns(node: AsofJoin, left: RelStats, right: RelStats) -> dict[str, ColumnStat]:
-    """Column stats for an ASOF join's output.
-
-    ASOF is **left-style**: every left row is emitted exactly once, so the left columns'
-    values are exactly the left input's — their full stats (EXACT included) carry through
-    unchanged. A right column is preserved where matched and NULL where not, and the nearest
-    match can repeat or skip right rows, so it survives only as downgraded *bounds* with the
-    null count dropped — the same treatment `join_columns` gives a preserved side. Without
-    this the estimator returned no columns at all, blinding every operator above an ASOF join
-    to the very statistics (bounds, ndv, byte width) that drive its cost and broadcast sizing.
-    """
-    out: dict[str, ColumnStat] = {}
-    for o in node.output:
-        if o.side == "left":
-            src = left.columns.get(o.name)
-            if src is not None:
-                out[o.alias] = src  # every left row emitted once → values unchanged
-        else:
-            src = right.columns.get(o.name)
-            if src is not None:
-                out[o.alias] = dataclasses.replace(
-                    src.downgrade(Provenance.DEFAULT), null_count=None, mcv=None
-                )
-    return out
-
-
-def _join_ndv(ndv: float | None, out_rows: float | None) -> float | None:
-    """A preserved column's distinct count after a join: `min(ndv, out_rows)`."""
-    if ndv is None or out_rows is None:
+    paired = [(v, r) for v, r in zip(values, rows, strict=False) if v is not None and r > 0.0]
+    if not paired or len(paired) != sum(1 for r in rows if r > 0.0) or total_rows <= 0.0:
         return None
-    return max(1.0, min(ndv, out_rows))
+    return sum(v * r for v, r in paired) / total_rows
 
 
 def _safe_min(values: list):

@@ -12,11 +12,11 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float32Builder, Float64Array, GenericBinaryArray, Int32Array, Int64Array,
-    ListBuilder, OffsetSizeTrait, StructArray,
+    Array, ArrayRef, AsArray, Float32Builder, Float64Array, GenericBinaryArray, Int32Array,
+    Int64Array, ListBuilder, OffsetSizeTrait, StructArray,
 };
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, Int64Type};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -404,7 +404,6 @@ mod tests {
     fn ea(func: AudioFunc, arr: &ArrayRef, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
         eval_audio(func, arr, rate, None, None, None, None)
     }
-    use arrow::array::{Float32Array, ListArray};
 
     /// Build a minimal mono 16-bit PCM WAV from `samples` at `sample_rate`.
     fn make_wav(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
@@ -439,9 +438,9 @@ mod tests {
             Some(b"not audio".as_slice()),
         ]));
         let out = ea(AudioFunc::Decode, &arr, None).unwrap();
-        let s = out.as_any().downcast_ref::<StructArray>().unwrap();
-        let rate = s.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let frames = s.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let s = out.as_struct();
+        let rate = s.column(0).as_primitive::<Int32Type>();
+        let frames = s.column(2).as_primitive::<Int64Type>();
         assert!(s.is_valid(0) && rate.value(0) == 8000 && frames.value(0) == 6);
         assert!(s.is_null(1)); // null bytes → null
         assert!(s.is_null(2)); // undecodable → null
@@ -494,8 +493,8 @@ mod tests {
             rows.iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
         ));
         let out = ea(AudioFunc::Decode, &arr, None).unwrap();
-        let s = out.as_any().downcast_ref::<StructArray>().unwrap();
-        let frames = s.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let s = out.as_struct();
+        let frames = s.column(2).as_primitive::<Int64Type>();
         for (i, exp) in expect_frames.iter().enumerate() {
             match exp {
                 Some(f) => assert!(s.is_valid(i) && frames.value(i) == *f, "row {i}"),
@@ -545,7 +544,7 @@ mod tests {
             Some(b"not audio".as_slice()),
         ]));
         let out = ea(AudioFunc::Resample, &arr, Some(4000)).unwrap();
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         assert_eq!(list.value_length(0), 4); // 8 frames at 8k -> 4 at 4k
         assert!(list.is_null(1) && list.is_null(2)); // null + undecodable -> null
     }
@@ -568,10 +567,10 @@ mod tests {
         let wav = make_wav(8000, &[0, 16384, -16384]);
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(wav.as_slice()), None]));
         let out = ea(AudioFunc::ToWaveform, &arr, None).unwrap();
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let list = out.as_list::<i32>();
         assert!(list.is_valid(0) && list.value_length(0) == 3);
         let row0 = list.value(0);
-        let px = row0.as_any().downcast_ref::<Float32Array>().unwrap();
+        let px = row0.as_primitive::<Float32Type>();
         // 16384/32768 ≈ 0.5 in normalized f32.
         assert!((px.value(1) - 0.5).abs() < 0.01);
         assert!(list.is_null(1)); // null bytes → null list

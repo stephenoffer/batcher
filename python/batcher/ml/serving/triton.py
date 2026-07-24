@@ -32,6 +32,7 @@ def triton_client(
     max_batch_size: int | None = None,
     pipeline_depth: int = 1,
     retries: int = 2,
+    timeout: float | None = None,
 ) -> type:
     """A `map_batches` class UDF running each batch through a Triton model.
 
@@ -62,6 +63,9 @@ def triton_client(
             the client encodes and decodes. Results stay in input order.
         retries: retry attempts, with jittered backoff, for a transient Triton failure
             (a restarting server, a dropped connection).
+        timeout: per-request timeout in seconds. Without one, a wedged Triton replica
+            blocks the worker forever and the retry never fires (the call never returns);
+            with one, a timed-out request raises and is retried like any transient failure.
 
     Returns:
         A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
@@ -70,7 +74,9 @@ def triton_client(
         raise BackendError(f"triton protocol must be 'http' or 'grpc', got {protocol!r}")
 
     def connect() -> _TritonServingClient:
-        return _TritonServingClient(url, model, list(output_columns), protocol, model_version)
+        return _TritonServingClient(
+            url, model, list(output_columns), protocol, model_version, timeout
+        )
 
     return serving_udf(
         connect,
@@ -86,7 +92,13 @@ class _TritonServingClient:
     """Wraps a `tritonclient` http/grpc connection as a `ServingClient`."""
 
     def __init__(
-        self, url: str, model: str, outputs: list[str], protocol: str, version: str
+        self,
+        url: str,
+        model: str,
+        outputs: list[str],
+        protocol: str,
+        version: str,
+        timeout: float | None = None,
     ) -> None:
         try:
             if protocol == "grpc":
@@ -104,6 +116,7 @@ class _TritonServingClient:
         self._model = model
         self._outputs = outputs
         self._version = version
+        self._timeout = timeout
 
     def warmup(self) -> None:
         """Check the model is loaded and serving, before the first real batch.
@@ -125,8 +138,14 @@ class _TritonServingClient:
             triton_in.set_data_from_numpy(arr)
             infer_inputs.append(triton_in)
         requested = [self._tc.InferRequestedOutput(name) for name in self._outputs]
+        # `client_timeout` bounds the wait so a wedged replica raises (and is retried)
+        # instead of blocking the worker forever; both the http and grpc clients accept it.
         response = self._client.infer(
-            self._model, infer_inputs, model_version=self._version, outputs=requested
+            self._model,
+            infer_inputs,
+            model_version=self._version,
+            outputs=requested,
+            client_timeout=self._timeout,
         )
         return {name: response.as_numpy(name) for name in self._outputs}
 

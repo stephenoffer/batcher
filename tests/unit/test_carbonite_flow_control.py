@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from batcher.carbonite import ResourceManager
-from batcher.carbonite.policies import AIMDFlowControl
+from batcher.carbonite.policies import AIMDFlowControl, credit_ceiling
 from batcher.config import Config, FlowControlConfig, config_context
 
 pytestmark = pytest.mark.unit
@@ -59,16 +59,59 @@ def test_credit_ceiling_shrinks_for_wide_learned_rows():
     assert wide_grant < narrow_grant
 
 
-def test_aimd_slow_starts_then_grows_additively():
+def test_aimd_slow_starts_then_recovers_along_the_cubic_curve():
     # Before the first congestion the window is in slow-start and DOUBLES each headroom
     # round (TCP slow-start) so it fills the bandwidth-delay product in log2 rounds; the
-    # first congestion exits slow-start into additive-increase (congestion avoidance).
+    # first congestion exits slow-start into congestion avoidance.
+    #
+    # Congestion avoidance recovers along CUBIC, not `+alpha`. The window congestion was
+    # found at (16) is a *measured* capacity, so climbing back to it one credit per round
+    # would spend most of the transfer below a value the channel already proved safe — on a
+    # cross-node shuffle every one of those rounds is a network round trip. The cubic is
+    # steepest far below `w_max` and flattens as it approaches, so it recovers in a couple of
+    # rounds and then sits near the known-good window.
     a = _aimd(default_credits=4, aimd_alpha=1)
     assert a.observe(congested=False) == 8  # slow-start: 4 -> 8
     assert a.observe(congested=False) == 16  # slow-start: 8 -> 16
     assert a.observe(congested=True) == 8  # congestion: cut, and leave slow-start
-    assert a.observe(congested=False) == 9  # now additive: +alpha per round
-    assert a.observe(congested=False) == 10
+    first = a.observe(congested=False)
+    second = a.observe(congested=False)
+    assert first > 9, "additive increase would have crawled to 9"
+    assert first < 16, "recovery must approach the known-good window from below"
+    assert first < second <= 16
+
+
+def test_cubic_recovery_is_never_slower_than_additive_increase():
+    # CUBIC's TCP-friendly region: growth is the larger of the cubic and the additive law, so
+    # the change can only ever make recovery faster, never slower — including on a small
+    # window where the cubic is flat and `+alpha` is what actually moves it.
+    cfg = Config().replace(flow_control=FlowControlConfig(default_credits=4, aimd_alpha=1))
+    ceiling = credit_ceiling(cfg)
+    for beta in (0.5, 0.9):
+        cubic = _aimd(default_credits=4, aimd_alpha=1, aimd_beta=beta)
+        for _ in range(3):
+            cubic.observe(congested=False)
+        cubic.observe(congested=True)
+        after_backoff = cubic.window
+        windows = [cubic.observe(congested=False) for _ in range(6)]
+        # Both laws are clamped by the same memory-safe ceiling, so the comparison is
+        # against additive increase *under that ceiling*.
+        additive = [min(after_backoff + i, ceiling) for i in range(1, 7)]
+        assert all(c >= a for c, a in zip(windows, additive, strict=True)), (
+            f"beta={beta}: {windows} fell below additive increase {additive}"
+        )
+
+
+def test_cubic_growth_never_passes_the_memory_safe_ceiling():
+    a = _aimd(default_credits=4, aimd_alpha=1)
+    for _ in range(6):
+        a.observe(congested=False)
+    a.observe(congested=True)
+    ceiling = a.window
+    for _ in range(200):
+        ceiling = max(ceiling, a.observe(congested=False))
+    cfg = Config().replace(flow_control=FlowControlConfig(default_credits=4, aimd_alpha=1))
+    assert ceiling <= credit_ceiling(cfg)
 
 
 def test_aimd_warm_started_channel_skips_slow_start():

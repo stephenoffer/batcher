@@ -41,8 +41,11 @@ def _tokens_with_eos(column: pa.Array, eos_token: int | None) -> np.ndarray:
 
     if isinstance(column, pa.ChunkedArray):
         column = column.combine_chunks()
-    # An all-null (or empty, hence type-less) column carries no documents at all.
-    if len(column) == 0 or not pa.types.is_list(column.type):
+    # An all-null (or empty, hence type-less) column carries no documents at all. Accept
+    # every list flavour a tokenizer produces: `list` (the default), `large_list` (the
+    # HuggingFace fast tokenizers' int32-offset output, which the old `is_list`-only check
+    # silently dropped every token of), and `fixed_size_list` (padded/uniform outputs).
+    if len(column) == 0 or not _is_list_like(column.type):
         return np.empty(0, dtype=np.int64)
     # A null list contributes no tokens, and no separator (it is not a document).
     if column.null_count:
@@ -53,8 +56,7 @@ def _tokens_with_eos(column: pa.Array, eos_token: int | None) -> np.ndarray:
     if eos_token is None:
         return flat
 
-    offsets = np.asarray(column.offsets, dtype=np.int64)
-    lengths = np.diff(offsets)
+    lengths = _list_lengths(column)
     if lengths.size == 0:
         return flat
 
@@ -64,6 +66,28 @@ def _tokens_with_eos(column: pa.Array, eos_token: int | None) -> np.ndarray:
     shift = np.repeat(np.arange(lengths.size, dtype=np.int64), lengths)
     out[np.arange(flat.size, dtype=np.int64) + shift] = flat
     return out
+
+
+def _is_list_like(dtype: pa.DataType) -> bool:
+    """Whether `dtype` is a list column this packer can read tokens out of."""
+    import pyarrow as pa
+
+    return (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+    )
+
+
+def _list_lengths(column: pa.Array) -> np.ndarray:
+    """Each row's token count. A `fixed_size_list` has no offsets — every row is `list_size`."""
+    import numpy as np
+    import pyarrow as pa
+
+    if pa.types.is_fixed_size_list(column.type):
+        return np.full(len(column), column.type.list_size, dtype=np.int64)
+    offsets = np.asarray(column.offsets, dtype=np.int64)
+    return np.diff(offsets)
 
 
 def _emit(tokens: np.ndarray, seq_len: int, output_column: str) -> pa.RecordBatch:

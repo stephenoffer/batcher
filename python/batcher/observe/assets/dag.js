@@ -57,6 +57,7 @@ function createDagExplorer() {
   const moved = new Map();          // queryId -> { op_id: {x,y} } for user-dragged boxes
   let view = { x: 0, y: 0, k: 1 };
   let ctx = null;                   // everything about the currently rendered graph
+  let sizeObserver = null;          // fits the graph once its container first has a size
 
   const el = (name, attrs = {}) => {
     const node = document.createElementNS(SVG_NS, name);
@@ -99,12 +100,31 @@ function createDagExplorer() {
     if (!ctx || !ctx.placed.length) return;
     const b = bounds();
     const box = ctx.svg.getBoundingClientRect();
+    // A zero-width box means the graph's pane is not laid out yet — hidden behind another
+    // tab, or revealed a frame later than this call. Leave `fitted` false so the size
+    // observer re-fits the moment the box gains a width, instead of stranding the graph at
+    // scale 1 in the top-left corner, which is what read as "the plan graph is broken".
     if (!box.width) return;
     const k = Math.max(MIN_SCALE, Math.min(1.15, Math.min(box.width / (b.maxX - b.minX),
                                                           box.height / (b.maxY - b.minY)) * 0.94));
     view = { k, x: (box.width - (b.maxX - b.minX) * k) / 2 - b.minX * k,
                 y: (box.height - (b.maxY - b.minY) * k) / 2 - b.minY * k };
     applyView();
+    ctx.fitted = true;
+  }
+
+  /* Fit the graph once its container first has a size.
+   *
+   * `render` schedules a fit on the next frame, but a graph that renders into a hidden pane
+   * (another tab is active, or the view is revealed a beat later) has no width then, so that
+   * fit no-ops and nothing ever re-fits it. A ResizeObserver closes the gap: the first time
+   * the box transitions to a real width it fits, once, and then stops auto-fitting so a zoom
+   * the reader has set is never yanked back. */
+  function observeSize(svg) {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (sizeObserver) sizeObserver.disconnect();
+    sizeObserver = new ResizeObserver(() => { if (ctx && !ctx.fitted) fit(); });
+    sizeObserver.observe(svg);
   }
 
   /* Pan a specific step to the middle of the viewport without changing zoom.
@@ -114,7 +134,10 @@ function createDagExplorer() {
    * Only the position moves. */
   function reveal(id) {
     if (!ctx) return;
-    const pos = ctx.placed.find((p) => p.node.op_id === id);
+    // The node's drawn position lives in `ctx.boxes`, keyed by op_id — `placed` holds the
+    // node data, not its coordinates. Reading `.x`/`.y` off a placed node (or `.node.op_id`)
+    // silently found nothing, so clicking a cost row never panned to its step.
+    const pos = ctx.boxes.get(id);
     if (!pos) return;
     const box = ctx.svg.getBoundingClientRect();
     if (!box.width) return;
@@ -233,7 +256,7 @@ function createDagExplorer() {
     ctx = { svg, dag, opts, queryId, placed: [], boxes: new Map(), groups: new Map(),
             byId: new Map(), edgePaths: [], selected: null, focus: false, needle: '',
             showCritical: prev && prev.queryId === queryId ? prev.showCritical : true,
-            onZoom: opts.onZoom, stats: null };
+            onZoom: opts.onZoom, stats: null, fitted: false };
     if (!dag || !dag.nodes.length) return [];
 
     // Rows are numbered bottom-up (0 = sources) but drawn top-down.
@@ -408,6 +431,9 @@ function createDagExplorer() {
     installGestures(svg);
     applyEmphasis();
     requestAnimationFrame(fit);
+    // Belt to the rAF-fit's suspenders: if the pane has no width this frame, this fits the
+    // instant it gains one, so a graph rendered off-screen is never left un-fitted.
+    observeSize(svg);
 
     const legend = [{ swatch: 'ramp', label: 'share of operator time' }];
     if (dag.critical_path?.length) legend.push({ cls: 'crit', label: 'critical path — the chain that sets the runtime' });
@@ -519,9 +545,81 @@ function createDagExplorer() {
   const fmtMs = (v) => UI.ms(v);
   const fmtShare = (fraction) => UI.pct(fraction);
 
+  /* A pipeline's plan as a tiny, static drawing — its visual fingerprint.
+   *
+   * Not the interactive explorer: no pan, zoom, selection, or measurements. Just the shape,
+   * so a reader can tell one pipeline from another down a list the way you recognise a face
+   * before you read the name. Laid out from the same column/row the server computed for the
+   * full graph, so the thumbnail and the graph never disagree about where an operator sits.
+   *
+   * Nodes are neutral chips with the operator's glyph, not colour-coded — the page's rule is
+   * that plan steps are stages of one query, labelled, not categories tinted by hue. Only the
+   * critical path gets a faint accent, because that is state, not identity. */
+  function thumbnail(shape, { width = 148, height = 92 } = {}) {
+    const nodes = (shape && shape.nodes) || [];
+    if (!nodes.length) {
+      return `<div class="dag-thumb is-empty" role="img" aria-label="No plan recorded yet">` +
+        `${glyphMarkup('_default', 22)}</div>`;
+    }
+    const cols = Math.max(1, shape.width || 1);
+    const maxRow = Math.max(1, (shape.depth || 1) - 1);
+    const pad = 14;
+    const px = (c) => (cols === 1
+      ? width / 2
+      : pad + (c / (cols - 1)) * (width - 2 * pad));
+    // row 0 is the sources (bottom); the highest row is the root (top).
+    const py = (row) => pad + ((maxRow - row) / maxRow) * (height - 2 * pad);
+    const byId = new Map(nodes.map((n) => [n.op_id, n]));
+    const edges = (shape.edges || []).map((e) => {
+      const a = byId.get(e.from), b = byId.get(e.to);
+      if (!a || !b) return '';
+      return `<line class="tn-edge" x1="${px(a.column).toFixed(1)}" y1="${py(a.row).toFixed(1)}" ` +
+        `x2="${px(b.column).toFixed(1)}" y2="${py(b.row).toFixed(1)}"/>`;
+    }).join('');
+    const chips = nodes.map((n) => {
+      const cx = px(n.column), cy = py(n.row);
+      const glyph = GLYPHS[n.kind] || GLYPHS._default;
+      return `<g transform="translate(${cx.toFixed(1)},${cy.toFixed(1)})" ` +
+        `class="tn-node${n.on_critical_path ? ' is-crit' : ''}">` +
+        `<circle r="11"/>` +
+        `<path transform="translate(-7,-7) scale(0.78)" d="${glyph}" ` +
+        `fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" ` +
+        `stroke-linejoin="round"/>` +
+        `<title>${UI.esc(friendlyKind(n.kind))}${n.detail ? ` — ${UI.esc(n.detail)}` : ''}</title>` +
+        `</g>`;
+    }).join('');
+    const label = nodes.map((n) => friendlyKind(n.kind)).join(', ');
+    return `<svg class="dag-thumb" viewBox="0 0 ${width} ${height}" ` +
+      `role="img" aria-label="Plan: ${UI.esc(label)}">${edges}${chips}</svg>`;
+  }
+
+  /* A short, readable name for a pipeline, derived from its plan shape — the default when a
+   * person has not named it themselves. The operators in execution order, collapsed and
+   * capped, so a filter-join-group pipeline reads "Read → Filter → Join → Group" rather than
+   * repeating the raw IR tag of whichever operator happened to be the terminal one. */
+  const SHORT = {
+    scan: 'Read', filter: 'Filter', hash_join: 'Join', sort_merge_join: 'Join',
+    asof_join: 'Join', aggregate: 'Group', sort: 'Sort', limit: 'Limit',
+    distinct: 'Distinct', project: 'Select', union: 'Union', window: 'Window', unnest: 'Unnest',
+  };
+  function pipelineName(shape, custom) {
+    if (custom) return custom;
+    const nodes = (shape && shape.nodes) || [];
+    if (!nodes.length) return 'Unnamed pipeline';
+    // Execution order: row 0 (sources) first, up toward the root; ties broken left to right.
+    const order = [...nodes].sort((a, b) => a.row - b.row || a.column - b.column);
+    const seq = [];
+    for (const n of order) {
+      const step = SHORT[n.kind] || friendlyKind(n.kind);
+      if (seq[seq.length - 1] !== step) seq.push(step);  // collapse consecutive repeats
+    }
+    const parts = seq.length > 4 ? [seq[0], '…', seq[seq.length - 2], seq[seq.length - 1]] : seq;
+    return parts.join(' → ');
+  }
+
   return { render, fit, reset, select, step, stepAcross, setSearch, setFocus, setCritical,
            selectedNode, fmtCount, fmtMs, friendlyKind, friendlyKinds, glyphMarkup,
-           reveal, selectOnly, fmtShare };
+           reveal, selectOnly, fmtShare, thumbnail, pipelineName };
 }
 
 //: The run page's graph. Also the module's home for the shared formatters, which the rest

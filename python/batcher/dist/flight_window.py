@@ -12,7 +12,6 @@ partition (still on disk) on a survivor — the same Spark-style lineage recover
 
 from __future__ import annotations
 
-import contextlib
 import json
 
 import pyarrow as pa
@@ -125,94 +124,31 @@ def _window_reduce_with_recovery(
     """
     import ray
 
-    from batcher._internal.errors import ResourceError
-    from batcher.carbonite.resilience import ShuffleRecovery, gather_with_backups
-    from batcher.dist.executors.ray_runtime import (
-        draining_workers,
-        recovery_policy,
-        speculation_policy,
-    )
+    from batcher.dist.executors.ray_runtime import run_bucket_reduce
 
-    dead: set[int] = set(dead or ())
-
-    def _pick_live(avoid: set[int]) -> int:
-        for i in range(workers):
-            if i not in dead and i not in avoid:
-                return i
-        raise ResourceError("no surviving worker to recover the window shuffle on")
-
-    # A window-bucket reduce that returns "ok" computed its complete partitions
-    # deterministically, so cache it across recovery rounds (keyed by bucket index) and
-    # never re-run it. Only pending buckets re-launch, so one lost mapper doesn't
-    # recompute every surviving bucket — the amplification that hurt most on a churning
-    # spot/autoscaling cluster.
-    done: dict[int, object] = {}
-
-    def _host_for(r: int, avoid: set[int]) -> int:
-        return r if r not in dead and r not in avoid else _pick_live(avoid)
-
-    def attempt():
-        failed = set()
-        # Launch every *pending* window reduce concurrently, then collect via
-        # `gather_with_backups`: a degraded-but-alive bucket gets a backup on another
-        # live worker (deterministic ⇒ byte-identical), a dead host is classified for
-        # recompute — so one slow node cannot stall the window barrier.
-        ref_host: dict[object, int] = {}
-
-        def _launch(r: int, avoid: set[int]):
-            host = _host_for(r, avoid)
-            ref = actors[host].reduce_window.remote(
-                win_json, addrs, r, None, None, current_plan_id()
-            )
-            ref_host[ref] = host
-            return ref
-
-        pending = [r for r in range(n_buckets) if r not in done]
-        refs = [_launch(r, set()) for r in pending]
-
-        def _relaunch(idx: int):
-            try:
-                return _launch(pending[idx], {ref_host[refs[idx]]})
-            except ResourceError:
-                return _launch(pending[idx], set())
-
-        def _on_failure(_idx: int, ref: object, _exc: Exception):
-            return ("__dead__", ref_host.get(ref))
-
-        gathered = gather_with_backups(
-            refs, _relaunch, speculation_policy(), on_failure=_on_failure
+    def remote_reduce(host: int, bucket: int):
+        return actors[host].reduce_window.remote(
+            win_json, addrs, bucket, None, None, current_plan_id()
         )
-        for r, (status, payload) in zip(pending, gathered, strict=True):
-            if status == "ok":
-                done[r] = payload  # complete + deterministic → cache, never re-run
-            elif status == "__dead__":
-                if payload is not None:
-                    dead.add(payload)  # its mapped rows are lost too
-                    failed.add(payload)
-            else:
-                failed.update(payload)
-        return [p for p in done.values() if p], failed
 
-    def recompute(failed_srcs):
-        for src in failed_srcs:
-            dead.add(src)  # an unreachable mapper means that worker is gone
-            target = _pick_live({src})
-            addrs[src] = ray.get(
-                actors[target].map_publish_raw.remote(
-                    map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
-                )
+    def republish(target: int, src: int) -> None:
+        addrs[src] = ray.get(
+            actors[target].map_publish_raw.remote(
+                map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
             )
+        )
 
-    # Proactive spot-preemption migration: move a draining worker's window bucket to a
-    # survivor before reclamation (no recovery round, no idle-timeout stall). Best-effort
-    # — a failure falls through to the reactive recompute the loop already does.
-    proactive = draining_workers(actors, workers)
-    if proactive:
-        with contextlib.suppress(Exception):
-            recompute(proactive)
-
-    finals = ShuffleRecovery(recovery_policy()).run(attempt, recompute)
+    done = run_bucket_reduce(
+        kind="window",
+        n_buckets=n_buckets,
+        workers=workers,
+        actors=actors,
+        remote_reduce=remote_reduce,
+        republish=republish,
+        dead=dead,
+    )
     out: list[pa.RecordBatch] = []
-    for res in finals:
-        out.extend(b for b in res if b.num_rows > 0)
+    for res in done.values():
+        if res:
+            out.extend(b for b in res if b.num_rows > 0)
     return out

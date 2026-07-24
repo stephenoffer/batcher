@@ -156,6 +156,56 @@ fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprErr
         })
 }
 
+/// Validate a per-row element count and return it as a `usize`.
+///
+/// Every tensor-producing image function shares one hazard: the per-row element count is
+/// also the `FixedSizeList` element length, an Arrow `i32`, and is driven by the query's
+/// width/height parameters. At ~26,755² a `w*h*3` request already exceeds `i32::MAX`,
+/// where the later `as i32` cast wraps negative (an invalid array / panic) and the
+/// `len * per_row` allocation becomes a multi-gigabyte OOM bomb. Rejecting it here, with
+/// `per_row` computed in `u64` so the multiply cannot itself overflow, is the guard all of
+/// them need — so it lives once. `unit` names what a row counts (``"bytes"`` / ``"floats"``
+/// / ``"pixels"``) for the error message.
+fn element_len_guard(func: &str, per_row: u64, unit: &str) -> Result<usize, ExprError> {
+    if per_row > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: func.to_string(),
+            reason: format!(
+                "{per_row} {unit} per row exceeds the maximum element length of {}",
+                i32::MAX
+            ),
+        });
+    }
+    Ok(per_row as usize)
+}
+
+/// Assemble per-row RGB8/gray buffers into a `FixedSizeList<UInt8>` column.
+///
+/// The tail every `UInt8` image tensor shares: a straight `per_row`-byte memcpy per row
+/// into one contiguous child buffer (an undecodable row — `None` — leaves its slot zeroed
+/// and is marked null), then the `FixedSizeListArray`. Serial on purpose: it is a memcpy,
+/// cheap next to the parallel decode that produced `rows`.
+fn assemble_u8_tensor(n: usize, per_row: usize, rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
+    let mut values: Vec<u8> = vec![0u8; n * per_row];
+    let mut valid: Vec<bool> = Vec::with_capacity(n);
+    for (i, row) in rows.into_iter().enumerate() {
+        match row {
+            Some(buf) => {
+                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
+                valid.push(true);
+            }
+            None => valid.push(false),
+        }
+    }
+    let field = Arc::new(Field::new("item", DataType::UInt8, false));
+    Arc::new(FixedSizeListArray::new(
+        field,
+        per_row as i32,
+        Arc::new(UInt8Array::from(values)),
+        Some(NullBuffer::from(valid)),
+    ))
+}
+
 /// `resize(w, h)` → re-encoded PNG bytes at the new size. Null/undecodable → null.
 fn resize<O: OffsetSizeTrait>(
     bytes: &GenericBinaryArray<O>,
@@ -247,25 +297,7 @@ fn to_tensor<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("to_tensor", "width", width)?;
     let h = dim("to_tensor", "height", height)?;
-    // Each dimension is individually a valid `u32` (guarded by `dim`), but the *product*
-    // `w * h * 3` is the per-row byte count — and it is also the `FixedSizeList` element
-    // length, an Arrow `i32`. At ~26_755² it already exceeds `i32::MAX`: the `as i32` cast
-    // below would wrap negative (an invalid array / panic), and `bytes.len() * per_row`
-    // would pre-allocate a multi-gigabyte zeroed buffer (an OOM bomb driven by a query
-    // parameter). Reject the request cleanly instead — computed in `u64` so the multiply
-    // itself cannot overflow.
-    let per_row = (w as u64) * (h as u64) * 3;
-    if per_row > i32::MAX as u64 {
-        return Err(ExprError::InvalidArgument {
-            func: "to_tensor".to_string(),
-            reason: format!(
-                "tensor of {w}x{h}x3 = {per_row} bytes per row exceeds the maximum \
-                 element length of {} bytes",
-                i32::MAX
-            ),
-        });
-    }
-    let per_row = per_row as usize;
+    let per_row = element_len_guard("to_tensor", (w as u64) * (h as u64) * 3, "bytes")?;
     // Decode + resize every row in parallel (this is the training-data hot path:
     // `read.images(decode=True)` lowers to exactly this kernel). Each row yields its
     // own `per_row`-byte RGB8 buffer, or `None` on null/undecodable/wrong-size input.
@@ -275,27 +307,7 @@ fn to_tensor<O: OffsetSizeTrait>(
         }
         decode_rgb_resized(bytes.value(i), w, h).filter(|buf| buf.len() == per_row)
     });
-    // Assemble the contiguous FixedSizeList child buffer serially — a straight memcpy
-    // per row (undecodable rows leave their slot zeroed), cheap next to the decode.
-    let mut values: Vec<u8> = vec![0u8; bytes.len() * per_row];
-    let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
-    for (i, row) in rows.into_iter().enumerate() {
-        match row {
-            Some(buf) => {
-                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
-                valid.push(true);
-            }
-            None => valid.push(false),
-        }
-    }
-    let field = Arc::new(Field::new("item", DataType::UInt8, false));
-    let arr = FixedSizeListArray::new(
-        field,
-        per_row as i32,
-        Arc::new(UInt8Array::from(values)),
-        Some(NullBuffer::from(valid)),
-    );
-    Ok(Arc::new(arr))
+    Ok(assemble_u8_tensor(bytes.len(), per_row, rows))
 }
 
 /// `to_tensor_f32(w, h, mean, std, channels_first)` → `FixedSizeList<Float32>` of length
@@ -318,21 +330,7 @@ fn to_tensor_f32<O: OffsetSizeTrait>(
 
     let w = dim("to_tensor_f32", "width", width)?;
     let h = dim("to_tensor_f32", "height", height)?;
-    // Same overflow guard as `to_tensor`: the element length is an Arrow i32, and the
-    // product is a query-parameter-driven allocation size. Computed in u64 so the multiply
-    // cannot itself overflow.
-    let per_row = (w as u64) * (h as u64) * 3;
-    if per_row > i32::MAX as u64 {
-        return Err(ExprError::InvalidArgument {
-            func: "to_tensor_f32".to_string(),
-            reason: format!(
-                "tensor of {w}x{h}x3 = {per_row} floats per row exceeds the maximum \
-                 element length of {}",
-                i32::MAX
-            ),
-        });
-    }
-    let per_row = per_row as usize;
+    let per_row = element_len_guard("to_tensor_f32", (w as u64) * (h as u64) * 3, "floats")?;
     let hw = (w as usize) * (h as usize);
 
     // Decode+resize in parallel (the hot path), then normalize into the flat child buffer.
@@ -388,19 +386,7 @@ fn center_crop<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("center_crop", "width", width)? as usize;
     let h = dim("center_crop", "height", height)? as usize;
-    // Same overflow/allocation guard as `to_tensor`: the element length is an Arrow i32.
-    let per_row = (w as u64) * (h as u64) * 3;
-    if per_row > i32::MAX as u64 {
-        return Err(ExprError::InvalidArgument {
-            func: "center_crop".to_string(),
-            reason: format!(
-                "crop of {w}x{h}x3 = {per_row} bytes per row exceeds the maximum element \
-                 length of {}",
-                i32::MAX
-            ),
-        });
-    }
-    let per_row = per_row as usize;
+    let per_row = element_len_guard("center_crop", (w as u64) * (h as u64) * 3, "bytes")?;
 
     let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
@@ -431,25 +417,7 @@ fn center_crop<O: OffsetSizeTrait>(
         Some(out)
     });
 
-    let mut values: Vec<u8> = vec![0u8; bytes.len() * per_row];
-    let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
-    for (i, row) in rows.into_iter().enumerate() {
-        match row {
-            Some(buf) => {
-                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
-                valid.push(true);
-            }
-            None => valid.push(false),
-        }
-    }
-    let field = Arc::new(Field::new("item", DataType::UInt8, false));
-    let arr = FixedSizeListArray::new(
-        field,
-        per_row as i32,
-        Arc::new(UInt8Array::from(values)),
-        Some(NullBuffer::from(valid)),
-    );
-    Ok(Arc::new(arr))
+    Ok(assemble_u8_tensor(bytes.len(), per_row, rows))
 }
 
 /// `to_grayscale(w, h)` → `FixedSizeList<UInt8>` of length `w*h` (shape `(h, w, 1)`).
@@ -464,19 +432,7 @@ fn to_grayscale<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("to_grayscale", "width", width)?;
     let h = dim("to_grayscale", "height", height)?;
-    // One byte per pixel; the product is the element length (an Arrow i32).
-    let per_row = (w as u64) * (h as u64);
-    if per_row > i32::MAX as u64 {
-        return Err(ExprError::InvalidArgument {
-            func: "to_grayscale".to_string(),
-            reason: format!(
-                "grayscale of {w}x{h} = {per_row} pixels per row exceeds the maximum \
-                 element length of {}",
-                i32::MAX
-            ),
-        });
-    }
-    let per_row = per_row as usize;
+    let per_row = element_len_guard("to_grayscale", (w as u64) * (h as u64), "pixels")?;
 
     let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
@@ -494,25 +450,7 @@ fn to_grayscale<O: OffsetSizeTrait>(
         Some(gray)
     });
 
-    let mut values: Vec<u8> = vec![0u8; bytes.len() * per_row];
-    let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
-    for (i, row) in rows.into_iter().enumerate() {
-        match row {
-            Some(buf) => {
-                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
-                valid.push(true);
-            }
-            None => valid.push(false),
-        }
-    }
-    let field = Arc::new(Field::new("item", DataType::UInt8, false));
-    let arr = FixedSizeListArray::new(
-        field,
-        per_row as i32,
-        Arc::new(UInt8Array::from(values)),
-        Some(NullBuffer::from(valid)),
-    );
-    Ok(Arc::new(arr))
+    Ok(assemble_u8_tensor(bytes.len(), per_row, rows))
 }
 
 /// `dhash()` → UInt64, the 64-bit difference hash of each image.

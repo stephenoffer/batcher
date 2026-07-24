@@ -14,10 +14,10 @@ disagree on (see `_cast_is_exact`).
 from __future__ import annotations
 
 import datetime as _dt
-import math
 
 import pyarrow as pa
 
+from batcher._internal.mathx import is_nan
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit, Not
 from batcher.plan.expr_ir.func_nodes import DateOffset
@@ -247,7 +247,7 @@ def _comparable(a: object, b: object) -> bool:
 
 def _is_nan(x: object) -> bool:
     """Whether `x` is a NaN float (whose comparison order differs from Python's)."""
-    return isinstance(x, float) and math.isnan(x)
+    return is_nan(x)
 
 
 def _is_bool(expr: Expr) -> bool:

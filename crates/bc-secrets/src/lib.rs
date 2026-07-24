@@ -182,7 +182,12 @@ fn ttl() -> Duration {
         .map_or(Duration::from_secs(300), Duration::from_secs)
 }
 
-/// Clear the resolution cache. Intended for tests and for forcing a rotation to be seen.
+/// Clear the resolution cache, so the next `resolve` re-fetches every reference.
+///
+/// A test hook, and the only caller today is this crate's own test module: the cache is
+/// process-global with a TTL, so a test that changes a backend has to reset it or read a
+/// stale value. It is `pub` because a host embedding this crate needs the same escape
+/// hatch to make a credential rotation visible before the TTL expires.
 pub fn clear_cache() {
     if let Ok(mut c) = cache().write() {
         c.clear();

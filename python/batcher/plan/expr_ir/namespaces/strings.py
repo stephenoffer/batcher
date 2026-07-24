@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from typing import Any
 
 from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.core import Cast, Expr
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
@@ -48,6 +50,24 @@ class _StrNamespace:
     def __repr__(self) -> str:
         """Show the accessor and its parent, e.g. ``<.str accessor of col('name')>``."""
         return f"<.str accessor of {self._e!r}>"
+
+    def __getattr__(self, name: str) -> Any:
+        """Point a pandas/Polars ``.str`` idiom at its Batcher spelling.
+
+        Only reached when normal lookup fails, so it never shadows a real ``.str``
+        method. ``.str.pad``, ``.str.extractall``, ``.str.find`` come back naming
+        ``.str.lpad``, ``.str.extract_all``, ``.str.position`` — see
+        `batcher.plan.expr_ir.compat.guidance`.
+
+        Args:
+            name: The attribute name that was not found.
+
+        Raises:
+            AttributeError: Always, with guidance for `name`.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise accessor_attribute_error(self, "'.str' accessor", name, STR_UNSUPPORTED)
 
     def len(self) -> StrFunc:
         """Count the characters in the string (→ Int64).

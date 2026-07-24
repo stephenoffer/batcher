@@ -6,7 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ def vt(duck):
     ],
 )
 def test_sql_vector_functions_match_duckdb(duck, vt, q):
-    assert_same(bt.sql(q, vt=vt).collect(), duck.sql(q))
+    assert_same_ordered(bt.sql(q, vt=vt).collect(), duck.sql(q))
 
 
 def test_sql_vector_search_top_k():
