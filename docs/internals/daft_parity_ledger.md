@@ -444,11 +444,53 @@ barely moved the clock. Why is not established here, and guessing at it would be
 than leaving it open. The lesson taken is narrower and solid: **infer the build profile
 from the build, never from a stopwatch.**
 
+## Where DuckDB actually stands, replicated
+
+The earlier reading of "trails DuckDB on 12 of 22" came from a single harness pass taken while
+the box carried a 15-minute load average of 17.6. Two independent passes on a quieter box, both
+with every correctness check passing, put it differently: **the per-query loss list is six, not
+twelve, and the aggregate is a narrow Batcher lead.**
+
+| | pass 1 | pass 2 |
+|---|---|---|
+| geomean ratio (batcher / duckdb) | 0.964x | 0.990x |
+| total wall time | 555.7 vs 585.4 ms | 641.4 vs 631.1 ms |
+
+The geomean is below 1.0 in both passes, so a few percent ahead overall is supportable. The
+**total** flips sign between them, so it is not — quote the geomean or nothing.
+
+Six queries lose in *both* passes, and this is the list worth working: q4 ~1.45x, q12 ~1.43x,
+q6 ~1.40x, q5 ~1.30x, q22 ~1.30x, q21 ~1.29x. Six win in both: q16 ~0.59x, q2 and q8 ~0.65x,
+q17 ~0.68x, q10, q13. The remainder sit at parity or swing, and a single pass cannot tell which.
+
+### Two ways this benchmark manufactures a false result
+
+Both were hit while producing the table above, and both survive a warm-up and a best-of-N:
+
+- **A delta the mechanism cannot have caused is noise, whatever its size.** Forcing the runtime
+  join filter on appeared to cost q4 +50% and q13 +36%. Both plans show *no filter engaged* —
+  q4 builds from a 3.79M-row side whose distinct keys exceed `MAX_DISTINCT_KEYS`, and q13's only
+  join is a `LEFT`, which is not reducible. Check `explain(analyze=True)` for whether the thing
+  under test is active *before* believing a timing about it.
+- **Some queries are bimodal, so min-of-N invents winners.** q19 measures min 14.8ms against a
+  median of 52ms in the *same* arm. Pairing one arm's unlucky min against the other's lucky min
+  produced an apparent 72% win from byte-identical behaviour. Report the median beside the min.
+
+### Reusing a `Dataset` is not the same measurement
+
+q12 runs ~30ms when the `Dataset` is rebuilt each time and ~14ms when one `Dataset` is collected
+repeatedly — a 2x gap present from the first reuse, so not convergence. It is **not** the learned
+statistics loop: the `fresh` arm never trends downward across 14 iterations, and q12's build-side
+decision still reports `[default]` provenance afterwards. q4, q6 and q21 show no such gap. The
+cause is unidentified and deliberately not guessed at here. What matters for quoting numbers is
+that the rebuilt-plan figure is the honest one, because it is what the harness and a user both
+do; a repeated-collect loop measures something else and will flatter the engine by ~2x on q12.
+
 ## What this ledger does not claim
 
 It does not claim Batcher beats every competitor. As of the last run it leads Polars on 18 of
-22 TPC-H queries and Daft on 18 of the 19 it answers, and **trails DuckDB on 12 of 22** — and
-that gap is one architectural item (`rfc-streaming-executor.md`, Proposal 2), not a list of
-optimizations. Anyone quoting a number from here should quote the machine and scale factor with
-it: the join-heavy comparison against Daft reverses between 16 and 96 cores, which is the whole
-reason this section states its conditions twice.
+22 TPC-H queries and Daft on 18 of the 19 it answers, and trails DuckDB on the six queries named
+above — a gap whose largest component is one architectural item (`rfc-streaming-executor.md`,
+Proposal 2), not a list of optimizations. Anyone quoting a number from here should quote the
+machine and scale factor with it: the join-heavy comparison against Daft reverses between 16 and
+96 cores, which is the whole reason this section states its conditions twice.
