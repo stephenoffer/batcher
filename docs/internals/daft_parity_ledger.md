@@ -271,6 +271,46 @@ per-file latency amortizes and Batcher's kernels dominate. The two results are c
 and describe different ends of the corpus-size range. What is now known is that the small
 end belongs to Daft.
 
+### q17 vs Polars (2.41x): the 6 M-row probe runs twice
+
+The largest single loss to any competitor, localized. `explain(analyze=True)` on q17 at sf1:
+
+```
+hash_join   103.2ms   lineitem(6,001,215) x filtered_part(204) -> 6,088 rows
+  aggregate   3.0ms   -> 204 per-part averages
+hash_join    96.2ms   lineitem(6,001,215) x those_204          -> 6,088 rows
+```
+
+**The same 6 M-row probe is paid twice**, and the second one reproduces the 6,088 rows the
+first already had. That is the whole 2.41x: two probes where Polars does one.
+
+Two ways out, and the cheap one is not the obvious one:
+
+- **Plan-level CSE is the obvious answer and the wrong tool here.** The two joins are
+  identical, so eliminating the duplicate looks like a job for common sub-*plan* elimination.
+  But `kyber/rules/extra/cse.py` is deliberately expression-level (repeats inside one
+  `Project`), and sharing a sub-plan needs the executor to feed one materialized intermediate
+  to two consumers — a DAG where `bc_ir::RelOp` is a tree. That is an IR shape change, i.e. a
+  wire-contract change, for one query shape.
+- **Decorrelating differently costs nothing at the IR level.** The subquery correlates on
+  `l_partkey`, which is *also* the join key, so the per-part average can be computed as a
+  window over the already-joined 6,088 rows instead of by re-joining:
+
+  ```
+  lineitem x filtered_part -> 6,088 rows
+    -> avg(l_quantity) OVER (PARTITION BY l_partkey)
+    -> filter l_quantity < 0.2 * avg
+    -> sum
+  ```
+
+  One probe, and every operator already exists. This is a rewrite in the SQL decorrelation
+  path (or a Kyber rule over the join-aggregate-rejoin shape it produces), gated on the
+  correlation key being a subset of the join key. The care needed is in scalar-subquery
+  semantics — what an empty group yields — not in new machinery.
+
+Not attempted here: it is a correctness-sensitive rewrite of subquery translation, and the
+measurement above is what it needs to start from rather than a rushed patch.
+
 ### The per-batch Python callback: 2.3-2.6x recovered
 
 `vs-daft.md` records Daft ~2x faster on a per-batch numpy UDF. Measuring the batch size
