@@ -951,7 +951,7 @@ Kyber rule families for streaming (unbounded-input) plans.
 | `blocking.py` | 354 | Blocking-operator avoidance under a stream. |
 | `state.py` | 500 | Streaming rule family: state minimization — shrink what a streaming operator retains. |
 | `watermark.py` | 159 | Pushdown through the watermark-bounded streaming operators. |
-| `windows.py` | 10 | Streaming rule family: windows (placeholder — rules land here). |
+| `windows.py` | 79 | Streaming rule family: windows -- collapsing nested event-time window alignment. |
 
 ### `batcher/kyber/shortcuts/` — 3 · subsystem
 
@@ -981,7 +981,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `columns.py` | 411 | Per-operator column-statistics propagation. |
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
-| `distribution.py` | 419 | Distributional primitives shared by the cardinality and selectivity estimators. |
+| `distribution.py` | 429 | Distributional primitives shared by the cardinality and selectivity estimators. |
 | `estimator.py` | 1345 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 180 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
