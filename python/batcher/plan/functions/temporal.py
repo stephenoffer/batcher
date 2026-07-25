@@ -23,9 +23,11 @@ def _duration_micros(duration: str, *, arg: str) -> int:
     """Parse a fixed-length duration string to microseconds (no calendar units).
 
     Event-time windows must have a fixed width, so a calendar duration (months, years) is
-    rejected — ``"1mo"`` has no constant microsecond length. ``"1d"``, ``"1h30m"`` and
-    ``"30s"`` are fine. A second is the finest unit `parse_offset` accepts, so there is no
-    sub-second spelling.
+    rejected — ``"1mo"`` has no constant microsecond length. Both duration syntaxes are
+    accepted: the compact combinable form `parse_offset` reads (``"1d"``, ``"1h30m"``) and the
+    spelled-out single-unit form the streaming module reads (``"1 hour"``, ``"500ms"``). The
+    two used to be disjoint, so ``"1d"`` sized a window but could not delay a watermark and
+    ``"10 seconds"`` did the reverse — a trap, because one pipeline writes both.
 
     Every rejection here raises `PlanError`, including an unparseable string: `parse_offset`
     raises a bare `ValueError` whose advice names the ``y``/``mo`` units *this* function goes
@@ -35,17 +37,28 @@ def _duration_micros(duration: str, *, arg: str) -> int:
     try:
         months, days, micros = parse_offset(duration)
     except ValueError as exc:
-        raise PlanError(
-            f"cannot parse {arg} {duration!r}; a window needs a fixed-length duration: "
-            "counts with units w/d/h/m/s, e.g. '1h', '30m', '1h30m' ('m' is minutes). "
-            "Seconds are the finest unit, and calendar units (y/mo) are not fixed-length."
-        ) from exc
+        from batcher.plan.streaming.spec import parse_interval_seconds
+
+        try:
+            return _positive_micros(
+                round(parse_interval_seconds(duration) * 1_000_000), duration, arg
+            )
+        except PlanError:
+            raise PlanError(
+                f"cannot parse {arg} {duration!r}; a window needs a fixed-length duration: "
+                "counts with units w/d/h/m/s, e.g. '1h', '30m', '1h30m' ('m' is minutes), or "
+                "the spelled-out form '1 hour'. Calendar units (y/mo) are not fixed-length."
+            ) from exc
     if months:
         raise PlanError(
             f"{arg} {duration!r} uses a calendar unit (month/year) with no fixed length; "
             "use fixed units (days/hours/minutes/seconds)"
         )
-    total = days * _DAY_MICROS + micros
+    return _positive_micros(days * _DAY_MICROS + micros, duration, arg)
+
+
+def _positive_micros(total: int, duration: str, arg: str) -> int:
+    """The parsed microseconds, rejecting a zero or negative window width."""
     if total <= 0:
         raise PlanError(f"{arg} must be a positive duration, got {duration!r}")
     return total
