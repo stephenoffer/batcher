@@ -18,6 +18,7 @@ from typing import Any
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber.correction import correction_factor
+from batcher.kyber.measured_selectivity import measured_selectivities
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
 from batcher.plan.logical import LogicalPlan
@@ -208,6 +209,12 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
     corrections = _cardinality_corrections(hub)
     if corrections:
         stats[CARDINALITY_CORRECTION_KEY] = corrections
+    for sig, sel in measured_selectivities(hub).items():
+        # `setdefault`: an explicit `record_selectivity` entry still wins. The two agree
+        # wherever both fire, so this only fills a signature that had nothing.
+        entry = dict(stats.get(sig) or {})
+        entry.setdefault("selectivity", sel)
+        stats[sig] = entry
     return stats
 
 

@@ -500,6 +500,41 @@ engagement gate should note that the argument for doing so is sound in kind — 
 half against the join in question — while the evidence for a *speedup* at this scale is absent.
 sf10+, or hardware where the probe genuinely is throughput-bound, is where that would be settled.
 
+### The filter-selectivity half of the feedback loop was not connected
+
+The moat's claim is that plans improve as a query is re-run. For filter cardinality that was
+not happening, and the reason was a missing join rather than a missing measurement.
+
+Core records every filter's measured `rows_out / rows_in` under the stable signature
+`annotate_ops` stamps, on every execution, profiled or not. `StatsEstimator._selectivity`
+reads exactly that per-signature `selectivity` key, and a measured value there always beats
+the structural guess. But the only writer of the key was `learning.record_selectivity`, which
+is handed the **query's** final row count and therefore guards on `_filter_over_scan`: the
+whole plan must be a filter over a single scan. Every filter beneath a join, aggregate, sort
+or limit — 21 of the 22 TPC-H queries — re-derived a guess the engine had already measured,
+on every run, forever.
+
+Verified before the fix: three runs of q12 left six signed filter rows in the hub carrying
+measured selectivities of 0.0869 and 0.0594, **none** of whose signatures held a `selectivity`
+entry, with the estimate frozen at 0.327 across ten consecutive runs.
+
+`kyber/measured_selectivity.py` derives the key from that history — the same shape as
+`learning._cardinality_corrections`, and the only correct layering, since Kyber cannot hook
+`core`'s recording. Folded in with `setdefault`, so `record_selectivity` keeps precedence.
+After two observations the estimates become exact:
+
+| | before | after |
+|---|---|---|
+| q12 filter | est 1,962,347 / actual 521,289 | est 521,289 |
+| q12 build side | `right≈205,429 [default]` | `right≈30,988 [learned]` |
+| q4 filter | est 3,040,569 / actual 3,793,296 | est 3,793,296 |
+| q4 build side | `left≈386,279 [default]` | `left≈57,218 [learned]` |
+
+Wall clock is neutral across 12 queries. Two things it cannot do: help a shape's first
+execution, by construction; and model correlation, because a signature is structural — that
+is a separate gap, still open, and the reason q12's chained
+`l_shipdate < l_commitdate < l_receiptdate` remains mis-estimated on a cold plan.
+
 ### Reusing a `Dataset` is not the same measurement
 
 q12 runs ~30ms when the `Dataset` is rebuilt each time and ~14ms when one `Dataset` is collected
