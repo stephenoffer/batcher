@@ -28,6 +28,20 @@ agent's work here:
   other agents' half-finished files. **Scope every fix and format command to the paths
   you own** (`ruff format path/to/your/file.py`).
 - **`git commit -a`** — commits everyone's work under your message.
+- **The index is shared too, so `git add` your paths is not enough.** `git commit` writes
+  whatever is staged, including files *another agent staged*, and a blocked commit of yours
+  leaves your own files staged for the next one to sweep up. Both have happened here: one
+  commit landed carrying 52 lines of another session's docs page, and an earlier one swallowed
+  an unrelated test fix left over from a commit the pre-commit hook had rejected. Use
+  **`git commit --only <paths>`** (or `git commit <paths>`), which commits exactly those paths
+  and ignores the rest of the index. If you use plain `git commit`, read
+  `git diff --cached --stat` immediately before it and confirm every line is yours.
+
+  To back a path out of a commit you already made, without touching the working tree:
+  `git restore --source=HEAD~1 --staged <path>` then `git commit --amend --no-edit`. Their
+  content stays in the tree and goes back to being unstaged. Guard any `--amend` with
+  `git rev-parse HEAD` against the hash you meant to amend — if another agent committed on
+  top, you would be rewriting *their* commit.
 
 ## `just build` crashes every other session's running tests
 
