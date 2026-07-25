@@ -238,6 +238,16 @@ class AIMDFlowControl:
         Leaves slow-start off, exactly as a warm `initial_window` does: the grant already
         reflects a real estimate, so an exponential ramp from it would overshoot.
 
+        Clearing the CUBIC recovery state is what makes the re-grant *hold*. `_w_max` is the
+        window congestion was measured at, and `_rounds_since_backoff` is how long recovery
+        toward it has been running — both describe the **previous** query's channel. Left in
+        place, the first uncongested round after a re-grant evaluates that stale curve at a
+        large `t`, and `(t - k)³` returns the old window immediately: a channel re-granted 4
+        went to 64 (the ceiling) in one round, where a fresh channel granted 4 goes to 5. The
+        re-grant survived exactly one round, which is the stale-grant regression this method
+        exists to prevent, one round later. With the state cleared, growth is the plain
+        additive law until this query finds its own congestion point.
+
         Args:
             credits: The new grant (1 credit = 1 in-flight batch), clamped to the band.
 
@@ -246,6 +256,8 @@ class AIMDFlowControl:
         """
         self._window = float(min(max(credits, self._floor), self._ceiling))
         self._slow_start = False
+        self._w_max = None
+        self._rounds_since_backoff = 0
         return self.window
 
     def observe(self, *, congested: bool) -> int:

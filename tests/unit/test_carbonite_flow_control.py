@@ -183,3 +183,75 @@ def test_grant_never_returns_zero():
     with config_context(cfg):
         assert ResourceManager().grant_credits(0) >= 1
         assert ResourceManager().grant_credits(-1) >= 1
+
+
+def test_a_regrant_is_not_undone_by_the_previous_querys_cubic_curve():
+    """`rewindow` must clear the CUBIC state, or the re-grant survives exactly one round.
+
+    `_w_max` and `_rounds_since_backoff` describe the channel's *previous* query. Left in
+    place across a re-grant, the first uncongested round evaluates that curve at a large `t`
+    and `(t - k)**3` restores the old window at once — the stale-grant regression `rewindow`
+    exists to prevent, one round later.
+    """
+    reused = _aimd(default_credits=8, aimd_alpha=1, aimd_beta=0.5)
+    reused.observe(congested=True)
+    for _ in range(50):
+        reused.observe(congested=False)
+    converged = reused.window
+
+    assert reused.rewindow(4) == 4
+    grown = reused.observe(congested=False)
+    assert grown < converged, (
+        f"a channel re-granted 4 climbed straight back to {grown} (it had converged to "
+        f"{converged} for the previous query), so the re-grant held for one round only"
+    )
+
+    fresh = _aimd(default_credits=4, aimd_alpha=1, aimd_beta=0.5)
+    assert grown == fresh.window + 1 == 5, "growth after a re-grant is the plain additive law"
+
+
+def test_a_regranted_channel_tracks_a_warm_started_one_exactly():
+    """A re-grant behaves like a warm `initial_window`, which is what `rewindow` documents.
+
+    The comparison channel is warm-started rather than built from `default_credits`, because
+    a cold channel keeps slow-start on and doubles; both re-granted and warm-started channels
+    grow additively.
+    """
+    reused = _aimd(default_credits=8, aimd_alpha=1, aimd_beta=0.5)
+    reused.observe(congested=True)
+    for _ in range(50):
+        reused.observe(congested=False)
+    reused.rewindow(4)
+    warm = AIMDFlowControl(
+        Config().replace(
+            flow_control=FlowControlConfig(default_credits=8, aimd_alpha=1, aimd_beta=0.5)
+        ),
+        initial_window=4,
+    )
+
+    assert [reused.observe(congested=False) for _ in range(8)] == [
+        warm.observe(congested=False) for _ in range(8)
+    ]
+
+
+def test_a_regranted_channel_still_recovers_along_its_own_cubic_curve():
+    """Clearing the state must not disable CUBIC — only re-anchor it on this query."""
+    chan = _aimd(default_credits=8, aimd_alpha=1, aimd_beta=0.5)
+    chan.observe(congested=True)
+    for _ in range(50):
+        chan.observe(congested=False)
+    chan.rewindow(4)
+    for _ in range(8):
+        chan.observe(congested=False)
+
+    own_w_max = chan.window
+    after_backoff = chan.observe(congested=True)  # this query's own congestion point
+    windows = [chan.observe(congested=False) for _ in range(6)]
+    assert windows == sorted(windows), f"recovery must be monotonic, got {windows}"
+    assert windows[-1] > own_w_max, (
+        f"CUBIC must carry the window back past its own w_max ({own_w_max}), got {windows}"
+    )
+    additive = after_backoff + 6  # `aimd_alpha=1` for six rounds
+    assert windows[-1] > additive, (
+        f"recovery should beat plain additive increase ({additive}), got {windows}"
+    )

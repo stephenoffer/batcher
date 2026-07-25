@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 823 Python modules across 124 packages and 165 Rust files across 13 crates.
+Covering 834 Python modules across 126 packages and 165 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -193,7 +193,7 @@ The `Dataset` builder package.
 | `_window.py` | 105 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 220 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 5534 | `Dataset` — the lazy, immutable, fluent entry point. |
-| `ml.py` | 2713 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
+| `ml.py` | 2719 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/compat/` — 5 · conductor
@@ -396,7 +396,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `gpu.py` | 1071 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 483 | Native linear models — ordinary and ridge regression trained inside the engine. |
-| `mixture.py` | 343 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
+| `mixture.py` | 374 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
 | `model_selection.py` | 374 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `naive_bayes.py` | 469 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
 | `outliers.py` | 364 | Outlier detection — finding the rows a model should not be trained on, at scale. |
@@ -405,7 +405,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
 | `selection.py` | 372 | Deciding which features to keep, before a model ever sees them. |
 | `sparse_linear.py` | 258 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
-| `splitting.py` | 309 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
+| `splitting.py` | 314 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |
 
 ### `batcher/ml/decode/` — 6 · front-end
@@ -551,7 +551,7 @@ Statistical analysis and drift monitoring over a `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `_shared.py` | 70 | Helpers shared by the statistical modules — column checks and scalar collection. |
+| `_shared.py` | 103 | Helpers shared by the statistical modules — column checks and scalar collection. |
 | `_special.py` | 140 | Distribution tail probabilities for hypothesis testing, in dependency-free Python. |
 | `association.py` | 401 | Association between two columns — contingency tables, chi-squared, and ANOVA. |
 | `descriptive.py` | 255 | Statistics that need two passes or a grouping — ranks, entropy, and category association. |
@@ -740,7 +740,8 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `correction.py` | 105 | Turning a window of measured q-errors into one cardinality-correction factor. |
 | `cost.py` | 485 | Cost model — what will this plan *cost* to run? |
 | `cpu_shares.py` | 163 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 457 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 464 | Cross-execution learning — the metadata feedback loop. |
+| `measured_selectivity.py` | 98 | Filter selectivity derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 426 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 61 | The optimizer context — shared analysis threaded through every rule. |
@@ -815,7 +816,7 @@ Kyber rule modules.
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `agg_pushdown.py` | 508 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 | `fusion.py` | 343 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
-| `leaf_rewrite.py` | 110 | The shared machinery every leaf-level expression rule is built from. |
+| `leaf_rewrite.py` | 104 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 58 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 699 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 480 | Predicate pushdown — evaluate filters as early as possible. |
@@ -830,6 +831,20 @@ Algebraic rewrites: small, local, unconditionally semantics-preserving simplific
 |---|---|---|
 | `disjunctions.py` | 223 | Rewrites of a disjunction — factoring an `OR`, and folding one into `IN`. |
 | `identities.py` | 324 | Algebraic relational identities — small, local, always-correct simplifications. |
+
+### `batcher/kyber/rules/exprs/` — 3 · subsystem
+
+Expression-level Kyber rule families.
+
+| module | lines | what it is |
+|---|---|---|
+| `comparisons.py` | 127 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
+| `complex_types.py` | 398 | Struct, list, and array algebra -- the extract-over-construct family. |
+| `conditionals.py` | 312 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
+| `guards.py` | 172 | Schema-aware helpers for expression rules that may only fire on a known type. |
+| `numeric.py` | 406 | Numeric algebra the earlier arithmetic families leave on the table. |
+| `temporal.py` | 209 | Temporal identities: reading a date part through a truncation, and offset fusion. |
+| `text.py` | 305 | Regex de-specialization and the remaining string identities. |
 
 ### `batcher/kyber/rules/extra/` — 3 · subsystem
 
@@ -915,6 +930,14 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `ranges.py` | 272 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
 | `simplify.py` | 145 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
+### `batcher/kyber/rules/relational/` — 3 · subsystem
+
+Relational Kyber rule families -- rewrites that move or reshape a plan node.
+
+| module | lines | what it is |
+|---|---|---|
+| `windows.py` | 186 | Window rewrites the existing window family leaves: transposition and ranking top-N. |
+
 ### `batcher/kyber/rules/streaming/` — 3 · subsystem
 
 Kyber rule families for streaming (unbounded-input) plans.
@@ -966,8 +989,8 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 | module | lines | what it is |
 |---|---|---|
 | `combine.py` | 416 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 434 | Leaf predicate selectivity — one estimate per non-composite predicate. |
-| `scalars.py` | 191 | Scalar and column-statistic primitives shared by every selectivity estimator. |
+| `leaves.py` | 469 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `scalars.py` | 249 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
 ### `batcher/carbonite/` — 3 · subsystem
 
@@ -999,7 +1022,7 @@ Carbonite's resource policies — admission, flow control, and scheduling.
 | module | lines | what it is |
 |---|---|---|
 | `admission.py` | 125 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
-| `flow_control.py` | 323 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
+| `flow_control.py` | 335 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `scheduling.py` | 184 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
@@ -1548,7 +1571,7 @@ The expression function library, grouped by family.
 | `security.py` | 286 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 442 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `string.py` | 426 | String-building free functions (`concat`, `concat_ws`, `format_string`). |
-| `temporal.py` | 392 | Temporal free functions. |
+| `temporal.py` | 405 | Temporal free functions. |
 
 ### `batcher/plan/functions/analysis/` — 1 · contract
 
@@ -1560,7 +1583,7 @@ Statistical analysis expressions — robust spread, distribution shape, associat
 | `dispersion.py` | 177 | Quantile-based location and spread — the robust half of "describe". |
 | `inference.py` | 331 | Two-sample comparison and interval estimation as single-pass aggregates. |
 | `moments.py` | 146 | Dispersion ratios — spread expressed relative to level, in one pass. |
-| `shape.py` | 130 | Distribution shape — skew, tail weight, and how far from normal a column is. |
+| `shape.py` | 143 | Distribution shape — skew, tail weight, and how far from normal a column is. |
 | `weighted.py` | 152 | Weighted statistics — a mean, variance, and correlation where rows carry different weights. |
 
 ### `batcher/plan/functions/metrics/` — 1 · contract
@@ -1628,7 +1651,8 @@ Query profiles — the planned plan joined to the measured run, for `EXPLAIN`.
 
 | module | lines | what it is |
 |---|---|---|
-| `spec.py` | 474 | Neutral streaming-query specification types — triggers, output modes, progress. |
+| `_duration.py` | 144 | Duration parsing for streaming intervals — the one gate every trigger/lateness flows through. |
+| `spec.py` | 382 | Neutral streaming-query specification types — triggers, output modes, progress. |
 
 ### `batcher/plan/types/` — 1 · contract
 
