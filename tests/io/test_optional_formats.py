@@ -263,6 +263,48 @@ def test_lance_roundtrip(tmp_path):
     assert len(src.splits()) >= 1
 
 
+def test_avro_roundtrips_a_nested_column(tmp_path):
+    """A list or struct column must survive Avro, which has native `array` and `record`.
+
+    `_avro_branch` fell through to `"string"` for anything it did not recognise, so writing a
+    nested column raised from inside fastavro — ``ValueError: [1, 2] (type <class 'list'>) do
+    not match ['null', 'string']``, an error naming a type the caller never asked for. The
+    read side had the mirror gap: an Avro `array` also fell to `"string"`, so `schema()`
+    advertised Utf8 and the read failed against the batches it decoded. The two are inverses
+    now, as the temporal/decimal note in that module already claims for its own family.
+    """
+    pytest.importorskip("fastavro")
+    import batcher as bt
+
+    table = pa.table(
+        {
+            "ints": pa.array([[1, 2], [], None, [3]], pa.list_(pa.int64())),
+            "strs": pa.array([["a"], [], None, ["b", "c"]], pa.list_(pa.string())),
+            "rec": pa.array([{"a": 1}, {"a": 2}, None, {"a": 3}], pa.struct([("a", pa.int64())])),
+            "deep": pa.array(
+                [[{"a": 1}], [], None, [{"a": 2}]], pa.list_(pa.struct([("a", pa.int64())]))
+            ),
+        }
+    )
+    path = str(tmp_path / "nested.avro")
+    bt.from_arrow(table).write(path, format="avro", single_file=True)
+    got = bt.read.avro(path).collect()
+    assert got.to_pydict() == table.to_pydict()
+    for field in table.schema:
+        assert got.schema.field(field.name).type == field.type, field.name
+
+
+def test_avro_names_an_arrow_type_it_cannot_write(tmp_path):
+    """An unmapped type is refused here, not turned into a string for fastavro to reject."""
+    pytest.importorskip("fastavro")
+    import batcher as bt
+    from batcher._internal.errors import BackendError
+
+    unmapped = pa.table({"c": pa.array([[("a", 1)]], pa.map_(pa.string(), pa.int64()))})
+    with pytest.raises(BackendError, match="no mapping for the Arrow type"):
+        bt.from_arrow(unmapped).write(str(tmp_path / "m.avro"), format="avro", single_file=True)
+
+
 def test_lance_write_through_the_public_api(tmp_path):
     """`ds.write(..., format="lance")` — the spelling a user actually types.
 

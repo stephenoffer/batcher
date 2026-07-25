@@ -1296,7 +1296,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `_csv_diagnostics.py` | 81 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
 | `_parquet_native.py` | 153 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 175 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
-| `avro.py` | 329 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
+| `avro.py` | 392 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 489 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
 | `lance.py` | 331 | Lance format — columnar, random-access read + write via `pylance` (lance). |

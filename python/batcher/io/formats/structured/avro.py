@@ -18,6 +18,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import BackendError
 from batcher._internal.native import engine
 from batcher._internal.optional import require
 from batcher.config import active_config
@@ -89,7 +90,27 @@ def _arrow_type(avro_type: Any) -> pa.DataType:
             return pa.decimal128(avro_type.get("precision", 38), avro_type.get("scale", 0))
         if logical in _AVRO_LOGICAL_TO_ARROW:
             return _AVRO_LOGICAL_TO_ARROW[logical]
-        return _AVRO_TO_ARROW.get(avro_type.get("type", "string"), pa.string())
+        # `array` and `record` are Avro's own container types. Without these two arms they
+        # fell to the `"string"` default, so `schema()` advertised Utf8 for a list column and
+        # the read failed with a schema mismatch against the batches actually decoded — the
+        # read-side twin of the writer mapping nested types to `"string"`.
+        kind = avro_type.get("type")
+        if kind == "array":
+            return pa.list_(_arrow_type(avro_type.get("items", "string")))
+        if kind == "record":
+            return pa.struct(
+                [
+                    pa.field(
+                        f["name"],
+                        _arrow_type(f["type"]),
+                        nullable=_avro_field_nullable(f["type"]),
+                    )
+                    for f in avro_type.get("fields", [])
+                ]
+            )
+        if kind == "map":
+            return pa.map_(pa.string(), _arrow_type(avro_type.get("values", "string")))
+        return _AVRO_TO_ARROW.get(kind or "string", pa.string())
     return _AVRO_TO_ARROW.get(avro_type, pa.string())
 
 
@@ -276,7 +297,9 @@ class AvroSink(FileSink):
         avro_schema = {
             "type": "record",
             "name": "batcher",
-            "fields": [{"name": n, "type": ["null", _avro_branch(t)]} for n, t in _fields(table)],
+            "fields": [
+                {"name": n, "type": ["null", _avro_branch(t, n)]} for n, t in _fields(table)
+            ],
         }
         parsed = fastavro.parse_schema(avro_schema)
         fastavro.writer(fh, parsed, table.to_pylist())
@@ -300,8 +323,14 @@ _ARROW_TO_AVRO_LOGICAL: tuple[tuple[Any, dict[str, Any]], ...] = (
 )
 
 
-def _avro_branch(arrow_type: pa.DataType) -> str | dict[str, Any]:
-    """Map an Arrow type to the Avro type name (or logical type) used for writing."""
+def _avro_branch(arrow_type: pa.DataType, path: str = "f") -> str | dict[str, Any]:
+    """Map an Arrow type to the Avro type name (or logical type) used for writing.
+
+    `path` names the field being written, and nested levels extend it. Avro records carry a
+    name and a schema may not redefine one, so the name has to be unique per *occurrence*
+    rather than per shape: two columns that both hold `struct<a: int64>` would otherwise both
+    be called `r_a` and fastavro would reject the schema with "redefined named type".
+    """
     if pa.types.is_boolean(arrow_type):
         return "boolean"
     if pa.types.is_integer(arrow_type):
@@ -326,4 +355,38 @@ def _avro_branch(arrow_type: pa.DataType) -> str | dict[str, Any]:
     for candidate, logical in _ARROW_TO_AVRO_LOGICAL:
         if arrow_type.equals(candidate):
             return logical
-    return "string"
+    # Avro has native `array` and `record` types, and the *reader* already maps both back
+    # (`_MEMBER_PREDICATES` matches a list branch). Falling through to `"string"` here was
+    # the same bug the temporal/decimal note above records, one type family later: writing
+    # any list or struct column raised `ValueError: [1, 2] (type <class 'list'>) do not
+    # match ['null', 'string']` from inside fastavro — an error naming a type the caller
+    # never asked for.
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        return {
+            "type": "array",
+            "items": ["null", _avro_branch(arrow_type.value_type, f"{path}_item")],
+        }
+    if pa.types.is_struct(arrow_type):
+        return {
+            "type": "record",
+            "name": _record_name(path),
+            "fields": [
+                {"name": f.name, "type": ["null", _avro_branch(f.type, f"{path}_{f.name}")]}
+                for f in arrow_type
+            ],
+        }
+    if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        return "string"
+    # Anything left is genuinely unmapped. Say so here, naming the type, rather than
+    # writing it as a string and letting fastavro reject the value with a message that
+    # blames a type this function chose.
+    raise BackendError(
+        f"the Avro writer has no mapping for the Arrow type {arrow_type}; cast the column "
+        "to a supported type, or write a format that carries it (Parquet, Arrow IPC)."
+    )
+
+
+def _record_name(path: str) -> str:
+    """An Avro-legal record name for the struct at `path` (unique per occurrence)."""
+    safe = "".join(c if c.isalnum() or c == "_" else "_" for c in path) or "empty"
+    return f"r_{safe}"
