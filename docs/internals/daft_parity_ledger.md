@@ -271,6 +271,27 @@ per-file latency amortizes and Batcher's kernels dominate. The two results are c
 and describe different ends of the corpus-size range. What is now known is that the small
 end belongs to Daft.
 
+### Why the DuckDB gap is one item, not twelve
+
+Profiled the three worst DuckDB losses individually, expecting three causes. They are mostly
+one:
+
+| Query | Bottleneck | Reading |
+|---|---|---|
+| q21 (1.37x) | `filter` 90 ms, 6 M rows in, 3.79 M out, 87 MB materialized | gather |
+| q5 (1.42x) | `hash_join` 204 ms, 6 M probe emitting 1.2 M rows | gather |
+| q17 (2.41x vs Polars) | two 6 M probes where one suffices | duplicated work |
+
+The q5 number is the clearest evidence. The *same* 6 M-row probe costs 204 ms when it emits
+1.2 M rows and 103 ms when it emits 6 k (q17's first join) — so the cost tracks the *output*
+size, not the probe. That is materialization, which is exactly what
+`rfc-streaming-executor.md` measured with `perf` on q1 (~22% of wall time in the filter
+gather, because the predicate passes 98% of rows and the engine copies them where DuckDB
+carries a selection vector).
+
+So chasing individual queries is the wrong shape of work here: q5 and q21 are the same item,
+and it already has an RFC. q17 is the exception and has its own cheap fix below.
+
 ### q17 vs Polars (2.41x): the 6 M-row probe runs twice
 
 The largest single loss to any competitor, localized. `explain(analyze=True)` on q17 at sf1:
