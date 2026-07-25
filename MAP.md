@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 821 Python modules across 124 packages and 165 Rust files across 13 crates.
+Covering 822 Python modules across 124 packages and 165 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -815,6 +815,7 @@ Kyber rule modules.
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `agg_pushdown.py` | 508 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 | `fusion.py` | 343 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
+| `leaf_rewrite.py` | 110 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 58 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 699 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 480 | Predicate pushdown — evaluate filters as early as possible. |
@@ -1547,7 +1548,7 @@ The expression function library, grouped by family.
 | `security.py` | 286 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 442 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `string.py` | 426 | String-building free functions (`concat`, `concat_ws`, `format_string`). |
-| `temporal.py` | 379 | Temporal free functions. |
+| `temporal.py` | 392 | Temporal free functions. |
 
 ### `batcher/plan/functions/analysis/` — 1 · contract
 
@@ -1767,10 +1768,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/breaker.rs` | 304 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 197 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 212 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 745 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 770 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/parallel.rs` | 816 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
-| `stream/probe_chunks.rs` | 96 | Emitting one probed morsel as however many output morsels its fan-out needs. |
+| `stream/probe_chunks.rs` | 152 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `window_spill.rs` | 72 | Bounded-memory window execution via grace partitioning. |
 

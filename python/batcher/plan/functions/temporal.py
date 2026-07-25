@@ -22,11 +22,24 @@ _DAY_MICROS = 86_400_000_000
 def _duration_micros(duration: str, *, arg: str) -> int:
     """Parse a fixed-length duration string to microseconds (no calendar units).
 
-    Event-time windows must have a fixed width, so a calendar duration (months) is
-    rejected — ``"1mo"`` has no constant microsecond length. ``"1d"``, ``"1h30m"``,
-    ``"500ms"`` etc. are fine.
+    Event-time windows must have a fixed width, so a calendar duration (months, years) is
+    rejected — ``"1mo"`` has no constant microsecond length. ``"1d"``, ``"1h30m"`` and
+    ``"30s"`` are fine. A second is the finest unit `parse_offset` accepts, so there is no
+    sub-second spelling.
+
+    Every rejection here raises `PlanError`, including an unparseable string: `parse_offset`
+    raises a bare `ValueError` whose advice names the ``y``/``mo`` units *this* function goes
+    on to refuse, so passing it through would both break the typed-error contract and point
+    the caller at a unit that cannot work.
     """
-    months, days, micros = parse_offset(duration)
+    try:
+        months, days, micros = parse_offset(duration)
+    except ValueError as exc:
+        raise PlanError(
+            f"cannot parse {arg} {duration!r}; a window needs a fixed-length duration: "
+            "counts with units w/d/h/m/s, e.g. '1h', '30m', '1h30m' ('m' is minutes). "
+            "Seconds are the finest unit, and calendar units (y/mo) are not fixed-length."
+        ) from exc
     if months:
         raise PlanError(
             f"{arg} {duration!r} uses a calendar unit (month/year) with no fixed length; "
