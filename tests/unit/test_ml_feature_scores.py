@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import batcher as bt
+from batcher._internal.errors import PlanError
 from batcher.ml.feature_scores import (
     chi2_scores,
     f_classif_scores,
@@ -86,3 +87,67 @@ def test_scores_pipe_into_selection() -> None:
     weak = rng.normal(0, 1, 100)
     ds = bt.from_pydict({"y": y.tolist(), "strong": strong.tolist(), "weak": weak.tolist()})
     assert select_k_best(f_classif_scores(ds, "y"), 1) == ["strong"]
+
+
+# --------------------------------------------------------------------------- #
+# A categorical scorer on a continuous column scores every feature identically
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("scorer", [chi2_scores, mutual_info_scores])
+def test_a_categorical_scorer_refuses_an_all_distinct_column(scorer) -> None:
+    """The score is pinned at its maximum, so it ranks unrelated features equally.
+
+    A column with one level per row determines the target by construction: `chi2_scores`
+    returned exactly the row count and `mutual_info_scores` exactly the target's entropy, the
+    same for every such feature however unrelated. `select_k_best` then ranked features that all
+    scored alike and returned whichever the dict ordered first. Nothing raised, so the caller saw
+    a confident selection resting on no information.
+    """
+    rng = np.random.default_rng(1)
+    values = np.abs(rng.normal(5.0, 2.0, 100))
+    ds = bt.from_pydict({"a": values.tolist(), "y": (values > 5.0).astype(int).tolist()})
+
+    with pytest.raises(PlanError, match="one distinct value per row"):
+        scorer(ds, "y", ["a"])
+
+
+@pytest.mark.parametrize("scorer", [chi2_scores, mutual_info_scores])
+def test_the_message_points_at_a_scorer_that_does_take_continuous_features(scorer) -> None:
+    rng = np.random.default_rng(2)
+    values = rng.normal(0.0, 1.0, 40)
+    ds = bt.from_pydict({"a": values.tolist(), "y": (values > 0).astype(int).tolist()})
+
+    with pytest.raises(PlanError) as excinfo:
+        scorer(ds, "y", ["a"])
+    message = str(excinfo.value)
+    assert "f_classif_scores" in message and "f_regression_scores" in message
+    assert "'a'" in message, "the message names the offending column"
+
+
+def test_the_continuous_scorers_still_accept_a_continuous_column() -> None:
+    """The guard belongs to the categorical scorers only."""
+    rng = np.random.default_rng(3)
+    values = rng.normal(0.0, 1.0, 60)
+    ds = bt.from_pydict(
+        {
+            "a": values.tolist(),
+            "cls": (values > 0).astype(int).tolist(),
+            "reg": (2.0 * values).tolist(),
+        }
+    )
+    assert f_classif_scores(ds, "cls", ["a"])["a"] > 0
+    assert f_regression_scores(ds, "reg", ["a"])["a"] > 0
+
+
+def test_a_repeated_categorical_column_is_accepted() -> None:
+    """Distinct-per-row is the rejection rule, not "numeric" — a coded category is fine."""
+    ds = bt.from_pydict(
+        {"y": [0, 0, 1, 1, 0, 1], "coded": [1, 1, 2, 2, 1, 2], "free": [1, 2, 1, 2, 1, 2]}
+    )
+    assert chi2_scores(ds, "y")["coded"] > chi2_scores(ds, "y")["free"]
+    assert mutual_info_scores(ds, "y")["coded"] > mutual_info_scores(ds, "y")["free"]
+
+
+def test_a_tiny_input_is_not_rejected() -> None:
+    """Below three rows every column is trivially all-distinct; that is not the bug."""
+    ds = bt.from_pydict({"y": ["p", "q"], "a": ["x", "y"]})
+    assert set(chi2_scores(ds, "y")) == {"a"}
