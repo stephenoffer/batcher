@@ -15,6 +15,8 @@ All of these passed when written; the file exists so a future rule cannot quietl
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pyarrow as pa
 import pytest
 
@@ -199,3 +201,80 @@ def test_a_field_of_a_constructed_struct_is_the_input() -> None:
     ds = bt.from_pydict({"x": [1, 2, None], "y": ["a", "b", None]})
     got = ds.select(r=bt.struct(x=bt.col("x"), y=bt.col("y")).struct.field("x")).to_pydict()
     assert got["r"] == [1, 2, None]
+
+
+# --------------------------------------------------------------------------- #
+# Temporal rewrites. `combine_adjacent_date_offsets` fires only when both
+# offsets carry zero months, and that guard is the correctness argument.
+# --------------------------------------------------------------------------- #
+_MONTH_END_DATES = [
+    dt.date(2024, 1, 31),  # +1mo clamps to Feb 29 (leap), +1mo again lands Mar 29
+    dt.date(2023, 1, 31),  # ...and Feb 28 in a non-leap year, so Mar 28
+    dt.date(2024, 3, 31),
+    dt.date(2024, 5, 31),
+    dt.date(2024, 1, 29),  # no clamping, so the two forms agree here
+    dt.date(2024, 2, 29),
+    dt.date(2024, 12, 31),
+]
+
+
+@pytest.fixture
+def month_ends() -> pa.Table:
+    return pa.table({"d": pa.array(_MONTH_END_DATES, pa.date32())})
+
+
+def test_stacked_month_offsets_are_not_fused(month_ends) -> None:
+    """Month arithmetic clamps, so it is not associative and the offsets must stay separate.
+
+    January 31 plus one month is February 29, and one further month is March 29, while January 31
+    plus *two* months is March 31. Fusing the pair would move four of these seven dates. If this
+    test fails, `combine_adjacent_date_offsets` has widened past its zero-months guard.
+    """
+    stacked = (
+        bt.from_arrow(month_ends)
+        .select(r=bt.col("d").dt.offset_by("1mo").dt.offset_by("1mo"))
+        .to_pydict()["r"]
+    )
+    fused = bt.from_arrow(month_ends).select(r=bt.col("d").dt.offset_by("2mo")).to_pydict()["r"]
+
+    differing = [d for d, a, b in zip(_MONTH_END_DATES, stacked, fused, strict=True) if a != b]
+    assert len(differing) == 4, (
+        f"expected the clamping dates to differ between +1mo+1mo and +2mo, got {differing}"
+    )
+    assert stacked[0] == dt.date(2024, 3, 29)
+    assert fused[0] == dt.date(2024, 3, 31)
+
+
+def test_stacked_month_offsets_match_duckdb(duck, month_ends) -> None:
+    got = (
+        bt.from_arrow(month_ends)
+        .select(r=bt.col("d").dt.offset_by("1mo").dt.offset_by("1mo"))
+        .collect()
+    )
+    duck.register("t", month_ends)
+    assert_same(
+        got,
+        duck.sql("SELECT CAST((d + INTERVAL 1 MONTH) + INTERVAL 1 MONTH AS DATE) AS r FROM t"),
+    )
+
+
+def test_stacked_day_offsets_fuse_to_the_same_dates(duck, month_ends) -> None:
+    """Days are exact durations with no clamping, so fusing them is the same function."""
+    stacked = (
+        bt.from_arrow(month_ends)
+        .select(r=bt.col("d").dt.offset_by("5d").dt.offset_by("3d"))
+        .to_pydict()["r"]
+    )
+    fused = bt.from_arrow(month_ends).select(r=bt.col("d").dt.offset_by("8d")).to_pydict()["r"]
+    assert stacked == fused
+
+    duck.register("t", month_ends)
+    assert_same(
+        bt.from_arrow(month_ends).select(r=bt.col("d").dt.offset_by("8d")).collect(),
+        duck.sql("SELECT CAST(d + INTERVAL 8 DAY AS DATE) AS r FROM t"),
+    )
+
+
+def test_a_zero_offset_leaves_the_date_alone(month_ends) -> None:
+    got = bt.from_arrow(month_ends).select(r=bt.col("d").dt.offset_by("0d")).to_pydict()["r"]
+    assert got == _MONTH_END_DATES
