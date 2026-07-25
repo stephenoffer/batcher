@@ -463,6 +463,27 @@ Six queries lose in *both* passes, and this is the list worth working: q4 ~1.45x
 q6 ~1.40x, q5 ~1.30x, q22 ~1.30x, q21 ~1.29x. Six win in both: q16 ~0.59x, q2 and q8 ~0.65x,
 q17 ~0.68x, q10, q13. The remainder sit at parity or swing, and a single pass cannot tell which.
 
+### Two ways an in-process optimizer A/B lies, and both shipped a regression
+
+These are worse than the two below, because they do not merely waste time — they produced a
+green verdict for a change that cost ~9%, and it landed.
+
+- **A monkeypatch A/B must clear the plan cache on every arm switch.** `plan_cache.cache_key`
+  folds in `learning.generation()`. Stubbing an estimator's *consumer* does not bump that
+  counter, so a plan optimized under one arm is served to the other and the arms stop
+  differing. Call `plan_cache.clear()` in the arm switch. Without it, two separate "timing
+  neutral" verdicts were measuring a contaminated mixture.
+- **A flat percentage noise floor is wrong for tight distributions.** The ~30% floor below is
+  calibrated for the *bimodal* queries (q19 is min 14.8ms against a median of 52ms). Applied
+  to a tight distribution it hides real effects: a consistent +12-28% across 18 of 22
+  queries, min and median agreeing, was labelled "noise" by a 30% rule. **Sign consistency
+  across many queries is the stronger signal** — 18 of 22 one-directional is ~0.1% by chance.
+  Look at that and at min-versus-median agreement, not a single magnitude cutoff.
+
+Clearing the plan cache also changes what is being measured, and that is the point: it moves
+the comparison onto **cold-plan** cost, where optimizer overhead shows up. q2 goes from 12ms
+to 112ms under it. A change that only touches planning is invisible until you do this.
+
 ### Two ways this benchmark manufactures a false result
 
 Both were hit while producing the table above, and both survive a warm-up and a best-of-N:
