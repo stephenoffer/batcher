@@ -278,3 +278,74 @@ def test_stacked_day_offsets_fuse_to_the_same_dates(duck, month_ends) -> None:
 def test_a_zero_offset_leaves_the_date_alone(month_ends) -> None:
     got = bt.from_arrow(month_ends).select(r=bt.col("d").dt.offset_by("0d")).to_pydict()["r"]
     assert got == _MONTH_END_DATES
+
+
+# --------------------------------------------------------------------------- #
+# Constant folds must agree with the runtime. A fold only fires on a literal,
+# so a fold that computes a different value than the engine makes the *same*
+# expression return two answers depending on where its input came from.
+# --------------------------------------------------------------------------- #
+_FOLD_INPUTS = ["hello", "", "Hello World", "MiXeD cAsE", "  pad  ", "123", "hi"]
+
+_STRING_FOLDS = [
+    ("md5", lambda e: e.str.md5()),
+    ("sha1", lambda e: e.str.sha1()),
+    ("sha256", lambda e: e.str.sha256()),
+    ("crc32", lambda e: e.str.crc32()),
+    ("hex", lambda e: e.str.hex()),
+    ("ascii", lambda e: e.str.ascii()),
+    ("initcap", lambda e: e.str.initcap()),
+    ("reverse", lambda e: e.str.reverse()),
+    ("bit_length", lambda e: e.str.bit_length()),
+    ("octet_length", lambda e: e.str.octet_length()),
+    ("trim", lambda e: e.str.strip_chars()),
+    ("ltrim", lambda e: e.str.strip_chars_start()),
+    ("rtrim", lambda e: e.str.strip_chars_end()),
+    ("repeat", lambda e: e.str.repeat(2)),
+    ("lpad", lambda e: e.str.pad_start(10)),
+    ("rpad", lambda e: e.str.pad_end(10)),
+]
+
+
+@pytest.mark.parametrize(("name", "build"), _STRING_FOLDS)
+def test_folding_a_literal_equals_running_on_a_column(name, build):
+    """The invariant that catches a fold reimplementing a function slightly differently.
+
+    Three folds failed this when it was written. `hex` used Python's `bytes.hex()`, which is
+    lowercase where the engine returns uppercase, so `hex(col) = hex('needle')` could never
+    match. `lpad`/`rpad` used `str.rjust`/`str.ljust`, which leave an over-long input alone
+    where SQL truncates it, so `lpad('Hello World', 10)` folded to `'Hello World'` against the
+    runtime's `'Hello Worl'`.
+    """
+    table = pa.table({"s": pa.array(_FOLD_INPUTS)})
+    ds = bt.from_arrow(table)
+
+    on_column = ds.select(r=build(bt.col("s"))).to_pydict()["r"]
+    on_literal = [
+        ds.limit(1).select(r=build(bt.lit(value))).to_pydict()["r"][0] for value in _FOLD_INPUTS
+    ]
+
+    assert on_literal == on_column, (
+        f"{name}: folding a literal disagrees with running on a column, so the same expression "
+        f"returns two different answers depending on where its input came from"
+    )
+
+
+@pytest.mark.parametrize("value", _FOLD_INPUTS)
+def test_hex_folds_to_uppercase_like_the_engine(duck, value):
+    ds = bt.from_arrow(pa.table({"s": pa.array([value])}))
+    folded = ds.select(r=bt.lit(value).str.hex()).collect()
+    duck.register("t", pa.table({"s": pa.array([value])}))
+    assert_same(folded, duck.sql("SELECT hex(s) AS r FROM t"))
+
+
+@pytest.mark.parametrize("width", [1, 5, 10, 11, 20])
+@pytest.mark.parametrize("method", ["pad_start", "pad_end"])
+def test_a_pad_fold_truncates_an_over_long_literal(duck, width, method):
+    """SQL pads *to* a width, so an input already wider than it is cut down, not left alone."""
+    value = "Hello World"
+    ds = bt.from_arrow(pa.table({"s": pa.array([value])}))
+    folded = ds.select(r=getattr(bt.lit(value).str, method)(width)).collect()
+    duck.register("t", pa.table({"s": pa.array([value])}))
+    fn = "lpad" if method == "pad_start" else "rpad"
+    assert_same(folded, duck.sql(f"SELECT {fn}(s, {width}, ' ') AS r FROM t"))
