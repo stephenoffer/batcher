@@ -1767,10 +1767,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/breaker.rs` | 304 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 197 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 212 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 746 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 745 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/parallel.rs` | 816 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
-| `stream/probe_chunks.rs` | 92 | Emitting one probed morsel as however many output morsels its fan-out needs. |
+| `stream/probe_chunks.rs` | 96 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `window_spill.rs` | 72 | Bounded-memory window execution via grace partitioning. |
 

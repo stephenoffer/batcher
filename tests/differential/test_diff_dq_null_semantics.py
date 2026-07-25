@@ -52,10 +52,16 @@ def test_value_constraints_pass_a_null_but_not_null_catches_it() -> None:
 
 
 def test_two_null_keys_are_duplicates_of_each_other() -> None:
-    """`unique` lowers to a count over the key partition, which groups NULLs together."""
+    """`unique` lowers to a count over the key partition, which groups NULLs together.
+
+    The violation count is **2**, the two rejected rows, not 1 for the one repeated key.
+    `ValidationReport.total_violations` is documented as a row total and sums across
+    constraints, so a key count could not be one of its summands. The `drop` assertion on the
+    line above already implies two rows went; this used to say 1.
+    """
     ds = bt.from_pydict({"k": [None, None, 1]})
     assert ds.dq.unique("k").drop().to_pydict() == {"k": [1]}
-    assert ds.dq.unique("k").validate().violations == {"unique(k)": 1}
+    assert ds.dq.unique("k").validate().violations == {"unique(k)": 2}
 
 
 # -------------------------------------------------------------- the lowering's leftovers

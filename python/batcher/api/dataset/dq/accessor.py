@@ -278,11 +278,38 @@ class DatasetDQ:
                 violations[c.name] = int((res[f"v{i}"][0]) or 0)
         for u in self._constraints:
             if isinstance(u, UniqueConstraint):
-                dupe_keys = (
-                    self._ds.group_by(*u.keys).agg(__dq_n=count()).filter(Col("__dq_n") > 1).count()
-                )
-                violations[u.name] = int(dupe_keys)
+                violations[u.name] = self._duplicate_row_count(u)
         return ValidationReport(violations)
+
+    def _duplicate_row_count(self, unique: UniqueConstraint) -> int:
+        """How many *rows* the uniqueness constraint rejects — not how many keys repeat.
+
+        `ValidationReport.total_violations` is documented as the number of violating rows, and
+        every row-wise constraint reports one. This counted the duplicated *groups* instead,
+        so it under-reported by the size of each group and by an unbounded factor: over
+        ``[1, 1, 1, 2]``, `drop` removes three rows and `quarantine` rejects three, while the
+        report said `1`. A key repeated a thousand times still said `1`.
+
+        Summing the group sizes matches what `drop`/`quarantine` do — they keep a row iff
+        ``count() OVER (PARTITION BY keys) == 1`` — so the non-raising report and the
+        non-raising split now agree, which is what anyone reading a monitoring dashboard next
+        to a dead-letter sink is entitled to assume.
+
+        Args:
+            unique: The uniqueness constraint to measure.
+
+        Returns:
+            The number of rows whose key combination occurs more than once.
+        """
+        duplicated = (
+            self._ds.group_by(*unique.keys)
+            .agg(__dq_n=count())
+            .filter(Col("__dq_n") > 1)
+            .agg(__dq_rows=Col("__dq_n").sum())
+            .to_pydict()["__dq_rows"]
+        )
+        # `sum` over no group is NULL, which is zero violating rows.
+        return int(duplicated[0]) if duplicated and duplicated[0] is not None else 0
 
     def fail(self) -> Dataset:
         """Raise `DataQualityError` on any violation; else return the dataset unchanged.

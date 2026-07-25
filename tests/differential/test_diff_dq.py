@@ -80,10 +80,23 @@ def test_unique_quarantine_routes_duplicate_rows():
     assert sorted(bad.collect().to_pydict()["id"]) == [1, 1, 3, 3]
 
 
-def test_unique_validate_counts_duplicate_keys():
+def test_unique_validate_counts_the_rows_it_rejects_not_the_keys():
+    """This assertion used to read ``== 2  # keys 1 and 3``. That was the wrong contract.
+
+    `ValidationReport.total_violations` is documented as "the total number of violating rows
+    summed across every constraint", and every row-wise constraint reports rows. The summing
+    is what settles it: a total that adds a *key* count from `unique` to a *row* count from
+    `not_null` is dimensionally meaningless, so `unique` owes rows like the rest.
+
+    The test directly above already showed `quarantine` rejecting ``[1, 1, 3, 3]`` — four rows
+    — for this very input. Both facts lived in this file and nothing compared them.
+    """
     t = pa.table({"id": [1, 1, 2, 3, 3]})
-    report = bt.from_arrow(t).dq.unique(["id"]).validate()
-    assert report.violations["unique(id)"] == 2  # keys 1 and 3
+    dq = bt.from_arrow(t).dq.unique(["id"])
+    report = dq.validate()
+    assert report.violations["unique(id)"] == 4  # rows 1, 1, 3, 3 — not the two keys
+    _clean, bad = bt.from_arrow(t).dq.unique(["id"]).quarantine()
+    assert report.total_violations == bad.count()
 
 
 def test_foreign_key_finds_orphans(duck):
@@ -97,3 +110,73 @@ def test_foreign_key_finds_orphans(duck):
         .collect()
     )
     assert_same(orphans, duck.sql("SELECT * FROM f WHERE cid NOT IN (SELECT id FROM d)"))
+
+
+# --- the report and the split must agree on how many rows failed -----------------------
+
+
+@pytest.mark.parametrize(
+    ("ids", "rejected"),
+    [
+        ([1, 1, 2], 2),
+        ([1, 1, 1, 2], 3),
+        ([1, 1, 2, 2, 3], 4),
+        ([7, 7, 7, 7], 4),
+        ([1, None, None, 2], 2),
+        ([1, 2, 3], 0),
+    ],
+    ids=["pair", "triple", "two-pairs", "all-same", "null-key", "clean"],
+)
+def test_validate_counts_the_rows_a_uniqueness_check_rejects(ids, rejected):
+    """`total_violations` is documented as violating *rows*, and `unique` owes that too.
+
+    It counted the duplicated *groups* instead — one `count()` over the grouped keys — so it
+    under-reported by the size of each group, and by an unbounded factor: over
+    ``[1, 1, 1, 2]`` `drop` removes three rows and `quarantine` rejects three, while the
+    report said `1`. A key repeated a thousand times still said `1`.
+
+    `validate()` and `quarantine()` are the two non-raising paths, and someone reading a
+    monitoring number beside a dead-letter sink is entitled to have them agree.
+    """
+    ds = bt.from_arrow(pa.table({"id": pa.array(ids, pa.int64())}))
+
+    report = ds.dq.unique("id").validate()
+    _clean, bad = ds.dq.unique("id").quarantine()
+    kept = ds.dq.unique("id").drop().count()
+
+    assert bad.count() == rejected, "quarantine() rejected an unexpected number of rows"
+    assert report.total_violations == rejected, (
+        f"validate() reported {report.total_violations} for {rejected} rejected rows"
+    )
+    assert report.violations["unique(id)"] == rejected
+    assert kept + bad.count() == len(ids), "drop and quarantine must partition the input"
+    assert report.ok is (rejected == 0)
+
+
+def test_validate_agrees_with_quarantine_across_every_constraint_kind():
+    """The row-wise constraints already agreed; this pins all of them together.
+
+    A report whose count means "rows" for one constraint and "keys" for another is worse than
+    either convention, because nothing tells the reader which they are looking at.
+    """
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 2, 4, None], pa.int64()),
+            "score": pa.array([10, -5, 50, 200, 7], pa.int64()),
+            "name": pa.array(["ana", "bob", None, "dan", "eve"]),
+        }
+    )
+    ds = bt.from_arrow(table)
+    for label, apply_to in (
+        ("not_null", lambda dq: dq.not_null("id")),
+        ("in_range", lambda dq: dq.in_range("score", 0, 100)),
+        ("accepted_values", lambda dq: dq.accepted_values("name", ["ana", "bob"])),
+        ("unique", lambda dq: dq.unique("id")),
+        ("check", lambda dq: dq.check(bt.col("score") > 0, name="positive")),
+    ):
+        _clean, bad = apply_to(ds.dq).quarantine()
+        report = apply_to(ds.dq).validate()
+        assert report.total_violations == bad.count(), (
+            f"{label}: validate() says {report.total_violations}, quarantine() rejects "
+            f"{bad.count()}"
+        )
