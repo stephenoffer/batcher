@@ -381,6 +381,33 @@ def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
     return RunStats.from_profile(profile)
 
 
+def _sink_owns_its_layout(sink: object, path: str) -> bool:
+    """Whether this sink's file layout is a property of the *target*, not of this write.
+
+    `partitions_itself` is the flat form: a sink whose layout never comes from the call site
+    (a partitioned Iceberg table declares its spec in the catalog). `requires_partitioned_write`
+    is the form that has to look: a Delta table is partitioned or not depending on how it was
+    created, so only the table can answer, and the answer decides whether this write may take
+    the single-file path.
+
+    It matters because Delta keeps a partition value in the file's *directory name*. A write
+    that takes the single-file path into a partitioned table does not merely lay the file out
+    differently — the value is nowhere, and the rows read back null in the column the table is
+    organised by.
+
+    Args:
+        sink: The format sink about to be written through.
+        path: The write's destination root.
+
+    Returns:
+        True when this write must go through the partitioned path.
+    """
+    ask = getattr(sink, "requires_partitioned_write", None)
+    if ask is not None:
+        return bool(ask(path))
+    return bool(getattr(sink, "partitions_itself", False))
+
+
 def _streaming_write_eligible(
     plan: LogicalPlan,
     sources: list[Source],
@@ -389,6 +416,8 @@ def _streaming_write_eligible(
     max_rows_per_file: int | None,
     num_files: int | None,
     target_bytes_per_file: int | None,
+    sink: object = None,
+    path: str = "",
 ) -> bool:
     """Whether `_write` can stream the result to one file instead of collecting it.
 
@@ -405,6 +434,8 @@ def _streaming_write_eligible(
 
     if distributed or partition_by:
         return False
+    if sink is not None and _sink_owns_its_layout(sink, path):
+        return False  # a partitioned target needs the whole table to fan out by key
     if max_rows_per_file is not None or num_files is not None or target_bytes_per_file is not None:
         return False
     if not is_streamable(plan):
@@ -581,6 +612,8 @@ def _write(
         max_rows_per_file,
         num_files,
         target_bytes_per_file,
+        sink,
+        path,
     ):
         from batcher._internal.prefetch import prefetch
         from batcher.api.terminal.map_stream import peek_stream
@@ -617,7 +650,7 @@ def _write(
         directory
         or partition_by
         or max_rows_per_file is not None
-        or getattr(sink, "partitions_itself", False)
+        or _sink_owns_its_layout(sink, path)
     ):
         # A row cap (or partitioning) writes a directory of `part-*` files; the cap
         # bounds each file's size (no single giant file; tiny files coalesce upstream).

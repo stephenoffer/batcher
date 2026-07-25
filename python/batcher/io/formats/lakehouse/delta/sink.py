@@ -86,6 +86,7 @@ class DeltaSink:
         "_partition_by",
         "_replace_where",
         "_storage_options",
+        "_table_parts",
         "_token",
         "_txn_version",
     )
@@ -106,6 +107,7 @@ class DeltaSink:
             raise BackendError(f"unsupported Delta write mode {mode!r}; use append/overwrite")
         self._mode = mode
         self._partition_by = partition_by
+        self._table_parts: dict[str, list[str]] = {}
         self._merge_predicate = merge_predicate
         self._replace_where = replace_where
         self._merge_schema = merge_schema
@@ -138,6 +140,22 @@ class DeltaSink:
         """
         written = self._data_sink().write_partitioned(table, path, file_index=0)[0]
         return replace(written, stats=collect_file_stats(table))
+
+    def requires_partitioned_write(self, path: str) -> bool:
+        """Whether a write to `path` must fan out by partition key rather than write one file.
+
+        True when the target table is partitioned — by this write's `partition_by` or, for an
+        existing table, by its own metadata. `write` returns a single `WrittenFile` and so
+        cannot represent a shard that spans several partitions; routing such a write here is
+        what keeps the partition values from being dropped.
+
+        Args:
+            path: The table root about to be written.
+
+        Returns:
+            True when the partitioned write path is required.
+        """
+        return bool(self._partition_columns(path))
 
     def write_stream(
         self,
@@ -181,10 +199,19 @@ class DeltaSink:
 
         The shard never travels to the driver — only the returned locators do, carrying
         the statistics and partition values the commit registers.
+
+        When the caller does not say how to partition, the **table's** partitioning is used.
+        Delta keeps a partition value in the file's directory name rather than in the file, so
+        writing an unpartitioned file into a partitioned table does not merely lay it out
+        differently — it loses the value. Appending `region="us"` to a table partitioned on
+        `region` without restating `partition_by` wrote the file outside every `region=`
+        directory, and the row read back with ``region = NULL``: present, and silently
+        stripped of the column the table is organised by. Restating the partitioning on every
+        append is not something a caller should have to remember to keep their data.
         """
         if partition_by is not None:
             self._partition_by = partition_by
-        parts = self._partition_by
+        parts = self._partition_columns(path) or None
         written = self._data_sink().write_partitioned(
             table, path, partition_by=parts, file_index=file_index
         )
@@ -253,7 +280,7 @@ class DeltaSink:
             return
         if already_committed(path, self._app_txn, self._storage_options):
             return
-        mode, filters = self._overwrite_scope()
+        mode, filters = self._overwrite_scope(path)
         commit_add_actions(
             manifest,
             path,
@@ -265,7 +292,7 @@ class DeltaSink:
             app_txn=self._app_txn,
         )
 
-    def _overwrite_scope(self) -> tuple[str, list[tuple[str, str, str]] | None]:
+    def _overwrite_scope(self, path: str) -> tuple[str, list[tuple[str, str, str]] | None]:
         """The commit's mode and, for a `replace_where`, the partitions it is scoped to.
 
         A `replace_where` over partition columns becomes a partition-scoped overwrite: the
@@ -273,13 +300,21 @@ class DeltaSink:
         predicate delta-rs cannot express as partition filters is refused rather than
         silently widened to a full overwrite — replacing a day and getting the table
         replaced instead is the worst possible failure here.
+
+        The partition columns come from the *table* when this write does not restate them,
+        which is the ordinary case: a backfill targets a table that was partitioned when it
+        was created, and `partition_by=` on an overwrite is redundant. Checking only this
+        call's argument refused every such write — `write(mode="overwrite",
+        replace_where=col("region") == "us")` on a table whose log says
+        ``partition_columns: ['region']`` raised the error below, which then told the caller
+        to "partition the table on the columns you backfill by" when it already was.
         """
         if self._replace_where is None:
             return self._mode, None
 
         from batcher.io.formats.lakehouse.delta._predicate import to_partition_filters
 
-        filters = to_partition_filters(self._replace_where, self._partition_by or [])
+        filters = to_partition_filters(self._replace_where, self._partition_columns(path))
         if filters is None:
             raise CommitError(
                 "write(replace_where=...) on a Delta table needs a predicate over the "
@@ -288,6 +323,37 @@ class DeltaSink:
                 "columns you backfill by, or overwrite the whole table explicitly."
             )
         return "overwrite", filters
+
+    def _partition_columns(self, path: str) -> list[str]:
+        """This write's partition columns, else the existing table's.
+
+        An unreadable or not-yet-created table falls back to what the caller passed, so a
+        first write behaves as before and the error below still explains itself.
+
+        Args:
+            path: The table root.
+
+        Returns:
+            The partition column names to scope a `replace_where` against.
+        """
+        if self._partition_by:
+            return list(self._partition_by)
+        if path in self._table_parts:
+            return self._table_parts[path]
+        try:
+            import deltalake
+
+            found = list(
+                deltalake.DeltaTable(path, storage_options=self._storage_options)
+                .metadata()
+                .partition_columns
+            )
+        except Exception:  # not a Delta table yet, or the log cannot be read here
+            found = []
+        # Memoized per path: a distributed write asks once per shard, and every shard reads
+        # the same log and must reach the same answer.
+        self._table_parts[path] = found
+        return found
 
     def _commit_merge(self, manifest: WriteManifest, path: str) -> None:
         """Upsert the written files' rows into the table via `DeltaTable.merge`.

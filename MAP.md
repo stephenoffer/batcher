@@ -337,7 +337,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 443 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 755 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 788 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 115 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 376 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 488 | The opt-in GPU execution backend for supported relational shapes. |
@@ -1137,7 +1137,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_predicate.py` | 174 | Rendering an expression for delta-rs: as partition filters, or as SQL. |
 | `_snapshot.py` | 481 | One cached read of a Delta table's `_delta_log`, shared by every metadata question. |
 | `maintenance.py` | 172 | Delta table maintenance: OPTIMIZE, ZORDER, VACUUM, and log checkpointing. |
-| `sink.py` | 337 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
+| `sink.py` | 403 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
 | `source.py` | 478 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
 | `stream.py` | 156 | Reading a Delta table as an unbounded stream via its Change Data Feed. |
 
