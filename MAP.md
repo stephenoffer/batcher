@@ -252,7 +252,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 188 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 155 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1417 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1443 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1240 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor

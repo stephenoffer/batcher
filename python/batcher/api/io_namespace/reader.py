@@ -356,6 +356,32 @@ class Reader:
         """
         return _read(path, format="xml", **opts)
 
+    def msgpack(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read MessagePack file(s) — a file, directory, or glob — into columnar rows.
+
+        The counterpart of `ds.write.msgpack`. Without it, MessagePack was the one format
+        this engine could write by name and not read by name: `ds.write.msgpack(p)` succeeded,
+        `bt.read.msgpack(p)` raised `FormatError: Unknown format 'msgpack'`, and the reader
+        the registry already held was reachable only through the untyped
+        ``bt.read(p, format="msgpack")``.
+
+        Needs the optional extra: ``pip install 'batcher-engine[msgpack]'``.
+
+        Args:
+            path: A MessagePack file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the MessagePack source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.msgpack("data/events.msgpack")  # doctest: +SKIP
+        """
+        return _read(path, format="msgpack", **opts)
+
     def logs(self, path: PathLike, **opts: Any) -> Dataset:
         """Read line-delimited log file(s) as rows, one raw line per row by default.
 
