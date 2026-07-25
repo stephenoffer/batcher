@@ -57,6 +57,28 @@ What to do about it:
 The same swap is why a benchmark can silently measure the *other* agent's build: check
 `bt.versions()["engine_profile"]`, which the suite now does for you.
 
+## The pre-commit hook is repo-wide, so someone else's half-done refactor blocks you
+
+`lint-structure` runs over the whole tree, not your staged paths. An agent mid-way through
+shrinking an oversized file — say `stream/mod.rs` at 804 code lines against a limit of 800,
+on its way down from 826 — fails the hook for *every* session trying to commit, including
+ones that touched nothing near it.
+
+Diagnose it before assuming your change is at fault: the FAIL line names the file, and
+`git status <that file>` plus `git show HEAD:<that file> | wc -l` tells you whether someone
+is actively working it down.
+
+Then **wait and retry** — a loop around `git commit` is the whole fix, and their next save
+usually clears it. Do not:
+
+- **`--no-verify`.** The gate is the point, and skipping it is how an oversized file or a
+  broken layer contract lands.
+- **"Just fix" their file.** It is four lines; it is also the middle of someone's refactor,
+  and your trim will collide with theirs.
+
+The same applies to `MAP.md`: it goes stale the moment any session adds a module, so
+regenerate it *inside* the retry loop rather than before it.
+
 ## Prove "pre-existing", never assume it
 
 Reporting another agent's in-flight breakage as "pre-existing and unrelated" is the

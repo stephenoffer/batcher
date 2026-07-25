@@ -1,10 +1,14 @@
-# Daft parity ledger
+# Daft parity ledger (and the single-node competitive picture)
 
-**Status:** open, started 2026-07-24. A running record of the Daft-versus-Batcher gap and
-what has been closed. Read `competitive_architecture.md` for the scorecard and
-`competitor_technique_review.md` for the mechanism-level parts list; this file is narrower
-than either. It answers one question: what can a Daft user do that a Batcher user cannot,
-and what did we do about it.
+**Status:** open, started 2026-07-24. Read `competitive_architecture.md` for the scorecard and
+`competitor_technique_review.md` for the mechanism-level parts list; this file is narrower than
+either.
+
+It started with one question — what can a Daft user do that a Batcher user cannot, and what did
+we do about it — and the capability half below is still exactly that. The *measurement* half
+outgrew it: chasing the one place Batcher measurably lost to Daft led into DuckDB and Polars, so
+"Measured" now covers all three single-node engines under one set of conditions. The filename is
+kept because several files point at it.
 
 Daft was read from `/mnt/shared_storage/ref/Daft` (the Python surface under `daft/`, the
 Rust crates under `src/`).
@@ -170,200 +174,18 @@ way. Checked against Daft's tree, not its documentation.
 - **Data quality.** `ds.dq` with fail/drop/quarantine. Absent from Daft.
 - **SQL.** Batcher has a SQL front-end over the same plan; Daft's `daft-sql` is narrower.
 
-## Measured: Batcher against Daft
+## Measured: the single-node competitive picture
 
-`benchmarks/engines/daft.py` has existed for a while, but Daft was only in the *multi*-node
-default lineup, so the run everyone actually types (`python benchmarks/run.py`) never
-included it. It is now in both tiers, because a claim no default run measures is a claim
-nobody checks.
+This section began as a Daft comparison and now carries all three single-node engines,
+because the question it answers moved. Everything below was taken at TPC-H sf1 on a 96-core
+node with a **release** build, with the engine's mtime checked across each run — see
+`benchmarks/run.py::_check_build_profile` for why that check exists.
 
-The operator suite at TPC-H scale factor 1, best-of-5, on this machine
-(`python benchmarks/run.py --benchmark operators --engines batcher,duckdb,polars,daft
---scale 1`). `b/daft` below 1 means Batcher is faster by that factor.
+`benchmarks/engines/daft.py` had existed for a while, but Daft sat only in the *multi*-node
+default lineup, so the run everyone actually types (`python benchmarks/run.py`) never included
+it. It is now in both tiers, because a claim no default run measures is a claim nobody checks.
 
-The run below printed `release` from `bt.versions()["engine_profile"]` before starting, and
-the suite now refuses to run otherwise (`benchmarks/run.py::_check_build_profile`).
-
-| Query | batcher_ms | duckdb_ms | polars_ms | daft_ms | b/daft |
-|---|---|---|---|---|---|
-| op-groupby-sum | 3.8 | 3.2 | 15.9 | 26.8 | 0.14x |
-| op-groupby-2key | 7.7 | 5.0 | 19.7 | 36.8 | 0.21x |
-| op-global-sum | 0.1 | 1.5 | 1.2 | 4.0 | 0.04x |
-| op-filter-count | 0.2 | 1.3 | 11.5 | 6.2 | 0.04x |
-| op-join-agg | 39.5 | 43.4 | 50.1 | 238.8 | 0.17x |
-| op-sort-limit | 7.4 | 6.0 | 230.9 | 46.1 | 0.16x |
-| op-filter-project | 9.4 | 7.1 | 16.0 | 13.2 | 0.71x |
-| op-window-rank | 42.4 | 117.9 | 851.7 | 6903.9 | 0.01x |
-| op-window-runsum | 39.4 | 237.9 | 861.9 | 7480.2 | 0.01x |
-| op-window-lag | 61.1 | 150.8 | 2655.5 | 6958.8 | 0.01x |
-| op-window-sum-partition | 35.9 | 44.7 | 49.0 | 2662.5 | 0.01x |
-
-Batcher is ahead on all eleven, from 1.4x on the narrowest (`op-filter-project`) to two
-orders of magnitude on the window functions. Discount the window column, though: one of
-those four is not computing the same thing on both sides (below), and the other three
-share its kernel.
-
-Three limits on what this supports: one machine, one scale factor, and the operator suite
-rather than full TPC-H. `docs/benchmarks/vs-daft.md` remains the scorecard, and it reports
-Daft ahead on join-heavy TPC-H — nothing here contradicts that, because none of these
-eleven is a multi-join query.
-
-### An oddity worth recording rather than explaining away
-
-An earlier pass of this same suite was run before the build profile was verified, and its
-numbers are within noise of the release ones above. That is not what a dev-profile build
-(`opt-level = 0`, `debug_assertions` on, dependencies unoptimized) should produce, and it
-is the reason the old timing-heuristic guard never fired: on these queries the profile
-barely moved the clock. Why is not established here, and guessing at it would be worse
-than leaving it open. The lesson taken is narrower and solid: **infer the build profile
-from the build, never from a stopwatch.**
-
-### Where Batcher was behind: small-corpus image ingest (mostly closed)
-
-The multimodal suite at scale 10 (100 JPEGs from S3), release build, `b/daft` above 1
-meaning Batcher is slower:
-
-| Query | before | after | daft_ms | b/daft before | b/daft after |
-|---|---|---|---|---|---|
-| img-list | 239.7 | 163.5 | 143.2 | 1.83x | **1.14x** |
-| img-decode | 285.5 | 174.2 | 145.8 | 2.18x | **1.20x** |
-| img-resize | 253.2 | 179.3 | 143.7 | 1.60x | **1.25x** |
-
-**The cause was a stat per file that the fetch already answers.** `_chunks()` called
-`probe_sizes` to size every file before packing them into batches — one object-store HEAD
-per file — and then the read issued a GET per file that returns the length anyway. Two
-round trips against the same latency where one would do. Instrumented on this corpus it
-was **86 ms of a 272 ms read, 32%**, and the docstring justifying it ("one stat per file is
-negligible next to what a media source already does per file") was reasoning about *bytes
-transferred* when the binding cost is *round trips*.
-
-`read()` now fetches first and fills a size cache from what came back, so `_chunks()` needs
-no stat. `iter_batches` still probes and must: it bounds memory before fetching, which is
-the whole point of a byte bound on the streaming path. Chunk boundaries are unchanged —
-only the source of the sizes moved — so `read`, `iter_batches` and `splits` still share the
-one chunk definition, which the module docstring requires.
-
-Batcher remains ~1.2x behind, so this is improved rather than won. What is left is inside
-the fetch itself (163 ms for 100 GETs against Daft's 143 ms).
-
-The diagnosis came from the *shape*, not the totals. `img-list` does no image work at all —
-it lists and fetches bytes — and Batcher was 1.8x behind there. Decode and resize then cost
-Batcher almost nothing on top (`img-resize` is *faster* than `img-decode`, the DCT-scaled
-JPEG path doing its job), while Daft's resize adds ~30 ms. That located the whole loss in
-per-file fetch and none of it in the image kernels, which are the better ones.
-
-Also checked along the way, and recorded so nobody re-chases them:
-
-1. **Serial header parsing** — metadata extraction ran in a Python loop after the
-   concurrent fetch, one `PIL.Image.open` per file on one thread. Fusing it into the pool
-   task is right on its own terms but moved the number only a few percent, inside the
-   spread. It was not the cause.
-2. **Benchmark fairness** — the obvious excuse is that Batcher expands a glob while Daft is
-   handed a URI list. It does not hold: `ImageCorpus.uris()` calls `open()`, which calls
-   `_list_corpus` with no caching, inside the timed function. Both engines list.
-
-The lesson for the remaining 1.2x: the first two attempts were hypotheses and both missed;
-the third came from instrumenting the read and reading the clock. Profile first.
-
-This does **not** contradict `docs/benchmarks/vs-daft.md`, which reports Batcher well ahead
-on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regime where
-per-file latency amortizes and Batcher's kernels dominate. The two results are consistent
-and describe different ends of the corpus-size range. What is now known is that the small
-end belongs to Daft.
-
-### Why the DuckDB gap is one item, not twelve
-
-Profiled the three worst DuckDB losses individually, expecting three causes. They are mostly
-one:
-
-| Query | Bottleneck | Reading |
-|---|---|---|
-| q21 (1.37x) | `filter` 90 ms, 6 M rows in, 3.79 M out, 87 MB materialized | gather |
-| q5 (1.42x) | `hash_join` 204 ms, 6 M probe emitting 1.2 M rows | gather |
-| q17 (2.41x vs Polars) | two 6 M probes where one suffices | duplicated work |
-
-The q5 number is the clearest evidence. The *same* 6 M-row probe costs 204 ms when it emits
-1.2 M rows and 103 ms when it emits 6 k (q17's first join) — so the cost tracks the *output*
-size, not the probe. That is materialization, which is exactly what
-`rfc-streaming-executor.md` measured with `perf` on q1 (~22% of wall time in the filter
-gather, because the predicate passes 98% of rows and the engine copies them where DuckDB
-carries a selection vector).
-
-So chasing individual queries is the wrong shape of work here: q5 and q21 are the same item,
-and it already has an RFC. q17 is the exception and has its own cheap fix below.
-
-### q17 vs Polars (2.41x): the 6 M-row probe runs twice
-
-The largest single loss to any competitor, localized. `explain(analyze=True)` on q17 at sf1:
-
-```
-hash_join   103.2ms   lineitem(6,001,215) x filtered_part(204) -> 6,088 rows
-  aggregate   3.0ms   -> 204 per-part averages
-hash_join    96.2ms   lineitem(6,001,215) x those_204          -> 6,088 rows
-```
-
-**The same 6 M-row probe is paid twice**, and the second one reproduces the 6,088 rows the
-first already had. That is the whole 2.41x: two probes where Polars does one.
-
-Two ways out, and the cheap one is not the obvious one:
-
-- **Plan-level CSE is the obvious answer and the wrong tool here.** The two joins are
-  identical, so eliminating the duplicate looks like a job for common sub-*plan* elimination.
-  But `kyber/rules/extra/cse.py` is deliberately expression-level (repeats inside one
-  `Project`), and sharing a sub-plan needs the executor to feed one materialized intermediate
-  to two consumers — a DAG where `bc_ir::RelOp` is a tree. That is an IR shape change, i.e. a
-  wire-contract change, for one query shape.
-- **Decorrelating differently costs nothing at the IR level.** The subquery correlates on
-  `l_partkey`, which is *also* the join key, so the per-part average can be computed as a
-  window over the already-joined 6,088 rows instead of by re-joining:
-
-  ```
-  lineitem x filtered_part -> 6,088 rows
-    -> avg(l_quantity) OVER (PARTITION BY l_partkey)
-    -> filter l_quantity < 0.2 * avg
-    -> sum
-  ```
-
-  One probe, and every operator already exists. This is a rewrite in the SQL decorrelation
-  path (or a Kyber rule over the join-aggregate-rejoin shape it produces), gated on the
-  correlation key being a subset of the join key. The care needed is in scalar-subquery
-  semantics — what an empty group yields — not in new machinery.
-
-Not attempted here: it is a correctness-sensitive rewrite of subquery translation, and the
-measurement above is what it needs to start from rather than a rushed patch.
-
-### The per-batch Python callback: 2.3-2.6x recovered
-
-`vs-daft.md` records Daft ~2x faster on a per-batch numpy UDF. Measuring the batch size
-Batcher hands such a callback found the cause, and it was a constant set from a claim that
-does not hold. `strategy.py` said of its 131,072-row floor: "throughput is flat from here
-up, so this is the smallest batch on the plateau." Re-measured on a 12 M-row numpy
-map+reduce (29 B/row, best-of-5):
-
-| rows per call | wall |
-|---|---|
-| 131,072 *(old default)* | 39.9 ms |
-| 262,144 *(old cap)* | 28.4 ms |
-| 524,288 | 19.2 ms |
-| **1,048,576** | **14.9 ms** |
-| 2,097,152 | 15.6 ms |
-| 4,194,304 | 40.3 ms |
-
-Not flat — a genuine optimum. Coarser amortizes more per-call overhead until concurrency
-starves: at 3 batches over 96 cores the GIL-bound per-call Arrow conversion serializes and it
-is worse than the morsel. 1 M is the bottom, and it is the same figure on a 6 M-row input, so
-it is a per-call row count rather than a function of the total.
-
-The old *cap* could not simply be raised, because a row count cannot bound memory — 1 M rows
-is 29 MB of narrow numerics and gigabytes of decoded frames, and the row cap was protecting
-the wide case at the narrow case's expense. The target is now byte-bounded, the same rule
-`udf/stream.py` already applies to its CPU chunks. A heavy `fn` keeps the per-worker split
-and the old cap: the measurement is about per-call overhead on the light path, and raising the
-core-filling path's footprint is a separate claim nothing here tests.
-
-Result: 6 M rows 22.3 → 9.7 ms, 12 M rows 39.5 → 15.2 ms. Wide-row callbacks are unchanged
-(still morsel-sized, 13 calls of 16,384 on the 4 KB/row case) — the byte bound is a guard
-there, not a speedup.
+Summary first, then per-competitor detail, then the per-query diagnoses.
 
 ### The full single-node picture, TPC-H sf1, 96 cores, release
 
@@ -465,10 +287,168 @@ This is recorded here rather than filed anywhere, because the point for Batcher 
 the differential harness catches this class of thing, and it caught it in a competitor
 before it could ever have caught it in us.
 
+### Why the DuckDB gap is one item, not twelve
+
+Profiled the three worst DuckDB losses individually, expecting three causes. They are mostly
+one:
+
+| Query | Bottleneck | Reading |
+|---|---|---|
+| q21 (1.37x) | `filter` 90 ms, 6 M rows in, 3.79 M out, 87 MB materialized | gather |
+| q5 (1.42x) | `hash_join` 204 ms, 6 M probe emitting 1.2 M rows | gather |
+| q17 (2.41x vs Polars) | two 6 M probes where one suffices | duplicated work |
+
+The q5 number is the clearest evidence. The *same* 6 M-row probe costs 204 ms when it emits
+1.2 M rows and 103 ms when it emits 6 k (q17's first join) — so the cost tracks the *output*
+size, not the probe. That is materialization, which is exactly what
+`rfc-streaming-executor.md` measured with `perf` on q1 (~22% of wall time in the filter
+gather, because the predicate passes 98% of rows and the engine copies them where DuckDB
+carries a selection vector).
+
+So chasing individual queries is the wrong shape of work here: q5 and q21 are the same item,
+and it already has an RFC. q17 is the exception and has its own cheap fix below.
+
+### q17 vs Polars (2.41x): the 6 M-row probe runs twice
+
+The largest single loss to any competitor, localized. `explain(analyze=True)` on q17 at sf1:
+
+```
+hash_join   103.2ms   lineitem(6,001,215) x filtered_part(204) -> 6,088 rows
+  aggregate   3.0ms   -> 204 per-part averages
+hash_join    96.2ms   lineitem(6,001,215) x those_204          -> 6,088 rows
+```
+
+**The same 6 M-row probe is paid twice**, and the second one reproduces the 6,088 rows the
+first already had. That is the whole 2.41x: two probes where Polars does one.
+
+Two ways out, and the cheap one is not the obvious one:
+
+- **Plan-level CSE is the obvious answer and the wrong tool here.** The two joins are
+  identical, so eliminating the duplicate looks like a job for common sub-*plan* elimination.
+  But `kyber/rules/extra/cse.py` is deliberately expression-level (repeats inside one
+  `Project`), and sharing a sub-plan needs the executor to feed one materialized intermediate
+  to two consumers — a DAG where `bc_ir::RelOp` is a tree. That is an IR shape change, i.e. a
+  wire-contract change, for one query shape.
+- **Decorrelating differently costs nothing at the IR level.** The subquery correlates on
+  `l_partkey`, which is *also* the join key, so the per-part average can be computed as a
+  window over the already-joined 6,088 rows instead of by re-joining:
+
+  ```
+  lineitem x filtered_part -> 6,088 rows
+    -> avg(l_quantity) OVER (PARTITION BY l_partkey)
+    -> filter l_quantity < 0.2 * avg
+    -> sum
+  ```
+
+  One probe, and every operator already exists. This is a rewrite in the SQL decorrelation
+  path (or a Kyber rule over the join-aggregate-rejoin shape it produces), gated on the
+  correlation key being a subset of the join key. The care needed is in scalar-subquery
+  semantics — what an empty group yields — not in new machinery.
+
+Not attempted here: it is a correctness-sensitive rewrite of subquery translation, and the
+measurement above is what it needs to start from rather than a rushed patch.
+
+### Where Batcher was behind: small-corpus image ingest (mostly closed)
+
+The multimodal suite at scale 10 (100 JPEGs from S3), release build, `b/daft` above 1
+meaning Batcher is slower:
+
+| Query | before | after | daft_ms | b/daft before | b/daft after |
+|---|---|---|---|---|---|
+| img-list | 239.7 | 163.5 | 143.2 | 1.83x | **1.14x** |
+| img-decode | 285.5 | 174.2 | 145.8 | 2.18x | **1.20x** |
+| img-resize | 253.2 | 179.3 | 143.7 | 1.60x | **1.25x** |
+
+**The cause was a stat per file that the fetch already answers.** `_chunks()` called
+`probe_sizes` to size every file before packing them into batches — one object-store HEAD
+per file — and then the read issued a GET per file that returns the length anyway. Two
+round trips against the same latency where one would do. Instrumented on this corpus it
+was **86 ms of a 272 ms read, 32%**, and the docstring justifying it ("one stat per file is
+negligible next to what a media source already does per file") was reasoning about *bytes
+transferred* when the binding cost is *round trips*.
+
+`read()` now fetches first and fills a size cache from what came back, so `_chunks()` needs
+no stat. `iter_batches` still probes and must: it bounds memory before fetching, which is
+the whole point of a byte bound on the streaming path. Chunk boundaries are unchanged —
+only the source of the sizes moved — so `read`, `iter_batches` and `splits` still share the
+one chunk definition, which the module docstring requires.
+
+Batcher remains ~1.2x behind, so this is improved rather than won. What is left is inside
+the fetch itself (163 ms for 100 GETs against Daft's 143 ms).
+
+The diagnosis came from the *shape*, not the totals. `img-list` does no image work at all —
+it lists and fetches bytes — and Batcher was 1.8x behind there. Decode and resize then cost
+Batcher almost nothing on top (`img-resize` is *faster* than `img-decode`, the DCT-scaled
+JPEG path doing its job), while Daft's resize adds ~30 ms. That located the whole loss in
+per-file fetch and none of it in the image kernels, which are the better ones.
+
+Also checked along the way, and recorded so nobody re-chases them:
+
+1. **Serial header parsing** — metadata extraction ran in a Python loop after the
+   concurrent fetch, one `PIL.Image.open` per file on one thread. Fusing it into the pool
+   task is right on its own terms but moved the number only a few percent, inside the
+   spread. It was not the cause.
+2. **Benchmark fairness** — the obvious excuse is that Batcher expands a glob while Daft is
+   handed a URI list. It does not hold: `ImageCorpus.uris()` calls `open()`, which calls
+   `_list_corpus` with no caching, inside the timed function. Both engines list.
+
+The lesson for the remaining 1.2x: the first two attempts were hypotheses and both missed;
+the third came from instrumenting the read and reading the clock. Profile first.
+
+This does **not** contradict `docs/benchmarks/vs-daft.md`, which reports Batcher well ahead
+on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regime where
+per-file latency amortizes and Batcher's kernels dominate. The two results are consistent
+and describe different ends of the corpus-size range. What is now known is that the small
+end belongs to Daft.
+
+### The per-batch Python callback: 2.3-2.6x recovered
+
+`vs-daft.md` records Daft ~2x faster on a per-batch numpy UDF. Measuring the batch size
+Batcher hands such a callback found the cause, and it was a constant set from a claim that
+does not hold. `strategy.py` said of its 131,072-row floor: "throughput is flat from here
+up, so this is the smallest batch on the plateau." Re-measured on a 12 M-row numpy
+map+reduce (29 B/row, best-of-5):
+
+| rows per call | wall |
+|---|---|
+| 131,072 *(old default)* | 39.9 ms |
+| 262,144 *(old cap)* | 28.4 ms |
+| 524,288 | 19.2 ms |
+| **1,048,576** | **14.9 ms** |
+| 2,097,152 | 15.6 ms |
+| 4,194,304 | 40.3 ms |
+
+Not flat — a genuine optimum. Coarser amortizes more per-call overhead until concurrency
+starves: at 3 batches over 96 cores the GIL-bound per-call Arrow conversion serializes and it
+is worse than the morsel. 1 M is the bottom, and it is the same figure on a 6 M-row input, so
+it is a per-call row count rather than a function of the total.
+
+The old *cap* could not simply be raised, because a row count cannot bound memory — 1 M rows
+is 29 MB of narrow numerics and gigabytes of decoded frames, and the row cap was protecting
+the wide case at the narrow case's expense. The target is now byte-bounded, the same rule
+`udf/stream.py` already applies to its CPU chunks. A heavy `fn` keeps the per-worker split
+and the old cap: the measurement is about per-call overhead on the light path, and raising the
+core-filling path's footprint is a separate claim nothing here tests.
+
+Result: 6 M rows 22.3 → 9.7 ms, 12 M rows 39.5 → 15.2 ms. Wide-row callbacks are unchanged
+(still morsel-sized, 13 calls of 16,384 on the 4 KB/row case) — the byte bound is a guard
+there, not a speedup.
+
+### An oddity worth recording rather than explaining away
+
+An earlier pass of this same suite was run before the build profile was verified, and its
+numbers are within noise of the release ones above. That is not what a dev-profile build
+(`opt-level = 0`, `debug_assertions` on, dependencies unoptimized) should produce, and it
+is the reason the old timing-heuristic guard never fired: on these queries the profile
+barely moved the clock. Why is not established here, and guessing at it would be worse
+than leaving it open. The lesson taken is narrower and solid: **infer the build profile
+from the build, never from a stopwatch.**
+
 ## What this ledger does not claim
 
-It does not claim Batcher is faster than Daft in general. It reports one suite, on one
-machine, at one scale factor, on a verified release build — eleven operator queries, none
-of them a multi-join. `docs/benchmarks/vs-daft.md` is the scorecard, and it says Daft leads
-on join-heavy TPC-H; this ledger does not amend that and should not be quoted as if it
-did.
+It does not claim Batcher beats every competitor. As of the last run it leads Polars on 18 of
+22 TPC-H queries and Daft on 18 of the 19 it answers, and **trails DuckDB on 12 of 22** — and
+that gap is one architectural item (`rfc-streaming-executor.md`, Proposal 2), not a list of
+optimizations. Anyone quoting a number from here should quote the machine and scale factor with
+it: the join-heavy comparison against Daft reverses between 16 and 96 cores, which is the whole
+reason this section states its conditions twice.
