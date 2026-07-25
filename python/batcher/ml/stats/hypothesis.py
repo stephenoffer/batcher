@@ -18,7 +18,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from batcher.ml.stats._shared import scalar
+from batcher.ml.stats._shared import indicator, scalar
 from batcher.ml.stats._special import (
     chi2_sf,
     f_sf,
@@ -366,7 +366,7 @@ def proportion_ztest(ds: Dataset, success: str, p0: float = 0.5) -> TestResult:
             >>> proportion_ztest(ds, "won", 0.5).pvalue < 0.1
             True
     """
-    row = ds.agg(k=count_if(col(success) == 1), n=col(success).count()).collect()
+    row = ds.agg(k=count_if(indicator(success)), n=col(success).count()).collect()
     k = int(row.column("k")[0].as_py())
     n = int(row.column("n")[0].as_py())
     phat = k / n
@@ -403,8 +403,8 @@ def mcnemar_test(ds: Dataset, correct_a: str, correct_b: str) -> TestResult:
             >>> mcnemar_test(ds, "a", "b").df
             1.0
     """
-    a_right = col(correct_a) == True  # noqa: E712 — Arrow boolean equality, not identity
-    b_right = col(correct_b) == True  # noqa: E712
+    a_right = indicator(correct_a)
+    b_right = indicator(correct_b)
     row = ds.agg(
         b=count_if(~a_right & b_right),
         c=count_if(a_right & ~b_right),
@@ -459,7 +459,7 @@ def binomial_test(ds: Dataset, success: str, p0: float = 0.5) -> TestResult:
             >>> round(binomial_test(ds, "won", 0.5).pvalue, 4)
             0.3437
     """
-    row = ds.agg(k=count_if(col(success) == 1), n=col(success).count()).collect()
+    row = ds.agg(k=count_if(indicator(success)), n=col(success).count()).collect()
     k = int(row.column("k")[0].as_py())
     n = int(row.column("n")[0].as_py())
     observed = _binomial_pmf(k, n, p0)
