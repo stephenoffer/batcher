@@ -223,7 +223,7 @@ The `Dataset.dq` namespace — data-quality expectations with quarantine.
 
 | module | lines | what it is |
 |---|---|---|
-| `accessor.py` | 392 | `DatasetDQ` — the `ds.dq` accessor: accumulate constraints, then apply them. |
+| `accessor.py` | 419 | `DatasetDQ` — the `ds.dq` accessor: accumulate constraints, then apply them. |
 | `constraints.py` | 45 | The constraint values a `ds.dq` chain accumulates, before any of them is applied. |
 | `report.py` | 87 | `ValidationReport` — per-constraint violation counts, and the ways to read them. |
 
@@ -1056,7 +1056,7 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `lifecycle.py` | 52 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 165 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 139 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
-| `strategy.py` | 472 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
+| `strategy.py` | 497 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
 | `stream.py` | 500 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem

@@ -83,7 +83,7 @@ def test_learned_row_cost_changes_the_thread_batch_size():
         op, 4_000_000, num_workers=256, morsel=morsel, current=current
     )
 
-    # Cold: the trivial `fn` probes as LIGHT, so the floor lifts to the amortization plateau.
+    # Cold: the trivial `fn` probes as LIGHT, so the target lifts to the measured optimum.
     _clear_caches()
     default_hub().put_keyed_param(strat._LEARN_NS, key, {})  # explicitly cold
     light = strat.thread_batch_target(
@@ -91,7 +91,7 @@ def test_learned_row_cost_changes_the_thread_batch_size():
     )
 
     assert heavy < light  # the learned per-row cost steered the batch size
-    assert light >= strat._THREAD_MIN_COARSE_ROWS
+    assert light >= strat._THREAD_LIGHT_COARSE_ROWS
 
 
 def test_learned_row_cost_is_persisted_after_measuring():
@@ -126,3 +126,45 @@ def test_batch_size_policy_is_result_invariant():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --- the byte bound on the coarsened thread batch ----------------------------------------
+
+
+def test_wide_rows_get_fewer_rows_than_the_light_target():
+    """A row count cannot bound memory, so the target is reduced by measured row width.
+
+    The same 1 M rows is ~29 MB of narrow numerics and gigabytes of decoded frames. Without
+    this bound, coarsening onto the light-`fn` optimum would hand a multimodal batch a target
+    it cannot hold — which is what a row-only cap was protecting against by keeping *every*
+    `fn` narrow.
+    """
+    op = _op_for(_double)
+    morsel = 16_384
+    narrow = pa.table({"x": list(range(300_000))}).to_batches()
+    # ~4 KB per row, the shape the bound exists for.
+    wide = pa.table({"blob": pa.array([b"x" * 4096] * 40_000, pa.large_binary())}).to_batches()
+
+    _clear_caches()
+    default_hub().put_keyed_param(strat._LEARN_NS, strat._fn_probe_key(op.fn), {})
+    narrow_target = strat.thread_batch_target(
+        op, 8_000_000, num_workers=8, morsel=morsel, current=narrow
+    )
+    _clear_caches()
+    default_hub().put_keyed_param(strat._LEARN_NS, strat._fn_probe_key(op.fn), {})
+    wide_target = strat.thread_batch_target(
+        op, 8_000_000, num_workers=8, morsel=morsel, current=wide
+    )
+
+    assert wide_target < narrow_target
+    # Both stay at or above the morsel: shrinking past it would trade the memory bound for
+    # per-call overhead the plain morsel path already accepts.
+    assert wide_target >= morsel
+    # And the wide batch stays inside the byte budget.
+    per_row = sum(b.nbytes for b in wide) // sum(b.num_rows for b in wide)
+    assert wide_target * per_row <= max(strat._THREAD_COARSE_BATCH_BYTES, morsel * per_row)
+
+
+def test_byte_bound_passes_the_target_through_with_no_sample():
+    # Nothing to measure a row width from, so the caller's target stands.
+    assert strat._byte_bounded(500_000, 16_384, []) == 500_000

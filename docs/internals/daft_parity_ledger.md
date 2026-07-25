@@ -61,6 +61,7 @@ number as progress; track the closed table.
 | 45-48 | `encode_image` | `.image.encode(format)` over png/jpeg/bmp/gif | same files |
 | 49 | *(benchmark)* Daft was measured only in the multi-node lineup | Daft added to the single-node default lineup | `benchmarks/engines/lineup.py`; results in this file |
 | 50 | *(process)* the debug-build guard was a timing heuristic that passed silently | `bc_py` exports `__engine_profile__`; the suite hard-stops on a debug engine, and `bt.versions()` reports it | `benchmarks/run.py::_check_build_profile`; `tests/unit/test_toplevel_namespace_ergonomics.py` |
+| 58 | *(perf)* a light `map_batches` callback was batched 2.7x below its measured optimum | `thread_batch_target` targets 1,048,576 rows for a light `fn` (was a 131,072 floor under a 262,144 cap), bounded by bytes so a wide-row `fn` shrinks instead | 6 M rows 22.3 → 9.7 ms, 12 M rows 39.5 → 15.2 ms, best-of-5; `tests/unit/test_learned_udf_strategy.py` |
 | 56 | WARC (`daft-warc`) | `bt.read.warc(path)` — one row per crawl record, named headers typed, the rest as JSON in `warc_headers`, `.warc.gz` including per-record gzip members. No third-party dependency | `tests/io/test_warc.py` (18 tests) |
 | 57 | *(guidance)* the IO category list omitted `robotics` | `maintainability.md` and the connector skill now list ten categories | `just lint-guardrails`; `io/formats/robotics/` |
 | 52-55 | `convert_image` | `.image.convert(mode)` over `L`/`LA`/`RGB`/`RGBA`. **Batcher's image namespace now covers Daft's completely.** Writing it surfaced a divergence: `image`'s `into_luma8` weights Rec. 709 while `to_grayscale` and `dhash` weight Rec. 601, so the three would have disagreed about grey (147 vs 124 on RGB(10,200,30)). One `rec601` now serves all three, asserted | `crates/bc-expr/.../image/`, `tests/integration/test_image_expr.py` |
@@ -269,6 +270,69 @@ on multimodal ingest: that measurement is 2,000 frames on a 96-core node, a regi
 per-file latency amortizes and Batcher's kernels dominate. The two results are consistent
 and describe different ends of the corpus-size range. What is now known is that the small
 end belongs to Daft.
+
+### The per-batch Python callback: 2.3-2.6x recovered
+
+`vs-daft.md` records Daft ~2x faster on a per-batch numpy UDF. Measuring the batch size
+Batcher hands such a callback found the cause, and it was a constant set from a claim that
+does not hold. `strategy.py` said of its 131,072-row floor: "throughput is flat from here
+up, so this is the smallest batch on the plateau." Re-measured on a 12 M-row numpy
+map+reduce (29 B/row, best-of-5):
+
+| rows per call | wall |
+|---|---|
+| 131,072 *(old default)* | 39.9 ms |
+| 262,144 *(old cap)* | 28.4 ms |
+| 524,288 | 19.2 ms |
+| **1,048,576** | **14.9 ms** |
+| 2,097,152 | 15.6 ms |
+| 4,194,304 | 40.3 ms |
+
+Not flat — a genuine optimum. Coarser amortizes more per-call overhead until concurrency
+starves: at 3 batches over 96 cores the GIL-bound per-call Arrow conversion serializes and it
+is worse than the morsel. 1 M is the bottom, and it is the same figure on a 6 M-row input, so
+it is a per-call row count rather than a function of the total.
+
+The old *cap* could not simply be raised, because a row count cannot bound memory — 1 M rows
+is 29 MB of narrow numerics and gigabytes of decoded frames, and the row cap was protecting
+the wide case at the narrow case's expense. The target is now byte-bounded, the same rule
+`udf/stream.py` already applies to its CPU chunks. A heavy `fn` keeps the per-worker split
+and the old cap: the measurement is about per-call overhead on the light path, and raising the
+core-filling path's footprint is a separate claim nothing here tests.
+
+Result: 6 M rows 22.3 → 9.7 ms, 12 M rows 39.5 → 15.2 ms. Wide-row callbacks are unchanged
+(still morsel-sized, 13 calls of 16,384 on the 4 KB/row case) — the byte bound is a guard
+there, not a speedup.
+
+### The full single-node picture, TPC-H sf1, 96 cores, release
+
+All three engines, same run conditions, engine mtime verified unchanged. `b/x` below 1 means
+Batcher is faster.
+
+| Competitor | Batcher ahead on | Batcher behind on | Worst |
+|---|---|---|---|
+| Daft | 18 of 19 answered | q4 | 1.41x (q4) |
+| Polars | 18 of 22 | q17, q14, q22, q5 | **2.41x (q17)** |
+| DuckDB | 10 of 22 | 12 queries | 1.42x (q5) |
+
+So the remaining single-node work is **DuckDB across the board** and **Polars on q17**. q5 is
+the only query lost to two competitors at once.
+
+Both DuckDB leads turn out to be already-known architectural items rather than unexplored
+optimizations, which is worth recording so nobody re-derives them:
+
+- **The JIT does not compile filters on the streaming path**, and that is deliberate:
+  `crates/bc-interp/src/stream/mod.rs` records that wiring Tier-1 in "was tried and measured
+  1.01x over TPC-H in an interleaved A/B, with five queries slower", because Arrow's
+  compare/boolean kernels are already SIMD. Verified independently here — `bc-codegen`
+  *accepts* both `int > int` and `date > date`, so the `interp` label in `explain(analyze=True)`
+  is a choice, not a fallback. The `optimize-a-slow-query` heuristic "`backend` reads `interp`
+  on a shape the JIT should compile → a gap worth closing" leads nowhere on this path.
+- **The gather tax on high-selectivity filters** is analyzed with `perf` in
+  `rfc-streaming-executor.md`: q1 at sf10 spends ~22% in the filter gather because the
+  predicate passes ~98% of rows and the engine materializes them, where DuckDB carries a
+  selection vector. That RFC is written and unaccepted; it is the lever, not a missing
+  micro-optimization.
 
 ### TPC-H: the documented loss has reversed on a large machine
 
