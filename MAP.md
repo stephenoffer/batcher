@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 834 Python modules across 126 packages and 165 Rust files across 13 crates.
+Covering 835 Python modules across 126 packages and 165 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -498,7 +498,7 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 | `scalers.py` | 496 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
 | `text.py` | 252 | Feature assembly and text tokenization. |
 | `text_features.py` | 155 | Surface features from a text column — the numbers a model can use before an embedding. |
-| `transforms.py` | 463 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
+| `transforms.py` | 394 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
 
 ### `batcher/ml/preprocessors/derived/` — 6 · front-end
 
@@ -1579,9 +1579,10 @@ Statistical analysis expressions — robust spread, distribution shape, associat
 
 | module | lines | what it is |
 |---|---|---|
+| `_normal.py` | 87 | The standard normal quantile, on the neutral side of the layer boundary. |
 | `association.py` | 113 | How strongly two columns move together — the feature-selection primitives. |
 | `dispersion.py` | 177 | Quantile-based location and spread — the robust half of "describe". |
-| `inference.py` | 331 | Two-sample comparison and interval estimation as single-pass aggregates. |
+| `inference.py` | 366 | Two-sample comparison and interval estimation as single-pass aggregates. |
 | `moments.py` | 146 | Dispersion ratios — spread expressed relative to level, in one pass. |
 | `shape.py` | 143 | Distribution shape — skew, tail weight, and how far from normal a column is. |
 | `weighted.py` | 152 | Weighted statistics — a mean, variance, and correlation where rows carry different weights. |
