@@ -349,3 +349,89 @@ def test_a_pad_fold_truncates_an_over_long_literal(duck, width, method):
     duck.register("t", pa.table({"s": pa.array([value])}))
     fn = "lpad" if method == "pad_start" else "rpad"
     assert_same(folded, duck.sql(f"SELECT {fn}(s, {width}, ' ') AS r FROM t"))
+
+
+# --------------------------------------------------------------------------- #
+# `fold_cast_of_literal` is the highest-risk fold: a rounding convention or an
+# overflow handled differently from the engine changes a value, not a plan.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("value", [1.4, 1.5, 2.5, -1.5, -2.5, 0.5, -0.5, 3.7])
+def test_folding_a_float_to_int_cast_uses_the_engine_rounding(duck, value):
+    """`.5` is the whole question: half-even, half-away, or truncate."""
+    table = pa.table({"c": pa.array([value], pa.float64())})
+    ds = bt.from_arrow(table)
+
+    on_literal = ds.select(r=bt.lit(value).cast("int64")).to_pydict()["r"]
+    on_column = ds.select(r=bt.col("c").cast("int64")).to_pydict()["r"]
+    assert on_literal == on_column
+
+    duck.register("t", table)
+    assert_same(
+        ds.select(r=bt.lit(value).cast("int64")).collect(),
+        duck.sql("SELECT CAST(c AS BIGINT) AS r FROM t"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "arrow_type", "dtype"),
+    [
+        (float("nan"), pa.float64(), "int64"),
+        (float("inf"), pa.float64(), "int64"),
+        (1e30, pa.float64(), "int64"),
+        (2**31, pa.int64(), "int32"),
+        (2**63 - 1, pa.int64(), "int32"),
+        ("abc", pa.string(), "int64"),
+        ("", pa.string(), "int64"),
+        ("abc", pa.string(), "float64"),
+    ],
+)
+def test_a_cast_with_no_answer_fails_on_both_paths(value, arrow_type, dtype):
+    """A fold must not quietly succeed where the engine raises, or the reverse."""
+    ds = bt.from_arrow(pa.table({"c": pa.array([value], arrow_type)}))
+
+    def outcome(expr):
+        try:
+            return ("ok", ds.select(r=expr).to_pydict()["r"][0])
+        except Exception as exc:  # the exception *type* is the assertion here
+            return ("raised", type(exc).__name__)
+
+    assert outcome(bt.lit(value).cast(dtype)) == outcome(bt.col("c").cast(dtype))
+
+
+@pytest.mark.parametrize("value", ["1", "-1", "3.7", " 5 ", "1e3"])
+def test_folding_a_string_to_number_cast_matches_the_engine(duck, value):
+    table = pa.table({"c": pa.array([value], pa.string())})
+    ds = bt.from_arrow(table)
+    assert (
+        ds.select(r=bt.lit(value).cast("int64")).to_pydict()["r"]
+        == ds.select(r=bt.col("c").cast("int64")).to_pydict()["r"]
+    )
+    duck.register("t", table)
+    assert_same(
+        ds.select(r=bt.lit(value).cast("int64")).collect(),
+        duck.sql("SELECT CAST(c AS BIGINT) AS r FROM t"),
+    )
+
+
+@pytest.mark.parametrize("value", ["hello", "", "Straße", "ÄÖÜ", "MiXeD", "İstanbul"])
+@pytest.mark.parametrize("method", ["to_uppercase", "to_lowercase", "len"])
+def test_folding_a_case_or_length_function_matches_the_column_path(value, method):
+    """Unicode case mapping is where two implementations most plausibly diverge."""
+    ds = bt.from_arrow(pa.table({"c": pa.array([value], pa.string())}))
+    on_literal = getattr(bt.lit(value).str, method)()
+    on_column = getattr(bt.col("c").str, method)()
+    assert ds.select(r=on_literal).to_pydict()["r"] == ds.select(r=on_column).to_pydict()["r"], (
+        f"{method} folds differently than it runs for {value!r}"
+    )
+
+
+@pytest.mark.parametrize(("start", "length"), [(0, 3), (1, 3), (2, 10), (5, 2), (0, 0)])
+def test_folding_a_substring_matches_the_column_path(start, length):
+    """An off-by-one in the fold's index base would shift every folded substring."""
+    values = ["hello", "", "Straße", "a b"]
+    ds = bt.from_arrow(pa.table({"c": pa.array(values)}))
+    on_column = ds.select(r=bt.col("c").str.slice(start, length)).to_pydict()["r"]
+    on_literal = [
+        ds.limit(1).select(r=bt.lit(v).str.slice(start, length)).to_pydict()["r"][0] for v in values
+    ]
+    assert on_literal == on_column
