@@ -25,7 +25,12 @@ from batcher.ml.stats import (
     t_test_1samp,
     t_test_ind,
 )
-from batcher.ml.stats._special import chi2_sf, f_sf, students_t_two_sided_p
+from batcher.ml.stats._special import (
+    chi2_sf,
+    f_sf,
+    normal_two_sided_p,
+    students_t_two_sided_p,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -35,21 +40,55 @@ scipy_stats = pytest.importorskip("scipy.stats")
 # --- survival functions ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("t", "df"), [(2.0, 10), (0.5, 3), (3.5, 100), (1.0, 1), (0.0, 5)])
+# A *relative* tolerance, because these are p-values and the tail is where they are read. An
+# absolute 1e-10 is satisfied by any answer at all once the true value drops below it, so it
+# cannot see a tail regression: at chi2_sf(200, 100) the reference is 1.2e-08 and at
+# normal_two_sided_p(15) it is 7.3e-51. Measured worst relative error across this grid is
+# 4.4e-13, so 1e-9 is loose by three orders of magnitude and still catches a real drift.
+_TAIL_RTOL = 1e-9
+
+
+@pytest.mark.parametrize(
+    ("t", "df"),
+    [(2.0, 10), (0.5, 3), (3.5, 100), (1.0, 1), (0.0, 5), (10.0, 5), (30.0, 30), (100.0, 1000)],
+)
 def test_students_t_matches_scipy(t: float, df: int) -> None:
     assert students_t_two_sided_p(t, df) == pytest.approx(
-        2 * scipy_stats.t.sf(abs(t), df), abs=1e-10
+        2 * scipy_stats.t.sf(abs(t), df), rel=_TAIL_RTOL, abs=1e-300
     )
 
 
-@pytest.mark.parametrize(("f", "d1", "d2"), [(2.0, 3, 20), (1.0, 5, 5), (5.0, 2, 100), (0.3, 4, 4)])
+@pytest.mark.parametrize(
+    ("f", "d1", "d2"),
+    [(2.0, 3, 20), (1.0, 5, 5), (5.0, 2, 100), (0.3, 4, 4), (100.0, 5, 20), (1000.0, 20, 1000)],
+)
 def test_f_survival_matches_scipy(f: float, d1: int, d2: int) -> None:
-    assert f_sf(f, d1, d2) == pytest.approx(scipy_stats.f.sf(f, d1, d2), abs=1e-10)
+    assert f_sf(f, d1, d2) == pytest.approx(scipy_stats.f.sf(f, d1, d2), rel=_TAIL_RTOL, abs=1e-300)
 
 
-@pytest.mark.parametrize(("x", "df"), [(3.0, 2), (10.0, 5), (1.0, 1), (50.0, 30), (0.5, 10)])
+@pytest.mark.parametrize(
+    ("x", "df"),
+    [
+        (3.0, 2),
+        (10.0, 5),
+        (1.0, 1),
+        (50.0, 30),
+        (0.5, 10),
+        (200.0, 100),
+        (400.0, 100),
+        (1000.0, 500),
+    ],
+)
 def test_chi2_survival_matches_scipy(x: float, df: int) -> None:
-    assert chi2_sf(x, df) == pytest.approx(scipy_stats.chi2.sf(x, df), abs=1e-10)
+    assert chi2_sf(x, df) == pytest.approx(scipy_stats.chi2.sf(x, df), rel=_TAIL_RTOL, abs=1e-300)
+
+
+@pytest.mark.parametrize("z", [0.0, 0.5, 1.0, 1.96, 3.0, 5.0, 8.0, 15.0])
+def test_normal_two_sided_matches_scipy(z: float) -> None:
+    """The one survival function that had no test, and the deepest tail of the four."""
+    assert normal_two_sided_p(z) == pytest.approx(
+        2 * scipy_stats.norm.sf(abs(z)), rel=_TAIL_RTOL, abs=1e-300
+    )
 
 
 # --- tests vs scipy --------------------------------------------------------------------

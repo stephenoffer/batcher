@@ -741,7 +741,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `cost.py` | 485 | Cost model — what will this plan *cost* to run? |
 | `cpu_shares.py` | 163 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 464 | Cross-execution learning — the metadata feedback loop. |
-| `measured_selectivity.py` | 98 | Filter selectivity derived from what Core measured, per plan signature. |
+| `measured_selectivity.py` | 133 | Filter selectivity derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 426 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 61 | The optimizer context — shared analysis threaded through every rule. |
