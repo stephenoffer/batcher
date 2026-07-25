@@ -28,6 +28,10 @@ if TYPE_CHECKING:
 
 __all__ = ["GaussianMixture"]
 
+# Where inside each equal-probability bucket a component's mean is seeded. `seed` indexes this,
+# so every seed gives a separated start and the default (0) lands on the bucket midpoints.
+_BUCKET_OFFSETS = (0.5, 0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9)
+
 
 class GaussianMixture:
     """A mixture of `n_components` full-covariance Gaussians, fitted by expectation-maximization.
@@ -39,9 +43,10 @@ class GaussianMixture:
     scores far below the rest.
 
     Because expectation-maximization only finds a local optimum, the initialization matters: the
-    means are seeded from a reproducible content-hash sample of the rows, so a fit is deterministic
-    from its seed. On well-separated data it recovers the components; where clusters overlap it
-    gives the calibrated soft assignment that a hard clusterer cannot.
+    means are seeded at evenly spaced quantiles of each column, so a fit is deterministic from its
+    seed *and* the components always start separated. On well-separated data it recovers the
+    components; where clusters overlap it gives the calibrated soft assignment that a hard
+    clusterer cannot.
 
     Examples:
         .. doctest::
@@ -63,7 +68,8 @@ class GaussianMixture:
         tol: The convergence tolerance on the mean log-likelihood between iterations.
         reg_covar: A ridge added to each covariance diagonal for numerical stability.
         output_column: The name of the component-label column `predict` appends.
-        seed: Seed for the mean initialization.
+        seed: Selects where inside each quantile bucket the means are seeded, so a
+            different seed gives EM a different (still separated) starting point.
     """
 
     __slots__ = (
@@ -179,7 +185,6 @@ class GaussianMixture:
             PlanError: If there are fewer rows than components.
         """
 
-        from batcher.api.dataset._build import split_key
         from batcher.plan.functions.aggregate import mean as mean_
         from batcher.plan.functions.aggregate import sum as sum_
 
@@ -194,16 +199,7 @@ class GaussianMixture:
         n = ds.count()
         if n < self.n_components:
             raise PlanError(f"GaussianMixture needs at least {self.n_components} rows, got {n}.")
-        sample = (
-            ds.with_columns(__bt_hash=split_key(ds, None, self.seed))
-            .sort("__bt_hash")
-            .select(*self.columns)
-            .limit(self.n_components)
-            .to_pydict()
-        )
-        self.means_ = [
-            [float(sample[name][k]) for name in self.columns] for k in range(self.n_components)
-        ]
+        self.means_ = self._seed_means(ds)
         global_cov = self._global_covariance(ds)
         self.covariances_ = [global_cov.copy() for _ in range(self.n_components)]
         self.weights_ = [1.0 / self.n_components] * self.n_components
@@ -237,6 +233,41 @@ class GaussianMixture:
             previous = log_likelihood
             self.log_likelihood_ = log_likelihood
         return self
+
+    def _seed_means(self, ds: Dataset):
+        """Seed the component means at evenly spaced quantiles of each column.
+
+        Component `k` starts at the ``(k + u) / K`` quantile, so the seeds are spread across the
+        data's actual range by construction. This replaced seeding from a hash-sampled row per
+        component, which was deterministic but not *separated*: every component also starts with
+        the **global** covariance, so when two sampled rows landed close together relative to
+        that spread, every row's responsibility was ~``1/K`` for every component.
+
+        That is not a slow start, it is a fixed point. Identical components give identical
+        responsibilities, which reproduce identical components, so EM stays there and reports
+        `converged_`. On a trivially bimodal column (150 points near -3, 150 near +3) it
+        returned means of -0.17 and 0.13 with both covariances at the global 9.37, against
+        sklearn's -3.02 and 2.99 -- a fit that had found nothing while claiming success.
+
+        `seed` picks `u`, the position inside each equal-probability bucket, so a different seed
+        still gives EM a different starting point to search from; every choice is separated, and
+        the default lands on the bucket midpoints. Quantile seeds can only collide if the column
+        is genuinely degenerate (a constant, or fewer distinct values than components), where the
+        components are unidentifiable and coincident means are the honest answer.
+        """
+        offset = _BUCKET_OFFSETS[self.seed % len(_BUCKET_OFFSETS)]
+        fractions = [(k + offset) / self.n_components for k in range(self.n_components)]
+        row = ds.agg(
+            **{
+                f"q{k}_{i}": col(name).quantile(q)
+                for k, q in enumerate(fractions)
+                for i, name in enumerate(self.columns)
+            }
+        ).collect()
+        return [
+            [float(row.column(f"q{k}_{i}")[0].as_py()) for i in range(len(self.columns))]
+            for k in range(self.n_components)
+        ]
 
     def _global_covariance(self, ds: Dataset):
         """The overall covariance of the feature block, used to seed every component."""

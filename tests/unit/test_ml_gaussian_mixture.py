@@ -106,3 +106,73 @@ def test_names_a_missing_column(blobs) -> None:
     _, _, ds = blobs
     with pytest.raises(ColumnNotFoundError):
         GaussianMixture(["a", "nope"], n_components=2).fit(ds)
+
+
+def test_a_bimodal_column_does_not_collapse_to_the_global_distribution() -> None:
+    """Both components starting alike is a fixed point EM can never leave.
+
+    Seeding each mean from a hash-sampled row while every covariance starts at the *global*
+    covariance meant two nearby sampled rows made every responsibility ~1/K. Identical
+    components then reproduce identical components, so `fit` sat there and set `converged_`.
+    Whether it happened depended on which rows the hash picked, which is why
+    `test_every_seed_starts_the_components_apart` is the case that reproduces it.
+    """
+    rng = np.random.default_rng(7)
+    values = np.concatenate([rng.normal(-3.0, 0.6, 150), rng.normal(3.0, 0.6, 150)])
+    ds = bt.from_pydict({"v": values.tolist()})
+
+    gm = GaussianMixture(["v"], n_components=2, max_iter=300, tol=1e-8).fit(ds)
+    means = sorted(float(m[0]) for m in gm.means_)
+    spread = float(np.var(values))
+
+    assert means[0] < -2.0 < 2.0 < means[1], (
+        f"the two components collapsed onto the global mean: {means}"
+    )
+    for covariance in gm.covariances_:
+        assert float(np.asarray(covariance).ravel()[0]) < spread / 2, (
+            "a component kept the global covariance, so it is modelling the whole column"
+        )
+
+
+def test_a_bimodal_column_matches_sklearn() -> None:
+    rng = np.random.default_rng(7)
+    values = np.concatenate([rng.normal(-3.0, 0.6, 150), rng.normal(3.0, 0.6, 150)])
+    ds = bt.from_pydict({"v": values.tolist()})
+
+    gm = GaussianMixture(["v"], n_components=2, max_iter=300, tol=1e-8).fit(ds)
+    sk = sk_mixture.GaussianMixture(n_components=2, max_iter=300, tol=1e-8, random_state=0).fit(
+        values.reshape(-1, 1)
+    )
+
+    got = sorted(float(m[0]) for m in gm.means_)
+    want = sorted(float(m) for m in sk.means_.ravel())
+    for g, w in zip(got, want, strict=True):
+        assert g == pytest.approx(w, abs=1e-3)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 3, 7, 11])
+def test_every_seed_starts_the_components_apart(seed: int) -> None:
+    """A seed picks a different start, never a degenerate one.
+
+    This is the case that reproduces the collapse. On this data, hash-sampling the seed rows
+    put ``seed=7`` at means ``[-0.1506, -0.0042]`` with both covariances at ``9.391`` against a
+    global variance of ``9.398`` -- two copies of the whole column, ``converged_`` after three
+    iterations, where the components are at -3 and +3. Seeds 1, 3 and 11 did escape but needed
+    49, 71 and 34 iterations to do it, against 6 from a separated start, so the old
+    initialization was fragile even when it eventually worked.
+    """
+    rng = np.random.default_rng(7)
+    values = np.concatenate([rng.normal(-3.0, 0.6, 150), rng.normal(3.0, 0.6, 150)])
+    ds = bt.from_pydict({"v": values.tolist()})
+
+    gm = GaussianMixture(["v"], n_components=2, max_iter=300, tol=1e-8, seed=seed).fit(ds)
+    means = sorted(float(m[0]) for m in gm.means_)
+    assert means[0] < -2.0 < 2.0 < means[1], f"seed={seed} collapsed: {means}"
+
+
+def test_a_constant_column_is_unidentifiable_but_does_not_raise() -> None:
+    """Coincident means are the honest answer when there is nothing to separate."""
+    ds = bt.from_pydict({"v": [4.0] * 20})
+    gm = GaussianMixture(["v"], n_components=2, max_iter=50).fit(ds)
+    assert all(np.isfinite(float(m[0])) for m in gm.means_)
+    assert sum(gm.weights_) == pytest.approx(1.0, abs=1e-9)
