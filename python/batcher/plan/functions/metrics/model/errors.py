@@ -18,6 +18,7 @@ pushdown and partitioning.
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError, require_float
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.aggregate import _as_column, count_if
@@ -419,10 +420,14 @@ def pinball_loss(y_true: IntoExpr, y_pred: IntoExpr, *, quantile: float = 0.5) -
     Args:
         y_true: The observed values.
         y_pred: The predicted values.
-        quantile: The target quantile in ``(0, 1)``.
+        quantile: The target quantile in ``[0, 1]``.
 
     Returns:
         The mean pinball loss over the group.
+
+    Raises:
+        PlanError: If `quantile` is not a number in ``[0, 1]``. Past it the weights stop sharing a
+            sign and the "loss" goes **negative**: ``90`` scored -890.0 where ``0.9`` scored 1.0.
 
     Examples:
         .. doctest::
@@ -432,6 +437,9 @@ def pinball_loss(y_true: IntoExpr, y_pred: IntoExpr, *, quantile: float = 0.5) -
             >>> ds.agg(m=bt.pinball_loss("y", "p", quantile=0.9)).to_pydict()
             {'m': [1.8]}
     """
+    quantile = require_float(quantile, func="pinball_loss", arg="quantile")
+    if not 0.0 <= quantile <= 1.0:
+        raise PlanError(f"pinball_loss quantile must be in [0, 1], got {quantile}")
     error = _residual(y_true, y_pred)
     under = error * lit(quantile)
     over = error * lit(quantile - 1.0)

@@ -122,6 +122,34 @@ def test_pinball_loss_weights_under_prediction_by_the_quantile() -> None:
     assert _one(ds, m=bt.pinball_loss("y", "p", quantile=0.9))["m"] == pytest.approx(1.8)
 
 
+@pytest.mark.parametrize("quantile", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_pinball_loss_is_never_negative_in_its_domain(quantile: float) -> None:
+    """A loss is non-negative by definition, and outside [0, 1] this one was not."""
+    ds = bt.from_pydict({"y": [1.0, 2.0, 3.0], "p": [11.0, 12.0, 13.0]})
+    assert _one(ds, m=bt.pinball_loss("y", "p", quantile=quantile))["m"] >= 0.0
+
+
+@pytest.mark.parametrize("quantile", [-0.001, -0.5, 1.001, 1.5, 90.0, float("nan")])
+def test_pinball_loss_rejects_a_quantile_outside_the_unit_interval(quantile: float) -> None:
+    """Past 1 the two weights stop sharing a sign, so the "loss" goes negative.
+
+    On a forecast that overshoots by 10, ``quantile=1.5`` scored -5.0 and the percentile typo
+    ``quantile=90`` scored -890.0, against 1.0 for the correct 0.9 -- and anything minimizing
+    the metric is driven away from the data. `quantile`, `approx_quantile` and
+    `token_estimate_quantile` all already rejected their domain; this did not.
+    """
+    ds = bt.from_pydict({"y": [1.0, 2.0], "p": [11.0, 12.0]})
+    with pytest.raises(PlanError, match=r"quantile must be in \[0, 1\]"):
+        _one(ds, m=bt.pinball_loss("y", "p", quantile=quantile))
+
+
+@pytest.mark.parametrize("quantile", ["0.9", True, None])
+def test_pinball_loss_rejects_a_non_numeric_quantile(quantile) -> None:
+    ds = bt.from_pydict({"y": [1.0], "p": [2.0]})
+    with pytest.raises(PlanError, match="must be a number"):
+        _one(ds, m=bt.pinball_loss("y", "p", quantile=quantile))
+
+
 def test_huber_loss_is_quadratic_below_delta_and_linear_above() -> None:
     ds = bt.from_pydict({"y": [0.0, 0.0], "p": [0.5, 10.0]})
     # 0.5 * 0.5^2 = 0.125 below delta; 1.0 * (10 - 0.5) = 9.5 above; mean = 4.8125.

@@ -1603,7 +1603,7 @@ Metrics that score a model's predictions against known labels.
 | `classification.py` | 500 | Classification metrics as mergeable aggregate expressions. |
 | `diagnostic.py` | 399 | Diagnostic-test metrics — the epidemiology and medical-ML vocabulary of the confusion matrix. |
 | `embedding.py` | 295 | Embedding-quality metrics — scoring vector columns for retrieval, similarity, and drift. |
-| `errors.py` | 492 | Regression error metrics as mergeable aggregate expressions. |
+| `errors.py` | 500 | Regression error metrics as mergeable aggregate expressions. |
 | `losses.py` | 282 | Loss functions and proper scoring rules — the numbers a model is trained to minimize. |
 
 ### `batcher/plan/functions/metrics/text/` — 1 · contract
