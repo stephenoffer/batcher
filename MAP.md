@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 835 Python modules across 126 packages and 165 Rust files across 13 crates.
+Covering 837 Python modules across 126 packages and 165 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -839,12 +839,14 @@ Expression-level Kyber rule families.
 | module | lines | what it is |
 |---|---|---|
 | `comparisons.py` | 127 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
-| `complex_types.py` | 398 | Struct, list, and array algebra -- the extract-over-construct family. |
+| `complex_types.py` | 427 | Struct, list, and array algebra -- the extract-over-construct family. |
 | `conditionals.py` | 312 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
 | `guards.py` | 172 | Schema-aware helpers for expression rules that may only fire on a known type. |
 | `numeric.py` | 406 | Numeric algebra the earlier arithmetic families leave on the table. |
 | `temporal.py` | 209 | Temporal identities: reading a date part through a truncation, and offset fusion. |
-| `text.py` | 305 | Regex de-specialization and the remaining string identities. |
+| `text.py` | 315 | Regex de-specialization and the remaining string identities. |
+| `text_algebra.py` | 147 | String structure: de-specializing the remaining regex calls, and composing substrings. |
+| `text_folds.py` | 337 | Constant folding for the string functions -- one rule per function. |
 
 ### `batcher/kyber/rules/extra/` — 3 · subsystem
 
