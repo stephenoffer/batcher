@@ -1299,7 +1299,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `avro.py` | 329 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 489 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
-| `lance.py` | 257 | Lance format — columnar, random-access read + write via `pylance` (lance). |
+| `lance.py` | 331 | Lance format — columnar, random-access read + write via `pylance` (lance). |
 | `orc.py` | 338 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
 
 ### `batcher/io/formats/structured/_csv_options/` — 2 · neutral IO

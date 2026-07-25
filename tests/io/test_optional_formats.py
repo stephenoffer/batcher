@@ -263,6 +263,53 @@ def test_lance_roundtrip(tmp_path):
     assert len(src.splits()) >= 1
 
 
+def test_lance_write_through_the_public_api(tmp_path):
+    """`ds.write(..., format="lance")` — the spelling a user actually types.
+
+    `test_lance_roundtrip` above drives `LanceSink().write()` directly, which is why nothing
+    caught that the sink had no `commit`. `ds.write` calls `commit` on every sink after
+    merging the shards' manifests, and every other format writer inherits one from
+    `FileSink` — which `LanceSink` cannot subclass, because `FileSink` writes a file handle
+    and a Lance dataset is a directory `lance.write_dataset` owns. So every `format="lance"`
+    write raised `AttributeError` *after* writing the data, leaving a valid dataset on disk
+    and an exception in the caller's face.
+    """
+    pytest.importorskip("lance")
+    import batcher as bt
+
+    table = _sample_table()
+    for label, kwargs in (("default", {}), ("single_file", {"single_file": True})):
+        path = str(tmp_path / f"public-{label}.lance")
+        bt.from_arrow(table).write(path, format="lance", **kwargs)
+        got = bt.read.lance(path).collect()
+        assert _sorted_pydict(got) == _sorted_pydict(table), label
+        assert got.schema == table.schema, f"{label}: schema changed on round trip"
+
+
+def test_lance_declines_the_write_shapes_it_cannot_honour(tmp_path):
+    """A Hive layout and a sharded write are refused by name, not by `AttributeError`.
+
+    Both previously reached `sink.write_partitioned`, which did not exist — the distributed
+    one from inside a Ray task, after three retries.
+    """
+    pytest.importorskip("lance")
+    import batcher as bt
+    from batcher._internal.errors import BackendError
+    from batcher.io.formats.structured.lance import LanceSink
+
+    table = _sample_table()
+    with pytest.raises(BackendError, match="partition_by"):
+        bt.from_arrow(table).write(
+            str(tmp_path / "hive.lance"), format="lance", partition_by=[table.column_names[0]]
+        )
+    # A shard other than the first is refused directly; shard 0 is the ordinary single write.
+    sink = LanceSink()
+    with pytest.raises(BackendError, match="cannot be sharded"):
+        sink.write_partitioned(table, str(tmp_path / "shard.lance"), file_index=1)
+    written = sink.write_partitioned(table, str(tmp_path / "one.lance"), file_index=0)
+    assert len(written) == 1 and written[0].rows == table.num_rows
+
+
 def test_excel_read(tmp_path):
     pytest.importorskip("python_calamine")
     openpyxl = pytest.importorskip("openpyxl")
