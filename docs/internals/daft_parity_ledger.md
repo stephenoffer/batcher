@@ -476,6 +476,30 @@ Both were hit while producing the table above, and both survive a warm-up and a 
   median of 52ms in the *same* arm. Pairing one arm's unlucky min against the other's lucky min
   produced an apparent 72% win from byte-identical behaviour. Report the median beside the min.
 
+### Runtime join filters: the row reductions are real, the wall clock does not move
+
+`bc-interp`'s `stream/runtime_filter.rs` sinks a join's build-side key set down the probe pipeline
+to the scan, and records as an open item that "the wall-clock effect at scale was not measurable
+on the benchmark box." That reproduces, on a release build at sf1, on a quieter box.
+
+What the filter buys is certain, because it is a count. Forcing it on in q19:
+
+| | rows through the `lineitem` filter | bytes | that filter's CPU |
+|---|---|---|---|
+| off | 1,500,048 | 88 MB | 255.4 ms |
+| on | 180,632 | 11 MB | 20.0 ms |
+
+An 8.3x row reduction, 235 ms of CPU removed, and the join above it 13.2 -> 5.0 ms. And no
+wall-clock effect whatsoever: 10 alternating pairs give off min 14.77 / median 52.11 against on
+min 14.80 / median 50.65, and the 22-query total moves +0.1%.
+
+The reason is in those medians. q19 is bimodal at this scale, so it is not throughput-bound, and
+CPU taken off the probe is not CPU the query was waiting on. Anyone tempted to widen the
+engagement gate should note that the argument for doing so is sound in kind — the economics are
+"small selective build side meets large probe side", and the query-global row gate tests neither
+half against the join in question — while the evidence for a *speedup* at this scale is absent.
+sf10+, or hardware where the probe genuinely is throughput-bound, is where that would be settled.
+
 ### Reusing a `Dataset` is not the same measurement
 
 q12 runs ~30ms when the `Dataset` is rebuilt each time and ~14ms when one `Dataset` is collected
