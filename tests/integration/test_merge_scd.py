@@ -97,3 +97,65 @@ def test_surrogate_key_via_hash64_is_stable():
     assert sk["sk"][0] == sk["sk"][2]  # same business key → same surrogate id
     assert sk["sk"][0] != sk["sk"][1]
     assert all(isinstance(v, int) for v in sk["sk"])
+
+
+# --- the first load, on a transactional target -----------------------------------------
+
+
+def test_scd_type1_first_load_creates_a_delta_target(tmp_path):
+    """An absent target is the dimension's first load, whatever the format.
+
+    `test_scd_type1_is_upsert` above also starts from a fresh target, but a Parquet one — and
+    a file merge into a missing path happens to work. `type1` delegated straight to
+    `ds.write.merge`, which opens the Delta table, so the *first* run of a type-1 load into a
+    transactional target failed with delta-rs's ``Local path "..." does not exist or you don't
+    have access!``: a message about permissions for a table that simply was not there yet.
+
+    `type2`, `type3` and `apply_changes` have always had this branch; `type1` was the one
+    sibling without it.
+    """
+    pytest = __import__("pytest")
+    pytest.importorskip("deltalake")
+    tgt = f"{tmp_path}/dim"
+
+    bt.from_arrow(pa.table({"id": [1, 2], "name": ["Ann", "Bob"]})).scd.type1(
+        tgt, keys="id", format="delta"
+    )
+    first = bt.read.delta(tgt).collect().to_pydict()
+    assert dict(zip(first["id"], first["name"], strict=True)) == {1: "Ann", 2: "Bob"}
+
+    # ...and the second load is still an upsert, not a replace.
+    bt.from_arrow(pa.table({"id": [2, 3], "name": ["Bobby", "Cara"]})).scd.type1(
+        tgt, keys="id", format="delta"
+    )
+    out = bt.read.delta(tgt).collect().to_pydict()
+    assert dict(zip(out["id"], out["name"], strict=True)) == {1: "Ann", 2: "Bobby", 3: "Cara"}
+
+
+def test_every_scd_mode_bootstraps_its_target(tmp_path):
+    """The four `ds.scd` entry points agree about an absent target: it is the first load."""
+    pytest = __import__("pytest")
+    pytest.importorskip("deltalake")
+    incoming = pa.table(
+        {
+            "id": pa.array([1, 2], pa.int64()),
+            "region": pa.array(["us", "eu"]),
+            "seq": pa.array([1, 1], pa.int64()),
+        }
+    )
+    ds = bt.from_arrow(incoming)
+    loads = {
+        "type1": lambda p: ds.scd.type1(p, keys="id", format="delta"),
+        "type2": lambda p: ds.scd.type2(
+            p, keys="id", track=["region"], as_of="2024-01-01", format="delta"
+        ),
+        "type3": lambda p: ds.scd.type3(p, keys="id", track=["region"], format="delta"),
+        "apply_changes": lambda p: ds.scd.apply_changes(
+            p, keys="id", sequence_by="seq", format="delta"
+        ),
+    }
+    for name, load in loads.items():
+        target = f"{tmp_path}/{name}"
+        load(target)
+        got = bt.read.delta(target).collect()
+        assert sorted(got.to_pydict()["id"]) == [1, 2], f"{name} did not load both rows"

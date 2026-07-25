@@ -194,7 +194,7 @@ The `Dataset` builder package.
 | `callbacks.py` | 220 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 5534 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2713 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
-| `scd.py` | 399 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
+| `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/compat/` — 5 · conductor
 
