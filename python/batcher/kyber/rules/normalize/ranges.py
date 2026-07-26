@@ -15,13 +15,25 @@ from batcher._internal.mathx import is_nan
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, plan_rule
-from batcher.plan.expr_ir import Binary, Col, Expr, Lit
+from batcher.plan.expr_ir import Binary, Col, Expr, InList, Lit
 from batcher.plan.expr_ir.namespaces import DateTrunc, StrFunc
-from batcher.plan.expr_rewrite import combine_conjuncts, map_node_expressions, split_conjuncts
+from batcher.plan.expr_rewrite import (
+    combine_conjuncts,
+    expr_key,
+    map_node_expressions,
+    split_conjuncts,
+)
 from batcher.plan.logical import Filter, LogicalPlan
 from batcher.plan.visitor import transform_up
 
-__all__ = ["date_trunc_to_range", "like_prefix_to_range", "or_to_in_and_range"]
+__all__ = [
+    "date_trunc_to_range",
+    "len_zero_to_empty_string",
+    "like_prefix_to_range",
+    "or_equalities_to_in_list",
+    "or_to_in_and_range",
+    "prefix_predicates_to_range",
+]
 
 
 # --- LIKE-prefix → range ----------------------------------------------------
@@ -194,6 +206,130 @@ DEFAULT_REGISTRY.add(
 )
 
 
+# --- starts_with / substr prefix → range ------------------------------------
+
+
+def prefix_predicates_to_range(plan: LogicalPlan) -> LogicalPlan:
+    """Rewrite `starts_with(col, 'abc')` and `substr(col, 1, 3) = 'abc'` to the same
+    exact range `col >= 'abc' AND col < 'abd'` that `LIKE 'abc%'` already gets.
+
+    `like_prefix_to_range` has handled the SQL spelling for a while; these are the two
+    *DataFrame* spellings of the identical predicate, and neither was rewritten. So
+    `ds.filter(col("s").str.starts_with("abc"))` — the idiom a Batcher user actually
+    writes — scanned every row group while the SQL form skipped them. The asymmetry was
+    invisible because both return the right rows.
+
+    Both equivalences are exact:
+
+    * a string starts with `p` iff it lies in `[p, next(p))`, which is the same argument
+      `like_prefix_to_range` rests on;
+    * `substr(s, 1, n) = lit` (with `len(lit) == n`) is the same statement — a shorter `s`
+      yields a shorter substring that cannot equal `lit`, and is also below `lit` in the
+      range, so both forms exclude it.
+
+    NULL is preserved: `starts_with`/`substr`/`=` are all null-propagating, and so is the
+    conjunction of two comparisons. Same conservative guard as the `LIKE` rule — the
+    prefix must be non-empty and end in a safely incrementable ASCII character, since the
+    upper bound is built by incrementing that character.
+    """
+    return transform_up(plan, lambda node: map_node_expressions(node, _rewrite_prefix))
+
+
+def _rewrite_prefix(expr: Expr) -> Expr:
+    prefix, column = _prefix_and_column(expr)
+    if prefix is None or column is None:
+        return expr
+    upper = _increment_prefix(prefix)
+    if upper is None:
+        return expr
+    return Binary("and", Binary("ge", column, Lit(prefix)), Binary("lt", column, Lit(upper)))
+
+
+def _prefix_and_column(expr: Expr) -> tuple[str | None, Expr | None]:
+    """`(prefix, column)` for the two prefix spellings, else `(None, None)`."""
+    if isinstance(expr, StrFunc) and expr.fn == "starts_with" and isinstance(expr.pattern, str):
+        return expr.pattern, expr.input
+    # `substr(col, 1, n) = lit` — only from the first character, and only when the
+    # literal is exactly `n` characters. A shorter literal makes the predicate
+    # unsatisfiable and a longer one makes it constant-false; neither is a prefix test,
+    # and folding them here would hide a user's mistake behind a range.
+    if not (isinstance(expr, Binary) and expr.op == "eq"):
+        return None, None
+    for value, other in ((expr.left, expr.right), (expr.right, expr.left)):
+        if (
+            isinstance(value, StrFunc)
+            and value.fn == "substr"
+            and value.start == 1
+            and isinstance(other, Lit)
+            and isinstance(other.value, str)
+            and value.length == len(other.value)
+        ):
+            return other.value, value.input
+    return None, None
+
+
+def _increment_prefix(prefix: str) -> str | None:
+    """The exclusive upper bound for a literal prefix, or None if it is not safe.
+
+    Shares `_MAX_INCREMENTABLE` with the `LIKE` rule so the two cannot disagree about
+    which prefixes are incrementable.
+    """
+    if not prefix or ord(prefix[-1]) > _MAX_INCREMENTABLE:
+        return None
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
+DEFAULT_REGISTRY.add(
+    plan_rule(
+        "prefix_predicates_to_range",
+        Phase.NORMALIZE,
+        lambda plan, _ctx: prefix_predicates_to_range(plan),
+    )
+)
+
+
+# --- len(col) = 0 → col = '' ------------------------------------------------
+
+
+def len_zero_to_empty_string(plan: LogicalPlan) -> LogicalPlan:
+    """Rewrite `len(col) = 0` to `col = ''` (and `len(col) <> 0` to `col <> ''`).
+
+    A length test wraps the column in a function, which makes it opaque to zone-map
+    pruning, bloom probing and source pushdown — every one of which needs a bare `Col` on
+    one side. The equality is the same predicate in a form all three can use.
+
+    Exact: a string has zero characters iff it is the empty string, and both spellings
+    are null-propagating, so a null row is null either way.
+    """
+    return transform_up(plan, lambda node: map_node_expressions(node, _rewrite_len_zero))
+
+
+def _rewrite_len_zero(expr: Expr) -> Expr:
+    if not (isinstance(expr, Binary) and expr.op in ("eq", "ne")):
+        return expr
+    for value, other in ((expr.left, expr.right), (expr.right, expr.left)):
+        if (
+            isinstance(value, StrFunc)
+            and value.fn == "len"
+            and isinstance(other, Lit)
+            # `type(...) is int` because `True` is an `int` subclass and `len(s) = True`
+            # is not this predicate.
+            and type(other.value) is int
+            and other.value == 0
+        ):
+            return Binary(expr.op, value.input, Lit(""))
+    return expr
+
+
+DEFAULT_REGISTRY.add(
+    plan_rule(
+        "len_zero_to_empty_string",
+        Phase.NORMALIZE,
+        lambda plan, _ctx: len_zero_to_empty_string(plan),
+    )
+)
+
+
 def _flat_or_equalities(expr: Expr) -> tuple[str, list] | None:
     """If `expr` is `c == v1 OR c == v2 OR …` (≥2 disjuncts, one column, literal
     values), return `(column, [values])`; else None. The shape SQL `IN (...)` and
@@ -224,6 +360,22 @@ def _flat_or_equalities(expr: Expr) -> tuple[str, list] | None:
     return cols.pop(), values
 
 
+def _in_list_values(expr: Expr) -> tuple[str, list] | None:
+    """`(column, values)` for a `col IN (…)` over literals, else None.
+
+    `or_to_in_and_range` must see this shape as well as the `OR` chain, because
+    `or_equalities_to_in_list` folds the chain into an `InList` in the same phase — and
+    whichever of the two runs first, the bounds this rule derives must still be derived.
+    Reading only the `OR` form made the fold silently *remove* the zone-map bounds.
+    """
+    if not (isinstance(expr, InList) and isinstance(expr.input, Col)):
+        return None
+    values = list(expr.values)
+    if len(values) < 2 or any(_bad_range_literal(v) for v in values):
+        return None
+    return expr.input.name, values
+
+
 def _bad_range_literal(value: object) -> bool:
     """Whether a literal cannot participate in a min/max range bound.
 
@@ -240,6 +392,58 @@ def _bad_range_literal(value: object) -> bool:
     return is_nan(value)
 
 
+@rule(name="or_equalities_to_in_list", phase=Phase.NORMALIZE, matches=(Filter,))
+def or_equalities_to_in_list(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Fold `c = v1 OR c = v2 OR …` into `c IN (v1, v2, …)` (DuckDB's
+    `contains_to_in_clause`).
+
+    This pays twice, and the second time is the larger one.
+
+    At runtime the disjunction is *n* sequential comparisons over the whole column,
+    while `InList` lowers to one hash-set probe per row (`bc_expr::eval::in_list`,
+    which builds an `ahash` set once per operator). That is the direct win.
+
+    The compounding one is that this repository already carries a family of rules keyed
+    on `InList` — `prune_in_list_by_zonemap`, `prune_in_list_by_bloom`, `dedup_in_list`,
+    `refine_in_list_by_equality`/`_comparison`/`_neq`, `intersect_in_lists`,
+    `push_in_list_across_join_keys` — **none of which can fire on the `OR` form**. A user
+    who writes the chain (or whose ORM does) got none of them. Producing the node they
+    match is what turns eight existing rules on.
+
+    Exactly equivalent, including NULL: `x = 1 OR x = 2` and `x IN (1, 2)` both yield
+    NULL for a null `x` (verified against DuckDB, which agrees on both forms), so this is
+    safe in a projection as well as under a filter — though it only matches `Filter`,
+    where the pruning rules that consume it live.
+
+    `or_to_in_and_range` is the sibling rewrite and is *not* superseded: it derives
+    `min ≤ c ≤ max` bounds from the same shape, which zone maps use directly. Both fire;
+    the bounds are added to the conjunction and the disjunct itself becomes the `IN`.
+    """
+    conjuncts = split_conjuncts(node.predicate)
+    rewritten: list[Expr] = []
+    changed = False
+    for conj in conjuncts:
+        info = _flat_or_equalities(conj)
+        if info is None:
+            rewritten.append(conj)
+            continue
+        col_name, values = info
+        # First-occurrence order, deduplicated: the set semantics are the same and a
+        # stable order keeps the rewrite idempotent (`dedup_in_list` would otherwise
+        # rewrite it again on the next fixpoint iteration).
+        deduped = tuple(dict.fromkeys(values))
+        if len(deduped) < 2:
+            # One distinct value is an equality, not a membership test; leave it for
+            # the equality rules rather than wrapping a single value in a hash set.
+            rewritten.append(conj)
+            continue
+        rewritten.append(InList(Col(col_name), deduped))
+        changed = True
+    if not changed:
+        return None
+    return Filter(node.input, combine_conjuncts(rewritten))
+
+
 @rule(name="or_to_in_and_range", phase=Phase.NORMALIZE, matches=(Filter,))
 def or_to_in_and_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Add `c >= min AND c <= max` alongside a `c = v1 OR c = v2 OR …` conjunct.
@@ -252,10 +456,14 @@ def or_to_in_and_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | No
     not already present. Skipped when the literals aren't mutually comparable.
     """
     conjuncts = split_conjuncts(node.predicate)
-    existing = [c.to_ir() for c in conjuncts]  # IR dicts are unhashable → list + `in`
+    # Keyed by `expr_key` (the canonical, memoized IR serialization) rather than by the
+    # raw IR dict: dicts are unhashable, so the presence test used to be a linear scan of
+    # a list with a full dict comparison at each step — quadratic in the conjunct count on
+    # exactly the wide `OR` chains this rule exists to fold.
+    existing = {expr_key(c) for c in conjuncts}
     added: list[Expr] = []
     for conj in conjuncts:
-        info = _flat_or_equalities(conj)
+        info = _flat_or_equalities(conj) or _in_list_values(conj)
         if info is None:
             continue
         col_name, values = info
@@ -264,9 +472,10 @@ def or_to_in_and_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | No
         except TypeError:
             continue  # values not mutually comparable (mixed types)
         for bound in (Binary("ge", Col(col_name), Lit(lo)), Binary("le", Col(col_name), Lit(hi))):
-            if bound.to_ir() not in existing:
+            key = expr_key(bound)
+            if key not in existing:
                 added.append(bound)
-                existing.append(bound.to_ir())
+                existing.add(key)
     if not added:
         return None
     return Filter(node.input, combine_conjuncts([*conjuncts, *added]))
