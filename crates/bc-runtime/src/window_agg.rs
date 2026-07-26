@@ -4,8 +4,8 @@
 //! had five. The nine added here are exactly the ones whose running form is **O(1) per
 //! row**, which is what makes them safe to compute the same way the existing five are:
 //!
-//! * the moment aggregates `var` and `stddev`, from a running `(n, Σx, Σx²)` — the same
-//!   sum-of-powers state `agg/var.rs` keeps, so a window and a `GROUP BY` over the same
+//! * the moment aggregates `var` and `stddev`, from a running Welford `(n, mean, M2)` —
+//!   the same recurrence `agg/var.rs` keeps, so a window and a `GROUP BY` over the same
 //!   rows agree by construction rather than by coincidence;
 //! * the folds `product`, `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, each a
 //!   running application of an associative operator;
@@ -36,41 +36,50 @@ use arrow::row::Rows;
 use crate::error::RuntimeError;
 use crate::window::WindowFn;
 
-/// Running sum-of-powers state for the moment aggregates.
+/// Running **Welford** `(n, mean, M2)` state for the moment aggregates.
 ///
-/// `Σx` and `Σx²` rather than Welford: it is what `agg/var.rs` accumulates, and a window
-/// aggregate that disagreed with the `GROUP BY` aggregate over the same rows would be a
-/// worse defect than the extra cancellation error this trades for. The subtraction is
-/// clamped at zero, because catastrophic cancellation on a near-constant column can
-/// otherwise produce a variance of `-1e-16` and a `NaN` standard deviation.
+/// This is the same recurrence `agg/var.rs` keeps, and for the same reason. The obvious
+/// state is `(n, Σx, Σx²)` with `variance = (Σx² − n·mean²)/(n−1)`, which subtracts two
+/// nearly equal large numbers and cancels catastrophically when the mean dwarfs the
+/// spread: over `[1e9+1, 1e9+2, 1e9+3]` it returns exactly `0` where the answer is `1`.
+///
+/// The first version of this module used sum-of-powers, and its doc comment claimed the
+/// `GROUP BY` aggregate did too — it does not, and has not since that exact case was
+/// fixed there. So the window and the group aggregate disagreed by a factor of infinity
+/// on a column of large near-equal values, while the test fixture (values 1 through 8)
+/// could not see it. Welford makes the two agree because it *is* the same recurrence, not
+/// because they were checked against each other on small numbers.
 #[derive(Default, Clone, Copy)]
 struct Moments {
     n: i64,
-    sum: f64,
-    sum_sq: f64,
+    mean: f64,
+    m2: f64,
 }
 
 impl Moments {
+    /// One online Welford update: shift the mean by the new value's share of the
+    /// deviation, then accumulate the centred product. No sum of squares is ever formed,
+    /// so there is nothing to cancel.
     #[inline]
     fn push(&mut self, v: f64) {
         self.n += 1;
-        self.sum += v;
-        self.sum_sq += v * v;
+        let delta = v - self.mean;
+        self.mean += delta / self.n as f64;
+        self.m2 += delta * (v - self.mean);
     }
 
-    /// The sample variance (`ddof` = 1), or `None` when there are too few values for it
-    /// to be defined. `ddof` is a parameter rather than a constant because the population
-    /// form is the same state with a different divisor, and will want it when the
-    /// aggregate vocabulary grows a tag for it.
+    /// The variance under `ddof` (1 = sample), or `None` when there are too few values
+    /// for it to be defined. `ddof` is a parameter rather than a constant because the
+    /// population form is the same state with a different divisor, and will want it when
+    /// the aggregate vocabulary grows a tag for it.
     #[inline]
     fn variance(&self, ddof: i64) -> Option<f64> {
         if self.n <= ddof {
             return None;
         }
-        let n = self.n as f64;
-        let mean = self.sum / n;
-        let numerator = (self.sum_sq - n * mean * mean).max(0.0);
-        Some(numerator / (n - ddof as f64))
+        // M2 is a sum of squares of *deviations*, so it is non-negative by construction;
+        // the clamp guards only against a -0.0 sneaking into `sqrt`.
+        Some((self.m2.max(0.0)) / (self.n - ddof) as f64)
     }
 
     #[inline]

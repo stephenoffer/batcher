@@ -306,9 +306,20 @@ aggregate vocabulary has no tag for them (the DataFrame spellings are composites
 `var`/`stddev`), so a `WindowFn` variant would have had nothing able to construct it —
 speculative generality rather than a capability.
 
-**`var`/`stddev` keep the same sum-of-powers state `agg/var.rs` keeps**, so the window and
-the `GROUP BY` over the same rows agree by construction rather than by coincidence — and a
-test asserts that equality so "by construction" is checkable.
+**`var`/`stddev` keep the same Welford `(n, mean, M2)` recurrence `agg/var.rs` keeps**, so
+the window and the `GROUP BY` over the same rows agree by construction rather than by
+coincidence — and a test asserts that equality so "by construction" is checkable.
+
+That sentence was **false when this entry was first written**, and the correction is the
+part worth keeping. The kernel shipped with a sum-of-powers state, `(n, Σx, Σx²)`, and
+this entry claimed the group aggregate used one too. It does not, and has not since
+exactly this case was fixed there: recovering the variance as `(Σx² − n·mean²)` subtracts
+two nearly equal large numbers, so over `[1e9+1, 1e9+2, 1e9+3]` the window returned `0`
+where the `GROUP BY` returned `1`. The test fixture (values 1 through 8) could not see it.
+Two lessons, both cheap to state and expensive to relearn: a claim that two paths "agree
+by construction" is only worth as much as the construction actually being shared, and a
+numerical-stability defect needs a fixture with a large mean and a small spread — a
+differential test over small integers will pass either way.
 
 `WINDOW_FRAMEABLE` deliberately did *not* grow with `WINDOW_AGGREGATES`: the framed path
 has a hand-written sliding kernel per function and has none for these, so an explicit

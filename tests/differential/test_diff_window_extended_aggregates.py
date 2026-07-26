@@ -134,8 +134,10 @@ def test_peer_rows_share_the_running_value(duck, table):
 def test_a_window_aggregate_agrees_with_the_group_by_aggregate(duck, table):
     """The whole-partition window value must equal the `GROUP BY` value for that group.
 
-    `var`/`stddev` keep a sum-of-powers state in both places on purpose, so this holds by
-    construction; the test is what makes "by construction" checkable.
+    `var`/`stddev` keep the same Welford recurrence in both places on purpose, so this
+    holds by construction; the test is what makes "by construction" checkable. See
+    `test_variance_survives_a_large_mean_with_a_small_spread` for what happened when the
+    two states differed.
     """
     windowed = (
         bt.from_arrow(table)
@@ -146,6 +148,26 @@ def test_a_window_aggregate_agrees_with_the_group_by_aggregate(duck, table):
     )
     grouped = duck.sql("SELECT g, var_samp(x) v, stddev(x) s FROM t GROUP BY g ORDER BY g")
     assert_same_ordered(windowed, grouped)
+
+
+@pytest.mark.differential
+def test_variance_survives_a_large_mean_with_a_small_spread(duck):
+    """The cancellation case that decides which recurrence the kernel may use.
+
+    With `(n, Sx, Sx^2)` the variance is recovered by subtracting two nearly equal large
+    numbers, and over `[1e9+1, 1e9+2, 1e9+3]` that returns exactly `0` where the answer is
+    `1`. `agg/var.rs` moved to Welford for this; the first version of the *window* kernel
+    did not, and its fixture (values 1 through 8) could not see the difference — the
+    window aggregate disagreed with the `GROUP BY` aggregate by a factor of infinity.
+    """
+    big = pa.table({"g": ["a", "a", "a"], "x": [1e9 + 1, 1e9 + 2, 1e9 + 3]})
+    duck.register("big", big)
+    out = bt.from_arrow(big).select(v=col("x").var().over("g"), s=col("x").std().over("g"))
+    assert out.to_pydict()["v"] == [1.0, 1.0, 1.0]
+    assert out.to_pydict()["s"] == [1.0, 1.0, 1.0]
+    expected = duck.sql("SELECT var_samp(x) v, stddev(x) s FROM big")
+    grouped = bt.from_arrow(big).agg(v=col("x").var(), s=col("x").std()).collect()
+    assert_same_ordered(grouped, expected)
 
 
 @pytest.mark.differential
