@@ -62,6 +62,20 @@ _UNARY_MATH = {
     "Trunc": "trunc",
     "Degrees": "degrees",
     "Radians": "radians",
+    # The remaining DuckDB math builtins sqlglot promotes to typed nodes. Each has an
+    # identically-named `Expr` method, so the only thing that was missing was the row
+    # in this table — `SELECT cot(x)` raised "unsupported SQL expression: Cot".
+    "Atan": "atan",
+    "Asin": "asin",
+    "Acos": "acos",
+    "Sinh": "sinh",
+    "Cosh": "cosh",
+    "Tanh": "tanh",
+    "Asinh": "asinh",
+    "Acosh": "acosh",
+    "Atanh": "atanh",
+    "Cot": "cot",
+    "Factorial": "factorial",
 }
 _UNARY_STR = {
     "Upper": "upper",
@@ -69,6 +83,18 @@ _UNARY_STR = {
     "Length": "len",
     "Reverse": "reverse",
     "Ascii": "ascii",
+    # `unicode(s)` is DuckDB's spelling of `ascii(s)` — the first character's codepoint.
+    "Unicode": "ascii",
+    "Hex": "hex",
+    "Unhex": "unhex",
+    "MD5": "md5",
+    "SHA": "sha1",
+    # `SHA2` is deliberately absent: it carries a digest width, and matching it here
+    # (this table is consulted first) made `sha2(s, 512)` silently return sha256.
+    # `functions._scalar_function` handles it and rejects any width but 256.
+    "BitLength": "bit_length",
+    "Initcap": "initcap",
+    "Soundex": "soundex",
 }
 _DATE_PART = {
     "Year": "year",
@@ -82,6 +108,13 @@ _DATE_PART = {
     "Week": "week",
     "DayOfWeek": "dayofweek",
     "DayOfYear": "dayofyear",
+    # DuckDB date-part builtins sqlglot promotes to typed nodes; each already has a
+    # `.dt` method, so only the row was missing.
+    "Dayname": "dayname",
+    "Monthname": "monthname",
+    "LastDay": "last_day",
+    "WeekOfYear": "weekofyear",
+    "DayOfWeekIso": "isodow",
 }
 # EXTRACT(<part> FROM ts) field name (lowercased) → `.dt` method.
 _EXTRACT_PART = {

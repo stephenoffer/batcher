@@ -8,6 +8,8 @@ nested subqueries via `tr.statement`. They hold no state of their own.
 from __future__ import annotations
 
 from batcher._sql.parser.core_utils import _columns_selector
+from batcher._sql.parser.expressions.aggregates import is_agg_node
+from batcher._sql.parser.expressions.anonymous import anonymous_scalar
 from batcher._sql.parser.expressions.functions import (
     _date_diff,
     _list_function,
@@ -50,7 +52,10 @@ def _scalar(tr, node) -> Expr:
 
     # Inside an aggregate query, an aggregate sub-expression refers to its
     # pre-computed output column.
-    if tr._agg_map is not None and isinstance(node, exp.AggFunc):
+    # `is_agg_node` rather than `isinstance(node, exp.AggFunc)`: the DuckDB aggregates
+    # sqlglot leaves anonymous (`product`, `sem`, `count_star`, …) are registered by the
+    # grouping too, so they must resolve to their output column here as well.
+    if tr._agg_map is not None and is_agg_node(node):
         entry = tr._agg_map.get(node.sql())
         if entry is not None:
             # string_agg collects into a list (array_agg); join it here with the
@@ -208,6 +213,9 @@ def _scalar(tr, node) -> Expr:
     # An unknown function call (parsed as Anonymous) is the most common cause —
     # name it and point at registration rather than a generic node-type error.
     if isinstance(node, exp.Anonymous):
+        named = anonymous_scalar(tr, node)
+        if named is not None:
+            return named
         raise NotImplementedError(
             f"unknown function {node.name!r}: it is not a supported SQL function and "
             f"is not registered (use bt.register_function to call a Python function)"

@@ -131,12 +131,19 @@ def _within_group_to_agg(node):
 
 
 def _has_aggregate(node) -> bool:
-    from sqlglot import expressions as exp
-
     # An aggregate inside a window (e.g. SUM(x) OVER (...)) is a window
     # function, not a GROUP-BY aggregate, so ignore those. An aggregate
     # inside a (scalar) subquery belongs to the inner query, not this one.
-    for a in node.find_all(exp.AggFunc):
+    #
+    # `iter_agg_nodes`, not `find_all(exp.AggFunc)`: the DuckDB aggregates sqlglot
+    # leaves anonymous (`product`, `sem`, `count_star`, …) are not `AggFunc` subclasses,
+    # so an ungrouped `SELECT product(x) FROM t` was not recognized as an aggregate
+    # query at all and fell through to the scalar translator.
+    from sqlglot import expressions as exp
+
+    from batcher._sql.parser.expressions.aggregates import iter_agg_nodes
+
+    for a in iter_agg_nodes(node):
         if a.find_ancestor(exp.Window) is not None:
             continue
         if a.find_ancestor(exp.Subquery) is not None:

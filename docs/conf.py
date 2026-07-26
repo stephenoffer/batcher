@@ -177,6 +177,15 @@ exclude_patterns = [
     # competitor file it was read from, plus the ranked build order. A contributor working
     # record, not a site page.
     "internals/competitor_technique_review.md",
+    # The build log against that parts list: one row per landed engine improvement with its
+    # source technique, its safety argument and its measurement, plus what is still open. A
+    # contributor working record, not a site page.
+    "internals/engine_improvements_ledger.md",
+    # The other half of that review: gaps found by *executing* the reference engines and
+    # Batcher side by side over their whole function surface, the wrong answers that
+    # measurement turned up, and the build log against them. A contributor working record,
+    # not a site page.
+    "internals/competitor_parity_census.md",
     # A code-checked parity scorecard against the Databricks stack (Catalyst/AQE, Photon,
     # Reyden/Lakehouse//RT) covering the optimizer, vectorized execution, the distributed
     # path, and the enterprise surface — plus the Databricks claims that are secondary-
