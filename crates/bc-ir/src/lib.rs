@@ -103,6 +103,29 @@ pub enum RelOp {
         output: Vec<JoinOutputCol>,
     },
 
+    /// Join two relations on one or two **inequalities** (`l.x < r.y`, interval
+    /// containment, a band join). A pipeline breaker.
+    ///
+    /// Without this node every such join lowers to a cartesian `HashJoin` with the
+    /// predicate as a `Filter` above it, so the intermediate is `|left| x |right|` rows
+    /// however few survive — quadratic time *and* memory. This node is executed by an
+    /// output-sensitive algorithm instead: a sorted-suffix scan for one inequality, and
+    /// IEJoin (Khayyat et al., the algorithm DuckDB's `PhysicalIEJoin` implements) for
+    /// two.
+    ///
+    /// `conditions` holds one or two inequalities, each oriented `left_key OP right_key`.
+    /// The planner is responsible for their key columns sharing a data type; anything
+    /// further in the original predicate stays as a `Filter` above this node, which is
+    /// what keeps the rewrite a *restriction* of the cartesian plan rather than a
+    /// reinterpretation of it.
+    RangeJoin {
+        left: Box<RelOp>,
+        right: Box<RelOp>,
+        conditions: Vec<RangeCondition>,
+        join_type: JoinType,
+        output: Vec<JoinOutputCol>,
+    },
+
     /// Deduplicate rows (DISTINCT over all columns). A pipeline breaker.
     Distinct { input: Box<RelOp> },
 
@@ -253,6 +276,27 @@ pub enum JoinStrategy {
     Hash,
     Broadcast,
     SortMerge,
+}
+
+/// One inequality in a [`RelOp::RangeJoin`] condition, oriented `left_key OP right_key`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RangeCondition {
+    pub left_key: String,
+    pub right_key: String,
+    pub op: RangeOp,
+}
+
+/// The comparison in a [`RangeCondition`]. Wire names are the contract with the planner.
+///
+/// Only the four ordering comparisons appear: `=` is a hash join and `<>` admits no
+/// ordering structure at all, so both are left to the paths that already handle them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// One output column of a join: which side it comes from, its source name there,
@@ -449,6 +493,20 @@ pub enum WindowFn {
     ForwardFill,
     /// The mirror of `ForwardFill`: carry the next non-null value backward.
     BackwardFill,
+    /// The aggregates beyond `sum`/`avg`/`min`/`max`/`count`. Every reference engine
+    /// (DuckDB, Spark, Polars) allows any aggregate over a window; these are the ones
+    /// whose running form is O(1) per row, which is what lets them share the same
+    /// whole-partition and running machinery as the five above. Order statistics
+    /// (`median`/`quantile`/`mode`) are deliberately absent — see `bc_runtime::window_agg`.
+    Var,
+    Stddev,
+    Product,
+    BoolAnd,
+    BoolOr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    CountDistinct,
 }
 
 /// One output column of a `Project`: an expression and the name it is bound to.
@@ -478,7 +536,9 @@ impl RelOp {
             | RelOp::RowId { input, .. }
             | RelOp::Unpivot { input, .. }
             | RelOp::Sample { input, .. } => vec![input],
-            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+            RelOp::HashJoin { left, right, .. }
+            | RelOp::AsofJoin { left, right, .. }
+            | RelOp::RangeJoin { left, right, .. } => {
                 vec![left, right]
             }
             RelOp::Union { inputs, .. } => inputs.iter().collect(),
@@ -535,7 +595,9 @@ impl RelOp {
             | RelOp::RowId { input, .. }
             | RelOp::Unpivot { input, .. }
             | RelOp::Sample { input, .. } => input.contains_media_decode(),
-            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+            RelOp::HashJoin { left, right, .. }
+            | RelOp::AsofJoin { left, right, .. }
+            | RelOp::RangeJoin { left, right, .. } => {
                 left.contains_media_decode() || right.contains_media_decode()
             }
             RelOp::Window {

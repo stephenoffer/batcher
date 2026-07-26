@@ -58,6 +58,9 @@ pub(crate) fn broadcast_partition_aggregate(
         return Ok(Arc::new(Int64Array::from(out)));
     }
     let values = require(values, func)?;
+    if crate::window_agg::is_extended_aggregate(func) {
+        return crate::window_agg::broadcast(func, group_ids, num_groups, values);
+    }
     match values.data_type() {
         DataType::Int64 => grouped_i64(func, group_ids, num_groups, values),
         DataType::Float64 => grouped_f64(func, group_ids, num_groups, values),

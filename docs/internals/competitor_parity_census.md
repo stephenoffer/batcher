@@ -285,6 +285,42 @@ And one was refused rather than mapped: Spark's `to_binary(s, charset)` encodes 
 while DuckDB's `to_binary(s)` is a `0`/`1` bit string. Same name, different function. The
 two-argument form silently returned the bit string; it now raises.
 
+### 152-160. Nine window aggregates beyond `sum`/`avg`/`min`/`max`/`count`
+
+**Source:** the capability probe, and the open list's own item 2. DuckDB, Spark and Polars
+all allow *any* aggregate over a window; this engine allowed five, and
+`col("x").std().over("g")` raised `unknown window function 'stddev'`.
+
+**Now** `var`, `stddev`, `product`, `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`
+and `count_distinct` work in both window shapes, in a new
+`bc-runtime/src/window_agg.rs`.
+
+**The selection rule is the point.** These nine are exactly the aggregates whose *running*
+form costs **O(1) per row**: the moment pair from a running `(n, Σx, Σx²)`, the six folds
+from a running application of an associative operator, and `count_distinct` from a running
+hash set. Order statistics (`median`, `quantile`, `mode`) are deliberately absent —
+their running form needs a sorted structure, and adding them here would put an `O(n log n)`
+kernel behind the same call shape as an `O(n)` one with nothing at the call site to say so.
+`var_pop`/`stddev_pop` are absent for a different reason worth separating: the engine's
+aggregate vocabulary has no tag for them (the DataFrame spellings are composites over
+`var`/`stddev`), so a `WindowFn` variant would have had nothing able to construct it —
+speculative generality rather than a capability.
+
+**`var`/`stddev` keep the same sum-of-powers state `agg/var.rs` keeps**, so the window and
+the `GROUP BY` over the same rows agree by construction rather than by coincidence — and a
+test asserts that equality so "by construction" is checkable.
+
+`WINDOW_FRAMEABLE` deliberately did *not* grow with `WINDOW_AGGREGATES`: the framed path
+has a hand-written sliding kernel per function and has none for these, so an explicit
+`ROWS` frame is rejected at plan time rather than silently ignored.
+
+**Verified** by 30 differential cases against DuckDB covering the whole-partition,
+running and unpartitioned shapes over groups of different sizes, a singleton group (where
+sample variance is NULL), nulls in every value column, and repeated values so
+`count_distinct` is not the row count. The comparison is **ordered**, not the suite's
+usual multiset: a running aggregate is a sequence, and an order-independent comparison
+cannot see a running kernel that emits the right values in the wrong order.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -335,13 +371,14 @@ surface.
 1. **`last_day(DATE)` returns a `TIMESTAMP`.** An engine-level type bug, not a translator
    one: `.dt.last_day()` widens a `DATE` input to a timestamp. The only mismatch in the
    census that is a defect in the data plane rather than a representation choice.
-2. **Window aggregates beyond `{sum, avg, min, max, count}`.** DuckDB, Spark and Polars
-   all allow every aggregate over a window; `stddev`, `var`, `median`, `product`,
-   `bool_and`, `count_distinct`, `mode` and `arg_min`/`arg_max` all raise
-   `unknown window function` here. The whole-partition, running and framed paths are three
-   separate hand-written kernels, so this is the largest item on the list. The framed path
-   generalizes: its `FifoSum` is the two-stack sliding-window trick, which works for any
-   associative operator, so one generalization would serve every new aggregate at once.
+2. **The window aggregates entries 152-160 did not take.** `median`, `quantile` and
+   `mode` need an order-statistic structure for their running form; `arg_min`/`arg_max`
+   and the two-input aggregates need a second input, which `WindowCall` has nowhere to
+   put; `array_agg` accumulates O(n) state per row in the running form. Separately, none
+   of the nine that landed honours an explicit `ROWS` frame — the framed path has a
+   hand-written sliding kernel per function. That one **generalizes**: its `FifoSum` is
+   the two-stack sliding-window trick, which works for *any* associative operator, so one
+   generalization would give every fold a framed form at once.
 3. **Aggregates the engine does not have at all**: `entropy`, `mad`, `approx_top_k`,
    `bitstring_agg`, `histogram_exact`, `quantile_disc`, the `arg_*_null` variants, and a
    true `any_value`/`first`/`last` with no ordering requirement.

@@ -39,6 +39,7 @@ class Op:
     ROW_ID: Final = "row_id"
     SAMPLE: Final = "sample"
     ASOF_JOIN: Final = "asof_join"
+    RANGE_JOIN: Final = "range_join"
 
 
 class ExprTag:
@@ -102,7 +103,18 @@ class ExprTag:
 WINDOW_RANKING: Final = frozenset(
     {"row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile"}
 )
-WINDOW_AGGREGATES: Final = frozenset({"sum", "avg", "min", "max", "count"})
+WINDOW_AGGREGATES: Final = frozenset(
+    {
+        "sum", "avg", "min", "max", "count",
+        # DuckDB, Spark and Polars all allow any aggregate over a window. These are the
+        # ones whose *running* form costs O(1) per row, which is what lets them share the
+        # existing whole-partition and running machinery. Order statistics
+        # (`median`/`quantile`/`mode`) need a sorted structure and are deliberately
+        # absent — see `bc_runtime::window_agg`.
+        "var", "stddev", "product",
+        "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor", "count_distinct",
+    }
+)  # fmt: skip
 # The fills select by *nullness* rather than by offset, but share the value functions'
 # contract: input required, output type = input type, no explicit frame (theirs is
 # implied). Unlike the other value functions they are meaningless without an order.
@@ -114,4 +126,11 @@ WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE
 # Functions that honour an explicit frame: the reducing aggregates, plus the
 # positional value functions that pick the frame's first/last/nth row. `lag`/`lead`
 # and the fills carry no frame (theirs is fixed by their own offset / nullness).
-WINDOW_FRAMEABLE: Final = WINDOW_AGGREGATES | frozenset({"first_value", "last_value", "nth_value"})
+# Functions that honour an explicit `ROWS`/`GROUPS` frame. This is the *original* five
+# aggregates plus the positional value functions, NOT all of `WINDOW_AGGREGATES`: the
+# framed path in `bc_runtime::window_frame` has a hand-written sliding kernel per
+# function, and the twelve extended aggregates have only whole-partition and running
+# forms. Listing them here would send a frame to a kernel that cannot honour it.
+WINDOW_FRAMEABLE: Final = frozenset(
+    {"sum", "avg", "min", "max", "count", "first_value", "last_value", "nth_value"}
+)
