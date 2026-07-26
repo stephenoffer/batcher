@@ -615,7 +615,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 |---|---|---|
 | `aggregates.py` | 197 | DuckDB aggregate spellings → the Batcher aggregate surface. |
 | `anonymous.py` | 201 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
-| `functions.py` | 403 | Named-function dispatch for the SQL translator's scalar path. |
+| `functions.py` | 413 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 47 | SQL JSON extraction — ``json_extract`` / ``json_extract_string`` / ``->`` / ``->>``. |
 | `literals.py` | 414 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `scalar.py` | 473 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
@@ -1555,7 +1555,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
 | `collections.py` | 1306 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 3703 | The `.str` accessor namespace. |
+| `strings.py` | 3715 | The `.str` accessor namespace. |
 | `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -1944,7 +1944,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 531 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1393 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1423 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/temporal/date.rs` | 722 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |

@@ -27,7 +27,6 @@ from batcher.plan.functions.temporal import make_date
 _STR_CONST_ARG = {
     "Split": ("split", "delimiter"),
     "Levenshtein": ("levenshtein", "comparison string"),
-    "RegexpExtractAll": ("regexp_extract_all", "pattern"),
     "RegexpSplit": ("regexp_split", "pattern"),
     "JarowinklerSimilarity": ("jaro_winkler_similarity", "comparison string"),
     "JaroSimilarity": ("jaro_similarity", "comparison string"),
@@ -163,11 +162,16 @@ def _scalar_function(tr, node):
         operands = node.expressions
         if len(operands) == 2:
             return tr._scalar(operands[0]).list.intersect(tr._scalar(operands[1]))
-    if name == "RegexpExtract":
-        pat = _const_str_arg(node.expression, "regexp_extract()", "pattern")
+    if name in ("RegexpExtract", "RegexpExtractAll"):
+        # Both carry an optional capture-group index. `regexp_extract_all` used to drop
+        # it, so `regexp_extract_all('100-200', '(\\d+)-(\\d+)', 1)` collected the whole
+        # matches (`['100-200']`) where DuckDB collects the group (`['100']`).
+        label = "regexp_extract()" if name == "RegexpExtract" else "regexp_extract_all()"
+        pat = _const_str_arg(node.expression, label, "pattern")
         grp = node.args.get("group")
-        group = _const_int_arg(grp, "regexp_extract() capture group") if grp is not None else 0
-        return tr._scalar(node.this).str.regexp_extract(pat, group)
+        group = _const_int_arg(grp, f"{label} capture group") if grp is not None else 0
+        method = "regexp_extract" if name == "RegexpExtract" else "regexp_extract_all"
+        return getattr(tr._scalar(node.this).str, method)(pat, group)
     if name == "StrPosition":
         pat = node.args["substr"]
         if not isinstance(pat, exp.Literal) or not pat.is_string:
@@ -290,10 +294,16 @@ def _list_function(tr, node):
         return tr._scalar(node.this).list.len()
     if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
         return tr._scalar(node.this).list.contains(_raw_value(node.expression))
-    if isinstance(node, exp.Bracket):  # a[i] — sqlglot already 0-bases the index
+    if isinstance(node, exp.Bracket):
+        # `a[i]`. sqlglot 0-bases the index for the dialects whose subscript is 1-based
+        # (duckdb, postgres) and leaves `offset` unset; where it cannot, it keeps the
+        # written index and records the base in `offset` — Spark's `element_at(a, 2)`
+        # becomes `Bracket(expressions=[2], offset=1)`. Ignoring `offset` made every such
+        # subscript return the *next* element: `element_at(array(1,2,3), 2)` answered 3.
         idxs = node.expressions
         if len(idxs) == 1 and not isinstance(idxs[0], exp.Slice):
-            return tr._scalar(node.this).list.get(int(idxs[0].name))
+            offset = int(node.args.get("offset") or 0)
+            return tr._scalar(node.this).list.get(int(idxs[0].name) - offset)
         return None  # slices (a[lo:hi]) not supported
     reduce = _LIST_REDUCE.get(type(node).__name__)
     if reduce is not None:

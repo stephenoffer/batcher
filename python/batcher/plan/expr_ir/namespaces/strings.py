@@ -2755,14 +2755,20 @@ class _StrNamespace:
             length = require_int(length, func="str.overlay", arg="length")
         return StrFunc("overlay", self._e, replacement=replacement, start=pos, length=length)
 
-    def regexp_extract_all(self, pattern: str) -> StrFunc:
+    def regexp_extract_all(self, pattern: str, group: int = 0) -> StrFunc:
         """Collect every regex match as a list of strings (DuckDB ``regexp_extract_all``).
 
         Returns an empty list when there are no matches. Chain ``.list`` to operate
         on the result. Returns List<Utf8>.
 
+        With a ``group`` above 0 the list holds that capture group of each match rather
+        than the whole match, and an element is null where the group did not participate
+        in its match. Asking for a group the pattern does not have is an error, matching
+        DuckDB rather than returning empty lists.
+
         Args:
             pattern: The regular expression to match.
+            group: Capture group index; 0 (default) is the whole match.
 
         Returns:
             A new List<Utf8> expression of all matches.
@@ -2776,8 +2782,14 @@ class _StrNamespace:
                 ...     bt.col("s").str.regexp_extract_all(r"\\d+").alias("r")
                 ... ).to_pydict()
                 {'r': [['2024', '01', '15']]}
+
+                >>> d = bt.from_pydict({"s": ["100-200, 300-400"]})
+                >>> d.select(
+                ...     bt.col("s").str.regexp_extract_all(r"(\\d+)-(\\d+)", 1).alias("r")
+                ... ).to_pydict()
+                {'r': [['100', '300']]}
         """
-        return StrFunc("regexp_extract_all", self._e, pattern=pattern)
+        return StrFunc("regexp_extract_all", self._e, pattern=pattern, start=group)
 
     def regexp_count(self, pattern: str) -> StrFunc:
         """Count non-overlapping regex matches (DuckDB ``regexp_count``).

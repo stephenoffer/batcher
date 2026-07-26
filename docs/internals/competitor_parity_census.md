@@ -145,6 +145,47 @@ it is now `iso_year() * 100 + week_of_year()`.
 DuckDB's `epoch(ts)` is fractional seconds as a `DOUBLE` (`1709618828.123456`); the
 mapping to `.dt.epoch()` truncated to the second. Now `epoch_us() / 1e6`.
 
+### 107. `regexp_extract_all` ignored its capture-group argument
+
+**Source:** Spark's own `@ExpressionDescription` examples, confirmed against DuckDB.
+
+Spark annotates every builtin with an `examples` block holding `> SELECT _FUNC_(args);`
+lines and the expected output, and `FunctionRegistry.scala` maps each expression class to
+its SQL name. Together they are an executable oracle needing no JVM — which matters here,
+because there is no Java runtime on this machine. Running them through
+`bt.sql(dialect="spark")` reported `regexp_extract_all('100-200, 300-400', '(\d+)-(\d+)',
+1)` as `['100-200', '300-400']` against Spark's documented `['100','300']`; DuckDB agrees
+with Spark.
+
+The group index had nowhere to go. The kernel called `find_iter` unconditionally, and
+`.str.regexp_extract_all` took only a pattern — so the SQL translator, which had just
+gained the function in entry 1-100, silently dropped the third argument. Both halves are
+fixed: the index rides the same `start` field the scalar `regexp_extract` already uses
+for it (no IR tag changed), and the kernel switches to `captures_iter`.
+
+Three details are DuckDB's, and each needed checking rather than assuming: a group that
+did not participate in its match is a **NULL element** (where the scalar
+`regexp_extract` yields `''` for the same case), a group index past the pattern's count
+is an **error** rather than an empty list, and group 0 stays the whole match.
+
+Verified by a Rust kernel test, six differential cases through both the DataFrame and SQL
+paths, and a case pinning the null-element behaviour.
+
+### 108. Every 1-based array subscript was off by one outside the DuckDB dialect
+
+**Source:** the same Spark example run — `element_at(array(1, 2, 3), 2)` answered `3`.
+
+sqlglot rewrites `l[2]` to a 0-based index for dialects whose subscript is 1-based
+(duckdb, postgres) and leaves `Bracket.offset` unset. Where it cannot rewrite — Spark's
+`element_at(a, 2)` is 1-based while Spark's own `a[2]` is 0-based, so the two cannot share
+a normalization — it keeps the written index and records the base in `offset`. The
+translator ignored `offset` and treated every subscript as already 0-based, returning the
+*next* element.
+
+This is the shape of bug the census exists to find: it is invisible in the dialect the
+test suite uses, silent in the dialect it breaks, and off by exactly one, so a small
+example looks plausible.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -161,10 +202,35 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
   and `DOUBLE` here; `unhex` returns a `BLOB` there and `VARCHAR` here; `histogram`
   returns a `MAP` there and a list of pairs here; `list_distinct` returns its elements in
   an unspecified order in both, which the census reports as a mismatch and is not one.
+* **Spark's semantics are not adopted with Spark's syntax.** `dialect="spark"` selects a
+  *parser*, not a semantics. Where Spark and DuckDB genuinely disagree the engine follows
+  DuckDB, because DuckDB is the differential oracle the whole suite is written against:
+  `regexp_replace` replaces the first match (Spark replaces all), `sort_array` orders
+  nulls last (Spark first), `array_distinct` drops nulls (Spark keeps them), `dayname`
+  spells the day in full (Spark abbreviates), and `round` is half-away-from-zero (Polars
+  is half-to-even). A Spark query that relies on one of these will run and return DuckDB's
+  answer, so each is listed in the `migrate-from-spark` skill rather than left to be
+  discovered.
+* **`round` half-away-from-zero.** Polars rounds half to even (`round(-2.5)` is `-2.0`);
+  DuckDB and Batcher round half away from zero (`-3.0`). DuckDB is the oracle.
+* **`list_sum` of an empty list** is `NULL` here and in DuckDB, `0` in Polars.
+
+## The three censuses, and what each is good for
+
+| Reference | Oracle | Surface probed | Result |
+|---|---|---|---|
+| DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 478 scalar/aggregate signatures, through `bt.sql` | 93 → 193 supported; 6 wrong answers found |
+| Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, through `bt.sql(dialect="spark")` | 75 supported; 2 wrong answers found (entries 107, 108) |
+| Polars | the live library | every zero-argument method on `pl.Expr` and its `.str`/`.dt`/`.list` namespaces | 53 supported, 31 absent, 14 differences (all but two are representation or a pinned semantic choice) |
+
+Spark deserves a note: **it needs no JVM.** There is no Java runtime on this machine, so
+`SparkSession` cannot start — but every builtin carries its expected output in an
+annotation next to its implementation, which is an oracle a text reader can use. That is
+worth remembering the next time a reference engine will not run.
 
 ## Open
 
-Ordered by measured value, from the same census and a capability probe of the DataFrame
+Ordered by measured value, from the same censuses and a capability probe of the DataFrame
 surface.
 
 1. **`last_day(DATE)` returns a `TIMESTAMP`.** An engine-level type bug, not a translator

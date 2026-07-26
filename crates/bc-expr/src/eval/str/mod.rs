@@ -582,14 +582,44 @@ pub(crate) fn eval_str(
         StrFunc::RegexpExtractAll => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
             let re = compile_regex(pattern, func)?;
+            // The capture-group index rides `start`, as it does for the scalar
+            // `RegexpExtract`. Without it every call collected the *whole* match, so
+            // `regexp_extract_all('100-200', '(\d+)-(\d+)', 1)` answered
+            // `['100-200']` where DuckDB says `['100']` — a wrong answer, not a refusal,
+            // because the group argument was simply dropped on the way down.
+            let group = start.unwrap_or(0).max(0) as usize;
+            // DuckDB rejects a group the pattern does not have rather than returning
+            // empty lists; `captures_len` counts group 0, so the last valid index is
+            // one less.
+            if group >= re.captures_len() {
+                return Err(ExprError::InvalidArgument {
+                    func: format!("{func:?}"),
+                    reason: format!(
+                        "pattern has {} group(s); cannot access group {group}",
+                        re.captures_len() - 1
+                    ),
+                });
+            }
             // One list per row; match volume per row is unknown, so pre-size only the
             // outer offset buffer and let the inner value builder grow as matches land.
             let mut builder = ListBuilder::with_capacity(StringBuilder::new(), s.len());
             for o in s.iter() {
                 match o {
                     Some(v) => {
-                        for m in re.find_iter(v) {
-                            builder.values().append_value(m.as_str());
+                        if group == 0 {
+                            for m in re.find_iter(v) {
+                                builder.values().append_value(m.as_str());
+                            }
+                        } else {
+                            for c in re.captures_iter(v) {
+                                // A group that did not participate in this match is a
+                                // NULL element in DuckDB (the scalar `regexp_extract`
+                                // yields `''` instead — the two genuinely differ).
+                                match c.get(group) {
+                                    Some(m) => builder.values().append_value(m.as_str()),
+                                    None => builder.values().append_null(),
+                                }
+                            }
                         }
                         builder.append(true);
                     }
@@ -2141,6 +2171,70 @@ mod tests {
         assert_eq!(damerau_levenshtein("abc", ""), 3);
         // True (unrestricted) DL, matching DuckDB: transpose ca→ac then insert b = 2.
         assert_eq!(damerau_levenshtein("ca", "abc"), 2);
+    }
+
+    /// `regexp_extract_all` collects a *capture group* of every match when one is asked
+    /// for, not the whole match. The group index rides `start`, as it does for the scalar
+    /// `RegexpExtract`; before it was honoured the kernel called `find_iter`
+    /// unconditionally, so group 1 of `(\d+)-(\d+)` came back as the whole `100-200`.
+    #[test]
+    fn regexp_extract_all_collects_the_requested_capture_group() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+        use std::sync::Arc;
+
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("100-200, 300-400")]));
+        let row = |group: i64| -> Vec<Option<String>> {
+            let out = eval_str(
+                StrFunc::RegexpExtractAll,
+                &arr,
+                Some(r"(\d+)-(\d+)"),
+                None,
+                Some(group),
+                None,
+            )
+            .unwrap();
+            let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = list.value(0);
+            let strings = values.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..strings.len())
+                .map(|i| (!strings.is_null(i)).then(|| strings.value(i).to_string()))
+                .collect()
+        };
+        let owned = |v: &[&str]| -> Vec<Option<String>> {
+            v.iter().map(|s| Some((*s).to_string())).collect()
+        };
+        // Group 0 (and the default) is the whole match; 1 and 2 are the two halves.
+        assert_eq!(row(0), owned(&["100-200", "300-400"]));
+        assert_eq!(row(1), owned(&["100", "300"]));
+        assert_eq!(row(2), owned(&["200", "400"]));
+
+        // A branch that did not participate is a NULL element, matching DuckDB — the
+        // scalar `regexp_extract` yields `""` for the same case, so the two differ.
+        let alt: ArrayRef = Arc::new(StringArray::from(vec![Some("a1 b")]));
+        let out = eval_str(
+            StrFunc::RegexpExtractAll,
+            &alt,
+            Some(r"(\d)|(x)"),
+            None,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value(0).len(), 1);
+        assert!(list.value(0).is_null(0));
+
+        // A group the pattern does not have is rejected, not silently empty.
+        assert!(eval_str(
+            StrFunc::RegexpExtractAll,
+            &arr,
+            Some(r"(\d+)"),
+            None,
+            Some(5),
+            None,
+        )
+        .is_err());
     }
 
     /// `regexp_replace`/`regexp_replace_all` use DuckDB's RE2 rewrite template: `\1`..`\9`
