@@ -158,10 +158,13 @@ a port actually hits, each found by running Spark's own documented examples thro
 | `dayname(d)` / `monthname(d)` | abbreviated (`Wed`, `Feb`) | full (`Wednesday`, `February`) |
 | `round(x)` | half **up** | half **away from zero** |
 | `split(s, p)` | `p` is a **regex** | `p` is a **literal**; use `regexp_split_to_array` |
+| `weekday(d)` | `0` is **Monday** | `0` is **Sunday** (DuckDB's `dayofweek`) |
+| `to_binary(s, charset)` | the encoded **bytes** | refused — DuckDB's `to_binary(s)` is a `0`/`1` bit string, a different function under the same name |
 | `element_at(a, i)` | 1-based | 1-based (`a[i]` is 0-based in Spark, 1-based in DuckDB — the parser handles it) |
 
-Rewrite the first six explicitly during the port; none of them raises, so each is a
-result that quietly differs. Verify the port the way the recipe above says: compare row
+Rewrite the first seven explicitly during the port; none of them raises, so each is a
+result that quietly differs. `to_binary` is the exception and is deliberately so: it is
+refused rather than answered, because the two functions share a name and nothing else. Verify the port the way the recipe above says: compare row
 counts and a checksum against the original job's output, not the eyeball.
 
 ## See also

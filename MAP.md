@@ -614,10 +614,10 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 197 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 246 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
-| `functions.py` | 426 | Named-function dispatch for the SQL translator's scalar path. |
+| `anonymous.py` | 289 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `functions.py` | 466 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 47 | SQL JSON extraction — ``json_extract`` / ``json_extract_string`` / ``->`` / ``->>``. |
-| `literals.py` | 421 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
+| `literals.py` | 426 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `scalar.py` | 473 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 
 ### `batcher/_sql/parser/joins/` — 6 · front-end
@@ -1947,7 +1947,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/mod.rs` | 1489 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
-| `eval/temporal/date.rs` | 722 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
+| `eval/temporal/date.rs` | 741 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |

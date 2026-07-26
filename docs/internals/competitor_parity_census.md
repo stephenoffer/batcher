@@ -38,8 +38,9 @@ function, 478 of which have a signature this census can synthesize an argument f
 
 **Method.** For each function, every overload is called in DuckDB and then in
 `bt.sql(...)` with the same literal arguments; a function counts as supported when *any*
-overload returns DuckDB's answer. Before this wave: **93 of 478**. After: **193 of 478**,
-with **no function that previously matched now failing**.
+overload returns DuckDB's answer. Before this wave: **93 of 478**. After this entry:
+**193 of 478**; after the later entries in this file, **215 of 478** — with **no function
+that previously matched now failing**, checked after every wave.
 
 **Was.** Three distinct failures, none of which is visible from the DataFrame API:
 
@@ -242,6 +243,48 @@ because a prefix comparison answers a caller's mistake with a plausible number.
 kernel tests including a round-trip property over Unicode and empty input, and a test that
 each escaped value matches itself through the engine's own matcher.
 
+### 126. A date function on a text column worked for half the family and raised for the rest
+
+**Source:** Spark's documented examples — twelve of them are `year('2016-07-30')`-shaped,
+and Spark parses the string as a date.
+
+`eval_date` handles twenty-one functions. Some of them (`dayname`, `monthname`,
+`last_day`, `is_leap_year`, `days_in_month`, `iso_year`) cast the input to
+`Timestamp(µs)` *as a side effect of how they compute*, and so accepted a text column.
+The rest (`year`, `month`, `day`, `hour`, `second`, `quarter`, …) hand the array straight
+to Arrow's `date_part` kernel and failed with `Year does not support: Utf8`. Which half a
+function fell in was an accident of implementation, not a decision — and the ones that
+failed are the common ones.
+
+The cast is now hoisted to the top of `eval_date`, so the family agrees. This accepts
+*more* than DuckDB, which rejects the string form outright with a binder error, rather
+than answering differently from it — the only direction a compatibility convenience may
+go when DuckDB is the oracle.
+
+### 127-151. Twenty-five Spark SQL names reachable from `bt.sql(dialect="spark")`
+
+Typed nodes (`Sec`, `Csc`, `Rint`, `BitwiseCount`, `Flatten`, `ArraySort`,
+`ArrayToString`, `ArrayPosition`, `ArraySlice`, `TsOrDsToDate`) and anonymous names
+(`hypot`, `nanvl`, `isnull`, `isnotnull`, `log1p`, `expm1`, `xxhash64`, `map_values`,
+`map_keys`, `make_date`, `try_mod`, `try_to_binary`, `try_url_decode`), plus DuckDB's
+`list_slice`/`array_slice`, which the census had not reached either.
+
+Spark's census score went from 75 of 312 probed to 108, with no name that previously
+matched now failing.
+
+Two of these were nearly wrong answers, and both are about a second operand:
+
+* `slice(l, start, length)` is 1-based with a *length*; `.list.slice(offset, length)` is
+  0-based. sqlglot names the two operands `start` and `end`, which invites reading the
+  second as an index. Getting either wrong returns a plausible window one element along —
+  the first implementation did, and Spark's own documented example caught it.
+* `list_slice(l, begin, end)` is DuckDB's, and its bounds are an inclusive 1-based pair,
+  *not* Spark's start-and-count. The two spellings cannot share a translation.
+
+And one was refused rather than mapped: Spark's `to_binary(s, charset)` encodes bytes
+while DuckDB's `to_binary(s)` is a `0`/`1` bit string. Same name, different function. The
+two-argument form silently returned the bit string; it now raises.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -263,8 +306,8 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
   DuckDB, because DuckDB is the differential oracle the whole suite is written against:
   `regexp_replace` replaces the first match (Spark replaces all), `sort_array` orders
   nulls last (Spark first), `array_distinct` drops nulls (Spark keeps them), `dayname`
-  spells the day in full (Spark abbreviates), and `round` is half-away-from-zero (Polars
-  is half-to-even). A Spark query that relies on one of these will run and return DuckDB's
+  spells the day in full (Spark abbreviates), `weekday` is Sunday-based (Spark's is
+  Monday-based), and `round` is half-away-from-zero (Polars is half-to-even). A Spark query that relies on one of these will run and return DuckDB's
   answer, so each is listed in the `migrate-from-spark` skill rather than left to be
   discovered.
 * **`round` half-away-from-zero.** Polars rounds half to even (`round(-2.5)` is `-2.0`);
@@ -275,8 +318,8 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
 
 | Reference | Oracle | Surface probed | Result |
 |---|---|---|---|
-| DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 478 scalar/aggregate signatures, through `bt.sql` | 93 → 193 supported; 6 wrong answers found |
-| Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, through `bt.sql(dialect="spark")` | 75 supported; 2 wrong answers found (entries 107, 108) |
+| DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 478 scalar/aggregate signatures, through `bt.sql` | **93 → 215** supported; 6 wrong answers found |
+| Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, through `bt.sql(dialect="spark")` | **75 → 108** supported; 4 wrong answers found (entries 107, 108, and the two in 127-151) |
 | Polars | the live library | every zero-argument method on `pl.Expr` and its `.str`/`.dt`/`.list` namespaces | 53 supported, 31 absent, 14 differences (all but two are representation or a pinned semantic choice) |
 
 Spark deserves a note: **it needs no JVM.** There is no Java runtime on this machine, so

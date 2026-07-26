@@ -61,6 +61,15 @@ def _scalar_function(tr, node):
     if name in _UNARY_MATH:
         return getattr(tr._scalar(node.this), _UNARY_MATH[name])()
     if name in _UNARY_STR:
+        if name == "ToBinary" and node.args.get("format") is not None:
+            # DuckDB's `to_binary(s)` is a `0`/`1` *bit string*; Spark's
+            # `to_binary(s, charset)` is the encoded *bytes*. Same name, different
+            # function — so the two-argument form is refused rather than answered with
+            # the bit string, which is what it silently did.
+            raise NotImplementedError(
+                "to_binary(value, charset) is Spark's binary encoding, not DuckDB's "
+                "bit-string to_binary; the two-argument form is not supported"
+            )
         return getattr(tr._scalar(node.this).str, _UNARY_STR[name])()
     if name in _DATE_PART:
         return getattr(tr._scalar(node.this).dt, _DATE_PART[name])()
@@ -149,6 +158,15 @@ def _scalar_function(tr, node):
     if name == "TimeToStr":  # strftime(ts, fmt)
         fmt = _const_str_arg(node.args.get("format"), "strftime()", "format")
         return tr._scalar(node.this).dt.strftime(fmt)
+    if name == "TsOrDsToDate":
+        # Spark's implicit "this is a date" wrapper — `year('2016-07-30')` parses as
+        # `Year(TsOrDsToDate('2016-07-30'))`. With a format it is `to_date(s, fmt)`;
+        # without, it is a plain cast, which is what Spark means by it.
+        fmt = node.args.get("format")
+        value = tr._scalar(node.this)
+        if fmt is None:
+            return Cast(value, "date")
+        return value.str.to_date(_const_str_arg(fmt, "to_date()", "format"))
     if name == "TimeToUnix":
         # `epoch(ts)` is DuckDB's *fractional* seconds since the epoch (a DOUBLE), not
         # the whole seconds `.dt.epoch()` returns — `epoch('…:08.123456')` is
@@ -305,6 +323,28 @@ def _list_function(tr, node):
 
     if isinstance(node, exp.ArraySize):  # array_length / len(list)
         return tr._scalar(node.this).list.len()
+    if isinstance(node, exp.Flatten):  # flatten(list-of-lists) — one level
+        return tr._scalar(node.this).list.flatten()
+    if isinstance(node, exp.ArraySort):  # array_sort(l) without a comparator
+        if node.expression is not None:
+            raise NotImplementedError("array_sort with a comparator is not supported")
+        return tr._scalar(node.this).list.sort()
+    if isinstance(node, exp.ArrayToString):  # array_join(l, sep) / list_aggr concat
+        sep = _const_str_arg(node.expression, "array_join()", "separator")
+        return tr._scalar(node.this).list.join(sep)
+    if isinstance(node, exp.ArrayPosition):
+        # Spark's `array_position(l, v)` is the 1-based index of `v`, 0 when absent —
+        # which is what `.list.position` returns.
+        return tr._scalar(node.this).list.position(_raw_value(node.expression))
+    if isinstance(node, exp.ArraySlice):
+        # `slice(l, start, length)`. SQL counts the start from 1 and `.list.slice` from
+        # 0, so the index is shifted; sqlglot names the second operand `end`, but Spark's
+        # is a *length*, so it passes through as the length rather than as an index.
+        # Getting either wrong returns a plausible window one element along.
+        start = _const_int_arg(node.args["start"], "slice(): start")
+        size = node.args.get("end")
+        length = _const_int_arg(size, "slice(): length") if size is not None else None
+        return tr._scalar(node.this).list.slice(start - 1, length)
     if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
         return tr._scalar(node.this).list.contains(_raw_value(node.expression))
     if isinstance(node, exp.Bracket):

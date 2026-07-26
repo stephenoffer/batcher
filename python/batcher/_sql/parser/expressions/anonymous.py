@@ -32,8 +32,8 @@ from __future__ import annotations
 import math
 
 from batcher.plan.expr_ir import Binary, Expr, array, atan2, lit
-from batcher.plan.functions.scalar import gcd, lcm, next_after
-from batcher.plan.functions.temporal import current_date
+from batcher.plan.functions.scalar import gcd, hypot, lcm, nanvl, next_after
+from batcher.plan.functions.temporal import current_date, make_date
 
 __all__ = ["anonymous_scalar"]
 
@@ -52,6 +52,11 @@ _UNARY_EXPR = {
     "sec": "sec",
     "csc": "csc",
     "rint": "rint",
+    # Spark spellings whose Batcher method is identically named.
+    "isnull": "is_null",
+    "isnotnull": "is_not_null",
+    "log1p": "log1p",
+    "expm1": "expm1",
 }
 
 # `f(s)` → a `.str` method.
@@ -75,6 +80,18 @@ _UNARY_STR = {
     "parse_path": "parse_path",
     "to_binary": "to_binary",
     "from_binary": "from_binary",
+    "xxhash64": "xxhash64",
+    # Spark's `try_*` string forms differ from the plain ones only by returning null
+    # instead of raising on a *conversion* failure, and these two already return null
+    # rather than raising, so the two spellings mean the same thing here.
+    "try_to_binary": "to_binary",
+    "try_url_decode": "url_decode",
+}
+
+# `f(m)` → a `.map` method. `map_keys` reaches the typed dispatch; `map_values` does not.
+_UNARY_MAP = {
+    "map_values": "values",
+    "map_keys": "keys",
 }
 
 # `f(ts)` → a `.dt` method. These are the DuckDB date-part spellings sqlglot has no
@@ -147,6 +164,21 @@ _BINARY_FN = {
     "least_common_multiple": lcm,
     "atan2": atan2,
     "nextafter": next_after,
+    "hypot": hypot,
+    "nanvl": nanvl,
+    # Spark's `try_mod` returns null on a zero divisor where `mod` raises; the engine's
+    # `%` already yields null there, so the two spellings coincide.
+    "try_mod": lambda a, b: a.mod(b),
+}
+
+# `f(a, b, c)` → a three-argument builder over the translated operands.
+#
+# `list_slice` is DuckDB's, and its two bounds are an inclusive 1-based `begin`..`end`
+# pair — *not* Spark's `slice(l, start, length)`, which sqlglot gives its own node. The
+# two spellings differ in both the base and the meaning of the second operand, so they
+# cannot share a row.
+_TERNARY_FN = {
+    "make_date": make_date,
 }
 
 # `f()` → a constant. DuckDB spells these as nullary functions; the engine has no node
@@ -209,6 +241,8 @@ def anonymous_scalar(tr, node):
         derived = _UNARY_DT_DERIVED.get(name)
         if derived is not None:
             return derived(tr._scalar(one))
+        if name in _UNARY_MAP:
+            return getattr(tr._scalar(one).map, _UNARY_MAP[name])()
 
     if len(args) == 2:
         left, right = args
@@ -225,6 +259,15 @@ def anonymous_scalar(tr, node):
             return tr._scalar(left).list.get(_const_int_arg(right, f"{name}(): index") - 1)
         if name in _LIST_PAIR:
             return getattr(tr._scalar(left).list, _LIST_PAIR[name])(tr._scalar(right))
+
+    if len(args) == 3:
+        if name in ("list_slice", "array_slice"):
+            begin = _const_int_arg(args[1], f"{name}(): begin")
+            end = _const_int_arg(args[2], f"{name}(): end")
+            return tr._scalar(args[0]).list.slice(begin - 1, max(end - begin + 1, 0))
+        builder = _TERNARY_FN.get(name)
+        if builder is not None:
+            return builder(*(tr._scalar(a) for a in args))
 
     if name in _LIST_PACK:
         return array(*(tr._scalar(a) for a in args))

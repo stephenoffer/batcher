@@ -14,6 +14,25 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     use arrow::compute::kernels::temporal::DatePart;
     use arrow::datatypes::TimeUnit;
 
+    // A text column is parsed as a timestamp first, uniformly.
+    //
+    // Half of this function already did that as a side effect of how it computed:
+    // `dayname`, `last_day`, `is_leap_year` and friends cast to Timestamp(µs) before
+    // doing their own work, so they accepted a string column, while `year`, `month` and
+    // `second` handed the array straight to Arrow's `date_part` kernel and failed with
+    // "Year does not support: Utf8". Which of the twenty-one functions worked on text was
+    // therefore an accident of implementation, not a decision — and the ones that failed
+    // are the common ones.
+    //
+    // Hoisting the cast here makes the whole family agree. It also makes a Spark or
+    // pandas port work unchanged (`year('2016-07-30')` is legal Spark); DuckDB rejects the
+    // string form outright, so this accepts *more* than the oracle rather than answering
+    // differently from it, which is the only direction a compatibility convenience may go.
+    if matches!(arr.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        let parsed = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+        return eval_date(func, &parsed);
+    }
+
     // `epoch` isn't a date-part: whole seconds since the Unix epoch, as Int64.
     //
     // The division MUST floor, not truncate toward zero. Arrow's
