@@ -186,6 +186,62 @@ This is the shape of bug the census exists to find: it is invisible in the diale
 test suite uses, silent in the dialect it breaks, and off by exactly one, so a small
 example looks plausible.
 
+### 109-125. Seventeen scalar functions DuckDB has and the engine did not
+
+**Source:** the census gap column, filtered to the functions whose argument and result
+shapes the existing `Expr`/`StrFunc` nodes can already carry.
+
+**Math** (`bc-expr` `MathFunc`/`Math2Func`, five unary and one binary): `even`, `gamma`,
+`lgamma`, `sec`, `csc`, `rint`, and `nextafter`. Three of them exist because a rounding
+rule is not one thing:
+
+* `round` is half **away from zero** (DuckDB's rule, and the engine's).
+* `rint` is half **to even** — IEEE-754's own rule, so a column of rounded values does not
+  drift upward the way half-up rounding does. Spark has it; DuckDB does not.
+* `even` rounds **outward** to an even integer, so `3.0` becomes `4.0`, which is neither
+  of the above.
+
+`gamma`/`lgamma` go through `libm`, the pure-Rust port of the FDLIBM routines DuckDB
+reaches through its libc, rather than a series approximation — so they agree to the last
+bit rather than to a tolerance. (One input, `gamma(0.5)`, still differs by 1 ULP; the
+differential harness rounds to 9 places, so it is inside the tolerance either way.)
+`nextafter` steps the two's-complement-ordered bit pattern, and is *not* lowered by the
+JIT for the reason `cbrt` is not: a libm libcall need not reproduce the interpreter's
+answer bit-for-bit on the subnormal and sign-crossing cases, and the contract says the JIT
+must then fall back.
+
+**String** (a new `eval/str/uri_path.rs`, eleven functions): `url_encode`, `url_decode`,
+`regexp_escape`, `parse_filename`, `parse_dirname`, `parse_dirpath`, `parse_path`,
+`to_binary`, `from_binary`, `hamming` (also spelled `mismatches`) and `jaccard`.
+
+They are one module because they share a property worth naming: each is defined by an
+*external specification* rather than by an operation on characters, so the interesting
+part of every one is an edge case that has to be read off DuckDB rather than derived.
+Four were, and each would have been wrong otherwise:
+
+* `url_decode('a%2')` is `'a%2'` — a truncated escape passes through. It does not raise
+  and does not null the row.
+* `parse_dirname` is the **first** path component (`/` for an absolute path); the
+  directory holding the file is `parse_dirpath`. They disagree on every path deeper than
+  one level, and both exist in DuckDB.
+* `parse_dirpath('/')` is `/` while `parse_dirpath('/single')` is `''` — the root is its
+  own directory, so the carve-out is the one-character path, not "starts with a
+  separator". The first implementation got this wrong and the differential test caught it.
+* `regexp_escape` is RE2's `QuoteMeta`, which backslashes **every** ASCII byte outside
+  `[A-Za-z0-9_]` — not the `regex` crate's `escape`, which escapes only its own
+  metacharacters and returned `'a b'` where DuckDB returns `'a\ b'`. Both are patterns
+  that match the literal, so the difference is invisible if you match with it
+  immediately; the returned *string* is what a user stores and compares. (Escaping the
+  wider set is safe for the engine's own matcher, which accepts a backslash before any
+  punctuation — verified, not assumed.)
+
+`hamming` raises on unequal lengths rather than comparing a prefix, as DuckDB does,
+because a prefix comparison answers a caller's mistake with a plausible number.
+
+**Verified** by 152 differential cases against DuckDB (columns, not literals), two Rust
+kernel tests including a round-trip property over Unicode and empty input, and a test that
+each escaped value matches itself through the engine's own matcher.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -251,6 +307,12 @@ surface.
    against DuckDB's eleven.
 5. **`ROLLUP`/`CUBE`/`GROUPING SETS` on the DataFrame API.** The SQL front-end has them
    (`_sql/parser/grouping_sets.py`); `ds.rollup(...)` does not exist.
-6. **Scalar gaps with no engine implementation**: `chr`, `bin`/`unbin`, `url_encode`/
-   `url_decode`, `to_base`, `uuid`, `random`, `time_bucket`, `list_reduce`, `list_zip`,
-   `generate_series`, `bar`, `format_bytes`, `age`, `equi_width_bins`.
+6. **Scalar gaps with no engine implementation.** The ones entries 109-125 did not take,
+   and why: `chr`, `bin`, `to_base`, `format_bytes` and `bar` all map **Int → Utf8**, and
+   `StrFunc` requires a Utf8 input — the caller downcasts to `StringArray` before the
+   kernel is reached — so they need either a new `Expr` variant or a widening of that
+   dispatch, which is a design decision rather than a kernel. Then `uuid`/`random`
+   (nondeterministic, so they collide with seq == par == JIT unless seeded through the
+   plan), `time_bucket`, `age`, `list_reduce`, `list_zip`, `generate_series`,
+   `equi_width_bins`, and `nfc_normalize`/`strip_accents` (which want a Unicode
+   normalization dependency).

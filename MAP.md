@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 847 Python modules across 128 packages and 168 Rust files across 13 crates.
+Covering 847 Python modules across 128 packages and 169 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -164,7 +164,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 207 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 279 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 673 | Top-level expression constructors re-exported for the public API. |
+| `functions.py` | 675 | Top-level expression constructors re-exported for the public API. |
 | `groupby.py` | 867 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `source_stats.py` | 261 | Per-source statistics collection for the conductor. |
 | `stats.py` | 323 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
@@ -177,7 +177,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 |---|---|---|
 | `gating.py` | 176 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 85 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
-| `staging.py` | 395 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
+| `staging.py` | 403 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/dataset/` — 5 · conductor
 
@@ -335,7 +335,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 443 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 463 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 788 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 115 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
@@ -614,10 +614,10 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 197 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 201 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
-| `functions.py` | 413 | Named-function dispatch for the SQL translator's scalar path. |
+| `anonymous.py` | 246 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `functions.py` | 426 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 47 | SQL JSON extraction — ``json_extract`` / ``json_extract_string`` / ``->`` / ``->>``. |
-| `literals.py` | 414 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
+| `literals.py` | 421 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `scalar.py` | 473 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 
 ### `batcher/_sql/parser/joins/` — 6 · front-end
@@ -755,7 +755,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `metadata_answer.py` | 426 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 61 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 339 | Memoize the optimizer — the same query, planned once. |
+| `plan_cache.py` | 353 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 209 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 171 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 168 | The Kyber rule abstraction — one small, pure unit of optimization. |
@@ -1397,7 +1397,7 @@ Source connectors — the façade over the source implementation modules.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 184 | The `Source` protocol — the contract every connector satisfies. |
-| `inmemory.py` | 476 | `InMemorySource` — a relation already materialized as Arrow record batches. |
+| `inmemory.py` | 489 | `InMemorySource` — a relation already materialized as Arrow record batches. |
 | `inmemory_stats.py` | 295 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 186 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
 | `materialized.py` | 70 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
@@ -1525,8 +1525,8 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 4686 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 167 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `core.py` | 4799 | The scalar expression base class and its core IR nodes. |
+| `fn_names.py` | 172 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -1555,7 +1555,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
 | `collections.py` | 1306 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 3715 | The `.str` accessor namespace. |
+| `strings.py` | 3940 | The `.str` accessor namespace. |
 | `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -1591,7 +1591,7 @@ The expression function library, grouped by family.
 | `prompt.py` | 134 | Prompt-construction functions — assemble an LLM prompt from row columns, in the engine. |
 | `quantiles.py` | 181 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 229 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
-| `scalar.py` | 385 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
+| `scalar.py` | 412 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 286 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 442 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `string.py` | 426 | String-building free functions (`concat`, `concat_ws`, `format_string`). |
@@ -1685,7 +1685,7 @@ The neutral type vocabulary and inference for the plan layer.
 
 | module | lines | what it is |
 |---|---|---|
-| `infer.py` | 472 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
+| `infer.py` | 485 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
 | `widths.py` | 96 | Static per-column byte widths derived from a column's Arrow type. |
@@ -1818,7 +1818,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 213 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 779 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 972 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 990 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 158 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -1883,7 +1883,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `compile.rs` | 485 | Build and JIT-compile a Cranelift function that evaluates an `Expr` element-wise over the row index, returning the finalized function pointer. |
 | `emit.rs` | 617 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
 | `kleene.rs` | 111 | Kleene / null-propagation support analysis for the JIT. |
-| `lib.rs` | 730 | `bc-codegen` — a Cranelift JIT backend for `bc-expr` scalar expressions. |
+| `lib.rs` | 735 | `bc-codegen` — a Cranelift JIT backend for `bc-expr` scalar expressions. |
 | `simd.rs` | 346 | Vector (SIMD) emitter for the JIT's vectorizable `Expr` subset. |
 
 ### `bc-ir`
@@ -1924,7 +1924,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 84 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
-| `eval/math.rs` | 402 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 460 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/mod.rs` | 617 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/image/reencode.rs` | 250 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
@@ -1944,13 +1944,14 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 531 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1423 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1489 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
+| `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
 | `eval/temporal/date.rs` | 722 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1127 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1189 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`

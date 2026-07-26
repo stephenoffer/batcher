@@ -30,6 +30,7 @@ __all__ = [
     "lcm",
     "log",
     "nanvl",
+    "next_after",
     "width_bucket",
 ]
 
@@ -269,6 +270,32 @@ def hypot(a: IntoExpr, b: IntoExpr) -> Math2Expr:
             {'r': [5.0, 13.0]}
     """
     return Math2Expr("hypot", _wrap(a), _wrap(b))
+
+
+def next_after(value: IntoExpr, toward: IntoExpr) -> Math2Expr:
+    """The next representable float after ``value`` in the direction of ``toward``.
+
+    DuckDB ``nextafter``. One unit in the last place — the smallest step the type can
+    take, which is what makes it the way to write a strict floating-point boundary
+    (``x > next_after(limit, inf)``); ``limit + tiny`` cannot express it, because for a
+    large ``limit`` there is no ``tiny`` that changes the value.
+
+    Args:
+        value: The starting value (column or literal).
+        toward: The direction to step in (column or literal).
+
+    Returns:
+        The adjacent representable float, or ``toward`` when the two are already equal.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1.0, 1.0]})
+            >>> ds.select(bt.next_after(bt.col("a"), bt.lit(2.0)).alias("r")).to_pydict()
+            {'r': [1.0000000000000002, 1.0000000000000002]}
+    """
+    return Math2Expr("next_after", _wrap(value), _wrap(toward))
 
 
 def width_bucket(value: IntoExpr, low: IntoExpr, high: IntoExpr, count: int) -> Expr:

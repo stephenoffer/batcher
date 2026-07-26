@@ -532,6 +532,7 @@ dependencies = [
  "hmac",
  "image",
  "jpeg-decoder",
+ "libm",
  "lz4_flex",
  "md-5",
  "memchr",

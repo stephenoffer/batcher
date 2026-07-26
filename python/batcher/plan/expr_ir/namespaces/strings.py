@@ -2907,6 +2907,231 @@ class _StrNamespace:
         """
         return StrFunc("jaro_winkler_similarity", self._e, pattern=target)
 
+    def hamming(self, target: str) -> StrFunc:
+        """Count the positions at which the value and ``target`` differ (→ Int64).
+
+        DuckDB ``hamming`` (also spelled ``mismatches``). Defined only for strings of
+        equal length: an unequal length raises rather than comparing a prefix, because a
+        prefix comparison would answer a caller's mistake with a plausible number.
+        Counted in Unicode scalar values, as :meth:`len` counts them.
+
+        Args:
+            target: The literal string to compare against, of the same length.
+
+        Returns:
+            A new Int64 expression: the number of differing positions.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc", "abd", "xyz"]})
+                >>> ds.select(d=bt.col("s").str.hamming("abc")).to_pydict()
+                {'d': [0, 1, 3]}
+        """
+        return StrFunc("hamming", self._e, pattern=target)
+
+    def jaccard(self, target: str) -> StrFunc:
+        """Compute the Jaccard similarity of the two strings' character sets (→ Float64).
+
+        DuckDB ``jaccard``: the size of the intersection over the size of the union of the
+        two values' distinct characters, in ``[0, 1]``. A repeated character does not
+        change the answer, which is what makes it a *set* similarity — for element-wise
+        list similarity use ``.list.jaccard``.
+
+        Args:
+            target: The literal string to score against.
+
+        Returns:
+            A new Float64 expression: the Jaccard similarity.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc", "aab"]})
+                >>> ds.select(j=bt.col("s").str.jaccard("abd")).to_pydict()
+                {'j': [0.5, 0.6666666666666666]}
+        """
+        return StrFunc("jaccard_similarity", self._e, pattern=target)
+
+    def url_encode(self) -> StrFunc:
+        """Percent-encode the value for use in a URL (→ Utf8).
+
+        DuckDB ``url_encode``. Everything outside the RFC 3986 unreserved set
+        (``A-Za-z0-9-_.~``) becomes ``%XX`` over the UTF-8 bytes, ``/`` and ``+``
+        included — this encodes a URL *component*, not a whole URL, so it is safe to
+        paste into a query string or a path segment.
+
+        Returns:
+            A new Utf8 expression: the percent-encoded value.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a b/c"]})
+                >>> ds.select(u=bt.col("s").str.url_encode()).to_pydict()
+                {'u': ['a%20b%2Fc']}
+        """
+        return StrFunc("url_encode", self._e)
+
+    def url_decode(self) -> StrFunc:
+        """Percent-decode the value (→ Utf8).
+
+        DuckDB ``url_decode``, the inverse of :meth:`url_encode`. A malformed escape (a
+        ``%`` not followed by two hex digits, or bytes that do not decode as UTF-8) is
+        left as written rather than raising or nulling the row, matching DuckDB.
+
+        Returns:
+            A new Utf8 expression: the decoded value.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a%20b%2Fc", "100%"]})
+                >>> ds.select(u=bt.col("s").str.url_decode()).to_pydict()
+                {'u': ['a b/c', '100%']}
+        """
+        return StrFunc("url_decode", self._e)
+
+    def regexp_escape(self) -> StrFunc:
+        """Escape the regex metacharacters in the value (→ Utf8).
+
+        DuckDB ``regexp_escape``. Use it to embed data in a pattern as a literal, so a
+        value containing ``.`` or ``[`` matches itself instead of acting as syntax.
+
+        Returns:
+            A new Utf8 expression: the value with its metacharacters escaped.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a.b"]})
+                >>> ds.select(e=bt.col("s").str.regexp_escape()).to_pydict()
+                {'e': ['a\\\\.b']}
+        """
+        return StrFunc("regexp_escape", self._e)
+
+    def parse_filename(self) -> StrFunc:
+        """Take the final component of a path (→ Utf8).
+
+        DuckDB ``parse_filename``: everything after the last ``/`` or ``\\\\``, or the
+        whole value when there is no separator.
+
+        Returns:
+            A new Utf8 expression: the filename.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"p": ["/data/2024/events.parquet"]})
+                >>> ds.select(f=bt.col("p").str.parse_filename()).to_pydict()
+                {'f': ['events.parquet']}
+        """
+        return StrFunc("parse_filename", self._e)
+
+    def parse_dirname(self) -> StrFunc:
+        """Take the *first* component of a path (→ Utf8).
+
+        DuckDB ``parse_dirname``: ``/`` for an absolute POSIX path, the leading directory
+        for a relative one, and the empty string when there is no separator. This is not
+        the directory holding the file — that is :meth:`parse_dirpath`, and the two
+        differ on every path deeper than one level.
+
+        Returns:
+            A new Utf8 expression: the first path component.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"p": ["/data/2024/events.parquet", "a/b/c.txt"]})
+                >>> ds.select(d=bt.col("p").str.parse_dirname()).to_pydict()
+                {'d': ['/', 'a']}
+        """
+        return StrFunc("parse_dirname", self._e)
+
+    def parse_dirpath(self) -> StrFunc:
+        """Take everything before the last separator of a path (→ Utf8).
+
+        DuckDB ``parse_dirpath``: the directory holding the file, empty when the value has
+        no separator.
+
+        Returns:
+            A new Utf8 expression: the directory path.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"p": ["/data/2024/events.parquet", "a/b/c.txt"]})
+                >>> ds.select(d=bt.col("p").str.parse_dirpath()).to_pydict()
+                {'d': ['/data/2024', 'a/b']}
+        """
+        return StrFunc("parse_dirpath", self._e)
+
+    def parse_path(self) -> StrFunc:
+        """Split a path into its components (→ List<Utf8>).
+
+        DuckDB ``parse_path``. A leading separator is kept as its own first element, so an
+        absolute path stays distinguishable from a relative one.
+
+        Returns:
+            A new List<Utf8> expression: the path components.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"p": ["/data/2024/events.parquet"]})
+                >>> ds.select(c=bt.col("p").str.parse_path()).to_pydict()
+                {'c': [['/', 'data', '2024', 'events.parquet']]}
+        """
+        return StrFunc("parse_path", self._e)
+
+    def to_binary(self) -> StrFunc:
+        """Render the value's UTF-8 bytes as ``0``/``1`` characters (→ Utf8).
+
+        DuckDB ``to_binary``: eight characters per byte, most significant bit first.
+
+        Returns:
+            A new Utf8 expression: the binary text.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a"]})
+                >>> ds.select(b=bt.col("s").str.to_binary()).to_pydict()
+                {'b': ['01100001']}
+        """
+        return StrFunc("to_binary", self._e)
+
+    def from_binary(self) -> StrFunc:
+        """Read ``0``/``1`` characters back into text (→ Utf8, nullable).
+
+        DuckDB ``from_binary``, the inverse of :meth:`to_binary`. Input that is not a
+        whole number of eight binary digits, or whose bytes are not UTF-8, becomes null
+        rather than raising — one corrupt row is a bad row, not a bad query, the same rule
+        :meth:`unhex` follows.
+
+        Returns:
+            A new Utf8 expression: the decoded text, or null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"b": ["01100001", "0110000"]})
+                >>> ds.select(s=bt.col("b").str.from_binary()).to_pydict()
+                {'s': ['a', None]}
+        """
+        return StrFunc("from_binary", self._e)
+
     def soundex(self) -> StrFunc:
         """Compute the American Soundex phonetic code, a 4-character key.
 

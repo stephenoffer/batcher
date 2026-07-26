@@ -17,6 +17,7 @@ mod json;
 mod like;
 mod minhash;
 mod regex_cache;
+mod uri_path;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
 /// Apply a string function to a **dictionary** column's distinct values and gather the
@@ -656,6 +657,71 @@ pub(crate) fn eval_str(
                 s.iter()
                     .map(|o| o.map(|v| re.find_iter(v).count() as i64))
                     .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::UrlEncode => Arc::new(map_str(s, uri_path::url_encode)),
+        StrFunc::UrlDecode => Arc::new(map_str(s, uri_path::url_decode)),
+        StrFunc::RegexpEscape => Arc::new(map_str(s, uri_path::regexp_escape)),
+        StrFunc::ParseFilename => Arc::new(map_str_borrow(s, uri_path::parse_filename)),
+        StrFunc::ParseDirname => Arc::new(map_str_borrow(s, uri_path::parse_dirname)),
+        StrFunc::ParseDirpath => Arc::new(map_str_borrow(s, uri_path::parse_dirpath)),
+        StrFunc::ParsePath => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            // Components are borrowed slices of the input, so the value buffer needs at
+            // most the input's bytes — the same pre-sizing `Split` uses.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
+            for o in s.iter() {
+                match o {
+                    Some(v) => {
+                        for part in uri_path::parse_path(v) {
+                            builder.values().append_value(part);
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        StrFunc::ToBinary => Arc::new(map_str(s, uri_path::to_binary)),
+        StrFunc::FromBinary => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(uri_path::from_binary))
+                .collect::<StringArray>(),
+        ),
+        StrFunc::Hamming => {
+            use arrow::array::Array;
+            let target = require_pattern(pattern, func)?;
+            // Unequal lengths have no Hamming distance; DuckDB raises rather than
+            // comparing a prefix, and a silent prefix comparison would answer a
+            // caller's bug with a plausible number.
+            let mut out = Vec::with_capacity(s.len());
+            for o in s.iter() {
+                match o {
+                    None => out.push(None),
+                    Some(v) => match uri_path::hamming(v, target) {
+                        Some(d) => out.push(Some(d)),
+                        None => {
+                            return Err(ExprError::InvalidArgument {
+                                func: format!("{func:?}"),
+                                reason: "strings must be of equal length".into(),
+                            })
+                        }
+                    },
+                }
+            }
+            Arc::new(Int64Array::from(out))
+        }
+        StrFunc::JaccardSimilarity => {
+            use arrow::array::Float64Array;
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| uri_path::jaccard(v, target)))
+                    .collect::<Float64Array>(),
             )
         }
         StrFunc::Levenshtein => {

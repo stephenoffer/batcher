@@ -724,7 +724,12 @@ pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static st
         Atan2 => "atan2",
         // Round (digit count), and the integer-semantics gcd/lcm/hypot, are not a
         // single libm call — they stay on the interpreter (the JIT falls back).
-        Round | Gcd | Lcm | Hypot => return None,
+        //
+        // `NextAfter` is not lowered either, and for the reason `cbrt` is not: the
+        // interpreter computes it by stepping the bit pattern, which a libm `nextafter`
+        // libcall need not reproduce for the subnormal and sign-crossing cases. The JIT
+        // must be bit-for-bit identical to the oracle or fall back; it falls back.
+        Round | Gcd | Lcm | Hypot | NextAfter => return None,
     })
 }
 

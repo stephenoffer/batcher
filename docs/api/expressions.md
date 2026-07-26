@@ -2,8 +2,10 @@
 
 The expression API describes column computations that lower to the Rust data plane
 and run vectorized over Arrow batches. This page is the reference for the
-constructors, operators, methods, and accessor namespaces. For a guided tour with
-runnable examples, see the [expressions user guide](../user-guide/expressions.md).
+constructors, operators, and methods callable on an `Expr`. The accessor namespaces
+(`.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, `.video`) are
+enumerated on {doc}`expression-accessors`. For a guided tour with runnable examples, see
+the [expressions user guide](../user-guide/expressions.md).
 
 Blocks on this page share one namespace and run in order.
 
@@ -135,7 +137,11 @@ print(out.to_pydict())
 `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`, `.trunc()`,
 `.cbrt()`, `.degrees()`, `.radians()`, `.factorial()`, `.square()` (i.e. `x*x`),
 `.log1p()` / `.expm1()` (accurate near zero), and the inverse-hyperbolics
-`.asinh()` / `.acosh()` / `.atanh()` (→ Float64). Integer bitwise
+`.asinh()` / `.acosh()` / `.atanh()` (→ Float64). The reciprocal trig pair
+`.sec()` / `.csc()`, the gamma function `.gamma()` and its log `.lgamma()` (which stays
+finite where `.gamma()` overflows, above about 171), and two rounding modes that are not
+`.round()`: `.rint()` rounds half to *even*, `.even()` rounds *away from zero* to the
+nearest even integer. Integer bitwise
 ops (distinct from the boolean `&`/`|`): `.bitwise_and(o)`, `.bitwise_or(o)`,
 `.bitwise_xor(o)`, `.bitwise_left_shift(o)`, `.bitwise_right_shift(o)`, and
 `.bit_count()` (the number of set bits, i.e. population count → Int64).
@@ -245,78 +251,6 @@ print(r.with_columns(m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2,
 d = bt.from_pydict({"x": [10, 15, 30]})
 print(d.with_columns(chg=bt.col("x").diff(), pct=bt.col("x").pct_change()).to_pydict())
 # {'x': [10, 15, 30], 'chg': [None, 5, 15], 'pct': [None, 0.5, 1.0]}
-```
-
-## Accessor namespaces
-
-Breadth lives on accessor namespaces rather than on the expression itself.
-
-| Namespace | Covers |
-| --- | --- |
-| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0, boundary="char")` (RAG document splitter; `boundary` may be `"char"`/`"word"`/`"sentence"`/`"line"` so a chunk never ends mid-word), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, `zfill(width)` (zero-pad numeric strings), `contains_any([...])` (true if any literal substring is present), and more |
-| `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `epoch_ms()` / `epoch_us()` / `epoch_ns()` (integer epoch at ms/µs/ns resolution), `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `l1_norm` (Manhattan magnitude), `max_abs` (MaxAbs-scaling divisor), `normalize`, `softmax` (per-row logits→probabilities), `arg_sort` (indices sorting ascending, so reverse for top-k), `cum_sum` (cumulative sum), `diff` (first difference with a leading null, for delta features), `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`, `add(o)` / `subtract(o)` / `multiply(o)` (element-wise vector arithmetic → List<Float64>); vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `l1_distance(o)` (Manhattan), `hamming_distance(o)` (differing positions, for binary or quantized embeddings), `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature, the blocking key for a vector similarity join) |
-| `.struct` | `field(name)` |
-| `.json` | `extract_string(path)` |
-| `.map` | `get(key)`, `keys()`, `values()`, which read a `Map`-typed column |
-| `.image` | `decode()`, `to_tensor(width, height)`, `to_tensor_f32(width, height, mean=, std=, channels_first=)` (model-ready `float32` tensor: scale to `[0,1]`, per-channel normalize, HWC/CHW), `center_crop(width, height)` (centered crop, torchvision-style zero-pad when smaller), `to_grayscale(width, height)` (decode+resize to a single Rec.601 luma channel), `resize(width, height)` (re-encode to PNG bytes), `dhash()` (64-bit perceptual hash for near-duplicate detection) |
-| `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal), `resample(rate)` (decode + band-limited resample to `rate` Hz, the 16 kHz audio-ML preprocessing step), `mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80)` (the speech-model mel power-spectrogram front end; matches `torchaudio.transforms.MelSpectrogram`), `mfcc(rate, n_fft=400, hop_length=160, n_mels=128, n_mfcc=40)` (Mel-Frequency Cepstral Coefficients; matches `torchaudio.transforms.MFCC`) |
-| `.video` | `decode()` |
-
-### More `.str` methods
-
-| Method | Description |
-| --- | --- |
-| `.lpad(width, fill=" ")` / `.rpad(width, fill=" ")` | pad to `width` characters with `fill` (cycled); truncate if longer |
-| `.repeat(n)` | repeat the string `n` times (`n` ≤ 0 → empty) |
-| `.normalize_whitespace()` | collapse every run of whitespace to a single space and trim the ends |
-| `.position(pattern)` | 1-based index of `pattern`, 0 if absent (→ Int64) |
-| `.regexp_matches(pattern)` | true where the regex matches anywhere (→ Bool) |
-| `.ascii()` | Unicode codepoint of the first character, 0 if empty (→ Int64) |
-| `.bit_length()` / `.octet_length()` | number of bits / UTF-8 bytes in the string (→ Int64) |
-| `.from_base64()` | decode standard base64 to a UTF-8 string; null if invalid |
-| `.unhex()` | decode pairs of hex digits to a UTF-8 string; null if invalid |
-| `.md5()` / `.sha1()` / `.sha256()` | cryptographic digest as lowercase hex; null → null |
-| `.crc32()` | CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`, → Int64) |
-| `.hash64()` | deterministic FNV-1a 64-bit hash, stable across partitions and machines, so it's a surrogate-key building block (→ Int64) |
-| `.xxhash64()` | fast non-cryptographic 64-bit xxHash; the standard bucketing/sharding hash (→ Int64) |
-| `.substring_index(delimiter, count)` | substring before the `count`-th `delimiter` (Spark) |
-| `.overlay(replacement, pos, length=None)` | replace `length` chars from 1-based `pos` (SQL `OVERLAY`) |
-| `.regexp_extract_all(pattern)` | every regex match as a `List<Utf8>` (DuckDB `regexp_extract_all`) |
-| `.regexp_count(pattern)` | number of non-overlapping regex matches (→ Int64) |
-| `.levenshtein(target)` | edit distance to the constant `target` (DuckDB `levenshtein`, → Int64) |
-| `.damerau_levenshtein(target)` | edit distance to `target` counting an adjacent-swap as one edit (DuckDB `damerau_levenshtein`, → Int64), which handles typos better |
-| `.jaro_similarity(target)` | Jaro similarity to `target`, `[0,1]` (DuckDB `jaro_similarity`, → Float64), for fuzzy matching and record linkage |
-| `.jaro_winkler_similarity(target)` | Jaro-Winkler similarity to `target`, `[0,1]` (DuckDB `jaro_winkler_similarity`, → Float64), prefix-weighted for name matching |
-| `.soundex()` | American Soundex phonetic code, a 4-character key (→ Utf8) |
-| `.to_date(format="%Y-%m-%d")` | parse into a Date with a strftime format; unmatched → NULL (→ Date32) |
-| `.to_datetime(format)` | parse into a Timestamp (DuckDB `try_strptime`); unmatched → NULL (→ Timestamp(us)) |
-
-### More `.dt` methods
-
-`.century()`, `.decade()`, `.isodow()` (ISO day of week), `.last_day()` (last day
-of the month), and `.millennium()`. Each extracts the named field of a date/time column (→ Int64).
-
-### More `.json` methods
-
-| Method | Description |
-| --- | --- |
-| `.extract_int(path)` | the integer value at JSON `path`; null if absent or non-integral (→ Int64) |
-| `.extract_float(path)` | the numeric value at JSON `path` as a float; null if absent or non-numeric |
-| `.extract_bool(path)` | the boolean value at JSON `path`; null if absent or non-boolean |
-
-For retrieval / RAG, the vector ops score each row's embedding against a query
-vector (a broadcast `array(...)` literal): `bt.col("emb").list.cosine_similarity(
-bt.array(*[bt.lit(x) for x in query]))`.
-
-```python
-words = bt.from_pydict({"name": ["Ann", "bob"], "tags": [["x", "y"], ["z"]]})
-out = words.select(
-    upper=bt.col("name").str.upper(),
-    n_tags=bt.col("tags").list.len(),
-)
-print(out.to_pydict())
-# {'upper': ['ANN', 'BOB'], 'n_tags': [2, 1]}
 ```
 
 ## Compatibility spellings (Polars / pandas / SQL names)
@@ -489,38 +423,11 @@ Column-level profiling aggregates complete the toolkit: `bt.q1(x)` / `bt.q3(x)` 
 ## Model evaluation metrics
 
 Every model-evaluation metric is an expression, so it belongs inside `agg()` and composes
-with `group_by` — a per-segment report is the same query with a grouping added, at no extra
+with `group_by`. A per-segment report is the same query with a grouping added, at no extra
 pass. All are checked against scikit-learn where it defines them.
 
-**Regression error**: `bt.rmse`, `bt.mse`, `bt.mae`, `bt.medae`, `bt.max_error`,
-`bt.mean_bias`, `bt.mean_percentage_error` (the signed bias), `bt.normalized_rmse`, `bt.mape`, `bt.smape`, `bt.wape`, `bt.msle`, `bt.rmsle`, `bt.r2`,
-`bt.explained_variance`, `bt.huber_loss`, `bt.pinball_loss` — each ``metric(y_true, y_pred)``.
-
-**Classification (from the confusion counts)**: `bt.accuracy`, `bt.precision`, `bt.recall`,
-`bt.specificity`, `bt.false_negative_rate`, `bt.false_positive_rate`, `bt.negative_predictive_value`, `bt.f1_score`,
-`bt.fbeta_score`, `bt.balanced_accuracy`, `bt.matthews_corrcoef`, `bt.cohen_kappa`,
-`bt.prevalence`, plus the raw cells `bt.true_positives` / `bt.false_positives` /
-`bt.false_negatives` / `bt.true_negatives`.
-
-**Probabilistic**: `bt.log_loss` and `bt.brier_score` over a predicted probability. `bt.hamming_loss` is the multi-label error rate (`1 - accuracy` for a single label). `bt.hinge_loss` and `bt.squared_hinge_loss` score a raw decision function (a margin) rather than a probability — the support-vector-machine objective.
-
-**Agreement and efficiency** (agreement, not just correlation — a prediction that is always
-half the truth correlates perfectly and is useless): `bt.concordance_correlation` (Lin's CCC),
-`bt.nash_sutcliffe_efficiency`, and `bt.kling_gupta_efficiency`, from method-comparison and
-hydrology.
-
-**Count and rate models**: `bt.poisson_deviance`, `bt.gamma_deviance`, and
-`bt.tweedie_deviance(y, p, power=...)` — the losses a Poisson, gamma, or Tweedie model is
-fitted on, for a count or rate target where squared error is the wrong shape. Each matches
-scikit-learn's `mean_*_deviance`.
-
-**Diagnostic-test vocabulary** (the epidemiology names, all over the same four cells):
-`bt.jaccard_score`, `bt.false_discovery_rate`, `bt.false_omission_rate`,
-`bt.positive_likelihood_ratio`, `bt.negative_likelihood_ratio`, `bt.diagnostic_odds_ratio`,
-`bt.informedness` (Youden's J), `bt.markedness`, `bt.fowlkes_mallows_index`,
-`bt.geometric_mean_score` (the geometric mean of sensitivity and specificity, high only when
-*both* classes are recalled well), and `bt.prevalence_threshold` (the base rate below which a
-positive result is more likely wrong than right).
+They are top-level functions rather than `Expr` methods, so they are enumerated on
+{doc}`metrics` with their signatures and docstrings.
 
 ```python
 scored = bt.from_pydict({"y": [1, 0, 1, 1, 0], "p": [1, 0, 0, 1, 1]})
@@ -533,78 +440,13 @@ print(scored.agg(
 
 The metrics that need a global ordering (ROC AUC, average precision) or return a table
 (confusion matrix, calibration curve) are Dataset functions in `batcher.ml.metrics`, not
-expressions — see {doc}`../ml/evaluation`.
+expressions. See {doc}`../ml/evaluation`.
 
-## AI data-pipeline toolkit
+## See also
 
-Curating a training corpus, scrubbing PII, and budgeting context windows are all
-per-row scans, so they belong in the engine rather than a Python loop. These score a
-whole corpus in one vectorized pass.
-
-**Corpus quality heuristics** on `.str` are the character-class ratios and shape statistics that Gopher, C4, and RefinedWeb-style filters threshold on to drop boilerplate and machine-generated text: `.alpha_ratio()`, `.digit_ratio()`, `.uppercase_ratio()`,
-`.lowercase_ratio()`, `.punctuation_ratio()`, `.whitespace_ratio()`,
-`.non_ascii_ratio()`, `.alnum_ratio()`, plus `.non_ascii_count()`, `.line_count()`,
-`.mean_line_length()`, `.avg_word_length()`, `.sentence_count()`, `.url_count()`, and
-`.email_count()`.
-
-Document-shape signals: `.paragraph_count()`, `.is_single_line()`,
-`.ends_with_punctuation()` (catches truncated crawls),
-`.has_repeated_punctuation()`, `.quote_count()`, `.paren_count()`,
-`.digit_to_word_ratio()`, and the code detectors `.code_fence_count()` /
-`.looks_like_code()` (route code out of a prose corpus, or keep only code).
-
-More corpus signals: `.uppercase_word_count()` (shouting/headers),
-`.long_word_count(n)`, `.symbol_to_word_ratio()` (markup and ASCII art),
-`.hashtag_count()` / `.mention_count()` (social-media provenance), and
-`.phone_count()`.
-
-**Cleaning and PII scrubbing**: `.remove_urls()`, `.remove_emails()`,
-`.remove_phones()`, `.has_phone()`, and the shape-preserving `.mask_emails(token)` /
-`.mask_urls(token)` (preferred over deletion for training data),
-`.remove_non_ascii()`, `.remove_digits()`, `.remove_html_tags()`, and the budget guards
-`.truncate_chars(n)` / `.truncate_words(n)` (which never cut mid-word).
-
-**Detection predicates** for filtering: `.has_url()`, `.has_email()`,
-`.has_non_ascii()`, `.has_digits()`, `.has_html()`, `.is_ascii_only()`, `.is_blank()`,
-`.starts_with_bullet()`, and `.looks_like_json()` (a cheap shape check before decoding
-LLM structured output).
-
-Counts and shape predicates: `.newline_count()`, `.tab_count()`, `.space_count()`,
-`.word_char_ratio()`, `.avg_sentence_length()`, `.is_short(n)` / `.is_long(n)`,
-`.is_question()`, `.is_exclamation()`, `.starts_with_capital()`, `.is_all_caps()`,
-`.has_currency()`, `.is_url()`, and `.is_email()` (whole-string forms, stricter than
-`has_url`/`has_email`).
-
-Extraction into `List<Utf8>`: `.extract_urls()`, `.extract_emails()`,
-`.extract_numbers()`, `.extract_hashtags()`, `.extract_mentions()`, plus the scalar
-`.first_sentence()`, `.first_word()`, and `.last_word()`.
-
-Normalization for dedup keys and prose corpora: `.slugify()`, `.remove_bullets()`,
-`.remove_repeated_punctuation()`, `.remove_markdown_links()`, `.remove_code_blocks()`,
-`.remove_stopwords(words)`, and `.truncate_sentences(n)`.
-
-**Token budgeting**: `.estimate_tokens(chars_per_token=4.0)` and
-`.fits_token_budget(budget)` give the tokenizer-free estimate used to size context windows without paying to tokenize the corpus.
-
-Embedding sanity and pooling on `.list`: `.dim()` (the embedding dimension),
-`.is_zero_vector()` (the failed-encoder check), `.sum_squares()`, `.mean_pool()`, and
-`.max_pool()`.
-
-**Embedding helpers** on `.list`: `.magnitude()`, `.is_unit_norm(tol)` (assert the
-normalization invariant held), `.euclidean_distance(o)`, and `.angular_distance(o)`. Angular distance is a true metric, unlike `1 - cosine`, and that is what nearest-neighbour indexes require.
-
-```python
-docs_ds = bt.from_pydict({"text": ["Real prose here, with sentences.", "AAA 111 &&& http://x.co"]})
-scored = docs_ds.select(
-    alpha=bt.col("text").str.alpha_ratio().round(3),
-    toks=bt.col("text").str.estimate_tokens(),
-    linky=bt.col("text").str.has_url(),
-)
-print(scored.to_pydict())
-# {'alpha': [0.813, 0.435], 'toks': [8, 6], 'linky': [False, True]}
-```
-
-At the dataset level, `ds.shuffle(seed=)`, `ds.stratified_split(label, test_size)`
-(preserves each class's proportion, value-hashed so it is identical distributed),
-`ds.sample_per_group(by, n)`, `ds.class_balance(label)`, and `ds.class_weights(label)`
-cover the train-set preparation steps.
+:::{seealso}
+- {doc}`expression-accessors`: every method on every accessor namespace.
+- {doc}`functions`: the top-level scalar, horizontal, aggregate, and window functions.
+- {doc}`metrics`: the scoring and statistical aggregates used inside `agg()`.
+- {doc}`../user-guide/expressions`: the same language taught rather than tabulated.
+:::

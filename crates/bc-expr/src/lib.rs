@@ -450,6 +450,10 @@ pub enum Math2Func {
     Lcm,
     /// `hypot(a, b)` = sqrt(a² + b²), the Euclidean norm (DuckDB `hypot`).
     Hypot,
+    /// `nextafter(a, b)` — the next representable `f64` after `a` in the direction of
+    /// `b` (DuckDB `nextafter`). One ULP, which is what makes it useful for testing a
+    /// boundary; `a + tiny` cannot express it.
+    NextAfter,
 }
 
 /// Image decode operations for the `.image` namespace. `Decode` reads each
@@ -701,6 +705,24 @@ pub enum MathFunc {
     /// Population count: the number of set bits in the Int64 two's-complement value
     /// (DuckDB `bit_count`). → Float64 (integral-valued).
     BitCount,
+    /// `even(x)` — round *away from zero* to the nearest even integer (DuckDB `even`):
+    /// `2.1 → 4`, `-2.1 → -4`, `2.0 → 2`. Not `round`-then-adjust; the rounding
+    /// direction is outward, which is why `3.0` is `4` and not `2`.
+    Even,
+    /// `gamma(x)` — the gamma function Γ(x) (DuckDB `gamma`), the continuous extension
+    /// of the factorial: `Γ(n) = (n-1)!` for a positive integer.
+    Gamma,
+    /// `lgamma(x)` — the natural log of |Γ(x)| (DuckDB `lgamma`). Computed directly
+    /// rather than as `ln(gamma(x))`, which overflows to `inf` above ~171.
+    Lgamma,
+    /// `sec(x)` = 1/cos(x) (Spark `sec`).
+    Sec,
+    /// `csc(x)` = 1/sin(x) (Spark `csc`).
+    Csc,
+    /// `rint(x)` — round half to **even** (Spark `rint`, IEEE-754 `roundTiesToEven`).
+    /// Distinct from `round`, which is half away from zero here and in DuckDB:
+    /// `rint(2.5)` is `2`, `round(2.5)` is `3`.
+    Rint,
 }
 
 /// String functions. `upper`/`lower` → Utf8; `len` → Int64; `contains`/
@@ -923,6 +945,46 @@ pub enum StrFunc {
     /// null; an unknown style is an error, not a silent passthrough. → Utf8.
     /// See `eval::str::case`.
     ToCase,
+    /// Percent-encode for use in a URL (DuckDB `url_encode`): everything outside the
+    /// RFC 3986 unreserved set becomes `%XX` over the UTF-8 bytes, including `/` and
+    /// `+` — this encodes a *component*, not a whole URL. Null → null. → Utf8.
+    UrlEncode,
+    /// Inverse of `UrlEncode` (DuckDB `url_decode`). A malformed escape (`%` not
+    /// followed by two hex digits, or bytes that do not decode as UTF-8) is left
+    /// **as written** rather than erroring or nulling the row — verified against DuckDB,
+    /// which returns `'a%2'` for `url_decode('a%2')`. Null → null. → Utf8.
+    UrlDecode,
+    /// Escape the regex metacharacters in the value (DuckDB `regexp_escape`), so it can
+    /// be embedded in a pattern as a literal. Null → null. → Utf8.
+    RegexpEscape,
+    /// The final component of a path (DuckDB `parse_filename`): everything after the
+    /// last separator. → Utf8.
+    ParseFilename,
+    /// The directory part of a path (DuckDB `parse_dirname`) — the *first* component,
+    /// which is `/` for an absolute POSIX path. Not the same as `ParseDirpath`, which is
+    /// everything before the filename; DuckDB genuinely has both. → Utf8.
+    ParseDirname,
+    /// Everything before the last separator of a path (DuckDB `parse_dirpath`). → Utf8.
+    ParseDirpath,
+    /// A path split into its components (DuckDB `parse_path`), with a leading `/` kept
+    /// as its own first element for an absolute POSIX path. → List<Utf8>.
+    ParsePath,
+    /// Hamming distance to the literal string `pattern` (DuckDB `hamming`/`mismatches`):
+    /// the number of positions at which the two differ. Defined only for equal-length
+    /// strings, which DuckDB enforces — an unequal length is an error, not a silent
+    /// truncation. → Int64.
+    Hamming,
+    /// Jaccard similarity to the literal string `pattern` (DuckDB `jaccard`): the size of
+    /// the intersection over the size of the union of the two strings' *character sets*.
+    /// `[0, 1]`. Distinct from `.list.jaccard`, which is over list elements. → Float64.
+    JaccardSimilarity,
+    /// The value's UTF-8 bytes as a string of `0`/`1` (DuckDB `to_binary`), 8 characters
+    /// per byte, most significant bit first. Null → null. → Utf8.
+    ToBinary,
+    /// Inverse of `ToBinary` (DuckDB `from_binary`). Input that is not a whole number of
+    /// 8 `0`/`1` characters, or does not decode as UTF-8, yields **null**, matching
+    /// `unhex`. → Utf8 (nullable).
+    FromBinary,
 }
 
 /// Temporal *constructors* carried by [`Expr::MakeTemporal`] — the inverse direction of

@@ -31,6 +31,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    lcm
    log
    nanvl
+   next_after
    width_bucket
    concat
    concat_str

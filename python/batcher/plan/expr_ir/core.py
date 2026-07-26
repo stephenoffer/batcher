@@ -2491,6 +2491,119 @@ class Expr:
         """
         return MathExpr("cot", self)
 
+    def sec(self) -> MathExpr:
+        """Secant (``1 / cos``) of an angle in radians (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the secants.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0]})
+                >>> ds.select(r=bt.col("x").sec()).to_pydict()
+                {'r': [1.0]}
+        """
+        return MathExpr("sec", self)
+
+    def csc(self) -> MathExpr:
+        """Cosecant (``1 / sin``) of an angle in radians (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the cosecants.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import math
+                >>> ds = bt.from_pydict({"x": [math.pi / 2]})
+                >>> ds.select(r=bt.col("x").csc()).to_pydict()
+                {'r': [1.0]}
+        """
+        return MathExpr("csc", self)
+
+    def rint(self) -> MathExpr:
+        """Round half to **even** — IEEE-754 ``roundTiesToEven`` (→ Float64).
+
+        The tie rule is the difference from :meth:`round`, which rounds half *away from
+        zero* here and in DuckDB: ``rint(2.5)`` is ``2.0`` where ``round(2.5)`` is
+        ``3.0``. Ties-to-even is what floating-point arithmetic itself uses, so summing
+        rounded values does not drift upward the way half-up rounding does.
+
+        Returns:
+            A new Float64 expression of the rounded values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.5, 1.5, 2.5, 3.5, -2.5]})
+                >>> ds.select(r=bt.col("x").rint()).to_pydict()
+                {'r': [0.0, 2.0, 2.0, 4.0, -2.0]}
+        """
+        return MathExpr("rint", self)
+
+    def even(self) -> MathExpr:
+        """Round away from zero to the nearest even integer (DuckDB ``even``; → Float64).
+
+        The rounding direction is *outward*, not to-nearest: ``3.0`` becomes ``4.0`` and
+        ``-2.1`` becomes ``-4.0``. A value that is already an even integer is unchanged.
+
+        Returns:
+            A new Float64 expression of the rounded values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [2.1, -2.1, 2.0, 3.0]})
+                >>> ds.select(r=bt.col("x").even()).to_pydict()
+                {'r': [4.0, -4.0, 2.0, 4.0]}
+        """
+        return MathExpr("even", self)
+
+    def gamma(self) -> MathExpr:
+        """The gamma function ``Γ(x)`` (DuckDB ``gamma``; → Float64).
+
+        The continuous extension of the factorial: ``Γ(n) == (n - 1)!`` for a positive
+        integer. Use :meth:`lgamma` instead above ~171, where ``Γ`` overflows to infinity.
+
+        Returns:
+            A new Float64 expression of the gamma values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5.0, 1.0]})
+                >>> ds.select(r=bt.col("x").gamma()).to_pydict()
+                {'r': [24.0, 1.0]}
+        """
+        return MathExpr("gamma", self)
+
+    def lgamma(self) -> MathExpr:
+        """The natural log of ``|Γ(x)|`` (DuckDB ``lgamma``; → Float64).
+
+        Computed directly rather than as ``gamma().ln()``, which overflows to infinity
+        above ~171 and loses the answer entirely. This is the form log-likelihoods and
+        combinatorial ratios are written in.
+
+        Returns:
+            A new Float64 expression of the log-gamma values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5.0]})
+                >>> r = ds.select(r=bt.col("x").lgamma()).to_pydict()
+                >>> round(r["r"][0], 6)
+                3.178054
+        """
+        return MathExpr("lgamma", self)
+
     def factorial(self) -> MathExpr:
         """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``; → Float64).
 

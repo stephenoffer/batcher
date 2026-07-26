@@ -96,6 +96,7 @@ class Math2Fn(StrEnum):
     GCD = "gcd"
     LCM = "lcm"
     ROUND = "round"  # round(x, digits)
+    NEXT_AFTER = "next_after"
 
 
 # --- Open families: named, exhaustive vocabularies (one entry per function) ------
@@ -118,6 +119,9 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
         "starts_with", "strip_html", "substr", "substring_index", "to_case", "translate",
         "trim", "unhex", "upper", "xxhash64",
+        "from_binary", "hamming", "jaccard_similarity", "parse_dirname", "parse_dirpath",
+        "parse_filename", "parse_path", "regexp_escape", "to_binary", "url_decode",
+        "url_encode",
     }
 )  # fmt: skip
 
@@ -163,5 +167,6 @@ MATH_FNS: Final[frozenset[str]] = frozenset(
         "abs", "acos", "asin", "atan", "bit_count", "cbrt", "ceil", "cos", "cosh",
         "cot", "degrees", "exp", "factorial", "floor", "ln", "log10", "log2",
         "radians", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc",
+        "csc", "even", "gamma", "lgamma", "rint", "sec",
     }
 )  # fmt: skip

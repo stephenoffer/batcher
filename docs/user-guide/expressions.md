@@ -203,6 +203,25 @@ print(out.to_pydict())
 # {'g': [6.0, 5.0], 'l': [36.0, 60.0], 'dist': [5.0, 13.0]}
 ```
 
+{py:obj}`bt.next_after(value, toward) <batcher.next_after>` is the two-argument
+function to reach for when a comparison has to be *strict* in floating point. It returns
+the adjacent representable double, one unit in the last place toward `toward`, which is
+something no addition can express: for a large `value` there is no constant small enough
+to change it and large enough to survive rounding.
+
+```python
+edge = bt.from_pydict({"limit": [1.0, 1e16]})
+out = edge.select(
+    just_above=bt.next_after(bt.col("limit"), bt.lit(float("inf"))),
+    naive=bt.col("limit") + bt.lit(1e-12),
+)
+print(out.to_pydict())
+# {'just_above': [1.0000000000000002, 1.0000000000000002e+16], 'naive': [1.000000000001, 1e+16]}
+```
+
+The `naive` column is the point: adding a small constant moved the small limit too far
+and the large one not at all.
+
 `hypot` measures a flat plane. For latitude and longitude,
 {py:obj}`bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km") <batcher.great_circle_distance>`
 measures the distance over the Earth's surface. It uses the haversine formula, which keeps
@@ -271,3 +290,10 @@ Then, for reference and for where expressions are used:
   aggregate and windowed expressions are used.
 - [SQL](sql.md): the same column language, spelled as SQL.
 - [Transformations](transformations.md): where expressions are applied to a Dataset.
+
+And for what happens to an expression after you write it:
+
+- [Expression evaluation](../deep-dives/expression-evaluation.md): how a tree of `Expr`
+  nodes becomes vectorized work over an Arrow batch.
+- [JIT compilation](../deep-dives/jit-compilation.md): when the Cranelift tier compiles an
+  arithmetic chain, and why it silently falls back rather than diverging.

@@ -15,15 +15,25 @@ together would mean re-deriving the shape at the call site from the arity, which
 makes the shape a property of the entry.
 
 Only names whose result is *bit-identical* to DuckDB's are listed. A name whose closest
-Batcher equivalent differs in semantics (DuckDB's character-bigram ``jaccard`` against
-the engine's list-valued `.list.jaccard`, say) is left out, so it keeps raising a clear
-"not supported" rather than returning a plausible wrong answer.
+Batcher equivalent differs in semantics is left out, so it keeps raising a clear "not
+supported" rather than returning a plausible wrong answer — `first`/`last`/`any_value`
+(DuckDB returns an unspecified row's value; the engine's require an explicit ordering)
+and `fsum`/`kahan_sum` (compensated summation, which the engine's `sum` is not) are the
+current members of that list.
+
+Note the two `jaccard`s: DuckDB's is over the two strings' character *sets*, which is
+`.str.jaccard`, **not** the engine's list-valued `.list.jaccard`. Mapping the name to the
+nearer-looking one would have been exactly the failure this module's rule exists to
+prevent.
 """
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir import Binary, Expr, array, atan2
-from batcher.plan.functions.scalar import gcd, lcm
+import math
+
+from batcher.plan.expr_ir import Binary, Expr, array, atan2, lit
+from batcher.plan.functions.scalar import gcd, lcm, next_after
+from batcher.plan.functions.temporal import current_date
 
 __all__ = ["anonymous_scalar"]
 
@@ -36,6 +46,12 @@ _UNARY_EXPR = {
     "isfinite": "is_finite",
     "isinf": "is_infinite",
     "isnan": "is_nan",
+    "even": "even",
+    "gamma": "gamma",
+    "lgamma": "lgamma",
+    "sec": "sec",
+    "csc": "csc",
+    "rint": "rint",
 }
 
 # `f(s)` → a `.str` method.
@@ -49,6 +65,16 @@ _UNARY_STR = {
     "crc32": "crc32",
     "initcap": "initcap",
     "soundex": "soundex",
+    "from_hex": "unhex",
+    "url_encode": "url_encode",
+    "url_decode": "url_decode",
+    "regexp_escape": "regexp_escape",
+    "parse_filename": "parse_filename",
+    "parse_dirname": "parse_dirname",
+    "parse_dirpath": "parse_dirpath",
+    "parse_path": "parse_path",
+    "to_binary": "to_binary",
+    "from_binary": "from_binary",
 }
 
 # `f(ts)` → a `.dt` method. These are the DuckDB date-part spellings sqlglot has no
@@ -93,6 +119,11 @@ _STR_TEXT = {
     "string_split": "split",
     "string_to_array": "split",
     "regexp_split_to_array": "regexp_split",
+    "hamming": "hamming",
+    "mismatches": "hamming",
+    "jaccard": "jaccard",
+    "prefix": "starts_with",
+    "suffix": "ends_with",
 }
 
 # `f(a, b)` → an arithmetic operator. DuckDB exposes the operators under function
@@ -115,6 +146,15 @@ _BINARY_FN = {
     "lcm": lcm,
     "least_common_multiple": lcm,
     "atan2": atan2,
+    "nextafter": next_after,
+}
+
+# `f()` → a constant. DuckDB spells these as nullary functions; the engine has no node
+# for them because there is nothing per-row to compute, so they fold to a literal at
+# plan-build time — which is also what makes them constant-foldable downstream.
+_NULLARY = {
+    "pi": lambda: lit(math.pi),
+    "today": current_date,
 }
 
 # `f(list, i)` → 1-based element access. DuckDB's `list_extract`/`array_extract`/
@@ -152,6 +192,11 @@ def anonymous_scalar(tr, node):
 
     name = node.name.lower()
     args = list(node.expressions)
+
+    if not args:
+        nullary = _NULLARY.get(name)
+        if nullary is not None:
+            return nullary()
 
     if len(args) == 1:
         one = args[0]

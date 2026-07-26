@@ -12,6 +12,12 @@ arrow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 regex = "1"
+# The pure-Rust port of the FDLIBM special functions, for `gamma`/`lgamma`. Rust's own
+# `f64::gamma` is still unstable, and a series approximation would agree with DuckDB only
+# to a tolerance — DuckDB reaches the same FDLIBM routines through its libc, so this
+# agrees to the last bit. Already in the lock file as a transitive dependency, so the
+# direct edge costs nothing.
+libm = "0.2"
 # Fast non-cryptographic hashing for the `IN` membership set (see `eval/in_list.rs`):
 # `std`'s SipHash was the whole cost of a large `IN` over a wide column.
 ahash.workspace = true

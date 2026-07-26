@@ -76,6 +76,9 @@ _UNARY_MATH = {
     "Atanh": "atanh",
     "Cot": "cot",
     "Factorial": "factorial",
+    # Not math *functions*, but the same shape: a method on the value expression.
+    "IsNan": "is_nan",
+    "IsInf": "is_infinite",
 }
 _UNARY_STR = {
     "Upper": "upper",
@@ -95,6 +98,10 @@ _UNARY_STR = {
     "BitLength": "bit_length",
     "Initcap": "initcap",
     "Soundex": "soundex",
+    "ToBase64": "base64",
+    "FromBase64": "from_base64",
+    "ToBinary": "to_binary",
+    "FromBinary": "from_binary",
 }
 _DATE_PART = {
     "Year": "year",

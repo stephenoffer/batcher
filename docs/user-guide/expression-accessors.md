@@ -85,6 +85,40 @@ print(out.to_pydict())
 # {'code': [82, 82, 99], 'bytes': [6, 6, 5], 'dist': [3, 1, 7], 'phonetic': ['R163', 'R163', 'C100']}
 ```
 
+`hamming(target)` counts the positions at which two equal-length strings differ — the
+right distance for fixed-width codes — and `jaccard(target)` scores the overlap of two
+values' character sets. `hamming` raises on unequal lengths rather than comparing a
+prefix, because a prefix comparison answers a caller's mistake with a plausible number.
+
+### Paths and URLs
+
+Text columns often hold a file path or a URL component rather than prose. `parse_path`
+splits a path into its parts, and `parse_filename`, `parse_dirname` and `parse_dirpath`
+pick one out. The last two are easy to confuse and are genuinely different:
+`parse_dirname` is the *first* component (`/` for an absolute path) while `parse_dirpath`
+is the directory holding the file.
+
+`url_encode` percent-encodes a URL *component* — `/` and `+` included, so the result is
+safe in a path segment or a query string — and `url_decode` reverses it; a malformed
+escape decodes to itself rather than failing the row. `regexp_escape` is the same idea for
+a pattern, neutralizing the metacharacters in a value so it matches itself.
+
+```python
+files = bt.from_pydict({"p": ["/data/2024/events.parquet", "raw/in.csv"]})
+out = files.select(
+    name=bt.col("p").str.parse_filename(),
+    first=bt.col("p").str.parse_dirname(),
+    folder=bt.col("p").str.parse_dirpath(),
+    parts=bt.col("p").str.parse_path(),
+    quoted=bt.col("p").str.url_encode(),
+)
+print(out.to_pydict())
+# {'name': ['events.parquet', 'in.csv'], 'first': ['/', 'raw'], 'folder': ['/data/2024', 'raw'], 'parts': [['/', 'data', '2024', 'events.parquet'], ['raw', 'in.csv']], 'quoted': ['%2Fdata%2F2024%2Fevents.parquet', 'raw%2Fin.csv']}
+```
+
+`to_binary` renders a value's UTF-8 bytes as `0`/`1` text and `from_binary` reads it back;
+undecodable input becomes null rather than raising, the rule `unhex` also follows.
+
 Other `.str` methods include `lower`, `trim`, `lstrip`, `rstrip`, `reverse`,
 `substr`, `right`, `repeat`, `lpad`, `rpad`, `position`, `split`, `replace`,
 `initcap`, `hex`, `base64`, `from_base64`, `unhex`, and `translate`.

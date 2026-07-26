@@ -51,6 +51,7 @@ from batcher.plan.functions.scalar import (
     lcm,
     log,
     nanvl,
+    next_after,
     width_bucket,
 )
 from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
@@ -136,6 +137,7 @@ __all__ = [
     "n_unique",
     "named_struct",
     "nanvl",
+    "next_after",
     "product_horizontal",
     "reduce_horizontal",
     "render_template",

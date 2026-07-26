@@ -49,12 +49,13 @@ _STR_INT = frozenset(
         "bit_length",
         "octet_length",
         "crc32",
+        "hamming",
         "hash64",
         "xxhash64",
         "json_extract_int",
     }
 )
-_STR_FLOAT = frozenset({"json_extract_float"})
+_STR_FLOAT = frozenset({"json_extract_float", "jaccard_similarity"})
 
 # `dt` accessor (`DateFunc`) output types. Every field-extraction fn yields Int64;
 # these four are the exceptions. `last_day` yields a timestamp regardless of whether
@@ -119,6 +120,14 @@ _STR_STR = frozenset(
         "reverse",
         "translate",
         "unhex",
+        "url_encode",
+        "url_decode",
+        "regexp_escape",
+        "parse_filename",
+        "parse_dirname",
+        "parse_dirpath",
+        "to_binary",
+        "from_binary",
     }
 )
 
@@ -430,6 +439,10 @@ def _strfunc_type(fn: str) -> pa.DataType | None:
         return pa.list_(pa.string())
     if fn == "regexp_extract_all":
         return pa.list_(pa.string())  # every match of the pattern
+    if fn == "regexp_split":
+        return pa.list_(pa.string())
+    if fn == "parse_path":
+        return pa.list_(pa.string())  # the path's components
     if fn in _STR_BOOL:
         return pa.bool_()
     if fn in _STR_INT:

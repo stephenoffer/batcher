@@ -189,6 +189,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.count()` | COUNT(*) aggregate |
 | `bt.iff(condition, if_true, if_false)` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
 | `bt.nanvl(value, fallback)` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
+| `bt.next_after(value, toward)` | the adjacent representable float, one ULP toward `toward` (DuckDB `nextafter`) |
 | `bt.concat(*exprs)` | concatenate values into one string |
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
 | `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
@@ -360,3 +361,13 @@ from batcher import Config, set_config, config_context
 with `set_config(...)` or temporarily with `config_context(...)`. `Config.from_env`
 and `Config.from_file` overlay `BATCHER_*` environment variables and a JSON file.
 See the configuration page for the full pattern.
+
+## See also
+
+- {doc}`dataset`: every `Dataset` method, with its arguments and its return type.
+- {doc}`expressions` and {doc}`expression-accessors`: the column language and the
+  `.str` / `.dt` / `.list` / `.struct` / `.json` namespaces.
+- {doc}`functions`: the free functions, grouped by family.
+- {doc}`io`: readers, writers, save modes, and the format-specific options.
+- {doc}`../user-guide/index`: the task-oriented guides behind these signatures.
+- {doc}`../getting-started/quickstart`: the same surface as a five-minute walkthrough.

@@ -8,6 +8,8 @@ translator instance (`tr`) as its first argument and recurses through `tr._scala
 
 from __future__ import annotations
 
+import math
+
 from batcher._sql.parser.expressions.literals import (
     _DATE_PART,
     _EXTRACT_PART,
@@ -18,7 +20,13 @@ from batcher._sql.parser.expressions.literals import (
     _int_literal,
 )
 from batcher.plan.expr_ir import Cast, Expr, atan2, lit
-from batcher.plan.functions.temporal import make_date
+from batcher.plan.functions.temporal import current_date, make_date
+
+# sqlglot node names for the nullary constant functions → the literal they denote.
+_NULLARY_CONST = {
+    "Pi": lambda: lit(math.pi),
+    "CurrentDate": current_date,
+}
 
 # Typed sqlglot nodes of the shape `f(value, constant-string)`: the engine's method
 # takes the second operand as a Python `str` (a pattern, delimiter or comparison
@@ -38,6 +46,11 @@ def _scalar_function(tr, node):
     from sqlglot import expressions as exp
 
     name = type(node).__name__
+    if name in _NULLARY_CONST:
+        # `pi()` / `today()` — DuckDB spells them as nullary functions, and sqlglot has a
+        # typed node for each. There is nothing per-row to compute, so they lower to a
+        # literal at plan-build time (which also makes them constant-foldable downstream).
+        return _NULLARY_CONST[name]()
     if name == "Trunc" and node.args.get("decimals") is not None:
         # `trunc(x, n)` truncates to `n` decimal places; the one-arg `.trunc()`
         # ignores `n` and silently truncated to a whole number. Scale, truncate,

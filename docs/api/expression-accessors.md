@@ -53,6 +53,15 @@ Each namespace and the methods it carries:
 | `.jaro_similarity(target)` | Jaro similarity to `target`, `[0,1]` (DuckDB `jaro_similarity`, → Float64), for fuzzy matching and record linkage |
 | `.jaro_winkler_similarity(target)` | Jaro-Winkler similarity to `target`, `[0,1]` (DuckDB `jaro_winkler_similarity`, → Float64), prefix-weighted for name matching |
 | `.soundex()` | American Soundex phonetic code, a 4-character key (→ Utf8) |
+| `.hamming(target)` | positions at which the value and `target` differ (DuckDB `hamming`/`mismatches`, → Int64); the lengths must be equal |
+| `.jaccard(target)` | Jaccard similarity of the two values' character *sets*, `[0,1]` (DuckDB `jaccard`, → Float64) |
+| `.url_encode()` / `.url_decode()` | percent-encode a URL *component* and its inverse (DuckDB `url_encode`/`url_decode`) |
+| `.regexp_escape()` | escape the regex metacharacters, so a value can be embedded in a pattern as a literal (DuckDB `regexp_escape`) |
+| `.parse_filename()` | the final component of a path (DuckDB `parse_filename`) |
+| `.parse_dirname()` | the *first* component of a path — `/` for an absolute one (DuckDB `parse_dirname`) |
+| `.parse_dirpath()` | everything before the last separator, i.e. the containing directory (DuckDB `parse_dirpath`) |
+| `.parse_path()` | the path's components as a `List<Utf8>`, keeping a leading `/` (DuckDB `parse_path`) |
+| `.to_binary()` / `.from_binary()` | the UTF-8 bytes as `0`/`1` text and back; undecodable input is null (DuckDB `to_binary`/`from_binary`) |
 | `.to_date(format="%Y-%m-%d")` | parse into a Date with a strftime format; unmatched → NULL (→ Date32) |
 | `.to_datetime(format)` | parse into a Timestamp (DuckDB `try_strptime`); unmatched → NULL (→ Timestamp(us)) |
 | `.to_case(style)` | re-case an identifier into `style`, one of `snake`, `upper_snake`, `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train` |
