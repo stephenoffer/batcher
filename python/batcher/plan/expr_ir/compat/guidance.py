@@ -223,7 +223,6 @@ LIST_UNSUPPORTED: dict[str, str] = {
         "Symmetric difference is .list.set_difference(a, b) both ways, then .list.union(...)."
     ),
     "shift": "Shifting elements within a list is not built in; explode, window, and re-aggregate.",
-    "concat": "Concatenate list columns with .list.union(...); for strings use bt.concat_str(...).",
     "sample": "Sampling within a list is not built in; explode then ds.sample(...).",
     "tail": "The last n elements are .list.slice(-n, n); the last one is .list.last().",
     "drop_nulls": "Drop nulls inside a list by exploding first: ds.explode('x').drop_nulls('x').",

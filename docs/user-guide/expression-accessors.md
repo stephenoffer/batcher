@@ -68,10 +68,9 @@ print(out.to_pydict())
 # {'is_conf': [True, False, False], 'second': ['app', 'local', ''], 'head': ['etc/app', 'usr/local', '  a   b  '], 'tidy': ['etc/app/conf', 'usr/local/bin', 'a b']}
 ```
 
-`ascii` returns the codepoint of the first character. `bit_length` and
-`octet_length` measure the encoded size in bits and UTF-8 bytes, not characters.
-`levenshtein(target)` gives the edit distance to a constant string and `soundex` its
-phonetic key; both earn their keep in fuzzy matching and deduplication.
+`ascii` returns the codepoint of the first character; `bit_length` and `octet_length`
+measure the encoded size in bits and UTF-8 bytes, not characters. `levenshtein(target)`
+gives the edit distance to a constant string and `soundex` its phonetic key.
 
 ```python
 words = bt.from_pydict({"w": ["Robert", "Rupert", "café"]})
@@ -98,10 +97,9 @@ pick one out. The last two are easy to confuse and are genuinely different:
 `parse_dirname` is the *first* component (`/` for an absolute path) while `parse_dirpath`
 is the directory holding the file.
 
-`url_encode` percent-encodes a URL *component* — `/` and `+` included, so the result is
-safe in a path segment or a query string — and `url_decode` reverses it; a malformed
-escape decodes to itself rather than failing the row. `regexp_escape` is the same idea for
-a pattern, neutralizing the metacharacters in a value so it matches itself.
+`url_encode` percent-encodes a URL *component* (`/` and `+` included) and `url_decode`
+reverses it; a malformed escape decodes to itself. `regexp_escape` neutralizes a value's
+regex metacharacters so it matches itself.
 
 ```python
 files = bt.from_pydict({"p": ["/data/2024/events.parquet", "raw/in.csv"]})
@@ -116,8 +114,13 @@ print(out.to_pydict())
 # {'name': ['events.parquet', 'in.csv'], 'first': ['/', 'raw'], 'folder': ['/data/2024', 'raw'], 'parts': [['/', 'data', '2024', 'events.parquet'], ['raw', 'in.csv']], 'quoted': ['%2Fdata%2F2024%2Fevents.parquet', 'raw%2Fin.csv']}
 ```
 
-`to_binary` renders a value's UTF-8 bytes as `0`/`1` text and `from_binary` reads it back;
-undecodable input becomes null rather than raising, the rule `unhex` also follows.
+On `.list`, `concat(other)` appends and is deliberately not `union`: it keeps duplicates
+and order, and a null list counts as *empty*, so `concat` of `[1,2]` and `[2,3]` is
+`[1,2,2,3]` where `union` is `[1,2,3]`. `has_all(other)` and `has_any(other)` test
+containment and, unlike `concat`, are null when either side is null.
+
+`to_binary` renders a value's UTF-8 bytes as `0`/`1` text and `from_binary` reads it back
+(undecodable input is null, the rule `unhex` also follows).
 
 Other `.str` methods include `lower`, `trim`, `lstrip`, `rstrip`, `reverse`,
 `substr`, `right`, `repeat`, `lpad`, `rpad`, `position`, `split`, `replace`,

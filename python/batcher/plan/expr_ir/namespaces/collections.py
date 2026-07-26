@@ -550,6 +550,89 @@ class _ListNamespace:
         """
         return ListSet("array_intersect", self._e, _wrap(other))
 
+    def concat(self, other: Any) -> ListSet:
+        """This list's elements followed by ``other``'s, keeping duplicates (→ List).
+
+        DuckDB ``list_concat``. Unlike :meth:`union` this does not deduplicate or reorder,
+        and a null list counts as **empty** rather than making the row null — so
+        ``concat`` of a null and ``[1]`` is ``[1]``, where ``union`` of the two is null.
+        The result is null only when both sides are.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the two lists appended.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [[2, 3]]})
+                >>> ds.select(bt.col("a").list.concat(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[1, 2, 2, 3]]}
+        """
+        return ListSet("array_concat", self._e, _wrap(other))
+
+    def has_all(self, other: Any) -> Expr:
+        """Whether every element of ``other`` is present in this list (→ Boolean).
+
+        DuckDB ``list_has_all``. An empty ``other`` is trivially contained, so the result
+        is true; a null list on either side gives null.
+
+        Composed as "the intersection holds as many distinct elements as ``other`` does"
+        rather than the more obvious "``other`` minus this list is empty". Both are
+        correct on non-null input, but the difference form reads `other` first and so
+        stays non-null when *this* list is null, answering `False` where DuckDB answers
+        null. Going through the intersection makes both operands load-bearing, so
+        nullness propagates from either side on its own.
+
+        Args:
+            other: The list of elements to look for.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3], [1, 2]], "b": [[1, 2], [1, 5]]})
+                >>> ds.select(bt.col("a").list.has_all(bt.col("b")).alias("r")).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.intersect(_wrap(other)).list.len() == _wrap(other).list.n_unique()
+
+    def has_any(self, other: Any) -> Expr:
+        """Whether this list shares any element with ``other`` (→ Boolean).
+
+        DuckDB ``list_has_any``. The two share an element exactly when their intersection
+        is non-empty, so an empty list on either side is false and a null list on either
+        side is null.
+
+        The trailing ``* 0`` is what carries `other`'s nullness. `intersect` treats a null
+        right operand as an *empty* list (DuckDB does the same:
+        ``list_intersect([1,2], NULL)`` is ``[]``), so the intersection alone would answer
+        `False` where ``list_has_any`` answers null. Multiplying `other`'s length by zero
+        contributes nothing for a real list and null for a null one.
+
+        Args:
+            other: The list of elements to look for.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2], [1, 2]], "b": [[2, 5], [5, 6]]})
+                >>> ds.select(bt.col("a").list.has_any(bt.col("b")).alias("r")).to_pydict()
+                {'r': [True, False]}
+        """
+        other_expr = _wrap(other)
+        return (self.intersect(other_expr).list.len() + other_expr.list.len() * 0) > 0
+
     def difference(self, other: Any) -> ListSet:
         """The distinct elements in this list but not in ``other`` (→ List).
 

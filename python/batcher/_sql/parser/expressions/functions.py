@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+from batcher._sql.parser.expressions.json import json_function
 from batcher._sql.parser.expressions.literals import (
     _DATE_PART,
     _EXTRACT_PART,
@@ -19,6 +20,8 @@ from batcher._sql.parser.expressions.literals import (
     _const_str_arg,
     _int_literal,
 )
+from batcher._sql.parser.expressions.strings import string_function
+from batcher._sql.parser.expressions.temporal import temporal_function
 from batcher.plan.expr_ir import Cast, Expr, atan2, lit
 from batcher.plan.functions.temporal import current_date, make_date
 
@@ -233,6 +236,13 @@ def _scalar_function(tr, node):
         if method is None:
             raise NotImplementedError(f"date_part field {args[0].this!r} is not supported")
         return getattr(tr._scalar(args[1]).dt, method)()
+    # The families that carry enough of their own dispatch to live in a module of their
+    # own: JSON inspection and temporal construction. Each returns None for a name it
+    # does not serve, so the caller's "unknown function" error still names it.
+    for family in (json_function, temporal_function, string_function):
+        built = family(tr, node)
+        if built is not None:
+            return built
     return None
 
 
@@ -323,6 +333,17 @@ def _list_function(tr, node):
 
     if isinstance(node, exp.ArraySize):  # array_length / len(list)
         return tr._scalar(node.this).list.len()
+    if isinstance(node, exp.ArrayContainsAll):  # array_has_all / arrays_contain_all
+        return tr._scalar(node.this).list.has_all(tr._scalar(node.expression))
+    if isinstance(node, exp.ArrayOverlaps):  # list_has_any / arrays_overlap
+        return tr._scalar(node.this).list.has_any(tr._scalar(node.expression))
+    if isinstance(node, exp.ArrayConcat):
+        # `list_concat`/`array_cat` — sqlglot puts the first operand in `this` and the
+        # rest in `expressions`, so a three-way concat folds left to right.
+        result = tr._scalar(node.this)
+        for operand in node.expressions:
+            result = result.list.concat(tr._scalar(operand))
+        return result
     if isinstance(node, exp.Flatten):  # flatten(list-of-lists) — one level
         return tr._scalar(node.this).list.flatten()
     if isinstance(node, exp.ArraySort):  # array_sort(l) without a comparator

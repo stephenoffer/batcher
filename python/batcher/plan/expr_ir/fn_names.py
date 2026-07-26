@@ -77,6 +77,9 @@ class ListSetFn(StrEnum):
     ARRAY_INTERSECT = "array_intersect"
     ARRAY_EXCEPT = "array_except"
     ARRAY_UNION = "array_union"
+    # `array_concat` rides this family because its shape is the same (two lists in, one
+    # list out), but it is not a set operation: it appends without deduplicating.
+    ARRAY_CONCAT = "array_concat"
 
 
 class ListZipFn(StrEnum):

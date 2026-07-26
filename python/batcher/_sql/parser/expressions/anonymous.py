@@ -31,7 +31,8 @@ from __future__ import annotations
 
 import math
 
-from batcher.plan.expr_ir import Binary, Expr, array, atan2, lit
+from batcher.plan.expr_ir import Binary, Expr, array, atan2, lit, nullif, when
+from batcher.plan.functions.collection import element
 from batcher.plan.functions.scalar import gcd, hypot, lcm, nanvl, next_after
 from batcher.plan.functions.temporal import current_date, make_date
 
@@ -199,14 +200,36 @@ _ELEMENT_AT = frozenset(
 _LIST_PAIR = {
     "list_intersect": "intersect",
     "array_intersect": "intersect",
+    "list_concat": "concat",
+    "array_concat": "concat",
+    "list_cat": "concat",
+    "array_cat": "concat",
+    "list_has_all": "has_all",
+    "array_has_all": "has_all",
+    "list_has_any": "has_any",
+    "array_has_any": "has_any",
     "list_difference": "difference",
     "array_difference": "difference",
     "list_union": "union",
     "array_union": "union",
 }
 
+# `f(a, b)` on two list expressions → the negation of a `.list` method. DuckDB's
+# `list_negative_dot_product`/`list_negative_inner_product` are the plain products with
+# the sign flipped, which is the form a maximum-inner-product search minimizes.
+_LIST_PAIR_NEGATED = {
+    "list_negative_dot_product": "dot",
+    "list_negative_inner_product": "dot",
+    "array_negative_dot_product": "dot",
+    "array_negative_inner_product": "dot",
+}
+
 # `f(v, …)` → a list literal of every argument (DuckDB's list constructors).
 _LIST_PACK = frozenset({"list_pack", "list_value", "array_value"})
+
+# `grade_up(l)` — the 1-based positions that sort the list. `.list.arg_sort` is the same
+# permutation 0-based, so the whole difference is the index origin.
+_GRADE_UP = frozenset({"grade_up", "list_grade_up", "array_grade_up"})
 
 
 def anonymous_scalar(tr, node):
@@ -229,6 +252,19 @@ def anonymous_scalar(tr, node):
         nullary = _NULLARY.get(name)
         if nullary is not None:
             return nullary()
+
+    if name in _GRADE_UP and len(args) == 1:
+        return tr._scalar(args[0]).list.arg_sort().list.transform(element() + lit(1))
+
+    if name == "constant_or_null" and len(args) >= 2:
+        # `constant_or_null(v, x, …)` is `v` unless any guard is null, in which case
+        # null — DuckDB's way of writing "this constant, but propagate the nulls of the
+        # arguments it replaced". Folding the guards with `&` keeps one pass per guard.
+        guard = tr._scalar(args[1]).is_not_null()
+        for extra in args[2:]:
+            guard = guard & tr._scalar(extra).is_not_null()
+        value = tr._scalar(args[0])
+        return when(guard).then(value).otherwise(nullif(value, value))
 
     if len(args) == 1:
         one = args[0]
@@ -259,6 +295,9 @@ def anonymous_scalar(tr, node):
             return tr._scalar(left).list.get(_const_int_arg(right, f"{name}(): index") - 1)
         if name in _LIST_PAIR:
             return getattr(tr._scalar(left).list, _LIST_PAIR[name])(tr._scalar(right))
+        negated = _LIST_PAIR_NEGATED.get(name)
+        if negated is not None:
+            return lit(0.0) - getattr(tr._scalar(left).list, negated)(tr._scalar(right))
 
     if len(args) == 3:
         if name in ("list_slice", "array_slice"):

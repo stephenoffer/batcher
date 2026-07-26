@@ -321,6 +321,36 @@ sample variance is NULL), nulls in every value column, and repeated values so
 usual multiset: a running aggregate is a sequence, and an order-independent comparison
 cannot see a running kernel that emits the right values in the wrong order.
 
+### 161-165. `list_concat`, `list_has_all`, `list_has_any` and the two negative products
+
+**Source:** the census gap column, the list family.
+
+Three DuckDB list functions the engine did not have, plus SQL access to
+`list_negative_dot_product`/`list_negative_inner_product` (the sign-flipped dot product a
+maximum-inner-product search minimizes, composed from the existing `.list.dot`).
+
+What separates all three from the set operations sitting next to them is the same thing,
+and it is **not** the operation — it is how a null list and an empty list behave:
+
+* `list_concat` keeps duplicates *and* treats a null list as **empty**, so
+  `list_concat(NULL, [1])` is `[1]` where `list_union(NULL, [1])` is NULL. That rule holds
+  all the way down: `list_concat(NULL, NULL)` is `[]`, so the kernel never produces a null
+  row at all. The first implementation nulled the both-null case; the differential test's
+  both-null row caught it.
+* `list_has_all`/`list_has_any` are null when **either** side is null — even though
+  `list_intersect([1,2], NULL)` is `[]` rather than NULL in *both* engines. That asymmetry
+  is why they are composed to make both operands load-bearing (`has_all` compares the
+  intersection's size to `other`'s distinct count rather than asking whether
+  `other - self` is empty, which reads only `other` and so answered `False` where DuckDB
+  answers null).
+
+`Concat` rides the existing `ListSetOp` because its shape is the same — two lists in, one
+list out — but it takes its own kernel, with a comment saying why the set machinery's
+dedup and null rules do not apply.
+
+**Verified** by 11 differential cases whose fixture crosses both operands over disjoint,
+overlapping, contained, null and empty lists — every row is one of the edge cases above.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.

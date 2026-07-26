@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 847 Python modules across 128 packages and 170 Rust files across 13 crates.
+Covering 849 Python modules across 128 packages and 170 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -337,7 +337,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 463 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 802 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 800 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 115 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 376 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 488 | The opt-in GPU execution backend for supported relational shapes. |
@@ -614,11 +614,13 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 197 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 289 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
-| `functions.py` | 466 | Named-function dispatch for the SQL translator's scalar path. |
-| `json.py` | 47 | SQL JSON extraction — ``json_extract`` / ``json_extract_string`` / ``->`` / ``->>``. |
-| `literals.py` | 426 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
+| `anonymous.py` | 328 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `functions.py` | 487 | Named-function dispatch for the SQL translator's scalar path. |
+| `json.py` | 100 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
+| `literals.py` | 452 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `scalar.py` | 473 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
+| `strings.py` | 29 | SQL string functions whose translation is more than a name lookup. |
+| `temporal.py` | 145 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
 
 ### `batcher/_sql/parser/joins/` — 6 · front-end
 
@@ -755,7 +757,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `metadata_answer.py` | 426 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 61 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 352 | Memoize the optimizer — the same query, planned once. |
+| `plan_cache.py` | 350 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 209 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 171 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 168 | The Kyber rule abstraction — one small, pure unit of optimization. |
@@ -788,7 +790,7 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 
 | module | lines | what it is |
 |---|---|---|
-| `bandit.py` | 357 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
+| `bandit.py` | 379 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
 | `crossover.py` | 130 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
 | `priors.py` | 185 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
 
@@ -1526,7 +1528,7 @@ The scalar expression algebra.
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 4799 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 172 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `fn_names.py` | 175 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 203 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -1542,7 +1544,7 @@ Ecosystem-compatible spellings bound onto `Expr`.
 | module | lines | what it is |
 |---|---|---|
 | `binder.py` | 38 | Attach the compatibility aliases onto `Expr`. |
-| `guidance.py` | 269 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `guidance.py` | 268 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 | `names.py` | 426 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
 | `namespaces.py` | 307 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 | `operators.py` | 385 | Method-form spellings of the `Expr` operators (the pandas ``Series.add`` family). |
@@ -1554,7 +1556,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | module | lines | what it is |
 |---|---|---|
 | `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
-| `collections.py` | 1306 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1389 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `strings.py` | 3940 | The `.str` accessor namespace. |
 | `temporal.py` | 1006 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
@@ -1865,7 +1867,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `shuffle.rs` | 934 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window.rs` | 1097 | Window functions — partition, order, and append one column per function. |
-| `window_agg.rs` | 391 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
+| `window_agg.rs` | 400 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
 | `window_fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window_frame.rs` | 704 | Explicit `ROWS` window frames — sliding-window aggregates. |
 | `window_parallel.rs` | 277 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
@@ -1920,7 +1922,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/list_hof.rs` | 81 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
 | `eval/list_ops/list_reduce.rs` | 161 | Per-row, list-returning numeric transforms for `eval/list.rs` (`normalize`, `softmax`, `arg_sort`, `cum_sum`, `diff`). |
 | `eval/list_ops/list_reshape.rs` | 62 | Reshaping `List`-column operations that change nesting depth — currently `flatten` (`List<List<T>>` → `List<T>`). |
-| `eval/list_ops/list_set.rs` | 123 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
+| `eval/list_ops/list_set.rs` | 173 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
@@ -1952,7 +1954,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1189 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1197 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`

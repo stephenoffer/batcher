@@ -536,6 +536,14 @@ pub enum ListSetOp {
     Except,
     #[serde(rename = "array_union")]
     Union,
+    /// `list_concat(a, b)` — the left list's elements followed by the right's, with
+    /// **no** deduplication and **no** reordering. It rides `ListSetOp` because the two
+    /// operands and the list result are the same shape, but it is not a set operation:
+    /// duplicates survive, and a NULL list counts as empty rather than making the row
+    /// null (DuckDB `list_concat(NULL, [1])` is `[1]`, where `list_union(NULL, [1])` is
+    /// NULL).
+    #[serde(rename = "array_concat")]
+    Concat,
 }
 
 /// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
