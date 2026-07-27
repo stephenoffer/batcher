@@ -579,6 +579,37 @@ still open here.
 empty right, plus the right-join asymmetry, the anti-join collapse, an ordinary join left
 untouched, and the `false AND k IS NOT NULL` shape asserted directly.
 
+### 187-189. A map lookup that crashed with an error about integers
+
+**Source:** re-probing the `.map` family from SQL after entries 177-178, which added the
+DataFrame methods but never asked whether SQL could reach them.
+
+Three spellings of one operation, all of which had a working kernel sitting behind them:
+
+* **`m['a']` raised `invalid literal for int()`.** The `exp.Bracket` handler assumed every
+  subscript was a list index and called `int()` on the key, so an ordinary map lookup died
+  with an error message about integers on a query containing no integer. It now dispatches
+  on the key's *type*: a string key is a map lookup, an integer stays a list index.
+* **Spark's `element_at(m, 'a')` parses as the same `Bracket` node**, so it failed
+  identically, and is fixed by the same branch.
+* **`map_keys(m)` reported "unsupported SQL expression" while `map_values(m)` worked.** The
+  two differ only in that sqlglot gives one a typed node and leaves the other anonymous —
+  the same asymmetry entries 1-100 were opened to fix, still producing new instances.
+
+**`map_extract` is deliberately still absent**, and this is the entry's real content.
+DuckDB returns a **list** for it — `[1]` for a hit, `[]` for a miss — where the subscript
+returns the bare value. Mapping it to `.map.get` would have answered `1`/`NULL`: a
+plausible result that is not DuckDB's. It was in the table for one test run, and the
+differential fixture is what took it out.
+
+The dispatch has a stated limit: a translator has no schema, so an *integer-keyed* map
+still resolves as a list index. A string key is unambiguous, because no list is indexed by
+one.
+
+**Verified** by eight differential cases, including the two negative ones — an integer
+subscript still being a list index, and Spark's 1-based list offset surviving the new
+branch.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.

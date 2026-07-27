@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 863 Python modules across 130 packages and 174 Rust files across 13 crates.
+Covering 864 Python modules across 130 packages and 174 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -616,11 +616,12 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 237 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 354 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `anonymous.py` | 359 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
 | `collections.py` | 214 | SQL list/array functions — the Spark-shaped half, including the lambda forms. |
-| `functions.py` | 495 | Named-function dispatch for the SQL translator's scalar path. |
+| `functions.py` | 500 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 110 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 457 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
+| `maps.py` | 67 | SQL → `.map` accessor dispatch. |
 | `scalar.py` | 469 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 256 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 68 | SQL string functions whose translation is more than a name lookup. |
@@ -1094,7 +1095,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `gpu_plan.py` | 350 | Translate a linear Batcher plan to a GPU dataframe execution (cuDF) — many ops, not one. |
 | `gpu_transform.py` | 201 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
-| `runtime.py` | 208 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
+| `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 160 | Column-statistics measurement — Core's lane. |
 | `streaming.py` | 416 | Streaming (incremental) aggregation — bounded-memory group-by over a source. |
@@ -1846,7 +1847,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 213 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 780 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 1019 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1026 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 158 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |

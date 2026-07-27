@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import math
 
+from sqlglot import expressions as exp
+
+from batcher._sql.parser.expressions.collections import collection_function
 from batcher._sql.parser.expressions.json import json_function
 from batcher._sql.parser.expressions.literals import (
     _DATE_PART,
@@ -20,8 +23,10 @@ from batcher._sql.parser.expressions.literals import (
     _const_str_arg,
     _int_literal,
 )
+from batcher._sql.parser.expressions.maps import map_function, map_subscript
+from batcher._sql.parser.expressions.spark import spark_function
 from batcher._sql.parser.expressions.strings import string_function
-from batcher._sql.parser.expressions.temporal import temporal_function
+from batcher._sql.parser.expressions.temporal import datetime_pattern, temporal_function
 from batcher.plan.expr_ir import Cast, Expr, atan2, lit
 from batcher.plan.functions.temporal import current_date, make_date
 
@@ -46,8 +51,6 @@ _STR_CONST_ARG = {
 
 def _scalar_function(tr, node):
     """Map a SQL scalar function call to its `Expr` builder, or None."""
-    from sqlglot import expressions as exp
-
     name = type(node).__name__
     if name in _NULLARY_CONST:
         # `pi()` / `today()` — DuckDB spells them as nullary functions, and sqlglot has a
@@ -158,9 +161,12 @@ def _scalar_function(tr, node):
         frm = _const_str_arg(node.args.get("from_"), "translate()", "source character set")
         to = _const_str_arg(node.args.get("to"), "translate()", "target character set")
         return tr._scalar(node.this).str.translate(frm, to)
-    if name == "TimeToStr":  # strftime(ts, fmt)
-        fmt = _const_str_arg(node.args.get("format"), "strftime()", "format")
-        return tr._scalar(node.this).dt.strftime(fmt)
+    if name == "TimeToStr":  # strftime(ts, fmt) / Spark date_format(ts, fmt)
+        raw = _const_str_arg(node.args.get("format"), "strftime()", "format")
+        pattern = datetime_pattern(raw)
+        if pattern is None:
+            raise NotImplementedError(f"datetime format {raw!r} is not supported")
+        return tr._scalar(node.this).dt.strftime(pattern)
     if name == "TsOrDsToDate":
         # Spark's implicit "this is a date" wrapper — `year('2016-07-30')` parses as
         # `Year(TsOrDsToDate('2016-07-30'))`. With a format it is `to_date(s, fmt)`;
@@ -169,7 +175,11 @@ def _scalar_function(tr, node):
         value = tr._scalar(node.this)
         if fmt is None:
             return Cast(value, "date")
-        return value.str.to_date(_const_str_arg(fmt, "to_date()", "format"))
+        raw = _const_str_arg(fmt, "to_date()", "format")
+        pattern = datetime_pattern(raw)
+        if pattern is None:
+            raise NotImplementedError(f"datetime format {raw!r} is not supported")
+        return value.str.to_date(pattern)
     if name == "TimeToUnix":
         # `epoch(ts)` is DuckDB's *fractional* seconds since the epoch (a DOUBLE), not
         # the whole seconds `.dt.epoch()` returns — `epoch('…:08.123456')` is
@@ -236,10 +246,17 @@ def _scalar_function(tr, node):
         if method is None:
             raise NotImplementedError(f"date_part field {args[0].this!r} is not supported")
         return getattr(tr._scalar(args[1]).dt, method)()
-    # The families that carry enough of their own dispatch to live in a module of their
-    # own: JSON inspection and temporal construction. Each returns None for a name it
-    # does not serve, so the caller's "unknown function" error still names it.
-    for family in (json_function, temporal_function, string_function):
+    # Families that carry enough of their own dispatch to live in a module of their own.
+    # Each returns None for a name it does not serve, so the caller's "unknown function"
+    # error still names it.
+    for family in (
+        json_function,
+        temporal_function,
+        string_function,
+        collection_function,
+        spark_function,
+        map_function,
+    ):
         built = family(tr, node)
         if built is not None:
             return built
@@ -329,8 +346,6 @@ _LIST_TYPED_BINARY = {
 
 def _list_function(tr, node):
     """List/array operations dispatched to the `.list` namespace, or None."""
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.ArraySize):  # array_length / len(list)
         return tr._scalar(node.this).list.len()
     if isinstance(node, exp.ArrayContainsAll):  # array_has_all / arrays_contain_all
@@ -376,6 +391,9 @@ def _list_function(tr, node):
         # subscript return the *next* element: `element_at(array(1,2,3), 2)` answered 3.
         idxs = node.expressions
         if len(idxs) == 1 and not isinstance(idxs[0], exp.Slice):
+            # A map subscript is the same node as a list one, so `maps` reads it first.
+            if (as_map := map_subscript(tr, node)) is not None:
+                return as_map
             offset = int(node.args.get("offset") or 0)
             return tr._scalar(node.this).list.get(int(idxs[0].name) - offset)
         return None  # slices (a[lo:hi]) not supported
@@ -422,8 +440,6 @@ def _list_anon_method(name: str) -> str | None:
 
 def _boolean_arg(node) -> bool:
     """The boolean a sqlglot `Boolean`/literal argument denotes."""
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.Boolean):
         return bool(node.this)
     return str(node.this).lower() not in ("false", "0")
@@ -431,8 +447,6 @@ def _boolean_arg(node) -> bool:
 
 def _raw_value(node):
     """The Python value of a literal node (for `.list.contains`)."""
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.Literal):
         raise NotImplementedError("list_contains requires a constant value")
     if node.is_string:
@@ -449,7 +463,6 @@ def _regexp_replace(tr, node) -> Expr:
     (replace-all) variant, and ``'i'``/``'s'``/``'c'`` map to an inline regex flag prefix
     (`_regexp_flags_prefix`). Previously the whole options arg was ignored, so
     ``regexp_replace(s, 'abc', 'X', 'i')`` matched case-sensitively (wrong vs DuckDB)."""
-    from sqlglot import expressions as exp
 
     from batcher._sql.parser.expressions.literals import _regexp_flags_prefix
 

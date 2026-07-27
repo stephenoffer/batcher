@@ -99,6 +99,11 @@ _UNARY_MAP = {
 # `f(m, key)` → a `.map` method taking one literal key. Spark's `map_contains_key` is
 # absent because sqlglot gives it a *typed* node, so it never reaches this table; adding
 # it here would be dead code.
+# `map_extract` is deliberately absent. DuckDB returns a **list** — `[1]` for a present
+# key and `[]` for a missing one — where `m[k]` and Spark's `element_at(m, k)` return the
+# bare value. Mapping it to `.map.get` would answer `1`/`NULL`: a plausible result that is
+# not DuckDB's, which is the failure this census exists to catch. It needs a kernel that
+# wraps the hit in a list, not a table row.
 _MAP_KEY = {
     "map_contains": "contains",
 }
