@@ -86,14 +86,14 @@ pub(crate) fn eval_list_simhash(
             reason: format!("num_bits must be in [1, {MAX_BITS}], got {num_bits}"),
         });
     }
+    // Through the shared coercion so `simhash` accepts the same encodings as the rest of
+    // `.list` — an embedding is a `FixedSizeList`, which is precisely the input a
+    // similarity hash is asked for.
+    let arr = super::coerce::as_var_list(arr, "simhash")?;
     let list = arr
         .as_any()
         .downcast_ref::<ListArray>()
-        .ok_or_else(|| ExprError::ExpectedType {
-            func: "simhash".into(),
-            want: "a List argument",
-            got: arr.data_type().to_string(),
-        })?;
+        .expect("as_var_list yields a List");
 
     // One numeric read path: cast the flat child once rather than per row.
     let values = arrow::compute::cast(list.values(), &DataType::Float64)?;

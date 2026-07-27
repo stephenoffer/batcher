@@ -716,6 +716,43 @@ has. Only running them against the encoding a real embedding arrives in shows it
 encodings, plus two negative tests: a variable-size list is unaffected, and a genuine
 non-list argument still raises an error naming the function.
 
+### 210-249. `LargeList` was rejected by the entire `.list` namespace
+
+**Source:** the same encoding-coverage probe that found entries 200-209, extended to the
+third Arrow list encoding — and to the string ones, which turned out clean.
+
+Arrow has three ways to hold a list column. After the previous wave, `List` and
+`FixedSizeList` both worked. **`LargeList` was rejected by all 39 no-argument `.list`
+methods**, so the namespace was entirely unusable on such a column.
+
+That matters more than a missing function, because `LargeList` is not exotic: it is what
+an Arrow reader hands back for a `large_list` Parquet column **regardless of its actual
+size**, and what Arrow reaches for once a list passes `i32::MAX` offsets. For an engine
+whose stated range runs to PB scale, the encoding chosen *for* large data was the one the
+list namespace could not read.
+
+One edit fixed all 39, because the previous wave had already made
+`list_ops::coerce::as_var_list` the single normalization point. `simhash` was the one
+kernel still downcasting on its own; it now goes through the same helper, and the
+differential file asserts its output is **bit-identical** across encodings — a similarity
+hash that varied by encoding would return different neighbours for the same vector
+depending on how its column was written, with no error anywhere.
+
+The narrowing to 32-bit offsets is stated rather than assumed: it is safe *per morsel*
+(16,384 rows would need over 131,000 child elements each to overflow) and the Arrow cast
+**errors** rather than truncating beyond that. Making the kernels generic over the offset
+type removes the bound entirely and is the follow-on, not this change.
+
+**The string encodings were probed the same way and are clean** — 135 `.str` methods
+across `Utf8`, `LargeUtf8` and `StringView`, and 135 over a dictionary-encoded column,
+with zero rejections. That closes the open list's "StringView end-to-end" item as already
+done, and is recorded because a negative result from this probe is worth as much as a
+positive one: it says where *not* to look next.
+
+**Verified** by 38 differential cases — eight methods × three encodings against DuckDB,
+eleven more compared across encodings where DuckDB has no counterpart, the simhash
+identity, a nested `LargeList` flatten, and a non-list column still erroring.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
