@@ -15,6 +15,8 @@ family has a spill history, else the learned-blended peak. That is one decision,
 
 from __future__ import annotations
 
+from batcher._internal.mathx import ceil_div
+
 __all__ = [
     "partitions_for_envelope",
     "partitions_for_volume",
@@ -52,18 +54,24 @@ def spill_basis(peak: int, volume: int) -> int:
     return volume if volume > 0 else max(0, peak)
 
 
-def partitions_for_volume(basis: int) -> int | None:
-    """Bucket count that puts roughly `SPILL_BYTES_PER_PARTITION` in each bucket.
+def partitions_for_volume(basis: int, target_bytes: int = SPILL_BYTES_PER_PARTITION) -> int | None:
+    """Bucket count that puts roughly `target_bytes` in each bucket.
 
     Args:
         basis: Bytes to shard, from `spill_basis`.
+        target_bytes: Bytes to aim at per bucket. Defaults to `SPILL_BYTES_PER_PARTITION`.
+            A caller that knows the real per-bucket ceiling — `memory.spill_bucket_max_bytes`
+            is the size above which the reduce re-partitions a bucket by grace recursion —
+            should pass it, so the *first* partitioning already lands under the ceiling
+            instead of producing buckets the reduce then has to split again. Sharding twice
+            for a figure that was known up front is pure re-read of the spilled state.
 
     Returns:
         The bucket count, or `None` when `basis` is 0 so the caller keeps its default.
     """
     if basis <= 0:
         return None
-    parts = max(MIN_SPILL_PARTITIONS, -(-basis // SPILL_BYTES_PER_PARTITION))  # ceil-div
+    parts = max(MIN_SPILL_PARTITIONS, ceil_div(basis, max(1, target_bytes)))
     return min(MAX_SPILL_PARTITIONS, int(parts))
 
 
@@ -79,8 +87,7 @@ def partitions_for_envelope(basis: int, envelope_bytes: int) -> int:
     """
     if basis <= 0 or envelope_bytes <= 0:
         return 0
-    parts = -(-basis // envelope_bytes)  # ceil-div
-    return min(MAX_SPILL_PARTITIONS, int(max(1, parts)))
+    return min(MAX_SPILL_PARTITIONS, max(1, ceil_div(basis, envelope_bytes)))
 
 
 def should_compress(peak: int) -> bool | None:

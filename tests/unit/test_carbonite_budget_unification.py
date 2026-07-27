@@ -40,9 +40,9 @@ def test_soft_budget_below_hard_budget():
     cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=1_000))
     with config_context(cfg):
         rm = ResourceManager()
-        assert rm._soft_budget() == 850  # 1000 * 0.85
-        assert rm._hard_budget() == 900  # 1000 * 0.90
-        assert rm._soft_budget() < rm._hard_budget()
+        assert rm._spill.soft_budget() == 850  # 1000 * 0.85
+        assert rm._spill.hard_budget() == 900  # 1000 * 0.90
+        assert rm._spill.soft_budget() < rm._spill.hard_budget()
 
 
 def test_reserve_reports_false_when_over_budget():

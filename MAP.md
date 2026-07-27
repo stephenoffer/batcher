@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 888 Python modules across 137 packages and 174 Rust files across 13 crates.
+Covering 895 Python modules across 139 packages and 174 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -176,7 +176,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 
 | module | lines | what it is |
 |---|---|---|
-| `gating.py` | 209 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
+| `gating.py` | 222 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 90 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
 | `staging.py` | 397 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
@@ -345,7 +345,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `gpu_backend.py` | 488 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
-| `profile.py` | 286 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
+| `profile.py` | 301 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 172 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
@@ -823,7 +823,7 @@ The Kyber optimizer entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `driver.py` | 307 | The rule-application engine: phases, fixpoint, and the two levels of fusion. |
+| `driver.py` | 360 | The rule-application engine: phases, fixpoint, and the two levels of fusion. |
 | `facade.py` | 364 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -842,6 +842,14 @@ Kyber rule modules.
 | `selection.py` | 437 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `zonemap_pruning.py` | 373 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
+### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
+
+Aggregate rule families: an aggregate that is a cheaper aggregate in disguise.
+
+| module | lines | what it is |
+|---|---|---|
+| `extremes.py` | 120 | An aggregate whose arguments make it the group's minimum or maximum. |
+
 ### `batcher/kyber/rules/algebraic/` — 3 · subsystem
 
 Algebraic rewrites: small, local, unconditionally semantics-preserving simplifications.
@@ -853,12 +861,11 @@ Algebraic rewrites: small, local, unconditionally semantics-preserving simplific
 
 ### `batcher/kyber/rules/collections_algebra/` — 3 · subsystem
 
-List-column rule families: membership predicates, order-insensitivity, and folds.
+List-column rule families: order-insensitivity and constant folding.
 
 | module | lines | what it is |
 |---|---|---|
 | `folds.py` | 208 | Constant list calls, and the two list calls that are the identity. |
-| `membership.py` | 94 | `list_position(x, v)` compared against zero is `list_contains(x, v)`. |
 | `ordering.py` | 112 | Drop a list reordering that the operation above it cannot see. |
 
 ### `batcher/kyber/rules/conditional_algebra/` — 3 · subsystem
@@ -867,7 +874,8 @@ List-column rule families: membership predicates, order-insensitivity, and folds
 
 | module | lines | what it is |
 |---|---|---|
-| `push_calls.py` | 155 | Push a scalar call through a `CASE` onto each of its branch values. |
+| `branches.py` | 111 | Merge `CASE` branches that agree, and collapse one that re-tests a decided condition. |
+| `push_calls.py` | 190 | Push a scalar call through a `CASE` onto each of its branch values. |
 
 ### `batcher/kyber/rules/exprs/` — 3 · subsystem
 
@@ -880,7 +888,7 @@ Expression-level Kyber rule families.
 | `comparisons.py` | 127 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
 | `complex_types.py` | 483 | Struct, list, and array algebra -- the extract-over-construct family. |
 | `conditionals.py` | 329 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
-| `guards.py` | 193 | Schema-aware helpers for expression rules that may only fire on a known type. |
+| `guards.py` | 205 | Schema-aware helpers for expression rules that may only fire on a known type. |
 | `numeric.py` | 444 | Numeric algebra the earlier arithmetic families leave on the table. |
 | `temporal.py` | 262 | Temporal identities: reading a date part through a truncation, and offset fusion. |
 | `text.py` | 315 | Regex de-specialization and the remaining string identities. |
@@ -924,8 +932,8 @@ Extended Kyber rule families.
 | `setops.py` | 254 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `strings.py` | 500 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
-| `temporal_extra.py` | 490 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
-| `temporal_sargable.py` | 221 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
+| `temporal_extra.py` | 493 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
+| `temporal_sargable.py` | 237 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 127 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
 | `window_extra.py` | 360 | Window rewrites — prune keys, frames and functions a window does not actually need. |
 | `window_rules.py` | 150 | Window-operator rewrites — canonicalize a `Window`'s keys and prune dead output. |
@@ -978,7 +986,8 @@ Numeric rule families that turn a computed comparison back into a sargable one.
 | module | lines | what it is |
 |---|---|---|
 | `absolute.py` | 231 | `abs` and `sign` inside a comparison, restated over the bare column. |
-| `rounding.py` | 302 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
+| `float_predicates.py` | 74 | `isnan` / `isinf` see through the rounding functions. |
+| `rounding.py` | 434 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
 
 ### `batcher/kyber/rules/normalize/` — 3 · subsystem
 
@@ -997,8 +1006,16 @@ Null-reasoning rule families — three-valued logic and null-strictness.
 
 | module | lines | what it is |
 |---|---|---|
-| `strictness.py` | 285 | Push `IS NULL` / `IS NOT NULL` through the scalar functions that are null-strict. |
+| `strictness.py` | 332 | Push `IS NULL` / `IS NOT NULL` through the scalar functions that are null-strict. |
 | `three_valued.py` | 387 | Three-valued logic: collapsing the null predicates that other rules generate. |
+
+### `batcher/kyber/rules/predicate_algebra/` — 3 · subsystem
+
+Predicate families that reason about *disjunctions* of bounds and sets.
+
+| module | lines | what it is |
+|---|---|---|
+| `bounds.py` | 302 | Union the disjuncts a generated predicate leaves on one column. |
 
 ### `batcher/kyber/rules/relational/` — 3 · subsystem
 
@@ -1025,8 +1042,8 @@ Temporal rule families that put a predicate back onto the raw timestamp column.
 
 | module | lines | what it is |
 |---|---|---|
-| `epoch.py` | 128 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
-| `offsets.py` | 115 | `offset_by(ts, …) OP instant` restated as `ts OP shifted_instant`. |
+| `epoch.py` | 206 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
+| `offsets.py` | 187 | `offset_by(ts, …) OP instant` restated as `ts OP shifted_instant`. |
 
 ### `batcher/kyber/rules/text_algebra/` — 3 · subsystem
 
@@ -1088,8 +1105,8 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 102 | Policy seams for the Carbonite resource manager. |
-| `cache.py` | 234 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 499 | The Carbonite resource manager entry point. |
+| `cache.py` | 312 | The result cache — a memory-bounded LRU of materialized query results. |
+| `manager.py` | 418 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1110,10 +1127,12 @@ Carbonite's resource policies — admission, flow control, and scheduling.
 | module | lines | what it is |
 |---|---|---|
 | `admission.py` | 126 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
-| `concurrency.py` | 234 | Bounding how many queries run at once, and how wide each one gets. |
-| `flow_control.py` | 335 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
-| `scheduling.py` | 184 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_shape.py` | 98 | How wide and how compressed a spilled state should be. |
+| `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
+| `flow_control.py` | 420 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
+| `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
+| `scheduling.py` | 209 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
+| `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_shape.py` | 105 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
 
@@ -1122,10 +1141,10 @@ Carbonite fault tolerance: Spark-style recompute-from-lineage on worker loss.
 | module | lines | what it is |
 |---|---|---|
 | `lineage.py` | 76 | Shuffle lineage — how to recompute an output a lost worker produced. |
-| `preemption.py` | 225 | Spot-preemption detection so the engine drains proactively, not reactively. |
-| `recovery.py` | 129 | Shuffle recovery — the recompute-on-failure coordination loop. |
-| `replication.py` | 83 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
-| `speculative.py` | 232 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
+| `preemption.py` | 236 | Spot-preemption detection so the engine drains proactively, not reactively. |
+| `recovery.py` | 135 | Shuffle recovery — the recompute-on-failure coordination loop. |
+| `replication.py` | 110 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
+| `speculative.py` | 269 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
 
 ### `batcher/carbonite/spill/` — 3 · subsystem
 
@@ -1146,8 +1165,8 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 |---|---|---|
 | `locality.py` | 77 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `placement.py` | 82 | Locality-aware reducer placement — put a reducer where its data already is. |
-| `server.py` | 359 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 425 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `server.py` | 401 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
+| `session.py` | 485 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
 ### `batcher/core/` — 3 · subsystem
@@ -1945,7 +1964,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather.rs` | 212 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 137 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
-| `join/dense.rs` | 146 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1320 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |

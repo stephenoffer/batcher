@@ -48,13 +48,23 @@ _DEFAULT_FAN_IN = 8
 # single client runtime no matter how many sessions exist (a per-session runtime
 # would accumulate background threads and destabilize a many-actor worker).
 _shared_client: ShuffleClient | None = None
+# Guards the lazy build. A join reducer gathers its two sides on two threads, and both
+# reach this on the first fetch of a fresh worker: without the lock they each construct a
+# `ShuffleClient`, which means two tokio runtimes and two channel pools, one of which is
+# then dropped on the floor with its background threads still running. That is the exact
+# per-session-runtime accumulation the shared client exists to prevent.
+_client_lock = threading.Lock()
 
 
 def _process_client() -> ShuffleClient:
     global _shared_client
-    if _shared_client is None:
-        _shared_client = ShuffleClient()
-    return _shared_client
+    client = _shared_client
+    if client is None:
+        with _client_lock:
+            if _shared_client is None:
+                _shared_client = ShuffleClient()
+            client = _shared_client
+    return client
 
 
 # Every live session, so a process-exit hook can retire the pyarrow-backed batches
@@ -238,22 +248,43 @@ class ShuffleSession:
             )
         else:
             mode = select_mode(addr, self.addr)
-        self._fetches += 1
+        # Under the same lock the concurrent gathers use. A join reducer fetches its two
+        # sides on two threads and both land here, so the un-guarded `+= 1` pair could lose
+        # increments — under-reporting exactly the locality ratio that is supposed to prove
+        # placement is working, and silently, since a slightly-low ratio reads as a
+        # slightly-worse shuffle rather than as a broken counter.
+        self._count_fetch(1, off_network=mode is not TransferMode.NETWORK)
         if mode is TransferMode.DIRECT_MEMORY:
-            self._off_network += 1
             local = self._server.local_fetch(ticket)
             return local if local is not None else []
         if mode is TransferMode.SHARED_MEMORY:
             shared = self._server.shm_fetch(addr, ticket)
             if shared is not None:  # a miss (empty/un-shm'd bucket) falls back to Flight
-                self._off_network += 1
                 return shared
+            # The bucket was not in shared memory after all, so this fetch does cross the
+            # network: take back the off-network credit the mode selection had assumed.
+            self._count_fetch(0, off_network=False, correction=True)
         # NETWORK (or a shared-memory miss): stream over credit-bounded Flight. The
         # process-wide pooled client reuses one channel per peer across every session's
         # fetches. The window is adaptive when a flow controller is set.
         out = _process_client().fetch(addr, ticket, credits=self._window(), token=self._token)
-        self._observe_backpressure()
+        with self._stats_lock:
+            self._observe_backpressure()
         return out
+
+    def _count_fetch(self, n: int, *, off_network: bool, correction: bool = False) -> None:
+        """Fold `n` fetches into the locality counters under the stats lock.
+
+        `correction=True` reverses one previously-credited off-network fetch: the shared
+        memory path has to guess before it knows, and a miss must not be left counted as a
+        local hit.
+        """
+        with self._stats_lock:
+            self._fetches += n
+            if correction:
+                self._off_network -= 1
+            elif off_network:
+                self._off_network += n
 
     def gather(self, sources: list[tuple[str, ShuffleTicket]]) -> list[pa.RecordBatch]:
         """Fetch from every `(addr, ticket)` and concatenate into one batch list.
@@ -307,8 +338,9 @@ class ShuffleSession:
             shm=self._shm,
             replicas=replicas,
         )
-        self._fetches += len(sources)
-        self._observe_backpressure()
+        with self._stats_lock:
+            self._fetches += len(sources)
+            self._observe_backpressure()
         return payload, unreachable
 
     def gather_to_files(
@@ -342,8 +374,9 @@ class ShuffleSession:
             shm=self._shm,
             replicas=replicas,
         )
-        self._fetches += len(sources)
-        self._observe_backpressure()
+        with self._stats_lock:
+            self._fetches += len(sources)
+            self._observe_backpressure()
         return paths, unreachable
 
     def gather_concat(
@@ -400,6 +433,33 @@ class ShuffleSession:
         Empty (no fetches yet) reports 1.0 by the shared `locality_ratio` convention.
         """
         return locality_ratio_counts(self._off_network, self._fetches)
+
+    def stats(self) -> dict[str, int | float]:
+        """Everything this session measured about its shuffle, in one reading.
+
+        Locality was already exposed as a bare ratio, which cannot distinguish "one remote
+        fetch out of two" from "a million out of two million", and said nothing about the
+        *bytes* or about how the credit window behaved. Reading them together is what turns
+        a slow shuffle into a diagnosis: a low locality ratio with a healthy window is a
+        placement problem, and a high ratio with a high backoff rate is a memory problem.
+
+        Returns:
+            Fetch counts and the locality ratio, the server's published/local byte volumes,
+            and — under adaptive flow control — the credit controller's window statistics.
+        """
+        out: dict[str, int | float] = {
+            "fetches": self._fetches,
+            "off_network_fetches": self._off_network,
+            "locality_ratio": self.locality_ratio,
+            "bytes_published": self._server.bytes_published,
+            "bytes_served_locally": self._server.bytes_served_locally,
+            "partitions_retained": self._server.partition_count,
+        }
+        if self._flow_control is not None:
+            out.update({f"credit_{k}": v for k, v in self._flow_control.stats().items()})
+        elif self._credits is not None:
+            out["credit_window"] = self._credits
+        return out
 
     def release(self, ticket: ShuffleTicket) -> None:
         """Evict one published partition once its reducers have fetched it."""

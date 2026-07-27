@@ -26,15 +26,30 @@ __all__ = [
 ]
 
 
-def record_spill(prof, partitions: int) -> None:
-    """Record that the out-of-core spill path was taken into the profile."""
-    prof.carbonite_summary = f"out-of-core spill ({partitions} partitions)"
+def record_spill(prof, partitions: int, reason: str | None = None) -> None:
+    """Record that the out-of-core spill path was taken into the profile.
+
+    `reason` names *why* Carbonite routed the query out of core. A partition count alone
+    says what happened; the reason separates "this plan is too big" (reshape the plan)
+    from "the box is under pressure" (find what else is holding memory), which are
+    indistinguishable from the outside and call for opposite responses.
+
+    Args:
+        prof: The profile collector.
+        partitions: How many out-of-core buckets the spilled state was sharded into.
+        reason: Carbonite's spill reason, or `None` when it was not recorded.
+    """
+    because = f" — {reason}" if reason else ""
+    prof.carbonite_summary = f"out-of-core spill ({partitions} partitions){because}"
     prof.decisions.append(
         Decision(
             subsystem="carbonite",
             category="spill",
-            summary=f"executed out-of-core under bounded memory ({partitions} partitions)",
-            detail={"partitions": partitions},
+            summary=(
+                f"executed out-of-core under bounded memory ({partitions} partitions)"
+                f"{because}"
+            ),
+            detail={"partitions": partitions, "reason": reason},
         )
     )
 

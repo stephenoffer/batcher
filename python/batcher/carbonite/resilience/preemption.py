@@ -159,7 +159,9 @@ class PreemptionMonitor:
         """Stop polling and restore the prior SIGTERM handler. Idempotent."""
         self._stop.set()
         thread = self._thread
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
+            # Never join from inside the poll thread itself (a drain callback that calls
+            # `stop()` would otherwise deadlock waiting for its own thread to finish).
             thread.join(timeout=1.0)
         with self._lock:
             self._thread = None
@@ -176,14 +178,23 @@ class PreemptionMonitor:
             self._safe_call(callback)
 
     def _poll_loop(self) -> None:
-        while not self._stop.is_set():
-            draining = False
-            with contextlib.suppress(Exception):
-                draining = self._probe()
-            if draining:
-                self.trigger()
-                return  # sticky — nothing more to watch
-            self._stop.wait(self._poll_interval_s)
+        try:
+            while not self._stop.is_set():
+                draining = False
+                with contextlib.suppress(Exception):
+                    draining = self._probe()
+                if draining:
+                    self.trigger()
+                    return  # sticky — nothing more to watch
+                self._stop.wait(self._poll_interval_s)
+        finally:
+            # Release the thread slot on the way out, whichever way we left. `start()` is
+            # a no-op while `_thread` is set, so a loop that exited on its own (a drain
+            # was observed, or the probe raised out) left the monitor permanently
+            # un-startable — with a dead thread standing in for a live one.
+            with self._lock:
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _install_sigterm(self) -> None:
         try:

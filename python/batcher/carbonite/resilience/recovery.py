@@ -14,6 +14,8 @@ by every shuffle shape.
 
 from __future__ import annotations
 
+import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
@@ -22,6 +24,13 @@ from batcher._internal import events
 from batcher._internal.errors import ResourceError
 
 __all__ = ["RecoveryPolicy", "ShuffleRecovery"]
+
+# Ceiling on one backoff sleep, however many rounds have elapsed. `base * 2**round` is
+# unbounded in the exponent, so a policy configured with a generous base and a generous
+# attempt budget can put a reducer to sleep for longer than the query it is recovering —
+# and a worker that is coming back does so on cluster-restart timescales, not exponential
+# ones. Capping keeps the decorrelation the backoff exists for while bounding the wait.
+_MAX_BACKOFF_S = 30.0
 
 _Result = TypeVar("_Result")
 _Failed = TypeVar("_Failed")
@@ -108,10 +117,7 @@ class ShuffleRecovery:
             # a correlated preemption wave's retries, so survivors aren't stampeded by
             # every lost reducer retrying at the same instant.
             if self._policy.backoff_base_s > 0:
-                import random
-                import time
-
-                ceiling = self._policy.backoff_base_s * (2**round_idx)
+                ceiling = min(self._policy.backoff_base_s * (2**round_idx), _MAX_BACKOFF_S)
                 half = ceiling / 2.0
                 time.sleep(half + random.uniform(0.0, half))
         events.publish(

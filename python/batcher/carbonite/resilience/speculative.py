@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from batcher._internal import events
+from batcher._internal.errors import ResourceError
 from batcher._internal.logging import get_logger
 
 __all__ = ["SpeculationPolicy", "gather_with_backups", "stragglers_to_backup"]
@@ -67,6 +68,13 @@ class SpeculationPolicy:
     straggler_factor: float = 1.5
     min_finished_frac: float = 0.75
     max_backups: int = 0
+    #: Floor on a task's elapsed time before it can be called a straggler at all. The
+    #: `straggler_factor` test is purely *relative*, so on a fast stage — a median of 5 ms
+    #: is ordinary for a small partition — any task at 8 ms trips it, and the barrier
+    #: spends a scheduling slot, a worker, and a whole duplicate fetch to save three
+    #: milliseconds it will not even save, because the backup starts from zero. Speculation
+    #: only pays when the time it might reclaim exceeds the time it costs to launch.
+    min_elapsed_s: float = 1.0
 
 
 def stragglers_to_backup(
@@ -80,14 +88,31 @@ def stragglers_to_backup(
     Pure (no Ray, no clock): `finished` maps a finished task index to its completion
     time, `elapsed` maps a still-running task index to its current elapsed time.
     Returns `[]` until `min_finished_frac` of the `n` tasks have finished, then the
-    running tasks slower than `straggler_factor x median(finished)`, capped at
-    `max_backups`. Empty when speculation is disabled (`max_backups <= 0`).
+    running tasks slower than `straggler_factor x median(finished)` **and** past
+    `min_elapsed_s` in absolute terms, capped at `max_backups`. Empty when speculation is
+    disabled (`max_backups <= 0`).
+
+    The absolute floor is what keeps the relative test honest on a fast stage: with a 5 ms
+    median, every task at 8 ms is a "straggler" by ratio, and duplicating it costs strictly
+    more than it can save.
+
+    Args:
+        n: Total tasks at the barrier.
+        finished: Finished task index → its completion time in seconds.
+        elapsed: Still-running task index → its elapsed time in seconds.
+        policy: When to speculate.
+
+    Returns:
+        The indices to back up, slowest first.
     """
     if policy.max_backups <= 0 or not finished:
         return []
     if len(finished) < max(1, math.ceil(policy.min_finished_frac * n)):
         return []
-    threshold = policy.straggler_factor * statistics.median(finished.values())
+    threshold = max(
+        policy.straggler_factor * statistics.median(finished.values()),
+        policy.min_elapsed_s,
+    )
     laggards = [i for i, e in elapsed.items() if e > threshold]
     laggards.sort(key=lambda i: elapsed[i], reverse=True)  # slowest first
     return laggards[: policy.max_backups]
@@ -139,6 +164,18 @@ def gather_with_backups(
     stall_warnings = 0
 
     while len(result_of) < n:
+        if not pending:
+            # Nothing left to wait on, yet some slot has no result. `ray.wait([])` returns
+            # immediately, so continuing would spin this loop at 100% of a core with no
+            # way out. It should be unreachable — every ref either resolves a slot or is
+            # replaced by a backup — so the honest response is to say which slots are
+            # stranded rather than to hang the query burning CPU.
+            missing = sorted(set(range(n)) - set(result_of))
+            raise ResourceError(
+                f"shuffle barrier lost every copy of {len(missing)} task(s) "
+                f"(slots {missing[:8]}{'...' if len(missing) > 8 else ''}) with nothing "
+                "left in flight"
+            )
         # Drain *all* currently-ready refs per wake (not one): a burst of completions
         # is collected in a single iteration instead of one Python wakeup each. The
         # `poll_seconds` timeout still bounds the wake, so the straggler-backup cadence

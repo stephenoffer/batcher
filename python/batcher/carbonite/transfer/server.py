@@ -12,7 +12,8 @@ reads the partition straight from this server's store with no socket hop.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -22,7 +23,14 @@ from batcher._internal.native import engine
 if TYPE_CHECKING:
     from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
 
-__all__ = ["FlightShuffleServer", "ShuffleClient", "ShuffleTicket", "fetch"]
+__all__ = [
+    "FlightShuffleServer",
+    "ShuffleClient",
+    "ShuffleTicket",
+    "bytes_fetched",
+    "fetch",
+    "reset_bytes_fetched",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +42,23 @@ class ShuffleTicket:
     src_partition: int
     dst_partition: int
     epoch: int = 0
+    # The wire form, built once. An all-to-all shuffle has `workers²` tickets and every
+    # transport call re-formats the one it is passed — `gather_*` builds a fresh
+    # `[(addr, str(ticket))]` list per round — so the string was being rebuilt on the
+    # per-fetch path. Excluded from equality and repr: it is a rendering of the five
+    # fields above, never an independent part of the ticket's identity.
+    _wire: str = field(init=False, repr=False, compare=False, default="")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_wire",
+            f"{self.plan_id}/{self.stage_id}/{self.src_partition}/"
+            f"{self.dst_partition}/{self.epoch}",
+        )
 
     def __str__(self) -> str:
-        return (
-            f"{self.plan_id}/{self.stage_id}/{self.src_partition}/{self.dst_partition}/{self.epoch}"
-        )
+        return self._wire
 
 
 class FlightShuffleServer:
@@ -317,12 +337,11 @@ class ShuffleClient:
 
         `token` is the shuffle auth secret presented to an auth-gated peer.
         """
-        global _BYTES_FETCHED
         if credits is None:
             batches = self._client.fetch(addr, str(ticket), token=token)
         else:
             batches = self._client.fetch(addr, str(ticket), credits, token)
-        _BYTES_FETCHED += sum(b.nbytes for b in batches)
+        _add_bytes_fetched(sum(b.nbytes for b in batches))
         return batches
 
     @property
@@ -332,6 +351,30 @@ class ShuffleClient:
 
 
 _BYTES_FETCHED = 0
+# The reducer-ingress counter is written from every fetching thread (a join reducer runs
+# two gathers at once, and each `gather_*` fans out further). `+=` on a module global is a
+# read-modify-write, so concurrent fetches silently lost bytes from the one figure that is
+# supposed to measure how much data actually crossed the wire.
+_BYTES_LOCK = threading.Lock()
+
+
+def _add_bytes_fetched(n: int) -> None:
+    """Fold `n` fetched bytes into the process-wide ingress counter."""
+    global _BYTES_FETCHED
+    with _BYTES_LOCK:
+        _BYTES_FETCHED += n
+
+
+def reset_bytes_fetched() -> None:
+    """Zero the process-wide shuffle-ingress counter.
+
+    A per-process lifetime total cannot answer "how much did *this query* fetch", which is
+    the question a benchmark and a per-query profile both ask. Zeroing at a known point and
+    reading `bytes_fetched()` after gives the delta.
+    """
+    global _BYTES_FETCHED
+    with _BYTES_LOCK:
+        _BYTES_FETCHED = 0
 
 
 def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[pa.RecordBatch]:
@@ -341,14 +384,13 @@ def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[
     fetches so the gRPC channel is reused. `credits` is the flow-control window
     Carbonite grants; `None` uses the engine's conservative default window.
     """
-    global _BYTES_FETCHED
     flight_fetch = engine().flight_fetch
     batches = (
         flight_fetch(addr, str(ticket))
         if credits is None
         else flight_fetch(addr, str(ticket), credits)
     )
-    _BYTES_FETCHED += sum(b.nbytes for b in batches)
+    _add_bytes_fetched(sum(b.nbytes for b in batches))
     return batches
 
 

@@ -16,8 +16,11 @@ in `api` computes the key — Carbonite cannot import `kyber`).
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import threading
 from dataclasses import dataclass
+from typing import ClassVar
 
 import pyarrow as pa
 
@@ -25,7 +28,7 @@ from batcher._internal.mathx import safe_div
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import active_config
 
-__all__ = ["CacheStore", "current_result_cache", "result_cache"]
+__all__ = ["CacheStore", "current_result_cache", "reset_result_cache", "result_cache"]
 
 
 @dataclass(slots=True)
@@ -36,6 +39,7 @@ class _Entry:
     keepalive: object
     cost: float  # wall-clock seconds the result took to compute (recompute cost)
     hits: int  # times served since insertion (access frequency)
+    seq: int = 0  # insertion order, the eviction tie-break (oldest goes first)
 
     def value(self) -> float:
         """Greedy-Dual-Size-Frequency keep-value: recompute-cost x frequency / size.
@@ -64,6 +68,13 @@ class CacheStore:
     real RAM.
     """
 
+    # Fractions of the budget the cache is trimmed to at each pressure level. Storage always
+    # yields to execution, never the reverse, so these only ever shrink the cache.
+    _PRESSURE_RETAIN: ClassVar[dict[PressureLevel, float]] = {
+        PressureLevel.ELEVATED: 0.75,
+        PressureLevel.SPILL: 0.5,
+    }
+
     def __init__(self, max_bytes: int) -> None:
         self._max_bytes = max(0, max_bytes)
         # key -> _Entry. The keep-alive pins whatever the caller derived the key from
@@ -77,12 +88,36 @@ class CacheStore:
         # value): the aggregate hit-rate tells whether the result cache is *earning its RAM*.
         self._hits = 0
         self._misses = 0
+        # Entries dropped to stay within budget over this store's life. A hit rate alone
+        # cannot distinguish "nobody asked for it again" from "it was evicted before they
+        # could" — the first says the cache is not useful here, the second says it is too
+        # small — and those call for opposite responses.
+        self._evictions = 0
         self._lock = threading.Lock()
+        # Monotonic insertion counter, so eviction ties break on insertion order (oldest
+        # first) with a total order that never compares two `_Entry` objects.
+        self._seq = itertools.count()
 
     @property
     def max_bytes(self) -> int:
         """The cache's byte budget."""
         return self._max_bytes
+
+    def set_budget(self, max_bytes: int) -> None:
+        """Resize the storage envelope, evicting down at once if it shrank.
+
+        The reconcile `result_cache()` performs. It is a method rather than the module
+        function reaching in through `_lock` and `_max_bytes`, because reaching in put the
+        store's two invariants — the budget and the accounted bytes — outside the class
+        that maintains them, which is exactly where a later edit stops keeping them
+        together.
+
+        Args:
+            max_bytes: The new byte budget. Negative is treated as zero.
+        """
+        with self._lock:
+            self._max_bytes = max(0, max_bytes)
+            self._evict_to(self._max_bytes)
 
     @property
     def used_bytes(self) -> int:
@@ -101,15 +136,25 @@ class CacheStore:
             return None
 
     def stats(self) -> dict[str, int | float]:
-        """Result-cache effectiveness: hits, misses, aggregate hit-rate, and bytes held —
-        the signal for whether the cache is earning its RAM. Hit-rate is `0.0` before any get."""
+        """Result-cache effectiveness: hits, misses, evictions, and how full it is.
+
+        Returns:
+            The hit/miss counts and aggregate hit-rate (`0.0` before any get), the byte
+            budget and what is held against it, the entry count, and how many entries were
+            evicted. Evictions are what disambiguate a poor hit rate: many of them means
+            the budget is too small, none of them means the cache is not useful here.
+        """
         with self._lock:
             total = self._hits + self._misses
             return {
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": safe_div(self._hits, total),
+                "evictions": self._evictions,
+                "entries": len(self._entries),
                 "used_bytes": self._used,
+                "max_bytes": self._max_bytes,
+                "fill": safe_div(self._used, self._max_bytes),
             }
 
     def put(self, key: str, table: pa.Table, keepalive: object = None, cost: float = 0.0) -> None:
@@ -130,7 +175,9 @@ class CacheStore:
             existing = self._entries.pop(key, None)
             if existing is not None:
                 self._used -= existing.table.nbytes
-            self._entries[key] = _Entry(table=table, keepalive=keepalive, cost=cost, hits=0)
+            self._entries[key] = _Entry(
+                table=table, keepalive=keepalive, cost=cost, hits=0, seq=next(self._seq)
+            )
             self._used += size
             self._evict_to(self._max_bytes)
 
@@ -140,6 +187,19 @@ class CacheStore:
             entry = self._entries.pop(key, None)
             if entry is not None:
                 self._used -= entry.table.nbytes
+
+    def __len__(self) -> int:
+        """How many results are cached right now."""
+        return len(self._entries)
+
+    def __contains__(self, key: str) -> bool:
+        """Whether `key` is cached, **without** counting a hit or refreshing its value.
+
+        A membership test is not an access, so it must not move the eviction ranking. The
+        alternative — probing with `get` — silently promotes an entry every time anything
+        merely asks whether it exists.
+        """
+        return key in self._entries
 
     def clear(self) -> None:
         """Evict everything, returning all storage memory."""
@@ -172,12 +232,14 @@ class CacheStore:
         """
         if level >= PressureLevel.CRITICAL:
             self.clear()
-        elif level >= PressureLevel.SPILL:
-            with self._lock:
-                self._evict_to(self._max_bytes // 2)
-        elif level >= PressureLevel.ELEVATED:
-            with self._lock:
-                self._evict_to(self._max_bytes * 3 // 4)
+            return
+        retain = self._PRESSURE_RETAIN.get(
+            PressureLevel.SPILL if level >= PressureLevel.SPILL else PressureLevel.ELEVATED
+        )
+        if level < PressureLevel.ELEVATED or retain is None:
+            return
+        with self._lock:
+            self._evict_to(int(self._max_bytes * retain))
 
     def _evict_to(self, target_bytes: int) -> None:
         """Evict the lowest-value entries until `used <= target_bytes`.
@@ -186,22 +248,27 @@ class CacheStore:
         cold, large → goes first); ties break by insertion order (the oldest), so a
         never-hit zero-cost set degrades to size-then-FIFO.
 
-        An entry's keep-value is independent of which *other* entries remain, so the
-        eviction order is a single stable sort — not a fresh O(n) min-scan per victim.
-        That makes a bulk eviction (`on_pressure` halving the cache, a large insert
-        pushing out many small entries) O(n log n) instead of O(n²), and computes each
-        `value()` once instead of once per comparison per round.
+        A heap, not a sort. An entry's keep-value is independent of which *other* entries
+        remain, so the victims could be fully ordered up front — but the usual eviction
+        drops one or two entries out of many, and fully ordering `n` entries to remove two
+        is `O(n log n)` where `O(n + k log n)` will do. `heapify` pays the linear scan
+        either way and then charges only for the victims actually taken, which is the
+        common case; a bulk eviction (`on_pressure` halving the cache) degrades to the same
+        `O(n log n)` the sort had. Each `value()` is still computed exactly once.
         """
         if self._used <= target_bytes or not self._entries:
             return
-        # Stable sort keeps insertion order among equal values → oldest evicted first,
-        # matching the previous per-round `min` tie-break exactly.
-        victims = sorted(self._entries.items(), key=lambda kv: kv[1].value())
-        for key, entry in victims:
-            if self._used <= target_bytes:
-                break
-            del self._entries[key]
+        # `(value, seq, key)`: the seq makes the order total, so two equal-value entries
+        # never fall through to comparing keys or entries, and the older one goes first.
+        heap = [(e.value(), e.seq, k) for k, e in self._entries.items()]
+        heapq.heapify(heap)
+        while heap and self._used > target_bytes:
+            _, _, key = heapq.heappop(heap)
+            entry = self._entries.pop(key, None)
+            if entry is None:  # pragma: no cover - defensive: concurrent invalidate
+                continue
             self._used -= entry.table.nbytes
+            self._evictions += 1
 
 
 _result_cache: CacheStore | None = None
@@ -217,18 +284,29 @@ def result_cache() -> CacheStore:
     """
     global _result_cache
     budget = active_config().memory.result_cache_max_bytes
-    if _result_cache is None:
+    cache = _result_cache
+    if cache is None:
         with _result_cache_lock:
             if _result_cache is None:
                 _result_cache = CacheStore(budget)
                 return _result_cache
-    if _result_cache.max_bytes != budget:
-        with _result_cache._lock:
-            _result_cache._max_bytes = max(0, budget)
-            _result_cache._evict_to(_result_cache._max_bytes)
-    return _result_cache
+            cache = _result_cache
+    if cache.max_bytes != budget:
+        cache.set_budget(budget)
+    return cache
 
 
 def current_result_cache() -> CacheStore | None:
     """The process-wide result cache if one has been created, else `None`."""
     return _result_cache
+
+
+def reset_result_cache() -> None:
+    """Drop the process-wide result cache so the next call builds a fresh one.
+
+    For tests, which otherwise inherit whatever entries and hit/miss counters an earlier
+    test left behind — the same reason `reset_process_pool` exists for the buffer pool.
+    """
+    global _result_cache
+    with _result_cache_lock:
+        _result_cache = None

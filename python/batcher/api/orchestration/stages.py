@@ -154,7 +154,7 @@ def spill_to_disk(
     if ctx.profile is not None:
         from batcher.api.terminal.profile import record_spill
 
-        record_spill(ctx.profile, partitions)
+        record_spill(ctx.profile, partitions, rm.spill_reason(opt))
     # Force the learned spill codec (large IO-bound state compresses; small state does not).
     # IPC self-describes its codec, so the un-spilled result is byte-identical either way.
     with spill_compression_scope(rm, opt):

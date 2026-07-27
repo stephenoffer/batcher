@@ -57,6 +57,11 @@ class ExecutionGrant:
     #: How many queries (including this one) held a slot when it was granted. Carried for
     #: observability: a rising number is what an operator needs to see before latency does.
     concurrent: int
+    #: Seconds this query spent waiting for a slot. The number that separates "the engine
+    #: is slow" from "the engine was never running" — a p99 dominated by queueing needs
+    #: capacity, while one dominated by execution needs a faster plan, and from outside
+    #: the two are the same wall-clock reading.
+    queued_s: float = 0.0
 
 
 class ConcurrencyLimiter:
@@ -90,11 +95,35 @@ class ConcurrencyLimiter:
         self._active = 0
         self._waiting = 0
         self._depth = threading.local()
+        # Lifetime counters for the two things an operator needs to know about admission:
+        # how often it made a query wait at all, and how often it shed one.
+        self._queued = 0
+        self._rejected = 0
 
     @property
     def active(self) -> int:
         """Queries currently holding a slot."""
         return self._active
+
+    @property
+    def waiting(self) -> int:
+        """Queries currently queued for a slot."""
+        return self._waiting
+
+    def stats(self) -> dict[str, int]:
+        """Admission counters: live occupancy, and the lifetime queue/shed totals.
+
+        Returns:
+            `slots`/`active`/`waiting` for the live picture, plus `queued` (queries that
+            had to wait) and `rejected` (queries turned away by a full queue or a deadline).
+        """
+        return {
+            "slots": self._slots,
+            "active": self._active,
+            "waiting": self._waiting,
+            "queued": self._queued,
+            "rejected": self._rejected,
+        }
 
     def width_for(self, active: int) -> int:
         """Rayon pool width for one query when `active` are running.
@@ -111,12 +140,20 @@ class ConcurrencyLimiter:
         """
         if self._slots <= 0 or active <= 1:
             return 0  # unbounded: the historical single-query behavior
-        cores = self._cores
-        if cores <= 0:
+        return max(1, self._core_count() // active)
+
+    def _core_count(self) -> int:
+        """Cores to divide among running queries, memoized after the first probe.
+
+        `available_cpu_count` parses the cgroup CPU quota, and the core count of a running
+        process does not change. It was being re-derived on every admission, on the path
+        whose entire reason to exist is that the machine is already contended.
+        """
+        if self._cores <= 0:
             from batcher._internal.hardware import available_cpu_count
 
-            cores = available_cpu_count()
-        return max(1, cores // active)
+            self._cores = max(1, available_cpu_count())
+        return self._cores
 
     def acquire(self, timeout: float = 0.0) -> ExecutionGrant:
         """Wait for a slot and return the grant. Releases via `release`.
@@ -139,11 +176,15 @@ class ConcurrencyLimiter:
         depth = getattr(self._depth, "value", 0)
         if depth > 0:
             self._depth.value = depth + 1
-            return ExecutionGrant(workers=self.width_for(self._active), concurrent=self._active)
+            with self._lock:
+                active = self._active
+            return ExecutionGrant(workers=self.width_for(active), concurrent=active)
 
-        deadline = (time.monotonic() + timeout) if timeout > 0 else None
+        started = time.monotonic()
+        deadline = (started + timeout) if timeout > 0 else None
         with self._lock:
             if self._waiting >= self._queue_depth:
+                self._rejected += 1
                 raise AdmissionTimeout(
                     f"{self._waiting} queries are already queued for an execution slot "
                     f"(cap {self._queue_depth}).",
@@ -153,10 +194,13 @@ class ConcurrencyLimiter:
                     ),
                 )
             self._waiting += 1
+            if self._active >= self._slots:
+                self._queued += 1
             try:
                 while self._active >= self._slots:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
+                        self._rejected += 1
                         raise AdmissionTimeout(
                             f"waited {timeout:.1f}s for an execution slot "
                             f"({self._active} of {self._slots} in use).",
@@ -168,13 +212,26 @@ class ConcurrencyLimiter:
             self._active += 1
             active = self._active
         self._depth.value = 1
-        return ExecutionGrant(workers=self.width_for(active), concurrent=active)
+        return ExecutionGrant(
+            workers=self.width_for(active),
+            concurrent=active,
+            queued_s=time.monotonic() - started,
+        )
 
     def release(self) -> None:
-        """Give the slot back. Safe to call for a nested acquire, which held none."""
+        """Give the slot back. Safe to call for a nested acquire, which held none.
+
+        A release with no matching acquire on this thread is ignored. It used to free a
+        slot anyway, so one unbalanced call (an `admit()` whose acquire raised, a caller
+        releasing twice) permanently inflated the pool: `_active` fell below the number of
+        queries actually running and the limiter admitted that many extra forever — the
+        oversubscription it exists to prevent, caused by the mechanism preventing it.
+        """
         if self._slots <= 0:
             return
         depth = getattr(self._depth, "value", 0)
+        if depth <= 0:
+            return  # never acquired on this thread — not ours to give back
         if depth > 1:
             self._depth.value = depth - 1
             return
@@ -193,7 +250,11 @@ class ConcurrencyLimiter:
 # `memory.pool.process_pool` reconciles its budget, so a `config_context` that raises the
 # limit takes effect rather than being silently ignored.
 _LIMITER: ConcurrencyLimiter | None = None
-_LIMITER_SLOTS: int = -1
+# The `(slots, queue_depth)` the live limiter was built from. Both, not just the slot
+# count: keying on slots alone meant a changed `admission_queue_depth` was silently
+# ignored for the life of the process, so raising it — the fix the `AdmissionTimeout`
+# message itself recommends — did nothing unless the slot count happened to change too.
+_LIMITER_KEY: tuple[int, int] = (-1, -1)
 _LIMITER_LOCK = threading.Lock()
 
 
@@ -206,29 +267,29 @@ def process_limiter(config) -> ConcurrencyLimiter:
     Returns:
         The shared `ConcurrencyLimiter`.
     """
-    global _LIMITER, _LIMITER_SLOTS
+    global _LIMITER, _LIMITER_KEY
 
     execution = config.execution
-    slots = int(getattr(execution, "max_concurrent_queries", 0) or 0)
-    if _LIMITER is not None and slots == _LIMITER_SLOTS:
+    key = (
+        int(getattr(execution, "max_concurrent_queries", 0) or 0),
+        int(getattr(execution, "admission_queue_depth", 1000) or 1000),
+    )
+    if _LIMITER is not None and key == _LIMITER_KEY:
         return _LIMITER
     with _LIMITER_LOCK:
-        if _LIMITER is None or slots != _LIMITER_SLOTS:
+        if _LIMITER is None or key != _LIMITER_KEY:
             # Rebuilding drops the old limiter's in-flight accounting. That is acceptable
             # only because the slot count is deployment configuration, changed at startup
             # — not something a running workload flips. A rebuild under load would
             # briefly over-admit, never deadlock.
-            _LIMITER = ConcurrencyLimiter(
-                slots,
-                queue_depth=int(getattr(execution, "admission_queue_depth", 1000) or 1000),
-            )
-            _LIMITER_SLOTS = slots
+            _LIMITER = ConcurrencyLimiter(key[0], queue_depth=key[1])
+            _LIMITER_KEY = key
         return _LIMITER
 
 
 def reset_process_limiter() -> None:
     """Drop the process limiter, so the next call rebuilds it. For tests."""
-    global _LIMITER, _LIMITER_SLOTS
+    global _LIMITER, _LIMITER_KEY
     with _LIMITER_LOCK:
         _LIMITER = None
-        _LIMITER_SLOTS = -1
+        _LIMITER_KEY = (-1, -1)

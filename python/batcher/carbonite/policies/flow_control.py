@@ -32,7 +32,9 @@ __all__ = [
 _SHUFFLE_WINDOW_NS = "carbonite.shuffle_window"
 
 
-def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) -> int:
+def credit_ceiling(
+    config: Config, effective_morsel_bytes: int | None = None, *, channels: int | None = None
+) -> int:
     """The upper bound on a shuffle channel's credit window (count *and* bytes).
 
     The count ceiling (`default_credits x credit_ceiling_factor`) is further capped
@@ -40,15 +42,28 @@ def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) ->
     `credit_byte_budget` — bounding a channel's buffered memory regardless of row
     width. Always >= 1.
 
-    `effective_morsel_bytes` overrides the config `morsel_bytes` when a channel's real
-    per-batch size is known to be wider than the configured target — the learned-row-width
-    case (embeddings/blobs), where the assumed `morsel_bytes` under-counts the buffered
-    bytes and a fast producer would run the window well past `credit_byte_budget`.
+    Args:
+        config: The active config.
+        effective_morsel_bytes: Overrides the config `morsel_bytes` when a channel's real
+            per-batch size is known to be wider than the configured target — the
+            learned-row-width case (embeddings/blobs), where the assumed `morsel_bytes`
+            under-counts the buffered bytes and a fast producer would run the window well
+            past `credit_byte_budget`.
+        channels: How many channels are actually fetching at once. The whole-shuffle byte
+            budget is divided by this rather than by the configured `shuffle_fetch_fan_in`,
+            which is a *cap* on concurrency and not a measurement of it. A reducer with
+            three upstreams was being handed a budget sized for eight, so its three
+            channels could together buffer nearly three times the intended share — while a
+            reducer whose fan-out exceeds the configured cap got a share that was too
+            generous in the other direction. `None` keeps the configured fan-in.
+
+    Returns:
+        The maximum credits this channel may hold, at least 1.
     """
     fc = config.flow_control
     count_ceiling = fc.default_credits * fc.credit_ceiling_factor
     morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
-    byte_ceiling = max(1, _channel_byte_budget(config) // morsel_bytes)
+    byte_ceiling = max(1, _channel_byte_budget(config, channels) // morsel_bytes)
     return max(1, min(count_ceiling, byte_ceiling))
 
 
@@ -59,7 +74,7 @@ def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) ->
 _SHUFFLE_BUFFER_FRACTION = 0.10
 
 
-def _channel_byte_budget(config: Config) -> int:
+def _channel_byte_budget(config: Config, channels: int | None = None) -> int:
     """The per-channel buffered-byte budget: the configured cap, held under a share of the
     memory this machine actually has.
 
@@ -70,19 +85,29 @@ def _channel_byte_budget(config: Config) -> int:
     the backpressure path was not, so a node could be admitted for a query and then OOM'd by
     the transit buffers carrying it.
 
-    Caps only — it never raises the configured budget, so an operator who tuned this down
-    keeps their value and the change can only ever buffer *less* than before.
+    **Caps only.** It never raises the configured budget. The floor that keeps a tiny
+    container able to move a batch is therefore `min(configured, morsel_bytes)` and not
+    `morsel_bytes`: the latter silently *raised* a deliberately tiny `credit_byte_budget`
+    up to a morsel, so an operator who had tuned the transit buffer down below one morsel
+    got more buffering than they asked for from the one function whose contract is that it
+    only ever gives less.
+
+    Args:
+        config: The active config.
+        channels: Channels actually fetching at once; `None` uses the configured fan-in cap.
+
+    Returns:
+        The per-channel byte budget.
     """
     fc = config.flow_control
     configured = fc.credit_byte_budget
     total = total_memory_bytes()
     if total <= 0:
         return configured
-    fan_in = max(1, fc.shuffle_fetch_fan_in)
+    fan_in = max(1, channels if channels and channels > 0 else fc.shuffle_fetch_fan_in)
     headroom_per_channel = int(total * _SHUFFLE_BUFFER_FRACTION) // fan_in
-    # Floor at one morsel: a tiny container still has to be able to move one batch, and a
-    # zero budget here would collapse the window to a single credit and deadlock progress.
-    return max(config.execution.morsel_bytes, min(configured, headroom_per_channel))
+    floor = min(configured, config.execution.morsel_bytes)
+    return max(floor, min(configured, headroom_per_channel))
 
 
 def learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
@@ -160,6 +185,13 @@ _CUBIC_C = 0.4
 # window's *ramp*: same ceiling, same backoff, so the memory bound and results are
 # unchanged.
 _SLOW_START_FACTOR = 2
+# How far past a backoff the recovery clock keeps counting. The cubic is monotone in `t`
+# beyond `K`, so once `t` is this far out the curve is above any reachable ceiling and the
+# window is pinned there regardless — advancing the clock further changes nothing except
+# the size of the number being cubed. A long-lived streaming channel observes millions of
+# rounds, and `(t - k)**3` on an unbounded `t` is both wasted work and, at the far
+# extreme, a float overflow.
+_MAX_RECOVERY_ROUNDS = 1 << 20
 
 
 class AIMDFlowControl:
@@ -216,6 +248,17 @@ class AIMDFlowControl:
         # recover toward and growth is slow-start or plain additive.
         self._w_max: float | None = None
         self._rounds_since_backoff = 0
+        # `K`, the round at which the cubic returns to `_w_max`. It is a function of
+        # `_w_max` and `_beta` alone, both of which change only at a backoff — so it is
+        # computed there rather than re-deriving a cube root on every uncongested round of
+        # every channel of every shuffle.
+        self._k = 0.0
+        # Lifetime counters, so a channel can say what its window actually did. A shuffle
+        # that backs off on most rounds is a shuffle whose reducer is memory-bound, and
+        # that reads as "the query is slow" with nothing pointing at the cause.
+        self._backoffs = 0
+        self._rounds = 0
+        self._peak_window = int(self._window)
 
     @property
     def window(self) -> int:
@@ -257,8 +300,33 @@ class AIMDFlowControl:
         self._window = float(min(max(credits, self._floor), self._ceiling))
         self._slow_start = False
         self._w_max = None
+        self._k = 0.0
         self._rounds_since_backoff = 0
         return self.window
+
+    @property
+    def backoffs(self) -> int:
+        """How many rounds this channel has backed off on over its life."""
+        return self._backoffs
+
+    def stats(self) -> dict[str, int | float]:
+        """What this channel's window actually did — the shuffle's backpressure story.
+
+        Returns:
+            The live and peak window, the ceiling it was clamped to, how many rounds were
+            observed, how many backed off, and the resulting backoff *rate*. A high rate
+            means the reducer is memory-bound rather than network-bound, which is the
+            distinction an operator otherwise has no way to make.
+        """
+        return {
+            "window": self.window,
+            "peak_window": self._peak_window,
+            "ceiling": self._ceiling,
+            "rounds": self._rounds,
+            "backoffs": self._backoffs,
+            "backoff_rate": (self._backoffs / self._rounds) if self._rounds else 0.0,
+            "slow_start": int(self._slow_start),
+        }
 
     def observe(self, *, congested: bool) -> int:
         """Update the window from one round's congestion signal; return the new window.
@@ -268,19 +336,37 @@ class AIMDFlowControl:
         slow-start. Else the consumer kept up with headroom to spare: double the window
         in slow-start, otherwise grow along the CUBIC curve toward the window the last
         backoff happened at (`_grown_window`), never below what additive increase would give.
+
+        Args:
+            congested: Whether this round hit backpressure.
+
+        Returns:
+            The new credit window.
         """
+        self._rounds += 1
         if congested:
             # Remember the window congestion was found at: that is the channel's measured
             # capacity, and the point growth should return to rather than crawl toward.
             self._w_max = self._window
             self._rounds_since_backoff = 0
+            # K depends only on `w_max` and `beta`, so this is the one place it can change.
+            # Deriving it here instead of per growth round takes a cube root off the
+            # per-round path of every channel of every shuffle.
+            self._k = (self._w_max * (1.0 - self._beta) / _CUBIC_C) ** (1.0 / 3.0)
             self._window = max(self._floor, self._window * self._beta)
             self._slow_start = False
+            self._backoffs += 1
         elif self._slow_start:
             self._window = min(self._ceiling, self._window * _SLOW_START_FACTOR)
         else:
-            self._rounds_since_backoff += 1
+            # The clock only matters until the cubic has passed the ceiling; past that the
+            # window is pinned there anyway. Holding it bounds `(t - k)**3` to a small
+            # number instead of letting a long-lived channel cube a growing integer every
+            # round forever (and, at the extreme, overflow the float).
+            if self._rounds_since_backoff < _MAX_RECOVERY_ROUNDS:
+                self._rounds_since_backoff += 1
             self._window = min(self._ceiling, self._grown_window())
+        self._peak_window = max(self._peak_window, self.window)
         return self.window
 
     def _grown_window(self) -> float:
@@ -295,12 +381,11 @@ class AIMDFlowControl:
         reno = self._window + self._alpha
         if self._w_max is None:
             return reno
-        # K: the round at which the cubic returns to `w_max`, measured from the backoff.
-        # Solving `w_max = w_max + C·(K - K)³` is trivial; K comes from requiring the curve
-        # to pass through the *post-backoff* window at t = 0, i.e. `C·K³ = w_max·(1 - beta)`.
-        k = (self._w_max * (1.0 - self._beta) / _CUBIC_C) ** (1.0 / 3.0)
+        # `W(t) = w_max + C·(t - K)³`, with K (computed at the backoff) the round the curve
+        # returns to `w_max`. K comes from requiring the curve to pass through the
+        # *post-backoff* window at t = 0, i.e. `C·K³ = w_max·(1 - beta)`.
         t = float(self._rounds_since_backoff)
-        cubic = self._w_max + _CUBIC_C * (t - k) ** 3
+        cubic = self._w_max + _CUBIC_C * (t - self._k) ** 3
         return max(reno, min(cubic, self._ceiling))
 
     def _clamp(self, w: float) -> int:
