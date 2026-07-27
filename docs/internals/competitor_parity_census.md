@@ -362,6 +362,169 @@ dedup and null rules do not apply.
 **Verified** by 11 differential cases whose fixture crosses both operands over disjoint,
 overlapping, contained, null and empty lists — every row is one of the edge cases above.
 
+### 166-170. Four rewrites the reference optimizers have, and one they inspired
+
+**Source:** DuckDB's `optimizer/rule/` (27 files) and Spark's
+`optimizer/expressions.scala` (15 rules), probed against the plans Batcher actually
+produces rather than read for names.
+
+**Most of it is already here** — distributivity, de Morgan, LIKE despecialization to
+`=`/`ends_with`/`contains`, `LIKE 'abc%'` straight to a range, IN-list intersection and
+refinement, the sargable arithmetic peels, `x + 0`, `abs(abs(x))`. The probe is in this
+file's history because the *negative* result is the expensive part to rediscover.
+
+**Two apparent gaps were deliberate refusals the code already documents**, and "fixing"
+either would have been a wrong-answer bug:
+
+* `col + k < lit → col < lit - k` is **not** applied. The engine's arithmetic wraps, so
+  reassociating an *ordered* comparison breaks monotonicity: at `col = INT64_MAX`,
+  `col + 5 > 10` is false while `col > 5` is true. `sargable.py` says so; the equality
+  forms are rewritten and the ordered ones are not.
+* `x * 0 → 0` and `x - x → 0` are wrong for a null `x`.
+
+**Four were real, and three of them are the same shape of defect**: a predicate the
+optimizer *could* make sargable, spelled the way a DataFrame user writes it rather than
+the way SQL does.
+
+1. `c = v1 OR c = v2 OR …` → `c IN (…)` (DuckDB `contains_to_in_clause`). The direct win
+   is one hash-set probe instead of *n* comparisons. The larger one is that this
+   repository already carries **eight rules keyed on `InList`** — `prune_in_list_by_zonemap`,
+   `prune_in_list_by_bloom`, `dedup_in_list`, `refine_in_list_by_equality`/`_comparison`/
+   `_neq`, `intersect_in_lists`, `push_in_list_across_join_keys` — none of which can fire
+   on the `OR` form. Producing the node they match turns all eight on.
+2. `starts_with(col, 'abc')` and 3. `substr(col, 1, 3) = 'abc'` → the exact range
+   `col >= 'abc' AND col < 'abd'` that `LIKE 'abc%'` has always been given. These are the
+   *DataFrame* spellings of that predicate, so `.str.starts_with(...)` scanned every row
+   group while the SQL form skipped them.
+4. `len(col) = 0` → `col = ''`, unwrapping the column so zone maps, blooms and pushdown
+   can see it at all.
+
+Plus `(x + c1) + (y + c2)` → `(x + y) + (c1 + c2)` (Spark `ReorderAssociativeOperator`):
+`fold_add_sub_constants` collapses a chain nested down one side but cannot see this one,
+because neither operand is a bare literal, so the constants stay one addition apart
+however many fixpoint passes run.
+
+**Writing the first surfaced a regression it would otherwise have caused.**
+`or_to_in_and_range` derives `min ≤ c ≤ max` zone-map bounds *by reading the `OR` chain*,
+so consuming the chain first silently removed those bounds. It now reads the `InList` form
+too, and a test asserts both survive together. The name had also misled: despite reading
+`or_to_in`, it only ever added bounds — three other modules' comments deferred the
+single-column `IN` fold to it, and it never performed one.
+
+**Verified** by 40 cases (14 plan-shape, 26 differential). The differential tests project
+each predicate as a *value* rather than only filtering on it: under a filter NULL and
+FALSE both drop the row, so a filter-only test cannot tell a three-valued mistake from a
+correct rewrite. The reassociation is asserted at `INT64_MAX`, where the ring argument is
+the only thing keeping it exact.
+
+### 171-176. Every fold gets an explicit frame, from one generalization
+
+**Source:** this file's own open list, item 2 — "that one **generalizes**: its `FifoSum`
+is the two-stack sliding-window trick, which works for *any* associative operator, so one
+generalization would give every fold a framed form at once."
+
+`product`, `bool_and`, `bool_or`, `bit_and`, `bit_or` and `bit_xor` now honour an explicit
+`ROWS`/`GROUPS` frame. Six capabilities, one change: `window_frame::FifoSum` was the
+two-stack "queue from two stacks" specialized to `+`, and nothing about the structure was
+ever specific to addition. It is now `window_agg::SlidingFold`, generic over the combine.
+
+**Why that structure and not the obvious slide** is the whole point, and is what the tests
+pin. The naive O(1) update applies the entering value and *un-applies* the leaving one,
+which needs an **inverse** — and these folds have none. `product` cannot divide a zero back
+out; `bit_and` and `bool_and` cannot un-AND at all. The two-stack never un-applies: the
+reported value is always the fold of exactly what is in the window, at O(1) amortized cost.
+So the differential fixture contains a **zero** and a **false**, and asserts the window
+*recovers* once it has slid past them — with a subtract-based slide every later row is
+wrong, and no amount of ordinary test data shows it.
+
+Commutativity is the one property the generalization needs beyond associativity, because
+the two stacks' accumulators are combined without regard to which side is older. All six
+are commutative; the doc comment says so rather than leaving it implicit.
+
+`var`/`stddev` and `count_distinct` still refuse a frame, and the refusal is now for a
+*stated* reason rather than an absent kernel: the moment pair keeps a Welford state whose
+combine is Chan's parallel formula rather than an operator, and a distinct count needs a
+multiset rather than a fold. A test asserts all three still raise.
+
+**Verified** by 28 differential cases — six folds across trailing, centred,
+unbounded-preceding and leading frames, since the two-stack only reloads when its pop side
+empties and a reload bug appears only once the window has slid far enough to trigger one —
+plus the zero-recovery, false-recovery, and all-null-frame-is-NULL cases asserted directly.
+
+### 177-178. `.map.len()` and `.map.contains()`, with no kernel
+
+**Source:** this file's own open list, item 4 — "`.map` has three methods against DuckDB's
+eleven."
+
+Two of the eight missing ones need no Rust at all, because the key list already determines
+the answer: a map has exactly one key per entry by construction, so the key list's length
+*is* the cardinality, and membership in the map is membership in that list. `.map.len()` is
+`keys().list.len()` and `.map.contains(k)` is `keys().list.contains(k)`. Both reach SQL as
+`cardinality` and `map_contains`.
+
+Composing rather than writing a kernel is only correct if the composition **carries nullness
+the same way**, which is the whole risk and what the test file exists to check. Three cases
+a naive implementation collapses into one: a *null* map answers NULL, not `0`/`false`; an
+*empty* map answers `0`/`false`, not NULL; and an absent key in a non-empty map answers
+`false`, not NULL. The fixture asserts the full vectors — `[2, 1, None, 0]` and
+`[True, False, None, False]` — so a composition that flattened any pair would fail rather
+than merely differ on one row.
+
+Spark's `map_contains_key` is deliberately **not** in the anonymous-function table: sqlglot
+gives it a typed node, so a row there would never be reached and would be dead code.
+
+The remaining `.map` gaps (`map_entries`, `map_from_entries`, `map_concat`, `map_extract`,
+`element_at` on a map) all need a kernel, since none of them is recoverable from the key
+list alone.
+
+**Verified** by five differential cases against DuckDB, two of them through `bt.sql`.
+
+### 179-182. Four boolean normalizations, and the two of them that are half-rewrites
+
+**Source:** a rule-by-rule probe of `duckdb/src/optimizer/rule/` and
+`datafusion/datafusion/optimizer/src/` against Batcher's optimizer — 40 candidate
+rewrites, run through `Optimizer().optimize()` and checked on the resulting plan.
+
+The headline is how little was missing: **26 of the 40 already fired**, and four more
+that the probe reported as gaps were false negatives, already handled at construction
+(`5 = x` is built as `x = 5`) or by another rule (`x > x` collapses to a zero limit).
+Distributivity, De Morgan, the arithmetic identities, the `LIKE` family and the limit
+collapses were all there. Four were real, and are now in
+`kyber/rules/normalize/predicates.py`:
+
+* `self_comparison_to_null_check` (DuckDB `comparison_simplification`) — `a = a`,
+  `a <= a`, `a >= a` become `a IS NOT NULL`, answerable from a null count instead of a
+  scan.
+* `boolean_case_to_predicate` (DuckDB `case_simplification`) — `CASE WHEN c THEN true
+  ELSE false END` becomes `c`, which unlike the `CASE` can yield a range, push into a
+  source, or become a join key.
+* `intersect_in_lists` (DuckDB `in_clause_simplification`) — two `IN` lists on one
+  column under an `AND` become their intersection, which is what bloom probing and
+  source pushdown actually send down.
+* `constant_group_key_removed` (DataFusion `eliminate_group_by_constant`) — a literal
+  grouping key builds a one-entry hash table and, distributed, sends the whole relation
+  to a single node. The key returns as a projection so the schema is untouched.
+
+**The valuable part of this entry is what the tests refused.** Two of the four were
+written wrong first, and both mistakes were three-valued:
+
+* `self_comparison_to_null_check` was applied everywhere. `a = a` on a null row is NULL
+  and `a IS NOT NULL` is FALSE, so it returned `false` where DuckDB returned `NULL` as
+  soon as the predicate was *projected*. It is now filter-only.
+* `boolean_case_to_predicate` also rewrote the swapped branch, `THEN false ELSE true`,
+  to `NOT c`. That one is wrong **even under a filter**: the `CASE` sends a NULL
+  condition to `ELSE` and keeps the row, while `NOT c` is NULL and drops it. The rule is
+  now one-directional, and the asymmetry is stated rather than left as an omission.
+
+Neither would have been caught by a filter-only test, which is why every predicate in
+the fixture is run twice — once filtered, once projected as a value — over a column that
+carries a null. That is the same shape the prefix/length ledger entry used, and it has
+now paid twice.
+
+**Verified** by 15 plan-shape cases and 23 differential cases, with the negative tests
+(the projection context, the swapped `CASE`, the disjoint `IN` pair, the all-constant
+grouping over an empty input) carrying most of the weight.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -409,23 +572,28 @@ worth remembering the next time a reference engine will not run.
 Ordered by measured value, from the same censuses and a capability probe of the DataFrame
 surface.
 
-1. **`last_day(DATE)` returns a `TIMESTAMP`.** An engine-level type bug, not a translator
-   one: `.dt.last_day()` widens a `DATE` input to a timestamp. The only mismatch in the
-   census that is a defect in the data plane rather than a representation choice.
+1. **`.dt.date()` returns a midnight `TIMESTAMP`, not a `DATE`.** It is written as an
+   alias for `truncate('day')` and documented as returning a timestamp, but it is named
+   after Polars' `dt.date` and both Polars and DuckDB (`CAST(ts AS DATE)`, `date(ts)`)
+   return a `DATE`. Batcher's own `cast('date')` already does. A user who reaches for the
+   method the reference engines name gets a type that will not compare against a date
+   column. Found by the Polars census; `last_day(DATE)`, the earlier entry here, has since
+   been fixed and now returns `date32` for both `DATE` and `TIMESTAMP` inputs.
 2. **The window aggregates entries 152-160 did not take.** `median`, `quantile` and
    `mode` need an order-statistic structure for their running form; `arg_min`/`arg_max`
    and the two-input aggregates need a second input, which `WindowCall` has nowhere to
    put; `array_agg` accumulates O(n) state per row in the running form. Separately, none
-   of the nine that landed honours an explicit `ROWS` frame — the framed path has a
-   hand-written sliding kernel per function. That one **generalizes**: its `FifoSum` is
-   the two-stack sliding-window trick, which works for *any* associative operator, so one
-   generalization would give every fold a framed form at once.
+   of the nine that landed honours an explicit `ROWS` frame. **Closed by entries 171-176**
+   for the six folds; `var`/`stddev` and `count_distinct` remain, and cannot be closed the
+   same way (a Welford state is not a fold, and a distinct count needs a multiset).
 3. **Aggregates the engine does not have at all**: `entropy`, `mad`, `approx_top_k`,
    `bitstring_agg`, `histogram_exact`, `quantile_disc`, the `arg_*_null` variants, and a
    true `any_value`/`first`/`last` with no ordering requirement.
 4. **`struct` and `map` namespaces.** `.struct` has one method (`field`); DuckDB has
-   `struct_insert`/`struct_keys`/`struct_values`, Polars has more. `.map` has three
-   against DuckDB's eleven.
+   `struct_insert`/`struct_keys`/`struct_values`, Polars has more. `.map` is at five of
+   DuckDB's eleven after entries 177-178; the six that remain (`map_entries`,
+   `map_from_entries`, `map_concat`, `map_extract`, `element_at` on a map) each need a
+   kernel, since none is recoverable from the key list the way `len` and `contains` were.
 5. **`ROLLUP`/`CUBE`/`GROUPING SETS` on the DataFrame API.** The SQL front-end has them
    (`_sql/parser/grouping_sets.py`); `ds.rollup(...)` does not exist.
 6. **Scalar gaps with no engine implementation.** The ones entries 109-125 did not take,
