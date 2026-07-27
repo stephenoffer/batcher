@@ -38,13 +38,12 @@ JPEG frames, 640×480 → 224×224:
 | Engine | Time | Throughput | Batcher's lead |
 |---|---:|---:|:---:|
 | **Batcher** | 351 ms | 5,693 img/s | baseline |
-| Daft | 838 ms | 2,388 img/s | **2.4×** |
-| Ray Data | 2,136 ms | 936 img/s | **6.1×** |
+| Daft | 838 ms | 2,388 img/s | **2.4x** |
 
-This started the session at ~350 img/s, *losing to both*. Five fixes took it to 5,693. The
-one that matters for the comparison is the media-decode throttle: the per-row decode kernels
-ran serially, and the parallel executor capped its rayon pool to the morsel count. A
-small-JPEG corpus is a single morsel, so the entire decode ran on one core. See {doc}`multimodal-ingest` for the rest.
+This path started at about 350 img/s, and five fixes took it to 5,693. The one that matters
+for the comparison is the media-decode throttle: the per-row decode kernels ran serially, and
+the parallel executor capped its rayon pool to the morsel count. A small-JPEG corpus is a
+single morsel, so the entire decode ran on one core. See {doc}`multimodal-ingest` for the rest.
 
 ## In-memory kernels
 
@@ -53,11 +52,13 @@ kernels with no I/O in the way. Single node, 16 cores:
 
 | Operator | Batcher | Daft | Batcher's lead |
 |---|---:|---:|:---:|
-| filter | 28 ms | 188 ms | **6.7×** |
-| sum | 10 ms | 181 ms | **18×** |
-| group-by | 359 ms | 487 ms | **1.4×** |
+| filter | 28 ms | 188 ms | **6.7x** |
+| sum | 10 ms | 181 ms | **18x** |
+| group-by | 359 ms | 487 ms | **1.4x** |
 
 Hold on to this table. It is what makes the next one interesting.
+
+The full 11-case operator mix goes the same way: the latest sweep in `benchmarks/BENCHMARK_RESULTS.md` has **Batcher ahead of Daft on all 11**, and Daft unable to finish `op-window-rank` at all, where `RANK` over roughly 1.5M partitions hangs and Batcher returns in about 148 ms.
 
 ## Multi-join SQL: it depends on the machine
 
@@ -94,7 +95,7 @@ now decided from `min(left_bytes, right_bytes)`. q3 went from 7.7x to 3.8x, and 
 
 ## Distributed
 
-All three engines on the same live Ray cluster (16 worker nodes × 8 CPUs, 128 CPUs, plus a
+Both engines on the same live Ray cluster (16 worker nodes x 8 CPUs, 128 CPUs, plus a
 0-CPU head), each reading TPC-H parquet directly from S3, so the distributed read is part of
 the measured work. Daft runs its Ray runner (flotilla), not its local engine. Ratio is
 `daft_ms / batcher_ms`, so **above 1 means Batcher is faster**.
@@ -106,15 +107,15 @@ the measured work. Daft runs its Ray runner (flotilla), not its local engine. Ra
 | `groupby` | 1.03× | **1.18×** | **1.30×** |
 | `filter_count` | 1.18× | 0.92× | 0.84× |
 
-Batcher wins the join, the group-by, and the metadata-only count, and **loses
-`filter_count` at sf10 and sf100**. That loss is the most purely S3-bound shape there is:
-scan one column, filter, count. Both engines read the same bytes from the same store, and the
-difference is object-store read throughput, not execution.
+Batcher takes the join, the group-by, and the metadata-only count, and trails on
+`filter_count` at sf10 and sf100 by 8% to 16%. That shape is the most purely S3-bound in the
+grid: scan one column, filter, count. Both engines read the same bytes from the same store,
+and the difference is object-store read throughput rather than execution.
 
-Be clear about the ceiling here: the 10× bar Batcher clears against Ray Data is *not*
-attainable against Daft on these shapes. Daft is also a native Rust engine reading the same
-parquet from the same bucket. On an I/O-bound scan, no execution engine can be 10× faster
-than another that is already at a similar fraction of the network's line rate.
+That also sets the ceiling for this page. Daft is a native Rust engine reading the same
+parquet from the same bucket, so on an I/O-bound scan neither engine can pull far ahead of
+the other once both are near the network's line rate. The margins that matter here are on
+the compute-bound shapes, where the join and the top-N results sit.
 
 :::{dropdown} The superseded diagnosis, and why it was wrong
 An earlier round of this benchmark had Batcher ~10× *behind* Daft at sf100 and diagnosed it

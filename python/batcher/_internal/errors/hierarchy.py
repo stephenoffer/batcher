@@ -53,6 +53,8 @@ __all__ = [
     "OptimizationError",
     "PerformanceWarning",
     "PlanError",
+    "PlanTooDeepError",
+    "QueryCancelledError",
     "ResourceError",
     "RetryableShuffleError",
     "SchemaError",
@@ -607,9 +609,22 @@ def unknown_value(
 # control plane has one import site. The pure-Python shims keep this module
 # importable where the native extension is not built (config-only / unit-test
 # imports); the distributed path that raises them needs the native engine anyway.
+#
+# `QueryCancelledError` rides it too: the executor raises it when it finds the cancellation
+# flag set at a morsel boundary. It is deliberately not a subclass of `ExecutionError`'s
+# "something went wrong" family in spirit — nothing went wrong, someone asked for this — but
+# it is one in the hierarchy so a caller catching engine failures broadly still catches it
+# rather than having a cancellation escape a `try` that meant to cover execution.
+#
+# `PlanTooDeepError` rides the same channel for a different reason: a plan nesting past
+# the native depth limit used to overflow the deserializer's stack, which Rust reports as
+# an *uncatchable* `SIGABRT`. It is now an error, and giving it a type is what lets a
+# caller building plans in a loop catch it rather than lose the process.
 try:
     from batcher._native import (
         FatalShuffleError,
+        PlanTooDeepError,
+        QueryCancelledError,
         RetryableShuffleError,
     )
 except ImportError:
@@ -619,3 +634,9 @@ except ImportError:
 
     class FatalShuffleError(TransportError):  # type: ignore[no-redef]
         """A shuffle fetch failed fatally (decode/protocol/auth) — retrying cannot help."""
+
+    class PlanTooDeepError(PlanError):  # type: ignore[no-redef]
+        """The plan nests deeper than the native stack can deserialize."""
+
+    class QueryCancelledError(ExecutionError):  # type: ignore[no-redef]
+        """The query was cancelled; it stopped at the next morsel boundary."""

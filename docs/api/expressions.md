@@ -157,6 +157,10 @@ print(out.to_pydict())
 | Method | Description |
 | --- | --- |
 | `.alias(name)` | bind an output name to a derived expression, for positional `select` |
+| `.neg()` | arithmetic negation (the Polars spelling of the unary minus) |
+| `.chr()` | the character at this Unicode code point (DuckDB/Spark `chr`) |
+| `.to_base(radix)` | this integer written in base 2..36 (DuckDB `to_base`; `bin` is radix 2) |
+| `.format_bytes(si=False)` | a byte count as human-readable text — `1.5 KiB`, or `1.5 kB` with `si=True` |
 | `.clip(lower=None, upper=None)` | clamp each value into `[lower, upper]` (either bound optional) |
 | `.eq_missing(other)` | null-safe equality (SQL `IS NOT DISTINCT FROM`): two nulls compare equal, null vs non-null is false (never null) |
 | `.try_cast(type)` | the safe-ingest spelling of `.cast`: unconvertible values become NULL instead of erroring (DuckDB `TRY_CAST`) |
@@ -177,10 +181,37 @@ Spark `collect_list`), `.arg_min(by=…)` / `.arg_max(by=…)` (the value at the
 row with the extreme `by` key), and `.first(order_by=…)` / `.last(order_by=…)`
 (the value at the first or last row in `order_by` order). `order_by` is required there, because an arrival-order first or last wouldn't be partition-independent. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an `AggExpr`, the aggregate type that `group_by(...).agg(...)` and `.over(...)` consume. You rarely name it directly.
 
+The **distribution** aggregates read a group's whole value list rather than a running
+total: `.entropy()` (base-2 Shannon entropy of the value distribution, DuckDB `entropy`),
+`.mad()` (median absolute deviation, a spread measure a single outlier cannot move),
+`.kurtosis_pop()` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
+quantile *element*, where `.quantile(q)` interpolates between two of them), `.top_k(k)`
+(the `k` most frequent values as a list, DuckDB `approx_top_k`, computed exactly here),
+`.kahan_sum()` (compensated summation, DuckDB `fsum`/`kahan_sum` — the same answer as
+`.sum()` on a well-conditioned column and a materially better one when the addends differ
+wildly in magnitude), and `.any_value()` (one value from the group, DuckDB `any_value` / `arbitrary`; the
+engine resolves "unspecified" to the group minimum so a distributed run agrees with a
+single-node one).
+
 For heavy skew, the bounded-memory **approximate** variants keep one fixed-size
 sketch per group instead of every value, so a hot key cannot OOM: `.approx_n_unique()`
 (HLL, ~2% error) and `.approx_quantile(q)` / `.approx_median()` (DDSketch). They are
 mergeable, so results are identical single-node and distributed.
+
+An aggregate does not have to appear inside `group_by(...).agg(...)`. In a `select`
+whose every item is an aggregate it means the whole-frame aggregation and returns one
+row; anywhere else — `with_columns`, a mixed `select`, a `filter` predicate — it means
+the whole-frame aggregate **broadcast to every row**, which is `.over()` with no
+partition:
+
+```python
+print(ds.select(total=bt.col("a").sum()).to_pydict())
+# {'total': [6]}
+print(ds.with_columns(share=bt.col("a") / bt.col("a").sum()).to_pydict()["share"])
+# [0.16666666666666666, 0.3333333333333333, 0.5]
+print(ds.filter(bt.col("a") > bt.col("a").mean()).to_pydict())
+# {'a': [3], 'b': [30.0]}
+```
 
 ```python
 out = ds.group_by().agg(total=bt.col("a").sum(), avg=bt.col("b").mean(), rows=bt.count())

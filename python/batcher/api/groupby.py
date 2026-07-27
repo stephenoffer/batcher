@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError
 from batcher.api.dataset.compat.guidance import groupby_attribute_error
 from batcher.plan.expr_ir import AggExpr, Col, Expr
@@ -21,15 +23,20 @@ if TYPE_CHECKING:
 __all__ = ["GroupBy"]
 
 
-def _is_numeric(schema: object, column: str) -> bool:
-    """Whether `column` has an integer/float/decimal Arrow type in `schema`."""
-    import pyarrow as pa
+def _numeric_columns(schema: pa.Schema) -> set[str]:
+    """The names in `schema` with an integer/float/decimal Arrow type.
 
-    idx = schema.get_field_index(column)  # type: ignore[attr-defined]
-    if idx < 0:
-        return True  # unknown to the schema — don't pre-filter it out
-    t = schema.field(idx).type  # type: ignore[attr-defined]
-    return pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t)
+    One pass over the fields, rather than a name lookup per candidate column: the caller
+    is filtering *every* non-key column of the relation, so a per-column `get_field_index`
+    made the default reduction target list quadratic in the width of a wide table.
+    """
+    return {
+        f.name
+        for f in schema
+        if pa.types.is_integer(f.type)
+        or pa.types.is_floating(f.type)
+        or pa.types.is_decimal(f.type)
+    }
 
 
 class GroupBy:
@@ -801,8 +808,11 @@ class GroupBy:
         schema = self._source._plan.available_schema()
         if schema is None:
             return cols  # can't tell types; fall back to all and let the engine judge
-        arrow = schema.arrow
-        return [c for c in cols if _is_numeric(arrow, c)]
+        # A column the schema does not know about is kept rather than pre-filtered out,
+        # matching what the per-column check did on an unknown name.
+        known = {f.name for f in schema.arrow}
+        numeric = _numeric_columns(schema.arrow)
+        return [c for c in cols if c in numeric or c not in known]
 
     def _resolve_columns(
         self, columns: tuple[str | Selector, ...], numeric_only: bool

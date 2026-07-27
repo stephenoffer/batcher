@@ -356,6 +356,20 @@ pub(crate) fn finalize_kurtosis(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeE
     })
 }
 
+/// `kurtosis_pop` — the **population** excess kurtosis `m4/m2² - 3`, where
+/// [`finalize_kurtosis`] applies the sample correction. DuckDB has both under these two
+/// names, and the difference is large on a small group (5.71 against 1.63 on seven
+/// values), so mapping one name to the other is a wrong answer rather than a rounding.
+/// Null for a group with no variance, where the ratio is 0/0.
+pub(crate) fn finalize_kurtosis_pop(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
+    moment_finalize(state, |n, m2, _m3, m4| {
+        if n < 1.0 || m2 <= 0.0 {
+            return None;
+        }
+        Some(m4 / (m2 * m2) - 3.0)
+    })
+}
+
 /// Shared finalize for the moment aggregates: read the population central moments
 /// `m2/m3/m4` (per element, dividing the accumulated `Mk` by n) from the state and
 /// apply `f(n, m2, m3, m4)` (which returns `None` for the null cases).

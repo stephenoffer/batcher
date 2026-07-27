@@ -397,8 +397,13 @@ def calibration_curve(
 def _require_columns(ds: Dataset, *names: str) -> None:
     """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
     available = ds.columns
+    # Membership against a set: the check runs per requested name, and `available` is the
+    # relation's full width — a wide feature table turned a handful of name checks into a
+    # scan of thousands of columns each. The list is kept for the error message, which
+    # needs the original order to suggest a close match.
+    present = set(available)
     for name in names:
-        if name not in available:
+        if name not in present:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
 
             raise ColumnNotFoundError(

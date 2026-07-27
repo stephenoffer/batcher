@@ -24,6 +24,7 @@ import dataclasses
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
 from batcher.kyber.learned_tuning import (
+    JOIN_ARMS,
     learned_broadcast_max_bytes,
     learned_join_strategy,
     learned_sort_merge_min_rows,
@@ -59,6 +60,37 @@ __all__ = ["BuildSideDecision", "adaptive_build_side", "build_side_rule"]
 # side is still > 1M rows) a hash join over the smaller side wins.
 SORT_MERGE_MIN_ROWS = 50_000_000.0
 
+# ...and the same floor stated in the units the gate is actually about. Sort-merge is
+# chosen for one reason — the hash table over the build side would not comfortably fit
+# memory — and a row count is a poor proxy for that, because it says nothing about the
+# machine or about how wide the rows are. Measured on TPC-H sf10, `lineitem ⋈ orders`
+# on `orderkey`: the cost model put the build on the 57M-row `lineitem` side, which
+# cleared the row floor, and the resulting sort-merge join ran **10.4 s at 2.3x
+# parallelism against 1.5 s at 20x** for the hash join the bandit later replaced it with
+# — a 7x penalty on the first several executions of every large join, on a 184 GB machine
+# where that build is under a gigabyte.
+#
+# So the gate now also asks whether the hash table would actually strain the machine. A
+# hash build costs roughly three times the build side's bytes resident (keys, payload,
+# and the table itself), and past the point where that would occupy half of memory the
+# bounded-memory merge is the right answer. Hence `bytes > memory / 6`.
+#
+# **The byte test only overrules the row floor when the build size is *bounded*, not merely
+# estimated**, and that qualifier is the whole safety argument. A byte figure is
+# `rows x width`, so it is only as good as the row count behind it. For a join-free build —
+# a scan under filters and projections — that count has a hard ceiling: the scan's own EXACT
+# row count, which no filter can exceed. For a build that is itself a *join output* it has
+# none, because the size is a product of guesses that compound.
+#
+# TPC-H q5 is the case that proves it. Its `customer ⋈ supplier` edge on `nationkey` is
+# many-to-many, its build side is a join output, and relaxing the gate on that estimate took
+# the query from 880 ms to **OOM-killed at 134 GB resident**. Sort-merge is a memory guard; it
+# may be stood down on a bound, never on a guess.
+#
+# `memory_bytes` is `0` when the probe cannot answer, which disables the byte half and
+# leaves the row floor exactly as it was.
+_SORT_MERGE_MEMORY_SHARE = 6.0
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class BuildSideDecision:
@@ -72,6 +104,10 @@ class BuildSideDecision:
     # is a *byte* threshold (`broadcast_max_bytes`), so its learned fit needs bytes, not
     # rows — and only Kyber, which has the row widths, can supply them.
     build_bytes: float = 0.0
+    # Whether the build side's size is measured rather than guessed. The sort-merge memory
+    # guard may only be stood down on a measurement (see `_SORT_MERGE_MEMORY_SHARE`), and the
+    # bandit's arm set honours the same qualifier.
+    build_measured: bool = False
     # The plan signature SELECTION used to look up this join's learned strategy arm.
     #
     # It must be carried, not recomputed from the finished plan, because the two are not the
@@ -91,6 +127,7 @@ def adaptive_build_side(
     *,
     broadcast_max_bytes: int | None = None,
     sort_merge_min_rows: float | None = None,
+    sort_merge_min_bytes: float = 0.0,
 ) -> tuple[LogicalPlan, list[BuildSideDecision]]:
     """Rewrite inner joins so the cheaper-to-build input is the build side.
 
@@ -101,13 +138,19 @@ def adaptive_build_side(
     `broadcast_max_bytes` / `sort_merge_min_rows` override the strategy thresholds —
     `build_side_rule` passes the values *learned* from measured timings (see
     `kyber.learned_tuning`); when `None` the static config default and module floor
-    stand, so every existing caller is unchanged. Thresholds only pick among
-    equivalent physical algorithms, so learning them never changes the result."""
+    stand, so every existing caller is unchanged. `sort_merge_min_bytes` is the build-side
+    byte floor the row floor is ANDed with (see `_SORT_MERGE_MEMORY_SHARE`); `0.0` — the
+    default, and what a caller with no hardware profile passes — disables that half and
+    leaves the row floor alone. Thresholds only pick among equivalent physical algorithms,
+    so learning them never changes the result."""
     decisions: list[BuildSideDecision] = []
     cost = cost_model or CostModel(estimator)
     max_bytes = broadcast_max_bytes if broadcast_max_bytes is not None else _broadcast_max_bytes()
     smr = sort_merge_min_rows if sort_merge_min_rows is not None else SORT_MERGE_MIN_ROWS
-    return _rewrite(plan, estimator, cost, decisions, max_bytes, smr), decisions
+    return (
+        _rewrite(plan, estimator, cost, decisions, max_bytes, smr, sort_merge_min_bytes),
+        decisions,
+    )
 
 
 def _broadcast_max_bytes(l3_cache_bytes: int = 0) -> int:
@@ -139,15 +182,48 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     max_bytes = learned_bmax if learned_bmax is not None else cache_default
     learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
     smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
+    smb = ctx.hardware.memory_bytes / _SORT_MERGE_MEMORY_SHARE
     plan, decisions = adaptive_build_side(
-        plan, ctx.estimator, ctx.costs(), broadcast_max_bytes=max_bytes, sort_merge_min_rows=smr
+        plan,
+        ctx.estimator,
+        ctx.costs(),
+        broadcast_max_bytes=max_bytes,
+        sort_merge_min_rows=smr,
+        sort_merge_min_bytes=smb,
     )
-    plan = _apply_learned_strategies(plan, ctx.hub)
+    # Arms the bandit may range over, per join. Sort-merge is withheld from any join whose
+    # build side comfortably fits memory — see `_admissible_arms`.
+    admissible = {d.signature: _admissible_arms(d, smb) for d in decisions if d.signature}
+    plan = _apply_learned_strategies(plan, ctx.hub, admissible)
     ctx.notes["build_side_decisions"] = decisions
     return plan
 
 
-def _apply_learned_strategies(node: LogicalPlan, hub) -> LogicalPlan:
+def _admissible_arms(decision: BuildSideDecision, sort_merge_min_bytes: float) -> tuple[str, ...]:
+    """The strategy arms the bandit may explore for this join.
+
+    All three arms emit the identical relation, so admissibility is never about
+    correctness — it is about which experiments are worth running. Sort-merge is not one
+    of them when the build side comfortably fits memory: it exists to bound memory on a
+    build too large to hash, and where that does not apply it is not a plausible winner
+    but a *measured* 7x-to-10x loss (TPC-H sf10 `lineitem ⋈ orders`: 12.8 s at 2.5x
+    parallelism against 1.2 s at 21x).
+
+    That distinction matters because UCB1 gives every untried arm a turn, and the
+    discounted evidence expires, so an arm is re-explored roughly every
+    `1/(1-_ARM_DISCOUNT)` runs. Paying a 10x run that often to re-confirm what the memory
+    gate already establishes structurally is regret the bandit cannot recover — exploring
+    is only free when the arm might win. The two arms that might (hash, broadcast) are
+    always offered.
+    """
+    if decision.build_bytes > sort_merge_min_bytes or not decision.build_measured:
+        return JOIN_ARMS
+    return tuple(a for a in JOIN_ARMS if a != "sort_merge")
+
+
+def _apply_learned_strategies(
+    node: LogicalPlan, hub, admissible: dict[str, tuple[str, ...]] | None = None
+) -> LogicalPlan:
     """Override each join's strategy with the per-signature bandit arm the hub learned.
 
     A regret-minimizing bandit over `{hash, broadcast, sort_merge}` converges to the
@@ -155,12 +231,20 @@ def _apply_learned_strategies(node: LogicalPlan, hub) -> LogicalPlan:
     mis-ranked static cost guess. Every arm emits the identical relation (the engine
     falls back to hash for any it cannot honor), so this is a pure performance override.
     A cold signature yields `None` and the cost-model choice stands, so the plan is
-    unchanged until there is evidence."""
+    unchanged until there is evidence.
+
+    `admissible` narrows the arm set per join signature (see `_admissible_arms`); a
+    signature it does not name — or a `None` map, which is what a caller outside the rule
+    passes — keeps all three."""
     if hub is None:  # no learned store → skip the per-join signature work entirely
         return node
-    node = with_children(node, [_apply_learned_strategies(c, hub) for c in children(node)])
+    node = with_children(
+        node, [_apply_learned_strategies(c, hub, admissible) for c in children(node)]
+    )
     if isinstance(node, Join):
-        arm = learned_join_strategy(hub, plan_signature(node))
+        sig = plan_signature(node)
+        arms = (admissible or {}).get(sig, JOIN_ARMS)
+        arm = learned_join_strategy(hub, sig, arms)
         if arm is not None and arm != node.strategy:
             return dataclasses.replace(node, strategy=arm)
     return node
@@ -173,17 +257,18 @@ def _rewrite(
     decisions: list,
     max_bytes: int,
     smr: float,
+    smb: float,
 ) -> LogicalPlan:
     if isinstance(node, Scan):
         return node
     if isinstance(node, Union):
         return Union(
-            tuple(_rewrite(i, est, cost, decisions, max_bytes, smr) for i in node.inputs),
+            tuple(_rewrite(i, est, cost, decisions, max_bytes, smr, smb) for i in node.inputs),
             node.distinct,
         )
     if isinstance(node, Join):
-        left = _rewrite(node.left, est, cost, decisions, max_bytes, smr)
-        right = _rewrite(node.right, est, cost, decisions, max_bytes, smr)
+        left = _rewrite(node.left, est, cost, decisions, max_bytes, smr, smb)
+        right = _rewrite(node.right, est, cost, decisions, max_bytes, smr, smb)
         node = Join(
             left, right, node.left_keys, node.right_keys, node.join_type, node.output, node.strategy
         )
@@ -244,9 +329,18 @@ def _rewrite(
         # explicitly keeps the sort-merge gate below reading the rows it actually hashes.
         build_rows = l_est.rows if swap else r_est.rows
         build_bytes = left_bytes if swap else right_bytes
+        # Whether that byte figure rests on a hard ceiling rather than a compounding guess —
+        # the precondition for letting it stand down the sort-merge memory guard. Sized from
+        # the build's own base scan, so a filter that the estimator mis-prices can only make
+        # the real build *smaller* than what was compared against the floor.
+        build_side = node.left if swap else node.right
+        bounded = _bounded_build_bytes(build_side, est, cost)
+        build_measured = bounded is not None
+        if bounded is not None:
+            build_bytes = max(build_bytes, bounded)
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
-        elif build_rows >= smr:
+        elif build_rows >= smr and (build_bytes > smb or not build_measured):
             # Sort-merge only when the *build* side (the one hashed, after the swap) is
             # itself so large that a hash table over it is memory-prohibitive — then
             # SMJ's bounded-memory merge wins despite its RowConverter encoding cost.
@@ -269,6 +363,7 @@ def _rewrite(
                 broadcast,
                 cost_delta,
                 build_bytes,
+                build_measured,
                 plan_signature(node),
             )
         )
@@ -276,7 +371,7 @@ def _rewrite(
     # Single-input nodes: rewrite the child in place.
     if hasattr(node, "input"):
         return dataclasses.replace(
-            node, input=_rewrite(node.input, est, cost, decisions, max_bytes, smr)
+            node, input=_rewrite(node.input, est, cost, decisions, max_bytes, smr, smb)
         )
     return node
 
@@ -295,6 +390,45 @@ def _swap(join: Join) -> Join:
 
 def _flip(side: str) -> str:
     return "right" if side == "left" else "left"
+
+
+def _bounded_build_bytes(node: LogicalPlan, est: CardinalityEstimator, cost: CostModel):
+    """An upper bound on the build side's bytes, or `None` when it has no hard ceiling.
+
+    A join-free subtree — a scan under any number of filters, projections and limits — can
+    never emit more rows than its scan holds, and a scan's row count is EXACT. So the scan's
+    rows times the build's per-row width bounds the hash table however badly the intervening
+    selectivities are estimated. Anything else (a join, a union, a set operation below the
+    build) has no such ceiling: its size is a product of guesses, and the estimate can be
+    orders of magnitude low. Those get `None`, which leaves the sort-merge row floor in force.
+
+    This is deliberately a *bound* and not an estimate. It is consulted only to decide whether
+    the memory guard may be stood down, and being wrong in that direction is what OOM-killed
+    TPC-H q5 at 134 GB.
+    """
+    scan = _sole_scan(node)
+    if scan is None:
+        return None
+    rows = est.estimate(scan).rows
+    if rows <= 0.0:
+        return None
+    return rows * cost.row_bytes(node)
+
+
+def _sole_scan(node: LogicalPlan) -> LogicalPlan | None:
+    """The one `Scan` under `node`, or `None` if the subtree branches or is not join-free.
+
+    Row-preserving-or-shrinking unary operators are walked through; a `Join`, `Union` or any
+    multi-input node ends the walk with `None`, because past one the row count is no longer
+    bounded by a single scan.
+    """
+    while True:
+        if isinstance(node, Scan):
+            return node
+        kids = children(node)
+        if len(kids) != 1:
+            return None
+        node = kids[0]
 
 
 def _prov(l_est, r_est) -> str:

@@ -29,6 +29,16 @@ from typing import Any
 
 from batcher._internal import events
 from batcher._internal.mathx import safe_div
+from batcher.observe.inference.measures import (
+    _blocked_rising,
+    _count,
+    _finding,
+    _mean_util,
+    _mean_vram,
+    _partition_totals,
+    _pct,
+    _smooth,
+)
 
 __all__ = ["InferenceProgress"]
 
@@ -41,8 +51,6 @@ DEFAULT_MAX_JOBS = 32
 _GPU_WINDOW = 16
 #: Blocked-time snapshots kept per job, to judge whether the pipeline bottleneck is worsening.
 _BLOCKED_WINDOW = 16
-#: Smoothing for the displayed rate and latency: steady enough to read, quick enough to track.
-_ALPHA = 0.3
 
 # GPU utilization bands (percent), from Ray's field guidance. Below `_UTIL_SEVERE` the
 # accelerator is being wasted; the target band is the expensive hardware actually earning out.
@@ -111,6 +119,10 @@ class _Job:
     pool_pending: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
     skipped_total: int = 0
+    #: Fault-tolerance actions by `RECOVERY` discriminator (bounded by `RECOVERY_EVENTS`);
+    #: `workers_lost` counts rather than lists, since ids are unbounded over a long run.
+    recovery: dict[str, int] = field(default_factory=dict)
+    workers_lost: int = 0
 
 
 class InferenceProgress:
@@ -207,6 +219,17 @@ class InferenceProgress:
             reason = "other"
         job.skipped[reason] = job.skipped.get(reason, 0) + count
 
+    def _on_recovery(self, job: _Job, event: events.Event) -> None:
+        """Tally one fault-tolerance action, so recovery is not mistaken for slowness.
+
+        Without it a query that survived losing two workers and one that was simply four
+        times too slow look identical — the distinction a spot-capacity decision needs.
+        """
+        name = str(event.fields.get("event", "unknown"))
+        job.recovery[name] = job.recovery.get(name, 0) + 1
+        if name == "worker_lost":
+            job.workers_lost += 1
+
     def _on_pool(self, job: _Job, event: events.Event) -> None:
         job.pool_size = int(event.fields.get("size", job.pool_size))
         job.pool_pending = int(event.fields.get("pending", job.pool_pending))
@@ -282,6 +305,7 @@ class InferenceProgress:
                 },
                 "pool": {"size": job.pool_size, "pending": job.pool_pending},
                 "skipped": {"total": job.skipped_total, "by_reason": dict(job.skipped)},
+                "recovery": {"events": dict(job.recovery), "workers_lost": job.workers_lost},
                 "diagnostics": self._diagnostics(job),
             }
 
@@ -320,6 +344,10 @@ class InferenceProgress:
                 parts.append(f"{job.pool_size} actors")
             if job.skipped_total:
                 parts.append(f"{_count(job.skipped_total)} skipped")
+            # In the status line, not only the metrics: this is the moment a reader asks
+            # why the job is slow, and worker loss is the answer.
+            if job.workers_lost:
+                parts.append(f"recovering ({job.workers_lost} lost)")
         return "  ".join(parts)
 
     def diagnostics(self, query_id: str | None = None) -> list[dict[str, Any]]:
@@ -413,69 +441,5 @@ _INGEST: dict[str, Callable[[InferenceProgress, _Job, events.Event], None]] = {
     events.GPU: InferenceProgress._on_gpu,
     events.SKIPPED: InferenceProgress._on_skipped,
     events.POOL: InferenceProgress._on_pool,
+    events.RECOVERY: InferenceProgress._on_recovery,
 }
-
-
-# --- helpers ----------------------------------------------------------------
-
-
-def _smooth(current: float, sample: float) -> float:
-    """Exponentially smooth `sample` into `current`, seeding on the first reading."""
-    return sample if current == 0.0 else current + _ALPHA * (sample - current)
-
-
-def _partition_totals(job: _Job) -> tuple[int, int | None]:
-    """Aggregate partition ``done`` and ``total`` across a job's stages.
-
-    ``total`` is known only when every stage that has reported a total has one; a single
-    unbudgeted stage makes the aggregate total unknown rather than an undercount.
-    """
-    done = sum(s.done for s in job.stages.values())
-    totals = [s.total for s in job.stages.values()]
-    total = sum(t for t in totals if t is not None) if totals and None not in totals else None
-    return done, total
-
-
-def _mean_util(job: _Job) -> float | None:
-    """Mean current utilization across the job's devices, or `None` with no sample."""
-    if not job.gpus:
-        return None
-    return sum(g.util_pct for g in job.gpus.values()) / len(job.gpus)
-
-
-def _mean_vram(job: _Job) -> float | None:
-    """Mean used-VRAM fraction across devices that report a total, or `None`."""
-    fracs = [g.mem_fraction for g in job.gpus.values() if g.mem_fraction is not None]
-    return sum(fracs) / len(fracs) if fracs else None
-
-
-def _blocked_rising(trend: deque[float]) -> bool:
-    """Whether blocked time is trending up: the second half averages well above the first."""
-    if len(trend) < 6:
-        return False
-    values = list(trend)
-    half = len(values) // 2
-    early = sum(values[:half]) / half
-    late = sum(values[half:]) / (len(values) - half)
-    return early > 0 and late > early * 1.5
-
-
-def _finding(severity: str, code: str, message: str) -> dict[str, Any]:
-    """One diagnostic finding as a plain dict."""
-    return {"severity": severity, "code": code, "message": message}
-
-
-def _pct(fraction: float) -> str:
-    """A clamped integer percentage, e.g. ``62%``; ``<1%`` for a small-but-present share."""
-    value = max(fraction, 0.0) * 100
-    if 0 < value < 1:
-        return "<1%"
-    return f"{value:.0f}%"
-
-
-def _count(n: float) -> str:
-    """A compact SI-style count: ``1.2K``, ``3.4M``, ``5.6B``."""
-    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(n) >= limit:
-            return f"{n / limit:.1f}{suffix}"
-    return f"{n:.0f}"

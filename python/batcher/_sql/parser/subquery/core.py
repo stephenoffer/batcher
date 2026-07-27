@@ -7,6 +7,8 @@ their first argument so they can recurse via `tr.statement` / `tr._scalar`.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._sql.parser.core_utils import _has_aggregate, _join_and, _split_and
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import col, lit
@@ -29,9 +31,8 @@ def _apply_subquery_predicates(tr, ds: Dataset, pred):
     subquery combined with OR (or otherwise un-foldable into a join) raises
     NotImplementedError.
     """
-    from sqlglot import expressions as exp
 
-    from batcher._sql.parser.subquery_neq import _fuse_correlated_neq
+    from batcher._sql.parser.subquery.neq import _fuse_correlated_neq
 
     # Flatten the top conjunction so leaves can be co-optimized (two correlated `<>`
     # EXISTS over the same base table fuse into one group-by + join) before each
@@ -54,8 +55,6 @@ def _apply_subquery_predicates(tr, ds: Dataset, pred):
 def _apply_single_predicate(tr, ds: Dataset, pred):
     """Fold one WHERE leaf: an IN/EXISTS subquery becomes a join (no residual);
     anything else is returned unchanged as a residual for a normal ``filter``."""
-    from sqlglot import expressions as exp
-
     # A bare IN-subquery / EXISTS predicate becomes a join (no residual).
     if _is_in_subquery(pred):
         return _apply_in_subquery(tr, ds, pred, negate=False), None
@@ -81,8 +80,6 @@ def _apply_single_predicate(tr, ds: Dataset, pred):
 
 
 def _is_in_subquery(node) -> bool:
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.In):
         return False
     query = node.args.get("query")
@@ -91,8 +88,6 @@ def _is_in_subquery(node) -> bool:
 
 def _in_subquery_select(node):
     """Extract the inner SELECT/Union of an ``IN (subquery)`` node."""
-    from sqlglot import expressions as exp
-
     query = node.args.get("query")
     if isinstance(query, exp.Subquery):
         return query.this
@@ -102,8 +97,6 @@ def _in_subquery_select(node):
 
 
 def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
-    from sqlglot import expressions as exp
-
     inner_select = _in_subquery_select(node).copy()  # detach from outer AST
     target = node.this
     # A plain column, or a row value `(a, b, …)` — a multi-column IN → multi-key semi-join.
@@ -199,8 +192,6 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     An uncorrelated EXISTS is a whole-table keep-or-drop: collect the subquery
     eagerly to test emptiness, then keep or drop every row.
     """
-    from sqlglot import expressions as exp
-
     inner = node.this
     if isinstance(inner, exp.Subquery):
         inner = inner.this
@@ -215,6 +206,17 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
             pair = _correlation_pair(leaf, local, local_cols)
             (corr if pair is not None else local_preds).append(pair or leaf)
 
+    # A single *inequality* correlation (`a.x < b.y`) is a range semi/anti join: not an
+    # equi-key, so it never reaches `corr`, and before this it raised. See `subquery.range`.
+    from batcher._sql.parser.subquery.range import decorrelate_inequality_exists
+
+    if not corr:
+        ranged = decorrelate_inequality_exists(
+            tr, ds, inner, local_preds, local, local_cols, negate
+        )
+        if ranged is not None:
+            return ranged
+
     if not corr:
         # Uncorrelated: emptiness test → keep or drop every outer row.
         _reject_correlated(inner)
@@ -228,7 +230,7 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     # runs single-node, streaming, and distributed — no row id. Two such subqueries over the
     # same base table fuse into one pass upstream in `_apply_subquery_predicates`. TPC-H q21
     # is exactly this shape. See `subquery_neq`.
-    from batcher._sql.parser.subquery_neq import _decorrelate_neq_single, _parse_neq_exists
+    from batcher._sql.parser.subquery.neq import _decorrelate_neq_single, _parse_neq_exists
 
     spec = _parse_neq_exists(tr, node)
     if spec is not None:
@@ -252,8 +254,6 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
 
 def _local_tables(select_node) -> set[str]:
     """Table names + aliases introduced by this SELECT's own FROM/JOINs."""
-    from sqlglot import expressions as exp
-
     local: set[str] = set()
     from_ = select_node.args.get("from") or select_node.args.get("from_")
     sources = []
@@ -281,8 +281,6 @@ def _local_columns(tr, select_node):
     table or unknown name): then unqualified references can't be classified by
     membership and correlation detection falls back to table-qualifier-only.
     """
-    from sqlglot import expressions as exp
-
     from_ = select_node.args.get("from") or select_node.args.get("from_")
     sources = ([from_.this] if from_ is not None else []) + [
         j.this for j in select_node.args.get("joins", []) or []
@@ -309,8 +307,6 @@ def _correlation_pair(leaf, local: set[str], local_cols: set[str] | None = None,
     `<>` decorrelation in `subquery_neq` passes `exp.NEQ`: the outer-reference analysis is
     identical for both, and it was a verbatim copy until it was parameterized here.
     """
-    from sqlglot import expressions as exp
-
     if not isinstance(leaf, op or exp.EQ):
         return None
     lhs, rhs = leaf.this, leaf.expression
@@ -338,8 +334,6 @@ def _outer_key_reducer(tr, outer_node, sub, corr):
     the enclosing conjuncts whose *top-level* columns (not those in a nested subquery, so
     `ps_partkey IN (SELECT …)` counts) all belong to `T` — minus the conjunct carrying the sub
     (circular) — is a superset of the LEFT JOIN's keys, so it changes no surviving group."""
-    from sqlglot import expressions as exp
-
     if outer_node is None or not corr:
         return None
     ocs = [oc for (oc, _ic) in corr]
@@ -386,8 +380,6 @@ def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> D
     subquery node is replaced in place by a reference to the joined column
     (NULL where the outer row has no match — exactly scalar-subquery semantics).
     """
-    from sqlglot import expressions as exp
-
     for root in roots:
         if root is None:
             continue
@@ -457,8 +449,6 @@ def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> D
 
 
 def _is_plain_column(node) -> bool:
-    from sqlglot import expressions as exp
-
     return isinstance(node, exp.Column)
 
 
@@ -470,8 +460,6 @@ def _reject_correlated(select_node) -> None:
     subquery introduces and flagging any qualified column outside that set.
     Unqualified columns are assumed local (we cannot resolve them otherwise).
     """
-    from sqlglot import expressions as exp
-
     local: set[str] = set()
     for t in select_node.find_all(exp.Table):
         local.add(t.name)

@@ -97,11 +97,32 @@ impl Codegen<'_, '_> {
                 let r = self.emit_validity(right);
                 self.b.ins().band(l, r)
             }
-            // Unary value ops propagate their operand's validity unchanged.
-            Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
-                self.emit_validity(input)
-            }
+            // Unary value ops propagate their operand's validity unchanged. `is_nan` /
+            // `is_inf` belong here too: the interpreter builds their result from the
+            // values buffer and carries the input's null buffer through untouched, so a
+            // null input yields a null answer exactly as the arithmetic ops do.
+            Expr::Not { input }
+            | Expr::Cast { input, .. }
+            | Expr::Math { input, .. }
+            | Expr::IsNan { input }
+            | Expr::IsInf { input }
+            // `x IN (...)` is null exactly when `x` is: a null never equals a literal, and
+            // the OR-of-equals it folds from is `NULL OR NULL = NULL`.
+            | Expr::InList { input, .. } => self.emit_validity(input),
+            // `is_null`/`is_not_null` answer for every row, so the *result* is never
+            // null -- whatever the operand's validity is.
+            Expr::IsNull { .. } | Expr::IsNotNull { .. } => self.b.ins().iconst(types::I8, 1),
             _ => unreachable!("needs_kleene guarantees a validity-supported node"),
+        }
+    }
+
+    /// The signed-i64 sort key for `v` under the engine's ordering: the float identity
+    /// for `F64` (NaN highest, `-0.0` == `0.0`), the value itself for the integer-shaped
+    /// types, which already compare correctly as signed integers.
+    fn order_key(&mut self, v: Value, ty: ScalarTy) -> Value {
+        match ty {
+            ScalarTy::F64 => canon_total_order_key(self.b, v),
+            _ => v,
         }
     }
 
@@ -141,6 +162,107 @@ impl Codegen<'_, '_> {
                 let (v, _) = self.emit_typed(input);
                 let one = self.b.ins().iconst(types::I8, 1);
                 (self.b.ins().bxor(v, one), ScalarTy::Bool)
+            }
+            Expr::IsNan { input } => {
+                // A value is unordered with itself exactly when it is NaN -- any sign,
+                // any payload. This must NOT be lowered to the engine's `!=`: that
+                // operator uses *total* ordering, under which `NaN == NaN`, so `x != x`
+                // would never flag one. `canon_total_order_key` uses the same raw
+                // `Unordered` compare for the same reason.
+                use cranelift_codegen::ir::condcodes::FloatCC;
+                let (v, _) = self.emit_typed(input);
+                (self.b.ins().fcmp(FloatCC::Unordered, v, v), ScalarTy::Bool)
+            }
+            Expr::IsNull { input } | Expr::IsNotNull { input } => {
+                let want_null = matches!(expr, Expr::IsNull { .. });
+                match self.null_ptrs {
+                    // Kleene ABI: the answer *is* the operand's validity bit.
+                    Some(_) => {
+                        let valid = self.emit_validity(input);
+                        let v = if want_null {
+                            self.b.ins().bxor_imm(valid, 1)
+                        } else {
+                            valid
+                        };
+                        (v, ScalarTy::Bool)
+                    }
+                    // Null-free path: no row is null, so the answer is constant. Reached
+                    // only for a batch with no nulls -- `CompiledExpr::eval` refuses the
+                    // others, because these ops are not in `is_null_propagating`.
+                    None => {
+                        let c = self.b.ins().iconst(types::I8, i64::from(!want_null));
+                        (c, ScalarTy::Bool)
+                    }
+                }
+            }
+            Expr::Greatest { inputs } | Expr::Least { inputs } => {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                // The engine ranks by its *float identity*, not by IEEE compare: a NaN
+                // ranks above +inf (so `greatest(NaN, 5)` is NaN), and `-0.0`/`0.0` rank
+                // equal. `canon_total_order_key` is exactly that ordering as a signed
+                // i64 key -- the same one `MIN`/`MAX`, `GROUP BY`, and scalar `=` use.
+                //
+                // Ties keep the accumulator, which is observable: `greatest(-0.0, 0.0)`
+                // is `-0.0`, not `0.0`. That is why the compare is `>=`/`<=` rather than
+                // strict, and why the *original* value is selected while only the *key*
+                // is canonicalized.
+                let want_greatest = matches!(expr, Expr::Greatest { .. });
+                let (mut acc, ty) = self.emit_typed(&inputs[0]);
+                let mut acc_key = self.order_key(acc, ty);
+                for arg in &inputs[1..] {
+                    let (v, _) = self.emit_typed(arg);
+                    let v_key = self.order_key(v, ty);
+                    let cc = if want_greatest {
+                        IntCC::SignedGreaterThanOrEqual
+                    } else {
+                        IntCC::SignedLessThanOrEqual
+                    };
+                    let keep = self.b.ins().icmp(cc, acc_key, v_key);
+                    acc = self.b.ins().select(keep, acc, v);
+                    acc_key = self.b.ins().select(keep, acc_key, v_key);
+                }
+                (acc, ty)
+            }
+            Expr::InList { input, set } => {
+                use bc_expr::Literal;
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let (v, ty) = self.emit_typed(input);
+                // A float set is matched on RAW BITS, not by float equality. The
+                // interpreter keys membership with `f64::to_bits` because the operator
+                // this folds from compares by *total* order, and total-order equality is
+                // bit equality -- so `-0.0` never matches `0.0` and a NaN column value
+                // matches only an identically-patterned NaN literal. An `fcmp Equal` here
+                // would silently disagree on both.
+                let probe = match ty {
+                    ScalarTy::F64 => self.b.ins().bitcast(types::I64, MemFlags::new(), v),
+                    _ => v,
+                };
+                let mut acc = self.b.ins().iconst(types::I8, 0);
+                for lit in set {
+                    let key = match (ty, lit) {
+                        (ScalarTy::F64, Literal::Float(x)) => x.to_bits() as i64,
+                        (ScalarTy::F64, Literal::Int(x)) => (*x as f64).to_bits() as i64,
+                        (_, Literal::Int(x)) => *x,
+                        _ => unreachable!("validated in analyze"),
+                    };
+                    let k = self.b.ins().iconst(types::I64, key);
+                    let hit = self.b.ins().icmp(IntCC::Equal, probe, k);
+                    acc = self.b.ins().bor(acc, hit);
+                }
+                (acc, ScalarTy::Bool)
+            }
+            Expr::IsInf { input } => {
+                // `f.is_infinite()` is `|f| == inf`. `Equal` is an *ordered* compare, so
+                // a NaN operand answers false here -- which is what the interpreter's
+                // `is_infinite` does too.
+                use cranelift_codegen::ir::condcodes::FloatCC;
+                let (v, _) = self.emit_typed(input);
+                let magnitude = self.b.ins().fabs(v);
+                let infinity = self.b.ins().f64const(f64::INFINITY);
+                (
+                    self.b.ins().fcmp(FloatCC::Equal, magnitude, infinity),
+                    ScalarTy::Bool,
+                )
             }
             Expr::Binary { op, left, right } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
                 // Both operands are booleans (i8 0/1); bitwise band/bor is the

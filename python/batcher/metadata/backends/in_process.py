@@ -35,3 +35,19 @@ class InProcessBackend:
         dst = self._tables.setdefault(table, {})
         for key, value in items:
             dst[key] = value
+
+    def delete(self, table: str, keys: list[Key]) -> None:
+        """Drop `keys` from `table`; absent keys are ignored.
+
+        Beyond the four methods `MetadataBackend` requires, and deliberately optional: a
+        *durable* store accumulating history across runs is the point of it, but this
+        backend is a dict in the running process, so without a way to forget, the operator
+        feedback every terminal op records would grow the process for its whole life. The
+        hub prunes through this when a backend offers it (see `MetadataHub._prune_op_stats`)
+        and leaves a backend without it untouched.
+        """
+        rows = self._tables.get(table)
+        if rows is None:
+            return
+        for key in keys:
+            rows.pop(key, None)

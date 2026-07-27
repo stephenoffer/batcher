@@ -48,7 +48,9 @@ DEFAULT_MAX_LOGS = 2000
 #: Event kinds that describe *how the work is being executed* rather than what the query
 #: did — partition completion, GPU load, inference throughput, dropped rows, actor pool
 #: size. They are folded by `InferenceProgress`, not by the query record.
-_LIVE_KINDS = frozenset({events.PARTITION, events.GPU, events.INFER, events.SKIPPED, events.POOL})
+_LIVE_KINDS = frozenset(
+    {events.PARTITION, events.GPU, events.INFER, events.SKIPPED, events.POOL, events.RECOVERY}
+)
 
 
 @dataclass(slots=True)

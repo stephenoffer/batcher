@@ -30,6 +30,9 @@ pub enum RuntimeError {
     #[error("range-partition key must be a numeric column, got {dtype}")]
     NonNumericRangeKey { dtype: String },
 
+    #[error("range join cannot run on this condition: {reason}")]
+    UnsupportedRangeJoin { reason: String },
+
     #[error("spill i/o error: {0}")]
     Io(#[from] std::io::Error),
 

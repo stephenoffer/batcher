@@ -44,6 +44,8 @@ The section dataclasses are exported so you can construct one and slot it into
 | `OptimizerConfig` | Kyber planning thresholds, cost model, and cardinality defaults |
 | `PIDConfig` | gains for the adaptive batch-size PID controller |
 | `MetadataConfig` | learned-stats backend, URI, and decay rate |
+| `GovernanceConfig` | whether row/column policy is advisory or mandatory |
+| `TenantConfig` | which tenant a scope's work belongs to, and its share |
 
 ### Config.replace
 
@@ -125,3 +127,11 @@ print(out)
 ## Precedence
 
 Highest first: `config_context` > `set_config` > `BATCHER_*` env vars > `BATCHER_CONFIG_FILE` JSON > defaults. The environment and file layers are read once at import, and the runtime entry points override them. See [configuration/index](../configuration/index.md) for the full discussion.
+
+## See also
+
+- {doc}`../configuration/index`: the runtime entry points, in prose.
+- {doc}`../configuration/options`: every field, with its default and unit.
+- {doc}`../configuration/environment`: the `BATCHER_*` spelling of the same settings.
+- {doc}`../configuration/profiles`: ready-made configurations for common machine shapes.
+- {doc}`../user-guide/performance`: which fields are worth changing for a slow query.

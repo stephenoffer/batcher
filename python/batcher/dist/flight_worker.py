@@ -337,6 +337,39 @@ try:
 
             return ray.get_runtime_context().get_node_id()
 
+        def clear_plan(self, plan_id: int) -> None:
+            """Evict every bucket this worker published for `plan_id`.
+
+            The shuffle store is append-only until something evicts it, and until this was
+            wired the *batch* path evicted nothing: `ShuffleSession.clear_plan` existed and
+            was bound all the way through to Rust, with exactly one caller — a test. So a
+            session-scoped fleet (`reuse_session_fleet`, on by default) accumulated every
+            bucket of every stage of every query it ever served, until the node ran out of
+            memory. Only the streaming pipeline released anything.
+            """
+            self.session.clear_plan(plan_id)
+
+        def release_ticket(self, ticket: str) -> None:
+            """Evict one published bucket, once the stage that reads it has finished.
+
+            The finer-grained half of `clear_plan`: an adaptive query's stage `k` holds its
+            buckets resident through stages `k+1..n` otherwise, which is the leak that
+            exhausts memory *inside a single query* rather than across a session.
+            """
+            from batcher.carbonite.transfer.server import ShuffleTicket
+
+            parts = [int(p) for p in str(ticket).split("/")]
+            self.session.release(ShuffleTicket(*parts))
+
+        def partition_count(self) -> int:
+            """How many buckets this worker still holds.
+
+            The leak oracle, and the reason this is a permanent method rather than a test
+            helper: a bucket leak has no symptom until the node dies, so the only way to
+            test for it is to ask a live worker what it is still holding.
+            """
+            return self.session.partition_count
+
         def map_publish(
             self, map_ir, gk, aj, partition, n_keys, n_reducers, src=None, epoch=0, plan_id=None
         ) -> str:

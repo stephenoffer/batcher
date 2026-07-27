@@ -7,6 +7,8 @@ nested subqueries via `tr.statement`. They hold no state of their own.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._sql.parser.core_utils import _columns_selector
 from batcher._sql.parser.expressions.aggregates import is_agg_node
 from batcher._sql.parser.expressions.anonymous import anonymous_scalar
@@ -48,8 +50,6 @@ from batcher.plan.expr_ir import (
 
 
 def _scalar(tr, node) -> Expr:
-    from sqlglot import expressions as exp
-
     # Inside an aggregate query, an aggregate sub-expression refers to its
     # pre-computed output column.
     # `is_agg_node` rather than `isinstance(node, exp.AggFunc)`: the DuckDB aggregates
@@ -359,8 +359,6 @@ def _concat(tr, node) -> Expr:
     additionally emits **no separator** for a dropped argument — so
     `concat_ws(',', NULL, 'x', NULL)` is `'x'`, not `',x,'`.
     """
-    from sqlglot import expressions as exp
-
     empty = lit("")
     arg_nodes = [node.this, *node.expressions] if node.this is not None else list(node.expressions)
     arg_nodes = [a for a in arg_nodes if a is not None]
@@ -400,8 +398,6 @@ def _concat(tr, node) -> Expr:
 
 
 def _like(tr, node, case_insensitive: bool = False, escape: str | None = None) -> Expr:
-    from sqlglot import expressions as exp
-
     pattern_node = node.expression
     if not isinstance(pattern_node, exp.Literal) or not pattern_node.is_string:
         raise NotImplementedError("LIKE supports only constant string patterns")

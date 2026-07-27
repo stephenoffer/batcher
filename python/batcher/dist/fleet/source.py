@@ -21,6 +21,11 @@ from batcher.carbonite.transfer import ShuffleTicket
 __all__ = ["FlightFetchSplit", "FlightMaterializedSource"]
 
 
+#: Bounded wait for the per-stage bucket release. Short on purpose: freeing an
+#: intermediate is memory hygiene, and a slow worker must not hold up the next stage.
+_RELEASE_TIMEOUT_S = 2.0
+
+
 @dataclass(frozen=True, slots=True)
 class FlightFetchSplit:
     """One reducer's result bucket, read locator-only over Arrow Flight from the
@@ -79,6 +84,38 @@ class FlightMaterializedSource:
         addr, ticket, rows = handle
         return FlightFetchSplit(addr, ticket, rows, self._schema)
 
+    def _release_buckets(self) -> None:
+        """Tell each holding worker to drop the buckets this intermediate advertised.
+
+        Resolved through the live fleet's cached `addrs`, which is a local list parallel to
+        `actors` — so mapping an address back to its actor costs nothing and needs no
+        remote call. Fire-and-forget: a bucket that fails to free is wasted memory, never a
+        wrong answer, and this runs on a teardown path where raising would replace the
+        query's real outcome.
+        """
+        if not self._handles:
+            return
+        try:
+            import ray
+
+            from batcher.dist.fleet import _fleet
+
+            fleet = _fleet.current_fleet()
+            if fleet is None or not getattr(fleet, "addrs", None):
+                return
+            by_addr = dict(zip(fleet.addrs, fleet.actors, strict=False))
+            refs = [
+                by_addr[addr].release_ticket.remote(str(ticket))
+                for addr, ticket, _rows in self._handles
+                if addr in by_addr
+            ]
+            if refs:
+                ray.wait(refs, num_returns=len(refs), timeout=_RELEASE_TIMEOUT_S)
+        except Exception as exc:  # pragma: no cover - teardown must never raise
+            from batcher._internal.logging import note_suppressed
+
+            note_suppressed("dist", "release materialized shuffle buckets", exc)
+
     def schema(self) -> pa.Schema:
         return self._schema
 
@@ -102,11 +139,20 @@ class FlightMaterializedSource:
         return [self._split(h) for h in self._handles]
 
     def cleanup(self) -> None:
-        """Kill the actors holding the buckets and release their placement group.
+        """Release this intermediate's buckets, then tear down the actors that held them.
 
-        No-ops when the producing stage borrowed a query-lifetime fleet (`_actors`
-        is `None`) — that fleet is owned and freed by the adaptive loop instead.
+        Called once per intermediate by the adaptive loop's `finally`, at the point the
+        next stage has finished reading it.
+
+        The bucket release happens **before** the `_actors is None` early return, and that
+        ordering is the whole fix. `_actors is None` is the *borrowed-fleet* case — the
+        stage ran on a query-lifetime fleet that outlives it — which is exactly the case
+        that leaks: without an explicit release, stage `k`'s buckets stay resident on the
+        workers through stages `k+1..n`, so a deep adaptive query holds every stage's
+        intermediate at once. Killing the actors, the old behaviour, only frees memory in
+        the case where the actors were about to die anyway.
         """
+        self._release_buckets()
         if self._actors is None:
             return
 

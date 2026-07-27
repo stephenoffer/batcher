@@ -197,7 +197,7 @@ Recall is not total: a similar pair can miss every LSH band and survive. `bands`
 dial, trading candidate pairs for recall. Precision is guaranteed instead, since every
 returned pair is verified against `threshold`, so nothing below it is ever dropped. In
 other words, near-duplicate dedup can leave a duplicate behind, but it will not delete a
-row that was not one. See the [preprocessors guide](../ml/preprocessors.md) for the
+row that was not one. See the [preprocessors guide](../ml/preprocessors/index.md) for the
 tuning detail.
 :::
 

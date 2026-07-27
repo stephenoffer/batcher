@@ -27,7 +27,11 @@ from batcher.kyber.stats.distribution import (
     merge_quantile_grids,
     union_ndv,
 )
-from batcher.kyber.stats.join_columns import asof_join_columns, join_columns
+from batcher.kyber.stats.join_columns import (
+    asof_join_columns,
+    join_columns,
+    range_join_columns,
+)
 from batcher.plan.expr_ir import Cast, Col, Lit
 from batcher.plan.logical import Projection
 from batcher.plan.schema import SchemaRef
@@ -43,6 +47,7 @@ __all__ = [
     "join_columns",
     "limit_columns",
     "project_columns",
+    "range_join_columns",
     "sample_columns",
     "scan_columns",
     "union_columns",

@@ -8,8 +8,8 @@ slot and a producer blocks when its credits reach zero. The batches bypass the R
 entirely.
 
 That distinction is the whole integration. An object-store shuffle serializes every batch into
-plasma, spills it under pressure, and makes the driver a funnel. That is the cost Ray Data pays and
-the one this design removes. Single-node execution never imports Ray at all.
+plasma, spills it under pressure, and makes the driver a funnel. Keeping bulk data off it is what
+lets a distributed query move at line rate. Single-node execution never imports Ray at all.
 
 | | |
 | --- | --- |
@@ -17,7 +17,7 @@ the one this design removes. Single-node execution never imports Ray at all.
 | **Ray does not carry** | Bulk Arrow batches. Those move over Arrow Flight (`bc-transport`). |
 | **Extra** | `pip install 'batcher-engine[ray]'` |
 | **Entry point** | `collect(distributed=True)`, or `"auto"` (the default) |
-| **From Ray Data** | `bt.from_ray_dataset(rds)`, streamed block by block |
+| **From a Ray Dataset** | `bt.from_ray_dataset(rds)`, streamed block by block |
 | **Cluster config** | `config.distributed` |
 
 ## Going distributed
@@ -117,7 +117,7 @@ The rest (retries, straggler speculation, skew salting, adaptive credits) is in
 [configuration options](../configuration/options.md), and the defaults fill a cluster with no
 tuning: one worker per node, an even share of each node's cores, reducer count scaled to workers.
 
-## Coming from Ray Data
+## Bringing in a Ray Dataset
 
 `bt.from_ray_dataset(rds)` takes a Ray Dataset and streams its Arrow blocks into the engine, one
 block per batch, lazily. It does not collect to the driver, so memory stays bounded.
@@ -132,17 +132,15 @@ events = bt.from_ray_dataset(rds)
 print(events.group_by("region").agg(bt.col("amount").sum()).sort("region").to_pydict())
 ```
 
-Treat this as an on-ramp, not a destination. Everything Ray Data did *before* the hand-off (its
-per-task scheduling, its block/pandas bridge, its object-store round trip) you still pay for. The
-hand-off itself is cheap; the pipeline upstream of it is not. If the Ray Dataset is a
-`read_parquet`, delete it and use `bt.read.parquet`: on a 20 M-row, 64-file read-and-sum that
-measured 72 ms against Ray Data's 1502 ms, a 20.8x gap (`benchmarks/BENCHMARK_RESULTS.md`).
+Treat this as an on-ramp, not a destination. Whatever built the incoming dataset still costs what
+it costs, and the hand-off cannot claw that back. Where the source is a plain read, read it with
+Batcher instead: `bt.read.parquet` takes a 20 M-row, 64-file read-and-sum in **72 ms**
+(`benchmarks/BENCHMARK_RESULTS.md`), because files decode concurrently in-process with no per-file
+task scheduling and no object-store hop.
 
-The same holds for Ray Data's own idioms. `ds.ml.map_batches` takes a class, loads the model once
-per worker, and runs the batches through an actor pool. Same shape, and on the measured map-heavy
-ETL mix it ran 2.35x faster on a per-batch NumPy transform and 1.29x on class-based inference on a
-single 96-core node. On the cluster (TPC-H sf10, everything reading S3), the `map_batches`-plus-
-aggregate workload that is Ray Data's home turf came in ~2.9x ahead.
+The inference idiom carries over unchanged. `ds.ml.map_batches` takes a class, loads the model once
+per worker, and runs the batches through an actor pool, so a ported pipeline keeps its shape while
+picking up warm pools and stage overlap. See {doc}`../ml/inference`.
 
 ## Failure modes worth knowing
 

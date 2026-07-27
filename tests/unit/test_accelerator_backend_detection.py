@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+import batcher._internal.accelerators as accel
 import batcher._internal.hardware as hw
 from batcher.ml.gpu import torch_device, vram_context_overhead
 
@@ -31,30 +32,26 @@ def _no_torch(monkeypatch):
 
 
 def test_a_neuron_host_reports_neuron(monkeypatch):
-    import batcher._internal.accelerators as accel
-
     _no_torch(monkeypatch)
-    monkeypatch.setattr(hw, "gpu_devices_absent", lambda: False)
-    monkeypatch.setattr(hw, "_tpu_available", lambda: False)
+    monkeypatch.setattr(accel, "gpu_devices_absent", lambda: False)
+    monkeypatch.setattr(accel, "_tpu_available", lambda: False)
     monkeypatch.setattr(accel, "has_neuron_device", lambda: True)
     monkeypatch.setattr(accel, "has_gaudi_device", lambda: False)
     assert hw.accelerator_backend() == "neuron"
 
 
 def test_a_gaudi_host_reports_hpu(monkeypatch):
-    import batcher._internal.accelerators as accel
-
     _no_torch(monkeypatch)
-    monkeypatch.setattr(hw, "gpu_devices_absent", lambda: False)
-    monkeypatch.setattr(hw, "_tpu_available", lambda: False)
+    monkeypatch.setattr(accel, "gpu_devices_absent", lambda: False)
+    monkeypatch.setattr(accel, "_tpu_available", lambda: False)
     monkeypatch.setattr(accel, "has_neuron_device", lambda: False)
     monkeypatch.setattr(accel, "has_gaudi_device", lambda: True)
     assert hw.accelerator_backend() == "hpu"
 
 
 def test_a_bare_cpu_host_still_reports_cpu(monkeypatch):
-    monkeypatch.setattr(hw, "gpu_devices_absent", lambda: True)
-    monkeypatch.setattr(hw, "_tpu_available", lambda: False)
+    monkeypatch.setattr(accel, "gpu_devices_absent", lambda: True)
+    monkeypatch.setattr(accel, "_tpu_available", lambda: False)
     assert hw.accelerator_backend() == "cpu"
 
 

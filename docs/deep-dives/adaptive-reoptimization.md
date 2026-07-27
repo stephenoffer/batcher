@@ -35,7 +35,7 @@ Kyber optimizes the logical plan once, up front. Then each round does the follow
 1. `plan_surgery.lowest_breaker(plan)` finds a breaker whose inputs are all breaker-free, which is the first thing that must materialize.
 1. `gating._estimate_rows` asks Kyber's `CardinalityEstimator` how big it thinks that stage's output will be. This is the prediction under test.
 1. `staging._run_stage` runs the stage through the full Kyber, Carbonite, Core sequence and gets back a table or a partitioned source.
-1. `staging._stage_row_count` reads the exact output rows. That's the measurement.
+1. The stage's result carries its exact output row count. That's the measurement.
 1. `plan_surgery.replace` swaps the stage node for a `Scan` over the materialized result, and the loop repeats.
 
 ```text
@@ -52,7 +52,7 @@ Kyber optimizes the logical plan once, up front. Then each round does the follow
    |   _run_stage(stage)            Kyber -> Carbonite -> Core, one full round
    |        |
    |        v
-   |   _stage_row_count(result)     the MEASUREMENT. counted, not guessed.
+   |   result.num_rows              the MEASUREMENT. counted, not guessed.
    |        |
    |        +--- inside the band? -----> break: run the whole residual plan in one shot
    |        |      q-error <= 1 + optimizer.reoptimize_error   (default 2.0, a 3x band)
@@ -91,11 +91,15 @@ The early exit has one guard. A residual plan that still has no one-shot distrib
 
 ## When it turns on
 
-`adaptive="auto"` is the default on `collect()`, and `gating.resolve_adaptive` turns it on in any of three cases:
+`adaptive="auto"` is the default on `collect()`. `gating.resolve_adaptive` asks measured history first and falls back to a structural heuristic:
 
-- The plan requires staging on the distributed path, such as a 3-or-more-table star join that the one-shot dispatcher can't route at all. There staging isn't an optimization, it's the only distributed path.
-- The plan has a join, its total scan rows clear `_ADAPTIVE_MIN_INPUT_ROWS` (20,000,000, a hard-coded module constant in `gating.py` rather than a config knob), and some join operand is both non-streamable and sized by a merely-default-provenance estimate.
-- The `MetadataHub` says adaptivity has helped this plan signature before. `learned_adaptive_helps` requires at least 3 prior runs with the estimate flipping outside the band on at least 25% of them.
+- The plan requires staging on the distributed path, such as a 3-or-more-table star join that the one-shot dispatcher can't route at all. There staging isn't an optimization, it's the only distributed path, and it always wins.
+- Otherwise the `MetadataHub` decides, if it has measured this plan signature on both routes. `learned_adaptive_route` is a two-arm bandit over `staged` and `one_shot`, keyed by plan signature and rewarded with the whole query's wall time. Staging only re-plans equivalent algebra, so both arms return the identical relation.
+- With no history, the structural heuristic decides: the plan has a join, its total scan rows clear `_ADAPTIVE_MIN_INPUT_ROWS` (20,000,000, a hard-coded module constant in `gating.py` rather than a config knob), and some join operand is both non-streamable and sized by a merely-default-provenance estimate.
+
+The bandit matters more than it sounds, because staging is not the planning round-trip the structural gate was priced against. The loop runs one breaker per stage, so it materializes every join separately and gives up both operator fusion and the streaming executor's width. On TPC-H sf10 with warm statistics that costs a multiple of the whole query: q8 887 ms staged against 142 ms one-shot, q17 476 against 105, q2 205 against 32, and q5 running at 1.9x parallelism on a 96-core machine where the one-shot plan reaches 22.6x. The structural heuristic fires on nearly every multi-join query at that scale, and nothing used to measure whether it paid.
+
+It is a bandit rather than a rule because which route wins is not a constant of the plan. Staging is the only distributed route for some shapes; it is what earns the statistics a cold shape has not learned yet; and the cost of a mis-estimated plan grows with the data. Exploration is bounded at roughly one run of the losing arm per signature, and the arms are re-explored as their measurements age (the discounted-UCB horizon in `bandit.py`).
 
 So on a small single-node query, adaptive is off and stays off. That floor exists because a sub-second query can't afford a staging round-trip to learn something it could have guessed. The gate reads exact source row counts, which separates scales cleanly: TPC-H sf1 is roughly 9M rows and stays off, sf10 is roughly 90M and turns on. Below 20M rows you can still force it with `adaptive=True`.
 
@@ -127,7 +131,7 @@ lifetime:     the process, or longer with a durable backend
 :::
 ::::
 
-They share the measurement plumbing and nothing else. The across-query half is what makes plans improve the more a query shape runs. Each adaptive run also folds its own outcome back in: `gating._record_adaptive_flip` records whether any stage's measured size diverged from its estimate, which is what `learned_adaptive_helps` reads on the next run.
+They share the measurement plumbing and nothing else. The across-query half is what makes plans improve the more a query shape runs. Each run also folds its own outcome back in: `gating.record_adaptive_route` records the query's wall time against the route it took, which is what `learned_adaptive_route` ranks on the next run.
 
 ## Watching it work
 
@@ -170,7 +174,7 @@ A stage carrying `map_batches` is opaque to the IR, so the whole-plan Kyber opti
 | The on/off gate and the q-error test | `python/batcher/api/adaptive/gating.py` |
 | Breaker set, plan walk, subtree replacement | `python/batcher/api/adaptive/plan_surgery.py` |
 | Breaker-free test | `python/batcher/plan/logical/transforms.py::is_streamable` |
-| Learned adaptive gate | `python/batcher/kyber/learned_tuning/priors.py::learned_adaptive_helps` |
+| Learned adaptive router | `python/batcher/kyber/learned_tuning/bandit.py::learned_adaptive_route` |
 | Per-operator metrics (Rust) | `crates/bc-interp/src/metrics.rs` |
 | Metric to feedback transcription | `python/batcher/core/executor.py::_record_op_feedback` |
 | The `reoptimize_error` knob | `python/batcher/config/config.py::OptimizerConfig` |

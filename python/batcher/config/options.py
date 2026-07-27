@@ -33,7 +33,14 @@ __all__ = [
 
 
 def _leaves(obj: object, prefix: str = "") -> Iterator[tuple[str, object]]:
-    """Yield ``(dotted_path, value)`` for every scalar leaf of a nested config object."""
+    """Yield ``(dotted_path, value)`` for every scalar leaf of a nested config object.
+
+    Left recursive deliberately: the emission order *is* the declaration order the option
+    listing shows, which means a nested section's leaves must appear where the section is
+    declared, not after every scalar of its parent. The config tree is two levels deep and
+    this runs once per listing, so the `yield from` re-entry cost is not worth restructuring
+    around at the price of that ordering.
+    """
     for field in dataclasses.fields(obj):  # type: ignore[arg-type]
         value = getattr(obj, field.name)
         path = f"{prefix}{field.name}"

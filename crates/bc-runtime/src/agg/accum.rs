@@ -192,6 +192,51 @@ pub(crate) fn minmax_acc(
     is_min: bool,
     func: AggFunc,
 ) -> Result<ArrayRef, RuntimeError> {
+    // Global min/max fast path, mirroring `sum_acc` above: with a single group every row maps
+    // to it, so the group extreme *is* the whole-column extreme and arrow's SIMD reduction
+    // beats the scalar scatter loop. Null-only / empty input yields null, as SQL requires and
+    // as `masked_i64` encodes.
+    //
+    // Measured on 20M `Int64` rows behind a filter (an unfiltered `MIN`/`MAX` never reaches
+    // here — it is answered from the source's exact column statistics): **~24-28 ms → ~4.3 ms,
+    // roughly 6x**. The scatter loop it replaces carries a per-row bounds-checked index and a
+    // per-row validity branch that together defeat vectorization; arrow's reduction has neither.
+    //
+    // **Int64 only, deliberately — do not extend this to Float64.** Arrow's `min`/`max` compare
+    // with raw IEEE `<`/`>`, which is false against NaN, so a NaN can never win and `max()`
+    // silently skips it. That is precisely the bug the Float64 arm below documents and fixes
+    // with `crate::keys::float_total_cmp`; routing floats through arrow here would reintroduce
+    // it and disagree with both our own ORDER BY (NaN sorts last, i.e. greatest) and DuckDB.
+    // Integers have no such value, so they are safe.
+    if num_groups == 1 {
+        match values.data_type() {
+            DataType::Int64 => {
+                let arr = values.as_primitive::<Int64Type>();
+                let e = if is_min {
+                    arrow::compute::min(arr)
+                } else {
+                    arrow::compute::max(arr)
+                };
+                return Ok(Arc::new(masked_i64(
+                    vec![e.unwrap_or(0)],
+                    vec![e.is_some()],
+                )));
+            }
+            // Decimal128 joins on the same argument: within one column precision and scale are
+            // fixed, so ordering the raw `i128` payloads *is* ordering the decimal values —
+            // which is exactly what the scatter arm below does, one row at a time.
+            DataType::Decimal128(p, s) => {
+                let arr = values.as_primitive::<Decimal128Type>();
+                let e = if is_min {
+                    arrow::compute::min(arr)
+                } else {
+                    arrow::compute::max(arr)
+                };
+                return masked_decimal(vec![e.unwrap_or(0)], vec![e.is_some()], *p, *s);
+            }
+            _ => {}
+        }
+    }
     match values.data_type() {
         DataType::Int64 => {
             let arr = values.as_primitive::<Int64Type>();
@@ -504,6 +549,55 @@ pub(crate) fn product_acc(
     Ok(Arc::new(masked_f64(cur, valid)))
 }
 
+/// `kahan_sum`/`fsum` — **compensated** summation, as a 2-column state `(sum, c)`.
+///
+/// A plain float sum loses the low bits of every addend whose magnitude is far below the
+/// running total, so summing a long column of small values against a large one drifts:
+/// the classic `1e16 + 1.0 + 1.0 …` loses every 1. Neumaier's variant tracks that lost
+/// part in `c` and adds it back at the end, which is exact for the cases that matter and
+/// never worse than the naive sum.
+///
+/// Neumaier rather than plain Kahan because it is also correct when the *addend* is the
+/// larger of the two, which is the case a running total meets on its first rows.
+///
+/// Mergeable: two `(sum, c)` states combine by compensated-adding the sums and adding the
+/// compensations, which is associative and commutative up to the same rounding the
+/// single-node path performs — so a partitioned run and a single-node one agree.
+pub(crate) fn kahan_acc(
+    values: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
+    let f = arrow::compute::cast(values, &DataType::Float64)?;
+    let arr = f.as_primitive::<Float64Type>();
+    let mut sums = vec![0f64; num_groups];
+    let mut comps = vec![0f64; num_groups];
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            let g = g as usize;
+            neumaier_add(&mut sums[g], &mut comps[g], arr.value(i));
+            valid[g] = true;
+        }
+    }
+    Ok(vec![
+        Arc::new(masked_f64(sums, valid.clone())),
+        Arc::new(masked_f64(comps, valid)),
+    ])
+}
+
+/// Add `value` into the running `(sum, compensation)` pair (Neumaier).
+pub(crate) fn neumaier_add(sum: &mut f64, compensation: &mut f64, value: f64) {
+    let t = *sum + value;
+    // The lost low bits live in whichever operand was smaller in magnitude.
+    *compensation += if sum.abs() >= value.abs() {
+        (*sum - t) + value
+    } else {
+        (value - t) + *sum
+    };
+    *sum = t;
+}
+
 pub(crate) fn masked_i64(vals: Vec<i64>, valid: Vec<bool>) -> Int64Array {
     Int64Array::from_iter(vals.into_iter().zip(valid).map(|(v, ok)| ok.then_some(v)))
 }
@@ -641,6 +735,72 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(tmin.value(0), 10);
+    }
+
+    #[test]
+    fn global_int_minmax_fastpath_matches_the_scatter_loop() {
+        // The `num_groups == 1` arm routes Int64 min/max through arrow's SIMD reduction instead
+        // of the scatter loop. It must agree with that loop on every edge the loop handles, so
+        // each case is checked against the two-group form of the same data, which cannot take
+        // the fast path.
+        let cases: Vec<Vec<Option<i64>>> = vec![
+            vec![Some(5), Some(-3), Some(9), Some(0)], // plain
+            vec![Some(5), None, Some(-3), None],       // interleaved nulls
+            vec![None, None],                          // all null -> null
+            vec![],                                    // empty -> null
+            vec![Some(7)],                             // single row
+            vec![Some(i64::MIN), Some(i64::MAX)],      // range ends
+            vec![Some(4), Some(4), Some(4)],           // all equal
+        ];
+        for values in cases {
+            let arr: ArrayRef = Arc::new(Int64Array::from(values.clone()));
+            let n = arr.len();
+            for is_min in [true, false] {
+                let func = if is_min { AggFunc::Min } else { AggFunc::Max };
+                // Fast path: one group.
+                let fast = minmax_acc(&arr, &vec![0u32; n], 1, is_min, func).unwrap();
+                // Reference: two groups, all rows in group 0, so group 0 holds the same answer
+                // while `num_groups != 1` keeps it on the scalar loop.
+                let slow = minmax_acc(&arr, &vec![0u32; n], 2, is_min, func).unwrap();
+                let f = fast.as_any().downcast_ref::<Int64Array>().unwrap();
+                let s = slow.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(
+                    f.is_null(0),
+                    s.is_null(0),
+                    "validity differs for {values:?} is_min={is_min}"
+                );
+                if !f.is_null(0) {
+                    assert_eq!(
+                        f.value(0),
+                        s.value(0),
+                        "value differs for {values:?} is_min={is_min}"
+                    );
+                }
+            }
+
+            // Decimal128 takes the same fast path and must agree with its own scatter arm,
+            // including that precision and scale survive it.
+            let dec: ArrayRef = Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|x| x as i128))
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(20, 3)
+                    .unwrap(),
+            );
+            for is_min in [true, false] {
+                let func = if is_min { AggFunc::Min } else { AggFunc::Max };
+                let fast = minmax_acc(&dec, &vec![0u32; n], 1, is_min, func).unwrap();
+                let slow = minmax_acc(&dec, &vec![0u32; n], 2, is_min, func).unwrap();
+                assert_eq!(fast.data_type(), &DataType::Decimal128(20, 3));
+                let f = fast.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let s = slow.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                assert_eq!(f.is_null(0), s.is_null(0), "decimal validity {values:?}");
+                if !f.is_null(0) {
+                    assert_eq!(f.value(0), s.value(0), "decimal value {values:?}");
+                }
+            }
+        }
     }
 
     #[test]

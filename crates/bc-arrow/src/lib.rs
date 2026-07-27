@@ -15,6 +15,8 @@
 //! shared tuning contract lives here, is mirrored into `bc_ir::EngineConfig`, and is
 //! shipped from the Python control plane.
 
+pub mod row_sort;
+
 pub use arrow;
 pub use arrow::array::{Array, ArrayRef, RecordBatch};
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -22,6 +24,9 @@ pub use arrow::error::ArrowError;
 
 mod hardware;
 pub use hardware::{usable_cores, HardwareProfile, SimdOverride};
+
+pub mod hash;
+pub use hash::{mix64, xxhash64, PortableBuildHasher, PortableHasher};
 
 pub mod float_ident;
 pub use float_ident::{

@@ -20,6 +20,7 @@ import pyarrow as pa
 from batcher._internal.mathx import safe_div
 from batcher._internal.native import engine
 from batcher.config import active_config
+from batcher.core.runtime import current_query_id
 from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilization
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
@@ -160,10 +161,16 @@ class LocalExecutor:
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
         _ensure_native_tracing(_native)
+        # The id makes this execution cancellable. `""` outside a `query_scope` — which is
+        # every non-terminal-op caller — and the engine then registers nothing and polls
+        # nothing, so an uncancellable path costs exactly what it did before.
+        query_id = current_query_id() or None
         if self._feedback is None:
-            return _native.execute_plan(plan.to_json(), sources, engine_cfg)
+            return _native.execute_plan(plan.to_json(), sources, engine_cfg, query_id)
 
-        out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg)
+        out, metrics_json = _native.execute_plan_metered(
+            plan.to_json(), sources, engine_cfg, query_id
+        )
         record_exec_metrics(self._feedback, metrics_json, cfg.execution.morsel_rows, plan.ops)
         return out
 
@@ -202,7 +209,10 @@ def execute_local_metered(
     _ensure_native_tracing(_native)
     cfg = active_config()
     out, metrics_json = _native.execute_plan_metered(
-        plan.to_json(), sources, cfg.engine_config_json_with(plan.op_budgets())
+        plan.to_json(),
+        sources,
+        cfg.engine_config_json_with(plan.op_budgets()),
+        current_query_id() or None,
     )
     try:
         ops = json.loads(metrics_json).get("ops", [])

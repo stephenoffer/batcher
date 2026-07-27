@@ -386,6 +386,18 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::Skewness => agg::AggFunc::Skewness,
         AggFunc::Kurtosis => agg::AggFunc::Kurtosis,
         AggFunc::Histogram => agg::AggFunc::Histogram,
+        AggFunc::AnyValue => agg::AggFunc::AnyValue,
+        AggFunc::Entropy => agg::AggFunc::Entropy,
+        AggFunc::Mad => agg::AggFunc::Mad,
+        // Same permille encoding as `Quantile`: the param is a fraction on the wire and
+        // an integer permille in the runtime, so the two cannot drift apart.
+        AggFunc::QuantileDisc => {
+            agg::AggFunc::QuantileDisc((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+        }
+        // `k` is a count, not a fraction, so it rides `param` unscaled.
+        AggFunc::ApproxTopK => agg::AggFunc::ApproxTopK(item.param.unwrap_or(1.0).round() as u16),
+        AggFunc::KurtosisPop => agg::AggFunc::KurtosisPop,
+        AggFunc::KahanSum => agg::AggFunc::KahanSum,
     }
 }
 

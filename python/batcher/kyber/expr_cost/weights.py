@@ -289,10 +289,25 @@ def sub_exprs(expr: Expr) -> tuple[Expr, ...]:
         return ()
     if isinstance(expr, IRNode):
         out: list[Expr] = []
-        for f in dataclasses.fields(expr):
-            _collect_exprs(getattr(expr, f.name, None), out)
+        for name in _field_names(type(expr)):
+            _collect_exprs(getattr(expr, name, None), out)
         return tuple(out)
     return ()
+
+
+# A node class's field names, resolved once. `dataclasses.fields` rebuilds its tuple on
+# every call and this runs per node of every expression the cost model prices, which is
+# every expression of every plan.
+_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+
+
+def _field_names(cls: type) -> tuple[str, ...]:
+    """`cls`'s dataclass field names, cached per class."""
+    names = _FIELD_NAMES.get(cls)
+    if names is None:
+        names = tuple(f.name for f in dataclasses.fields(cls))
+        _FIELD_NAMES[cls] = names
+    return names
 
 
 def _collect_exprs(value: object, out: list[Expr]) -> None:

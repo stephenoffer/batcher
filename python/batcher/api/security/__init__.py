@@ -9,7 +9,17 @@ place enforcement has to happen for it to be unbypassable.
 
 from __future__ import annotations
 
+from batcher.api.security._authn import authenticate, current_verifier, set_verifier
 from batcher.api.security._binding import govern_scan, table_name
 from batcher.api.security._context import SecurityContext, current_security, security
 
-__all__ = ["SecurityContext", "current_security", "govern_scan", "security", "table_name"]
+__all__ = [
+    "SecurityContext",
+    "authenticate",
+    "current_security",
+    "current_verifier",
+    "govern_scan",
+    "security",
+    "set_verifier",
+    "table_name",
+]

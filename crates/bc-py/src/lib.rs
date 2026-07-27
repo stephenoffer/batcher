@@ -63,24 +63,40 @@ use process::shared_memory_pool;
 /// Runs on the Tier-0 interpreter today; tier selection becomes transparent to
 /// this entry point once the JIT lands.
 #[pyfunction]
-#[pyo3(signature = (plan_json, sources, engine_config=""))]
+#[pyo3(signature = (plan_json, sources, engine_config="", query_id=None))]
 fn execute_plan(
     py: Python<'_>,
     plan_json: &str,
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
+    query_id: Option<&str>,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
-    let (plan, sources, opts, narrow, streaming, budget) =
-        prepare_exec(plan_json, sources, engine_config)?;
+    let ExecSetup {
+        plan,
+        sources,
+        opts,
+        narrow,
+        streaming,
+        budget,
+        materialize_fits,
+    } = prepare_exec(plan_json, sources, engine_config, query_id)?;
     let out = py
         .allow_threads(|| {
             if streaming {
-                match bc_interp::execute_streaming_parallel(&plan, &sources, opts.workers(), budget)
-                {
-                    // A breaker would have blown the envelope. The materializing executor spills
-                    // it; re-run there rather than OOM. The work already done is lost, which is
-                    // the price of the fast path — and far cheaper than the crash it replaces.
-                    Err(e) if needs_spill(&e) => {
+                match bc_interp::execute_streaming_parallel_or_hand_off(
+                    &plan,
+                    &sources,
+                    opts.workers(),
+                    budget,
+                    materialize_fits,
+                    opts.cancel.as_ref(),
+                ) {
+                    // Either a breaker would have blown the envelope (the materializing executor
+                    // spills it; re-run there rather than OOM) or the streaming executor found it
+                    // could not spread this plan and handed it back. The work already done is
+                    // lost, which is the price of the fast path — and far cheaper than the crash,
+                    // or the single-pipeline join, it replaces.
+                    Err(e) if wants_materializing(&e) => {
                         bc_interp::execute_parallel_with(&plan, &sources, &opts)
                     }
                     other => other,
@@ -89,7 +105,7 @@ fn execute_plan(
                 bc_interp::execute_parallel_with(&plan, &sources, &opts)
             }
         })
-        .map_err(to_pyerr)?;
+        .map_err(errors::interp_to_pyerr)?;
     let out = narrow_output(out, &narrow);
     Ok(out.into_iter().map(PyArrowType).collect())
 }
@@ -102,25 +118,35 @@ fn execute_plan(
 /// — Core transcribes them into `OperatorFeedback` so Kyber can calibrate its cost
 /// model on the next run. Returns `(batches, metrics_json)`.
 #[pyfunction]
-#[pyo3(signature = (plan_json, sources, engine_config=""))]
+#[pyo3(signature = (plan_json, sources, engine_config="", query_id=None))]
 fn execute_plan_metered(
     py: Python<'_>,
     plan_json: &str,
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
+    query_id: Option<&str>,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, String)> {
-    let (plan, sources, opts, narrow, streaming, budget) =
-        prepare_exec(plan_json, sources, engine_config)?;
+    let ExecSetup {
+        plan,
+        sources,
+        opts,
+        narrow,
+        streaming,
+        budget,
+        materialize_fits,
+    } = prepare_exec(plan_json, sources, engine_config, query_id)?;
     let (out, metrics) = py
         .allow_threads(|| {
             if streaming {
-                match bc_interp::execute_streaming_parallel_metered(
+                match bc_interp::execute_streaming_parallel_metered_or_hand_off(
                     &plan,
                     &sources,
                     opts.workers(),
                     budget,
+                    materialize_fits,
+                    opts.cancel.as_ref(),
                 ) {
-                    Err(e) if needs_spill(&e) => {
+                    Err(e) if wants_materializing(&e) => {
                         bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts)
                     }
                     other => other,
@@ -129,7 +155,7 @@ fn execute_plan_metered(
                 bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts)
             }
         })
-        .map_err(to_pyerr)?;
+        .map_err(errors::interp_to_pyerr)?;
     let out = narrow_output(out, &narrow);
     Ok((
         out.into_iter().map(PyArrowType).collect(),
@@ -139,14 +165,20 @@ fn execute_plan_metered(
 
 /// Shared setup for the execute entry points: parse the plan + engine config and
 /// normalize the input morsels (narrow numeric types → Int64/Float64) once.
-type ExecSetup = (
-    RelOp,
-    Vec<Vec<RecordBatch>>,
-    bc_interp::ExecOptions,
-    std::collections::HashMap<String, DataType>,
-    bool,
-    usize,
-);
+struct ExecSetup {
+    plan: RelOp,
+    sources: Vec<Vec<RecordBatch>>,
+    opts: bc_interp::ExecOptions,
+    /// Pre-widening source column types, for re-narrowing the output. Empty unless asked for.
+    narrow: std::collections::HashMap<String, DataType>,
+    /// Run on the streaming executor.
+    streaming: bool,
+    /// The streaming breakers' memory envelope (`0` = unbounded).
+    budget: usize,
+    /// Whether the materializing executor's footprint fits this query's envelope — the
+    /// permission the streaming executor needs before it may decline a plan it cannot shard.
+    materialize_fits: bool,
+}
 
 /// Whether this query runs on the streaming executor. `true` by default.
 ///
@@ -175,17 +207,28 @@ fn stream_budget(cfg: &EngineConfig) -> usize {
     cfg.memory_budget_bytes
 }
 
-/// True for the one error that means "this plan needs to spill, and I cannot".
-fn needs_spill(e: &bc_interp::InterpError) -> bool {
-    matches!(e, bc_interp::InterpError::MemoryBudgetExceeded { .. })
+/// True for the two signals that mean "re-run this on the materializing executor".
+///
+/// Neither is a failure. `MemoryBudgetExceeded` says a streaming breaker would have blown the
+/// envelope and cannot spill; `PreferMaterializing` says the streaming executor found, from the
+/// build sides it prepared, that it cannot spread this plan across cores. Both are answered the
+/// same way, and answering them is always sound: the two executors are checked against the same
+/// sequential oracle, so this changes only speed and peak memory.
+fn wants_materializing(e: &bc_interp::InterpError) -> bool {
+    matches!(
+        e,
+        bc_interp::InterpError::MemoryBudgetExceeded { .. }
+            | bc_interp::InterpError::PreferMaterializing { .. }
+    )
 }
 
 fn prepare_exec(
     plan_json: &str,
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
+    query_id: Option<&str>,
 ) -> PyResult<ExecSetup> {
-    let plan = RelOp::from_json(plan_json).map_err(to_pyerr)?;
+    let plan = RelOp::from_json(plan_json).map_err(errors::ir_to_pyerr)?;
     let cfg = EngineConfig::from_json(engine_config).map_err(to_pyerr)?;
     let mut opts = bc_interp::ExecOptions::default().with_engine_config(&cfg);
     // A positive budget activates the runtime memory backstop via the *process-wide*
@@ -194,6 +237,11 @@ fn prepare_exec(
     if cfg.memory_budget_bytes > 0 {
         opts.pool = Some(shared_memory_pool(cfg.memory_budget_bytes));
     }
+    // Look the token up rather than creating one: the control plane registered the id before
+    // it started optimizing, so a cancel that arrived during planning is already recorded on
+    // that token. A query with no id — or one whose scope has already closed — polls nothing,
+    // so an uncancellable path costs exactly what it did before.
+    opts.cancel = query_id.and_then(bc_resource::cancel::token_for);
     let budget = stream_budget(&cfg);
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
@@ -217,9 +265,16 @@ fn prepare_exec(
         .flatten()
         .map(|b| b.get_array_memory_size())
         .sum();
-    let materialize_is_safe_and_faster = !bc_interp::streaming_parallelizes(&plan)
-        && budget > 0
-        && src_bytes.saturating_mul(8) < budget;
+    //
+    // The same guard also decides whether the streaming executor may *decline* a plan it turns
+    // out it cannot shard. It answers "is the materializing executor affordable here", which is
+    // a question about this query's footprint and the envelope, and nothing the executor itself
+    // is told. Whether the plan is one it cannot shard is the executor's half of the answer, and
+    // it can only be read off the build sides once they exist — so the two halves meet by the
+    // executor reporting `PreferMaterializing` and this side honoring it (see `run_materializing`).
+    let materialize_fits = budget > 0 && src_bytes.saturating_mul(8) < budget;
+    let materialize_is_safe_and_faster =
+        !bc_interp::streaming_parallelizes(&plan) && materialize_fits;
     let streaming = use_streaming(&cfg) && !materialize_is_safe_and_faster;
     // Record pre-widening source widths *before* normalization (which widens them
     // away), and only when output re-narrowing is requested; an empty map makes
@@ -238,7 +293,48 @@ fn prepare_exec(
                 .collect::<PyResult<Vec<_>>>()
         })
         .collect::<PyResult<Vec<_>>>()?;
-    Ok((plan, sources, opts, narrow, streaming, budget))
+    Ok(ExecSetup {
+        plan,
+        sources,
+        opts,
+        narrow,
+        streaming,
+        budget,
+        materialize_fits,
+    })
+}
+
+/// Ask a running query to stop at its next morsel boundary.
+///
+/// Returns whether a query with that id was running. `false` means it already finished,
+/// which is not an error: the race between a cancel and a completion has no correct loser.
+#[pyfunction]
+fn cancel_query(query_id: &str) -> bool {
+    bc_resource::cancel::cancel(query_id)
+}
+
+/// Open a cancellation registration for `query_id`. The control plane owns its lifetime.
+#[pyfunction]
+fn register_query(query_id: &str) {
+    let _ = bc_resource::cancel::register(query_id);
+}
+
+/// Close the registration for `query_id`. Idempotent.
+#[pyfunction]
+fn unregister_query(query_id: &str) {
+    bc_resource::cancel::unregister(query_id);
+}
+
+/// Ids of the queries currently executing in this process, in unspecified order.
+#[pyfunction]
+fn running_queries() -> Vec<String> {
+    bc_resource::cancel::running()
+}
+
+/// Ask every running query in this process to stop. For interpreter shutdown.
+#[pyfunction]
+fn cancel_all_queries() {
+    bc_resource::cancel::cancel_all();
 }
 
 /// Map any engine error into a Python exception. The error hierarchy mapping
@@ -293,8 +389,13 @@ fn execute_plan_aggregated(
     engine_config: &str,
     finalize: bool,
 ) -> PyResult<PyArrowType<RecordBatch>> {
-    let (plan, sources, opts, narrow, _streaming, _budget) =
-        prepare_exec(plan_json, sources, engine_config)?;
+    let ExecSetup {
+        plan,
+        sources,
+        opts,
+        narrow,
+        ..
+    } = prepare_exec(plan_json, sources, engine_config, None)?;
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
     let out = py.allow_threads(|| {
@@ -608,6 +709,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
+    m.add_function(wrap_pyfunction!(cancel_query, m)?)?;
+    m.add_function(wrap_pyfunction!(register_query, m)?)?;
+    m.add_function(wrap_pyfunction!(unregister_query, m)?)?;
+    m.add_function(wrap_pyfunction!(running_queries, m)?)?;
+    m.add_function(wrap_pyfunction!(cancel_all_queries, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(read_avro, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet_filtered, m)?)?;

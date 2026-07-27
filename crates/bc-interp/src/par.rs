@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, RecordBatch};
 use bc_ir::{AggFunc, AggregateItem, EngineConfig, ProjectionItem, RelOp};
-use bc_resource::{MemoryPool, MemoryReservation};
+use bc_resource::{CancelToken, MemoryPool, MemoryReservation};
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec, SpillStore};
 use bc_runtime::{agg, shuffle};
 use rayon::prelude::*;
@@ -69,6 +69,13 @@ pub struct ExecOptions {
     /// breaker's *retained output* — is a follow-up (it needs the reservation
     /// threaded through `exec`'s return value).
     pub pool: Option<Arc<MemoryPool>>,
+    /// Cooperative cancellation flag, polled at operator and morsel boundaries.
+    ///
+    /// `None` (the default) means the query cannot be cancelled and nothing is polled, so
+    /// every path that does not opt in is byte-for-byte what it was. When present it is a
+    /// `Relaxed` load of an `AtomicBool` — see `bc_resource::cancel` for why that ordering
+    /// is both sufficient and free.
+    pub cancel: Option<CancelToken>,
     /// Per-operator spill budget (bytes), keyed by the pre-order `op_id`. When an
     /// operator has an entry, [`ExecOptions::op_budget`] returns *its* envelope
     /// instead of the one global `agg_spill.memory_budget_bytes`, so each stateful
@@ -106,6 +113,7 @@ impl Default for ExecOptions {
         Self {
             agg_spill: None,
             pool: None,
+            cancel: None,
             op_budgets: Arc::new(HashMap::new()),
             morsel_rows: DEFAULT_TARGET_MORSEL,
             morsel_bytes: DEFAULT_TARGET_MORSEL_BYTES,
@@ -123,6 +131,19 @@ impl ExecOptions {
     /// `memory_budget_bytes` populates `agg_spill` so the main `execute_plan` path
     /// can spill stateful operators out of core; a zero budget leaves `agg_spill`
     /// `None` (fully in-memory), so a small query pays no spill cost.
+    /// `Err(InterpError::Cancelled)` if cancellation has been requested, else `Ok(())`.
+    ///
+    /// Call this only where unwinding is already safe — between morsels, between
+    /// operators, between spill runs — because returning here drops whatever the executor
+    /// is holding. Mid-operator it would leak a partially-built hash table's reservation.
+    #[inline]
+    pub fn check_cancelled(&self) -> Result<(), InterpError> {
+        match &self.cancel {
+            Some(token) if token.is_cancelled() => Err(InterpError::Cancelled),
+            _ => Ok(()),
+        }
+    }
+
     pub fn with_engine_config(mut self, cfg: &EngineConfig) -> Self {
         self.morsel_rows = if cfg.morsel_rows == 0 {
             DEFAULT_TARGET_MORSEL
@@ -489,6 +510,8 @@ fn exec(
     m: &mut ExecMetrics,
     ids: &mut IdGen,
 ) -> Result<Vec<RecordBatch>, InterpError> {
+    // Between operators is the cheapest safe unwind point: nothing is half-built here.
+    opts.check_cancelled()?;
     // Pre-order id (parents before children) — same numbering the sequential
     // executor and the Python control plane use.
     let op_id = ids.next();
@@ -527,9 +550,17 @@ fn exec(
             // then reuse the fused JIT function across all morsels.
             let jit = parts.first().and_then(|b| ops::try_compile(predicate, b));
             let backend = backend_tag(&[jit.is_some()]);
+            // One conjunct-order per operator, shared across every worker: the morsels of
+            // one Filter see the same data distribution, so what the first few measure is
+            // what the rest should be ordered by. Lock-free and safe to share because the
+            // conjuncts of an `AND` commute — see `bc_expr::ConjunctOrder`.
+            let order = bc_expr::ConjunctOrder::new(predicate);
             let out: Vec<RecordBatch> = parts
                 .par_iter()
-                .map(|b| ops::filter_batch_jit(b, predicate, &jit))
+                .map(|b| {
+                    opts.check_cancelled()?;
+                    ops::filter_batch_jit(b, predicate, &jit, order.as_ref())
+                })
                 .collect::<Result<_, InterpError>>()?;
             push_metric(m, op_id, "filter", rows_in, &out, t0, false, backend);
             Ok(out)
@@ -549,7 +580,10 @@ fn exec(
             let backend = backend_tag(&jits.iter().map(|j| j.is_some()).collect::<Vec<_>>());
             let out: Vec<RecordBatch> = parts
                 .par_iter()
-                .map(|b| ops::project_batch_jit(b, exprs, &jits))
+                .map(|b| {
+                    opts.check_cancelled()?;
+                    ops::project_batch_jit(b, exprs, &jits)
+                })
                 .collect::<Result<_, InterpError>>()?;
             // A projection can add a wide column (a large string, an embedding, a
             // decoded image), so re-bound the output to the byte budget.
@@ -570,7 +604,10 @@ fn exec(
             let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = parts
                 .par_iter()
-                .map(|b| ops::unnest_batch(b, column, alias, *outer, index_alias.as_deref()))
+                .map(|b| {
+                    opts.check_cancelled()?;
+                    ops::unnest_batch(b, column, alias, *outer, index_alias.as_deref())
+                })
                 .collect::<Result<_, InterpError>>()?;
             // Unnest multiplies rows (a list of N explodes one row into N), so a
             // within-budget input morsel can produce an over-budget output morsel.
@@ -607,7 +644,10 @@ fn exec(
             let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = parts
                 .par_iter()
-                .map(|b| ops::unpivot_batch(b, index, on, variable_name, value_name))
+                .map(|b| {
+                    opts.check_cancelled()?;
+                    ops::unpivot_batch(b, index, on, variable_name, value_name)
+                })
                 .collect::<Result<_, InterpError>>()?;
             // Unpivot stacks `on` columns into rows, multiplying row count, so
             // re-bound the output to the byte budget.
@@ -643,7 +683,10 @@ fn exec(
                 None => {
                     let out: Vec<RecordBatch> = parts
                         .par_iter()
-                        .map(|b| ops::sample_batch(b, *fraction, *seed))
+                        .map(|b| {
+                            opts.check_cancelled()?;
+                            ops::sample_batch(b, *fraction, *seed)
+                        })
                         .collect::<Result<_, InterpError>>()?;
                     push_metric(m, op_id, "sample", rows_in, &out, t0, false, "interp");
                     Ok(out)
@@ -982,6 +1025,7 @@ fn exec(
                                 &sp.dir.join("sort"),
                                 opts.tuning.sort_merge_fanin,
                                 sp.codec,
+                                opts.cancel.as_ref(),
                             )?;
                             sort_spill_vol = vol; // measured pass-0 spill volume
                             sorted
@@ -1206,6 +1250,46 @@ fn exec(
                 &out,
                 t0,
                 spilled,
+                "interp",
+            );
+            Ok(out)
+        }
+
+        RelOp::RangeJoin {
+            left,
+            right,
+            conditions,
+            join_type,
+            output,
+        } => {
+            // The inputs are computed in parallel; the join itself is one sweep. A range
+            // join *is* decomposable — a left row's matches depend on the whole right side
+            // and on nothing else about the left — so chunking the left side would
+            // parallelize the sweep, at the cost of re-sorting the right side per chunk.
+            // That trade only pays when the left side dominates, so it is left for the
+            // block decomposition that would also make this distributable, rather than
+            // guessed at here. Sequential O(n log n + k) already replaces a quadratic plan.
+            let left_batches = exec(left, sources, opts, m, ids)?;
+            let right_batches = exec(right, sources, opts, m, ids)?;
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
+            let t0 = Stopwatch::start();
+            let left = ops::materialize(&left_batches)?;
+            let right = ops::materialize(&right_batches)?;
+            let out = vec![ops::range_join_batches(
+                &left, &right, conditions, *join_type, output,
+            )?];
+            push_breaker(
+                m,
+                op_id,
+                "range_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                false,
                 "interp",
             );
             Ok(out)
@@ -1918,6 +2002,10 @@ enum FusedStage<'a> {
         op_id: u32,
         predicate: &'a bc_expr::Expr,
         jit: ops::Jit,
+        /// Measured conjunct order for this operator, shared across its morsels. Built
+        /// here rather than per morsel for the same reason `jit` is: it is per-operator
+        /// state, and rebuilding it per morsel would throw away the measurement.
+        order: Option<bc_expr::ConjunctOrder>,
         backend: &'static str,
     },
     Project {
@@ -1931,7 +2019,12 @@ enum FusedStage<'a> {
 impl FusedStage<'_> {
     fn apply(&self, b: &RecordBatch) -> Result<RecordBatch, InterpError> {
         match self {
-            FusedStage::Filter { predicate, jit, .. } => ops::filter_batch_jit(b, predicate, jit),
+            FusedStage::Filter {
+                predicate,
+                jit,
+                order,
+                ..
+            } => ops::filter_batch_jit(b, predicate, jit, order.as_ref()),
             FusedStage::Project { exprs, jits, .. } => ops::project_batch_jit(b, exprs, jits),
         }
     }
@@ -1965,6 +2058,7 @@ fn compile_stage<'a>(op_id: u32, op: &'a RelOp, sample: Option<&RecordBatch>) ->
                 op_id,
                 predicate,
                 jit,
+                order: bc_expr::ConjunctOrder::new(predicate),
                 backend,
             }
         }
@@ -2041,6 +2135,7 @@ fn exec_fused(
     let results: Vec<(RecordBatch, Vec<u64>)> = base_morsels
         .par_iter()
         .map(|b| {
+            opts.check_cancelled()?;
             let mut cur = b.clone();
             let mut stage_rows = Vec::with_capacity(n);
             for stage in &stages {
@@ -2110,6 +2205,10 @@ fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
                 | AggFunc::ListAgg
                 | AggFunc::ApproxCountDistinct
                 | AggFunc::ApproxQuantile
+                | AggFunc::Entropy
+                | AggFunc::Mad
+                | AggFunc::QuantileDisc
+                | AggFunc::ApproxTopK
         )
     })
 }
@@ -2177,11 +2276,18 @@ fn try_fused_join_aggregate(
     let build_batches = exec(right, sources, opts, &mut sm, &mut bid)?;
     let next_id = bid.peek();
 
-    // Broadcast the (small) build side; decline to the partitioned path when it is not small.
+    // Broadcast the build side — at **any** size, unlike the un-fused join beside it.
+    //
+    // `BroadcastProbe::new` refuses a build past L3 because a flat probe would lose to the
+    // partitioned join. That is the wrong comparison here: declining does not send this query to
+    // a partitioned probe, it sends it to materializing the join's whole output and grouping it
+    // in a second pass. At sf10 `lineitem ⋈ orders` that is a 2.0 GB intermediate and a separate
+    // 60M-row pass, against a probe whose cache misses are bounded by the (much smaller) build.
+    // See `BroadcastProbe::over_any_build`.
     let build = ops::materialize(&build_batches)?;
     let tuning = &opts.tuning;
     let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
-    let Some(table) = bc_runtime::join::BroadcastProbe::new(
+    let Some(table) = bc_runtime::join::BroadcastProbe::over_any_build(
         &ops::columns_by_name(&build, right_keys)?,
         ops::map_join_type(*join_type),
         probe_rows,
@@ -2340,6 +2446,7 @@ fn exec_agg_fused(
     let results: Vec<(agg::Partial, Vec<u64>)> = base_morsels
         .par_iter()
         .map(|b| {
+            opts.check_cancelled()?;
             let mut cur = b.clone();
             let mut stage_rows = Vec::with_capacity(n);
             for stage in &stages {

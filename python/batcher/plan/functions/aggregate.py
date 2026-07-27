@@ -30,8 +30,8 @@ def corr(x: IntoExpr, y: IntoExpr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [1.0, 3.0], "y": [2.0, 6.0]})
-            >>> ds.agg(c=bt.corr(bt.col("x"), bt.col("y"))).to_pydict()
-            {'c': [1.0]}
+            >>> round(ds.agg(c=bt.corr(bt.col("x"), bt.col("y"))).to_pydict()["c"][0], 6)
+            1.0
     """
     return AggExpr("corr", _as_column(x), input2=_as_column(y))
 

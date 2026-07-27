@@ -1,5 +1,379 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Three learned mechanisms were measuring, and nothing read what they measured (2026-07-26)
+
+TPC-H sf10 was losing to DuckDB by 5-12x on exactly the queries with the most joins — q8 12.4x,
+q9 10.9x, q17 10.4x, q5 9.6x — while the single-table shapes sat at 1.2-1.7x. A split that clean
+by query *shape* is not a kernel problem, and it was not one. Measuring CPU time against wall
+time per query showed **q8 using 4.3 of 96 cores** where DuckDB used 22, q2 5.3, q17 6.4, q9
+10.3. Every slow query was a parallelism collapse, and all three causes were in the control
+plane.
+
+### A stage boundary's statistics were filed under a name nothing could ever read
+
+An adaptive stage hands the next stage its intermediate wrapped as an `InMemorySource`, which is
+keyed by **object identity** — its `identity()` is only shape-based, so two different relations
+would collide on it. That object dies with the execution. Both writers filed there anyway:
+`seed_column_ndv` before the optimizer and `learn_column_stats` after the run.
+
+1. The sketch was recomputed every run — q8 re-sketched 807k rows per `collect` and **280M** on
+   the first, 40-200 ms per execution on q8/q9/q17.
+2. The learned store grew by one dead `obj:<id>` entry per execution, without bound: 25 entries
+   to 43 over 16 runs of a single query, still climbing.
+3. Because a column absent from the store is *by definition* "measured for the first time",
+   `record_column_stats` advanced the learned **generation** every single execution — and the
+   generation is part of the plan cache's key, so the cache never hit once. **0 hits, 3 misses,
+   every run, forever.** Q8 re-derived its plan, join-order DP included, for 130 ms per run
+   against DuckDB's 84 ms for the whole query.
+
+`InMemorySource` already carried `zone_maps=False` for a stage source with the same argument
+spelled out. The distinct-count sketch is keyed by identity rather than gated on that flag, so it
+needed saying separately: stage sources are now `ephemeral=True`, which both writers and the plan
+cache honor.
+
+### The plan cache's calibration epoch was a different clock from the refit it tracked
+
+With the generation quiet, q8's cache still alternated hit/miss forever. The culprit was
+`_calibration_epoch`, which is in the key because the cost-calibration and CPU-share refits
+bypass `record_write`. It computed `hub.version // _RECALIBRATE_AFTER` — a bucket counting from
+zero — while the refit throttle counts feedback rows *since its last refit*. On a query recording
+~35 operators the bucket rolled over every second execution whether or not anything had been
+re-fit. It now reads the version each fit was actually computed at, which advances exactly when a
+fit is replaced.
+
+**The cache now hits on every warm run, and q8's steady state falls from ~340 ms to ~165 ms.**
+
+### Whether to re-optimize between stages is a cost question; nothing was measuring cost
+
+The gate turns staging on when a join has a breaker-produced operand whose size is only a guess —
+which at scale describes nearly every multi-join query — and it was priced against "a per-stage
+materialize + re-plan (~20-40 ms of control plane)". It is not that. The loop runs **one breaker
+per stage**, so it materializes every join separately and gives up both operator fusion and the
+streaming executor's width. Measured at sf10: q8 887 ms staged against 142 ms one-shot, q17 476
+against 105, q2 205 against 32, and q5 running at **1.9x parallelism on 96 cores** where the
+one-shot plan reaches 22.6x.
+
+The other half of the loop recorded whether a stage's measured size missed its estimate — a
+"flip" — and used it only to turn staging *on*. It could never turn it off, and the signal would
+not support that if it could: an accurate per-stage estimate does not mean the one-shot plan
+would have been the same, because the stage boundary is where the exact size becomes available at
+all. So the flip counter is gone and `learned_adaptive_route` is a two-arm UCB1 bandit over
+`staged` and `one_shot`, rewarded with the query's wall time. Both arms return the identical
+relation. Each arm's **first** observation is discarded: a shape's first run on a route pays
+one-time costs that recur for neither, so whichever arm ran first would otherwise carry that
+penalty forever and the bandit would rank the order the arms were tried in.
+
+**The size floor binds the router too.** `plan_signature` normalizes literals so statistics
+generalize, which also makes it scale-blind — the same query over sf1 and sf10 shares a
+signature. Consulting the router before the 20M-row floor replayed sf10's routes at interactive
+scale: sf1 q8 went 18.8 ms → 181.9 ms and q2 11.2 ms → 123.2 ms. The floor is now a precondition
+checked ahead of anything learned.
+
+### The cost model chose sort-merge for a build that fit memory eight times over
+
+One more, found by capturing what the *engine* actually receives rather than what `explain`
+prints: for `lineitem ⋈ orders` at sf10 the plan shipped `"strategy": "sort_merge"`, and ran
+**10.4 s at 2.3x parallelism** where the hash join the bandit later replaced it with ran
+**1.5 s at 20x**. The plan, the decisions log, and the engine config were byte-identical
+across the slow and fast runs — only the strategy differed, and only after four executions.
+
+The gate that chose it was a bare row count (`build_rows >= 50_000_000`) standing in for a
+memory question. It says nothing about the machine or about how wide the rows are: the cost
+model had put the build on the 57M-row `lineitem` side, which cleared the floor on a 184 GB
+host where that build is under a gigabyte. The gate now also asks whether the hash table would
+actually strain memory (`build_bytes > memory / 6`, a hash build costing ~3x its side's bytes
+resident), and the two conditions are ANDed so a mis-estimated row width cannot summon
+sort-merge on its own.
+
+The bandit needed the same treatment, for the same reason. UCB1 gives every untried arm a turn
+and its evidence expires, so sort-merge was re-explored roughly every `1/(1-γ)` runs at a
+measured 10x — regret it cannot recover, because the arm was never a candidate. It is now
+withheld from any join whose build fits memory; the two arms that might win are always offered.
+
+Cold-run effect on that join: **12.7 s → 4.1 s**, steady state 1.3-2.2 s, and the periodic
+12.8 s exploration spike is gone. TPC-H q18, which had been bimodal (304 ms / 380 ms / 7,449 ms
+across otherwise-identical measurements), settles at **382 ms**.
+
+### Where it lands
+
+TPC-H **sf10**, 96-core c5d.24xlarge, all 22 queries correct against DuckDB:
+
+| query | before | after | b/duckdb before | b/duckdb after |
+|---|---:|---:|---:|---:|
+| q8 | 1129.5 | **115.4** | 12.38x | **1.32x** |
+| q17 | 670.4 | **108.9** | 10.36x | **1.72x** |
+| q9 | 2060.5 | **623.3** | 10.92x | **3.27x** |
+| q5 | 908.0 | 882.1 | 9.55x | 8.28x |
+| q7 | 342.5 | **171.0** | 5.98x | **2.50x** |
+| q3 | 447.6 | **139.3** | 5.78x | **1.76x** |
+| q20 | 345.1 | **132.9** | 5.17x | **1.91x** |
+| q2 | 201.3 | **140.2** | 3.98x | 2.76x |
+| q21 | 1074.6 | 1052.6 | 3.68x | 2.90x |
+| q10 | 529.8 | **347.5** | 2.84x | 1.95x |
+| q18 | 508.7 | **382.5** | 2.96x | 2.17x |
+| q4 | 161.2 | 183.7 | 1.23x | **0.89x** (win) |
+
+The suite total falls from **9,192 ms to 5,158 ms (1.78x)**, and Batcher now wins 5 of 22
+against DuckDB's native store (q4, q11, q15, q16, q22; was 3), 19 of 22 against
+`duckdb_arrow`, and 16 of 22 against Polars.
+
+TPC-H **sf1** is where the compounding shows: **Batcher now beats DuckDB on 13 of 22 queries
+(was 8)**, and no remaining loss exceeds 1.41x — even though sf1 never stages at all, so the
+plan-cache fixes carry it alone.
+
+The operator mix at sf1 is down to two losses against DuckDB's native store (`groupby-sum` 1.48x,
+`join-agg` 1.28x); `sort-limit` turned from a 1.16x loss into a 0.88x win. ClickBench, JSON and
+TPC-DS are unchanged, as expected — they are join-free or below the floor, so none of this
+applies to them.
+
+### What is still open, stated plainly
+
+* **Stage-by-stage re-optimization OOM-kills TPC-H q5 at sf10.** Measured directly, three
+  runs each: `adaptive=True` is killed at **134 GB resident**; `adaptive=False` answers the
+  same query in **524-716 ms at 24.6 GB peak**. The staging loop appends every stage's
+  intermediate and frees them only when the query finishes, so a six-join plan holds all of
+  them at once — the intermediate blow-up the streaming executor exists to avoid. The route
+  bandit converges to the one-shot arm here, which is both faster and safe, but it *explores*
+  the staged arm, and the cold structural heuristic picks it. Nothing checks a route against
+  the memory envelope before taking it, and that is the next thing to fix: this is a
+  correctness-of-service defect, not a tuning gap.
+* **q5 is still the worst remaining loss on speed too** — ~5-7x DuckDB one-shot. Its
+  `customer ⋈ supplier` edge on `nationkey` is many-to-many, and it spends 4.4x DuckDB's CPU.
+* **q18's cardinality estimate is still wrong**, even though its timing is now stable:
+  `HAVING sum(l_quantity) > 300` is estimated to keep 5,066,006 of 15M groups where the truth is
+  **624**, so the join above it is planned against a 15M-row operand. A reduction of the `HAVING`
+  threshold onto the aggregate's *input* distribution was written and reverted — it depends on
+  the group-count estimate, which is itself 2.4x off cold, and made q18's estimate worse.
+* **Parallelism is still 12-19x of 96 cores on the join-heavy shapes** where DuckDB reaches
+  22-56x, and Batcher spends 1.4-4.4x more CPU on them. Routing was the large term, not the last.
+
+* **`op-join-agg` at sf10 is 629 ms against a 387 ms baseline** — the one benchmark case still
+  worse than where this round started, and not explained. The same shape hand-written reaches
+  1.3-2.2 s cold-to-warm on a stable `hash` plan, so it is not the sort-merge path.
+
+Verified on this round: 8,330 unit tests, 1,617 join/aggregate/window/sort differential tests
+against DuckDB, clippy `-D warnings`, ruff, the five layer contracts, structure, docstrings and
+guardrails. Every TPC-H and ClickBench number above is correctness-gated by the harness.
+
+Two measurement notes that cost real time here. A temporary `std::env::var` probe left in
+`stream::parallel`'s hot path inflated every staged query by ~20x and made three intermediate
+benchmark runs unusable — rebuild clean before measuring, and distrust a number that moves by
+more than the change could explain. And `explain()` prints the *logical* plan: the sort-merge
+choice above was invisible there and in the decisions log, and only surfaced by capturing the
+JSON at the `execute_plan_metered` boundary. When the plan, the config and the decisions are all
+byte-identical across a 10x swing, instrument the boundary rather than the planner.
+
+## The join→aggregate fusion switched itself off exactly when it mattered (2026-07-25)
+
+`try_fused_join_aggregate` exists because, in its own words, *"DuckDB and Polars win this shape
+precisely because they fuse it"*. It threads each probe morsel through the join and straight
+into a partial aggregate, so the join's output is never materialized. It declines when the
+build side is "too large for a broadcast probe" — and that ceiling is `BroadcastProbe::new`'s,
+which is about a flat probe losing to the *partitioned* join past L3.
+
+That is the wrong comparison for a fused aggregate. Declining does not send the query to a
+partitioned probe; it sends it to **materializing the join's entire output and grouping it in a
+second pass**. On the sf10 `lineitem ⋈ orders` group-by that is a 2.0 GB intermediate plus a
+separate 60M-row pass, against a probe whose cache misses are bounded by the (much smaller)
+build side. So the fusion turned itself off at precisely the scale it was written for: at sf1
+(1.5M build) it applied and the case was 1.1x DuckDB; at sf10 (15M build) it did not, and the
+case was 13.1x.
+
+`BroadcastProbe::over_any_build` is the same constructor without that ceiling, and the fused
+aggregate is its only caller — the un-fused join keeps `new` and its ceiling, because for *it*
+the partitioned path really is the alternative. Everything else is unchanged: probe-driven join
+types only, the same key shapes, the same table, the same probe loop, the same emitted rows.
+
+The measurement that makes the case is the CPU column, not the wall column — partitioning both
+sides of a 60M ⋈ 15M join is most of the work, and fusing deletes it rather than spreading it:
+
+| sf10 shape | wall before | wall after | CPU before | CPU after |
+|---|---:|---:|---:|---:|
+| join + `count(*)` | 230 ms | **178 ms** | 13.2 s | **2.1 s** |
+| join + `GROUP BY` int | 459 ms | **204 ms** | 25.0 s | **3.3 s** |
+| join + `GROUP BY` string | 966 ms | **560 ms** | 32.7 s | **5.9 s** |
+
+Found by attribution rather than guesswork: `explain(analyze=True)` put 741 ms of an 877 ms
+query in the `hash_join` node at **40% CPU** (the same join grouped by an *integer* column ran
+339 ms at 69%), which said the cost was the join's output handling, not the grouping.
+
+`op-join-agg` at sf10, against every comparator, is where this lands:
+
+| | session start | now |
+|---|---:|---:|
+| batcher | 2,701 ms | **371 ms** (7.3x) |
+| vs DuckDB (native store) | 13.13x | **1.82x** |
+| vs duckdb_arrow | 2.77x | **0.39x** (win) |
+| vs Polars | 8.04x | **1.08x** |
+
+Two smaller fixes landed with it, both the same omission — arrow's `concat` copies a
+variable-width column row by row on one core, and `bc_runtime::gather::concat_columns` (which
+sums lengths into the offset buffer and copies bytes into disjoint slices across cores) already
+existed but was not used by either caller: the join's chunked gather reassembly
+(`ops::joins::gather_column`) and `ops::materialize`'s string columns, whose `Int64`/`Float64`
+siblings were already a parallel memcpy. Neither moved this benchmark (its gather does not
+chunk), but both are on the whole-relation-concat path an un-shardable join and a sort take.
+
+1,265 Rust tests, 13,927 Python tests, clippy and the seq-vs-streaming oracle all pass.
+
+## A large join ran on a tenth of the machine, and only showed up at scale (2026-07-25)
+
+Everything below this entry was measured at sf1, where the operator mix put Batcher within
+1.1x of DuckDB on the join. At **sf10 the same case was 13.1x** — 2,701 ms against DuckDB's
+206 ms, and 8.0x Polars. A ratio that moves by an order of magnitude between scales is not a
+tuning gap, and it was not: single-threaded, Batcher ran that join in 11.4 s against DuckDB's
+8.0 s (1.43x — the kernels are competitive). Across 96 cores Batcher reached **3.9x** its own
+single-thread time where DuckDB reached 18x. The whole gap was parallelism.
+
+The streaming executor declines to shard a plan whose hash join cannot be probed one morsel at
+a time, which is right — sharding a join with no probe table rebuilds the whole hash table in
+every worker. But "decline to shard" meant the *entire* query then ran through one pipeline:
+the probe side drained and concatenated whole, the join, the gather, and the group-by above it
+all on a single core. `BroadcastProbe` refuses any build past ~2.1M rows (past L3, where a flat
+probe pays a miss per row), so every large-to-large join landed there. Two fixes:
+
+**The un-sharded aggregate now folds across the pool.** `partial` per morsel is mergeable by
+construction, so morsels are taken from the stream in order into a bounded buffer
+(`workers x 2`), `partial`-ed in parallel, and combined in that same order — the same algebra
+the sharded aggregate and the distributed path already run, with a wider `partial` step. The
+buffer is what the "streaming" aggregate holds of its input, so it stays proportional to the
+machine rather than the relation.
+
+**The executor may now hand a plan back.** After the build sides are prepared — the first
+moment the answer is exact rather than guessed from the plan's shape — a plan it cannot shard
+returns `InterpError::PreferMaterializing`, and `bc-py` re-runs it on the materializing
+executor, which partitions the same join across every core. It is reported rather than taken
+because the materializing executor needs the caller's spill options and memory pool, and
+because only the caller knows whether that executor's footprint is affordable.
+
+That last point is the one with teeth, and it took two corrections to get right:
+
+- **Bounded to a single hash join in the whole plan.** With one join the two executors hold the
+  same thing (the streaming fallback already concatenates the entire probe relation), so the
+  hand-off costs no peak the query was not already paying. With more, streaming holds one
+  join's output at a time while the materializing executor holds all of them: TPC-H q5 at sf10
+  (five joins) reaches **99 GB and is OOM-killed** there. Counting joins on the probe *spine*
+  was not enough — a bushy tree hides most of them under build sides, which is exactly how q5
+  slipped through the first version of this check.
+- **Bounded to a probe larger than its build.** What the hand-off buys is a parallel probe;
+  what it costs is the build side, executed once for a cache that is then discarded. TPC-H q4
+  (`orders SEMI lineitem`, ~57k probe rows against a ~3.8M build) measured within 1% on both
+  executors, so handing it over paid the build twice for nothing.
+
+Measured on 96 cores / 184 GB, best-of-3, correctness-gated against DuckDB:
+
+| sf10 operator mix | before | after | vs DuckDB before → after |
+|---|---:|---:|---|
+| `op-join-agg` | 2,701 ms | **718 ms** | 13.13x → **3.57x** |
+| join + `count(*)` | 660 ms | **222 ms** | — |
+| `EXISTS` semi join | 2,370 ms | **211 ms** | — |
+
+The semi join is the extreme case: 5.7x parallelism streaming against 62x materializing. Its
+probe side is 60M rows and its build 15M, so it is exactly the shape the hand-off is bounded to.
+
+**What still trails, and why.** `op-join-agg` remains the worst single-node case at sf10
+(1.7x duckdb_arrow, 2.5x Polars). Its cost is now attributed rather than guessed — the same
+join, grouped by an **integer** build column instead of a string one, runs in 444 ms at 58x
+parallelism against 877 ms at 35x:
+
+| sf10, 60M x 15M join | wall | parallelism |
+|---|---:|---:|
+| join + `count(*)` | 224 ms | 58x |
+| join + payload gather + global `SUM` | 302 ms | 57x |
+| join + `GROUP BY` an **int** build column | 444 ms | 58x |
+| join + `GROUP BY` a **string** build column | 877 ms | 35x |
+
+So ~430 ms of it is the string group key, and it costs *parallelism*, not just work. The build
+column has 5 distinct values across 15M rows, so the fix is to gather it as a **canonical
+dictionary** — keys taken from the join's existing `idx.right`, values the distinct strings —
+and let `assign_groups`' existing dictionary path group on the codes rather than hash 60M
+strings. That was left undone deliberately: it changes a join's output *type*, so every
+downstream operator, the FFI boundary and the user-visible result schema are in its blast
+radius, and it needs its own validation cycle rather than the tail of this one.
+
+1,265 Rust tests, clippy and the streaming-vs-sequential oracle pass, with the hand-off pinned
+in both directions (`a_large_probe_against_a_huge_build_is_handed_back_only_when_the_caller_asks`):
+it must fire for a large probe against an over-ceiling build, and must **not** fire for the
+default entry point, which every caller without somewhere to hand the plan to still uses.
+
+### Where Batcher stands against every competitor (2026-07-25, measured)
+
+Operator mix, sf1, all seven comparators in one run (`b/x < 1.00` = Batcher faster):
+
+| | Ray Data | Spark | Daft | Polars | PyArrow | duckdb_arrow | DuckDB (native store) |
+|---|---|---|---|---|---|---|---|
+| cases Batcher wins | 7/7 | 11/11 | 11/11 | 11/11 | 7/7 | 11/11 | 6/11 |
+| worst ratio | 0.04x | 0.06x | 0.78x | 0.93x | 1.48x | 0.81x | 1.92x |
+
+The same operator mix at **sf10** — the scale that exposed the join, and the one the entries
+above are about — after the fusion fix:
+
+| | duckdb_arrow | Polars | DuckDB (native store) |
+|---|---|---|---|
+| cases Batcher wins | **11/11** | **10/11** | 6/11 |
+| worst ratio | 0.86x | 1.08x (`op-join-agg`) | 3.02x (`op-sort-limit`) |
+
+ClickBench (43 queries, all correctness-gated): **43/43 vs duckdb_arrow**, 35/40 vs Polars
+(the five are `q00/q12/q14/q19/q38`, all sub-3 ms where fixed per-query overhead dominates),
+26/43 vs DuckDB's native store.
+
+### What "Batcher wins everything" would still take
+
+Not a to-do list of tuning. Each of these is a distinct piece of work, and none is a
+measurement artifact:
+
+1. **DuckDB's native compressed store** is the one comparator Batcher does not sweep — 26/43
+   ClickBench, roughly half of TPC-H sf1, 6/11 operators at sf10. On the *same* Arrow input
+   (`duckdb_arrow`) Batcher wins every one of those. The remaining gap is largely storage:
+   compression, zone-map skipping, and late materialization off a native format. That is a
+   storage-engine program, not an executor fix, and it should be costed as one.
+2. **Sub-millisecond queries vs Polars** (`cb-q00` is 0.2 ms against 0.1 ms). What is left there
+   is fixed per-query overhead — plan build, FFI, fanning a 1M-row scan across 96 workers that
+   do not earn their dispatch. An adaptive width that declines to fan out below a work
+   threshold is the obvious lever, and it needs a quiet machine to measure honestly.
+3. **`op-join-agg` at 1.08x Polars** — the flat probe is now memory-latency bound (10x
+   parallelism on 96 cores, not CPU-saturated). Software prefetching in `JoinTable::probe_range`
+   is the standard next step.
+4. **TPC-H q5 at sf10** (below) — the only case that does not merely lose but does not finish.
+
+TPC-H sf1, 22 queries: Batcher beats **Spark on 22/22** (0.02–0.19x, i.e. 5–50x faster),
+duckdb_arrow on 22/22, and Daft on 19/20 of the queries Daft can express. The remaining
+comparator Batcher does not uniformly beat is **DuckDB reading its own compressed native
+store**; on the like-for-like Arrow input (`duckdb_arrow`) Batcher wins every operator case.
+
+Two facts about the comparators, both reproducible above:
+
+- **Daft returns wrong answers on TPC-H q6, q15 and q18** and cannot express q21/q22 (it
+  raises). The harness reports these as `duckdb != daft`; Batcher agrees with DuckDB in every
+  one. Daft's running-sum window (`op-window-runsum`) also disagrees with DuckDB.
+- **Spark needs a JVM**, not just the `pyspark` wheel; without one the adapter reports
+  unavailable and the suite silently omits the column. Install with
+  `python -c "import jdk; print(jdk.install('17', jre=True))"` and export `JAVA_HOME`.
+
+### Two findings this work surfaced but did not fix
+
+- **TPC-H q5 at sf10 does not complete on either single-node executor.** It climbs past 130 GB
+  and is OOM-killed, which takes the whole sf10 TPC-H sweep down with it (the run stops at q5,
+  reproducibly, exit 137). q5 is a five-way join whose spine cannot be sharded, so the
+  un-shardable fallback materializes each join's output whole — the intermediate blow-up the
+  streaming executor exists to prevent, on the one path where it does not apply.
+
+  It is **pre-existing**, and that was established rather than assumed, because the changes
+  above are in exactly this area. Three independent checks: it fails identically on the
+  *materializing* executor, whose path carries none of them; it still fails with the parallel
+  fold compiled out; and it cannot reach the hand-off at all, which requires a plan with one
+  hash join and q5 has five. sf1 is unaffected (q5 measures 26 ms, unchanged).
+
+  It is also invisible in a normal run, which is why it survived: best-of-N reports the fastest
+  of three, and a query's *cold* run costs far more than its warm ones (q5 at sf1: 2,257 ms
+  cold, 31 ms warm). `diagnose.py time` prints every run as it lands, for this reason.
+
+  This is the single most important open item at scale, and it is where the next work belongs.
+- **The memory envelope is sensed once and does not track what the process has since
+  allocated**, so a guard written against it (`src_bytes x 8 < budget`) can pass while the box
+  is already full. That is why the hand-off is bounded structurally (one join, probe > build)
+  rather than by a byte estimate.
+
 ## A self-join fell to the single-threaded streaming path — TPC-H q21 3.2x → 1.5x (2026-07-23)
 
 TPC-H q21 was the worst-remaining single-node query (3.2x DuckDB, 211 ms), and the cause was
@@ -3843,3 +4217,81 @@ the spec omits NaN from column statistics, so the recorded max is the largest *n
 while SQL ranks NaN above every number. The minimum still comes free (a dropped NaN can never
 have been the minimum). Integer and temporal columns pay nothing, and neither does an in-memory
 source (it computes NaN-aware bounds and declares so via `SourceStatistics.bounds_include_nan`).
+
+## Cancellation poll cost — measured, and NOT resolvable on this box (2026-07-26)
+
+Phase 4B adds a cooperative cancellation check the executor polls: between morsels on the
+streaming executor, between operators on the materializing one, and between the merge passes
+of a spilling sort. `bc_resource::CancelToken::is_cancelled` is a `Relaxed` load of an
+`AtomicBool`. The expectation was "unmeasurable"; that is the sort of expectation this file
+exists to check, so it was measured.
+
+**Method.** One build, one process, paired A/B. `run_relational`'s `query_scope` was replaced
+by a `nullcontext` for the "no token" arm, which makes `current_query_id()` empty, sends
+`query_id=None` across the FFI, leaves `opts.cancel` as `None`, and polls nothing. 8M rows,
+31 pairs after 5 warm-up pairs, **alternating which arm runs first** so order bias cancels.
+
+| Shape | No token | Token | Median delta | Per-pair p10 / p90 |
+|---|---|---|---|---|
+| filter + project chain | 32.0 ms | 34.6 ms | +2.3% | -7.7% / +14.0% |
+| group_by + count | 24.2 ms | 24.7 ms | +1.1% | -14.4% / +19.7% |
+| sort desc | 131.9 ms | 131.6 ms | **-0.4%** | -11.4% / +5.8% |
+
+**Read this as "no regression demonstrated", not as "the poll is free", and not as a 2%
+regression either.** One arm is negative, which a polling check cannot cause, so the effect
+is under the noise floor. The per-pair spread is roughly ±14%, and the machine was at load
+average **16.9** from concurrent agent sessions — exactly the condition
+`envinfo.require_quiet_box()` exists to refuse. A tighter bound needs an idle box.
+
+An earlier non-interleaved run of the same A/B reported the token arm **17% faster**, which
+is impossible and was pure order bias: the second arm inherited the first's warm caches. It
+is recorded here because it is the trap, not because it is a result.
+
+Separately measured, and not noise: `query_scope()` entry+exit costs **15 µs per query**
+(uuid 2.3 µs, register+unregister across the FFI 2.3 µs, signal handler install/restore
+1.5 µs). On a 22 ms query that is 0.07%, and it is paid once per terminal op rather than per
+morsel.
+
+## TPC-DS front-end coverage — 76 of 99 queries plan (2026-07-26)
+
+`benchmarks/internals/tpcds_coverage.py`. Parse-and-plan only, against empty schemas: no data,
+no scale factor, seconds to run. It answers "can the front-end express this query", which is
+the question the roadmap needs.
+
+**Not** an execution result, **not** a performance result, and **not an audited TPC result**. A
+planned query is one the front-end accepts; it says nothing about whether the answer is right.
+
+Query texts and table schemas both come from DuckDB's `tpcds` extension — `tpcds_queries()` for
+the 99 official texts with validation-default parameters, `dsdgen(sf=0)` for the 24 official
+schemas. An earlier draft hand-typed the schemas from memory, which would have measured the
+typo rather than the engine.
+
+```text
+TPC-DS front-end coverage: 76/99 queries plan
+
+    6  decimal type support               q5 q12 q20 q47 q57 q98
+    4  synthesized join key out of scope  q72 q75 q78 q93
+    3  disjunctive IN/EXISTS subquery     q10 q35 q45
+    3  window function                    q36 q70 q86
+    2  set operation (intersect/except)   q27 q87
+    2  name resolution                    q80 q84
+    1  type / cast                        q14
+    1  correlated subquery                q41
+    1  star expansion in an expression    q89
+```
+
+**This corrects a claim in the repo.** `benchmarks/suites/standard/tpcds.py` says expanding
+past its 7 queries "is mechanical once a query's tables are added to `sources.TPCDS_TABLES`".
+Tables are not the constraint: all 24 are registered here and 23 queries still fail, every one
+of them on the **SQL surface**.
+
+Two findings worth acting on:
+
+- **Decimal is the single biggest blocker**, and it hides behind other symptoms. q12/q20/q47/q57/
+  q98 read as window-function gaps (`window function sum is not supported for column type
+  Decimal128(7, 2)`) and q5 reads as a set-operation gap (`incompatible branch types
+  Decimal128(7, 2) and Float64 with no common type`). One fix, four apparent roadmap items.
+- **`synthesized join key out of scope` looks like a defect, not a missing feature.** q72/q75/
+  q78/q93 fail with `projection '__jk_l0' references unknown column(s) ['w_warehouse_sk']` — a
+  join key the translator synthesized referring to a column that is not in the scope it built.
+  Worth a look before it is filed as "unsupported SQL".

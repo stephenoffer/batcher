@@ -113,7 +113,6 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     ),
     "rle": "Run-length encoding is not built in; detect run boundaries with a lag window.",
     "rle_id": "Run ids are not built in; derive them from a lag window and a running sum.",
-    "entropy": "Entropy is not a built-in reducer; compute it from value counts (ds.value_counts).",
     "dot": "The dot product of two vector columns is bt.col('a').list.dot(bt.col('b')).",
     "reshape": "Reshape a flat column into lists with the .list accessor or a group_by array_agg.",
     "extend_constant": (
@@ -185,10 +184,6 @@ STR_UNSUPPORTED: dict[str, str] = {
     "isnumeric": "Spelled .str.is_numeric() here.",
     "istitle": "There is no is_title; compare against .str.to_titlecase().",
     "isupper": "Spelled .str.is_upper() here.",
-    "join": (
-        "Join a list column's items with .list.join(sep); concatenate columns with "
-        "bt.concat_str(...)."
-    ),
     "normalize": (
         "Unicode normalization is not exposed; .str.normalize_whitespace() collapses whitespace."
     ),
@@ -225,7 +220,6 @@ LIST_UNSUPPORTED: dict[str, str] = {
     "shift": "Shifting elements within a list is not built in; explode, window, and re-aggregate.",
     "sample": "Sampling within a list is not built in; explode then ds.sample(...).",
     "tail": "The last n elements are .list.slice(-n, n); the last one is .list.last().",
-    "drop_nulls": "Drop nulls inside a list by exploding first: ds.explode('x').drop_nulls('x').",
     "all": "Reduce a boolean list with .list.min() (all true == min 1); or explode and aggregate.",
     "any": "Reduce a boolean list with .list.max() (any true == max 1); or explode and aggregate.",
 }

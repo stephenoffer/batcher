@@ -76,6 +76,9 @@ Each method returns a new `Dataset`. They chain.
 | `.join(other, ...)` | Relational join (see below). |
 | `.window(...)` | Per-row windowed columns (see below). |
 | `.group_by(*keys, **derived)` | Start a grouped aggregation (returns `GroupBy`). |
+| `.rollup(*keys)` | Aggregate at every prefix of `keys` plus the grand total (SQL `ROLLUP`). |
+| `.cube(*keys)` | Aggregate at every subset of `keys` (SQL `CUBE`). |
+| `.grouping_sets(*sets)` | Aggregate at exactly the levels given (SQL `GROUPING SETS`). |
 | `.map_batches(fn, ...)` | Apply a Python function to whole Arrow batches. |
 | `.offload_blobs(column="bytes", ...)` | Move a large-payload column to a content-addressed store, leaving URI handles ([blob-by-reference](../ml/multimodal.md)). |
 | `.materialize_blobs(...)` | Read offloaded payloads back from their handles (inverse of `offload_blobs`). |
@@ -257,6 +260,22 @@ Call `group_by()` with no keys for a global aggregate, and pass several keys to
 group by each unique combination. Derived keys are allowed as keyword expressions
 or via `with_columns`. See [Aggregations](../user-guide/aggregations.md) for the
 full aggregate function set.
+
+### Subtotals: rollup, cube and grouping sets
+
+A subtotal report needs the same aggregate at several grouping levels at once.
+`rollup(*keys)` aggregates at every prefix of the keys and then the grand total,
+`cube(*keys)` at every subset, and `grouping_sets(*sets)` at exactly the levels you
+name (`[]` is the grand total). Each returns a builder you finish with `.agg(...)`,
+and each is the DataFrame spelling of the SQL clause of the same name — the two
+front-ends produce identical rows. A key that is not part of a level reads as NULL,
+which is how a subtotal row is told apart from a detail row:
+
+```python
+report = ds.rollup("category").agg(revenue=bt.col("price").sum())
+print(report.sort("category").to_pydict())
+# {'category': ['a', 'b', 'c', None], 'revenue': [90.0, 60.0, 60.0, 210.0]}
+```
 
 ## Terminal operations
 

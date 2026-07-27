@@ -182,10 +182,16 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                 }
             })
             .collect();
-        return Ok(cast(
+        let stamps = cast(
             &(Arc::new(out) as ArrayRef),
             &DataType::Timestamp(TimeUnit::Microsecond, None),
-        )?);
+        )?;
+        // A **date**, not a timestamp — `last_day` names a day, and DuckDB, Spark and
+        // Polars all return a DATE for either input type. Returning midnight-of-that-day
+        // as a timestamp was visible to a user as `2024-03-31 00:00:00` beside their
+        // other date columns, changed the column's type in a `with_columns`, and forced
+        // every differential test of it to cast DuckDB's answer to compare at all.
+        return Ok(cast(&stamps, &DataType::Date32)?);
     }
 
     // `is_leap_year` (→ Bool), `days_in_month` (→ Int64), `iso_year` (→ Int64):

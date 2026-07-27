@@ -46,7 +46,9 @@
 //! violations of this module's invariants rather than conditions a query can create,
 //! and a fallback would turn a bug here into a silent slow path. They propagate.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, BooleanArray, BooleanBufferBuilder, RecordBatch, RecordBatchOptions, UInt32Array,
@@ -87,6 +89,20 @@ impl Expr {
         &self,
         batch: &RecordBatch,
     ) -> Result<Option<BooleanArray>, ExprError> {
+        self.short_circuit_filter_mask_with(batch, None)
+    }
+
+    /// [`Expr::short_circuit_filter_mask`], with the conjunct order taken from what
+    /// earlier morsels *measured* rather than from the static cost model alone.
+    ///
+    /// Pass a [`ConjunctOrder`] built once per Filter operator and shared across its
+    /// morsels and its workers. `None` reproduces the static-order behaviour exactly,
+    /// which is what the sequential oracle uses.
+    pub fn short_circuit_filter_mask_with(
+        &self,
+        batch: &RecordBatch,
+        learned: Option<&ConjunctOrder>,
+    ) -> Result<Option<BooleanArray>, ExprError> {
         let n = batch.num_rows();
         let conjuncts = self.and_conjuncts();
         if n == 0 || conjuncts.len() < 2 {
@@ -97,11 +113,13 @@ impl Expr {
             return Ok(None);
         }
 
-        // Cheapest conjunct first, the opening order DuckDB's `ExpressionHeuristics`
-        // also computes. `sort_by_key` is stable, so equal-cost conjuncts stay in the
-        // order the query wrote them — which is the only order a reader can predict.
-        let mut order: Vec<usize> = (0..conjuncts.len()).collect();
-        order.sort_by_key(|&i| conjuncts[i].eval_cost());
+        // A `ConjunctOrder` built for a different predicate would index the wrong slots,
+        // so a mismatched width is ignored rather than trusted.
+        let learned = learned.filter(|l| l.len() == conjuncts.len());
+        let order = match learned {
+            Some(l) => l.order(&conjuncts),
+            None => static_order(&conjuncts),
+        };
 
         // `view` is what the next conjunct is evaluated over and `view_abs` maps its
         // rows back to `batch` (`None` while they are still the same rows). `live` is
@@ -111,13 +129,24 @@ impl Expr {
         let mut live = all_set(n);
 
         for (pos, &ci) in order.iter().enumerate() {
+            let rows_in = view.num_rows();
+            let started = learned.map(|_| Instant::now());
             let Ok(evaluated) = conjuncts[ci].eval(&view) else {
                 return Ok(None);
             };
             let Ok(mask) = as_bool(&evaluated, "and") else {
                 return Ok(None);
             };
-            live = boolean::and(&live, &truthy(mask))?;
+            let kept = truthy(mask);
+            if let (Some(l), Some(started)) = (learned, started) {
+                l.record(
+                    ci,
+                    rows_in,
+                    kept.values().count_set_bits(),
+                    started.elapsed(),
+                );
+            }
+            live = boolean::and(&live, &kept)?;
 
             let remaining = &order[pos + 1..];
             let Some(&next) = remaining.first() else {
@@ -143,6 +172,134 @@ impl Expr {
         }))
     }
 }
+
+/// Cheapest conjunct first, the opening order DuckDB's `ExpressionHeuristics` also
+/// computes. `sort_by_key` is stable, so equal-cost conjuncts stay in the order the query
+/// wrote them, which is the only order a reader can predict.
+fn static_order(conjuncts: &[&Expr]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..conjuncts.len()).collect();
+    order.sort_by_key(|&i| conjuncts[i].eval_cost());
+    order
+}
+
+/// What one Filter operator has measured about each of its conjuncts, so the next morsel
+/// orders them by observed work rather than by a static guess.
+///
+/// ## Why measurement beats the cost model here
+///
+/// Cost is not selectivity, and the static order only knows cost. `WHERE is_active AND
+/// url LIKE '%checkout%'` opens with the boolean because it is cheap, and if nearly every
+/// row is active that ordering buys nothing: the expensive conjunct still runs at full
+/// width. The quantity that actually matters is *work removed per unit of work spent*,
+/// and both halves of it are observable after one morsel.
+///
+/// DuckDB reaches the same place differently: `AdaptiveFilter` swaps a random adjacent
+/// pair, keeps the swap if the *total* runtime improved over the next ten batches, and
+/// halves that position's swap likeliness when it did not
+/// (`src/execution/adaptive_filter.cpp`). That is a hill-climb on an aggregate signal, and
+/// it needs tens of batches to walk a permutation. Because
+/// [`Expr::short_circuit_filter_mask_with`] evaluates the conjuncts one at a time anyway,
+/// it can attribute rows and time to each conjunct *individually* and jump straight to the
+/// implied order after a single morsel. The trade is that the measurement is conditional:
+/// a conjunct that runs third only ever sees rows the first two kept, so its keep-rate is
+/// conditional on them. That biases the estimate but does not destabilize it, because the
+/// ordering it produces feeds back into the next measurement.
+///
+/// ## Why it needs no lock
+///
+/// Every counter is a plain atomic and each morsel derives its own permutation from
+/// whatever it reads. Two workers may briefly disagree about the best order, which costs
+/// nothing: the conjuncts of an `AND` commute, so **every** order yields the identical
+/// mask. That is the same property [`Expr::is_infallible_predicate`] guarantees for
+/// skipping, and it is why this can be adaptive without being a correctness surface.
+#[derive(Debug)]
+pub struct ConjunctOrder {
+    slots: Vec<Slot>,
+}
+
+#[derive(Debug, Default)]
+struct Slot {
+    rows_in: AtomicU64,
+    rows_out: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl ConjunctOrder {
+    /// Build state for `predicate`, or `None` when it has fewer than two conjuncts and
+    /// there is therefore no order to choose.
+    pub fn new(predicate: &Expr) -> Option<Self> {
+        let width = predicate.and_conjuncts().len();
+        (width >= 2).then(|| Self {
+            slots: (0..width).map(|_| Slot::default()).collect(),
+        })
+    }
+
+    /// How many conjuncts this was built for.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// True when there are no conjuncts. Present because clippy asks for it beside
+    /// [`Self::len`]; a `ConjunctOrder` is never actually built empty.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn record(&self, index: usize, rows_in: usize, rows_out: usize, elapsed: Duration) {
+        let slot = &self.slots[index];
+        slot.rows_in.fetch_add(rows_in as u64, Ordering::Relaxed);
+        slot.rows_out.fetch_add(rows_out as u64, Ordering::Relaxed);
+        slot.nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// The order to evaluate `conjuncts` in, cheapest expected work first.
+    ///
+    /// The rank is `time per row / rows removed per row`: a conjunct that removes most of
+    /// what it sees earns its cost, one that removes nothing never does however cheap it
+    /// is. A conjunct with no measurement yet falls back to its static cost, scaled into
+    /// the same units so the two can be compared before every slot has been filled.
+    fn order(&self, conjuncts: &[&Expr]) -> Vec<usize> {
+        let mut ranked: Vec<(usize, f64)> = (0..conjuncts.len())
+            .map(|i| (i, self.rank(i, conjuncts[i])))
+            .collect();
+        // A total order over finite, non-NaN ranks; ties keep index order, so an
+        // unmeasured predicate stays in the order it was written.
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        ranked.into_iter().map(|(i, _)| i).collect()
+    }
+
+    fn rank(&self, index: usize, conjunct: &Expr) -> f64 {
+        let slot = &self.slots[index];
+        let rows_in = slot.rows_in.load(Ordering::Relaxed);
+        if rows_in < MIN_MEASURED_ROWS {
+            // Not enough evidence yet. Keep the static cost, offset above the measured
+            // range so a measured conjunct is preferred once one exists — an unmeasured
+            // conjunct is the one whose selectivity we most want to learn, and it learns
+            // it by being evaluated, not by going first over the whole batch.
+            return UNMEASURED_RANK_BASE + f64::from(conjunct.eval_cost());
+        }
+        let rows_out = slot.rows_out.load(Ordering::Relaxed);
+        let nanos = slot.nanos.load(Ordering::Relaxed);
+        let per_row = nanos as f64 / rows_in as f64;
+        // Rows removed per row seen. Floored so a conjunct that removes nothing ranks
+        // last by a wide margin instead of dividing by zero.
+        let removed = ((rows_in - rows_out) as f64 / rows_in as f64).max(MIN_REMOVED_FRACTION);
+        per_row / removed
+    }
+}
+
+/// Rows a conjunct must have been evaluated over before its measurement is preferred to
+/// the static cost. One morsel is enough evidence; a handful of rows is not.
+const MIN_MEASURED_ROWS: u64 = 4_096;
+
+/// Floor on the "fraction of rows removed" denominator, so a conjunct that has never
+/// removed a row ranks last rather than producing an infinite rank.
+const MIN_REMOVED_FRACTION: f64 = 1.0 / 65_536.0;
+
+/// Rank offset for a conjunct with no measurement yet. Above any plausible measured rank
+/// (nanoseconds per row divided by a fraction), so measured conjuncts sort first.
+const UNMEASURED_RANK_BASE: f64 = 1.0e9;
 
 /// The mask with its nulls folded into false, so a chain of them composes with a
 /// plain `AND`.
@@ -617,6 +774,98 @@ mod tests {
         };
         assert!(mk(true).is_infallible_predicate(&schema));
         assert!(!mk(false).is_infallible_predicate(&schema));
+    }
+
+    /// The case the static cost model gets wrong, and the reason to measure at all: two
+    /// conjuncts of *identical* cost where only one is selective. Cost cannot separate
+    /// them, so the static order keeps the written one, which here is the useless
+    /// predicate first. After one morsel the measured order must put the selective one
+    /// first.
+    #[test]
+    fn a_measured_order_promotes_the_selective_conjunct() {
+        let n = 8_192;
+        // `keep_all` is true for every row; `keep_few` for one row in 512.
+        let a: Int64Array = (0..n as i64).map(Some).collect();
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).expect("batch");
+
+        let keep_all = cmp(BinaryOp::Ge, "a", 0);
+        let keep_few = cmp(BinaryOp::Lt, "a", 16);
+        let pred = and(keep_all.clone(), keep_few.clone());
+        assert_eq!(
+            keep_all.eval_cost(),
+            keep_few.eval_cost(),
+            "the premise is that cost cannot tell these apart"
+        );
+
+        let conjuncts = pred.and_conjuncts();
+        let learned = ConjunctOrder::new(&pred).expect("two conjuncts");
+        // Before any measurement the order is the static one, which is written order here.
+        assert_eq!(learned.order(&conjuncts), vec![0, 1]);
+
+        // One morsel is enough evidence.
+        pred.short_circuit_filter_mask_with(&batch, Some(&learned))
+            .expect("eval")
+            .expect("fast path");
+        assert_eq!(
+            learned.order(&conjuncts),
+            vec![1, 0],
+            "the conjunct that removes 511 rows in 512 must be evaluated first"
+        );
+    }
+
+    /// Whatever the order converges to, the mask may not move. This is the property that
+    /// lets the ordering be adaptive without being a correctness surface, so it is asserted
+    /// against the whole-batch oracle over many morsels rather than argued.
+    #[test]
+    fn a_measured_order_never_changes_the_mask() {
+        let pred = and(
+            and(cmp(BinaryOp::Ge, "a", 0), cmp(BinaryOp::Lt, "a", 3_000)),
+            and(cmp(BinaryOp::Ne, "b", 17), cmp(BinaryOp::Gt, "b", 2)),
+        );
+        let learned = ConjunctOrder::new(&pred).expect("four conjuncts");
+        for round in 0..8 {
+            let batch = sample(4_096 + round * 37);
+            let expected = oracle(&pred, &batch);
+            let mask = pred
+                .short_circuit_filter_mask_with(&batch, Some(&learned))
+                .expect("eval")
+                .expect("fast path");
+            let got = filter_record_batch(&batch, &mask).expect("filter");
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{expected:?}"),
+                "round {round}: a measured order changed the result"
+            );
+        }
+    }
+
+    /// A `ConjunctOrder` built for a different predicate must be ignored, not indexed
+    /// into. Nothing in the type system stops a caller pairing the two, and a mismatched
+    /// width would otherwise panic on a slot that does not exist.
+    #[test]
+    fn a_mismatched_order_width_is_ignored() {
+        let batch = sample(4_096);
+        let two = and(cmp(BinaryOp::Lt, "a", 100), cmp(BinaryOp::Gt, "b", 2));
+        let three = and(
+            and(cmp(BinaryOp::Lt, "a", 100), cmp(BinaryOp::Gt, "b", 2)),
+            cmp(BinaryOp::Ne, "a", 7),
+        );
+        let wrong = ConjunctOrder::new(&three).expect("three conjuncts");
+        assert_eq!(wrong.len(), 3);
+        let expected = oracle(&two, &batch);
+        let mask = two
+            .short_circuit_filter_mask_with(&batch, Some(&wrong))
+            .expect("must not panic on a mismatched order")
+            .expect("fast path");
+        let got = filter_record_batch(&batch, &mask).expect("filter");
+        assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+    }
+
+    /// A single-conjunct predicate has no order to choose, so it gets no state.
+    #[test]
+    fn no_order_state_for_a_single_conjunct() {
+        assert!(ConjunctOrder::new(&cmp(BinaryOp::Lt, "a", 1)).is_none());
     }
 
     #[test]

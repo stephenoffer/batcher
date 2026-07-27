@@ -21,8 +21,11 @@ if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
 
 __all__ = [
+    "JOIN_ARMS",
+    "learned_adaptive_route",
     "learned_arm",
     "learned_join_strategy",
+    "record_adaptive_route",
     "record_arm",
     "record_join_strategy",
     "ucb1_best_arm",
@@ -42,9 +45,22 @@ __all__ = [
 # run forever, so a machine that got faster, or data that changed shape, leaves an arm with a
 # permanently stale mean that the bandit will not revisit.
 _NS_ARM = "tuning.join_arm_v3"  # per-signature bandit arm statistics
+_NS_ROUTE = "tuning.adaptive_route_v1"  # per-signature staged-vs-one-shot arm statistics
+_NS_ROUTE_COLD = "tuning.adaptive_route_cold_v1"  # which route arms have spent their cold sample
 
 # The discrete join-algorithm arms the bandit ranges over — all equivalent relations.
-_JOIN_ARMS: tuple[str, ...] = ("hash", "broadcast", "sort_merge")
+JOIN_ARMS: tuple[str, ...] = ("hash", "broadcast", "sort_merge")
+# The two execution routes for a plan: re-optimize between stages, or plan once and run.
+# Equivalent relations again — staging only re-plans, it never changes the algebra.
+_ROUTE_ARMS: tuple[str, ...] = ("one_shot", "staged")
+# One observation is enough to start ranking, unlike the join bandit's three. Each sample here
+# is a whole query rather than one operator inside one, so the evidence per sample is far
+# stronger; and with only two arms, "start ranking" means "explore the arm never tried" —
+# `ucb1_best_arm` takes an untried arm first. So the second run of a signature measures the
+# other route and the third onward picks the winner, which bounds the exploration cost at one
+# run of the losing arm. (The floor is compared against a *discounted* count, so 2 would not
+# even be reached by two observations: `_ARM_DISCOUNT` makes them sum to 1.975.)
+_MIN_ROUTE_TOTAL = 1
 
 # UCB exploration weight (dimensionless — the radius is scaled by the measured reward spread)
 # and the warm-up floor below which the bandit defers to the cost model.
@@ -69,13 +85,27 @@ _ARM_DISCOUNT = 0.975
 
 # Reusable primitive 1 — a deterministic UCB1 bandit over a fixed arm set.
 def record_arm(
-    hub: MetadataHub | None, namespace: str, key: str, arm: str, reward_ms: float
+    hub: MetadataHub | None,
+    namespace: str,
+    key: str,
+    arm: str,
+    reward_ms: float,
+    *,
+    invalidates_plans: bool = True,
 ) -> None:
     """Fold one measured `reward_ms` for `arm` into the per-`key` bandit statistics.
 
     Stores a discounted Welford state `(n, mean, m2)` per arm under one keyed param, so a
     record touches only its own signature. `reward_ms` is a latency (lower is better); the
     bandit minimizes it.
+
+    `invalidates_plans=False` writes without advancing the learned generation. It is for the
+    one bandit whose decision is made *outside* the optimizer — the execution route, chosen by
+    `resolve_adaptive` before `optimize_full` runs and absent from the value the plan cache
+    stores. Left at the default it is a slow leak of exactly the kind this module's `record_write`
+    contract exists to prevent: an arm's mean moves on **every** execution, so every execution
+    would invalidate every memoized plan. Measured on TPC-H q8 at sf10, that alone halved the
+    plan cache's hit rate, and a hit is worth 160 ms against 350 ms there.
     """
     if hub is None or reward_ms <= 0.0 or not arm:
         return
@@ -87,7 +117,10 @@ def record_arm(
         # exactly the arm whose evidence is most likely to be stale.
         stats = {a: _decayed(v) for a, v in stored.items() if isinstance(v, dict)}
         stats[arm] = _welford_update(stats.get(arm), reward_ms)
-        plan_cache.record_write(hub, namespace, key, stats)
+        if invalidates_plans:
+            plan_cache.record_write(hub, namespace, key, stats)
+        else:
+            hub.put_keyed_param(namespace, key, stats)
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "record a bandit arm observation", exc)
         return
@@ -279,7 +312,7 @@ def record_join_strategy(
 
 
 def learned_join_strategy(
-    hub: MetadataHub | None, signature: str, arms: tuple[str, ...] = _JOIN_ARMS
+    hub: MetadataHub | None, signature: str, arms: tuple[str, ...] = JOIN_ARMS
 ) -> str | None:
     """The measured-fastest join algorithm for this signature, or `None` cold (cost model decides).
 
@@ -288,3 +321,77 @@ def learned_join_strategy(
     guess. Every arm yields the identical relation, so the choice is result-invariant.
     """
     return learned_arm(hub, _NS_ARM, signature, arms)
+
+
+# Decision family — execution route (bandit over staged / one-shot re-optimization).
+def record_adaptive_route(
+    hub: MetadataHub | None, signature: str, route: str, wall_ms: float
+) -> None:
+    """Record what one run of `signature` cost on the route it took.
+
+    Both routes compute the identical relation — stage-by-stage re-optimization only re-plans
+    equivalent algebra — so this is a pure latency choice and the bandit may range over it
+    freely.
+
+    **The first observation of each arm is discarded**, and that is not a tuning knob but a
+    correction for what it would otherwise be measuring. A shape's first execution on a given
+    route pays one-time costs that recur for *neither* route afterwards: sketching the source
+    columns the estimator needs, deriving the plan, warming the join-strategy bandit sitting
+    under it. On TPC-H q18 at sf10 that is the difference between ~8,000 ms and ~300 ms — 25x,
+    swamping the difference between the arms by an order of magnitude. Whichever arm happened
+    to run first would carry that penalty forever, so the bandit would be ranking the order the
+    arms were tried in rather than the routes themselves. Discarding it symmetrically costs one
+    extra run per arm and makes the first *recorded* number a steady-state one.
+
+    Args:
+        hub: The metadata hub to record into; `None` is a no-op.
+        signature: The plan signature — the bandit key.
+        route: The arm that ran (`staged` / `one_shot`).
+        wall_ms: Measured wall time for the whole query.
+    """
+    if hub is None or wall_ms <= 0.0 or not route:
+        return
+    try:
+        spent = dict(hub.get_keyed_param(_NS_ROUTE_COLD, signature) or {})
+        if not spent.get(route):
+            spent[route] = 1
+            hub.put_keyed_param(_NS_ROUTE_COLD, signature, spent)
+            return
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("kyber", "read the route cold-sample marker", exc)
+        return
+    record_arm(hub, _NS_ROUTE, signature, route, wall_ms, invalidates_plans=False)
+
+
+def learned_adaptive_route(hub: MetadataHub | None, signature: str) -> str | None:
+    """The measured-cheaper execution route for this signature, or `None` cold.
+
+    Whether to re-optimize between stages is a *cost* question, and it had been answered with
+    a proxy: the loop recorded whether any stage's measured cardinality missed its estimate (a
+    "flip") and stayed staged where flips were common. The proxy does not answer the question
+    in either direction.
+
+    It cannot say *stop*, because an accurate per-stage estimate does not mean the one-shot
+    plan would have been the same — the whole point of staging is that the stage boundary is
+    where the exact size becomes available at all. And it cannot say *go*, because the
+    structural heuristic that turns staging on fires on nearly every multi-join query at scale
+    while nothing measured whether it paid. Staging runs one breaker per stage, so it
+    materializes every join separately and gives up both operator fusion and the streaming
+    executor's width: measured on TPC-H sf10, once the learned statistics are warm, q8 cost
+    887 ms staged against 142 ms one-shot, q17 476 against 105, q2 205 against 32, and q5 fell
+    to **1.9x parallelism on a 96-core machine** where the one-shot plan reaches 22.6x.
+
+    So the decision is made the way every other genuinely-two-sided one here is made — by
+    measuring both arms and minimizing regret. That matters more than the direction the
+    current numbers point, because the direction is not a constant: staging is the only
+    distributed route for some shapes, it is what earns the statistics a cold shape has not
+    learned yet, and the cost of a mis-estimated plan grows with the data. A measured router
+    follows those; a hardcoded verdict, in either direction, does not.
+
+    The arms are equivalent — staging only re-plans, never changes the algebra — so the choice
+    is result-invariant, and exploration is bounded at roughly one run of the losing arm per
+    signature. Raw wall time is the right reward here, unlike the join bandit's size-normalized
+    one: the two routes are compared on the *same* query, so a size that drifts over time moves
+    both arms together.
+    """
+    return learned_arm(hub, _NS_ROUTE, signature, _ROUTE_ARMS, min_total=_MIN_ROUTE_TOTAL)

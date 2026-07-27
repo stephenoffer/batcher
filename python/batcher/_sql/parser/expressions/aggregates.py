@@ -20,13 +20,18 @@ invisible to aggregate collection and fell through to the scalar translator with
 collection sites use so those names are seen.
 
 A DuckDB aggregate whose closest Batcher equivalent has *different* semantics is
-deliberately absent. `first`/`last`/`arbitrary`/`any_value` return an unspecified row's
-value in DuckDB while the engine's `first`/`last` require an explicit ordering, and
-`fsum`/`kahan_sum` are compensated summation where the engine's `sum` is not — each
-would return a plausible answer that is not DuckDB's, so each keeps raising.
+deliberately absent. `first`/`last` name a row *in scan order*, which a mergeable
+aggregate cannot promise, so they keep raising. (`fsum`/`kahan_sum` were in that
+list until the engine grew a compensated sum of its own; they now map to it.)
+
+`any_value`/`arbitrary` are here, and are not the same case: DuckDB documents the chosen
+row as *unspecified*, so the group minimum — which a commutative combine can compute
+identically on one node and a hundred — conforms.
 """
 
 from __future__ import annotations
+
+from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import AggExpr, Expr
 from batcher.plan.functions.regression import (
@@ -85,6 +90,16 @@ _TYPED_BINARY = {
 # translated argument (`None` for the nullary `count_star()`).
 _ANON: dict[str, object] = {
     "product": lambda x: x.product(),
+    "entropy": lambda x: x.entropy(),
+    "fsum": lambda x: x.kahan_sum(),
+    "kahan_sum": lambda x: x.kahan_sum(),
+    "sumkahan": lambda x: x.kahan_sum(),
+    "mad": lambda x: x.mad(),
+    "kurtosis_pop": lambda x: x.kurtosis_pop(),
+    # DuckDB leaves the choice of row unspecified, and so does the engine's `any_value`
+    # (it takes the group minimum, which is what a commutative combine can promise).
+    "any_value": lambda x: x.any_value(),
+    "arbitrary": lambda x: x.any_value(),
     "histogram": lambda x: x.histogram(),
     "mean": lambda x: x.mean(),
     "favg": lambda x: x.mean(),
@@ -92,9 +107,17 @@ _ANON: dict[str, object] = {
     "count_star": lambda _x: AggExpr("count_star", None),
 }
 
+# Anonymous aggregates that take a *second, constant* argument: a quantile or a count.
+# They cannot live in `_ANON`, whose builders take exactly one translated argument.
+_ANON_PARAM: dict[str, object] = {
+    "quantile_disc": lambda x, p: x.quantile_disc(p),
+    "percentile_disc": lambda x, p: x.quantile_disc(p),
+    "approx_top_k": lambda x, p: x.top_k(int(p)),
+}
+
 #: Every DuckDB aggregate name that arrives as `exp.Anonymous`. The collection sites
 #: test membership here to decide whether an anonymous call is an aggregate.
-ANON_AGG_NAMES = frozenset(_ANON)
+ANON_AGG_NAMES = frozenset(_ANON) | frozenset(_ANON_PARAM)
 
 
 def is_agg_node(node) -> bool:
@@ -106,10 +129,13 @@ def is_agg_node(node) -> bool:
     Returns:
         True for `exp.AggFunc` and for an `exp.Anonymous` naming a known aggregate.
     """
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.AggFunc):
         return True
+    if isinstance(node, exp.IgnoreNulls):
+        # `any_value(x)` parses as `IgnoreNulls(AnyValue(x))`, and `IgnoreNulls` is not
+        # an `AggFunc` subclass — so without this the aggregate was invisible to
+        # collection and the name reached the scalar translator instead.
+        return is_agg_node(node.this)
     return isinstance(node, exp.Anonymous) and node.name.lower() in ANON_AGG_NAMES
 
 
@@ -126,9 +152,7 @@ def iter_agg_nodes(root):
     Returns:
         An iterator over the aggregate call nodes, in walk order.
     """
-    from sqlglot import expressions as exp
-
-    return (n for n in root.find_all(exp.AggFunc, exp.Anonymous) if is_agg_node(n))
+    return (n for n in root.find_all(exp.AggFunc, exp.Anonymous, exp.IgnoreNulls) if is_agg_node(n))
 
 
 def build_typed_agg(tr, node) -> AggExpr | Expr | None:
@@ -155,6 +179,19 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
         # `count_if(cond)` counts the rows where `cond` is true — the condition is the
         # aggregate's whole argument, not a value column.
         return _count_if(tr._scalar(node.this))
+    if kind == "ignorenulls" and type(node.this).__name__.lower() == "anyvalue":
+        # `any_value(x)` parses as `IgnoreNulls(AnyValue(x))` — the ignore-nulls wrapper
+        # is what every value aggregate already does, so only the inner node matters.
+        return tr._scalar(node.this.this).any_value()
+    if kind == "anyvalue":
+        return tr._scalar(node.this).any_value()
+    if kind == "percentiledisc":
+        return AggExpr(
+            "quantile_disc", tr._scalar(node.this), param=_fraction(node.args.get("expression"))
+        )
+    if kind == "approxtopk":
+        count = node.args.get("expression")
+        return tr._scalar(node.this).top_k(int(_fraction(count)))
     if kind == "approxquantile":
         return AggExpr(
             "approx_quantile", tr._scalar(node.this), param=_fraction(node.args.get("quantile"))
@@ -176,6 +213,11 @@ def build_anon_agg(tr, node) -> AggExpr | Expr:
     args = list(node.expressions)
     if name == "count_star":
         return AggExpr("count_star", None)
+    parametric = _ANON_PARAM.get(name)
+    if parametric is not None:
+        if len(args) != 2:
+            raise NotImplementedError(f"{name}() takes a value and a constant")
+        return parametric(tr._scalar(args[0]), _fraction(args[1]))
     if len(args) != 1:
         raise NotImplementedError(f"{name}() takes exactly one argument")
     return _ANON[name](tr._scalar(args[0]))
@@ -190,8 +232,6 @@ def _count_if(condition: Expr) -> AggExpr:
 
 def _fraction(node) -> float:
     """The constant fraction a quantile argument denotes."""
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.Literal) or node.is_string:
         raise NotImplementedError("approx_quantile requires a constant fraction")
     return float(node.name)

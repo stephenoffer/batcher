@@ -11,7 +11,8 @@ for choosing/deriving the full output, `with_columns` for adding/replacing.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
@@ -62,11 +63,8 @@ from batcher.api.dataset.compat import (
     build_last,
     build_memory_usage,
 )
-from batcher.api.dataset.dq import DatasetDQ
-from batcher.api.dataset.meta import DatasetMeta
-from batcher.api.dataset.ml import DatasetML
-from batcher.api.dataset.scd import DatasetSCD
 from batcher.api.groupby import GroupBy
+from batcher.api.multi_group import MultiLevelGroupBy, cube_levels, rollup_levels
 from batcher.api.terminal import (
     _collect,
     _count,
@@ -103,6 +101,10 @@ from batcher.plan.schema import suggest_columns
 from batcher.plan.streaming import Watermark
 
 if TYPE_CHECKING:
+    from batcher.api.dataset.dq import DatasetDQ
+    from batcher.api.dataset.meta import DatasetMeta
+    from batcher.api.dataset.ml import DatasetML
+    from batcher.api.dataset.scd import DatasetSCD
     from batcher.api.io_namespace import Writer
     from batcher.api.stats import RunStats
 
@@ -817,7 +819,7 @@ class Dataset:
             items.append(Projection(alias, _as_expr(expr)))
         if not items:
             raise PlanError(_empty_projection_message("select", columns))
-        return windowed_project(self, items)
+        return windowed_project(self, items, collapse=True)
 
     def with_columns(self, *exprs: Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Add or replace columns, keeping all existing ones.
@@ -1018,6 +1020,12 @@ class Dataset:
                 >>> ds.ml.map(lambda r: {"x": r["x"] * 10}).to_pydict()
                 {'x': [10, 20, 30]}
         """
+        # Imported here, not at module scope: the four accessor namespaces pull in the ML,
+        # data-quality, metadata-shortcut, and SCD stacks — and through the metadata one,
+        # the whole optimizer — none of which a pipeline that never touches an accessor
+        # needs. Deferring them is most of what `import batcher` used to spend.
+        from batcher.api.dataset.ml import DatasetML
+
         return DatasetML(self)
 
     @property
@@ -1041,6 +1049,8 @@ class Dataset:
                 >>> ds.dq.in_range("age", 0, 120).drop().to_pydict()
                 {'id': [1], 'age': [30]}
         """
+        from batcher.api.dataset.dq import DatasetDQ
+
         return DatasetDQ(self)
 
     @property
@@ -1069,6 +1079,8 @@ class Dataset:
                 >>> ds.meta.none_match(bt.col("x") > 100)
                 True
         """
+        from batcher.api.dataset.meta import DatasetMeta
+
         return DatasetMeta(self)
 
     @property
@@ -1089,6 +1101,8 @@ class Dataset:
                 >>> hasattr(ds.scd, "type2")
                 True
         """
+        from batcher.api.dataset.scd import DatasetSCD
+
         return DatasetSCD(self)
 
     def map_batches(
@@ -1507,8 +1521,12 @@ class Dataset:
         available = self._plan.available_columns()
         if callable(mapping):
             renamed = {c: mapping(c) for c in available}
-            produced = list(renamed.values())
-            collisions = sorted({n for n in produced if produced.count(n) > 1})
+            # One counting pass, not a `list.count()` per element: the latter is quadratic
+            # in the column count, and `rename(str.lower)` over a wide relation is exactly
+            # the call that would hit it hardest — thousands of columns, and the collision
+            # check running longer than everything else the rename does.
+            produced = Counter(renamed.values())
+            collisions = sorted(name for name, n in produced.items() if n > 1)
             if collisions:
                 raise PlanError(
                     f"rename(): the function maps several columns onto {collisions}; "
@@ -4362,6 +4380,104 @@ class Dataset:
                 raise PlanError(f"group_by() value for {alias!r} must be an expression")
             _reject_sliding_window_key(alias, expr)
         return GroupBy(self, keys, named)
+
+    def rollup(self, *keys: str) -> MultiLevelGroupBy:
+        """Aggregate at every prefix of `keys`, plus the grand total (SQL ``ROLLUP``).
+
+        The subtotal report: ``ds.rollup("region", "city").agg(total=col("v").sum())``
+        returns a row per (region, city), a row per region with `city` null, and one
+        grand-total row with both null. An inactive key reads as NULL, which is how SQL
+        marks a subtotal row.
+
+        Args:
+            *keys: The rollup key columns, most significant first.
+
+        Returns:
+            A `MultiLevelGroupBy` to finish with ``.agg(...)``.
+
+        Raises:
+            PlanError: If a key is not a column of this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"r": ["e", "e", "w"], "v": [1, 2, 4]})
+                >>> ds.rollup("r").agg(n=bt.col("v").sum()).sort("r").to_pydict()
+                {'r': ['e', 'w', None], 'n': [3, 4, 7]}
+        """
+        self._check_group_keys(keys, "rollup")
+        return MultiLevelGroupBy(self, keys, rollup_levels(keys))
+
+    def cube(self, *keys: str) -> MultiLevelGroupBy:
+        """Aggregate at every *subset* of `keys` (SQL ``CUBE``).
+
+        The cross-tabulation: every combination of the keys, from all of them down to
+        the grand total, so a two-key cube gives per-pair, per-first, per-second and
+        overall rows. Costs 2ⁿ levels, so keep `n` small.
+
+        Args:
+            *keys: The cube key columns.
+
+        Returns:
+            A `MultiLevelGroupBy` to finish with ``.agg(...)``.
+
+        Raises:
+            PlanError: If a key is not a column of this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": ["x"], "b": ["y"], "v": [2]})
+                >>> len(ds.cube("a", "b").agg(n=bt.col("v").sum()).to_pydict()["n"])
+                4
+        """
+        self._check_group_keys(keys, "cube")
+        return MultiLevelGroupBy(self, keys, cube_levels(keys))
+
+    def grouping_sets(self, *sets: Sequence[str]) -> MultiLevelGroupBy:
+        """Aggregate at exactly the grouping levels given (SQL ``GROUPING SETS``).
+
+        The explicit form the other two are shorthands for: each argument is one level's
+        key list, and ``()`` is the grand total. Use it when the levels you want are not
+        a prefix chain or a full cube.
+
+        Args:
+            *sets: One key-name sequence per grouping level.
+
+        Returns:
+            A `MultiLevelGroupBy` to finish with ``.agg(...)``.
+
+        Raises:
+            PlanError: If a key is not a column of this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": ["x", "x"], "b": ["y", "z"], "v": [1, 2]})
+                >>> out = ds.grouping_sets(["a"], ["b"], []).agg(n=bt.col("v").sum())
+                >>> sorted(out.to_pydict()["n"])
+                [1, 2, 3, 3]
+        """
+        levels = [tuple(level) for level in sets]
+        keys: list[str] = []
+        for level in levels:
+            keys.extend(k for k in level if k not in keys)
+        self._check_group_keys(tuple(keys), "grouping_sets")
+        return MultiLevelGroupBy(self, tuple(keys), levels)
+
+    def _check_group_keys(self, keys: tuple[str, ...], what: str) -> None:
+        """Reject a non-column key with the same message `group_by` uses."""
+        available = set(self._plan.available_columns())
+        for k in keys:
+            if not isinstance(k, str) or k not in available:
+                cols = sorted(available)
+                raise PlanError(
+                    f"{what}() key {k!r} is not a column; available: {cols}"
+                    f"{suggest_columns(str(k), cols)}"
+                )
 
     def agg(self, *aggs: Expr, **aggregates: Expr) -> Dataset:
         """Aggregate over the whole dataset (no grouping).

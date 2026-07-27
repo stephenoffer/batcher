@@ -10,7 +10,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.compat.guidance import DT_UNSUPPORTED, accessor_attribute_error
+from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.func_nodes import (
     ConvertTimezone,
@@ -223,6 +225,16 @@ class _DtNamespace:
         """
         return Strftime(self._e, format)
 
+    def _micros(self) -> Expr:
+        """The microsecond epoch count, whatever temporal type the input is.
+
+        The cast to timestamp is load-bearing. A `Date32`'s integer value is a **day**
+        count, so reading it as an integer directly reported 19,787 microseconds for
+        2024-03-05 (and 19 milliseconds) instead of the instant it denotes — a wrong
+        answer with no error. On a timestamp column the cast is a no-op.
+        """
+        return self._e.cast("timestamp").cast("int64")
+
     def epoch_ms(self) -> Expr:
         """Milliseconds since the Unix epoch as an integer (DuckDB ``epoch_ms``, → Int64).
 
@@ -241,7 +253,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.epoch_ms()).to_pydict()
                 {'r': [1609459200000]}
         """
-        return (self._e.cast("int64") // 1000).cast("int64")
+        return (self._micros() // 1000).cast("int64")
 
     def epoch_us(self) -> Expr:
         """Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).
@@ -260,7 +272,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.epoch_us()).to_pydict()
                 {'r': [1609459200000000]}
         """
-        return self._e.cast("int64")
+        return self._micros()
 
     def epoch_ns(self) -> Expr:
         """Nanoseconds since the Unix epoch as an integer (DuckDB ``epoch_ns``, → Int64).
@@ -280,7 +292,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.epoch_ns()).to_pydict()
                 {'r': [1609459200000000000]}
         """
-        return self._e.cast("int64") * 1000
+        return self._micros() * 1000
 
     def millisecond(self) -> Expr:
         """The millisecond-of-second component, 0-999 (Polars ``dt.millisecond``, → Int64).
@@ -375,11 +387,15 @@ class _DtNamespace:
         """
         return self.dayofyear()
 
-    def to_string(self, format: str) -> Expr:
+    def to_string(self, format: str = "%Y-%m-%dT%H:%M:%S") -> Expr:
         """Format as text — the Polars ``dt.to_string`` spelling of :meth:`strftime`.
 
+        The default is the ISO-8601 datetime form. A Date column has no time of day, so
+        pass ``"%Y-%m-%d"`` for one rather than reading back a midnight that is not in
+        the data.
+
         Args:
-            format: A strftime pattern, e.g. ``"%Y-%m-%d"``.
+            format: A strftime pattern, e.g. ``"%Y-%m-%d"``; ISO-8601 by default.
 
         Returns:
             A new Utf8 expression: the formatted text.
@@ -430,10 +446,10 @@ class _DtNamespace:
         return self.truncate("month")
 
     def month_end(self) -> Expr:
-        """Last day of the month at midnight — the Polars ``month_end`` spelling of ``last_day``.
+        """Last day of the month — the Polars ``month_end`` spelling of ``last_day``.
 
         Returns:
-            A new Timestamp expression at the last day of the month.
+            A new Date expression at the last day of the month.
 
         Examples:
             .. doctest::
@@ -442,7 +458,7 @@ class _DtNamespace:
                 >>> import datetime as dt
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
                 >>> ds.select(r=bt.col("d").dt.month_end()).to_pydict()
-                {'r': [datetime.datetime(2024, 2, 29, 0, 0)]}
+                {'r': [datetime.date(2024, 2, 29)]}
         """
         return self.last_day()
 
@@ -746,6 +762,53 @@ class _DtNamespace:
         """
         return self.isodow() <= 5
 
+    def is_business_day(self) -> Expr:
+        """True Monday through Friday — the Polars ``is_business_day`` spelling.
+
+        Holidays are not modelled: this is the weekday test, which is what the name
+        means everywhere it appears without a calendar argument.
+
+        Returns:
+            A Boolean expression, true on weekdays.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_business_day()).to_pydict()
+                {'r': [False, True]}
+        """
+        return self.is_weekday()
+
+    def timestamp(self, unit: str = "us") -> Expr:
+        """Epoch count at `unit` — the Polars ``dt.timestamp`` spelling (→ Int64).
+
+        Args:
+            unit: ``"s"``, ``"ms"`` or ``"us"`` (the default, as in Polars).
+
+        Returns:
+            A new Int64 expression: the epoch count at that resolution.
+
+        Raises:
+            PlanError: If `unit` is not one of the three.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(1970, 1, 1, 0, 0, 1)]})
+                >>> ds.select(r=bt.col("d").dt.timestamp("ms")).to_pydict()
+                {'r': [1000]}
+        """
+        readers = {"s": self.epoch, "ms": self.epoch_ms, "us": self.epoch_us}
+        reader = readers.get(unit)
+        if reader is None:
+            raise PlanError(f"dt.timestamp(): unit must be one of {sorted(readers)}, got {unit!r}")
+        return reader()
+
     def is_month_start(self) -> Expr:
         """True on the first day of the month (pandas ``is_month_start``).
 
@@ -897,7 +960,6 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.days_in_year()).to_pydict()
                 {'r': [366, 365]}
         """
-        from batcher.plan.expr_ir.constructors import lit, when
 
         return when(self.is_leap_year()).then(lit(366)).otherwise(lit(365))
 
@@ -993,7 +1055,7 @@ _DT_FIELDS = {
     "century": "century",  # the century, e.g. 2021 → 21 (→ Int64)
     "decade": "decade",  # the decade, e.g. 2021 → 202 (→ Int64)
     "millennium": "millennium",  # the millennium, e.g. 2021 → 3 (→ Int64)
-    "last_day": "last_day",  # last day of the month at 00:00:00 (→ Timestamp(us))
+    "last_day": "last_day",  # the month's last day (→ Date32, as in DuckDB/Spark)
 }
 
 

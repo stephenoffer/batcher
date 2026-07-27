@@ -162,7 +162,8 @@ execution model and the relational surface Ray Data does not have. Read
 
 - `docs/integrations/ray.md` — scheduling vs data plane, Flight shuffle, cluster config,
   failure modes.
-- `docs/migration/index.md` — the full mapping tables and the ML/batch-inference surface.
+- `docs/migration/transforming.md`, `docs/migration/ml-pipelines.md` — the full mapping
+  tables and the ML/batch-inference surface.
 - `docs/user-guide/{udfs,transformations,performance,writing-data}.md`;
   `docs/deep-dives/shuffle-flight.md`.
 - Skills: `migrate-from-spark` (the PySpark port), `run-quality-gate` (if the port changes

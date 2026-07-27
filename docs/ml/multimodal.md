@@ -57,9 +57,9 @@ clips never all co-resides. Keep `batch_size` small for multi-GB clips.
 Decode is fast because it runs in the data plane, not a Python loop. Image decode uses
 SIMD JPEG, including a DCT-scaled path for large frames feeding small model inputs, and
 SIMD resize, fanned out per row across every core. The result crosses into a shaped
-tensor column with no per-batch re-type step. On a 96-core node this makes image decode
-and resize **2.4x faster than Daft and 6.1x faster than Ray Data**, and LiDAR
-point-cloud loading **2.4x faster than Ray Data**. See
+tensor column with no per-batch re-type step. On a 96-core node that decodes and resizes
+**5,693 images per second**, which is **2.4x Daft**, and streams LiDAR point clouds at
+**21,467 frames per second**. See
 [Multimodal ingest benchmarks](../benchmarks/multimodal-ingest.md) and the reproducible
 head-to-heads under `benchmarks/scenarios/`.
 

@@ -30,6 +30,31 @@ Leave `concurrency` unset and the engine sizes the pool automatically at one act
 GPU the cluster reports. A multi-GPU cluster is never left idling a single engine, which
 is a common scale-out mistake.
 
+The call shape is the same with or without a device, so the pattern is runnable here on
+CPU. Pass the *class*, not an instance: the engine constructs it once per worker, which
+is what makes a multi-gigabyte model load once rather than once per batch.
+
+```python
+import pyarrow as pa
+
+import batcher as bt
+
+class Scorer:
+    def __init__(self):
+        self.weights = {"a": 1.5, "b": 2.0}   # a real model loads here, once per worker
+
+    def __call__(self, batch):
+        scores = [self.weights.get(k, 0.0) for k in batch.column("k").to_pylist()]
+        return pa.table({"k": batch.column("k"), "score": pa.array(scores)})
+
+ds = bt.from_pydict({"k": ["a", "b", "a"]})
+print(ds.ml.map_batches(Scorer, num_gpus=0, concurrency=2).sort("k").to_pydict())
+# {'k': ['a', 'a', 'b'], 'score': [1.5, 1.5, 2.0]}
+```
+
+Raise `num_gpus` to reserve a device (or a fraction of one) per actor, and the rest of
+the call is unchanged.
+
 ## Autoscaling the pool
 
 Pass `concurrency` as a `(min, max)` tuple to let the pool grow and shrink with the

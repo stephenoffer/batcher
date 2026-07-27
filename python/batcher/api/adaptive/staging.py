@@ -18,7 +18,7 @@ import logging
 import pyarrow as pa
 
 from batcher._internal.logging import get_logger, log_kv
-from batcher.api.adaptive.gating import _estimate_accurate, _estimate_rows, _record_adaptive_flip
+from batcher.api.adaptive.gating import _estimate_accurate, _estimate_rows
 from batcher.api.adaptive.plan_surgery import lowest_breaker, replace
 from batcher.io.source import InMemorySource, Source
 from batcher.plan.logical import LogicalPlan, Scan, empty_result_schema
@@ -142,8 +142,6 @@ def _execute_adaptive(
     worker loss."""
     from batcher import kyber
 
-    orig_plan = plan  # capture the signature key before the loop rewrites `plan`
-    flipped = False  # did any stage's measured size diverge from its estimate (a re-opt flip)?
     srcs = list(sources)
     # Re-optimize each stage starting from the *optimized* logical structure, not the
     # raw plan. A stage is a subtree rooted at a pipeline breaker; in the raw plan a
@@ -233,14 +231,7 @@ def _execute_adaptive(
             decisions.extend(decs)
             stages += 1
             if final:
-                _record_adaptive_flip(hub, orig_plan, flipped)
                 return AdaptiveResult(_as_table(result, target), decisions, stages)
-            # An intermediate whose measured size missed its estimate is exactly a stage
-            # where re-optimizing on the real cardinality can flip a downstream choice —
-            # learn that this signature benefits from staying adaptive.
-            measured = _stage_row_count(result)
-            if measured is not None and not _estimate_accurate(measured, est_rows, reopt_error):
-                flipped = True
             # Splice a Scan over the breaker's result (exact-size) for the rest of the
             # plan. A `MaterializedSource` is scanned in place; a collected table is
             # re-wrapped as an in-memory source (the single-node / fallback path).
@@ -277,7 +268,6 @@ def _execute_adaptive(
             plan, srcs, hub, distributed, num_workers, transport, materialize=True
         )
         decisions.extend(decs)
-        _record_adaptive_flip(hub, orig_plan, flipped)
         return AdaptiveResult(_as_table(result, plan), decisions, stages + 1)
     finally:
         # The final result is a fully in-memory table, independent of the on-disk
@@ -352,20 +342,6 @@ def _as_table(result: pa.Table | Source, node: LogicalPlan) -> pa.Table:
     return _table(list(result.iter_batches()), node)
 
 
-def _stage_row_count(result: pa.Table | Source) -> int | None:
-    """A stage's measured output rows, or `None` when the count is not known exactly.
-
-    A distributed stage parks a `MaterializedSource`/`FlightMaterializedSource`, not a
-    `pa.Table`; both carry an exact `row_count` from their reduce tasks. Reading only
-    `pa.Table.num_rows` silently skipped the estimate-accuracy check on the distributed
-    path, so `learned_adaptive_helps` could never turn on for a distributed shape.
-    """
-    if isinstance(result, pa.Table):
-        return result.num_rows
-    row_count = getattr(result, "row_count", None)
-    return row_count() if callable(row_count) else None
-
-
 def _stage_source(result: pa.Table | Source) -> tuple[Source, SchemaRef]:
     """A source + schema to splice in for the next stage's scan over `result`.
 
@@ -377,10 +353,18 @@ def _stage_source(result: pa.Table | Source) -> tuple[Source, SchemaRef]:
     min/max pass over it would be recomputed and discarded on every run of the query —
     at sf10 that was 130-200 ms per collect, 13-17% of TPC-H Q9. The measured
     `row_count`, which is what re-optimization actually reads, costs nothing.
+
+    It is also `ephemeral`, which is the same fact stated about the relation's *identity*
+    rather than its bounds, and it has to be said separately because the distinct-count
+    sketch is keyed by identity rather than gated on `zone_maps`. See
+    `api.terminal._metadata.seed_column_ndv`.
     """
     if isinstance(result, pa.Table):
         batches = result.to_batches() or [pa.RecordBatch.from_pylist([], schema=result.schema)]
-        return InMemorySource(batches, zone_maps=False), SchemaRef.from_arrow(result.schema)
+        return (
+            InMemorySource(batches, zone_maps=False, ephemeral=True),
+            SchemaRef.from_arrow(result.schema),
+        )
     return result, SchemaRef.from_arrow(result.schema())
 
 

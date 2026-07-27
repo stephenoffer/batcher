@@ -162,7 +162,7 @@ on. Sketch when you want a *number*.
 
 - [Aggregations](aggregations.md): the exact and approximate aggregate families.
 - [Filtering](filtering.md): predicates, which is how a stratum is defined.
-- [Preprocessors](../ml/preprocessors.md): fitting feature statistics on the train split
+- [Preprocessors](../ml/preprocessors/index.md): fitting feature statistics on the train split
   only.
 - [Cardinality estimation](../deep-dives/cardinality-estimation.md): the sketches behind
   `approx_n_unique`, and the error bounds they hold to.

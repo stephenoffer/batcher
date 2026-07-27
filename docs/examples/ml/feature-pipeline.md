@@ -179,7 +179,7 @@ above the largest training value lands in the top bin instead of inventing a fif
 
 ## See also
 
-- [Preprocessors](../../ml/preprocessors.md): every estimator, and what each `fit` learns.
+- [Preprocessors](../../ml/preprocessors/index.md): every estimator, and what each `fit` learns.
 - [Data loaders](../../ml/data-loaders.md): the loader table above, in full.
 - [PyTorch](../../ml/pytorch.md) and the
   [PyTorch integration](../../integrations/pytorch.md): the training loop on the other end.

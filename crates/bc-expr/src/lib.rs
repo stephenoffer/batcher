@@ -834,6 +834,32 @@ pub enum StrFunc {
     /// distinction `json_extract_*` cannot express, since both absent and null extract
     /// to null. → Boolean.
     JsonExists,
+    /// The value at `pattern` path as text, **JSON-quoted** — DuckDB `json_value`.
+    /// Unlike `JsonExtractString` (which unquotes a string and renders a container),
+    /// this returns the raw JSON token for a scalar and **null for an object or an
+    /// array**, which is the distinction DuckDB draws between the two functions. → Utf8.
+    JsonValue,
+    /// Whether the document contains `pattern` as a value, at the top level of an array
+    /// or as any member of an object — DuckDB `json_contains`. → Boolean.
+    JsonContains,
+    /// The document re-rendered with two-space indentation (DuckDB `json_pretty`).
+    /// Invalid JSON → null. → Utf8.
+    JsonPretty,
+    /// The document's *shape* with each leaf replaced by its type name (DuckDB
+    /// `json_structure`), e.g. `{"a":1}` → `{"a":"UBIGINT"}`. Invalid JSON → null. → Utf8.
+    JsonStructure,
+    /// The single character at a Unicode code point (DuckDB/Spark `chr`). Takes an
+    /// **integer** input, so it is handled before the Utf8 downcast. → Utf8.
+    Chr,
+    /// The integer written in base `start` (2..=36), no padding, `-` for a negative
+    /// value (DuckDB `to_base`, and `bin` at base 2). Integer input. → Utf8.
+    ToBase,
+    /// A byte count as human-readable text with binary units — `1024` → `1.0 KiB`
+    /// (DuckDB `format_bytes` / `formatReadableSize`). Integer input. → Utf8.
+    FormatBytes,
+    /// The same with decimal (SI) units — `1000` → `1.0 kB` (DuckDB
+    /// `formatReadableDecimalSize`). Integer input. → Utf8.
+    FormatBytesSi,
     /// Deterministic FNV-1a 64-bit hash of the UTF-8 bytes (→ Int64; the u64 digest
     /// reinterpreted as i64). Stable across partitions, runs, and machines — the
     /// building block for surrogate keys and slowly-changing-dimension change

@@ -21,14 +21,13 @@ from __future__ import annotations
 from typing import Any
 
 import pyarrow as pa
+from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
 
 
 def _const_value(node) -> Any:
     """The Python value of a literal SQL argument (constant UDF args bind directly)."""
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.Boolean):
         return bool(node.this)
     if isinstance(node, exp.Null):
@@ -109,8 +108,6 @@ def _make_adapter(rf, arg_cols, const_args, out_col):
 
 def _is_registered_scalar(tr, node) -> bool:
     """Whether `node` is a call to a registered *scalar* (non-table) function."""
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.Anonymous):
         return False
     rf = tr._functions.get(node.name)
@@ -119,8 +116,6 @@ def _is_registered_scalar(tr, node) -> bool:
 
 def contains_registered_scalar(tr, node) -> bool:
     """Whether any subexpression of `node` calls a registered scalar function."""
-    from sqlglot import expressions as exp
-
     if node is None:
         return False
     return any(_is_registered_scalar(tr, n) for n in node.find_all(exp.Anonymous))
@@ -136,8 +131,6 @@ def _hoist_udfs(tr, ds, clause_nodes):
     (possibly-replaced) clause nodes, since a call that is itself a clause root is
     swapped out and the caller must use the replacement.
     """
-    from sqlglot import expressions as exp
-
     roots = list(clause_nodes)
     calls = []
     for root in roots:
@@ -154,8 +147,6 @@ def _hoist_udfs(tr, ds, clause_nodes):
 
 
 def _hoist_one(tr, ds, call):
-    from sqlglot import expressions as exp
-
     rf = tr._functions[call.name]
     arg_cols: list[tuple[int, str]] = []
     const_args: list[tuple[int, Any]] = []
@@ -188,8 +179,6 @@ def _hoist_one(tr, ds, call):
 
 def _apply_table_function(tr, anon, rf):
     """Apply a registered table function ``f(t)`` (``SELECT * FROM f(t)``)."""
-    from sqlglot import expressions as exp
-
     if len(anon.expressions) != 1:
         raise PlanError(f"table function {rf.name!r} takes exactly one table argument")
     arg = anon.expressions[0]

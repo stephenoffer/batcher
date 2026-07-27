@@ -25,17 +25,37 @@ wrong number.
 
 from __future__ import annotations
 
+import functools
 import glob
+import os
+import sys
 
 __all__ = [
     "ACCELERATOR_RESOURCE_NAMES",
+    "accelerator_backend",
     "accelerator_memory_bytes",
     "accelerator_units",
     "binding_gpu_memory_bytes",
+    "gpu_devices_absent",
+    "gpu_inventory",
     "has_gaudi_device",
     "has_neuron_device",
     "is_accelerator_node",
+    "reset_accelerator_probes",
 ]
+
+
+def reset_accelerator_probes() -> None:
+    """Forget the memoized device probes, so the next call re-reads the machine.
+
+    Both probes below answer once and remember: the device set attached to a running
+    process does not change, and the probing itself is expensive (two optional-package
+    imports and several `/dev` globs) on a path every terminal op reaches. A test that
+    fakes the device nodes has to invalidate them; this is that hook, re-exported by
+    `hardware.reset_hardware_probes` so there is one call to make.
+    """
+    gpu_devices_absent.cache_clear()
+    _gpu_inventory_probe.cache_clear()
 
 
 def has_neuron_device() -> bool:
@@ -172,3 +192,205 @@ def accelerator_memory_bytes(accelerator_type: str | None) -> int:
     if not accelerator_type:
         return 0
     return _DEVICE_MEMORY_GIB.get(accelerator_type.upper(), 0) * _GIB
+
+
+# Device nodes of accelerators that are not NVIDIA GPUs: Google TPU (`/dev/accel*`, and
+# `/dev/vfio` for v5+), AWS Neuron / Trainium / Inferentia (`/dev/neuron*`), and Intel
+# Gaudi (`/dev/hl*`). Used only to *refuse* the cheap negative — presence here means "ask
+# properly", never "an accelerator is usable".
+_ACCELERATOR_DEVICE_GLOBS = (
+    "/dev/accel[0-9]*",
+    "/dev/neuron[0-9]*",
+    "/dev/hl[0-9]*",
+    "/dev/vfio/[0-9]*",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def gpu_devices_absent() -> bool:
+    """True when this host demonstrably has no GPU, decided without importing a framework.
+
+    Answers only the *cheap negative*. Proving a GPU is present needs the vendor runtime, but
+    proving one is absent usually does not, and that asymmetry is worth exploiting: the natural
+    way to ask "is there a GPU" is `torch.cuda.is_available()`, which costs ~2 s of import on
+    first call — paid on the first query of every GPU-less run, to learn there is nothing to
+    accelerate. A `stat` of a device node answers the same question in microseconds.
+
+    Deliberately conservative: it returns True only on Linux, where the vendor device nodes are
+    authoritative, and only when every one of them is missing. Anywhere else — macOS, whose
+    Metal devices have no node, or an unrecognized accelerator — it returns False, meaning "ask
+    properly", so the cheap path can never produce a false negative on a machine that has a
+    device. An explicitly empty ``CUDA_VISIBLE_DEVICES`` is honored as a definitive no.
+
+    Returns:
+        True only if a real probe is certain to find nothing.
+    """
+    if os.environ.get("CUDA_VISIBLE_DEVICES", None) == "":
+        return True  # the user masked every device; nothing to find
+    if not sys.platform.startswith("linux"):
+        return False  # no authoritative node to check — make the caller probe for real
+    # Numbered *device* nodes, not the driver's control node: a GPU-less machine built from a
+    # GPU-capable cloud image has `/dev/nvidiactl` (the driver is loaded) and no `/dev/nvidia0`
+    # at all. Keying on the control node would call that host GPU-equipped and re-introduce the
+    # very import this exists to avoid, on exactly the fleet where it is most common.
+    if glob.glob("/dev/nvidia[0-9]*"):
+        return False
+    # Non-NVIDIA accelerators expose their own nodes. Without these, a TPU, Trainium, or
+    # Gaudi host answered "definitely nothing here" — a *false* negative, which is the one
+    # answer this function promises never to give, and it suppressed the real probe on the
+    # machines that most need it. Globs, because these are numbered per device.
+    if any(glob.glob(pattern) for pattern in _ACCELERATOR_DEVICE_GLOBS):
+        return False
+    return not any(os.path.exists(p) for p in ("/dev/kfd", "/dev/dxg"))
+
+
+def accelerator_backend() -> str:
+    """The accelerator this host can compute on: ``cuda``/``rocm``/``xpu``/``mps``/``tpu``/
+    ``neuron``/``hpu``/``cpu``.
+
+    A hardware *fact*, so it lives here (the executor picks a device without importing `ml`);
+    `ml.gpu.detect_backend` re-exports it. Detected via torch where one exists (ROCm through
+    the CUDA API with ``torch.version.hip``; Intel ``torch.xpu``; Apple MPS; Cloud TPU
+    ``torch_xla``) and via device nodes for Trainium/Inferentia (``neuron``) and Gaudi
+    (``hpu``), whose frameworks are expensive to import. Naming the specific backend rather
+    than ``cpu`` lets such a host self-identify for diagnostics and `torch_device`.
+    """
+    if gpu_devices_absent() and not _tpu_available():
+        return "cpu"  # cheap negative first: `torch.cuda.is_available()` costs a ~2 s import
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "rocm" if getattr(torch.version, "hip", None) else "cuda"
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and xpu.is_available():
+            return "xpu"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except ImportError:
+        pass  # no torch → fall through to the device-node accelerators
+    from batcher._internal.accelerators import has_gaudi_device, has_neuron_device
+
+    if _tpu_available():
+        return "tpu"
+    if has_neuron_device():
+        return "neuron"
+    return "hpu" if has_gaudi_device() else "cpu"
+
+
+def _tpu_available() -> bool:
+    """Whether a Cloud TPU is present, via `torch_xla` — import-gated and side-effect-free.
+
+    `find_spec` avoids importing (and so initializing) the XLA runtime on the common
+    no-TPU host; only when `torch_xla` is actually installed do we ask its runtime for the
+    device type. Any failure (older API, no device) reads as "no TPU"."""
+    import importlib.util
+
+    if importlib.util.find_spec("torch_xla") is None:
+        return False
+    try:
+        import torch_xla.runtime as xr  # type: ignore[import-not-found]
+
+        return xr.device_type() == "TPU"
+    except Exception:
+        return False
+
+
+def gpu_inventory() -> list[dict[str, object]]:
+    """Visible GPUs as ``{"index", "name", "memory_bytes"}``, or `[]` when none/undetectable.
+
+    **Inventory only, deliberately.** This answers "what devices are attached", which is a
+    hardware fact and so belongs in this neutral layer where any package may read it. It does
+    *not* decide how to use them — VRAM budgeting, actors-per-GPU, backend selection, and the
+    autocast policy all live in `ml.gpu`, which is the executor-facing owner of those
+    decisions. Keeping the split at inventory-vs-policy is what stops this from becoming a
+    second, competing GPU module: there is one place that says what exists and one that says
+    what to do about it.
+
+    Best-effort and dependency-free at import: NVML first (accurate, no CUDA context, and it
+    sees devices even when no framework is installed), then torch as a fallback. Both are
+    optional, so a CPU-only or stripped-down install gets `[]` rather than an error.
+
+    Returns:
+        One dict per visible device, in device order.
+    """
+    # Fresh dicts over a memoized probe: the *probe* is what costs (two optional-package
+    # imports that, when absent, re-walk `sys.path` on every call because a failed import is
+    # never cached, plus three `/dev` globs), and it runs on every terminal op through the
+    # GPU-routing decision. The device set cannot change under a running process, so probing
+    # once is correct; copying the dicts out keeps a caller that annotates a device entry
+    # from mutating what every later caller sees.
+    return [dict(device) for device in _gpu_inventory_probe()]
+
+
+@functools.lru_cache(maxsize=1)
+def _gpu_inventory_probe() -> tuple[dict[str, object], ...]:
+    """The one-shot device probe behind `gpu_inventory` — NVML, then torch, then device nodes."""
+    return tuple(_nvml_inventory() or _torch_inventory() or _other_accelerator_inventory())
+
+
+def _nvml_inventory() -> list[dict[str, object]]:
+    """GPUs via NVML, or `[]`. Preferred: no CUDA context, and no framework required."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            out: list[dict[str, object]] = []
+            for index in range(pynvml.nvmlDeviceGetCount()):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+                name = pynvml.nvmlDeviceGetName(handle)
+                out.append(
+                    {
+                        "index": index,
+                        "name": name.decode() if isinstance(name, bytes) else str(name),
+                        "memory_bytes": int(pynvml.nvmlDeviceGetMemoryInfo(handle).total),
+                    }
+                )
+            return out
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # pragma: no cover - NVML absent or no NVIDIA driver
+        return []
+
+
+def _torch_inventory() -> list[dict[str, object]]:
+    """GPUs via torch, or `[]`. The fallback when NVML is unavailable."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return []
+        return [
+            {
+                "index": index,
+                "name": torch.cuda.get_device_name(index),
+                "memory_bytes": int(torch.cuda.get_device_properties(index).total_memory),
+            }
+            for index in range(torch.cuda.device_count())
+        ]
+    except Exception:  # pragma: no cover - torch absent or CUDA unusable
+        return []
+
+
+def _other_accelerator_inventory() -> list[dict[str, object]]:
+    """Non-NVIDIA accelerators, so diagnostics stop reporting `[]` on a machine that has one.
+
+    NVML and `torch.cuda` between them cover NVIDIA and (via HIP) AMD; everything else fell
+    through to an empty list, which the observability page then rendered as "no GPUs" on a
+    TPU, Trainium, or Gaudi host. Reports what the device nodes say, since there is no
+    portable cross-vendor API and no memory figure to be had without each vendor's runtime —
+    an accurate name with unknown memory beats a confident, wrong "nothing here".
+    """
+    devices: list[dict[str, object]] = []
+    for kind, pattern in (
+        ("TPU", "/dev/accel[0-9]*"),
+        ("Neuron", "/dev/neuron[0-9]*"),
+        ("Gaudi", "/dev/hl[0-9]*"),
+    ):
+        for index, node in enumerate(sorted(glob.glob(pattern))):
+            devices.append(
+                {"index": index, "name": f"{kind} ({os.path.basename(node)})", "memory_bytes": 0}
+            )
+    return devices

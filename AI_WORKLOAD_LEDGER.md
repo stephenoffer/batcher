@@ -244,3 +244,24 @@ transient mid-refactor test state or a sandbox-infra failure — none is a stand
 - Item 13.1 (`test_diff_agg_arg_extreme` null-value single==distributed) DID show a real data
   mismatch earlier and is a genuine pre-existing distributed arg-extreme bug — left flagged for a
   dedicated pass, out of AI-workload scope.
+  **RETRACTED — see item 13.1 above, which corrects this.** Re-confirmed 2026-07-26 with a
+  sharper reproducer, and the diagnosis is narrower than "bringup": `ray.init()` succeeds in
+  1.3 s, but *task execution* never completes. A bare remote function with no Batcher in it at
+  all times out:
+
+  ```python
+  @ray.remote
+  def add(a, b):
+      return a + b
+
+  ray.get(add.remote(1, 1), timeout=60)   # GetTimeoutError
+  ```
+
+  Every distributed test hangs for this reason, including a trivial `group_by().agg(sum)` — so a
+  failure here says nothing about the operator under test. The hang surfaces at
+  `carbonite/resilience/speculative.py::gather_with_backups`'s `ray.wait`, which is simply where
+  the driver waits for tasks that will never finish.
+
+  **Use that four-line snippet before diagnosing any distributed test failure in this sandbox.**
+  It takes 60 s and distinguishes "the engine is wrong" from "Ray is not running tasks", which is
+  the distinction this ledger has now gotten wrong once and corrected twice.

@@ -22,7 +22,7 @@ Batched inference over Arrow, on CPU or GPU.
 :::
 
 :::{grid-item-card} {octicon}`filter;1.1em` Prepare the data
-:link: preprocessors
+:link: preprocessors/index
 :link-type: doc
 Feature transforms, media decode, tokenization.
 :::
@@ -65,7 +65,7 @@ Models rarely read raw columns. These pages cover the transforms that sit betwee
 source and a model, all of which run as ordinary operators, so they stream and they
 distribute like everything else.
 
-- {doc}`preprocessors`: scalers, encoders, imputers, binning, and composition.
+- {doc}`preprocessors/index`: scalers, encoders, imputers, binning, and composition.
 - {doc}`multimodal`: decoding images, audio, and video into tensor columns.
 - {doc}`tokenization`: tokenizing as a pipeline stage, and packing sequences.
 
@@ -87,7 +87,9 @@ without leaving the engine.
 - {doc}`embeddings`: encoding a text or image column into vectors at scale.
 - {doc}`vector-search`: brute-force search in-engine, or an approximate index.
 - {doc}`rag`: chunk, embed, retrieve, generate, as one pipeline.
-- {doc}`llm`: batched text generation, and turning generated strings into typed columns.
+- {doc}`llm`: batched text generation, engines, prompts, and throughput.
+- {doc}`llm-outputs`: parsing generated strings into typed columns, and guided decoding.
+- {doc}`llm-evaluation`: scoring generations, and the reference-free output monitors.
 
 ## Serve and train
 
@@ -134,7 +136,7 @@ statistics-and-drift
 :hidden:
 :caption: Prepare the data
 
-preprocessors
+preprocessors/index
 multimodal
 tokenization
 ```
@@ -147,6 +149,8 @@ embeddings
 vector-search
 rag
 llm
+llm-outputs
+llm-evaluation
 ```
 
 ```{toctree}

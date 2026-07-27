@@ -98,7 +98,7 @@ pick one out. The last two are easy to confuse and are genuinely different:
 is the directory holding the file.
 
 `url_encode` percent-encodes a URL *component* (`/` and `+` included) and `url_decode`
-reverses it; a malformed escape decodes to itself. `regexp_escape` neutralizes a value's
+reverses it; a malformed escape decodes to itself. `regexp_escape` (`escape_regex` in Polars) neutralizes a value's
 regex metacharacters so it matches itself.
 
 ```python
@@ -456,8 +456,7 @@ print(out.to_pydict())
 
 ### Inspecting a document's shape
 
-Extraction assumes you already know the document. When you don't, five methods answer
-questions about its structure instead. `array_length(path)` counts elements without
+Extraction assumes you already know the document. When you don't, these methods answer questions about its structure instead. `structure()` renders the shape with each leaf replaced by its type name — the thing to group by when finding out what shapes a column holds; `value(path)` returns a scalar's JSON token and null for a container (DuckDB draws that line between `json_value` and `json_extract_string`); `contains(value)` tests membership; `pretty()` re-renders for a human. `array_length(path)` counts elements without
 parsing any of them, `keys(path)` lists an object's keys in source order, `type_of(path)`
 names the JSON type so you can route a field whose type varies row to row, and
 `exists(path)` reports presence.

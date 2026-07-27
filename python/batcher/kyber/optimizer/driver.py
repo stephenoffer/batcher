@@ -242,17 +242,26 @@ def _apply_node_rules(
     strong reference to the node it keyed on, so a recycled `id()` cannot produce a stale
     hit."""
 
+    # Which leaf rewrites apply to a node depends only on the node's *type*, and the rule
+    # list is fixed for this pass — but the filter ran per node, per fixpoint iteration,
+    # scanning every one of the several hundred registered rules to rebuild the same handful
+    # of answers. There are a dozen plan node types, so one entry each covers the whole run.
+    leaves_by_type: dict[type, list] = {}
+
     def visit(node: LogicalPlan) -> LogicalPlan:
         # Leaf `Expr -> Expr` rules share ONE traversal of the node's expressions rather than
         # each walking the whole tree. Sound only where node rules already fuse (a fixpoint
         # phase, which recovers next iteration anything a fused pass stepped over).
         if fuse_exprs:
             node_type = type(node)
-            leaves = [
-                r.expr_fn
-                for r in node_rules
-                if r.expr_fn is not None and (r.matches is None or node_type in r.matches)
-            ]
+            leaves = leaves_by_type.get(node_type)
+            if leaves is None:
+                leaves = [
+                    r.expr_fn
+                    for r in node_rules
+                    if r.expr_fn is not None and (r.matches is None or node_type in r.matches)
+                ]
+                leaves_by_type[node_type] = leaves
             if leaves:
                 node = _apply_expr_leaves(node, leaves)
         for r in node_rules:

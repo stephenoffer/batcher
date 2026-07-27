@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -21,6 +23,7 @@ from batcher.api.orchestration.sizing import (
 from batcher.api.orchestration.stages import execute_distributed, resolve_sources, spill_to_disk
 from batcher.api.source_stats import collect_source_stats, column_bounds_needed
 from batcher.config import active_config, config_context
+from batcher.core.runtime import query_scope
 
 if TYPE_CHECKING:
     from batcher.core import ExecutionContext
@@ -126,8 +129,45 @@ def run_relational(
         adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config(families)
         if adapted is not None:
             scope = config_context(adapted)
-    with scope:
+    # Hold an execution slot for the whole run, and narrow this query's pool to its share
+    # of the machine. Both are no-ops when `execution.max_concurrent_queries` is 0, which
+    # is the default — so an unconfigured deployment executes exactly as before.
+    #
+    # The grant is threaded through the SAME `config_context` the adaptive morsel sizing
+    # already uses rather than a second mechanism: one scoped-config path means one place
+    # where "what does this query think the machine looks like" is answered.
+    #
+    # `query_scope` wraps the whole thing so the execution has a cancellable id and Ctrl-C
+    # reaches it. It is outermost of the three because a query queued for an admission slot
+    # should be interruptible too — a user waiting on a full queue is exactly who reaches
+    # for Ctrl-C, and a scope inside `admit()` would not have been entered yet.
+    with (
+        query_scope(),
+        carbonite.ResourceManager(hub=ctx.hub).admit() as grant,
+        _with_grant(scope, grant),
+    ):
         return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
+
+
+@contextlib.contextmanager
+def _with_grant(scope, grant):
+    """Apply `grant.workers` to the active config for the block, inside `scope`.
+
+    Nested inside the adaptive-sizing scope rather than replacing it: that scope may have
+    adjusted the morsel target from learned statistics, and narrowing the pool must not
+    discard it.
+    """
+    with scope:
+        workers = getattr(grant, "workers", 0)
+        if not workers:
+            yield  # unbounded: the single-query case and the unconfigured default
+            return
+        current = active_config()
+        narrowed = current.replace(
+            execution=dataclasses.replace(current.execution, parallelism=workers)
+        )
+        with config_context(narrowed):
+            yield
 
 
 def _optimize(plan, sources, ctx, *, distributed: bool):

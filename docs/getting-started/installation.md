@@ -32,17 +32,40 @@ print(ds.select(doubled=bt.col("x") * 2).to_pydict())
 # {'doubled': [2, 4, 6]}
 ```
 
+If that prints, the control plane and the compiled engine are both in place.
+
+## Confirm what you installed
+
+`bt.versions()` reports the Batcher version, the compiled engine, and which optional
+backends resolved, which is the first thing to check when an extra seems missing:
+
+```python
+info = bt.versions()
+print("batcher" in info, "engine" in info, "engine_profile" in info)
+# True True True
+```
+
+The same dict carries a key per optional backend (`ray`, `torch`, `polars`, `deltalake`, and
+the rest), whose value is the installed version or `None` when the extra is absent.
+
+`bt.show_versions()` prints the same information as a block, and it is what to paste into
+a bug report.
+
 ## Optional extras
 
 Extras install with the usual `pip install "batcher-engine[extra]"` syntax. None of
-them change the core API.
+them change the core API, so nothing you write has to know which are present.
 
-- `ray`: distributed execution and scheduling. Ray schedules tasks and actors; bulk
-  data moves over Arrow Flight, never through the Ray object store.
-- `cloud`: object-store filesystems (`s3://`, `gs://`, and similar) via fsspec.
-- `torch`, `tensorflow`: ML data-plane backends for the `.ml` accessor.
-- `duckdb`, `polars`: the reference backends the benchmark and differential test
-  suites compare against. They are not part of the core engine.
+| Extra | What it turns on | Where it is used |
+|---|---|---|
+| `ray` | Distributed execution and scheduling | {doc}`../integrations/ray`, {doc}`../architecture/execution` |
+| `cloud` | Object-store filesystems (`s3://`, `gs://`, and similar) via fsspec | {doc}`../user-guide/cloud-storage` |
+| `torch`, `tensorflow` | ML data-plane backends for the `.ml` accessor | {doc}`../ml/index`, {doc}`../integrations/pytorch` |
+| `duckdb`, `polars` | The reference backends the benchmark and differential suites compare against | {doc}`../benchmarks/methodology` |
+
+Ray schedules tasks and actors only. Bulk data moves over Arrow Flight rather than through
+the Ray object store, which is why the `ray` extra changes where a query runs and not what
+it returns.
 
 Install several at once:
 

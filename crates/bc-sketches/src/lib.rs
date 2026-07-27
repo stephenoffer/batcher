@@ -16,7 +16,7 @@
 //! crate needs to change; `lib.rs` only declares the module and re-exports the
 //! type. Pure Rust, no PyO3 — `cargo test`/fuzz directly.
 
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
 mod bloom;
 mod countmin;
@@ -61,11 +61,18 @@ pub fn merge_all<S: Mergeable>(mut sketches: impl Iterator<Item = S>) -> Option<
     Some(acc)
 }
 
-// Fixed seed → deterministic results within and across processes, so sketches
-// built independently on different partitions agree when merged. Hash quality,
-// not cryptographic security, is what matters here.
-pub(crate) const SEED: ahash::RandomState =
-    ahash::RandomState::with_seeds(0xC0FF_EE01, 0xDEAD_BEEF, 0x1234_5678, 0xABCD_EF01);
+// Deterministic results within *and across* processes, so sketches built independently on
+// different partitions agree when merged. Hash quality, not cryptographic security, is
+// what matters here.
+//
+// The "and across" half of that sentence was false until this became
+// `PortableBuildHasher`. It sat over an `ahash::RandomState`, which selects an AES-NI
+// backend from the compile-time `target_feature` — so two workers built with different
+// `-C target-cpu` produced different registers for the same value, and `Mergeable::merge`
+// combined them without complaint into a wrong estimate. That is the quietest failure in
+// this crate: a cardinality estimate has no oracle at runtime, so nothing notices.
+pub(crate) const SEED: bc_arrow::PortableBuildHasher =
+    bc_arrow::PortableBuildHasher::with_seed(0x534B_4554_4348_4553);
 
 /// Hash one value with the shared deterministic seed.
 pub(crate) fn hash_one<T: Hash + ?Sized>(value: &T) -> u64 {
@@ -91,5 +98,57 @@ mod tests {
         // Union of the four disjoint quarters ≈ 25k distinct.
         let err = (merged.estimate() - 25_000.0).abs() / 25_000.0;
         assert!(err < 0.03, "merge_all error {err}");
+    }
+
+    /// The crate's hash is a **cross-process** value, and this pins it.
+    ///
+    /// `SEED` used to be an `ahash::RandomState` under a comment promising that its fixed
+    /// seed made partition-built sketches merge identically across processes. That was
+    /// false: `ahash` selects an AES-NI backend from the compile-time `target_feature`, so
+    /// two workers built with different `-C target-cpu` hashed the same value differently
+    /// and `merge` combined their registers without complaint.
+    ///
+    /// That failure is quieter than the shuffle's. A mis-routed shuffle key splits a
+    /// `GROUP BY` group, which a differential test can catch; a cardinality estimate has no
+    /// oracle at runtime, so a wrong `approx_count_distinct` just looks like the sketch's
+    /// documented error bar. Nothing anywhere would have flagged it.
+    ///
+    /// So the hash is pinned by value. A change here means sketches built by two different
+    /// engine versions can no longer be merged, which is a wire-format break and has to be
+    /// a deliberate, announced one — not a silent re-baseline.
+    #[test]
+    fn value_hashing_is_pinned_across_builds() {
+        assert_eq!(hash_one(&0_u64), 2_274_247_470_533_401_384);
+        assert_eq!(hash_one(&1_u64), hash_one(&1_u64));
+        assert_ne!(hash_one(&0_u64), hash_one(&1_u64));
+    }
+
+    /// Two sketches built independently — as two workers would — must merge to the same
+    /// registers as one built over the whole input. This is the property the seed exists
+    /// for, stated as a test rather than as a comment.
+    #[test]
+    fn independently_built_sketches_agree_with_a_single_pass() {
+        let mut whole = HyperLogLog::new(12);
+        for i in 0..2_000_u64 {
+            whole.add(&i);
+        }
+
+        let mut left = HyperLogLog::new(12);
+        let mut right = HyperLogLog::new(12);
+        for i in 0..2_000_u64 {
+            if i % 2 == 0 {
+                left.add(&i);
+            } else {
+                right.add(&i);
+            }
+        }
+        left.merge(&right);
+
+        assert_eq!(
+            left.to_bytes(),
+            whole.to_bytes(),
+            "a sketch merged from two partitions differs from one built in a single pass — \
+             the registers disagree, which is exactly what a non-portable hash produces"
+        );
     }
 }

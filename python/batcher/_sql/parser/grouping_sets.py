@@ -10,6 +10,8 @@ the levels are combined with UNION ALL. That keeps the aggregate path in
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher.api.dataset import Dataset
 
 
@@ -20,8 +22,6 @@ def _grouping_key(e) -> str:
     key matches a `SELECT t.a` projection; any other expression is identified
     by its SQL text (`b * 10`, `extract(...)`).
     """
-    from sqlglot import expressions as exp
-
     return e.name if isinstance(e, exp.Column) else e.sql()
 
 
@@ -30,8 +30,6 @@ def _grouping_set_members(m) -> list:
 
     `(a, b)` → `[a, b]`, `(b + 1)` → `[b + 1]`, `()` → `[]`, bare `a` → `[a]`.
     """
-    from sqlglot import expressions as exp
-
     if isinstance(m, exp.Tuple):
         return list(m.expressions)  # `(a, b)` and `()`
     if isinstance(m, exp.Paren):
@@ -96,8 +94,6 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
 def _grouping_level_node(node, active: dict, every: dict):
     """A copy of `node` grouping only by `active`; inactive grouping expressions in
     the SELECT list become NULL so every level shares one output schema."""
-    from sqlglot import expressions as exp
-
     m = node.copy()
     inactive = {k: v for k, v in every.items() if k not in active}
 

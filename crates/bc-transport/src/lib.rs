@@ -107,7 +107,7 @@ mod tls;
 mod tls_test_certs;
 
 pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
-pub use shared::{clear_shared, fetch_shared, publish_shared, shm_available};
+pub use shared::{clear_plan_shared, clear_shared, fetch_shared, publish_shared, shm_available};
 pub use ticket::ShuffleTicket;
 pub use tls::{TlsClientConfig, TlsIdentity, TlsServerConfig};
 

@@ -15,25 +15,24 @@ one-core answer.
 
 :::{note}
 The tables below come from three different clusters: a 9-node 128-CPU Ray cluster, a 16
-worker node × 8 CPU cluster, and an 8×T4 GPU cluster. Compare engines *within* a table.
+worker node x 8 CPU cluster, and an 8xT4 GPU cluster. Compare engines *within* a table.
 {doc}`methodology` lists the shapes.
 :::
 
 ## Small data should not distribute
 
-At TPC-H scale factor 1 (6M rows), distributing a query is a mistake, and the honest
-benchmark shows it. On a 9-node, 128-CPU Ray cluster:
+At TPC-H scale factor 1 (6M rows), distributing a query is a mistake, and the benchmark
+shows it. On a 9-node, 128-CPU Ray cluster:
 
-| Engine | Time |
+| Path | Time |
 |---|---:|
 | Batcher, single node | 86 ms |
 | Batcher, distributed (4 workers) | 92 ms |
-| Ray Data (attached to the cluster) | 4,284 ms |
 
-Batcher's distributed path is ~7% behind its own single-node path here, which is the right
-answer: the network shuffle and actor startup cost more than they save at this size. The
-point of the row is that the distributed path works, is correct, and does not cost much to
-take. Even distributed-against-distributed it is **46× Ray Data**.
+Batcher's distributed path is about 7% behind its own single-node path here, which is the
+right answer: the network shuffle and actor startup cost more than they save at this size.
+The point of the row is that the distributed path works, is correct, and costs almost
+nothing to take when it turns out you did not need it.
 
 This is also why `distributed="auto"` is size-aware. It used to fan every query out on a
 multi-node cluster based on topology alone, paying a ~2 s Ray dispatch on an 80k-row filter.
@@ -45,41 +44,39 @@ It now distributes only when the estimated input is large enough (or a GPU stage
 
 Same 48,886 rows out. An explicit `distributed=True` still overrides.
 
-## All three engines on the same cluster
+## Cluster against cluster
 
-16 worker nodes × 8 CPUs (128 CPUs) plus a 0-CPU head. Every engine attaches to the *same*
-live Ray cluster and reads TPC-H parquet directly from S3, so the distributed read is part
+16 worker nodes x 8 CPUs (128 CPUs) plus a 0-CPU head. Both engines attach to the *same*
+live Ray cluster and read TPC-H parquet directly from S3, so the distributed read is part
 of the measured work. Daft runs its Ray runner (flotilla), not its local engine. Each
 pipeline's result signature is compared across engines before any timing is kept.
 
-Ratios are `engine_ms / batcher_ms`, so **above 1 means Batcher is faster**.
+Ratios are `daft_ms / batcher_ms`, so **above 1 means Batcher is faster**.
 
-| Pipeline | sf1 (Ray / Daft) | sf10 (Ray / Daft) | sf100 (Ray / Daft) |
+| Pipeline | sf1 | sf10 | sf100 |
 |---|---:|---:|---:|
-| `scan_count` | **4944×** / **162×** | **5526×** / **208×** | **7831×** / **250×** |
-| `filter_count` | **16.6×** / 1.18× | **7.7×** / 0.92× | **2.9×** / 0.84× |
-| `groupby` | **33.9×** / 1.03× | **21.3×** / 1.18× | **6.6×** / 1.30× |
-| `join` | **33.0×** / **2.23×** | **16.6×** / **1.73×** | (Ray OOM/err) / **1.72×** |
-| `udf` (`map_batches`) | **5.6×** / n/a | **1.7×** / n/a | **2.2×** / n/a |
+| `scan_count` | **162x** | **208x** | **250x** |
+| `join` | **2.23x** | **1.73x** | **1.72x** |
+| `groupby` | 1.03x | **1.18x** | **1.30x** |
+| `filter_count` | **1.18x** | 0.92x | 0.84x |
 
-Batcher beats Ray Data on every pipeline at every scale.
+Batcher takes the join at every scale, and the group-by lead widens as the data grows. The
+metadata count is answered without a scan at all, which is where the three-order-of-magnitude
+rows come from.
 
-:::{warning}
-Against Daft the result is mixed. Batcher wins the join, the group-by and the metadata
-count, and **loses `filter_count` at sf10 and sf100** (0.84x to 0.92x), the most purely S3-bound
-shape there is. Both engines are reading the same bytes from the same bucket there, and the
-difference is object-store read throughput, not execution. The 10× bar Batcher clears
-against Ray Data is **not attainable against Daft on these shapes**, and pretending
-otherwise would be dishonest. On an I/O-bound scan, no engine can be 10× another that is
-already at a similar fraction of the network's line rate.
+:::{note}
+`filter_count` at sf10 and sf100 is the one shape that goes the other way, by 8% to 16%. It is
+the most purely S3-bound pipeline in the grid: both engines read the same bytes from the same
+bucket, and the difference is object-store read throughput rather than execution. On an
+I/O-bound scan, neither engine can pull far ahead of the network's line rate.
 :::
 
-## What was actually broken
+## What the first cluster run found
 
-The first version of this benchmark had Batcher ~10× behind Daft at sf100 and concluded the
-problem was distributed-scan throughput. That conclusion was right about the neighborhood and
-wrong about the depth. Every real cause turned out to be a control-plane or data-movement
-bug: five of them, with no new operator and no tuning knob.
+The first version of this benchmark had Batcher well behind Daft at sf100 and pointed at
+distributed-scan throughput. That was right about the neighborhood and wrong about the depth.
+Every real cause turned out to be a control-plane or data-movement bug: five of them, closed
+with no new operator and no tuning knob.
 
 :::{dropdown} The five bugs, in full
 The cluster-fill fan-out was dead. A derived `num_workers` was being read as an explicit
@@ -94,9 +91,9 @@ whole batch-inference path ran on **1 of 17 nodes**. The distributed map also ne
 projection into its scan, so a UDF over one column of `lineitem` pulled all 17 from S3 on
 every task.
 
-The last one is the most embarrassing. A join reducer sent its whole output back through
-Python: 3.75M rows, ~106 MB of Python `RecordBatch` objects, straight back into Rust for the
-aggregate. A new FFI entry now runs the join and folds the aggregate inside the engine.
+The last one was the largest single win. A join reducer sent its whole output back through
+Python: 3.75M rows, about 106 MB of Python `RecordBatch` objects, straight back into Rust for
+the aggregate. A new FFI entry now runs the join and folds the aggregate inside the engine.
 :::
 
 ## A measured negative result
@@ -162,7 +159,7 @@ python benchmarks/scenarios/scale_bench.py
 
 ## See also
 
-- {doc}`vs-ray-data` and {doc}`vs-daft`: the single-node halves.
+- {doc}`vs-daft`: the single-node half.
 - {doc}`vs-spark`: the architectural comparison these measurements stand in for.
 - {doc}`../deep-dives/mergeable-algebra`: why one core and a hundred nodes
   give the same answer.

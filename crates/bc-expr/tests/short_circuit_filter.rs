@@ -271,6 +271,72 @@ fn compare(label: &str, pred: &Expr, morsels: &[RecordBatch]) {
     );
 }
 
+/// Two conjuncts the static cost model provably cannot separate, written worst-first.
+///
+/// Both are `regexp_matches` over the same column, so `eval_cost` scores them *identically*
+/// and cheapest-first has no signal at all: it keeps the written order. The first matches
+/// every row, so nothing is removed and no compaction is possible, and the second then runs
+/// at full width too — two full-width regex passes. Reversed, the selective one removes six
+/// rows in seven first and the broad one runs over what is left.
+///
+/// This is the failure mode a cost model cannot fix in principle, because cost is not
+/// selectivity. It is the reason to measure.
+fn adversarially_ordered() -> Expr {
+    and(
+        // Matches every shipmode.
+        str_pred(StrFunc::RegexpMatches, "l_shipmode", "[A-Z]"),
+        // Matches only REG AIR, one of the seven.
+        str_pred(StrFunc::RegexpMatches, "l_shipmode", "^REG"),
+    )
+}
+
+/// The measured order must beat the static one on the adversarial shape, and agree with the
+/// oracle on every morsel while doing it.
+#[test]
+fn a_measured_order_beats_the_static_one_and_agrees_with_the_oracle() {
+    let morsels: Vec<RecordBatch> = (0..MORSELS as i64).map(|s| morsel(s * 11)).collect();
+    let pred = adversarially_ordered();
+
+    let learned = bc_expr::ConjunctOrder::new(&pred).expect("two conjuncts");
+    for (i, batch) in morsels.iter().enumerate() {
+        let expected = whole_batch(&pred, batch);
+        let mask = pred
+            .short_circuit_filter_mask_with(batch, Some(&learned))
+            .expect("eval")
+            .expect("fast path");
+        let got = filter_record_batch(batch, &mask).expect("filter");
+        assert_eq!(
+            format!("{expected:?}"),
+            format!("{got:?}"),
+            "morsel {i}: the measured order changed the result"
+        );
+    }
+
+    let time_it = |learned: Option<&bc_expr::ConjunctOrder>| {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            for batch in &morsels {
+                std::hint::black_box(
+                    pred.short_circuit_filter_mask_with(batch, learned)
+                        .expect("mask"),
+                );
+            }
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    };
+    // A fresh order for the timed run, so it pays its own warmup rather than inheriting
+    // the measurements above.
+    let fresh = bc_expr::ConjunctOrder::new(&pred).expect("two conjuncts");
+    let measured = time_it(Some(&fresh));
+    let static_order = time_it(None);
+    println!(
+        "\nadversarial order: static {static_order:>7.2} ms -> measured {measured:>7.2} ms ({:>5.2}x)",
+        static_order / measured
+    );
+}
+
 #[test]
 fn short_circuit_equals_whole_batch_on_a_lineitem_shape() {
     let morsels: Vec<RecordBatch> = (0..MORSELS as i64).map(|s| morsel(s * 7)).collect();

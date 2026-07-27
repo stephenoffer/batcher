@@ -16,6 +16,10 @@
 //! (soft 85% / hard 90% of the budget) and drives the pool through `bc-py`; the
 //! pool itself is policy-free — it only accounts and admits.
 
+pub mod cancel;
+
+pub use cancel::CancelToken;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 

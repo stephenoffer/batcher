@@ -37,7 +37,9 @@ pub mod spill;
 mod stats;
 mod var;
 
-use accum::{bitfold_acc, bool_acc, concat_col, minmax_acc, product_acc, require, sum_acc};
+use accum::{
+    bitfold_acc, bool_acc, concat_col, kahan_acc, minmax_acc, product_acc, require, sum_acc,
+};
 use argextreme::{arg_extreme_state, merge_arg_extreme};
 use distinct::{
     bucket_values_into_list, distinct_state, finalize_count_distinct, flatten_list_state,
@@ -47,13 +49,14 @@ pub use distinct::{distinct_batch, distinct_dense};
 pub(crate) use group::assign_groups;
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
-    finalize_histogram, finalize_list_agg, finalize_median, finalize_mode, finalize_quantile,
-    listagg_state, median_state, merge_median,
+    finalize_entropy, finalize_histogram, finalize_list_agg, finalize_mad, finalize_median,
+    finalize_mode, finalize_quantile, finalize_quantile_disc, finalize_top_k, listagg_state,
+    median_state, merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
 use stats::{
-    covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, merge_covar,
-    merge_moments, moment_state,
+    covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_kurtosis_pop,
+    finalize_skewness, merge_covar, merge_moments, moment_state,
 };
 use var::{count_non_null, finalize_mean, finalize_var, merge_welford, var_state};
 
@@ -131,6 +134,25 @@ pub enum AggFunc {
     /// `histogram` — a `Map<value, count>` of each group's values (DuckDB
     /// `histogram`). Same per-group value-list state as `Median`; finalize counts.
     Histogram,
+    /// `any_value`/`arbitrary` — an unspecified element of the group, resolved to the
+    /// minimum so the fold stays commutative (and so one node and a hundred agree).
+    AnyValue,
+    /// `entropy` — base-2 Shannon entropy of the group's value distribution. Same
+    /// per-group value-list state as `Median`.
+    Entropy,
+    /// `mad` — the median absolute deviation, `median(|x - median(x)|)`. Same state.
+    Mad,
+    /// `quantile_disc` at `permille/1000` — the quantile *element*, not an
+    /// interpolation between two of them. Same state.
+    QuantileDisc(u16),
+    /// `approx_top_k` — the `k` most frequent values as a `List`, exactly. Same state.
+    ApproxTopK(u16),
+    /// `kurtosis_pop` — population excess kurtosis (`m4/m2² - 3`). Same 5-column
+    /// moment state as `Kurtosis`, which is the sample-corrected form.
+    KurtosisPop,
+    /// `kahan_sum`/`fsum` — compensated summation, 2-column `(sum, compensation)` state.
+    /// Mergeable, and never less accurate than `Sum`.
+    KahanSum,
 }
 
 impl AggFunc {
@@ -140,9 +162,9 @@ impl AggFunc {
     /// [`Partial`]'s state columns — it is the single source of truth for arity.
     pub fn state_arity(self) -> usize {
         match self {
-            AggFunc::Mean | AggFunc::ArgMin | AggFunc::ArgMax => 2,
+            AggFunc::Mean | AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::KahanSum => 2,
             AggFunc::Var | AggFunc::Stddev => 3,
-            AggFunc::Skewness | AggFunc::Kurtosis => 5,
+            AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => 5,
             AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => 6,
             _ => 1,
         }
@@ -179,6 +201,13 @@ impl AggFunc {
             AggFunc::Skewness => "skewness",
             AggFunc::Kurtosis => "kurtosis",
             AggFunc::Histogram => "histogram",
+            AggFunc::AnyValue => "any_value",
+            AggFunc::Entropy => "entropy",
+            AggFunc::Mad => "mad",
+            AggFunc::QuantileDisc(_) => "quantile_disc",
+            AggFunc::ApproxTopK(_) => "approx_top_k",
+            AggFunc::KurtosisPop => "kurtosis_pop",
+            AggFunc::KahanSum => "kahan_sum",
         }
     }
 }
@@ -546,6 +575,7 @@ fn accumulate(
             )?]
         }
         AggFunc::Product => vec![product_acc(require(values, func)?, group_ids, num_groups)?],
+        AggFunc::KahanSum => kahan_acc(require(values, func)?, group_ids, num_groups)?,
         AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
             vec![bitfold_acc(
                 require(values, func)?,
@@ -554,9 +584,18 @@ fn accumulate(
                 func,
             )?]
         }
-        AggFunc::Skewness | AggFunc::Kurtosis => {
+        AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
             moment_state(require(values, func)?, group_ids, num_groups, func)?
         }
+        // The value-list family: entropy, the median absolute deviation, the discrete
+        // quantile and the exact top-k all read a group's whole value list, so they
+        // share `Median`'s state and differ only in `finalize`.
+        AggFunc::Entropy | AggFunc::Mad | AggFunc::QuantileDisc(_) | AggFunc::ApproxTopK(_) => {
+            vec![median_state(require(values, func)?, group_ids, num_groups)?]
+        }
+        // `any_value` folds with the same min reducer its combine uses, so a partial
+        // and a combined partial are the same shape and the fold is order-independent.
+        AggFunc::AnyValue => accumulate(AggFunc::Min, values, group_ids, num_groups)?,
         // arg_min/arg_max and covar/corr are two-input; `partial` builds their state
         // directly (it has access to the second input), so they never reach the
         // single-input `accumulate`.
@@ -696,6 +735,20 @@ fn partial_rows(parts: &[Partial]) -> usize {
     }
 }
 
+/// `kahan_sum`'s finalize: the compensated total is `sum + compensation`, added back
+/// exactly once so the correction is not applied twice by a repeated `combine`.
+fn finalize_kahan(sums: &ArrayRef, comps: &ArrayRef) -> Result<Vec<ArrayRef>, RuntimeError> {
+    use arrow::array::{Array, AsArray, Float64Array};
+    let (s, c) = (
+        sums.as_primitive::<arrow::datatypes::Float64Type>(),
+        comps.as_primitive::<arrow::datatypes::Float64Type>(),
+    );
+    let out: Float64Array = (0..s.len())
+        .map(|i| (!s.is_null(i)).then(|| s.value(i) + c.value(i)))
+        .collect();
+    Ok(vec![Arc::new(out)])
+}
+
 /// Step 3: turn merged state into output columns.
 pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, RuntimeError> {
     let mut out = Vec::with_capacity(funcs.len());
@@ -725,6 +778,15 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             AggFunc::Skewness => finalize_skewness(state)?,
             AggFunc::Kurtosis => finalize_kurtosis(state)?,
             AggFunc::Histogram => finalize_histogram(&state[0])?,
+            AggFunc::Entropy => finalize_entropy(&state[0])?,
+            AggFunc::Mad => finalize_mad(&state[0])?,
+            AggFunc::QuantileDisc(permille) => {
+                finalize_quantile_disc(&state[0], permille as f64 / 1000.0)?
+            }
+            AggFunc::ApproxTopK(k) => finalize_top_k(&state[0], k as usize)?,
+            AggFunc::KurtosisPop => finalize_kurtosis_pop(state)?,
+            // The compensation is added back exactly once, at the end.
+            AggFunc::KahanSum => finalize_kahan(&state[0], &state[1])?.remove(0),
             // All other functions' state IS their output.
             _ => state[0].clone(),
         });

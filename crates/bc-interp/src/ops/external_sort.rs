@@ -31,9 +31,10 @@ pub(crate) fn external_merge_sort(
     dir: &std::path::Path,
     sort_merge_fanin: usize,
     codec: bc_runtime::agg::spill::SpillCodec,
+    cancel: Option<&bc_resource::CancelToken>,
 ) -> Result<(Vec<RecordBatch>, u64), InterpError> {
     let Some((mut store, spill_bytes)) =
-        external_sort_to_final_store(parts, keys, dir, sort_merge_fanin, codec)?
+        external_sort_to_final_store(parts, keys, dir, sort_merge_fanin, codec, cancel)?
     else {
         return Ok((Vec::new(), 0));
     };
@@ -61,6 +62,7 @@ pub(crate) fn external_sort_to_final_store(
     dir: &std::path::Path,
     sort_merge_fanin: usize,
     codec: bc_runtime::agg::spill::SpillCodec,
+    cancel: Option<&bc_resource::CancelToken>,
 ) -> Result<Option<(bc_runtime::agg::spill::DiskSpillStore, u64)>, InterpError> {
     use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
 
@@ -91,6 +93,11 @@ pub(crate) fn external_sort_to_final_store(
     // is a perf-only knob (default 16, or the control plane's tuning), not the result.
     let fanin = sort_merge_fanin.max(2);
     while n_runs > 1 {
+        // A merge pass over a large sort runs for minutes; without this the operator
+        // boundary in `par::exec` is the next chance to notice a cancel.
+        if cancel.is_some_and(bc_resource::CancelToken::is_cancelled) {
+            return Err(InterpError::Cancelled);
+        }
         let n_groups = n_runs.div_ceil(fanin);
         let mut next = DiskSpillStore::with_codec(dir.to_path_buf(), n_groups, codec)
             .map_err(InterpError::from)?;
@@ -389,7 +396,8 @@ mod tests {
             descending,
             std::process::id()
         ));
-        let (sorted, _) = external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None).unwrap();
+        let (sorted, _) =
+            external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None, None).unwrap();
         assert_eq!(
             seq(std::slice::from_ref(&oracle)),
             seq(&sorted),
@@ -445,7 +453,8 @@ mod tests {
         ];
         let parts = vec![mk(&[5, 2, 9]), mk(&[1, 7]), mk(&[3, 8, 4, 6])];
         let dir = std::env::temp_dir().join(format!("bc_extsort_null_{}", std::process::id()));
-        let (sorted, _) = external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None).unwrap();
+        let (sorted, _) =
+            external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None, None).unwrap();
         let ids: Vec<i64> = sorted
             .iter()
             .flat_map(|b| {

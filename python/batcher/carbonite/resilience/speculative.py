@@ -28,6 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from batcher._internal import events
 from batcher._internal.logging import get_logger
 
 __all__ = ["SpeculationPolicy", "gather_with_backups", "stragglers_to_backup"]
@@ -154,6 +155,16 @@ def gather_with_backups(
             try:
                 result_of[i] = ray.get(r)  # first copy to finish wins
                 finished_times[i] = now - started[i]
+                if i in backed_up and r is not refs[i]:
+                    # The backup beat the original. Worth its own event: a fleet whose
+                    # backups routinely win is a fleet with a sick node, and that reads as
+                    # "queries are a bit slow" with nothing pointing at the cause.
+                    events.publish(
+                        events.RECOVERY,
+                        event="backup_won",
+                        slot=i,
+                        elapsed_s=round(finished_times[i], 3),
+                    )
             except Exception as exc:
                 if on_failure is None:
                     raise
@@ -168,6 +179,14 @@ def gather_with_backups(
                 if i not in backed_up and in_flight < policy.max_backups:
                     backed_up.add(i)
                     in_flight += 1
+                    events.publish(
+                        events.RECOVERY,
+                        event="straggler_backup",
+                        slot=i,
+                        elapsed_s=round(elapsed[i], 3),
+                        finished=len(result_of),
+                        total=n,
+                    )
                     backup = relaunch(i)
                     ref_to_idx[backup] = i
                     if on_failure is not None:

@@ -173,13 +173,15 @@ def test_a_tpu_host_is_not_reported_as_having_no_accelerator(monkeypatch):
     monkeypatch.setattr(
         hw.glob, "glob", lambda pattern, **kw: ["/dev/accel0"] if "accel" in pattern else []
     )
-    hw.gpu_devices_absent.cache_clear()
+    # Both probes memoize their answer for the process (the device set cannot change under
+    # a running process), so a simulated host has to invalidate them the same way.
+    hw.reset_hardware_probes()
     try:
         assert hw.gpu_devices_absent() is False
         # And diagnostics name the device instead of rendering an empty list.
         assert any("TPU" in str(d["name"]) for d in hw.gpu_inventory())
     finally:
-        hw.gpu_devices_absent.cache_clear()
+        hw.reset_hardware_probes()
 
 
 @pytest.mark.parametrize(

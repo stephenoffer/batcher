@@ -192,6 +192,7 @@ fn kind_of(plan: &RelOp) -> &'static str {
         RelOp::Limit { .. } => "limit",
         RelOp::HashJoin { .. } => "hash_join",
         RelOp::AsofJoin { .. } => "asof_join",
+        RelOp::RangeJoin { .. } => "range_join",
         RelOp::Distinct { .. } => "distinct",
         RelOp::Window { .. } => "window",
         RelOp::Union { .. } => "union",

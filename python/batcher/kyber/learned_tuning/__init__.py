@@ -30,16 +30,20 @@ consumes** — the `record_*` functions fold one observation into O(1) sufficien
 
 from __future__ import annotations
 
-# `_reward_scale` / `_smooth` / `_fold_ols` are re-exported (redundant alias = an explicit
-# re-export) because they are the family's tested primitives, named as such in the audit ledger.
-from batcher.kyber.learned_tuning.bandit import _reward_scale as _reward_scale
 from batcher.kyber.learned_tuning.bandit import (
+    JOIN_ARMS,
+    learned_adaptive_route,
     learned_arm,
     learned_join_strategy,
+    record_adaptive_route,
     record_arm,
     record_join_strategy,
     ucb1_best_arm,
 )
+
+# `_reward_scale` / `_smooth` / `_fold_ols` are re-exported (redundant alias = an explicit
+# re-export) because they are the family's tested primitives, named as such in the audit ledger.
+from batcher.kyber.learned_tuning.bandit import _reward_scale as _reward_scale
 from batcher.kyber.learned_tuning.crossover import _fold_ols as _fold_ols
 from batcher.kyber.learned_tuning.crossover import (
     learned_broadcast_max_bytes,
@@ -49,19 +53,18 @@ from batcher.kyber.learned_tuning.crossover import (
 )
 from batcher.kyber.learned_tuning.priors import _smooth as _smooth
 from batcher.kyber.learned_tuning.priors import (
-    learned_adaptive_helps,
     learned_build_sides,
     learned_partial_agg,
     learned_partition_count,
     learned_signature_rows,
-    record_adaptive_flip,
     record_group_reduction,
     record_join_sides,
     record_partition_rows,
 )
 
 __all__ = [
-    "learned_adaptive_helps",
+    "JOIN_ARMS",
+    "learned_adaptive_route",
     "learned_arm",
     "learned_broadcast_max_bytes",
     "learned_build_sides",
@@ -70,7 +73,7 @@ __all__ = [
     "learned_partition_count",
     "learned_signature_rows",
     "learned_sort_merge_min_rows",
-    "record_adaptive_flip",
+    "record_adaptive_route",
     "record_arm",
     "record_broadcast_timing",
     "record_group_reduction",

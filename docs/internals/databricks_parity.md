@@ -298,16 +298,159 @@ plan-rewrite approach is architecturally cleaner.
 
 | # | Gap | Detail |
 |---|---|---|
-| 1 | **No authentication** | `Principal` is caller-asserted and carries no credentials *by explicit design*. `bt.Principal("root", roles=["admin"])` bypasses every policy. Governance is **opt-in per `security()` block** — outside one, plans pass through ungoverned. In-memory and stream sources are ungovernable entirely (`_binding.py:32`). Tables key on **exact path strings**, so aliasing evades policy. No revoke; no privileges beyond SELECT — **writes are entirely ungoverned**. |
-| 2 | **No multi-tenancy** | Zero hits for `tenant`. No quotas, workload groups, priority scheduling, or charge-back — compounded by process-global shared result cache, plan cache, and UDF pool. Databricks' comparator is concrete: queue depth 1,000; warehouse sizes doubling 2X-Small (1 worker) → **5X-Large (512, Public Preview, pro + serverless only)**; a documented autoscaling ladder (2–6 min of query load → +1 cluster, 6–12 → +2, 12–22 → +3, >22 → +3 plus 1 per further 15 min; also triggered by any query queued 5 min; scale-down after 15 consecutive low-load minutes); and serverless-only Intelligent Workload Management. ⚠️ Serverless may use different instance types than the pro/classic size table, so those worker counts do not transfer to serverless capacity planning. |
-| 3 | **No UDF sandboxing** | The process pool exists for GIL escape, not isolation (`processes.py:1-8`). No seccomp, namespaces, rlimits, timeouts, or import allowlist. `forkserver` children inherit the parent environment, so **a UDF can read the `env:` key material** that the otherwise-careful `keyref.rs` design protects. |
-| 4 | **No encryption at rest** | Spill files and result cache are **plaintext**, not even `chmod 0600`. No KMS/Vault integration; key refs are `env:`/`file:` only. |
+| 1 | **No authentication** — *both halves addressed 2026-07-26; the residual is structural, not a gap* | `Principal` used to be caller-asserted with no credential, so `bt.Principal("root", roles=["admin"])` bypassed every policy. `governance.authn` now ships a `CredentialVerifier` seam with three real implementations — `ProcessIdentityVerifier` (OS user), `HmacTokenVerifier` (signed token, standard library only, key resolvable as `env:`/`file:`), and `JwtVerifier` (OIDC/JWKS, optional `pyjwt`). `bt.authenticate(credential)` is the only way to obtain a `Principal` whose `verified` is true, and `governance.require_verified_principal` makes `bt.security(...)` **refuse an asserted one**. Expired claims are refused unconditionally. **The residual is not a missing feature:** in-process code can set `issuer` by hand, and no library imported into the caller's process can prevent that — the trust boundary is the process, which `docs/user-guide/hardening.md` states plainly. Coverage: `tests/unit/test_authentication.py` (21 tests, including forged-token, wrong-key, expired-token, string-roles-claim, and the algorithm-confusion default). What is fixed is the *fail-open default*: `GovernanceConfig.mode` (`off`/`advisory`/`strict`) makes governance mandatory. Under `strict` a read that no `security()` block covers is refused, and so is a source that cannot be governed at all — an in-memory table or a live stream, which has no durable name to write a policy about, is **rejected rather than silently exempted**. `advisory` warns and proceeds, which is what makes `strict` adoptable: without it an operator cannot find the ungoverned reads in a live workload before switching refusal on. Default stays `off`, so no existing deployment changes. Coverage: `tests/unit/test_governance_mode.py`. In-memory and stream sources are ungovernable entirely (`_binding.py:32`). Tables key on **exact path strings**, so aliasing evades policy. No revoke; no privileges beyond SELECT — **writes are entirely ungoverned**. |
+| 2 | **No multi-tenancy** — *accidental sharing closed 2026-07-26; a warehouse manager is still out of scope* | Zero hits for `tenant`. No quotas, workload groups, priority scheduling, or charge-back — compounded by process-global shared result cache, plan cache, and UDF pool. Databricks' comparator is concrete: queue depth 1,000; warehouse sizes doubling 2X-Small (1 worker) → **5X-Large (512, Public Preview, pro + serverless only)**; a documented autoscaling ladder (2–6 min of query load → +1 cluster, 6–12 → +2, 12–22 → +3, >22 → +3 plus 1 per further 15 min; also triggered by any query queued 5 min; scale-down after 15 consecutive low-load minutes); and serverless-only Intelligent Workload Management. ⚠️ Serverless may use different instance types than the pro/classic size table, so those worker counts do not transfer to serverless capacity planning. **What now exists:** `TenantConfig` + the `bt.tenant(id)` scope, built on the existing `config_context` `ContextVar` so it is correct under threads, under asyncio, and when nested. Inside a scope the **result cache** and the **learned-statistics namespace** are keyed by tenant. The result-cache leak was real and demonstrated: with the old key, two tenants running the same query over the same path produced an identical key, so the second was served the first's rows. The key now also carries the **viewer** (principal + catalog), which converts a governed/ungoverned separation that was an *accident* of `enforce` rewriting the plan into a guarantee. Learned statistics carry column `min`/`max`, and the hub may be Redis or object storage shared across a fleet, so unqualified keys meant one tenant's measured bounds fed every other tenant's optimizer. Default `tenant_id=""` keys exactly as before. Coverage: `tests/unit/test_tenant_isolation.py`. **Still out of scope, deliberately:** quotas, workload groups, priority scheduling, and chargeback — the Databricks comparator in this row describes a *warehouse manager*, a product built on an engine. And a tenant here is a cooperating workload, not an adversary: two tenants in one process share an address space, so the trust boundary remains the process. |
+| 3 | **No UDF sandboxing** — *partly addressed 2026-07-26* | Still no seccomp, namespaces, or import allowlist, and **deliberately so**: an import allowlist is defeated by `getattr(builtins, '__imp'+'ort__')`, and a real syscall sandbox needs privileges Batcher lacks and breaks CUDA/torch. What **is** fixed is the credential inheritance: `core/udf/isolation.py` rebuilds a worker child's environment from an allowlist (dropping every `BATCHER_*`, including `BATCHER_SECRET_COMMAND`), applies `RLIMIT_AS`/`CPU`/`NOFILE`/`NPROC`/`CORE`, sets `umask 0o077`, and `execution.udf_timeout_s` bounds a wedged UDF. The `/dev/shm` input shards — the query's own data, previously mode 0644 in a world-writable directory — now live in a 0700 per-process directory and are opened 0600. **Scope limit, stated because it matters:** this covers the *process* path only. A UDF on the thread path runs inside the engine process and can read its environment, because it is that process; no in-process mechanism changes that. Untrusted UDFs still belong in a container. Verified end to end in `tests/integration/test_udf_isolation_e2e.py`, which also pins the thread-path limitation. |
+| 4 | **No encryption at rest** — *file permissions fixed 2026-07-26; encryption still absent* | Two corrections to this row. (a) The **result cache is not an at-rest surface at all** — `carbonite/cache.py` holds `pyarrow.Table`s in process memory and writes nothing. The real at-rest surfaces are spill (Python *and* Rust), shuffle scratch, the `/dev/shm` UDF shards, the event log, and the learned-stats database. (b) `env:`/`file:` is not the whole story: `bc-secrets` also implements **`cmd:`**, which *is* the Vault/AWS/GCP integration (`vault kv get`, `aws secretsmanager`, `gcloud secrets`), plus `register_backend` for an in-process SDK — so a KMS SDK dependency in the crate graph would buy nothing and would drag an async runtime and a TLS stack into every crate linking `bc-expr`. What **is** fixed: every artifact is now created owner-only (`_internal/paths.py::private_dir`/`open_private`, and `create_private` in `bc-runtime/agg/spill.rs`). Measured before: spill files 0644, spill dirs protected only by a best-effort `chmod` that ignores its own failure; shuffle scratch root 0755 on a shared cluster mount; event-log documents (which carry literal predicate constants) 0644; the stats database (which persists column `min`/`max`) 0644. **Encryption itself remains absent** and is deliberately deferred: it needs *both* spill implementations to be credible, and it defeats the `pa.memory_map` zero-copy read, so 0600 plus the full-disk encryption every enterprise already runs is the better trade until a named deployment requires more. Regression coverage: `tests/integration/test_artifact_permissions.py` and `crates/bc-runtime/tests/spill_permissions.rs`. |
 
-Gaps 1 and 3 compose into a concrete attack: an unauthenticated caller asserts an admin
-`Principal`, runs a UDF, and reads credentials from the inherited environment. That is not a
-feature gap; it is an exploitable path, and it should be triaged as such.
+Gaps 1 and 3 composed into a concrete attack: an unauthenticated caller asserts an admin
+`Principal`, runs a UDF, and reads credentials from the inherited environment.
 
-**Also absent:** Prometheus/OTel *metrics* (traces only), queryable query history, live progress
+**The second half of that composition is closed** (2026-07-26): a UDF worker no longer inherits
+the engine's credentials, demonstrated by running the exploit against both settings — under
+`udf_isolation="none"` the worker reads `AWS_SECRET_ACCESS_KEY`, under the default `"env"` it
+reads nothing. Gap 1 stands, so an unauthenticated caller can still assert an admin `Principal`
+and read whatever that principal is granted; the attack is now bounded by the policy rather than
+escalating past it via the environment.
+
+### Bounded admission, 2026-07-26 — the mechanism landed, the throughput claim did not
+
+Databricks' comparator in gap 2 names a concrete number: **queue depth 1,000**. Batcher had no
+queue at all. Every arriving query executed immediately and asked the Rust executor for a rayon
+pool sized to every core, so sixteen concurrent queries put roughly sixteen full-width pools on
+one machine.
+
+`carbonite/policies/concurrency.py` adds the two halves that have to ship together:
+
+- **Admit fewer at once.** `ConcurrencyLimiter` is a bounded FIFO slot pool with a queue cap and
+  an acquire deadline, reached through `ResourceManager.admit()` — a context manager, because a
+  slot must be held for the *duration* of execution and a `validate`-style call cannot bracket
+  that. `execution.max_concurrent_queries` defaults to `0`, which is a true bypass rather than a
+  large limit, so an unconfigured deployment does not acquire a lock per query.
+- **Give each one less.** `width_for(active) = max(1, cores // active)` narrows the pool each
+  query requests as concurrency rises. One query still gets the whole machine.
+
+Either alone is half a fix: slots without width still oversubscribe within the admitted set, and
+width without slots leaves an unbounded queue of one-core queries.
+
+The re-entrancy case is handled explicitly rather than discovered later. A `collect()` inside a
+`map_batches` UDF would ask for a slot while the outer query holds it, and with one slot
+configured the process would wait on itself forever — a hang in the middle of a pipeline that
+presents as a slow UDF. The limiter tracks depth per thread and lets a nested acquire through
+without consuming a slot.
+
+**What is verified:** the mechanism. Slots are never exceeded under twelve contending threads,
+waiters drain when a slot frees, a full queue raises instead of growing, a failing query returns
+its slot, one thread's nesting depth does not let another thread skip the queue, and the nested
+`collect()` does not deadlock. `tests/unit/test_admission_concurrency.py`, 16 tests.
+
+**What is NOT verified, and must not be claimed:** that this fixes the measured throughput
+inversion (`BENCHMARK_RESULTS.md`: 1 client 124 QPS, 16 clients 88 QPS, p50 7.6 ms → 178 ms).
+That is a performance claim and needs `benchmarks/concurrency/` against a real workload on a
+quiet box. It was **not measurable in this environment**: the Python control plane is GIL-bound,
+so concurrent `collect()` calls on small in-memory data serialize before they ever contend for
+cores — every grant in a live eight-thread run reported `concurrent == 1`. Until that curve is
+re-run on a box where the queries genuinely overlap, oversubscription remains a *diagnosis* that
+fits the 23x p50 blow-up, not a demonstrated cause.
+
+### Cooperative cancellation, 2026-07-26 — Ctrl-C now reaches a running query
+
+A query engine you cannot stop is a gap no competitor shares. Every platform in this ledger
+can kill a running statement; Batcher could not, and the reason was structural rather than
+missing-feature. `bc_py::execute_plan` runs inside `Python::allow_threads`, which releases
+the GIL for the whole of execution. Python's signal handlers run between bytecodes, and there
+are none to run between, so a `SIGINT` during a ten-minute `collect()` was recorded and not
+delivered until the query finished on its own. The interpreter was not hung; it was not
+scheduled. Ctrl-C did nothing, twice, and the third one killed the process.
+
+There is no safe way to interrupt from outside: killing a thread mid-operator leaks its
+Arrow buffers, its memory-pool reservation, and any spill file it holds. So the mechanism is
+cooperative — `bc_resource::cancel` holds an `AtomicBool` per query, and the executor polls
+it where unwinding is already safe:
+
+- **Between morsels** on the streaming executor (the default). It is pull-based, so one
+  `next()` drives one morsel through every operator, and a single check covers the pipeline.
+- **Between operators** on the materializing executor.
+- **Between merge passes** of the external sort, which is the longest a single operator runs.
+
+`bt.running_queries()` lists what is executing; `bt.cancel_query(id)` stops one. Ctrl-C is
+wired to the same path and re-raised as `KeyboardInterrupt`, and hands SIGINT back to the
+previous handler so a second Ctrl-C is still the hard interrupt.
+
+**A real bug this surfaced, worth recording because it would have shipped looking correct:**
+`query_scope` was not re-entrant. A terminal op opens its own scope, so a caller that opened
+one first — to learn the id it intended to cancel — had that id silently replaced by a fresh
+inner one. `cancel_query(outer_id)` then returned `True`, cancelled nothing, and the query
+ran to completion. Pinned by `TestScopeReentrancy`.
+
+**Verified:** six shapes (filter, project, aggregate, sort, distinct, join) x both executors
+= 12 combinations, each asserting `QueryCancelledError` rather than a short result; the id is
+released on the success *and* the failure path; an uncancelled query returns the identical
+relation. `tests/integration/test_query_cancellation.py`, 23 tests, plus 10 Rust unit tests
+in `bc-resource`.
+
+**Cost — measured, and not resolvable here.** A paired, interleaved, order-alternating A/B
+(31 pairs, token present vs absent, one build, one process) gave median deltas of +2.3%
+(filter+project), +1.1% (group-by), and **-0.4%** (sort). A negative arm means the effect is
+under the noise floor: per-pair p10/p90 spanned roughly ±14%, on a box at load average 16.9
+from concurrent agents. The scope's own overhead is separately measured at 15 µs per query,
+which is 0.07% of a 22 ms query. **The honest claim is that no regression was demonstrated,
+not that the poll is free.** A tighter bound needs `require_quiet_box()` and
+`benchmarks/run.py` on an idle machine.
+
+**Intended FFI surface change, stated explicitly rather than discovered.** `execute_plan` and
+`execute_plan_metered` gain a trailing `query_id=None`, and `_native` gains `cancel_query`,
+`running_queries`, `register_query`, `unregister_query`, `cancel_all_queries`, and the
+`QueryCancelledError` type. The parameter defaults to `None`, so an older caller compiles and
+runs unchanged and polls nothing. `EngineConfig` is deliberately **not** where the id went: it
+is per-query identity, not a tunable, and `engine_config_json()` is captured once and shipped
+to every Ray worker — a query id in it would be wrong on all of them.
+
+**Not covered:** a poll *inside* a breaker. A sort's run generation or a join's build
+consumes its whole input in one step, so a query four minutes into building a hash table
+notices four minutes late. The claim is "stops at the next boundary", never "stops at once".
+
+### New finding, 2026-07-26 — a governed column's bloom filter is a membership oracle
+
+Not in the four gaps above, and arguably sharper than any of them, because it needs no
+UDF and no asserted `Principal`.
+
+`api/source_stats.py::persist_written_source_stats` persists a per-column bloom index into
+the `MetadataHub` on every write. The hub's backends include Redis and object storage —
+that is the point of it, a learned-stats store shared across a fleet — so the artifact is
+readable by everyone with hub access.
+
+A bloom answers membership with no false negatives. Demonstrated end to end on the
+*actually persisted* artifact, queried through the *actual* consumer
+(`_build_bloom_index` -> `BloomIndex.from_bytes(...).contains(...)`):
+
+```
+  123-45-6789    -> PRESENT      (really in the column)
+  999-99-9999    -> PRESENT      (really in the column)
+  000-00-0000    -> absent
+  aaa-bb-cccc    -> absent
+  555-55-5555    -> absent
+```
+
+That is a read of a governed column that never touches the table. And because there are no
+false negatives, an `absent` is *proof* of absence — information in its own right.
+
+**Fixed:** under an active `security()` block, a column that is invisible or masked to the
+running principal has its value-bearing statistics dropped before persistence
+(`_value_bearing_columns_to_redact`). Cardinalities (`ndv`, `null_count`, `row_count`)
+survive, so the optimizer still orders joins on the table; only value-derived artifacts go.
+Outside a `security()` block nothing changes. `min`/`max` are covered by the same predicate
+— the encoder already serializes them, and only the current write-side caller happens not
+to populate them, so this closes the path rather than the single instance.
+
+Regression coverage: `tests/unit/test_governed_stats_redaction.py`, which contains the
+oracle demonstration above as an executable test.
+
+**Correction (2026-07-26):** this section previously listed "Prometheus/OTel *metrics* (traces
+only)" as absent. Prometheus metrics do exist — `observe/metrics.py::prometheus_text` and the
+`/metrics` route — and now carry `batcher_recovery_total{event=...}` for fault-tolerance actions.
+
+**Also absent:** queryable query history, live progress
 and **query cancellation**, lineage export (OpenLineage/Atlas/DataHub), materialized views and
 incremental view maintenance (vs Enzyme), engine-native transactions, tokenization/FPE/
 differential privacy. **Present:** MERGE/upsert with the full clause set, CDC apply, data-quality

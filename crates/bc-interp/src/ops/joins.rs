@@ -75,6 +75,39 @@ pub(crate) fn join_batches_with(
     gather_join_output(left, right, &idx, output)
 }
 
+/// Range (inequality) join: one or two inequalities, executed output-sensitively.
+///
+/// The relation is exactly the one the cartesian-product-plus-filter plan produces —
+/// `bc_runtime::join::range_join_indices` is pinned against that oracle — but nothing
+/// quadratic is materialized on the way there. A breaker: both sides are needed whole
+/// because a match is a function of the global sort order on each axis.
+pub(crate) fn range_join_batches(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    conditions: &[bc_ir::RangeCondition],
+    join_type: JoinType,
+    output: &[JoinOutputCol],
+) -> Result<RecordBatch, InterpError> {
+    let left_names: Vec<String> = conditions.iter().map(|c| c.left_key.clone()).collect();
+    let right_names: Vec<String> = conditions.iter().map(|c| c.right_key.clone()).collect();
+    let left_cols = columns_by_name(left, &left_names)?;
+    let right_cols = columns_by_name(right, &right_names)?;
+    let ops: Vec<join::RangeOp> = conditions.iter().map(|c| map_range_op(c.op)).collect();
+    let idx = join::range_join_indices(&left_cols, &right_cols, &ops, map_join_type(join_type))?;
+    gather_join_output(left, right, &idx, output)
+}
+
+/// Wire enum → runtime enum. Separate types because `bc-ir` sits *below* `bc-runtime`
+/// in the crate DAG, so neither can name the other's.
+fn map_range_op(op: bc_ir::RangeOp) -> join::RangeOp {
+    match op {
+        bc_ir::RangeOp::Lt => join::RangeOp::Lt,
+        bc_ir::RangeOp::Le => join::RangeOp::Le,
+        bc_ir::RangeOp::Gt => join::RangeOp::Gt,
+        bc_ir::RangeOp::Ge => join::RangeOp::Ge,
+    }
+}
+
 /// ASOF (nearest-match) join: each left row matched to the right row whose `on` key
 /// is nearest in `direction` within its `by` group. A breaker (both sides fully
 /// materialized), left-style (every left row emitted; unmatched → null right cols).
@@ -220,7 +253,17 @@ fn gather_column(source: &dyn Array, indices: &UInt32Array) -> Result<ArrayRef, 
         })
         .collect::<Result<_, _>>()?;
     let refs: Vec<&dyn Array> = pieces.iter().map(|p| p.as_ref()).collect();
-    Ok(arrow::compute::concat(&refs)?)
+    // `bc_runtime::gather::concat_columns`, not arrow's `concat` — the reassembly is not free
+    // for the column type that most needs the parallel gather above it. Arrow's `concat` drives
+    // `MutableArrayData::extend` once per row, so stitching a `Utf8` column's chunks back
+    // together is a *serial* copy of every byte the parallel `take` just produced, and it
+    // dominates: on the sf10 60M x 15M join, gathering one string build-side column ran the
+    // whole `hash_join` at 40% CPU and 741 ms, against 339 ms at 69% for the same join gathering
+    // an integer column instead. `concat_columns` sums the lengths into the offset buffer and
+    // copies each input's bytes into its own disjoint output slice across cores, and delegates
+    // to arrow for every type (and every offset overflow) it does not fast-path — so this is the
+    // same bytes in the same order, only assembled on more than one core.
+    Ok(bc_runtime::gather::concat_columns(&refs)?)
 }
 
 /// The schema a join's gathered output carries: one nullable field per `output` column,

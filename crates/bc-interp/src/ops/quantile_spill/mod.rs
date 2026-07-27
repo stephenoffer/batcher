@@ -240,6 +240,7 @@ pub(crate) fn bounded_group_quantile(
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
         codec,
+        None,
     )?
     else {
         return Ok((
@@ -489,6 +490,7 @@ pub(crate) fn bounded_group_distinct(
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
         codec,
+        None,
     )?
     else {
         return Ok((
@@ -610,6 +612,7 @@ pub(crate) fn bounded_group_mode(
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
         codec,
+        None,
     )?
     else {
         return Ok((

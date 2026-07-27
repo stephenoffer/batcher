@@ -10,7 +10,6 @@ reusable, configured transform (Ray Data / Daft ``@udf``).
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -30,6 +29,12 @@ def _gather_rows(fn: Callable, rows: list[dict[str, Any]], limit: int) -> list[A
     awaiting them one at a time. Runs a fresh loop per batch (the sync batch path holds no
     running loop), so the whole adapter stays a plain synchronous batch callable to the engine.
     """
+    # `asyncio` is imported here rather than at module scope: this module is reached from
+    # `batcher/__init__` (it defines the public `udf` decorator), so a module-level import
+    # pulled the whole `asyncio` package — ~10 ms and two dozen modules — into every
+    # `import batcher`, for a path only an `async def` row callback ever takes.
+    import asyncio
+
     from batcher.core.udf.async_udf import run_coroutine_blocking
 
     sem = asyncio.Semaphore(max(1, limit))

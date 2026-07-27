@@ -1,4 +1,4 @@
-//# Working with coding agents
+# Working with coding agents
 
 This page catalogs the agent skills Batcher ships, and explains how a coding agent
 picks one and how you use them in your own project.

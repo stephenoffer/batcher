@@ -97,6 +97,35 @@ absent**, and the moment it could see, it was wrong.
 
 *(none — B26 closed in wave 22 below.)*
 
+### Closed 2026-07-26 — the recursion-limit abort
+
+`RelOp::from_json` called `de.disable_recursion_limit()` on the stated grounds that "the Python
+control plane already caps plan depth at its own recursion limit (~1000), which the native stack
+comfortably handles." Both halves were wrong. A plan built iteratively (`for _ in range(N): ds =
+ds.filter(...)`) reaches depth N with **zero** Python recursion, and `sys.setrecursionlimit` is
+user-settable. What had been a catchable `Err` became a stack overflow, which Rust reports as an
+**uncatchable `SIGABRT`** — no Python exception, no message, and on a shuffle actor just an opaque
+`ActorDiedError`.
+
+Measured, on the debug profile (the conservative case, and a real one — `just build` installs it):
+
+| stack | deepest that parses | first that aborts |
+|---|---|---|
+| 2 MiB (rayon worker default) | 650 | 700 |
+| 8 MiB (the thread that calls `from_json`) | 2500 | 3000 |
+
+Fixed with `bc_ir::json_max_depth` — a non-recursive byte scan that skips string literals — run
+before deserialization, returning `IrError::PlanTooDeep` past `MAX_PLAN_DEPTH = 512`. The limit is
+chosen against three bounds: above a 100-operator filter chain (measured at 103 levels) and far
+above an ordinary plan (5-6); above what Python's own recursive `to_ir()` can emit at the default
+recursion limit (~500), so **it rejects nothing that used to work**; and clear of 650 on the
+smallest stack in the process. `node_count` and `contains_media_decode` also became worklist-based,
+since they recursed and so aborted on a deep plan that had already parsed.
+
+Surfaces as `batcher._internal.errors.PlanTooDeepError`. Verified end to end through the FFI:
+depth 511 executes, depth 701 raises. Tests: `crates/bc-ir/tests/plan_depth.rs`, including a
+20,000-deep walk that a recursive implementation cannot survive.
+
 ---
 
 ## Wave 2 — the whole-engine parallel sweep (2026-07-14)
@@ -1018,11 +1047,43 @@ were all reviewed **sound**. One latent panic:
 |---|-----|--------|-------|------|
 | B292 | S2 | **`range_partition_by_i64_key` / `range_partition_by_str_key` panic (task crash) when handed more boundaries than `n_buckets`** — `partition_point` returns an id up to `boundaries.len()`, which when `>= n_buckets` indexes `scatter_into_buckets`'s histogram out of bounds (`index out of bounds: the len is 4 but the index is 5`), killing the reducer/sort task. The f64 sibling `range_partition_by_key_array` was clamped for exactly this (B58); the i64 and string scatter variants — same contract, same `partition_point` routing, same `scatter_into_buckets` — never got the clamp. Fixed with the identical monotonic `b.min(n_buckets-1)` clamp (degrades to fewer non-empty buckets, every row preserved, equal keys still co-located). Latent today (the sample-sort caller passes exactly `parts-1` boundaries) but a crash the moment these `pub` fns are wired to the worker-sized-boundary path their f64 sibling already guards against. | `crates/bc-runtime/src/shuffle.rs` (`range_partition_by_{i64,str}_key`) | rust `shuffle::tests::range_{i64,str}_more_boundaries_than_buckets_does_not_panic` |
 
-**Flagged structural risk (not fixed — needs a design decision):** hash partitioning uses `ahash`
-with fixed seeds, scoped "within a process" by the code. `ahash` is not guaranteed identical across
-CPUs with vs without AES-NI, so a **heterogeneous** cluster could route equal keys to different
-reducers (join misses / split groups). Not reproducible on one host; a cross-node-deterministic hash
-(non-`ahash`) for the routing path would be the fix.
+**Flagged structural risk — FIXED 2026-07-26, and it was not merely a risk.** Hash partitioning
+used `ahash` with fixed seeds, scoped "within a process" by the code. `ahash` selects an AES-NI
+backend from the **compile-time** `target_feature`, so a heterogeneous cluster could route equal
+keys to different reducers (join misses / split groups).
+
+It was *demonstrated*, not inferred. Compiling `bc-runtime` twice on one machine, identical source
+and identical seeds, differing only in `-C target-feature=+aes`:
+
+| key set | default build | `+aes` build |
+|---|---|---|
+| single `Int64` | `[7,1,1,2,6,7,7,7]` | `[2,0,3,6,5,6,1,7]` |
+| mixed `Int64`+`Utf8` | `[1,7,2]` | `[4,7,3]` |
+
+Every trigger is a documented, supported configuration: `.cargo/config.toml` explicitly invites
+`-C target-cpu=native` for a "known-homogeneous" cluster (which enables `+aes`);
+`_self_ship_runtime_env` returns `None` whenever `distributed.runtime_env` is set or a managed
+platform's `RAY_RUNTIME_ENV_HOOK` intervenes, so each worker runs its own wheel; and a cross-arch
+cluster ships a per-arch binary by design.
+
+Fix: `bc_arrow::PortableBuildHasher` (`crates/bc-arrow/src/hash.rs`) — xxHash64 written out and
+pinned by the published specification vectors, with every integer write explicitly little-endian.
+Applied to **only** the sites whose value crosses a process boundary: `shuffle.rs` (via
+`keys::SHUFFLE_HASHER`, so key identity stays in one place), `agg/hll.rs`, and
+`bc-sketches::SEED`. The last two carried the same false claim — `bc-sketches` said in a comment
+that its fixed seed made partition-built sketches merge identically *across* processes, which was
+untrue for the same reason, and whose failure is quieter still: a wrong `approx_count_distinct`
+with no error anywhere.
+
+Intra-process hash tables (`agg/group/*`, `join/*`, `agg/distinct.rs`, `agg/spill.rs`,
+`in_list.rs`) deliberately **stay** on `ahash` — they are faster there and unobservable from
+outside. `window_parallel.rs` kept `ahash` but got a distinct seed constant, because it had been
+byte-identical to the shuffle's and that invited the wrong inference.
+
+Tests: `crates/bc-runtime/tests/shuffle_hash_golden.rs` pins the routing per `bucket_of_rows`
+branch, `crates/bc-expr/tests/xxhash_crosscheck.rs` differential-tests the implementation against
+`twox-hash` over 4 seeds x 256 lengths, and `just check-hash-portability` runs the golden vectors
+twice under different ISA flags — which is the part that actually proves the property.
 
 ### Wave 23 parallel sweep — Avro logical types
 

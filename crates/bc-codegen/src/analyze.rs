@@ -22,6 +22,11 @@ fn is_safe_int_divisor(expr: &bc_expr::Expr) -> bool {
 
 /// Validate the expression and infer its result scalar type, recording every
 /// referenced column in `cols`.
+/// Largest `IN` set the JIT lowers to a compare chain. Kept equal to the interpreter's
+/// `LINEAR_SCAN_MAX`: that is exactly the size at which it stops scanning linearly and
+/// starts hashing, and a chain past that point is the slower algorithm.
+pub(crate) const IN_LIST_JIT_MAX: usize = 8;
+
 pub(crate) fn analyze(
     expr: &bc_expr::Expr,
     batch: &RecordBatch,
@@ -198,10 +203,37 @@ pub(crate) fn analyze(
                 _ => Err(CodegenError::Unsupported("cast of boolean".into())),
             }
         }
-        Expr::IsNull { .. } => Err(CodegenError::Unsupported("is_null".into())),
-        Expr::IsNotNull { .. } => Err(CodegenError::Unsupported("is_not_null".into())),
-        Expr::IsNan { .. } => Err(CodegenError::Unsupported("is_nan".into())),
-        Expr::IsInf { .. } => Err(CodegenError::Unsupported("is_inf".into())),
+        // `is_null` / `is_not_null` are *total*: they answer for a null input rather than
+        // propagating it. That places them outside `is_null_propagating` deliberately,
+        // and the two compile paths handle them differently.
+        //
+        // Under the Kleene ABI the answer is the operand's validity bit (negated for
+        // `is_null`), and the result itself is always valid.
+        //
+        // On the null-free path the answer is a constant. That is safe rather than
+        // optimistic: `CompiledExpr::eval` refuses any batch whose referenced columns
+        // carry nulls when the expression is not `null_safe`, so a constant can only be
+        // emitted for a batch that genuinely has none.
+        Expr::IsNull { input } | Expr::IsNotNull { input } => {
+            analyze(input, batch, cols)?;
+            Ok(ScalarTy::Bool)
+        }
+        // `is_nan` / `is_inf` compile for a float operand. Both are null-propagating
+        // (the interpreter carries the input's validity buffer through unchanged), so
+        // they need no special validity handling beyond the unary propagation the
+        // Kleene path already does.
+        //
+        // A non-float operand falls back. NaN and the infinities are impossible for an
+        // integer, so the answer is a constant `false` there -- but the interpreter
+        // reaches it by casting to Float64 first, and reproducing that constant here
+        // would add a compile path whose only job is to be trivially true. Kyber folds
+        // the non-nullable integer case away before the JIT ever sees it.
+        Expr::IsNan { input } | Expr::IsInf { input } => match analyze(input, batch, cols)? {
+            ScalarTy::F64 => Ok(ScalarTy::Bool),
+            _ => Err(CodegenError::Unsupported(
+                "is_nan/is_inf on a non-float operand".into(),
+            )),
+        },
         Expr::Case {
             branches,
             otherwise,
@@ -248,7 +280,38 @@ pub(crate) fn analyze(
         Expr::Audio { .. } => Err(CodegenError::Unsupported("audio function".into())),
         Expr::Video { .. } => Err(CodegenError::Unsupported("video function".into())),
         Expr::Coalesce { .. } => Err(CodegenError::Unsupported("coalesce".into())),
-        Expr::InList { .. } => Err(CodegenError::Unsupported("in_list".into())),
+        // `x IN (lit, ...)`: compiled as an OR-chain of equality compares, so the whole
+        // surrounding predicate stays in one JIT pass instead of falling back wholesale.
+        //
+        // The cap mirrors the interpreter's own `LINEAR_SCAN_MAX`: below it the
+        // interpreter linear-scans and an unrolled compare chain is the same shape; above
+        // it the interpreter switches to a hash probe that a chain would lose to badly.
+        // So this is not "as far as the JIT can go", it is "as far as the chain wins".
+        //
+        // Every literal must convert to the operand's type. The interpreter *filters* a
+        // non-convertible literal out of the set (`filter_map`), so a mixed set is a
+        // different set than it looks; rather than reproduce that filtering, a mixed set
+        // is declined outright.
+        Expr::InList { input, set } => {
+            if set.is_empty() || set.len() > IN_LIST_JIT_MAX {
+                return Err(CodegenError::Unsupported("in_list arity".into()));
+            }
+            match analyze(input, batch, cols)? {
+                ScalarTy::I64 if set.iter().all(|l| matches!(l, bc_expr::Literal::Int(_))) => {
+                    Ok(ScalarTy::Bool)
+                }
+                ScalarTy::F64
+                    if set.iter().all(|l| {
+                        matches!(l, bc_expr::Literal::Int(_) | bc_expr::Literal::Float(_))
+                    }) =>
+                {
+                    Ok(ScalarTy::Bool)
+                }
+                _ => Err(CodegenError::Unsupported(
+                    "in_list operand/literal types".into(),
+                )),
+            }
+        }
         Expr::Array { .. } => Err(CodegenError::Unsupported("array literal".into())),
         // The row hash reads whole typed values (strings, canonicalized floats); the
         // JIT's numeric subset cannot express it, so the interpreter runs it.
@@ -288,8 +351,36 @@ pub(crate) fn analyze(
         }
         Expr::List { .. } => Err(CodegenError::Unsupported("list function".into())),
         Expr::NullIf { .. } => Err(CodegenError::Unsupported("nullif".into())),
-        Expr::Greatest { .. } => Err(CodegenError::Unsupported("greatest".into())),
-        Expr::Least { .. } => Err(CodegenError::Unsupported("least".into())),
+        // `greatest`/`least` fold to a select chain over the engine's float identity.
+        //
+        // They *skip* nulls rather than propagating them, so they are absent from both
+        // `kleene_supported` and `is_null_propagating`: like `Case`, they compile only on
+        // the null-free path, where every operand is present and the skip never happens.
+        //
+        // Every operand must already share one scalar type. The interpreter promotes a
+        // mixed `greatest(int, float)` via `coerce_numeric`; reproducing that promotion
+        // here would add a second coercion model to keep in step with it, so a mixed call
+        // falls back instead.
+        Expr::Greatest { inputs } | Expr::Least { inputs } => {
+            let mut it = inputs.iter();
+            let first = it.next().ok_or_else(|| {
+                CodegenError::Unsupported("greatest/least with no arguments".into())
+            })?;
+            let ty = analyze(first, batch, cols)?;
+            if !matches!(ty, ScalarTy::I64 | ScalarTy::F64) {
+                return Err(CodegenError::Unsupported(
+                    "greatest/least operand type".into(),
+                ));
+            }
+            for arg in it {
+                if analyze(arg, batch, cols)? != ty {
+                    return Err(CodegenError::Unsupported(
+                        "greatest/least with mixed operand types".into(),
+                    ));
+                }
+            }
+            Ok(ty)
+        }
         Expr::Math2 { func, left, right } => {
             // `pow`/`atan2` lower to a libm libcall (see `libm_binary_symbol`);
             // `round(x, digits)` is not a single libm call and stays on the

@@ -211,12 +211,56 @@ def _source_identity(source: Source) -> str:
     return identity_fn() if callable(identity_fn) else ""
 
 
+def _value_bearing_columns_to_redact(table: str, columns: list[str]) -> set[str]:
+    """Columns whose *values* must not be persisted into the shared statistics store.
+
+    Some statistics are cardinalities — a row count, a null count, a distinct estimate.
+    Those describe the shape of the data and leak nothing about it. Others carry the data:
+    `min`/`max` are literally two values out of the column, and a **bloom filter is a
+    membership oracle** — holding one for an `ssn` column lets anyone test whether a
+    specific SSN is present, without ever reading the table.
+
+    The `MetadataHub` those land in is not necessarily private. Its backends include Redis
+    and object storage, which is the whole point (a learned-stats store shared across a
+    fleet), so anything written there is readable by everyone with hub access — including
+    principals the catalog would never let read the column itself.
+
+    So under an active `security()` block, a column that is masked or invisible to the
+    running principal keeps only its cardinalities. Outside one, nothing changes: an
+    ungoverned deployment behaves exactly as before.
+
+    Args:
+        table: The governed table name — the bare path, which is what `_binding.table_name`
+            keys on and what a policy author writes before the table has ever been read.
+        columns: The column names about to have statistics persisted.
+
+    Returns:
+        The subset of `columns` whose value-bearing statistics must be dropped.
+    """
+    from batcher.api.security._context import current_security
+
+    context = current_security()
+    if context is None:
+        return set()
+    if not context.catalog.governs(table):
+        return set()
+    visible = set(context.catalog.visible_columns(table, columns, context.principal))
+    redact = {c for c in columns if c not in visible}
+    redact |= {
+        c for c in columns if context.catalog.mask_for(table, c, context.principal) is not None
+    }
+    return redact
+
+
 def persist_written_source_stats(table: pa.Table, path: str, fmt: str) -> None:
     """Persist a freshly-written result's statistics for a future read of `path`.
 
     Keyed by the read-side identity (`<fmt>:<path>`), so a later `read.<fmt>(path)`
     over a footerless format still finds an exact row count and per-column distinct
     estimates. Best-effort; never breaks a write.
+
+    Value-bearing statistics for governed columns are dropped first — see
+    `_value_bearing_columns_to_redact`.
     """
     from batcher import core
     from batcher.metadata.source_stats_store import save_source_stats
@@ -230,14 +274,18 @@ def persist_written_source_stats(table: pa.Table, path: str, fmt: str) -> None:
         ndv, _quants, _bytes = core.column_statistics(table.to_batches(), cols)
         index_on = active_config().optimizer.build_bloom_index
         blooms = _build_bloom_index(table, cols) if index_on else {}
+        # A bloom over a governed column is a membership oracle for its values, so it must
+        # not reach a shared statistics store. The distinct *count* is a cardinality and
+        # stays — the optimizer still gets to order joins on this table.
+        redacted = _value_bearing_columns_to_redact(path, list(cols))
         columns = {
             name: ColumnStat(
                 ndv=float(ndv[name]) if ndv.get(name) else None,
                 provenance=Provenance.SKETCH,
-                bloom=blooms.get(name),
+                bloom=None if name in redacted else blooms.get(name),
             )
             for name in cols
-            if ndv.get(name) or blooms.get(name)
+            if ndv.get(name) or (blooms.get(name) and name not in redacted)
         }
         stats = SourceStatistics(
             row_count=table.num_rows, byte_size=table.nbytes, columns=columns, exact_rows=True

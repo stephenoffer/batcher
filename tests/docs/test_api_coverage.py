@@ -45,9 +45,10 @@ sys.path.insert(0, str(_ROOT / "tools"))
 from lint_docstrings import collect as collect_style_violations  # noqa: E402
 from public_surface import expression_names, public_names  # noqa: E402
 
-# The expression reference page: the one page whose job is to enumerate every method
-# a user can call on an `Expr` (the fluent builder plus every accessor namespace).
-_EXPR_REFERENCE = "api/expressions.md"
+# The expression reference: the pages whose job is to enumerate every method a user can
+# call on an `Expr` — the fluent builder on one, every accessor namespace on the other.
+# Together they must be exhaustive; neither alone is.
+_EXPR_REFERENCE = ("api/expressions.md", "api/expression-accessors.md")
 
 # Public names not yet documented (drain toward empty). Keep each with a reason.
 KNOWN_UNDOCUMENTED: dict[str, str] = {
@@ -210,14 +211,14 @@ def test_every_public_name_is_taught_outside_the_reference():
 
 
 def test_expression_reference_lists_every_expr_method():
-    page = (_DOCS / _EXPR_REFERENCE).read_text(encoding="utf-8")
+    page = "\n".join((_DOCS / name).read_text(encoding="utf-8") for name in _EXPR_REFERENCE)
     names = expression_names()
     listed = {n for n in names if _mentioned(n, page)}
 
     missing = sorted(names - listed - set(KNOWN_EXPR_UNLISTED))
     assert not missing, (
-        f"{len(missing)} Expr method(s) missing from docs/{_EXPR_REFERENCE}: {missing}\n"
-        "That page is the exhaustive expression reference — add each method to the "
+        f"{len(missing)} Expr method(s) missing from {list(_EXPR_REFERENCE)}: {missing}\n"
+        "Those pages are the exhaustive expression reference — add each method to the "
         "relevant table/section, or add it to KNOWN_EXPR_UNLISTED with a reason."
     )
 

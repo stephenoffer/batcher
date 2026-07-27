@@ -16,6 +16,7 @@ mod jaro;
 mod json;
 mod like;
 mod minhash;
+mod numfmt;
 mod regex_cache;
 mod uri_path;
 
@@ -90,6 +91,12 @@ pub(crate) fn eval_str(
         if let Some(out) = eval_bytes(func, arr, pattern)? {
             return Ok(out);
         }
+    }
+    // Int → Utf8 functions (`chr`, `to_base`/`bin`, `format_bytes`, and `hex` of an
+    // integer) are dispatched before the Utf8 downcast below, which would reject their
+    // argument outright. Every other function declines here and takes the string path.
+    if let Some(out) = numfmt::eval_numeric_input(func, arr, start)? {
+        return Ok(out);
     }
     // A `Binary`-typed column (how ClickBench's `hits` string columns arrive — a
     // `BYTE_ARRAY` with no UTF-8 logical annotation) is coerced to `Utf8` so string
@@ -341,6 +348,40 @@ pub(crate) fn eval_str(
                     .map(|o| o.and_then(|v| json::value_type(v, &path)))
                     .collect::<StringArray>(),
             )
+        }
+        StrFunc::JsonValue => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::json_value(v, &path)))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::JsonContains => {
+            let needle = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| json::contains(v, needle)))
+                    .collect::<BooleanArray>(),
+            )
+        }
+        StrFunc::JsonPretty => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(json::pretty))
+                .collect::<StringArray>(),
+        ),
+        StrFunc::JsonStructure => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(json::structure))
+                .collect::<StringArray>(),
+        ),
+        // Int → Utf8, handled before the Utf8 downcast above. Reaching here means the
+        // argument was text, which these have no meaning for.
+        StrFunc::Chr | StrFunc::ToBase | StrFunc::FormatBytes | StrFunc::FormatBytesSi => {
+            return Err(ExprError::ExpectedString {
+                func: format!("{func:?}"),
+                got: "Utf8 (this function takes an integer)".into(),
+            })
         }
         StrFunc::JsonExists => {
             let path = json::parse_path(require_pattern(pattern, func)?);

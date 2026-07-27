@@ -1,6 +1,7 @@
-"""Join logical nodes: `JoinOutputCol` and `Join`.
+"""Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`.
 
-Equi-join of two relations — a pipeline breaker with two inputs.
+Equi-join, nearest-match and inequality joins of two relations — each a pipeline
+breaker with two inputs.
 """
 
 from __future__ import annotations
@@ -15,7 +16,14 @@ from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases
 from batcher.plan.schema import SchemaRef
 
-__all__ = ["AsofJoin", "Join", "JoinOutputCol", "WatermarkStreamJoin"]
+__all__ = [
+    "AsofJoin",
+    "Join",
+    "JoinOutputCol",
+    "RangeCondition",
+    "RangeJoin",
+    "WatermarkStreamJoin",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +245,86 @@ class AsofJoin(LogicalPlan):
             "left_by": list(self.left_by),
             "right_by": list(self.right_by),
             "backward": self.direction == "backward",
+            "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in self.output],
+        }
+
+    def available_columns(self) -> list[str]:
+        return [o.alias for o in self.output]
+
+    def available_schema(self) -> SchemaRef | None:
+        return _join_output_schema(self.left, self.right, self.output)
+
+
+# The inequalities a `RangeJoin` condition may carry. `eq` is a hash join and `ne`
+# admits no ordering structure, so neither appears here — both are left to the paths
+# that already handle them.
+RANGE_OPS = frozenset({"lt", "le", "gt", "ge"})
+
+
+@dataclass(frozen=True, slots=True)
+class RangeCondition:
+    """One inequality of a `RangeJoin`, oriented ``left_key OP right_key``."""
+
+    left_key: str
+    right_key: str
+    op: str  # one of RANGE_OPS
+
+
+@dataclass(frozen=True, slots=True)
+class RangeJoin(LogicalPlan):
+    """Inequality join on one or two range conditions. A pipeline breaker.
+
+    ``A JOIN B ON a.x < b.y`` (and interval containment, and band joins) otherwise
+    lowers to a cartesian `Join` with the predicate as a `Filter` above it, so the
+    intermediate is ``|A| x |B|`` rows however few survive. This node is executed by an
+    output-sensitive algorithm instead — a sorted-suffix scan for one inequality, IEJoin
+    for two — so the cost tracks the *result* size, not the product of the input sizes.
+
+    Anything else in the original predicate stays in a `Filter` above this node, which
+    is what makes the rewrite a restriction of the cartesian plan rather than a
+    reinterpretation of it.
+    """
+
+    left: LogicalPlan
+    right: LogicalPlan
+    conditions: tuple[RangeCondition, ...]
+    join_type: str  # one of JOIN_TYPES
+    output: tuple[JoinOutputCol, ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.conditions) <= 2:
+            raise PlanError(f"range join takes one or two conditions, got {len(self.conditions)}")
+        if self.join_type not in JOIN_TYPES:
+            raise PlanError(f"unknown join type {self.join_type!r}; expected {sorted(JOIN_TYPES)}")
+        left_cols = set(self.left.available_columns())
+        right_cols = set(self.right.available_columns())
+        for c in self.conditions:
+            if c.op not in RANGE_OPS:
+                raise PlanError(f"unknown range op {c.op!r}; expected {sorted(RANGE_OPS)}")
+            if c.left_key not in left_cols:
+                raise PlanError(f"range join left key {c.left_key!r} not in left columns")
+            if c.right_key not in right_cols:
+                raise PlanError(f"range join right key {c.right_key!r} not in right columns")
+        # The engine encodes both sides of a condition with one row converter, so a
+        # mismatched pair would surface at execution as an opaque encoder error.
+        _validate_key_types(
+            self.left,
+            self.right,
+            tuple(c.left_key for c in self.conditions),
+            tuple(c.right_key for c in self.conditions),
+        )
+        _reject_duplicate_aliases([o.alias for o in self.output], what="range join output")
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "op": Op.RANGE_JOIN,
+            "left": self.left.to_ir(),
+            "right": self.right.to_ir(),
+            "conditions": [
+                {"left_key": c.left_key, "right_key": c.right_key, "op": c.op}
+                for c in self.conditions
+            ],
+            "join_type": self.join_type,
             "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in self.output],
         }
 

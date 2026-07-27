@@ -5,7 +5,7 @@ description: Port an existing pandas or Polars script to Batcher's public Python
 
 # Migrate from Polars or pandas
 
-`docs/migration/index.md` is the user-facing mapping table and the source of truth.
+`docs/migration/transforming.md` is the user-facing mapping table and the source of truth.
 Read it first; this skill is the agent-side procedure around it, and must never
 contradict it. Everything below is verified against the live surface — if you need a
 name this skill doesn't list, check it with
@@ -37,7 +37,7 @@ Work happens only at a terminal op: `collect()`, `to_arrow()`, `to_pydict()`,
 
 ## Translation table
 
-Extends the tables in `docs/migration/index.md`; consult that page for the full
+Extends the tables in `docs/migration/transforming.md`; consult that page for the full
 pandas/Polars/PySpark grid, including IO, terminal ops, and the `from_*`/`to_*`
 round-trips.
 
@@ -172,8 +172,9 @@ For a sorted query, compare `new.to_pylist()` against the oracle **in order**.
 
 ## See also
 
-- `docs/migration/index.md` — the full pandas/Polars/PySpark mapping tables.
-- `docs/user-guide/expressions.md`, `docs/api/expressions.md` — the expression surface
+- `docs/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
+- `docs/user-guide/expressions.md`, `docs/user-guide/expression-accessors.md`,
+  `docs/api/expressions.md` — the expression surface
   and every accessor namespace.
 - `docs/user-guide/udfs.md` — when a UDF is justified and what it costs.
 - `docs/user-guide/window-functions.md`, `docs/user-guide/transformations.md`.

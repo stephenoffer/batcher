@@ -224,14 +224,14 @@ _DESCRIPTIONS: dict[str, str] = {
         "        {'r': [3]}"
     ),
     "last_day": (
-        "The last day of the month at 00:00:00 (→ Timestamp).\n\n"
+        "The last day of the instant's month (→ Date).\n\n"
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
         '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
         '        >>> ds.select(r=bt.col("d").dt.last_day()).to_pydict()\n'
-        "        {'r': [datetime.datetime(2024, 2, 29, 0, 0)]}"
+        "        {'r': [datetime.date(2024, 2, 29)]}"
     ),
     # --- .list per-row reductions over each list value ----------------------
     # The reductions return null on an empty or null list; len/n_unique return 0

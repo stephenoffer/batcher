@@ -35,6 +35,72 @@ policy (`region = principal.attrs["region"]`) serves every user.
    :no-index:
 ```
 
+## Establishing an identity
+
+A `Principal` you construct is *asserted*: a name someone typed. That is right for a
+single-user session and worthless as a control, because `bt.Principal("root",
+roles=["admin"])` holds every admin role.
+
+A `Principal` from {py:func}`bt.authenticate <batcher.authenticate>` is *verified*: its
+claims came out of a credential this process checked. Install a verifier once at startup,
+from whichever layer owns the network edge, then set
+`governance.require_verified_principal` to refuse asserted identities.
+
+```python
+import os
+
+import batcher as bt
+from batcher.governance.authn import HmacTokenVerifier
+
+# In production the operator sets this; the reference keeps the key out of the plan.
+os.environ["BATCHER_TOKEN_KEY"] = "a-signing-key"
+
+verifier = HmacTokenVerifier(key="env:BATCHER_TOKEN_KEY", issuer="gateway")
+bt.set_verifier(verifier)
+
+# The gateway mints a token after authenticating the user; the engine checks it.
+token = verifier.mint("ana", roles=["analyst"], ttl_seconds=900)
+principal = bt.authenticate(token)
+print(principal.name, sorted(principal.roles), principal.verified)
+# ana ['analyst'] True
+
+bt.set_verifier(None)
+```
+
+Batcher ships three verifiers. {py:obj}`ProcessIdentityVerifier
+<batcher.governance.authn.ProcessIdentityVerifier>` reports the OS user, which is the
+honest answer when each trust domain runs its own process.
+{py:obj}`HmacTokenVerifier <batcher.governance.authn.HmacTokenVerifier>` checks a compact
+signed token against a shared key, using only the standard library. {py:obj}`JwtVerifier
+<batcher.governance.authn.JwtVerifier>` validates an OIDC ID token against the provider's
+JWKS, and needs the optional `pyjwt` dependency.
+
+```{eval-rst}
+.. autoclass:: batcher.governance.authn.ProcessIdentityVerifier
+   :members:
+   :no-index:
+
+.. autoclass:: batcher.governance.authn.HmacTokenVerifier
+   :members:
+   :no-index:
+
+.. autoclass:: batcher.governance.authn.JwtVerifier
+   :members:
+   :no-index:
+
+.. autoclass:: batcher.governance.authn.CredentialVerifier
+   :members:
+   :no-index:
+```
+
+```{warning}
+Verification is a **deployment** control, not a security boundary. Code running inside the
+engine's process can construct a `Principal` with any `issuer` it likes, and no in-process
+mechanism can stop it. What this buys is that a query whose identity nobody established is
+refused instead of silently trusted. The boundary is still the process — run one per trust
+domain. See {doc}`../user-guide/hardening`.
+```
+
 ## The catalog
 
 {py:obj}`SecurityCatalog <batcher.governance.SecurityCatalog>` holds the policy: which

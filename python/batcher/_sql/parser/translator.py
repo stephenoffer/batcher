@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import pyarrow as pa
+from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
 from batcher._internal.sql_errors import parse_sql
@@ -67,8 +68,6 @@ _MAX_RECURSION = 1024
 
 def _references(node, name: str) -> bool:
     """Whether `node` reads the table `name` anywhere beneath it."""
-    from sqlglot import expressions as exp
-
     return any(t.name == name for t in node.find_all(exp.Table))
 
 
@@ -89,8 +88,6 @@ def _table_ref_count(root, name: str) -> int:
     later CTE. A CTE's own `WITH name AS (…)` header is an alias, not an `exp.Table`, so it is
     not counted — only real references are.
     """
-    from sqlglot import expressions as exp
-
     return sum(1 for t in root.find_all(exp.Table) if t.name == name)
 
 
@@ -172,7 +169,6 @@ class _Translator:
             A materialized `Dataset` over the accumulated rows.
         """
         import pyarrow as pa
-        from sqlglot import expressions as exp
 
         body = cte.this
         if not isinstance(body, exp.Union):
@@ -237,8 +233,6 @@ class _Translator:
     # --- statement ---------------------------------------------------------
     def statement(self, node) -> Dataset:
         """Translate a top-level statement: a SELECT or a set operation."""
-        from sqlglot import expressions as exp
-
         # WITH name AS (...), ... — translate each CTE in order and register it
         # under its alias so later FROM references resolve. CTEs may reference
         # earlier ones (they are translated and registered sequentially).
@@ -317,8 +311,6 @@ class _Translator:
     def _apply_setop_tail(self, node, ds: Dataset) -> Dataset:
         """Apply a trailing ORDER BY / LIMIT / OFFSET on a set-operation result."""
         import sys
-
-        from sqlglot import expressions as exp
 
         order = node.args.get("order")
         if order is not None:

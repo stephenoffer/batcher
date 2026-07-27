@@ -191,9 +191,36 @@ bench-all args="":
 bench-list:
     python benchmarks/run.py --list
 
+# Prove the shuffle's key-to-reducer mapping does not depend on the CPU it was built for.
+#
+# The engine hashed shuffle keys with `ahash`, which picks an AES-NI backend from the
+# COMPILE-TIME target_feature. Two workers built with different `-C target-cpu` therefore
+# routed the same key to different reducers — splitting a GROUP BY group and dropping join
+# matches, silently, on a mixed-instance cluster and nowhere else. This runs the golden
+# routing vectors twice on one machine under different ISA flags: same numbers both times,
+# or the portability property has been lost again.
+check-hash-portability:
+    cargo test -p bc-runtime --test shuffle_hash_golden
+    cargo test -p bc-sketches
+    RUSTFLAGS="-C target-feature=+aes" cargo test --target-dir target/aes \
+        -p bc-runtime --test shuffle_hash_golden
+    RUSTFLAGS="-C target-feature=+aes" cargo test --target-dir target/aes -p bc-sketches
+
 # Run the distributed single-node == many-partition equivalence benchmark.
 bench-dist args="":
     python benchmarks/run.py --benchmark distributed {{args}}
+
+# Measure throughput and tail latency as concurrent clients are added — the axis every
+# other suite here misses. A number from this is only meaningful with its four axes
+# (--clients-as, --rate, --shape, and the machine fingerprint), all of which it records.
+bench-qps args="":
+    python benchmarks/concurrency/run.py {{args}}
+
+# Self-test the concurrency harness on a pure-sleep workload. Needs no comparator and no
+# corpus, so it runs in CI: if the harness does not scale, no engine number it produces
+# means anything.
+bench-qps-sanity:
+    python benchmarks/concurrency/run.py --sanity
 
 # Run a standalone aux benchmark by name (distributed | optimizer | shuffle).
 bench-aux which:

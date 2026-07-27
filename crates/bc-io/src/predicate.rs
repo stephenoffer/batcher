@@ -109,7 +109,7 @@ fn rg_survives(rg: &RowGroupMetaData, pred: &Pred) -> bool {
 /// unsigned value (e.g. 3e9 in a `UInt32`) therefore surfaces as a negative `i32` stat, so
 /// interpreting it as signed silently prunes away the rows that actually match. The caller
 /// reinterprets the bits as unsigned when this is set.
-fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<(&'a Statistics, bool)> {
+pub(crate) fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<(&'a Statistics, bool)> {
     (0..rg.num_columns()).find_map(|i| {
         let cc = rg.column(i);
         let parts = cc.column_path().parts();

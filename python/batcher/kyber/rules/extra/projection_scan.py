@@ -33,6 +33,7 @@ from batcher.plan.expr_ir import Cast, Col, Expr, IsNotNull, IsNull, Not
 from batcher.plan.expr_ir.walk import column_occurrence_counts
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
+    expr_key,
     split_conjuncts,
     substitute_columns,
     transform_expr_up,
@@ -84,8 +85,13 @@ def eliminate_sort_before_sample(node: Sample, _ctx: OptimizerContext) -> Logica
 
 
 def _sort_key_sig(key: object) -> tuple:
-    """A structural signature for a sort key (lowered IR + direction + null placement)."""
-    return (key.expr.to_ir(), key.descending, key.nulls_first)
+    """A structural signature for a sort key (lowered IR + direction + null placement).
+
+    Uses `expr_key`'s canonical *string* rather than the raw IR dict, which makes the
+    signature hashable — so `dedupe_sort_keys` can hold the seen set in a `set` instead of
+    scanning a list and comparing whole dicts, one full comparison per key already kept.
+    """
+    return (expr_key(key.expr), key.descending, key.nulls_first)
 
 
 @rule(name="dedupe_sort_keys", phase=Phase.NORMALIZE, matches=(Sort,))
@@ -95,13 +101,13 @@ def dedupe_sort_keys(node: Sort, _ctx: OptimizerContext) -> LogicalPlan | None:
     ties on that key — where it is, by construction, also equal — so it never
     discriminates. Removing exact-duplicate keys leaves the ordering (and the result)
     unchanged. Returns None when every key is unique, keeping the rule idempotent."""
-    seen: list[tuple] = []
+    seen: set[tuple] = set()
     kept = []
     for key in node.keys:
         sig = _sort_key_sig(key)
         if sig in seen:
             continue
-        seen.append(sig)
+        seen.add(sig)
         kept.append(key)
     if len(kept) == len(node.keys):
         return None

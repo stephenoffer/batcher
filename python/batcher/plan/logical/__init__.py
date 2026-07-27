@@ -19,7 +19,14 @@ from batcher.plan.logical.aggregate import (
     SortKeySpec,
 )
 from batcher.plan.logical.base import LogicalPlan
-from batcher.plan.logical.join import AsofJoin, Join, JoinOutputCol, WatermarkStreamJoin
+from batcher.plan.logical.join import (
+    AsofJoin,
+    Join,
+    JoinOutputCol,
+    RangeCondition,
+    RangeJoin,
+    WatermarkStreamJoin,
+)
 from batcher.plan.logical.relational import (
     Distinct,
     Filter,
@@ -57,6 +64,8 @@ __all__ = [
     "MapBatches",
     "Project",
     "Projection",
+    "RangeCondition",
+    "RangeJoin",
     "RowId",
     "Sample",
     "Scan",

@@ -64,7 +64,7 @@ print(ds.to_pydict())
 
 ### From items and generators
 
-`from_items` builds a `Dataset` from a Python list, one row per item, Ray Data style.
+`from_items` builds a `Dataset` from a Python list, one row per item.
 A dict item expands to columns, and a scalar becomes a single `item` column. `date_range`
 generates a calendar dimension, the date-typed sibling of `range`.
 

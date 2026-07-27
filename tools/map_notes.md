@@ -100,7 +100,8 @@ Three families are not where a crate doc would lead you. Follow these, not intui
 | Pair | Difference |
 |---|---|
 | `bc-io/src/store.rs` vs `bc-transport/src/store.rs` | Object-store URI resolution vs. shuffle-ticket registry. Unrelated. |
-| `bc-expr/src/analyze.rs` vs `bc-codegen/src/analyze.rs` | Scheduling predicates over `Expr` vs. JIT-subset validation. |
+| `bc-expr/src/analyze.rs` vs `bc-codegen/src/analyze.rs` | Static answers *about* an `Expr` (cost, columns read, can-a-skipped-row-hide-an-error, contains-media-decode) vs. JIT-subset validation. |
+| `bc-expr/src/select.rs` vs `bc-interp/src/ops/mod.rs` | Computing a filter's keep mask (short-circuiting the `AND` conjuncts) vs. the Filter operator that gathers with it. |
 | `bc-sketches` `countmin` vs `frequent` | *How often is this key* vs. *which keys are heavy*. |
 | `minhash` (`eval/str/`) vs `simhash` (`eval/list_ops/`) | Jaccard over shingles vs. cosine over embeddings. |
 | `plan/expr_rewrite/` vs `kyber/rules/` | The traversal **mechanism** vs. the rewrite **policy**. |

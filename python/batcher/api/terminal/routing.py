@@ -10,12 +10,31 @@ decides *where* to run, never *what* the result is (single-node == distributed i
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import logging
+import sys
 
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
 __all__ = ["resolve_distributed"]
+
+
+@functools.lru_cache(maxsize=1)
+def _ray_importable() -> bool:
+    """Whether `ray` can be imported at all — resolved once per process.
+
+    ``distributed="auto"`` runs on every terminal op, and its first act was ``import ray``.
+    Python caches a *successful* import in `sys.modules` but caches nothing about a failed
+    one, so on the (common) machine with no Ray installed that statement re-walked every
+    `sys.path` entry looking for a package that is not there, once per query. Asking
+    `find_spec` once and remembering the answer turns a per-query path scan into a single
+    dict lookup, and leaves the behavior identical: an installed-but-broken Ray still
+    reaches the ``import ray`` below and still degrades to single-node through the
+    existing handler.
+    """
+    return "ray" in sys.modules or importlib.util.find_spec("ray") is not None
 
 
 def resolve_distributed(
@@ -34,6 +53,8 @@ def resolve_distributed(
     """
     if distributed != "auto":
         return bool(distributed)
+    if not _ray_importable():
+        return False  # no Ray, no cluster — the answer can only be single-node
     try:
         import ray
 

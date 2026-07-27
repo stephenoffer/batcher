@@ -492,6 +492,93 @@ pub(super) fn array_values(text: &str, path: &[PathPart]) -> Option<Vec<Option<S
 }
 
 /// Render one already-located JSON value as text: a string leaf verbatim, a container as
+/// `json_value(doc, path)` — the value at `path` as text, **null for a container**.
+///
+/// The distinction from `extract_string`, which DuckDB draws deliberately: `json_value`
+/// answers only for a scalar (and keeps a string's quotes, since it returns the JSON
+/// token), where `json_extract_string` unquotes a string and renders an object or array
+/// as compact JSON. Returning one where the other was asked for is a plausible wrong
+/// answer, which is why they are two kernels rather than one with a flag.
+pub(super) fn json_value(text: &str, path: &[PathPart]) -> Option<String> {
+    let raw = seek(text, path)?;
+    match serde_json::from_str::<Value>(raw).ok()? {
+        Value::Object(_) | Value::Array(_) => None,
+        Value::Null => None,
+        Value::String(_) => Some(compact(raw)), // keeps the quotes, as DuckDB does
+        other => Some(other.to_string()),
+    }
+}
+
+/// `json_contains(doc, needle)` — whether `needle` (itself a JSON value) appears as an
+/// element of a top-level array, as a value of a top-level object, or equals the whole
+/// document. Comparison is on the *parsed* values, so whitespace and key order in either
+/// argument cannot change the answer.
+pub(super) fn contains(text: &str, needle: &str) -> bool {
+    let Ok(doc) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let Ok(want) = serde_json::from_str::<Value>(needle) else {
+        return false;
+    };
+    if doc == want {
+        return true;
+    }
+    match doc {
+        Value::Array(items) => items.contains(&want),
+        Value::Object(fields) => fields.values().any(|v| *v == want),
+        _ => false,
+    }
+}
+
+/// `json_pretty(doc)` — the document re-rendered with **four-space** indentation, which
+/// is what DuckDB emits. Invalid JSON is null rather than an error, matching every other
+/// reader in this module.
+pub(super) fn pretty(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let mut out = Vec::new();
+    let indent = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, indent);
+    serde::Serialize::serialize(&value, &mut ser).ok()?;
+    String::from_utf8(out).ok()
+}
+
+/// `json_structure(doc)` — the document's shape with each leaf replaced by the name of
+/// the SQL type it would cast to, e.g. `{"a": 1, "b": "x"}` → `{"a":"UBIGINT","b":"VARCHAR"}`.
+///
+/// An array is described by its **first** element's structure, which is DuckDB's rule
+/// (a heterogeneous array has no single structure, and it reports the first).
+pub(super) fn structure(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    Some(structure_of(&value).to_string())
+}
+
+fn structure_of(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), structure_of(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(vec![items
+            .first()
+            .map_or_else(|| Value::String("JSON".into()), structure_of)]),
+        Value::Null => Value::String("NULL".into()),
+        Value::Bool(_) => Value::String("BOOLEAN".into()),
+        Value::String(_) => Value::String("VARCHAR".into()),
+        Value::Number(n) => Value::String(
+            if n.is_f64() {
+                "DOUBLE"
+            } else if n.as_i64().is_some_and(|v| v < 0) {
+                "BIGINT"
+            } else {
+                "UBIGINT"
+            }
+            .into(),
+        ),
+    }
+}
+
 /// its compact JSON, a JSON `null` as `None`, everything else as its canonical form.
 ///
 /// The single renderer behind `extract_string` and [`array_values`], so an element pulled

@@ -195,9 +195,9 @@ answers = hits.ml.generate(
 ```
 :::
 
-RAG is retrieval plus LLM, and Batcher is faster than Ray Data on both halves (47× on text
-embeddings, 11.1× on LLM batch inference), because the same engine runs both, with one model
-load per worker and stage overlap between them.
+RAG is retrieval plus an LLM, and Batcher runs both halves on one engine: 33,611 text/s
+embedding with MiniLM and 814.8 prompt/s generating with gpt2 on 8xT4, with one model load per
+worker and stage overlap between them.
 
 ## Keeping the index fresh
 
@@ -230,5 +230,5 @@ same paragraph and the model will pick one at random.
 - [Multimodal](../../ml/multimodal.md): `build_vector_index`, `vector_search`, and the
   `.list` distance expressions.
 - [ML API reference](../../api/ml.md): `str.chunk`, `ds.ml.embed`, `ds.ml.generate`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the 47× and the 11.1× quoted above.
+- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the throughput figures quoted above.
 - [Tensor columns](../../deep-dives/tensor-columns.md): how the vectors are stored and shipped.

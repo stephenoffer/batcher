@@ -232,6 +232,8 @@ Then, and only then, start changing the query.
 - [Troubleshooting](troubleshooting.md): what to do about what you found.
 - [Query lifecycle](../deep-dives/query-lifecycle.md): the stages the plan passes
   through, which is what the tree is a picture of.
+- [The plan IR](../deep-dives/plan-ir.md): the JSON document the tree is printed from, and
+  the contract the Rust engine reads it under.
 - [Cost model](../deep-dives/cost-model.md): how an `est≈N` becomes a join order.
 - [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): why the same
   `explain()` says something different after a run.

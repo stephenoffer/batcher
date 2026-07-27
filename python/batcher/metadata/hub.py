@@ -58,6 +58,15 @@ _PER_KIND_MAX = 4096
 # costs O(cap) once every O(cap) records rather than O(cap) on every record.
 _TRIM_SLACK = 2
 
+# Cap on the `op_stats` rows a *forgettable* backend retains, and how often it is enforced.
+# The views above are bounded; the table beneath them was not, so a long-lived session grew
+# the store by one row per operator per query for its whole life with nothing reading the
+# old ones. The cap sits far above what rebuilding either view needs, so pruning is
+# invisible to consumers. A durable backend keeps everything — that is what it is for, and
+# it simply does not offer the `delete` this uses.
+_OP_STATS_MAX = 65_536
+_OP_STATS_PRUNE_EVERY = 4_096
+
 # Sentinel for "the parsed view has no entry under this key" — distinct from a stored `None`,
 # which `_unchanged` must be able to recognize as already-written.
 _MISSING = object()
@@ -212,6 +221,24 @@ class MetadataHub:
             self._signed.append(row)  # keep the hot view current without a re-scan
             self._signed_appends += 1
             _trimmed(self._signed, _SIGNED_HISTORY_MAX)
+        if self._seq % _OP_STATS_PRUNE_EVERY == 0:
+            self._prune_op_stats()
+
+    def _prune_op_stats(self) -> None:
+        """Bound the stored operator feedback to its newest `_OP_STATS_MAX` rows.
+
+        Amortized: the scan-and-drop costs O(stored) but runs once every
+        `_OP_STATS_PRUNE_EVERY` records. Keys carry a monotonic sequence number, so "newest"
+        is exact without parsing values. A backend with no `delete` is left alone.
+        """
+        delete = getattr(self._backend, "delete", None)
+        if delete is None:
+            return
+        keys = [key for key, _value in self._backend.scan(_OP_STATS, ())]
+        if len(keys) <= _OP_STATS_MAX:
+            return
+        keys.sort(key=lambda k: k[1])  # (op_id, seq) -> oldest sequence first
+        delete(_OP_STATS, keys[: len(keys) - _OP_STATS_MAX])
 
     @property
     def signed_appends(self) -> int:

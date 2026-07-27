@@ -17,6 +17,7 @@ avoid an import-time cycle.
 
 from __future__ import annotations
 
+import datetime as _dt
 import itertools
 import math
 from collections.abc import Iterable
@@ -55,15 +56,25 @@ def _wrap(value: IntoExpr) -> Expr:
     return Lit(value)
 
 
+# `constructors` imports this module, so `col` is resolved on first use rather than at
+# module level — and remembered, instead of re-imported per coerced ordering argument.
+_COL = None
+
+
 def _col_or_expr(value: IntoExpr) -> Expr:
     """An ordering/source argument: a bare string names a *column*, not a string literal.
 
     ``_wrap`` would turn ``arg_max(v, "k")`` into an ordering by the constant ``'k'``;
     an ``Expr`` passes through unchanged. Mirrors SQL ``arg_max(v, k)`` / DuckDB.
     """
-    from batcher.plan.expr_ir.constructors import col
+    if isinstance(value, str):
+        global _COL
+        if _COL is None:
+            from batcher.plan.expr_ir.constructors import col
 
-    return col(value) if isinstance(value, str) else _wrap(value)
+            _COL = col
+        return _COL(value)
+    return _wrap(value)
 
 
 def _cut_labels(edges: list[float], left_closed: bool) -> list[str]:
@@ -82,6 +93,41 @@ def _cut_edge(value: float) -> str:
     if value == float("inf"):
         return "inf"
     return str(int(value)) if value.is_integer() else str(value)
+
+
+# Accessor-namespace classes, resolved on first use and remembered. The namespace modules
+# import `Expr` from here, so this module cannot import them at module level — but the
+# deferred `from ... import ...` each accessor carried then ran on *every* `.str` / `.dt` /
+# `.list` / ... access, and a repeat `from X import Y` still costs ~400 ns against ~70 ns
+# for a cached lookup. Resolving once keeps the import cycle broken and takes the import
+# machinery off the accessor path, which is the widest part of the expression API.
+_ACCESSORS: dict[str, type] = {}
+
+# `render` imports this module, so `render_expr` is another name that cannot be imported at
+# module level and was therefore re-imported on every `repr()` — which the aggregate-leaf
+# registry uses as its dedup key, so it is not only a debugging path.
+_RENDER = None
+
+
+def _render():
+    """The `render_expr` function, imported at most once."""
+    global _RENDER
+    if _RENDER is None:
+        from batcher.plan.expr_ir.render import render_expr
+
+        _RENDER = render_expr
+    return _RENDER
+
+
+def _accessor(module: str, name: str) -> type:
+    """The accessor-namespace class `name` from `module`, imported at most once."""
+    cls = _ACCESSORS.get(name)
+    if cls is None:
+        import importlib
+
+        cls = getattr(importlib.import_module(module), name)
+        _ACCESSORS[name] = cls
+    return cls
 
 
 class Expr:
@@ -182,9 +228,7 @@ class Expr:
 
     def __repr__(self) -> str:
         """A source-like rendering of the expression, e.g. ``(col('x') + lit(1))``."""
-        from batcher.plan.expr_ir.render import render_expr
-
-        return render_expr(self)
+        return _render()(self)
 
     # --- arithmetic operators ---------------------------------------------
     def __add__(self, other: IntoExpr) -> Expr:
@@ -904,9 +948,7 @@ class Expr:
                 >>> ds.select(r=bt.col("s").str.upper()).to_pydict()
                 {'r': ['AB', 'CD']}
         """
-        from batcher.plan.expr_ir.namespaces import _StrNamespace
-
-        return _StrNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_StrNamespace")(self)
 
     @property
     def dt(self) -> _DtNamespace:
@@ -927,9 +969,7 @@ class Expr:
                 >>> ds.select(r=bt.col("d").dt.year()).to_pydict()
                 {'r': [2021]}
         """
-        from batcher.plan.expr_ir.namespaces import _DtNamespace
-
-        return _DtNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_DtNamespace")(self)
 
     # --- math functions ----------------------------------------------------
     def abs(self) -> MathExpr:
@@ -947,6 +987,88 @@ class Expr:
                 {'r': [1, 2, 3]}
         """
         return MathExpr("abs", self)
+
+    def chr(self) -> Expr:
+        """The character at this Unicode code point (DuckDB/Spark ``chr``, → Utf8).
+
+        Returns:
+            A new Utf8 expression; null where the value is not a code point.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"n": [65, 233]})
+                >>> ds.select(r=bt.col("n").chr()).to_pydict()
+                {'r': ['A', 'é']}
+        """
+        from batcher.plan.expr_ir.func_nodes import StrFunc
+
+        return StrFunc("chr", self)
+
+    def to_base(self, radix: int) -> Expr:
+        """This integer written in `radix` (DuckDB ``to_base``; ``bin`` is radix 2, → Utf8).
+
+        Args:
+            radix: The base, from 2 to 36.
+
+        Returns:
+            A new Utf8 expression: the digits, with a leading ``-`` when negative.
+
+        Raises:
+            PlanError: If `radix` is outside 2..36.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"n": [15, 255]})
+                >>> ds.select(b=bt.col("n").to_base(2), h=bt.col("n").to_base(16)).to_pydict()
+                {'b': ['1111', '11111111'], 'h': ['f', 'ff']}
+        """
+        from batcher.plan.expr_ir.func_nodes import StrFunc
+
+        if not 2 <= radix <= 36:
+            raise PlanError(f"to_base(): radix must be between 2 and 36, got {radix}")
+        return StrFunc("to_base", self, start=radix)
+
+    def format_bytes(self, *, si: bool = False) -> Expr:
+        """This byte count as human-readable text (DuckDB ``format_bytes``, → Utf8).
+
+        Args:
+            si: Use decimal units (``kB``, ``MB``; powers of 1000) instead of the
+                default binary ones (``KiB``, ``MiB``; powers of 1024).
+
+        Returns:
+            A new Utf8 expression, e.g. ``"1.5 KiB"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"n": [512, 1536]})
+                >>> ds.select(r=bt.col("n").format_bytes()).to_pydict()
+                {'r': ['512 B', '1.5 KiB']}
+        """
+        from batcher.plan.expr_ir.func_nodes import StrFunc
+
+        return StrFunc("format_bytes_si" if si else "format_bytes", self)
+
+    def neg(self) -> Expr:
+        """Arithmetic negation — the Polars ``neg`` spelling of the unary minus.
+
+        Returns:
+            A new expression of the negated values (nulls propagate).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, -2, 3]})
+                >>> ds.select(r=bt.col("x").neg()).to_pydict()
+                {'r': [-1, 2, -3]}
+        """
+        return Lit(0) - self
 
     def round(self, digits: int | None = None) -> Expr:
         """Round half-away-from-zero to the nearest integer, or to `digits` decimal places.
@@ -2654,9 +2776,7 @@ class Expr:
                 >>> ds.select(r=bt.col("a").list.len()).to_pydict()
                 {'r': [2, 1]}
         """
-        from batcher.plan.expr_ir.namespaces import _ListNamespace
-
-        return _ListNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_ListNamespace")(self)
 
     @property
     def struct(self) -> _StructNamespace:
@@ -2675,9 +2795,7 @@ class Expr:
                 >>> ds.select(r=bt.col("s").struct.field("a")).to_pydict()
                 {'r': [1, 2]}
         """
-        from batcher.plan.expr_ir.namespaces import _StructNamespace
-
-        return _StructNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_StructNamespace")(self)
 
     @property
     def map(self) -> _MapNamespace:
@@ -2696,9 +2814,7 @@ class Expr:
                 >>> bt.col("m").map.get("k").to_ir()["e"]
                 'map'
         """
-        from batcher.plan.expr_ir.namespaces import _MapNamespace
-
-        return _MapNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_MapNamespace")(self)
 
     @property
     def json(self) -> _JsonNamespace:
@@ -2718,9 +2834,7 @@ class Expr:
                 >>> ds.select(r=bt.col("j").json.extract_string("$.a")).to_pydict()
                 {'r': ['x']}
         """
-        from batcher.plan.expr_ir.namespaces import _JsonNamespace
-
-        return _JsonNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_JsonNamespace")(self)
 
     @property
     def image(self) -> _ImageNamespace:
@@ -2740,9 +2854,7 @@ class Expr:
                 >>> isinstance(bt.col("img").image.decode(), Expr)
                 True
         """
-        from batcher.plan.expr_ir.image import _ImageNamespace
-
-        return _ImageNamespace(self)
+        return _accessor("batcher.plan.expr_ir.image", "_ImageNamespace")(self)
 
     @property
     def audio(self) -> _AudioNamespace:
@@ -2761,9 +2873,7 @@ class Expr:
                 >>> bt.col("a").audio.decode().to_ir()["e"]
                 'audio'
         """
-        from batcher.plan.expr_ir.audio import _AudioNamespace
-
-        return _AudioNamespace(self)
+        return _accessor("batcher.plan.expr_ir.audio", "_AudioNamespace")(self)
 
     @property
     def video(self) -> _VideoNamespace:
@@ -2782,9 +2892,7 @@ class Expr:
                 >>> bt.col("v").video.decode().to_ir()["e"]
                 'video'
         """
-        from batcher.plan.expr_ir.video import _VideoNamespace
-
-        return _VideoNamespace(self)
+        return _accessor("batcher.plan.expr_ir.video", "_VideoNamespace")(self)
 
     def hash(self, seed: int = 0) -> Expr:
         """A deterministic 64-bit hash of this expression's value, per row → Int64.
@@ -3093,6 +3201,154 @@ class Expr:
                 {'g': ['a'], 'r': [3.152000000000001]}
         """
         return AggExpr("kurtosis", self)
+
+    def kurtosis_pop(self) -> AggExpr:
+        """Population excess kurtosis per group (→ Float64).
+
+        The uncorrected ``m4/m2² - 3``, where :meth:`kurtosis` applies the sample
+        correction. DuckDB has both, and on a small group they differ by a lot, so
+        pick the one your statistics call for rather than treating them as rounding.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
+                >>> ds.group_by("g").agg(r=bt.col("x").kurtosis_pop()).to_pydict()
+                {'g': ['a'], 'r': [0.5049148147577234]}
+        """
+        return AggExpr("kurtosis_pop", self)
+
+    def entropy(self) -> AggExpr:
+        """Base-2 Shannon entropy of a group's value distribution (→ Float64).
+
+        ``-Σ pᵢ·log₂(pᵢ)`` over the distinct values' frequencies: 0 when a group holds
+        one distinct value, ``log₂(n)`` when all n are distinct. The measure to reach
+        for when the question is how *concentrated* a column is, rather than how large.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 1, 2, 2]})
+                >>> ds.group_by("g").agg(r=bt.col("x").entropy()).to_pydict()
+                {'g': ['a'], 'r': [1.0]}
+        """
+        return AggExpr("entropy", self)
+
+    def mad(self) -> AggExpr:
+        """Median absolute deviation per group (→ Float64).
+
+        ``median(|x - median(x)|)`` — a spread measure that, unlike the standard
+        deviation, a single extreme value cannot move.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 100]})
+                >>> ds.group_by("g").agg(r=bt.col("x").mad()).to_pydict()
+                {'g': ['a'], 'r': [1.0]}
+        """
+        return AggExpr("mad", self)
+
+    def quantile_disc(self, q: float) -> AggExpr:
+        """Discrete quantile `q ∈ [0, 1]` — a value that is actually present (→ Float64).
+
+        Where :meth:`quantile` interpolates between the two bracketing values, this
+        returns the element at rank ``ceil(q·n) - 1``. That matters for an ordinal
+        column, where the interpolated value may not be a legal value at all.
+
+        Args:
+            q: The quantile in ``[0, 1]``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 2, 3, 4]})
+                >>> ds.group_by("g").agg(r=bt.col("x").quantile_disc(0.5)).to_pydict()
+                {'g': ['a'], 'r': [2.0]}
+        """
+        return AggExpr("quantile_disc", self, param=q)
+
+    def top_k(self, k: int) -> AggExpr:
+        """The `k` most frequent values per group, most frequent first (→ List).
+
+        DuckDB's ``approx_top_k``, computed **exactly**: the aggregate already holds
+        every value of the group, so a sketch could only lose accuracy. Ties break to
+        the smaller value, so the result does not depend on partition order.
+
+        Args:
+            k: How many values to return.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 6, "x": [1, 2, 2, 3, 3, 3]})
+                >>> ds.group_by("g").agg(r=bt.col("x").top_k(2)).to_pydict()
+                {'g': ['a'], 'r': [[3, 2]]}
+        """
+        return AggExpr("approx_top_k", self, param=float(k))
+
+    def kahan_sum(self) -> AggExpr:
+        """Compensated sum of a group's values (DuckDB ``fsum``/``kahan_sum``, → Float64).
+
+        A plain float sum loses the low bits of every addend far smaller than the running
+        total, so a long column of small values added to a large one drifts. This one
+        carries that lost part along and adds it back, which is exact where it matters and
+        never worse than :meth:`sum`. Mergeable, so a distributed run agrees.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1e16, 1.0, 1.0, -1e16]})
+                >>> ds.select(exact=bt.col("x").kahan_sum(), naive=bt.col("x").sum()).to_pydict()
+                {'exact': [2.0], 'naive': [0.0]}
+        """
+        return AggExpr("kahan_sum", self)
+
+    def any_value(self) -> AggExpr:
+        """One value from each group, unspecified which (→ the input type).
+
+        DuckDB's ``any_value``/``arbitrary``, for the common case of carrying a column
+        that is constant within the group through a ``group_by`` without naming a
+        reduction for it. The engine resolves "unspecified" to the group's **minimum**,
+        because a mergeable aggregate has to combine commutatively — so the answer is
+        the same on one node as on a hundred, which "the first row" would not be.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a"], "dept": ["eng", "eng"]})
+                >>> ds.group_by("g").agg(r=bt.col("dept").any_value()).to_pydict()
+                {'g': ['a'], 'r': ['eng']}
+        """
+        return AggExpr("any_value", self)
 
     def median(self) -> AggExpr:
         """Exact median per group — the 0.5 quantile (→ Float64).
@@ -4285,20 +4541,38 @@ from batcher.plan.expr_ir.node_base import (  # noqa: E402
 class Lit(Expr):
     """A constant literal. The wire kind is inferred from the Python type."""
 
-    __slots__ = ("value",)
+    # `_ir_cache` mirrors the memo `IRNode` keeps in its instance `__dict__`. `Lit` is
+    # `__slots__`-based (there are more literals in a plan than any other node kind, and
+    # a per-instance dict on each is real memory), so it needs the slot declared to get
+    # the same one-lowering-per-node behavior every other node already has.
+    __slots__ = ("_ir_cache", "value")
 
     def __init__(self, value: int | float | bool | str) -> None:
         """Wrap a Python scalar (or date/datetime) as a literal expression node."""
         self.value = value
+        self._ir_cache: dict[str, Any] | None = None
 
     def to_ir(self) -> dict[str, Any]:
         """Lower this literal to its JSON IR dict (the Rust wire contract)."""
-        import datetime as _dt
-
+        cached = self._ir_cache
+        if cached is not None:
+            return cached
         v = self.value
-        # bool must be checked before int (bool is a subclass of int); likewise
-        # datetime before date (datetime subclasses date).
-        if isinstance(v, bool):
+        kind = type(v)
+        # Exact-type dispatch for the four scalar kinds that make up almost every literal
+        # in a plan, before the `isinstance` ladder the subclass relationships require
+        # (bool before int, datetime before date). A subclass of one of these — a
+        # `numpy.bool_`, an `IntEnum` — still falls through to the ladder below and is
+        # tagged exactly as it was.
+        if kind is int:
+            tagged: dict[str, Any] = {"int": v}
+        elif kind is str:
+            tagged = {"str": v}
+        elif kind is bool:
+            tagged = {"bool": v}
+        elif kind is float and -math.inf < v < math.inf:
+            tagged = {"float": v}  # finite: the numeric wire form
+        elif isinstance(v, bool):
             tagged = {"bool": v}
         elif isinstance(v, int):
             tagged = {"int": v}
@@ -4311,9 +4585,9 @@ class Lit(Expr):
             # numeric (unchanged wire, fast path).
             if v != v:
                 tagged = {"float": "NaN"}
-            elif v == float("inf"):
+            elif v == math.inf:
                 tagged = {"float": "inf"}
-            elif v == float("-inf"):
+            elif v == -math.inf:
                 tagged = {"float": "-inf"}
             else:
                 tagged = {"float": v}
@@ -4338,7 +4612,9 @@ class Lit(Expr):
             tagged = {"date": (v - _dt.date(1970, 1, 1)).days}
         else:  # pragma: no cover - guarded by typing
             raise TypeError(f"unsupported literal type: {type(v).__name__}")
-        return {"e": ExprTag.LIT, "value": tagged}
+        out = {"e": ExprTag.LIT, "value": tagged}
+        self._ir_cache = out
+        return out
 
 
 @expr_node

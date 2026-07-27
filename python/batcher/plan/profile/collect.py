@@ -250,6 +250,12 @@ def walk_ir(ir: Mapping[str, Any], depth: int = 0) -> Iterator[tuple[int, Mappin
     identically or they silently describe different operators. One walk, imported — never
     a second copy that can drift.
 
+    Recursive for the reason `plan.visitor.walk` documents: an IR tree is a handful of
+    nodes deep, and at that size an explicit stack's `(depth, node)` bookkeeping costs
+    more than the `yield from` re-entry it removes (measured on a real plan: 4.60 us
+    recursive against 5.46 us iterative). Rewriting this is also the riskiest kind of
+    change, because the walk order *is* the `op_id` contract.
+
     Args:
         ir: A relational IR node (the ``to_ir()`` shape).
         depth: Starting depth, used by the recursion.

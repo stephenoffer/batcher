@@ -30,6 +30,30 @@ use bc_arrow::{needs_canon_f32, needs_canon_f64};
 /// collides with this hash is never conflated with null; only co-location depends on it.
 pub(crate) const NULL_HASH: u64 = 0xa5a5_5a5a_dead_beef;
 
+/// The hasher every *cross-process* key hash goes through.
+///
+/// It lives here, beside the rest of the key-identity policy, for the reason stated at the
+/// top of this module: the paths that must agree about what makes two keys the same should
+/// read their answer from one place instead of restating it.
+///
+/// It is deliberately **not** `ahash`, which the shuffle used with fixed seeds and a
+/// comment claiming that made it deterministic. Fixed seeds make `ahash` deterministic
+/// within one binary; it picks an AES-NI backend from the compile-time `target_feature`,
+/// so two workers built with different `-C target-cpu` disagree. That was measured, not
+/// inferred — compiling this crate with `+aes` moved a single-`Int64`-key batch from
+/// buckets `[7,1,1,2,6,7,7,7]` to `[2,0,3,6,5,6,1,7]` with no source change. On a cluster
+/// with mixed builds, that splits one `GROUP BY` group across two reducers and drops join
+/// matches, silently.
+///
+/// `bc_arrow::PortableBuildHasher` is specified, endian-pinned, and identical everywhere.
+/// See `crates/bc-runtime/tests/shuffle_hash_golden.rs` for the routing vectors it pins.
+///
+/// **Only for values that leave the process.** Hash-table bucket selection inside one
+/// `execute_plan` call — the group assigner, the join build map, `distinct`, spill
+/// partitioning — stays on `ahash`, which is faster and cannot be observed from outside.
+pub(crate) const SHUFFLE_HASHER: bc_arrow::PortableBuildHasher =
+    bc_arrow::PortableBuildHasher::with_seed(0x5348_5546_464C_4530);
+
 /// Whether a data type has a floating-point leaf that needs canonicalizing — a top-level
 /// float, or a float nested inside a list/struct key. Dictionary and top-level narrow
 /// floats are decoded/widened at the FFI boundary, so only these shapes reach the engine.

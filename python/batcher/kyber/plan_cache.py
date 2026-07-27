@@ -163,13 +163,22 @@ def _calibration_epoch(hub: Any) -> str:
     Keyed by the refit *epoch* rather than the raw version, so it changes exactly when a refit
     can change the coefficients and not once per recorded operator — which would miss on every
     single execution and defeat the memo entirely.
-    """
-    version = getattr(hub, "version", None)
-    if version is None:
-        return "-"
-    from batcher.kyber.calibration import _RECALIBRATE_AFTER
 
-    return str(int(version) // _RECALIBRATE_AFTER)
+    The epoch is read from the two refit memos themselves — the hub version each fit was
+    computed at — because that is the only thing that advances exactly when a fit is replaced.
+    It used to be `version // _RECALIBRATE_AFTER`, which reads as the same quantity and is a
+    different clock: the refit throttle counts feedback rows *since the last refit* while the
+    bucket counts from zero, so on a query recording ~35 operators the bucket rolled over every
+    second execution regardless of whether anything had been re-fit. Measured on TPC-H q8 at
+    sf10 the plan cache alternated hit/miss forever over a completely stable set of
+    coefficients — and a miss there costs 350 ms against a hit's 160 ms, so half of the warm
+    query was a re-plan that should have been a lookup.
+    """
+    if getattr(hub, "version", None) is None:
+        return "-"
+    from batcher.kyber import calibration, cpu_shares
+
+    return f"{calibration.refit_version(hub)},{cpu_shares.refit_version(hub)}"
 
 
 def _source_stats_key(source_stats: list | None) -> str:
@@ -220,12 +229,26 @@ def _source_keys(sources: list | None) -> list[str] | None:
     key itself. The learned column statistics are filed under exactly the same key, so a
     plan and the statistics it was chosen under can never disagree about which source is
     which.
+
+    An **ephemeral** source is refused for the same reason as an unkeyable one, and the
+    reason is worth stating because it is not that its key is wrong — it is that the key is
+    correct and unrepeatable. An adaptive stage boundary wraps its intermediate as an
+    in-memory source, keyed by object identity, and that object is gone by the next
+    execution. A plan filed under it can therefore never be *read* again, and storing it
+    anyway costs on three counts: it burns an LRU slot and evicts an entry that would have
+    hit (measured on TPC-H Q8 at sf10, where the reusable entry survived only every other
+    run), and `store` pins the source tuple alive as a keepalive — so the stage's whole
+    materialized intermediate, tens or hundreds of megabytes of it, stays resident until
+    eviction. Not caching costs one re-plan of a subtree that was going to be re-planned
+    regardless.
     """
     keys: list[str] = []
     for source in sources or ():
         key = source_stats_key(source)
         if key is None:
             return None  # an unkeyable source: never cache a plan built over it
+        if getattr(source, "ephemeral", False):
+            return None  # a key that cannot recur: the entry could never be read again
         keys.append(key)
     return keys
 
@@ -247,20 +270,17 @@ def _source_keys(sources: list | None) -> list[str] | None:
 # is their per-observation quotient, compared via `_DERIVED_RATIOS` below. (`xmin`/`xmax` stay
 # compared directly: they are bounds, not accumulators, and move only on a genuinely new
 # extreme — which does change the fit's applicable range.)
-_BOOKKEEPING_FIELDS = frozenset(
-    {"n_obs", "n", "total", "flips", "sx", "sy", "sxx", "sxy", "sum", "sumsq"}
-)
+_BOOKKEEPING_FIELDS = frozenset({"n_obs", "n", "sx", "sy", "sxx", "sxy", "sum", "sumsq"})
 
-# Pairs whose *ratio* is a decision even though both fields are bookkeeping. `flips/total` is
-# the adaptive gate: `learned_tuning.record_adaptive_flip` writes **only** those two counters,
-# so with both listed above the key-set comparison below sees an empty set, `any(())` is False,
-# and the write can never bump the generation — `learned_adaptive_helps` flips False -> True and
-# a memoized plan is served forever, which is precisely the staleness routing every write
-# through one place was meant to prevent. Comparing the raw counters instead would bump on
-# every execution (`total` 1 -> 2 is a 100% "change") and defeat the memo, so the ratio — the
-# number a plan actually reads — is what gets compared.
+# Pairs whose *ratio* is a decision even though both fields are bookkeeping. A bandit arm is
+# the canonical case: `record_arm` writes only accumulators, so with each of them listed above
+# the key-set comparison below sees an empty set, `any(())` is False, and the write could never
+# bump the generation — the arm's ranking would move while a memoized plan chosen under the old
+# one was served forever, which is precisely the staleness routing every write through one place
+# was meant to prevent. Comparing the raw counters instead would bump on every execution (`n`
+# 1 -> 2 is a 100% "change") and defeat the memo, so the ratio — the number a plan actually
+# reads — is what gets compared.
 _DERIVED_RATIOS: tuple[tuple[str, str], ...] = (
-    ("flips", "total"),  # the adaptive gate's flip fraction
     ("sum", "n"),  # a bandit arm's mean reward — what `ucb1_best_arm` ranks by
     ("sumsq", "n"),  # its second moment, which the UCB confidence width reads
     # The OLS fit's per-observation moments. `_fit`'s intercept and slope are functions of

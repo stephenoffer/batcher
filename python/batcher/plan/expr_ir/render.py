@@ -99,9 +99,25 @@ def render_expr(expr: Any, depth: int = 0) -> str:
     return _render_generic(expr, depth)
 
 
+# `core` imports this module for `Expr.__repr__`, so the base class cannot be imported at
+# module level here — but re-importing it per rendered node meant the import machinery ran
+# once per node of every expression printed. Bound on first use instead.
+_EXPR_CLASS: type | None = None
+
+
+def _expr_class() -> type:
+    """The `Expr` base class, imported once (see the note above)."""
+    global _EXPR_CLASS
+    if _EXPR_CLASS is None:
+        from batcher.plan.expr_ir.core import Expr
+
+        _EXPR_CLASS = Expr
+    return _EXPR_CLASS
+
+
 def _kids(expr: Any) -> list[str]:
     """Rendered sub-expressions of a node, discovered by reflection."""
-    from batcher.plan.expr_ir.core import Expr
+    Expr = _expr_class()
 
     out: list[str] = []
     if is_dataclass(expr):
@@ -130,8 +146,7 @@ def _render_accessor(expr: Any, depth: int) -> str:
     render as ``.contains()`` and lose the very thing being searched for.
     """
     ns, method = _NS_PREFIX[type(expr).__name__]
-    from batcher.plan.expr_ir.core import Expr
-
+    Expr = _expr_class()
     node_fields = list(fields(expr)) if is_dataclass(expr) else []
     base_field = next((f for f in node_fields if isinstance(getattr(expr, f.name), Expr)), None)
     if base_field is None:  # no receiver to hang the call off — degrade, don't raise

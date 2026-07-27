@@ -53,9 +53,13 @@ def read_row_groups_filtered(
 
     `predicate` is the IR dict; its pushable subset is translated (`to_native_predicate`)
     to the reader's compact form and used to skip row-groups whose footer statistics prove
-    no row can match — the reader never fetches or decodes those column chunks. Pruning is
-    superset-safe (the engine keeps the `Filter`), so a non-pushable predicate reads every
-    requested row-group. Returns ``None`` on any failure (caller falls back to PyArrow).
+    no row can match — the reader never fetches or decodes those column chunks. The reader
+    may *also* apply the predicate row-by-row during decode when it measures that worth doing,
+    so the result is anywhere between the exactly-matching rows and every requested row-group.
+    Both are correct: `to_native_predicate` is all-or-nothing, so a predicate that reaches the
+    reader is a complete translation of the `Filter`, and the engine keeps that `Filter`
+    regardless (`core.scan_only` declines its shortcut whenever a predicate was pushed).
+    Returns ``None`` on any failure (caller falls back to PyArrow).
     """
     try:
         _native = engine()

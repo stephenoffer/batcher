@@ -3,16 +3,16 @@
 A join in Batcher is one primitive: a builder that produces a pair of row-index vectors
 describing the output. Every join type, every strategy, and both the parallel and distributed
 paths are built on that one primitive. This page describes it, the algorithms layered over it,
-and where the join still loses to DuckDB.
+and where its remaining headroom is.
 
-The join is the operator this engine is weakest at. On TPC-H at scale factor 1 on 16 cores,
-Batcher matches DuckDB's result on all 22 queries. Against DuckDB reading the same Arrow input
-Batcher wins all 22, but against DuckDB's own native store it loses the join- and
-subquery-heavy shapes: q17 at 7.9x, q20 at 2.8x, q3 at 2.6x, q21 at 2.4x. The operator
-microbenchmark `join → aggregate` is 98.3 ms against DuckDB's 85.6 ms. The cause isn't the
-join kernel. Single-node parallelism on these shapes reaches only about 1.7x to 3.8x on 16
-cores, because serial prefixes such as materialize, gather, and shuffle run before the
-parallel per-bucket join.
+The join is where single-node scaling has the most left to give. On TPC-H at scale factor 1 on
+16 cores, Batcher matches DuckDB's result on all 22 queries and, against DuckDB reading the same
+Arrow input, wins all 22. Against DuckDB's own native store the join- and subquery-heavy shapes
+are where it trails: q17 at 7.9x, q20 at 2.8x, q3 at 2.6x, q21 at 2.4x, and the operator
+microbenchmark `join → aggregate` at 98.3 ms against 85.6 ms. The cause isn't the join kernel.
+Single-node parallelism on these shapes reaches only about 1.7x to 3.8x on 16 cores, because
+serial prefixes such as materialize, gather, and shuffle run before the parallel per-bucket
+join. Distributed, where those prefixes are spread across workers, the same operator leads.
 
 ## One primitive: index pairs
 
@@ -256,8 +256,8 @@ remains (build-side materialization, the shuffle's own serial phases) is the ope
 it's tracked in `benchmarks/BENCHMARK_RESULTS.md` rather than in an aspiration.
 
 The distributed picture is different and better: on the operator-mix benchmarks Batcher's
-distributed join beats Daft's by 1.7x to 2.2x and beats Ray Data on every pipeline at every
-scale. Scale-out isn't the weak axis. Single-node join parallelism is.
+distributed join beats Daft's by 1.7x to 2.2x at every scale measured. Scale-out isn't the
+weak axis. Single-node join parallelism is.
 
 ## Code map
 

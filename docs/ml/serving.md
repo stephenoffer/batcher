@@ -86,6 +86,29 @@ udf = serving_udf(
 scored = ds.ml.map_batches(udf, concurrency=(2, 8))
 ```
 
+The protocol is small enough to exercise without a server. Any object with a `predict`
+method satisfies it, so this runs as written:
+
+```python
+import batcher as bt
+from batcher.ml.serving import serving_udf
+
+class LocalClient:
+    def __init__(self):
+        self.bias = 0.5          # stands in for the once-per-worker connection
+
+    def predict(self, inputs):
+        return {"score": inputs["features"] * 2 + self.bias}
+
+udf = serving_udf(LocalClient, input_columns=["features"], output_columns=["score"])
+ds = bt.from_pydict({"features": [1.0, 2.0, 3.0]})
+print(ds.ml.map_batches(udf).to_pydict())
+# {'features': [1.0, 2.0, 3.0], 'score': [2.5, 4.5, 6.5]}
+```
+
+The input columns pass through unchanged and `score` is appended, which is the same
+shape a real Triton or TorchServe call produces.
+
 When the server returns raw `logits` (a list per row), turn them into a probability
 distribution in the data plane with `.list.softmax()`, and rank the classes with
 `.list.arg_sort()` reversed for highest-first. No per-row Python runs:

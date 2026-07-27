@@ -99,6 +99,36 @@ pub enum InterpError {
         reason: &'static str,
     },
 
+    /// Not a failure: the streaming executor has found, from the build sides it just
+    /// prepared, that it cannot spread this plan across cores, and is asking the caller to
+    /// run it on the materializing executor instead.
+    ///
+    /// It is raised only when the caller opted in (it is the caller that knows whether the
+    /// materializing executor's memory profile is affordable), and only *after* the build
+    /// sides are prepared — which is the first moment the answer is exact rather than
+    /// guessed from the plan's shape. The work discarded is that preparation; the work
+    /// avoided is the whole probe-and-aggregate, which on this shape runs at a fraction of
+    /// the machine (measured at sf10: a 60M x 15M semi join at 5.7x parallelism streaming
+    /// against 62x materializing).
+    ///
+    /// Every executor answers the same rows, so honoring or ignoring this changes only
+    /// speed and peak memory — never the result.
+    #[error("this plan cannot be sharded by the streaming executor: {reason}")]
+    PreferMaterializing {
+        /// What on the probe spine blocked sharding (a `&'static` reason).
+        reason: &'static str,
+    },
+
+    /// The query was cancelled between morsels.
+    ///
+    /// Not a failure of the plan: something asked for the query to stop, and the executor
+    /// noticed at the next point where unwinding was safe. It is an error rather than an
+    /// empty result because an empty result is indistinguishable from a query that
+    /// legitimately matched nothing, and a caller that cannot tell those apart will
+    /// eventually treat a cancellation as data.
+    #[error("query cancelled")]
+    Cancelled,
+
     #[error(transparent)]
     Expr(#[from] ExprError),
 

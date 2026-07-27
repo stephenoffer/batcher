@@ -65,28 +65,43 @@ def test_an_aggregate_is_unhashable_for_the_same_reason_an_expression_is():
 
 
 @pytest.mark.parametrize(
-    "build",
+    ("build", "want"),
     [
-        lambda ds: ds.select(s=col("x").sum()),
-        lambda ds: ds.with_columns(s=col("x").sum()),
-        lambda ds: ds.filter(col("x").sum() > 1),
+        (lambda ds: ds.select(s=col("x").sum()), {"s": [6]}),
+        (lambda ds: ds.with_columns(s=col("x").sum()), {"x": [1, 2, 3], "s": [6, 6, 6]}),
+        (lambda ds: ds.filter(col("x") > col("x").mean()), {"x": [3]}),
     ],
     ids=["select", "with_columns", "filter"],
 )
-def test_a_bare_aggregate_outside_agg_names_the_real_mistake(build):
-    """A `PlanError` naming `group_by().agg()`, not a `TypeError` naming the wire format.
+def test_an_aggregate_outside_agg_is_the_whole_frame_aggregate(build, want):
+    """An aggregate in a row-shaped context now *means* something, and this pins which.
 
-    Two coercion helpers disagreed about `AggExpr`: `plan.expr_ir._wrap` passed it through
-    as a legal leaf, while `api._as_expr` lifted it to ``Lit(AggExpr)``. The `Lit` hid the
-    aggregate from both misuse guards, and the failure surfaced inside the optimizer as
-    ``TypeError: unsupported literal type: AggExpr`` — which names neither the call the
-    user got wrong nor the method they wanted.
+    It used to raise a `PlanError` pointing at `group_by().agg()`. It no longer does:
+    an all-aggregate `select` is the whole-frame aggregation (one row), and anywhere
+    else the aggregate broadcasts to every row — the reading Polars and pandas give it,
+    and the only one under which `with_columns(share=x / x.sum())` has a row per row.
+
+    What must still hold is the property this test was written for: the failure mode
+    it guarded against was `TypeError: unsupported literal type: AggExpr` leaking from
+    the optimizer, naming neither the call nor the fix. Every case below now answers
+    instead, and the two that genuinely cannot be expressed keep a `PlanError` (see
+    the tests that follow).
     """
     import batcher as bt
 
     ds = bt.from_pydict({"x": [1, 2, 3]})
-    with pytest.raises(PlanError, match=r"group_by\(\).agg\(\)"):
-        build(ds).collect()
+    assert build(ds).to_pydict() == want
+
+
+def test_an_aggregate_of_an_aggregate_is_still_refused():
+    """`sum(sum(x))` has no meaning at any nesting depth, and the refusal says so."""
+    import batcher as bt
+    from batcher.plan.expr_ir import AggExpr
+
+    ds = bt.from_pydict({"x": [1, 2, 3]})
+    nested = AggExpr("sum", AggExpr("sum", col("x")))
+    with pytest.raises(PlanError, match="aggregate"):
+        ds.select(s=nested).collect()
 
 
 def test_an_aggregate_comparison_computes_the_right_answer_inside_agg():

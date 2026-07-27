@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import pytest
 
-from batcher._internal import hardware
+from batcher._internal import accelerators, hardware
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _fresh_probes():
+    """Re-probe the OS around every test here.
+
+    The hardware readings are memoized for the process (they answer questions a running
+    process cannot see change), so a test that fakes `/proc` or `/sys` has to invalidate
+    them going in — and again coming out, so its fake state never leaks into the next test.
+    """
+    hardware.reset_hardware_probes()
+    yield
+    hardware.reset_hardware_probes()
 
 
 def test_available_cpu_count_is_positive():
@@ -52,8 +65,10 @@ def test_cfs_quota_count_parses_cgroup_v2(monkeypatch, tmp_path):
     monkeypatch.setattr(builtins, "open", fake_open)
     assert hardware._cfs_quota_count() == 2
 
-    # An unlimited quota ("max") yields None (fall back to host/affinity).
+    # An unlimited quota ("max") yields None (fall back to host/affinity). The quota is
+    # memoized per process, so changing the simulated file means re-probing.
     files["/sys/fs/cgroup/cpu.max"] = "max 100000"
+    hardware.reset_hardware_probes()
     assert hardware._cfs_quota_count() is None
 
 
@@ -128,26 +143,26 @@ def test_gpu_absence_keys_on_device_nodes_not_the_driver_control_node(monkeypatc
     # A GPU-less host built from a GPU-capable cloud image has /dev/nvidiactl (driver loaded)
     # and no /dev/nvidia0. Keying on the control node would call that host GPU-equipped and
     # re-introduce the ~2s torch import this probe exists to avoid.
-    hardware.gpu_devices_absent.cache_clear()
-    monkeypatch.setattr(hardware.sys, "platform", "linux")
-    monkeypatch.setattr(hardware.glob, "glob", lambda pat: [])
-    monkeypatch.setattr(hardware.os.path, "exists", lambda p: p == "/dev/nvidiactl")
+    # The probe lives in `accelerators` (and is re-exported by `hardware`), so the module
+    # state it reads is patched there; the memoized answer is dropped between the two halves.
+    hardware.reset_hardware_probes()
+    monkeypatch.setattr(accelerators.sys, "platform", "linux")
+    monkeypatch.setattr(accelerators.glob, "glob", lambda pat: [])
+    monkeypatch.setattr(accelerators.os.path, "exists", lambda p: p == "/dev/nvidiactl")
     assert hardware.gpu_devices_absent() is True
 
-    hardware.gpu_devices_absent.cache_clear()
-    monkeypatch.setattr(hardware.glob, "glob", lambda pat: ["/dev/nvidia0"])
+    hardware.reset_hardware_probes()
+    monkeypatch.setattr(accelerators.glob, "glob", lambda pat: ["/dev/nvidia0"])
     assert hardware.gpu_devices_absent() is False
-    hardware.gpu_devices_absent.cache_clear()
 
 
 def test_gpu_absence_never_false_negatives_off_linux(monkeypatch):
     # macOS Metal devices have no device node, so the cheap path must decline to answer there
     # rather than report "no GPU" on a machine that has one.
-    hardware.gpu_devices_absent.cache_clear()
-    monkeypatch.setattr(hardware.sys, "platform", "darwin")
-    monkeypatch.setattr(hardware.os.path, "exists", lambda p: False)
+    hardware.reset_hardware_probes()
+    monkeypatch.setattr(accelerators.sys, "platform", "darwin")
+    monkeypatch.setattr(accelerators.os.path, "exists", lambda p: False)
     assert hardware.gpu_devices_absent() is False
-    hardware.gpu_devices_absent.cache_clear()
 
 
 def test_l3_cache_size_is_parsed_from_sys(monkeypatch):

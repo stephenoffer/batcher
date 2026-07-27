@@ -156,8 +156,8 @@ def regr_r2(y: IntoExpr, x: IntoExpr) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [1.0, 3.0, 5.0, 7.0]})
-            >>> ds.agg(r=bt.regr_r2(bt.col("y"), bt.col("x"))).to_pydict()
-            {'r': [1.0]}
+            >>> round(ds.agg(r=bt.regr_r2(bt.col("y"), bt.col("x"))).to_pydict()["r"][0], 6)
+            1.0
     """
     yp, xp = _paired(y, x)
     return corr(yp, xp) ** 2

@@ -14,9 +14,9 @@ device.
 | **Extra** | `pip install 'batcher-engine[torch]'` |
 
 The measured stake, on 10 M rows x 32 float features, `batch_size=1024`, `prefetch=2`: 1.76 Mrows/s
-through `iter_torch_batches` against Ray Data's 0.58, a 3.0x gap, and 3.5x on a 4-rank DDP
-`streaming_split` (`benchmarks/BENCHMARK_RESULTS.md`). Last-mile ingest is where a training job
-quietly starves its GPUs, so measure it rather than assume it.
+through `iter_torch_batches`, and 1.28 Mrows/s on a 4-rank DDP `streaming_split`
+(`benchmarks/BENCHMARK_RESULTS.md`). Last-mile ingest is where a training job quietly starves
+its GPUs, so measure it rather than assume it.
 
 ## Tensors in
 

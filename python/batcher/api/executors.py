@@ -136,19 +136,52 @@ def _cached_or_run(
 
 
 def _result_cache_key(plan: LogicalPlan, sources: list[Source]) -> str:
-    """A correctness-safe result-cache key: the plan signature plus each input's
-    object identity *and* declared identity.
+    """A correctness-safe result-cache key: plan signature, inputs, tenant, and viewer.
 
     Object identity (`id`) distinguishes inputs that share a shape — `Source.identity()`
     is shape-based for in-memory data (``mem:schema:rows``), so two *different* in-memory
     datasets with the same shape would otherwise collide and return each other's result.
     The cache pins the source objects (keep-alive) for the entry's lifetime, so the
     `id` cannot be reused by another object while the entry is live.
+
+    The cache is **process-global**, so two workloads in one process share it. Without the
+    last two components they would share *results*:
+
+    - **Tenant.** Two tenants issuing the same query over the same path collided by
+      construction, and the second got the first's rows.
+    - **Viewer.** A governed read is rewritten by `enforce` before it reaches here, so a
+      masked and an unmasked read *happened* to produce different plan signatures. That is
+      an accident of the rewrite, not a guarantee — a future rewrite that normalized the
+      masked form would silently start serving unmasked rows to a principal who may not
+      see them. Folding the catalog and principal in makes it a guarantee instead.
+
+    Both components are empty outside a `tenant()`/`security()` block, so an un-tenanted,
+    ungoverned deployment produces byte-identical keys to before.
     """
     from batcher.kyber.signature import plan_signature
 
     inputs = "|".join(f"{id(s)}:{s.identity()}" for s in sources)
-    return f"{plan_signature(plan)}|{inputs}"
+    return f"{plan_signature(plan)}|{inputs}|{_cache_scope()}"
+
+
+def _cache_scope() -> str:
+    """The tenant and viewer this result belongs to, as a cache-key component.
+
+    Empty when neither a tenant nor a security context is active, which is what keeps this
+    from perturbing a deployment that uses neither.
+    """
+    from batcher.api.security import current_security
+    from batcher.config import active_config
+
+    tenant_id = active_config().tenant.tenant_id
+    context = current_security()
+    if context is None:
+        return f"t={tenant_id}" if tenant_id else ""
+    # The catalog is part of the identity too: the same principal under a *different*
+    # policy may legitimately see different rows, so a cached result is only reusable
+    # under the catalog that produced it.
+    viewer = f"{context.principal.name}:{sorted(context.principal.roles)}:{id(context.catalog)}"
+    return f"t={tenant_id}|v={viewer}"
 
 
 def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):

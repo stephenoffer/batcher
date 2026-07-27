@@ -28,15 +28,18 @@ from batcher.config import CostWeights as CostWeights
 from batcher.config import DistributedConfig as DistributedConfig
 from batcher.config import ExecutionConfig as ExecutionConfig
 from batcher.config import FlowControlConfig as FlowControlConfig
+from batcher.config import GovernanceConfig as GovernanceConfig
 from batcher.config import MemoryConfig as MemoryConfig
 from batcher.config import MetadataConfig as MetadataConfig
 from batcher.config import ObservabilityConfig as ObservabilityConfig
 from batcher.config import OptimizerConfig as OptimizerConfig
 from batcher.config import PIDConfig as PIDConfig
 from batcher.config import ShuffleTlsConfig as ShuffleTlsConfig
+from batcher.config import TenantConfig as TenantConfig
 from batcher.config import active_config as active_config
 from batcher.config import config_context as config_context
 from batcher.config import set_config as set_config
+from batcher.config import tenant as tenant
 
 __version__ = "0.1.0"
 
@@ -52,12 +55,15 @@ _CONFIG_EXPORTS = [
     "DistributedConfig",
     "ExecutionConfig",
     "FlowControlConfig",
+    "GovernanceConfig",
     "MemoryConfig",
     "MetadataConfig",
     "ObservabilityConfig",
     "OptimizerConfig",
     "PIDConfig",
     "ShuffleTlsConfig",
+    "TenantConfig",
+    "tenant",
     "active_config",
     "config_context",
     "set_config",

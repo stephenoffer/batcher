@@ -10,7 +10,7 @@ collects runtime metadata.
 
 This is a deliberate reaction to what the rewrite replaced: a "127 passes, 519
 rules" optimizer whose sprawl — a god-pass here, a one-file-per-rule catalog there —
-was the problem, not the achievement. The ~154 rules Kyber ships today are *not* a
+was the problem, not the achievement. The ~390 rules Kyber ships today are *not* a
 return to that bloat. They are the sanctioned "many small things" pattern: small,
 node-local rewrites grouped by family (one module per family a user names in one
 breath), discovered by a registry, each earning its place by making a query
@@ -90,6 +90,50 @@ The two metadata families are gated on `Provenance.EXACT` proof only — a
 learned/sketch estimate can never drive them, because dropping a `Distinct` or `Sort`
 on a wrong guess is silent data corruption.
 
+### The `exprs/` and `relational/` families
+
+Two later subpackages sit beside `extra/`. `kyber/rules/exprs/` holds expression
+algebra grouped by the value domain it rewrites, and `kyber/rules/relational/` holds
+rewrites that move a plan node rather than change an expression. The split keeps each
+directory inside the file-count cap and makes a rule findable from the shape it acts
+on.
+
+| Family module | What it rewrites |
+|---|---|
+| `exprs/numeric` | identities whose soundness depends on the operand's type and nullability: `x // 1`, `x * 0`, `x % 1`, `pow(x, 0)`, `hypot(x, 0)`, and the `gcd`/`lcm`/shift folds |
+| `exprs/cast_unwrap` | Spark's `UnwrapCastInBinaryComparison` -- lifts a widening `int -> float` cast out of a comparison against a literal, which is what lets zone-map pruning and source pushdown see the predicate at all |
+| `exprs/boolean_normalize` | drives `NOT` down to the leaves: both De Morgan laws (verified over the full Kleene cross-product) and double negation, so the comparisons underneath reach `fold_not_comparison` |
+| `exprs/comparisons` | the reflexive six, `x = x` through `x >= x`, folded to a constant on a non-nullable non-float operand |
+| `exprs/conditionals` | moving work across a `CASE`: pushing a foldable comparison into literal branches, flattening a nested `ELSE` ladder, unwrapping a boolean-branch `CASE` inside a filter, pruning a dominated `GREATEST`/`LEAST` literal |
+| `exprs/complex_types` | extract-over-construct (`make_struct(...).a`, `[x, y][0]`, `len([x, y])`) and list-function algebra (idempotence, involution, slice composition) |
+| `exprs/text_folds` | constant folding for the string functions -- lengths, the digests (`md5`/`sha1`/`sha256`/`crc32`), `hex`, the pads, `repeat`, `initcap`, and the trims, each verified against the engine and ASCII-guarded where Unicode case or whitespace handling could differ |
+| `exprs/text_algebra` | the remaining regex de-specializations (`regexp_replace_all` to `replace`, `regexp_split` to `split`) and composing stacked `substr` calls |
+| `exprs/text` | regex de-specialization — a metacharacter-free `regexp_matches` becomes `contains` / `starts_with` / `ends_with` / `=` — plus the string identities `reverse(reverse(x))`, `repeat(x, 1)`, a full-range `substr` |
+| `exprs/temporal` | reading a date part through a finer truncation (`year(date_trunc('day', t))`), `last_day` idempotence, and day/microsecond offset fusion |
+| `streaming/windows` | collapses nested event-time window alignment (`window(window(t, 5m), 15m)`) when the outer width is a whole multiple of the inner -- per-row work removed from a pipeline that never ends |
+| `relational/windows` | transposing two independent `Window` nodes into a canonical spec order so the collapse rule can find them, and pushing a top-N below an unpartitioned ranking window |
+
+Two constraints shape what these families can contain, and both are worth knowing
+before adding a rule here.
+
+There is no null *literal* in the IR: `Lit` rejects `None`, so a rule that matches
+`NULLIF(x, NULL)` would be unreachable and one that produces a null literal would emit
+a plan that fails to serialize. That rules out most "fold this call to a constant"
+rewrites over a nullable input, because the constant would have to be null on the null
+rows.
+
+Anything that trades `NULL` for `FALSE` is sound only at the top level of a `Filter`,
+which keeps a row just when the predicate is true. Those rules apply their rewrite to
+`split_conjuncts` of the predicate rather than walking the expression tree, since one
+`NOT` or `OR` deeper the two values are distinguishable.
+
+Some identities that look safe are refused, and the unit suite pins each refusal.
+`pow(x, 1)` is not folded, because libm's `pow` is not correctly rounded and the
+identity is therefore not provable, while `pow(x, 0)` is folded because IEEE 754
+specifies it as exactly one for every base. No timezone-conversion rewrite exists at
+all: a same-zone conversion is not the identity, since the engine nulls DST-ambiguous
+and nonexistent local times, and dropping the call would resurrect those rows' values.
+
 Adding a rule means dropping a function into the right family module and decorating
 it with `@rule(name=..., phase=..., matches=...)`; the registry discovers it. See
 the `add-kyber-optimizer-pass` recipe and [Extending Batcher](extending.md).
@@ -104,7 +148,7 @@ no two rules interfere in combination. Kyber proves both mechanically.
   DuckDB), across nulls, empties, and type edges.
 - **The whole set, in combination.** `tests/property/test_prop_optimizer_result_invariance.py`
   (Hypothesis) generates a random table and a random-but-valid pipeline and asserts
-  `result(full 154 rules) == result(no rules) == ds.collect()` under an
+  `result(full rule set) == result(no rules) == ds.collect()` under an
   order-independent multiset compare — the subtle rule interaction an example misses
   falls out as a counterexample. The same suite proves **confluence/termination**:
   the combined set converges to a deterministic plan fixpoint within the *production*

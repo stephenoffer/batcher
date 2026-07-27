@@ -31,13 +31,12 @@ How work is sized and parallelized.
 | `cpu_share_min` | `0.25` | Floor for the adaptive per-task CPU share, so an IO-bound stage never asks for an unschedulable sliver of a core. |
 | `adaptive_morsel_sizing` | `True` | Shrink the per-morsel (rows, bytes) target under memory pressure so the streaming working set stays bounded. Result-invariant; the static target is used unchanged until the pressure monitor reports elevated. Set `False` to pin the static target. |
 | `fuse_linear` | `True` | Fuse chains of linear streaming operators (filter/project) into one pass over the input morsels instead of a dispatch and buffer per operator. Result-invariant; engages only on a chain of two or more fusable ops. |
+| `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`../user-guide/hardening`. |
+| `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
+| `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
 | `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width, such as `Int32` ids widened on input, halving its footprint. It's lossless but data-dependent, so it's off by default. With it off, output types match `Dataset.schema` exactly. |
 
-The remaining execution fields are **power-user performance thresholds**: they tune
-*how* the parallel executor runs an operator and are result-invariant (a query produces
-the identical result at any setting). Each default equals the Rust constant it replaced,
-so leaving them untouched is bit-identical to the engine's tuned baseline. Reach for them
-only to tune a known hot path.
+The remaining execution fields are **power-user performance thresholds**: they tune *how* the parallel executor runs an operator and are result-invariant (a query produces the identical result at any setting). Each default equals the Rust constant it replaced, so leaving them untouched is bit-identical to the engine's tuned baseline. Reach for them only to tune a known hot path.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -221,6 +220,47 @@ cfg = Config().replace(metadata=MetadataConfig(backend="sqlite"))
 print(cfg.metadata.backend)
 # sqlite
 ```
+
+## governance
+
+Whether the row filters and column masks in a `SecurityCatalog` are advisory or mandatory.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `mode` | `"off"` | `"off"`, `"advisory"`, or `"strict"`. |
+| `default_deny` | `False` | Deny a table no grant mentions, rather than leaving it ungoverned. |
+| `audit_path` | `None` | Append every governance decision to this JSONL file. |
+| `require_verified_principal` | `False` | Refuse a principal that was asserted rather than established by a verifier. |
+
+These fields are the {py:class}`GovernanceConfig <batcher.GovernanceConfig>` dataclass.
+Reach for `"advisory"` before `"strict"`: it warns instead of refusing, which is how you
+find the ungoverned reads in a live workload. {doc}`../user-guide/hardening` walks through
+the migration.
+
+## tenant
+
+Which tenant a scope's work belongs to, so two workloads in one process do not share the
+process-global caches and learned statistics by accident.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `tenant_id` | `""` | Names the tenant. Empty means no tenancy: everything behaves as before. |
+| `cache_share` | `0.0` | Share of the result-cache budget this tenant may hold. 0 is unbounded. |
+| `max_concurrent_queries` | `0` | Concurrency cap for this tenant. 0 is unbounded. |
+
+These fields are the {py:class}`TenantConfig <batcher.TenantConfig>` dataclass. Set them
+with the {py:func}`bt.tenant <batcher.tenant>` scope, not by replacing the section:
+
+```python
+import batcher as bt
+
+with bt.tenant("analytics", max_concurrent_queries=4):
+    print(bt.active_config().tenant.tenant_id)
+# analytics
+```
+
+A tenant is a cooperating workload, not an adversary: two in one process share an address
+space. See {doc}`../user-guide/hardening`.
 
 ## distributed
 

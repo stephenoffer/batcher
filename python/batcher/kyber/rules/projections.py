@@ -43,6 +43,7 @@ from batcher.plan.logical import (
     MapBatches,
     Project,
     Projection,
+    RangeJoin,
     RowId,
     Sample,
     Scan,
@@ -509,6 +510,22 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             node.direction,
             node.output,
         )
+    if isinstance(node, RangeJoin):
+        # Each child needs its condition keys plus the output columns drawn from that
+        # side; the output spec itself is left intact.
+        left_need = {
+            *(c.left_key for c in node.conditions),
+            *(s.name for s in node.output if s.side == "left"),
+        }
+        right_need = {
+            *(c.right_key for c in node.conditions),
+            *(s.name for s in node.output if s.side == "right"),
+        }
+        left = _rewrite(node.left, left_need)
+        right = _rewrite(node.right, right_need)
+        if left is node.left and right is node.right:
+            return node
+        return RangeJoin(left, right, node.conditions, node.join_type, node.output)
     if isinstance(node, MapBatches):
         child = _rewrite(node.input, _map_batches_need(node, need))
         rebuilt = node if child is node.input else dataclasses.replace(node, input=child)
@@ -596,7 +613,7 @@ def _and(left: Expr, right: Expr) -> Expr:
 
 
 def _children(node: LogicalPlan) -> tuple[LogicalPlan, ...]:
-    if isinstance(node, (Join, AsofJoin)):
+    if isinstance(node, (Join, AsofJoin, RangeJoin)):
         return (node.left, node.right)
     if isinstance(node, Union):
         return tuple(node.inputs)
@@ -673,6 +690,14 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
     elif isinstance(node, AsofJoin):
         left_need = {node.left_on, *node.left_by}
         right_need = {node.right_on, *node.right_by}
+        for col in node.output:
+            (left_need if col.side == "left" else right_need).add(col.name)
+        _visit(node.left, left_need, acc)
+        _visit(node.right, right_need, acc)
+
+    elif isinstance(node, RangeJoin):
+        left_need = {c.left_key for c in node.conditions}
+        right_need = {c.right_key for c in node.conditions}
         for col in node.output:
             (left_need if col.side == "left" else right_need).add(col.name)
         _visit(node.left, left_need, acc)

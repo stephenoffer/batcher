@@ -185,6 +185,10 @@ def test_metrics_snapshot_shape(clean_metrics):
         "operators",
         "partitions",
         "queries",
+        # Fault-tolerance actions by kind (recompute, worker_lost, backup_won, ...).
+        # Recovery used to be entirely unobservable, so a query that transparently
+        # survived losing two workers looked identical to one that was merely slow.
+        "recovery",
         "rows",
         "skipped",
         "spills",

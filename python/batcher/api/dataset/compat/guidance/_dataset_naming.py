@@ -50,8 +50,6 @@ DATASET_NAMING: dict[str, str] = {
     "repartitionByRange": "Sort then repartition: ds.sort('key').repartition(n).",
     "colRegex": "Select columns by pattern with ds.select(bt.matches(r'^value_')).",
     "freqItems": "Approximate frequent values: ds.value_counts('col') or ds.group_by('col').len().",
-    "cube": "There is no CUBE; union several ds.group_by(...).agg(...) at different key sets.",
-    "rollup": "There is no ROLLUP; union several ds.group_by(...).agg(...) at nested key sets.",
     "observe": (
         "Measured per-operator metrics are ds.stats(); ds.explain(analyze=True) reports what ran."
     ),

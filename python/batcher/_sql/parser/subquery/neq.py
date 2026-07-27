@@ -23,8 +23,10 @@ translator to avoid an import cycle).
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._sql.parser.core_utils import _join_and, _split_and
-from batcher._sql.parser.subquery import (
+from batcher._sql.parser.subquery.core import (
     _correlation_pair,
     _local_columns,
     _local_tables,
@@ -38,15 +40,11 @@ def _correlation_neq(leaf, local: set[str], local_cols: set[str] | None = None):
 
     The `<>` analogue of `_correlation_pair`, and nothing more: the outer-reference test is
     the same one, so this passes `exp.NEQ` rather than restating it."""
-    from sqlglot import expressions as exp
-
     return _correlation_pair(leaf, local, local_cols, op=exp.NEQ)
 
 
 def _all_local(preds, local: set[str], local_cols: set[str] | None) -> bool:
     """Whether every column in `preds` is local to the subquery (no outer reference)."""
-    from sqlglot import expressions as exp
-
     for p in preds:
         for c in p.find_all(exp.Column):
             outer = (c.table and c.table not in local) or (
@@ -62,8 +60,6 @@ def _base_tables(select_node) -> frozenset[str]:
 
     Two correlated subqueries alias the same base table differently (q21's `l2`/`l3`),
     so fusion compatibility keys on the base name, not the alias."""
-    from sqlglot import expressions as exp
-
     from_ = select_node.args.get("from") or select_node.args.get("from_")
     sources = ([from_.this] if from_ is not None else []) + [
         j.this for j in select_node.args.get("joins", []) or []
@@ -77,8 +73,6 @@ def _parse_neq_exists(tr, exists_node):
     Returns a dict with the inner SELECT (a detached copy), its local tables, the
     correlation equi-keys `[(outer, inner), …]`, the single `<>` residual columns
     `(outer_c, inner_c)`, and the remaining purely-local predicates `true_local`."""
-    from sqlglot import expressions as exp
-
     inner = exists_node.this
     if isinstance(inner, exp.Subquery):
         inner = inner.this
@@ -113,8 +107,6 @@ def _parse_neq_exists(tr, exists_node):
 
 def _decorrelate_neq_single(tr, ds, spec, negate: bool):
     """One correlated-`<>` subquery → one group-by (min/max over local rows) + one join."""
-    from sqlglot import expressions as exp
-
     inner, corr = spec["inner"], spec["corr"]
     outer_c, inner_c, true_local = spec["outer_c"], spec["inner_c"], spec["true_local"]
     inner_keys = [ic for (_oc, ic) in corr]
@@ -142,8 +134,6 @@ def _fuse_correlated_neq(tr, ds, leaves):
 
     Returns `(ds, handled_indices)`; `handled_indices` is empty when no fusion applies,
     leaving every leaf for the caller's per-predicate path."""
-    from sqlglot import expressions as exp
-
     parsed = []  # (leaf_index, spec, negate)
     for i, leaf in enumerate(leaves):
         neg = isinstance(leaf, exp.Not) and isinstance(leaf.this, exp.Exists)
@@ -176,8 +166,6 @@ def _emit_fused_group(tr, ds, members):
     The members share correlation keys and a single base table; each contributes its
     own `min`/`max` (conditional on its local filter, via a value-typed null else), and
     each applies its own bound test. One scan, one shuffle, instead of one per member."""
-    from sqlglot import expressions as exp
-
     base = members[0][1]
     corr = base["corr"]
     inner_keys = [ic for (_oc, ic) in corr]
@@ -231,8 +219,6 @@ def _emit_fused_group(tr, ds, members):
 
 def _strip_tables(node):
     """Drop every column's table qualifier in-place (single-source scan → unambiguous)."""
-    from sqlglot import expressions as exp
-
     for c in node.find_all(exp.Column):
         c.set("table", None)
     return node

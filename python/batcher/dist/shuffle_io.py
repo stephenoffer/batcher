@@ -14,6 +14,8 @@ from collections.abc import Iterable
 
 import pyarrow as pa
 
+from batcher._internal.paths import open_private, private_dir
+
 __all__ = [
     "distributed_work_dir",
     "read_ipc",
@@ -73,7 +75,10 @@ def distributed_work_dir(prefix: str) -> str:
     """
     root = shared_scratch_root()
     if root:
-        os.makedirs(root, exist_ok=True)
+        # The root is a *shared cluster mount*, so creating it 0755 publishes every
+        # query's scratch listing to the whole node. `mkdtemp` already gives the inner
+        # directory 0700; this closes the parent, which nothing else does.
+        private_dir(root)
         return tempfile.mkdtemp(prefix=prefix, dir=root)
     return tempfile.mkdtemp(prefix=prefix)
 
@@ -82,7 +87,10 @@ def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
     """Write record batches to an Arrow IPC stream file. Returns `path`."""
     if not batches:
         raise ValueError("write_ipc requires at least one batch (for the schema)")
-    with pa.OSFile(path, "wb") as sink, pa.ipc.new_stream(sink, batches[0].schema) as writer:
+    with (
+        pa.PythonFile(open_private(path), mode="w") as sink,
+        pa.ipc.new_stream(sink, batches[0].schema) as writer,
+    ):
         for b in batches:
             writer.write_batch(b)
     return path
@@ -135,12 +143,14 @@ def write_ipc_round_robin(
     reads which batch differs.
     """
     n = len(paths)
-    sinks: list[pa.OSFile | None] = [None] * n
+    sinks: list[object | None] = [None] * n
     writers: list[object | None] = [None] * n
     schema: pa.Schema | None = None
 
     def _open(j: int, sch: pa.Schema) -> None:
-        sinks[j] = pa.OSFile(paths[j], "wb")
+        # Owner-only, like every other shuffle artifact: these files hold the query's rows
+        # on a scratch path that may be a shared cluster mount.
+        sinks[j] = pa.PythonFile(open_private(paths[j]), mode="w")
         writers[j] = pa.ipc.new_stream(sinks[j], sch)
 
     try:

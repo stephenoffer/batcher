@@ -8,7 +8,7 @@
 //! the whole range — so it needs neither a linear-counting handover threshold nor
 //! HyperLogLog++'s empirical per-precision bias tables.
 
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
 use arrow::array::{Array, ArrayRef};
 use arrow::row::{RowConverter, SortField};

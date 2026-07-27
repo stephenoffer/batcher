@@ -7,6 +7,8 @@ their first argument.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._internal.errors import PlanError
 from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs, sort_for_ordered_aggs
 from batcher._sql.parser.core_utils import (
@@ -67,8 +69,6 @@ def _expand_star(tr, star, visible: list[str]) -> dict[str, Expr]:
 
 
 def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
-    from sqlglot import expressions as exp
-
     named: dict[str, Expr] = {}
     for p in projections:
         # `SELECT *` (Star) or `SELECT t.*` (a Column wrapping a Star) → keep
@@ -109,16 +109,12 @@ def _is_group_agg(a) -> bool:
 
     An aggregate inside a (scalar) subquery belongs to that inner query, not this one.
     """
-    from sqlglot import expressions as exp
-
     if isinstance(a.parent, exp.Window):
         return False
     return a.find_ancestor(exp.Subquery) is None
 
 
 def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=None) -> tuple:
-    from sqlglot import expressions as exp
-
     # Plain (non-ROLLUP/CUBE/GROUPING SETS) GROUP BY: no level is ever rolled up, so
     # GROUPING(...) is the constant 0. (The grouping-sets path handles it per level.)
     scopes = [*projections, having.this] if having is not None else list(projections)
@@ -280,8 +276,6 @@ def _distinct_on(tr, ds: Dataset, projections, order, on_exprs) -> Dataset:
     sort expressions are materialized as internal ``__bc_`` columns first so they stay
     resolvable even when absent from the SELECT list, and never leak through ``SELECT *``.
     """
-    from sqlglot import expressions as exp
-
     on_cols: list[str] = []
     temp: dict[str, Expr] = {}
     for i, e in enumerate(on_exprs):
@@ -340,8 +334,6 @@ def _register_agg(tr, node, preferred: str | None, used: set) -> None:
 
 
 def _agg(tr, node) -> AggExpr | Expr:
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.Anonymous):
         # A DuckDB aggregate sqlglot does not model (`product`, `sem`, `count_star`, …).
         return build_anon_agg(tr, node)

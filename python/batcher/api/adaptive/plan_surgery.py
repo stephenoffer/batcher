@@ -40,7 +40,12 @@ def children(node: LogicalPlan) -> list[LogicalPlan]:
 
 
 def walk(node: LogicalPlan):
-    """Pre-order walk over the plan tree (local helper, no visitor import cycle)."""
+    """Pre-order walk over the plan tree (local helper, no visitor import cycle).
+
+    Recursive for the reason `plan.visitor.walk` documents: at real plan depths the stack
+    bookkeeping an iterative walk needs costs more than the `yield from` re-entry it
+    removes. Measured, not assumed.
+    """
     yield node
     for child in children(node):
         yield from walk(child)

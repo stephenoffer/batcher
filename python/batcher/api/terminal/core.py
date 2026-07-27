@@ -7,6 +7,8 @@ that forward their state (`self._plan`, `self._sources`, `self.columns`) here.
 
 from __future__ import annotations
 
+import time
+import uuid
 from typing import Any
 
 import pyarrow as pa
@@ -157,11 +159,12 @@ def _collect(
 
     if adaptive:
         from batcher import core
-        from batcher.api.adaptive import execute_adaptive
+        from batcher.api.adaptive import execute_adaptive, record_adaptive_route
 
         # Adaptive re-optimization now works distributed too: each breaker stage
         # fans out across workers and its measured cardinality re-plans the rest.
-        return execute_adaptive(
+        _t0 = time.perf_counter()
+        table = execute_adaptive(
             plan,
             sources,
             core.default_hub(),
@@ -169,6 +172,13 @@ def _collect(
             num_workers=num_workers,
             transport=transport,
         ).table
+        # Feed the staged arm of the route bandit. This is the *only* place either arm is
+        # measured, and it has to be the whole query rather than a per-stage total, because
+        # what the two routes differ in is precisely the work that is not inside a stage:
+        # the per-stage materialize, re-plan, and the fusion and parallel width the pipeline
+        # gives up by being cut at every breaker.
+        record_adaptive_route(core.default_hub(), plan, True, (time.perf_counter() - _t0) * 1000.0)
+        return table
 
     if spill and not distributed:
         from batcher import core, kyber
@@ -185,9 +195,9 @@ def _collect(
         # Other plan shapes have no spilling path → fall through to in-memory.
 
     # Imported here (not at module load) to keep the layer-import contract
-    # simple and avoid importing the engine for pure-Python tooling.
-    import time
-
+    # simple and avoid importing the engine for pure-Python tooling. `time` is not one of
+    # those: it is stdlib, already loaded, and re-importing it on every terminal op bought
+    # nothing.
     from batcher import core
     from batcher.api import executors
     from batcher.api.terminal.event_log import (
@@ -223,9 +233,11 @@ def _collect(
         raise
     total_ms = (time.perf_counter() - t0) * 1000.0
     write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows, query_id=query_id)
+    from batcher.api.adaptive import record_adaptive_route
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
+    record_adaptive_route(ctx.hub, plan, False, total_ms)  # the one-shot arm of the route bandit
     return table
 
 
@@ -542,8 +554,6 @@ def _write(
         # One write token shared by every worker's sink so all shards of this write name
         # their staged files under the same token (and a later write uses a different one,
         # so `add_files` never lets it clobber a file a prior snapshot still references).
-        import uuid
-
         sink_kwargs.setdefault("write_token", uuid.uuid4().hex[:12])
     # `sink` lets a caller supply the writer instead of taking the registry's default. The
     # copy-on-write MERGE needs it: its output files land *beside* files it deliberately did

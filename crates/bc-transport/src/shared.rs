@@ -238,8 +238,76 @@ pub fn clear_shared(addr: &str) {
     }
 }
 
+/// Remove only the shm files `addr` published for `plan_id`, leaving other plans' alone.
+///
+/// The plan-scoped counterpart to [`clear_shared`], and the missing half of the in-memory
+/// [`crate::PartitionStore::remove_prefix`]. A session-scoped worker fleet serves many
+/// queries, so tearing down one query must not evict another's live buckets — but leaving
+/// them costs *twice*: the `PartitionStore` entry and this file. tmpfs is RAM-backed, so
+/// an un-cleared shm directory is a second memory leak on the same node, and nothing freed
+/// it at all before this existed.
+///
+/// Best-effort by design, exactly like `publish_shared`: shm is a fast path that Flight
+/// always backs, so a failure to evict wastes memory but cannot produce a wrong answer.
+pub fn clear_plan_shared(addr: &str, plan_id: u64) {
+    let Some(root) = shm_root() else { return };
+    let dir = root.join(sanitize(addr));
+    // Tickets render as `plan/stage/src/dst/epoch` and `sanitize` maps every non-alphanumeric
+    // byte to `_`, so a plan's files are exactly those named `{plan_id}_…`. The trailing
+    // separator matters: without it, clearing plan 1 would also take plan 10's files.
+    let prefix = format!("{plan_id}_");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// `clear_plan_shared` must evict exactly one plan's files.
+    ///
+    /// It infers the filename prefix from the ticket format (`plan/stage/...` sanitized to
+    /// `plan_stage_...`). That inference is the fragile part: if the ticket rendering ever
+    /// changes, this eviction silently stops matching anything and the shm leak comes back
+    /// with no failure anywhere. So the assumption is pinned here rather than left implicit.
+    #[test]
+    fn clear_plan_shared_evicts_one_plan_only() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        if super::shm_root().is_none() {
+            return; // no tmpfs on this platform; the shm path is inert
+        }
+        let addr = "clear-plan-shared-test:1";
+        super::clear_shared(addr);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
+        // Ticket strings exactly as `ShuffleTicket::__str__` renders them.
+        for ticket in ["1/0/0/0/0", "1/0/1/0/0", "2/0/0/0/0", "10/0/0/0/0"] {
+            super::publish_shared(addr, ticket, std::slice::from_ref(&batch)).unwrap();
+        }
+        assert!(super::fetch_shared(addr, "1/0/0/0/0").unwrap().is_some());
+
+        super::clear_plan_shared(addr, 1);
+
+        assert!(super::fetch_shared(addr, "1/0/0/0/0").unwrap().is_none());
+        assert!(super::fetch_shared(addr, "1/0/1/0/0").unwrap().is_none());
+        // Another plan's buckets survive — a session fleet serves many queries at once.
+        assert!(super::fetch_shared(addr, "2/0/0/0/0").unwrap().is_some());
+        // And plan 10 is not a prefix match for plan 1. Without the trailing separator in
+        // the prefix this is the assertion that fails.
+        assert!(super::fetch_shared(addr, "10/0/0/0/0").unwrap().is_some());
+
+        super::clear_shared(addr);
+    }
+
     use std::sync::Arc;
 
     use arrow::array::{

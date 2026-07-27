@@ -452,10 +452,20 @@ pub(crate) fn merge_state(
         | AggFunc::Quantile(_)
         | AggFunc::ListAgg
         | AggFunc::Mode
-        | AggFunc::Histogram => {
+        | AggFunc::Histogram
+        | AggFunc::Entropy
+        | AggFunc::Mad
+        | AggFunc::QuantileDisc(_)
+        | AggFunc::ApproxTopK(_) => {
             vec![merge_median(&state[0], group_ids, num_groups)?]
         }
-        AggFunc::Min => accumulate(AggFunc::Min, Some(&state[0]), group_ids, num_groups)?,
+        // `any_value` merges with the same min reducer that built its partial.
+        // Compensated states merge by compensated-adding the sums and summing the
+        // compensations — the same fold the partial performs, so `combine([p]) == p`.
+        AggFunc::KahanSum => merge_kahan(&state[0], &state[1], group_ids, num_groups),
+        AggFunc::Min | AggFunc::AnyValue => {
+            accumulate(AggFunc::Min, Some(&state[0]), group_ids, num_groups)?
+        }
         AggFunc::Max => accumulate(AggFunc::Max, Some(&state[0]), group_ids, num_groups)?,
         // Boolean state re-folds via the same AND/OR reducer (associative).
         AggFunc::BoolAnd | AggFunc::BoolOr => {
@@ -499,7 +509,9 @@ pub(crate) fn merge_state(
         // formulas — summing them would be wrong (mean/M2/M3/M4 and the co-moment are not
         // additive across partitions), and the old sum-of-powers form catastrophically
         // cancelled at a large offset.
-        AggFunc::Skewness | AggFunc::Kurtosis => merge_moments(state, group_ids, num_groups)?,
+        AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
+            merge_moments(state, group_ids, num_groups)?
+        }
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {
             merge_covar(state, group_ids, num_groups)?
         }
@@ -508,3 +520,42 @@ pub(crate) fn merge_state(
 
 // --- serial group-id assignment (the per-morsel grouping core; the parallel
 // hash-radix combine above reuses these fast-path key hashers) ------------------
+
+/// Merge `(sum, compensation)` states: compensated-add the sums, and carry the
+/// compensations along so nothing that was already corrected for is lost.
+fn merge_kahan(
+    sums: &ArrayRef,
+    comps: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Vec<ArrayRef> {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, AsArray, Float64Array};
+    use arrow::datatypes::Float64Type;
+
+    let (s, c) = (
+        sums.as_primitive::<Float64Type>(),
+        comps.as_primitive::<Float64Type>(),
+    );
+    let mut out_sum = vec![0f64; num_groups];
+    let mut out_comp = vec![0f64; num_groups];
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if s.is_null(i) {
+            continue;
+        }
+        let g = g as usize;
+        crate::agg::accum::neumaier_add(&mut out_sum[g], &mut out_comp[g], s.value(i));
+        out_comp[g] += c.value(i);
+        valid[g] = true;
+    }
+    let mask = |vals: Vec<f64>| -> ArrayRef {
+        Arc::new(Float64Array::from_iter(
+            vals.into_iter()
+                .zip(valid.iter())
+                .map(|(v, ok)| ok.then_some(v)),
+        ))
+    };
+    vec![mask(out_sum), mask(out_comp)]
+}

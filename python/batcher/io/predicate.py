@@ -14,7 +14,11 @@ the whole expression unpushable for that backend (returns ``None``).
 
 from __future__ import annotations
 
+import datetime as _dt
+import math
 from typing import Any
+
+import pyarrow as pa
 
 __all__ = [
     "to_iceberg_expression",
@@ -38,16 +42,10 @@ def _literal(ir: dict[str, Any]) -> Any:
     """
     ((kind, value),) = ir["value"].items()
     if kind == "date":
-        import datetime as _dt
-
         return _dt.date(1970, 1, 1) + _dt.timedelta(days=value)
     if kind == "timestamp":
-        import datetime as _dt
-
         return _dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)
     if kind == "time":
-        import datetime as _dt
-
         return (_dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)).time()
     return value
 
@@ -70,8 +68,6 @@ def _pa_literal(ir: dict[str, Any], col_type: Any | None = None) -> Any:
     event-time data. The literal's raw value is UTC micros, so the same instant is
     expressed in the column's unit and zone.
     """
-    import pyarrow as pa
-
     ((kind, value),) = ir["value"].items()
     if kind == "date":
         return pa.scalar(value, pa.date32())
@@ -91,8 +87,6 @@ def _timestamp_scalar(micros: int, col_type: Any, pa: Any) -> Any:
     column gets a UTC-aware datetime (same instant), a tz-naive column a naive one, so the
     comparison type-checks either way.
     """
-    import datetime as _dt
-
     moment = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=micros)
     if col_type.tz is None:
         moment = moment.replace(tzinfo=None)
@@ -144,9 +138,23 @@ def to_pyarrow_expression(ir: dict[str, Any], schema: Any | None = None) -> Any 
 
     Returns ``None`` if the predicate is not (fully) pushable.
     """
-    import pyarrow.dataset as ds
+    return _to_pa(ir, _dataset_module(), schema)
 
-    return _to_pa(ir, ds, schema)
+
+# `pyarrow.dataset` is a heavy submodule and is *not* loaded by importing pyarrow, so a
+# module-level import here would add ~50 ms to `import batcher` for a module only the
+# predicate-pushdown path needs. Bound on first use instead of re-imported per pushdown.
+_DATASET = None
+
+
+def _dataset_module() -> Any:
+    """The `pyarrow.dataset` module, imported at most once."""
+    global _DATASET
+    if _DATASET is None:
+        import pyarrow.dataset
+
+        _DATASET = pyarrow.dataset
+    return _DATASET
 
 
 def _to_pa(ir: dict[str, Any], ds: Any, schema: Any | None = None) -> Any | None:
@@ -185,8 +193,6 @@ def _to_pa(ir: dict[str, Any], ds: Any, schema: Any | None = None) -> Any | None
 
 
 def _sql_literal(value: Any) -> str:
-    import datetime as _dt
-
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, str):
@@ -233,8 +239,6 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
         # are rejected by every warehouse these connectors target (Snowflake,
         # BigQuery, ClickHouse, …). Leave the term unpushed — the engine's Filter
         # re-checks every row, so a non-pushed predicate is always correct.
-        import math
-
         if isinstance(value, float) and not math.isfinite(value):
             return None
         effective = _FLIP[op] if flipped else op

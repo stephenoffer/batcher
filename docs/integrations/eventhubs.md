@@ -92,6 +92,46 @@ one does not.
 If your hub carries binary bodies, read it through the Kafka endpoint above, where the payload
 passes through untouched.
 
+## Decoding the payload
+
+Because the body arrives as UTF-8 text in `value`, decoding is an ordinary expression, and it
+runs in Rust rather than in a Python loop. The block below stands a local batch in for the hub,
+using the same six columns the reader delivers, so the pipeline runs here as written:
+
+```python
+import batcher as bt
+import pyarrow as pa
+from batcher import col
+
+schema = pa.schema([
+    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
+    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
+])
+batch = pa.record_batch({
+    "key": [b"dev-1", b"dev-2", b"dev-1"],
+    "value": [b'{"device":"dev-1","temp_c":21}', b'{"device":"dev-2","temp_c":25}',
+              b'{"device":"dev-1","temp_c":23}'],
+    "partition": [0, 1, 0],                                # the Event Hubs partition id
+    "offset": [4021, 991, 4022],                            # the native offset
+    "timestamp": [1700000000000, 1700000001000, 1700000002000],
+    "topic": ["telemetry"] * 3,                             # the hub name
+}, schema=schema)
+
+# Stand in for the hub; the pipeline below is what you run against the real one.
+events = bt.from_batches(lambda: iter([batch]), schema)
+
+readings = events.select(
+    col("value").cast("string").json.extract_string("$.device").alias("device"),
+    col("value").cast("string").json.extract_int("$.temp_c").alias("temp_c"),
+)
+print(readings.group_by("device").agg(peak=col("temp_c").max()).sort("device").to_pydict())
+# {'device': ['dev-1', 'dev-2'], 'peak': [23, 25]}
+```
+
+Against the live hub the only line that changes is the source, and the streaming controls
+(triggers, watermarks, checkpoints) attach to that source rather than to the transformation.
+See {doc}`../user-guide/streaming`.
+
 ## How it parallelizes
 
 A `Source` divides into `Split`s, and each split is a unit of read parallelism. The split here

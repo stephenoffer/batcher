@@ -14,7 +14,8 @@ import pytest
 
 from batcher._internal import events
 from batcher.observe import metrics
-from batcher.observe.inference import _GPU_WINDOW, InferenceProgress
+from batcher.observe.inference import InferenceProgress
+from batcher.observe.inference.progress import _GPU_WINDOW
 
 pytestmark = pytest.mark.unit
 

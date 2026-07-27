@@ -24,31 +24,62 @@ def _hub() -> MetadataHub:
     return MetadataHub(InProcessBackend())
 
 
-# --- 1 + 2. resolve_adaptive learned gate ⇄ record_adaptive_flip ------------------------------
-def test_resolve_adaptive_learned_gate_cold_and_warm():
-    from batcher.api.adaptive import resolve_adaptive
-    from batcher.kyber.learned_tuning import record_adaptive_flip
+# --- 1 + 2. resolve_adaptive learned router ⇄ record_adaptive_route ---------------------------
+def test_resolve_adaptive_learned_router_cold_and_warm(monkeypatch):
+    from batcher.api.adaptive import gating, resolve_adaptive
+    from batcher.kyber.learned_tuning import record_adaptive_route
 
-    # A join-less plan: the cold structural heuristic never enables adaptivity.
-    ds = bt.from_arrow(pa.table({"x": list(range(20))})).filter(col("x") > 3)
+    left = bt.from_arrow(pa.table({"k": list(range(20)), "x": list(range(20))}))
+    right = bt.from_arrow(pa.table({"k": [1, 2], "w": [9, 8]}))
+    ds = left.join(right, on="k")
     hub = _hub()
+    # Small inputs: the size floor refuses staging outright, before anything learned.
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is False
 
-    # Seed a history where re-optimization repeatedly flipped the plan for this signature.
+    # Above the floor, a history where staging measured far cheaper turns it on.
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
     sig = plan_signature(ds._plan)
     for _ in range(4):
-        record_adaptive_flip(hub, sig, True)
+        record_adaptive_route(hub, sig, "staged", 10.0)
+        record_adaptive_route(hub, sig, "one_shot", 1000.0)
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is True
+
+
+def test_the_size_floor_binds_the_learned_router_too(monkeypatch):
+    """A plan signature is scale-blind, so a route learned at scale must not replay below it.
+
+    `plan_signature` normalizes literals so statistics generalize across runs; the same query
+    over sf1 and sf10 therefore shares a signature. Consulting the router before the size floor
+    replayed sf10's routes at interactive scale and took TPC-H q8 from 18.8 ms to 181.9 ms.
+    """
+    from batcher.api.adaptive import gating, resolve_adaptive
+    from batcher.kyber.learned_tuning import record_adaptive_route
+
+    left = bt.from_arrow(pa.table({"k": list(range(20)), "x": list(range(20))}))
+    right = bt.from_arrow(pa.table({"k": [1, 2], "w": [9, 8]}))
+    ds = left.join(right, on="k")
+    hub = _hub()
+    sig = plan_signature(ds._plan)
+    for _ in range(4):
+        record_adaptive_route(hub, sig, "staged", 10.0)
+        record_adaptive_route(hub, sig, "one_shot", 1000.0)
+
+    # The very same history that turns staging on above the floor is ignored below it.
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
+    assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is True
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 20_000_000)
+    assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is False
 
 
 def test_resolve_adaptive_explicit_flag_ignores_learning():
     from batcher.api.adaptive import resolve_adaptive
-    from batcher.kyber.learned_tuning import record_adaptive_flip
+    from batcher.kyber.learned_tuning import record_adaptive_route
 
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]})).filter(col("x") > 0)
     hub = _hub()
     for _ in range(4):
-        record_adaptive_flip(hub, plan_signature(ds._plan), True)
+        record_adaptive_route(hub, plan_signature(ds._plan), "staged", 10.0)
+        record_adaptive_route(hub, plan_signature(ds._plan), "one_shot", 1000.0)
     assert resolve_adaptive(False, ds._plan, ds._sources, hub) is False
     assert resolve_adaptive(True, ds._plan, ds._sources, hub) is True
 

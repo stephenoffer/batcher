@@ -234,7 +234,15 @@ impl FlightShuffleServer {
     /// Evict every partition for plan `plan_id` (call at plan teardown so a reused
     /// worker doesn't accumulate finished plans' shuffle outputs).
     fn clear_plan(&self, py: Python<'_>, plan_id: u64) {
-        py.allow_threads(|| shared_runtime().block_on(self.exchange.clear_plan(plan_id)));
+        let addr = self.addr.clone();
+        py.allow_threads(|| {
+            shared_runtime().block_on(self.exchange.clear_plan(plan_id));
+            // The shm half, which nothing freed before. `/dev/shm` is RAM-backed, so a
+            // stale bucket file is a second memory leak on the same node — and unlike the
+            // in-memory store it has no eviction of any kind. `clear`/`clear_shared` are
+            // already paired this way; this pairs the plan-scoped form to match.
+            bc_transport::clear_plan_shared(&addr, plan_id);
+        });
     }
 
     /// Evict every published partition on this server.

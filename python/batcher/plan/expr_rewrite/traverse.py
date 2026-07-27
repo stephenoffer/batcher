@@ -217,6 +217,27 @@ def transform_expr_up(expr: Expr, rule: ExprRule) -> Expr:
     if kids_of is None:
         return rule(expr)  # leaf: no sub-expressions
     kids = kids_of(expr)
+    # The one- and two-child cases are spelled out because they are almost every node in
+    # almost every expression (unary functions and `Binary`), and this is the hottest
+    # function in the optimizer — ~900 calls per plan per pass, across 300+ rules. The
+    # general path below builds a generator, a tuple, a `zip`, and an `all` generator per
+    # node; at this size those frames cost more than the work they wrap. Semantics are
+    # identical, including the structural sharing: a node whose children all come back
+    # `is`-identical is passed through rather than rebuilt.
+    n = len(kids)
+    if n == 2:
+        left, right = kids
+        new_left = transform_expr_up(left, rule)
+        new_right = transform_expr_up(right, rule)
+        if new_left is left and new_right is right:
+            return rule(expr)
+        return rule(_EXPR_REBUILD[type(expr)](expr, (new_left, new_right)))
+    if n == 1:
+        only = kids[0]
+        new_only = transform_expr_up(only, rule)
+        if new_only is only:
+            return rule(expr)
+        return rule(_EXPR_REBUILD[type(expr)](expr, (new_only,)))
     new = tuple(transform_expr_up(k, rule) for k in kids)
     rebuilt = (
         expr

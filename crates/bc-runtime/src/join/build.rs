@@ -133,24 +133,44 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
     // never read, so allocating and zeroing it is pure waste: 24 MB of memset at 6M build rows,
     // serial, on the critical path. See `JoinTable::unique` for the probe-side half.
     let unique = built.iter().all(|(_, chain, _)| chain.is_empty());
-    let mut next: Vec<u32> = if unique {
-        Vec::new()
-    } else {
-        vec![u32::MAX; right_rows]
-    };
+    let next = stitch_chain(
+        built.iter().flat_map(|(_, chain, _)| chain.iter().copied()),
+        right_rows,
+        unique,
+    );
     let mut heads = Vec::with_capacity(shards);
     let mut merged = bloom;
-    for (shard_heads, chain, shard_bloom) in built {
-        // Empty for every shard when `unique` — so this never indexes the empty `next`.
-        for (row, nxt) in chain {
-            next[row as usize] = nxt;
-        }
+    for (shard_heads, _, shard_bloom) in built {
         if let (Some(m), Some(s)) = (merged.as_mut(), shard_bloom.as_ref()) {
             m.merge(s);
         }
         heads.push(shard_heads);
     }
     (heads, next, merged, unique)
+}
+
+/// Thread collected `(row, next)` chain links into the absolute-indexed `next` array.
+///
+/// Shared by every build path — the sharded hash build above and the dense direct-map build
+/// (`super::dense`) — because the chain's meaning is what makes their outputs identical, so
+/// there must be exactly one implementation of it.
+///
+/// A unique build key allocates nothing: every slot would be `u32::MAX` and the probe never
+/// reads it (see `JoinTable::unique`), so the 24 MB memset a 6M-row build would otherwise pay
+/// on the critical path is skipped. Callers pass no links in that case.
+pub(super) fn stitch_chain(
+    links: impl IntoIterator<Item = (u32, u32)>,
+    right_rows: usize,
+    unique: bool,
+) -> Vec<u32> {
+    if unique {
+        return Vec::new();
+    }
+    let mut next = vec![u32::MAX; right_rows];
+    for (row, nxt) in links {
+        next[row as usize] = nxt;
+    }
+    next
 }
 
 #[cfg(test)]

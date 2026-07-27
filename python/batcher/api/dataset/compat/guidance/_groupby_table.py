@@ -114,8 +114,6 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
         "Batcher's pivot is a Dataset method, not a grouped one: "
         "ds.pivot(index=['k'], on='col', values='v', aggregate='sum')."
     ),
-    "cube": "There is no CUBE; union several ds.group_by(...).agg(...) at different key sets.",
-    "rollup": "There is no ROLLUP; union several ds.group_by(...).agg(...) at nested key sets.",
     "applyInPandas": "Spelled ds.map_batches(fn) after grouping, or .agg(...) for reductions.",
     "cogroup": "Co-grouping two frames is a join on the key: ds.join(other, on='k').",
 }

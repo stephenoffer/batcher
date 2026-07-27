@@ -141,6 +141,17 @@ exclude_patterns = [
     # The same again: the running ledger of the engine-wide defect hunt (found / fixed /
     # open). A contributor's working record, not a site page.
     "internals/bug_hunt_ledger.md",
+    # The enterprise-requirement scorecard against the commercial platforms (Databricks,
+    # Snowflake, SageMaker, Anyscale, SkyPilot). Every cell carries an evidence citation or
+    # reads UNMEASURED. A working record for contributors deciding what to build next, and it
+    # names gaps in a register a published page should not carry.
+    "internals/platform_parity_scorecard.md",
+    # The three per-platform ledgers the scorecard above hoists from. Same reason: working
+    # records with an explicit ⚠️ register of claims that still need a primary source, which
+    # is exactly the kind of thing a published page must not carry.
+    "internals/snowflake_parity.md",
+    "internals/anyscale_parity.md",
+    "internals/orchestration_parity.md",
     # The running index of improvements to the estimators' mathematics (cardinality,
     # sketches, cost, learning, resource control). A working record for anyone touching
     # one of those closed forms, not a page a user reads.

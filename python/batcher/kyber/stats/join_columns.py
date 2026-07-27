@@ -14,10 +14,10 @@ import datetime
 import decimal
 from typing import Any
 
-from batcher.plan.logical import AsofJoin, Join
+from batcher.plan.logical import AsofJoin, Join, RangeJoin
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, ambiguous_float_bound
 
-__all__ = ["asof_join_columns", "join_columns"]
+__all__ = ["asof_join_columns", "join_columns", "range_join_columns"]
 
 
 def join_columns(
@@ -178,3 +178,31 @@ def _comparable_bound(value: Any) -> bool:
         and not isinstance(value, bool)
         and not ambiguous_float_bound(value)
     )
+
+
+def range_join_columns(
+    node: RangeJoin, left: RelStats, right: RelStats, out_rows: float | None = None
+) -> dict[str, ColumnStat]:
+    """Column stats for a range join's output, on the same reasoning as `join_columns`.
+
+    A range join removes rows from a side or repeats them and never invents a value, so a
+    preserved column's `min`/`max` stay valid *bounds* with provenance downgraded, and the
+    membership bloom survives. What it does *not* share with the equi-join case is the
+    cross-side key reasoning: an inequality relates the two key columns by *order*, not by
+    equality, so neither side's value set is narrowed to the other's — the intersection
+    tightening `join_columns` applies to a matched key pair would be unsound here.
+    """
+    out: dict[str, ColumnStat] = {}
+    for o in node.output:
+        side = left if o.side == "left" else right
+        src = side.columns.get(o.name)
+        if src is not None:
+            out[o.alias] = dataclasses.replace(
+                src.downgrade(Provenance.DEFAULT),
+                null_count=None,
+                ndv=_join_ndv(src.ndv, out_rows),
+                total_sum=None,
+                mean=None,
+                mcv=None,
+            )
+    return out

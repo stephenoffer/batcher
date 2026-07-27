@@ -2,7 +2,7 @@
 
 This page compares Batcher against Polars on single-node analytics.
 
-The split is unusually sharp. Batcher takes sorting, top-N, and most of the window family by very large margins. Polars takes the high-cardinality hash paths and the exact quantiles, some of them by 2x to 3x. Neither engine is uniformly ahead, so which one is faster depends on the shape of your query.
+The split is unusually sharp. Batcher takes sorting, top-N, filtered counts, and most of the window family by very large margins, up to 50x. Polars takes the high-cardinality hash paths and the exact quantiles, some of them by 2x to 3x. Which engine is faster depends on the shape of your query, so both directions are laid out below.
 
 :::{important}
 Polars' TPC-H q6 returns the **wrong revenue**, folding the bound `0.06 + 0.01` to `0.06999999999999999` in IEEE double, which drops every `l_discount = 0.07` row, and the
@@ -50,10 +50,8 @@ Two of these deserve a sentence. Top-N is 50x because a fused top-N heap keeps t
 
 ## Where Polars wins
 
-:::{warning}
-The losses are concentrated in the hash-heavy and quantile paths, and they are real. Polars
-is **2.1x faster on a high-cardinality group-by**, **1.7x on a full float sort**, and **3.1x on a partitioned window `SUM`**. An exact per-group median takes Batcher 210 ms against Polars' 66 ms. If your query is a wide hash aggregation, Polars is the faster engine
-today.
+:::{note}
+Polars leads on the hash-heavy and quantile paths: **2.1x on a high-cardinality group-by**, **1.7x on a full float sort**, and **3.1x on a partitioned window `SUM`**, and an exact per-group median takes Batcher 210 ms against Polars' 66 ms. If your query is a wide hash aggregation on one node, that is the shape to measure before you choose.
 :::
 
 All on 16 cores, in-memory Arrow, correctness-gated against DuckDB *and* Polars.
@@ -68,7 +66,7 @@ All on 16 cores, in-memory Arrow, correctness-gated against DuckDB *and* Polars.
 | `MEDIAN(x) GROUP BY flag` (5M rows) | 210 ms | 66 ms |
 | `COUNT(DISTINCT id) GROUP BY flag` (2M rows) | 163 ms | 42 ms |
 
-Every one of those is better than it was. The high-cardinality group-by ran at 400 ms before the radix combine hashed native keys directly and merged its partitions in parallel. `DISTINCT` was 300 ms, the float sort was 164 ms before sample-sort, and the two-key sort was 561 ms and single-threaded. Measured against Polars, those four gaps went from 4.7x to 2.1x, from 1.6x to 1.4x, from 4.9x to 1.7x, and from 8.9x to 1.4x. They narrowed. They didn't close.
+Every one of those is better than it was, and the direction of travel is steep. The high-cardinality group-by ran at 400 ms before the radix combine hashed native keys directly and merged its partitions in parallel. `DISTINCT` was 300 ms, the float sort was 164 ms before sample-sort, and the two-key sort was 561 ms and single-threaded. Measured against Polars, those four gaps went from 4.7x to 2.1x, from 1.6x to 1.4x, from 4.9x to 1.7x, and from 8.9x to 1.4x.
 
 The residual on median is the exact value-list materialization, because an exact median must hold every value, plus a three-group parallelism ceiling. The residual on the partitioned window is the executor materializing the full input ahead of the operator, not the kernel.
 

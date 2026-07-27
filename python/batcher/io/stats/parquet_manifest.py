@@ -126,8 +126,11 @@ def _file_bounds(meta: Any, columns: list[str]) -> dict[str, tuple[Any, Any, int
     interval the same way it does in `parquet_statistics`.
     """
     out: dict[str, tuple[Any, Any, int | None]] = dict.fromkeys(columns, (None, None, None))
-    names = meta.schema.names
-    wanted = {c: names.index(c) for c in columns if c in names}
+    # One name -> position map instead of a linear `in` test plus a linear `index` per
+    # requested column, which together made resolving the wanted columns quadratic in the
+    # width of the file (see the same fix in `io.splits.parquet`).
+    position = {name: i for i, name in enumerate(meta.schema.names)}
+    wanted = {c: i for c in columns if (i := position.get(c)) is not None}
     if not wanted:
         return out
 

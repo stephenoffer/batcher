@@ -18,6 +18,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal import events
 from batcher._internal.logging import note_suppressed
 from batcher.carbonite import ResourceManager
 from batcher.dist.adaptive_sizing import aggregate_reducer_count, record_aggregate_cardinality
@@ -420,6 +421,16 @@ def _reduce_with_recovery(
             # error, so falling back to it would silently drop this mapper's rows. See the
             # epoch invariant in `dist/shuffle_replication.py`.
             if replicas is not None and src < len(replicas):
+                if replicas[src]:
+                    events.publish(
+                        events.RECOVERY,
+                        name="aggregate",
+                        event="replica_retired",
+                        shuffle="aggregate",
+                        src=src,
+                        worker=host,
+                        replicas=len(replicas[src]),
+                    )
                 replicas[src] = []
             lineage[src] = lineage.get(src, ShuffleLineage(0, src)).reincarnate()
             target = _pick_live({host})
@@ -447,7 +458,7 @@ def _reduce_with_recovery(
         with contextlib.suppress(Exception):
             recompute(proactive)
 
-    finals = ShuffleRecovery(recovery_policy()).run(attempt, recompute)
+    finals = ShuffleRecovery(recovery_policy(), label="aggregate").run(attempt, recompute)
     if materialize:
         # Handles: (addr, ticket, rows, schema); empty buckets returned None (dropped).
         return [h for h in finals if h is not None]
@@ -605,6 +616,15 @@ def _tree_reduce_with_recovery(
             # falling back to it would silently drop this mapper's rows. The tree
             # republishes at the leaf, so the recomputed primary is the only valid copy.
             if replicas is not None and src < len(replicas):
+                if replicas[src]:
+                    events.publish(
+                        events.RECOVERY,
+                        name="aggregate",
+                        event="replica_retired",
+                        shuffle="aggregate",
+                        src=src,
+                        replicas=len(replicas[src]),
+                    )
                 replicas[src] = []
             target = next(j for j in range(workers) if j not in dead)
             leaf_addrs[src] = ray.get(
@@ -613,4 +633,4 @@ def _tree_reduce_with_recovery(
                 )
             )
 
-    return ShuffleRecovery(recovery_policy()).run(attempt, recompute)
+    return ShuffleRecovery(recovery_policy(), label="aggregate").run(attempt, recompute)

@@ -133,58 +133,34 @@ def test_distributed_distinct_records_operator_feedback():
 
 
 @pytest.mark.integration
-def test_stage_row_count_reads_every_result_shape():
-    """The adaptive loop must see a distributed stage's size, not only a collected table."""
-    from batcher.api.adaptive import _stage_row_count
-    from batcher.io.source import InMemorySource
+def test_distributed_adaptive_records_its_route():
+    """The staged-vs-one-shot bandit must be fed by the distributed path too.
 
-    batch = pa.record_batch([pa.array([1, 2, 3])], names=["a"])
-    assert _stage_row_count(pa.table({"a": [1, 2, 3]})) == 3
-    assert _stage_row_count(InMemorySource([batch])) == 3
-
-    class _Materialized:  # what a distributed stage parks
-        def row_count(self):
-            return 4096
-
-    class _Streaming:  # unbounded: no exact count to check an estimate against
-        def row_count(self):
-            return None
-
-    assert _stage_row_count(_Materialized()) == 4096
-    assert _stage_row_count(_Streaming()) is None
-    assert _stage_row_count(object()) is None
-
-
-@pytest.mark.integration
-def test_distributed_adaptive_records_a_flip(monkeypatch):
-    """`learned_adaptive_helps` must be reachable on the distributed path.
-
-    A distributed stage parks a `MaterializedSource`, so the old `isinstance(result,
-    pa.Table)` accuracy check never ran and `flipped` stayed `False` forever — adaptivity
-    could not learn from the very shapes that most need it. Forcing a wildly wrong estimate
-    makes a flip mandatory *if* the check runs at all.
+    This is the same guarantee an earlier flip-counter test pinned, restated for the
+    mechanism that replaced it. A distributed stage parks a `MaterializedSource` rather
+    than collecting a table, and the previous accuracy check keyed on `isinstance(result,
+    pa.Table)` — so adaptivity could not learn from the very shapes that most need it. The
+    route bandit reads wall time at the `collect` seam, which has no such shape dependence;
+    what this asserts is that the distributed run reaches it at all.
     """
-    from batcher.api.adaptive import staging as adaptive
-
-    monkeypatch.setattr(adaptive, "_estimate_rows", lambda *a, **k: 999_999_999)
-    recorded: dict[str, bool] = {}
-    original = adaptive._record_adaptive_flip
-    monkeypatch.setattr(
-        adaptive,
-        "_record_adaptive_flip",
-        lambda hub, plan, flipped: (
-            recorded.__setitem__("flipped", flipped),
-            original(hub, plan, flipped),
-        )[1],
-    )
+    from batcher import core
+    from batcher.kyber.learned_tuning import learned_adaptive_route
+    from batcher.kyber.signature import plan_signature
 
     fact = bt.from_arrow(_source(200_000))
     dim = bt.from_arrow(pa.table({"k": list(range(32)), "lbl": [f"d{i}" for i in range(32)]}))
     staged = fact.filter(bt.col("v") < 3.0).group_by("k").agg(s=bt.col("v").sum())
-    got = staged.join(dim, on="k").collect(distributed=True, num_workers=_WORKERS, adaptive=True)
+    query = staged.join(dim, on="k")
 
-    assert got.num_rows == 32
-    assert recorded.get("flipped") is True, "the distributed stage's size never reached the check"
+    hub = core.default_hub()
+    sig = plan_signature(query._plan)
+    for _ in range(2):
+        got = query.collect(distributed=True, num_workers=_WORKERS, adaptive=True)
+        assert got.num_rows == 32
+
+    assert learned_adaptive_route(hub, sig) is not None, (
+        "the distributed adaptive run never reached the route bandit"
+    )
 
 
 @pytest.mark.integration

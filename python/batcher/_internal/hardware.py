@@ -1,4 +1,4 @@
-"""Effective hardware detection — the CPU parallelism the process may actually use.
+"""Effective hardware detection — the CPU, memory, and cache budget this process really has.
 
 `os.cpu_count()` reports the *host's* logical cores, which over-counts inside a container:
 a Kubernetes/Ray pod is throttled by a cgroup CPU quota (CFS bandwidth) or pinned to a
@@ -6,6 +6,10 @@ cpuset, so sizing thread pools and task fan-out to the host count over-subscribe
 scheduler thrashes on context switches for cores the process will never get. This resolves
 the real budget: the CPU-affinity mask (cpuset) capped by the CFS quota, falling back to the
 host count when neither is discoverable. A neutral utility (any layer may import `_internal`).
+
+Device *inventory* — what accelerator is attached and how to reach it — lives one module
+over in `accelerators`, beside the model-to-VRAM table it belongs with, and is re-exported
+here so every existing caller and probe-reset hook keeps its import path.
 """
 
 from __future__ import annotations
@@ -14,12 +18,18 @@ import contextlib
 import functools
 import glob
 import os
-import sys
 
+from batcher._internal.accelerators import (
+    accelerator_backend,
+    gpu_devices_absent,
+    gpu_inventory,
+    reset_accelerator_probes,
+)
 from batcher._internal.mathx import ceil_div
 
 __all__ = [
     "INFERENCE_INFLIGHT_DEPTH_MAX",
+    "accelerator_backend",
     "available_cpu_count",
     "cgroup_v2_dirs",
     "cpu_contention",
@@ -27,6 +37,7 @@ __all__ = [
     "gpu_inventory",
     "l3_cache_bytes",
     "machine_memory_bytes",
+    "reset_hardware_probes",
 ]
 
 # Hard ceiling on how many partitions an inference actor keeps in flight at once (submit-ahead
@@ -36,6 +47,30 @@ __all__ = [
 # copy was the ONLY correct way to share this, and it used to be pasted instead. Past ~16
 # in-flight the GPU is already saturated and deeper submit-ahead only grows resident memory.
 INFERENCE_INFLIGHT_DEPTH_MAX = 16
+
+
+def reset_hardware_probes() -> None:
+    """Forget every memoized hardware reading, so the next call re-probes the OS.
+
+    These probes answer questions a running process cannot see change — its cgroup
+    ancestry and CPU quota, the machine's RAM and L3, the attached accelerators — so each
+    is read once and remembered, which is what keeps them off the per-query path. The one
+    caller that needs them re-read is a test faking the underlying `/proc`, `/sys`, or
+    device-node state; this is its hook, the counterpart of
+    `carbonite.memory.probe.reset_memory_sampling`. A name currently bound to a
+    test stand-in has no cache to clear, and is skipped.
+    """
+    for probe in (
+        cgroup_v2_dirs,
+        _read_cgroup_v2_quota,
+        _cfs_quota_count,
+        l3_cache_bytes,
+        machine_memory_bytes,
+    ):
+        clear = getattr(probe, "cache_clear", None)
+        if clear is not None:
+            clear()
+    reset_accelerator_probes()
 
 
 def _affinity_count() -> int | None:
@@ -57,10 +92,17 @@ def _quota_cores(quota: int, period: int) -> int | None:
     return None
 
 
+@functools.lru_cache(maxsize=8)
 def _read_cgroup_v2_quota(base: str) -> int | None:
     """Cores the cgroup v2 ``<base>/cpu.max`` permits, or `None` when unlimited/absent.
 
     ``cpu.max`` is ``"<quota> <period>"``; a ``max`` quota means unlimited.
+
+    Memoized per directory: the CFS quota is cgroup *configuration*, fixed for the
+    process's lifetime in every deployment that sets one (a K8s limit, a Ray worker's
+    slice), and `available_cpu_count` runs on every terminal op. Re-reading the file
+    each time cost one `open`+`read` syscall pair per ancestry level per query for a
+    value that never moves.
     """
     try:
         with open(os.path.join(base, "cpu.max")) as f:
@@ -76,7 +118,8 @@ def _read_cgroup_v2_quota(base: str) -> int | None:
     return None
 
 
-def cgroup_v2_dirs() -> list[str]:
+@functools.lru_cache(maxsize=1)
+def cgroup_v2_dirs() -> tuple[str, ...]:
     """Every cgroup v2 dir whose ``cpu.max`` can bind this process: mount root through leaf.
 
     The leaf comes from the process's own ``/proc/self/cgroup``. Root and leaf coincide inside a
@@ -84,6 +127,10 @@ def cgroup_v2_dirs() -> list[str]:
     *delegated* cgroup with no namespace (a Ray worker under a systemd slice). cgroup v2 enforces
     the CFS bandwidth quota at **every** level, so the effective limit is the tightest ``cpu.max``
     anywhere in the chain — checking only the ends would miss a quota set on a parent slice.
+
+    Resolved once and memoized: the CPU and memory probes read it on every terminal op, and a
+    process cannot change the cgroup it belongs to while it runs. A tuple, not a list, so the
+    memo cannot hand a mutable object to every caller (`reset_hardware_probes` clears it).
     """
     dirs = ["/sys/fs/cgroup"]
     sub = ""
@@ -94,19 +141,25 @@ def cgroup_v2_dirs() -> list[str]:
                     sub = line.rstrip().split("::", 1)[1]
                     break
     except OSError:
-        return dirs
+        return tuple(dirs)
     parts = [p for p in sub.split("/") if p]
     # Leaf first (most specific) down to the root; `_cfs_quota_count` mins over all anyway.
     for i in range(len(parts), 0, -1):
         dirs.append("/sys/fs/cgroup/" + "/".join(parts[:i]))
-    return dirs
+    return tuple(dirs)
 
 
+@functools.lru_cache(maxsize=1)
 def _cfs_quota_count() -> int | None:
     """Whole cores the cgroup CFS bandwidth quota permits, or `None` when unlimited/unavailable.
 
     cgroup v2 first (the tightest ``cpu.max`` across every dir in [`cgroup_v2_dirs`]), then
     v1 (``cpu.cfs_quota_us`` / ``cpu.cfs_period_us``).
+
+    Memoized for the same reason as `_read_cgroup_v2_quota`: off a quota'd cgroup this
+    otherwise falls all the way through to two more `open` attempts on the v1 paths, on
+    every terminal op, to conclude "no quota" again. The affinity mask — which *can* change
+    at runtime — is deliberately left un-memoized in `available_cpu_count`.
     """
     v2 = [q for d in cgroup_v2_dirs() if (q := _read_cgroup_v2_quota(d)) is not None]
     if v2:
@@ -287,196 +340,6 @@ def cpu_contention() -> dict[str, float]:
     if throttled is not None:
         out["throttled_ratio"] = throttled
     return out
-
-
-# Device nodes of accelerators that are not NVIDIA GPUs: Google TPU (`/dev/accel*`, and
-# `/dev/vfio` for v5+), AWS Neuron / Trainium / Inferentia (`/dev/neuron*`), and Intel
-# Gaudi (`/dev/hl*`). Used only to *refuse* the cheap negative — presence here means "ask
-# properly", never "an accelerator is usable".
-_ACCELERATOR_DEVICE_GLOBS = (
-    "/dev/accel[0-9]*",
-    "/dev/neuron[0-9]*",
-    "/dev/hl[0-9]*",
-    "/dev/vfio/[0-9]*",
-)
-
-
-@functools.lru_cache(maxsize=1)
-def gpu_devices_absent() -> bool:
-    """True when this host demonstrably has no GPU, decided without importing a framework.
-
-    Answers only the *cheap negative*. Proving a GPU is present needs the vendor runtime, but
-    proving one is absent usually does not, and that asymmetry is worth exploiting: the natural
-    way to ask "is there a GPU" is `torch.cuda.is_available()`, which costs ~2 s of import on
-    first call — paid on the first query of every GPU-less run, to learn there is nothing to
-    accelerate. A `stat` of a device node answers the same question in microseconds.
-
-    Deliberately conservative: it returns True only on Linux, where the vendor device nodes are
-    authoritative, and only when every one of them is missing. Anywhere else — macOS, whose
-    Metal devices have no node, or an unrecognized accelerator — it returns False, meaning "ask
-    properly", so the cheap path can never produce a false negative on a machine that has a
-    device. An explicitly empty ``CUDA_VISIBLE_DEVICES`` is honored as a definitive no.
-
-    Returns:
-        True only if a real probe is certain to find nothing.
-    """
-    if os.environ.get("CUDA_VISIBLE_DEVICES", None) == "":
-        return True  # the user masked every device; nothing to find
-    if not sys.platform.startswith("linux"):
-        return False  # no authoritative node to check — make the caller probe for real
-    # Numbered *device* nodes, not the driver's control node: a GPU-less machine built from a
-    # GPU-capable cloud image has `/dev/nvidiactl` (the driver is loaded) and no `/dev/nvidia0`
-    # at all. Keying on the control node would call that host GPU-equipped and re-introduce the
-    # very import this exists to avoid, on exactly the fleet where it is most common.
-    if glob.glob("/dev/nvidia[0-9]*"):
-        return False
-    # Non-NVIDIA accelerators expose their own nodes. Without these, a TPU, Trainium, or
-    # Gaudi host answered "definitely nothing here" — a *false* negative, which is the one
-    # answer this function promises never to give, and it suppressed the real probe on the
-    # machines that most need it. Globs, because these are numbered per device.
-    if any(glob.glob(pattern) for pattern in _ACCELERATOR_DEVICE_GLOBS):
-        return False
-    return not any(os.path.exists(p) for p in ("/dev/kfd", "/dev/dxg"))
-
-
-def accelerator_backend() -> str:
-    """The accelerator this host can compute on: ``cuda``/``rocm``/``xpu``/``mps``/``tpu``/
-    ``neuron``/``hpu``/``cpu``.
-
-    A hardware *fact*, so it lives here (the executor picks a device without importing `ml`);
-    `ml.gpu.detect_backend` re-exports it. Detected via torch where one exists (ROCm through
-    the CUDA API with ``torch.version.hip``; Intel ``torch.xpu``; Apple MPS; Cloud TPU
-    ``torch_xla``) and via device nodes for Trainium/Inferentia (``neuron``) and Gaudi
-    (``hpu``), whose frameworks are expensive to import. Naming the specific backend rather
-    than ``cpu`` lets such a host self-identify for diagnostics and `torch_device`.
-    """
-    if gpu_devices_absent() and not _tpu_available():
-        return "cpu"  # cheap negative first: `torch.cuda.is_available()` costs a ~2 s import
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            return "rocm" if getattr(torch.version, "hip", None) else "cuda"
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None and xpu.is_available():
-            return "xpu"
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available():
-            return "mps"
-    except ImportError:
-        pass  # no torch → fall through to the device-node accelerators
-    from batcher._internal.accelerators import has_gaudi_device, has_neuron_device
-
-    if _tpu_available():
-        return "tpu"
-    if has_neuron_device():
-        return "neuron"
-    return "hpu" if has_gaudi_device() else "cpu"
-
-
-def _tpu_available() -> bool:
-    """Whether a Cloud TPU is present, via `torch_xla` — import-gated and side-effect-free.
-
-    `find_spec` avoids importing (and so initializing) the XLA runtime on the common
-    no-TPU host; only when `torch_xla` is actually installed do we ask its runtime for the
-    device type. Any failure (older API, no device) reads as "no TPU"."""
-    import importlib.util
-
-    if importlib.util.find_spec("torch_xla") is None:
-        return False
-    try:
-        import torch_xla.runtime as xr  # type: ignore[import-not-found]
-
-        return xr.device_type() == "TPU"
-    except Exception:
-        return False
-
-
-def gpu_inventory() -> list[dict[str, object]]:
-    """Visible GPUs as ``{"index", "name", "memory_bytes"}``, or `[]` when none/undetectable.
-
-    **Inventory only, deliberately.** This answers "what devices are attached", which is a
-    hardware fact and so belongs in this neutral layer where any package may read it. It does
-    *not* decide how to use them — VRAM budgeting, actors-per-GPU, backend selection, and the
-    autocast policy all live in `ml.gpu`, which is the executor-facing owner of those
-    decisions. Keeping the split at inventory-vs-policy is what stops this from becoming a
-    second, competing GPU module: there is one place that says what exists and one that says
-    what to do about it.
-
-    Best-effort and dependency-free at import: NVML first (accurate, no CUDA context, and it
-    sees devices even when no framework is installed), then torch as a fallback. Both are
-    optional, so a CPU-only or stripped-down install gets `[]` rather than an error.
-
-    Returns:
-        One dict per visible device, in device order.
-    """
-    return _nvml_inventory() or _torch_inventory() or _other_accelerator_inventory()
-
-
-def _nvml_inventory() -> list[dict[str, object]]:
-    """GPUs via NVML, or `[]`. Preferred: no CUDA context, and no framework required."""
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            out: list[dict[str, object]] = []
-            for index in range(pynvml.nvmlDeviceGetCount()):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-                name = pynvml.nvmlDeviceGetName(handle)
-                out.append(
-                    {
-                        "index": index,
-                        "name": name.decode() if isinstance(name, bytes) else str(name),
-                        "memory_bytes": int(pynvml.nvmlDeviceGetMemoryInfo(handle).total),
-                    }
-                )
-            return out
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:  # pragma: no cover - NVML absent or no NVIDIA driver
-        return []
-
-
-def _torch_inventory() -> list[dict[str, object]]:
-    """GPUs via torch, or `[]`. The fallback when NVML is unavailable."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return []
-        return [
-            {
-                "index": index,
-                "name": torch.cuda.get_device_name(index),
-                "memory_bytes": int(torch.cuda.get_device_properties(index).total_memory),
-            }
-            for index in range(torch.cuda.device_count())
-        ]
-    except Exception:  # pragma: no cover - torch absent or CUDA unusable
-        return []
-
-
-def _other_accelerator_inventory() -> list[dict[str, object]]:
-    """Non-NVIDIA accelerators, so diagnostics stop reporting `[]` on a machine that has one.
-
-    NVML and `torch.cuda` between them cover NVIDIA and (via HIP) AMD; everything else fell
-    through to an empty list, which the observability page then rendered as "no GPUs" on a
-    TPU, Trainium, or Gaudi host. Reports what the device nodes say, since there is no
-    portable cross-vendor API and no memory figure to be had without each vendor's runtime —
-    an accurate name with unknown memory beats a confident, wrong "nothing here".
-    """
-    devices: list[dict[str, object]] = []
-    for kind, pattern in (
-        ("TPU", "/dev/accel[0-9]*"),
-        ("Neuron", "/dev/neuron[0-9]*"),
-        ("Gaudi", "/dev/hl[0-9]*"),
-    ):
-        for index, node in enumerate(sorted(glob.glob(pattern))):
-            devices.append(
-                {"index": index, "name": f"{kind} ({os.path.basename(node)})", "memory_bytes": 0}
-            )
-    return devices
 
 
 def process_start_method_context():

@@ -39,7 +39,7 @@ Once a query runs, the docs split by what you are trying to do. Reach for
 :::{seealso}
 - {doc}`../learning-paths/index`: an ordered reading list for your role.
 - {doc}`../migration/index`: the verb-by-verb mapping if you are coming from Spark,
-  pandas, Polars, DuckDB, Ray Data, or Daft.
+  pandas, Polars, DuckDB, or Daft.
 - {doc}`../api/reference`: the one-page cheat sheet to keep open while you work.
 - {doc}`../user-guide/troubleshooting`: what to read when the first query misbehaves.
 :::

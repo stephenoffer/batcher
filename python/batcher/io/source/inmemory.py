@@ -103,6 +103,11 @@ class InMemorySource:
     exact row count. Pass it for a relation the engine produced and consumes exactly once (an
     adaptive stage boundary), whose bounds would be rebuilt and discarded every run.
 
+    `ephemeral=True` says the same thing about the *relation's identity*: this object exists
+    for one execution, so nothing measured from it can be looked up again. It is what keeps
+    a stage boundary's statistics out of the cross-query learned store — see
+    `api.terminal._metadata.seed_column_ndv` for what recording them did instead.
+
     Examples:
         .. doctest::
 
@@ -117,14 +122,17 @@ class InMemorySource:
         "_batches",
         "_bounds_cache",
         "_cache",
+        "_identity",
         "_mean_cache",
         "_ndv_cache",
+        "_row_count",
         "_schema",
         "_stats",
         "_sum_cache",
         "_targets",
         "_valuecount_cache",
         "_zone_maps",
+        "ephemeral",
     )
     bounded = True
     # The batches are already in RAM, so a statistics pass over them costs no I/O. The
@@ -139,13 +147,25 @@ class InMemorySource:
     # shared identity; they are memoized per instance in `statistics()`.
     stable_stats_identity = False
 
-    def __init__(self, batches: list[pa.RecordBatch], *, zone_maps: bool = True) -> None:
+    def __init__(
+        self,
+        batches: list[pa.RecordBatch],
+        *,
+        zone_maps: bool = True,
+        ephemeral: bool = False,
+    ) -> None:
         if not batches:
             raise ValueError("InMemorySource requires at least one record batch")
         from batcher.config import active_config
 
         self._batches = batches
         self._zone_maps = zone_maps
+        self.ephemeral = ephemeral
+        # `batches` is fixed for the source's life, so its row count and shape key are too.
+        # Both are asked for several times per query and each answer walked every batch —
+        # the key also re-rendering the whole schema to a string. Resolved on first use.
+        self._row_count: int | None = None
+        self._identity: str | None = None
         src_schema = batches[0].schema
         if active_config().execution.shrink_output_dtypes:
             self._targets: dict[str, pa.DataType] = {}
@@ -345,7 +365,7 @@ class InMemorySource:
             The relation's exact row count and per-column bounds.
         """
         if self._stats is None:
-            rows = sum(b.num_rows for b in self._batches)
+            rows = self.row_count()
             if not self._zone_maps:
                 return SourceStatistics(row_count=rows)
             from batcher.io.source import inmemory_stats
@@ -434,7 +454,9 @@ class InMemorySource:
         Returns:
             The summed row count of every batch.
         """
-        return sum(b.num_rows for b in self._batches)
+        if self._row_count is None:
+            self._row_count = sum(b.num_rows for b in self._batches)
+        return self._row_count
 
     def identity(self) -> str:
         """A shape-based key (schema + size) — in-memory data has no cross-run identity.
@@ -453,7 +475,9 @@ class InMemorySource:
             is why `stable_stats_identity` is False.
         """
         # In-memory data has no stable cross-run identity; key by schema + size.
-        return f"mem:{self._schema}:{self.row_count()}"
+        if self._identity is None:
+            self._identity = f"mem:{self._schema}:{self.row_count()}"
+        return self._identity
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         """One `WholeSourceSplit` — resident batches are not re-partitioned for reading.

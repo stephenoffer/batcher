@@ -37,7 +37,8 @@ pub use par::{
 };
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,
-    execute_streaming_parallel_metered, streaming_parallelizes,
+    execute_streaming_parallel_metered, execute_streaming_parallel_metered_or_hand_off,
+    execute_streaming_parallel_or_hand_off, streaming_parallelizes,
 };
 
 use metrics::{IdGen, Stopwatch};
@@ -364,6 +365,38 @@ fn exec_seq(
                 m,
                 op_id,
                 "hash_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                false,
+            );
+            Ok(out)
+        }
+
+        RelOp::RangeJoin {
+            left,
+            right,
+            conditions,
+            join_type,
+            output,
+        } => {
+            let left_batches = exec_seq(left, sources, m, ids)?;
+            let right_batches = exec_seq(right, sources, m, ids)?;
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
+            let t0 = Stopwatch::start();
+            let left = ops::materialize(&left_batches)?;
+            let right = ops::materialize(&right_batches)?;
+            let out = vec![ops::range_join_batches(
+                &left, &right, conditions, *join_type, output,
+            )?];
+            record_breaker(
+                m,
+                op_id,
+                "range_join",
                 rows_in,
                 rows_build,
                 in_bytes,

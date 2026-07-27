@@ -13,9 +13,11 @@ from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.core import Cast, Expr
+from batcher.plan.expr_ir.constructors import lit, nullif
+from batcher.plan.expr_ir.core import AggExpr, Cast, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
+from batcher.plan.expr_ir.nodes import ListJoin
 
 # Where `str.chunk` may end a chunk; mirrors `bc-expr`'s `chunk::Boundary`.
 _CHUNK_BOUNDARIES = frozenset({"char", "word", "sentence", "line"})
@@ -1099,7 +1101,6 @@ class _StrNamespace:
 
     def _char_ratio(self, pattern: str) -> Expr:
         """Fraction of characters matching `pattern`; null for an empty string."""
-        from batcher.plan.expr_ir.constructors import lit, nullif
 
         return self.regexp_count(pattern) / nullif(self.len(), lit(0))
 
@@ -1314,7 +1315,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.avg_word_length().round(2)).to_pydict()
                 {'r': [4.5]}
         """
-        from batcher.plan.expr_ir.constructors import lit, nullif
 
         return self.regexp_count("[A-Za-z]") / nullif(self.word_count(), lit(0))
 
@@ -1585,7 +1585,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.estimate_tokens()).to_pydict()
                 {'r': [2]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         return (self.len() / Lit(chars_per_token)).cast("int64")
 
@@ -1607,7 +1606,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.fits_token_budget(2)).to_pydict()
                 {'r': [True, False]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         budget = require_int(budget, func="str.fits_token_budget", arg="budget")
         return self.estimate_tokens(chars_per_token) <= Lit(budget)
@@ -1875,7 +1873,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.symbol_to_word_ratio()).to_pydict()
                 {'r': [1.0]}
         """
-        from batcher.plan.expr_ir.constructors import lit, nullif
 
         return self.regexp_count(r"[^\w\s]") / nullif(self.word_count(), lit(0))
 
@@ -2030,7 +2027,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.digit_to_word_ratio().round(3)).to_pydict()
                 {'r': [0.667]}
         """
-        from batcher.plan.expr_ir.constructors import lit, nullif
 
         return self.regexp_count("[0-9]") / nullif(self.word_count(), lit(0))
 
@@ -2099,7 +2095,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.is_short(5)).to_pydict()
                 {'r': [True, False]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         max_chars = require_int(max_chars, func="str.is_short", arg="max_chars")
         return self.len() <= Lit(max_chars)
@@ -2121,7 +2116,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.is_long(5)).to_pydict()
                 {'r': [False, True]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         min_chars = require_int(min_chars, func="str.is_long", arg="min_chars")
         return self.len() >= Lit(min_chars)
@@ -2475,7 +2469,6 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.avg_sentence_length()).to_pydict()
                 {'r': [2.0]}
         """
-        from batcher.plan.expr_ir.constructors import lit, nullif
 
         return self.word_count() / nullif(self.sentence_count(), lit(0))
 
@@ -2995,6 +2988,46 @@ class _StrNamespace:
                 {'u': ['a b/c', '100%']}
         """
         return StrFunc("url_decode", self._e)
+
+    def join(self, delimiter: str = "") -> Expr:
+        """Concatenate every value into one string (Polars ``str.join``, → Utf8).
+
+        An **aggregate**, not a row operation: it collects the column and joins it, so it
+        belongs in a `select`, a `group_by().agg(...)`, or anywhere else an aggregate is
+        allowed. SQL spells the same thing ``string_agg``.
+
+        Args:
+            delimiter: The separator placed between values; none by default.
+
+        Returns:
+            A Utf8 expression: the joined text of the group.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "s": ["x", "y", "z"]})
+                >>> ds.group_by("g").agg(r=bt.col("s").str.join("-")).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'r': ['x-y', 'z']}
+        """
+
+        return ListJoin(AggExpr("list_agg", self._e), delimiter)
+
+    def escape_regex(self) -> StrFunc:
+        """Escape the regex metacharacters — the Polars ``str.escape_regex`` spelling.
+
+        Returns:
+            A new Utf8 expression, safe to embed in a pattern as a literal.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a.b"]})
+                >>> ds.select(r=bt.col("s").str.escape_regex()).to_pydict()
+                {'r': ['a\\.b']}
+        """
+        return self.regexp_escape()
 
     def regexp_escape(self) -> StrFunc:
         """Escape the regex metacharacters in the value (→ Utf8).

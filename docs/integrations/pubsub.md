@@ -58,6 +58,48 @@ it is not a position you can seek to.
 Message *attributes* are not surfaced. If your producers put routing metadata in attributes
 rather than the body, Batcher will not show it to you.
 
+## Decoding the payload
+
+The payload is opaque bytes, so decoding it is your first transformation. Write it as
+expressions and it runs in Rust rather than in a Python loop.
+
+The block below stands a local batch in for the subscription, using the same six columns
+Pub/Sub delivers, so the decode pipeline runs here exactly as it would against the real
+source:
+
+```python
+import batcher as bt
+import pyarrow as pa
+from batcher import col
+
+schema = pa.schema([
+    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
+    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
+])
+batch = pa.record_batch({
+    "key": [b"order-1", b"order-2", b"order-1"],          # the ordering key
+    "value": [b'{"sku":"a","qty":2}', b'{"sku":"b","qty":1}', b'{"sku":"a","qty":3}'],
+    "partition": [0, 0, 0],                                # always 0 on Pub/Sub
+    "offset": [7314159265358979, 2718281828459045, 1414213562373095],
+    "timestamp": [1700000000000, 1700000001000, 1700000002000],
+    "topic": ["projects/acme-prod/subscriptions/events-batcher"] * 3,
+}, schema=schema)
+
+# Stand in for the subscription; the pipeline below is what you run against the real one.
+events = bt.from_batches(lambda: iter([batch]), schema)
+
+decoded = events.select(
+    col("key").cast("string").alias("ordering_key"),
+    col("value").cast("string").json.extract_string("$.sku").alias("sku"),
+    col("value").cast("string").json.extract_int("$.qty").alias("qty"),
+)
+print(decoded.group_by("sku").agg(units=col("qty").sum()).sort("sku").to_pydict())
+# {'sku': ['a', 'b'], 'units': [5, 1]}
+```
+
+Against the live subscription, the only line that changes is the source:
+`events = bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher")`.
+
 ## It does not parallelize
 
 :::{important}

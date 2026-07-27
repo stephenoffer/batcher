@@ -197,26 +197,81 @@ def test_disabling_the_cache_gives_the_same_results():
     assert first == second == {"x": [2, 3]}
 
 
-# --- the adaptive gate must be able to invalidate a memoized plan ------------------
+# --- a bandit arm must be able to invalidate a memoized plan ------------------
 
 
-def test_adaptive_flip_ratio_invalidates_but_a_bare_tick_does_not():
-    """`record_adaptive_flip` writes only `{flips, total}` — both bookkeeping counters.
+def test_a_bandit_arms_mean_invalidates_but_a_bare_tick_does_not():
+    """`record_arm` writes only accumulators — `n`, `sum`, `sumsq` — all bookkeeping.
 
-    With neither compared, the key-set difference was empty and `any(())` was False, so the
-    write could *never* bump the generation: `learned_adaptive_helps` flipped False -> True and
-    a stale plan was served forever. Comparing the raw counters instead would bump on every
-    execution and defeat the memo. The *ratio* — the number the gate actually reads — is what
-    must decide.
+    With none of them compared, the key-set difference is empty and `any(())` is False, so the
+    write could *never* bump the generation: the arm's ranking would move while a plan chosen
+    under the old one was served forever. Comparing the raw counters instead would bump on
+    every execution and defeat the memo. The *ratio* — the mean reward `ucb1_best_arm` ranks
+    by — is what must decide.
     """
     from batcher.kyber.plan_cache import _materially_differs
 
-    # A run that ticks `total` without moving the flip ratio stays a cache hit.
-    assert not _materially_differs({"flips": 0, "total": 1}, {"flips": 0, "total": 2})
-    assert not _materially_differs({"flips": 3, "total": 10}, {"flips": 3, "total": 11})
-    # A run that moves the ratio (here, the first flip) must invalidate.
-    assert _materially_differs({"flips": 0, "total": 2}, {"flips": 1, "total": 3})
-    assert _materially_differs({"flips": 3, "total": 10}, {"flips": 4, "total": 11})
+    # A run that ticks `n` without moving the mean stays a cache hit.
+    assert not _materially_differs({"sum": 100.0, "n": 10}, {"sum": 110.0, "n": 11})
+    # A run that moves the mean materially must invalidate.
+    assert _materially_differs({"sum": 100.0, "n": 10}, {"sum": 300.0, "n": 11})
+
+
+def test_the_calibration_epoch_advances_only_with_a_refit():
+    """The epoch is the identity of the live cost fit, not a bucket of the feedback counter.
+
+    Those read as the same quantity and are different clocks. `calibrate`'s throttle counts
+    feedback rows *since its last refit*; `version // _RECALIBRATE_AFTER` counts from zero. On
+    TPC-H q8 at sf10, which records ~35 operators per execution, the bucket rolled over every
+    second run over a completely stable set of coefficients — so the plan cache alternated
+    hit/miss forever, and a miss costs 350 ms there against a hit's 160 ms.
+    """
+    import batcher as bt
+    from batcher.config import active_config
+    from batcher.kyber import calibration, cpu_shares, plan_cache
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    ds = bt.from_pydict({"x": [1, 2, 3]})
+    cfg, pk = active_config(), ds._plan.content_key()
+
+    assert calibration.refit_version(hub) == 0  # nothing fitted yet
+    assert cpu_shares.refit_version(hub) == 0
+    first = plan_cache.cache_key(pk, ds._sources, cfg, hub)
+
+    # Feedback accrues — the hub version climbs — but no refit has replaced either fit, so the
+    # plan chosen under the old one is still the plan the new one would choose.
+    calibration.calibrate(hub, cfg)
+    before = calibration.refit_version(hub)
+    for _ in range(200):
+        hub.record(_feedback_row())
+    assert plan_cache.cache_key(pk, ds._sources, cfg, hub) == plan_cache.cache_key(
+        pk, ds._sources, cfg, hub
+    )
+    assert calibration.refit_version(hub) == before, "the fit changed without being re-run"
+
+    # A refit past the throttle does advance it, so a plan chosen under the old coefficients
+    # is not served under the new ones.
+    calibration.calibrate(hub, cfg)
+    assert calibration.refit_version(hub) != before
+    assert plan_cache.cache_key(pk, ds._sources, cfg, hub) != first
+
+
+def _feedback_row():
+    from batcher.plan.feedback import OperatorFeedback
+    from batcher.plan.ids import OpId
+
+    return OperatorFeedback(
+        op_id=OpId(0),
+        kind="filter",
+        n_actual=50,
+        t_op_ms=1.0,
+        m_peak_bytes=1024,
+        selectivity=0.5,
+        batch_size=16384,
+        n_input=100,
+    )
 
 
 def test_source_stats_are_part_of_the_plan_cache_key():

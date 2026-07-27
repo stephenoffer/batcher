@@ -1148,7 +1148,13 @@ class DatasetML:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"t": list(range(100)), "x": list(range(100))})
                 >>> [(tr.count(), va.count()) for tr, va in ds.ml.time_series_split("t", 4)]
-                [(19, 20), (39, 20), (59, 20), (79, 19)]
+                [(20, 20), (40, 20), (60, 20), (80, 19)]
+
+        Note:
+            Each validation window is half-open, ``[cut_i, cut_i+1)``, and the last cut is
+            the maximum of `time_column`, so the single latest row falls outside every
+            validation fold. That is why the final pair above validates on 19 rows rather
+            than 20.
         """
         from batcher.ml.splitting import time_series_split
 

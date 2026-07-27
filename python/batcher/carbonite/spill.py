@@ -28,6 +28,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import IOError as BatcherIOError
 from batcher._internal.errors import ResourceError
+from batcher._internal.paths import open_private, private_dir
 
 __all__ = ["SpillHandle", "SpillTier", "TieredSpillStore"]
 
@@ -254,7 +255,9 @@ class _BucketWriter:
         else:
             self._tier = SpillTier.LOCAL
             self._path = os.path.join(store._local_dir, f"{self._name}.arrow")
-            self._fh = pa.OSFile(self._path, "wb")
+            # 0600 at `open`, not by a later chmod: a chmod leaves a window in which the
+            # rows are world-readable, and the private directory above is best-effort.
+            self._fh = pa.PythonFile(open_private(self._path), mode="w")
             opts = _ipc_options(store._compression)
             self._writer = pa.ipc.new_stream(self._fh, schema, options=opts)
 
@@ -299,7 +302,9 @@ class TieredSpillStore:
         compression: str | None = "lz4",
     ) -> None:
         self._local_dir = local_dir
-        os.makedirs(local_dir, exist_ok=True)
+        # Owner-only. A spill file holds the query's actual rows on a shared scratch path
+        # such as /tmp, so the default 0755/0644 makes them readable by every local user.
+        private_dir(local_dir)
         self._remote_uri = remote_uri.rstrip("/") if remote_uri else None
         # Overflow to the remote tier tracks the disk that actually exists, not a static
         # guess — so a smaller-than-configured scratch volume overflows before it fills

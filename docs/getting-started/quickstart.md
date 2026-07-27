@@ -28,7 +28,8 @@ print(ds.columns)
 ```
 
 A `Dataset` is lazy. Each operation returns a new `Dataset` describing a plan, and no
-work runs until a terminal operation such as `to_pydict` or `collect`.
+work runs until a terminal operation such as `to_pydict` or `collect`. That one idea
+explains most of the API, and {doc}`concepts/lazy` unpacks it.
 
 ## Filter rows
 
@@ -40,6 +41,8 @@ filtered = ds.filter(bt.col("price") >= 30.0)
 print(filtered.to_pydict())
 # {'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
 ```
+
+Null handling, `is_in`, and sampling are in {doc}`../user-guide/filtering`.
 
 ## Select and transform columns
 
@@ -55,6 +58,10 @@ enriched = ds.with_columns(total=bt.col("price") * bt.col("qty"))
 print(enriched.columns)
 # ['id', 'name', 'category', 'price', 'qty', 'total']
 ```
+
+Column work is expressed rather than looped, and the expression language has typed
+accessors for strings, dates, lists, and structs. See {doc}`../user-guide/transformations`
+and {doc}`../user-guide/expressions`.
 
 ## Aggregate
 
@@ -72,6 +79,10 @@ print(summary.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'orders': [3, 2]}
 ```
 
+{doc}`../user-guide/aggregations` covers the full aggregate list, pivots, and rollups, and
+{doc}`../user-guide/window-functions` covers ranking and running totals, which aggregate
+without collapsing rows.
+
 ## Join
 
 Join two datasets on a shared key. The default is an inner join.
@@ -82,6 +93,24 @@ joined = ds.join(dim, on="category").select("id", "category", "region").sort("id
 print(joined.to_pydict())
 # {'id': [1, 2, 3, 4, 5], 'category': ['a', 'b', 'a', 'b', 'a'], 'region': ['west', 'east', 'west', 'east', 'west']}
 ```
+
+Left, outer, semi, anti, and as-of joins take the same shape. See {doc}`../user-guide/joins`.
+
+## Write SQL instead, if you prefer
+
+The same plan comes out either way, so you can mix the two spellings in one pipeline.
+
+```python
+revenue = bt.sql(
+    "SELECT category, SUM(price * qty) AS revenue FROM sales GROUP BY category",
+    sales=ds,
+)
+print(revenue.sort("category").to_pydict())
+# {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
+```
+
+{doc}`../user-guide/sql` lists the supported surface, and {doc}`../tutorials/sql-to-dataframe`
+translates a SQL query into DataFrame verbs step by step.
 
 ## Execute and inspect
 
@@ -98,11 +127,17 @@ print(table.num_rows)
 # 5
 ```
 
-`explain` shows the optimized plan without executing it:
+`explain` shows the optimized plan without executing it, which is how you check that a
+filter reached the scan instead of running after it:
 
 ```python
 print(ds.filter(bt.col("price") > 25.0).explain())
 ```
+
+Reading a plan is a skill worth ten minutes: {doc}`../user-guide/explain-plans`.
+
+Some questions never need a scan at all. A `count()` on a Parquet source is answered from
+file metadata, and {doc}`../user-guide/metadata-shortcuts` lists the rest.
 
 ## Read and write files
 
@@ -114,6 +149,26 @@ snippet below needs real files, so it's shown rather than run.
 ds = bt.read("s3://bucket/events.parquet")
 ds.filter(bt.col("status") == "active").write.parquet("output/active.parquet")
 ```
+
+Local paths work the same way, and this one runs:
+
+```python
+ds.write.parquet("sales.parquet")
+back = bt.read.parquet("sales.parquet")
+print(back.count())
+# 5
+```
+
+Every format, glob, and credential path is in {doc}`../user-guide/reading-data` and
+{doc}`../user-guide/writing-data`, and object stores are in
+{doc}`../user-guide/cloud-storage`.
+
+## What you have now
+
+You built a dataset, filtered and derived columns, aggregated, joined, ran the same query
+as SQL, inspected a plan, and round-tripped a file. That is the whole shape of a Batcher
+pipeline: **read, chain lazy verbs, collect once at the end.** Scaling it up changes the
+source and the machine, not the code.
 
 ## Next steps
 
@@ -138,3 +193,13 @@ Every operator, with runnable examples.
 End-to-end walkthroughs you can run.
 :::
 ::::
+
+## See also
+
+- {doc}`../tutorials/first-pipeline`: the same shape again, on a realistic dataset.
+- {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one
+  short page each.
+- {doc}`../migration/index`: the verb-by-verb table if you already know pandas, Polars,
+  Spark, or SQL.
+- {doc}`../api/reference`: a one-page cheat sheet to keep open while you work.
+- {doc}`../user-guide/troubleshooting`: what to read when the first query misbehaves.

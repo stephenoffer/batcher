@@ -23,13 +23,13 @@ estimate held, `staging` runs the stage loop and owns its resources, and
 
 from __future__ import annotations
 
-from batcher.api.adaptive.gating import _estimate_accurate, resolve_adaptive
-from batcher.api.adaptive.staging import AdaptiveResult, _stage_row_count, execute_adaptive
+from batcher.api.adaptive.gating import _estimate_accurate, record_adaptive_route, resolve_adaptive
+from batcher.api.adaptive.staging import AdaptiveResult, execute_adaptive
 
 __all__ = [
     "AdaptiveResult",
     "_estimate_accurate",
-    "_stage_row_count",
     "execute_adaptive",
+    "record_adaptive_route",
     "resolve_adaptive",
 ]

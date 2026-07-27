@@ -94,5 +94,13 @@ The two layers here sit in the middle of the resolution order, highest first:
 1. Built-in defaults.
 
 So a `BATCHER_*` variable overrides a value set in `BATCHER_CONFIG_FILE`, and a
-runtime `set_config` or `config_context` overrides both. See {doc}`index` for the
-runtime entry points and {doc}`options` for every field a variable can name.
+runtime `set_config` or `config_context` overrides both.
+
+## See also
+
+- {doc}`index`: the runtime entry points these variables are overridden by.
+- {doc}`options`: every field a `BATCHER_*` variable can name, with its default.
+- {doc}`profiles`: ready-made configurations for common machine shapes.
+- {doc}`../user-guide/secrets`: why credentials belong in `env:` and `file:` references
+  rather than in a config value.
+- {doc}`../integrations/ray`: the variables a cluster reads, including the shuffle token.

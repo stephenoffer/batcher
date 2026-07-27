@@ -228,9 +228,16 @@ pub struct DiskSpillStore {
 /// Spilled data is the query's *actual rows* — the same bytes the caller may have taken
 /// care to encrypt in flight — written to a shared scratch path such as `/tmp`. Created
 /// with the default mode it is world-readable, so any other local user on the node can
-/// read a spilled join or aggregate. Restricting the directory is the single choke point:
+/// read a spilled join or aggregate. Restricting the directory is the primary choke point:
 /// without search permission on it, the `part-*.arrow` files inside are unreachable
 /// regardless of their own mode.
+///
+/// It is not the *only* one, which is why [`create_private`] restricts the files too. This
+/// function is best-effort and **silently ignores failure** — deliberately, so a filesystem
+/// that cannot represent Unix modes never fails a query over a hardening step — and that
+/// means the directory can legitimately end up 0755 with nothing said. Measured before the
+/// file mode was fixed: the directory came out 0700 and every `part-*.arrow` inside it
+/// 0644, so the entire protection rested on one call whose failure is by design invisible.
 ///
 /// Best-effort by design — a filesystem that cannot represent Unix modes (or a Windows
 /// host) must not fail the query over a hardening step, and the spill path is otherwise
@@ -243,6 +250,29 @@ fn restrict_to_owner(dir: &std::path::Path) {
     }
     #[cfg(not(unix))]
     let _ = dir;
+}
+
+/// Create a spill file readable only by the running user.
+///
+/// The mode is set in the `open` rather than by a following `chmod`: a chmod leaves a
+/// window in which the file is world-readable, and these files hold the query's actual
+/// rows. Non-unix falls back to a plain create, matching [`restrict_to_owner`]'s stance
+/// that the spill path stays platform-neutral.
+fn create_private(path: &std::path::Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+    }
 }
 
 impl DiskSpillStore {
@@ -318,7 +348,7 @@ impl SpillStore for DiskSpillStore {
                 .write_options
                 .get_or_insert_with(|| self.codec.write_options(&batch.schema()))
                 .clone();
-            let file = File::create(&self.paths[partition])?;
+            let file = create_private(&self.paths[partition])?;
             self.writers[partition] = Some(StreamWriter::try_new_with_options(
                 file,
                 &batch.schema(),

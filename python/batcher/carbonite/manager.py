@@ -39,6 +39,16 @@ from batcher.carbonite.policies import (
     learned_channel_morsel_bytes,
     load_shuffle_window,
 )
+from batcher.carbonite.policies.spill_shape import (
+    MAX_SPILL_PARTITIONS,
+    MIN_SPILL_PARTITIONS,
+    SPILL_BYTES_PER_PARTITION,
+    SPILL_COMPRESS_ABOVE,
+    partitions_for_envelope,
+    partitions_for_volume,
+    should_compress,
+    spill_basis,
+)
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 from batcher.plan.physical import PhysicalPlan
@@ -58,16 +68,12 @@ _MORSEL_PRESSURE_FACTORS = {
 _MIN_MORSEL_ROWS = 1024  # floor: a morsel never shrinks below a cache-efficient batch
 _MIN_MORSEL_BYTES = 64 * 1024  # 64 KiB floor (companion byte bound)
 
-# Learned spill-partition sizing: aim each out-of-core bucket at roughly this many bytes
-# of the LEARNED peak, so a bigger measured working set shards into more, smaller buckets
-# (bounded memory per bucket) and a small one stays coarse. Only *shards* — the shuffle
-# is result-invariant in the number of partitions.
-_SPILL_BYTES_PER_PARTITION = 128 * 1024 * 1024  # 128 MiB target per spill bucket
-_MIN_SPILL_PARTITIONS = 2
-_MAX_SPILL_PARTITIONS = 4096
-# Above this learned peak a spill bucket compresses well enough to be worth the CPU:
-# a large out-of-core state is IO-bound, so trading CPU for less disk/network wins.
-_SPILL_COMPRESS_ABOVE = 512 * 1024 * 1024  # 512 MiB
+# Re-exported under their historical private names: the sizing rules moved to
+# `policies.spill_shape`, but callers and tests name them from here.
+_SPILL_BYTES_PER_PARTITION = SPILL_BYTES_PER_PARTITION
+_MIN_SPILL_PARTITIONS = MIN_SPILL_PARTITIONS
+_MAX_SPILL_PARTITIONS = MAX_SPILL_PARTITIONS
+_SPILL_COMPRESS_ABOVE = SPILL_COMPRESS_ABOVE
 
 
 class ResourceManager:
@@ -340,13 +346,9 @@ class ResourceManager:
     def recommend_spill_partitions(self, plan: PhysicalPlan) -> int | None:
         """Number of out-of-core buckets to shard `plan`'s spilled state into, or ``None``.
 
-        Sizes the bucket count so each bucket holds ~`_SPILL_BYTES_PER_PARTITION` of the
-        LEARNED peak (`m_peak_bytes`-blended, not the plan guess): a larger measured
-        working set shards into more, smaller buckets so per-bucket memory stays bounded,
-        a small one stays coarse. Returns ``None`` when the plan is un-sized (nothing
-        learned or estimated) so the caller keeps its default partition count. The number
-        of partitions only *shards* the shuffle — the result is identical for any count
-        (the mergeable algebra), so this is a pure performance lever.
+        Shards by the LEARNED peak (`m_peak_bytes`-blended, not the plan guess) via
+        `policies.spill_shape`, which documents the sizing rule. Returns ``None`` when the
+        plan is un-sized so the caller keeps its default partition count.
 
         NOTE for the orchestrator: consume this in place of the blind
         `partitions_from_physical` fallback to right-size out-of-core sharding.
@@ -354,14 +356,7 @@ class ResourceManager:
         peak = self._peak_bytes(plan)
         if peak <= 0:
             return None
-        # Prefer the *measured* spill volume when a family has a spill history: buckets shard
-        # only the bytes that actually go to disk, which is smaller than the total working-set
-        # peak (which includes the in-memory budget that never spills). Fall back to peak when
-        # nothing has spilled yet. Result-invariant either way — this only sets bucket count.
-        volume = self._mem_model.predicted_spill_bytes(plan.ops)
-        basis = volume if volume > 0 else peak
-        parts = max(_MIN_SPILL_PARTITIONS, -(-basis // _SPILL_BYTES_PER_PARTITION))  # ceil-div
-        return min(_MAX_SPILL_PARTITIONS, int(parts))
+        return partitions_for_volume(spill_basis(peak, self._spill_volume(plan)))
 
     def flap_rate(self) -> float | None:
         """This run's measured pressure-level flap rate, or `None` if too few samples.
@@ -385,16 +380,12 @@ class ResourceManager:
         `suggested_bounds` counter-offer naming the per-operator byte envelope the plan *would*
         fit in. Nothing consumed it, so the conductor degraded an infeasible verdict to a bare
         `must_spill` boolean and then sharded the out-of-core phase by
-        `_SPILL_BYTES_PER_PARTITION` — a fixed constant that knows nothing about the machine's
-        actual budget. On a memory-tight host that produces buckets which individually still do
-        not fit, which is the exact failure admission had just diagnosed.
+        a fixed constant that knows nothing about the machine's actual budget. On a
+        memory-tight host that produces buckets which individually still do not fit, which is
+        the exact failure admission had just diagnosed.
 
-        Sharding by the offered envelope instead makes the counter-offer binding: with a peak
-        (or measured spill volume) of `B` and an envelope of `E`, `ceil(B / E)` buckets each
-        hold about `E`. Clamped to `_MAX_SPILL_PARTITIONS` like every other recommendation.
-
-        Result-invariant: partition count only *shards* the shuffle, and the mergeable algebra
-        gives an identical merged result for any count. This is a memory-safety lever only.
+        Sharding by the offered envelope instead makes the counter-offer binding
+        (`policies.spill_shape.partitions_for_envelope`).
 
         Args:
             plan: The physical plan about to be routed out-of-core.
@@ -404,16 +395,10 @@ class ResourceManager:
             The minimum bucket count, or `0` when there is no bound or the plan is un-sized
             (the caller then keeps whatever count it already chose).
         """
-        if bounds is None or bounds.m_max_bytes <= 0:
+        if bounds is None:
             return 0
-        # Same basis as `recommend_spill_partitions`: the measured spill volume when a family
-        # has a spill history, else the learned-blended peak.
-        volume = self._mem_model.predicted_spill_bytes(plan.ops)
-        basis = volume if volume > 0 else self._peak_bytes(plan)
-        if basis <= 0:
-            return 0
-        parts = -(-basis // bounds.m_max_bytes)  # ceil-div
-        return min(_MAX_SPILL_PARTITIONS, int(max(1, parts)))
+        basis = spill_basis(self._peak_bytes(plan), self._spill_volume(plan))
+        return partitions_for_envelope(basis, bounds.m_max_bytes)
 
     def recommend_spill_compression(self, plan: PhysicalPlan) -> bool | None:
         """Whether spilling `plan` should compress its buckets, from the learned peak.
@@ -426,10 +411,11 @@ class ResourceManager:
 
         NOTE for the orchestrator: map this onto `memory.spill_compression` when spilling.
         """
-        peak = self._peak_bytes(plan)
-        if peak <= 0:
-            return None
-        return peak >= _SPILL_COMPRESS_ABOVE
+        return should_compress(self._peak_bytes(plan))
+
+    def _spill_volume(self, plan: PhysicalPlan) -> int:
+        """Bytes this plan's family is predicted to actually write to disk, or 0."""
+        return self._mem_model.predicted_spill_bytes(plan.ops)
 
     def _soft_budget(self) -> int:
         """Bytes a query aims to stay under (the admission/throttle threshold)."""
@@ -440,6 +426,36 @@ class ResourceManager:
         cap). Both `should_spill` and `reserve` use this one figure, derived from the
         once-sampled envelope, so the two decisions never disagree."""
         return int(self._envelope * self._config.memory.hard_limit)
+
+    @contextmanager
+    def admit(self) -> Iterator[object]:
+        """Hold an execution slot for the block, sized to what else is running.
+
+        A context manager rather than a `validate`-style call because the slot must be
+        held for the *duration* of execution, and a function that returns a verdict cannot
+        bracket that — the query would be counted as running for as long as it took to
+        decide, which is not the thing being bounded.
+
+        Yields an `ExecutionGrant` whose `workers` is the rayon pool width this query
+        should request. `workers=0` means unbounded, which is what a single query gets and
+        what every query gets when `execution.max_concurrent_queries` is 0 (the default) —
+        so an unconfigured deployment executes exactly as it did before this existed.
+
+        Yields:
+            The `ExecutionGrant` for this query.
+
+        Raises:
+            AdmissionTimeout: If the queue is full or the wait deadline passes.
+        """
+        from batcher.carbonite.policies.concurrency import process_limiter
+
+        limiter = process_limiter(self._config)
+        timeout = float(getattr(self._config.execution, "admission_timeout_s", 0.0) or 0.0)
+        grant = limiter.acquire(timeout=timeout)
+        try:
+            yield grant
+        finally:
+            limiter.release()
 
     @contextmanager
     def reserve(self, m_bytes: int) -> Iterator[bool]:

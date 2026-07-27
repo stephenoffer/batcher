@@ -26,10 +26,10 @@ needs GPUs and a distributed benchmark needs a cluster. Each is labeled where it
 
 | Family | Hardware |
 |---|---|
-| Operators, TPC-H, connectors | Single node, 16 cores, 30 GB |
+| Operators, TPC-H, ClickBench, connectors | Single node, 16 cores, 30 GB |
 | Multimodal ingest (image, point cloud) | Single node, 96 cores |
-| Ray Data map / ETL / training ingest | Single node, 96 cores, 188 GB |
-| GPU inference and embeddings | 8×T4 across a Ray cluster |
+| `map_batches` ETL and training ingest | Single node, 96 cores, 188 GB |
+| GPU inference and embeddings | 8xT4 across a Ray cluster |
 | Distributed scale-out | 9-node Ray cluster, 128 CPUs |
 
 :::{note}
@@ -48,9 +48,9 @@ is timed on a different copy of the input. Timings are best-of-N warm.
 | Engine | Configuration | Why |
 |---|---|---|
 | Batcher | Single-node, in-process | Its low-overhead strength |
-| Ray Data | Attached to the live cluster (`ray.init(address="auto")`) | Where it is designed to be strongest |
-| Daft | Native multithreaded local engine (`DAFT_RUNNER=native`) | Its fastest runner for single-node work |
+| Daft | Native multithreaded local engine (`DAFT_RUNNER=native`), or its Ray runner for the cluster grid | Its fastest runner for each shape |
 | DuckDB, Polars | In-process | The only way they run |
+| Distributed engines | Attached to the live cluster (`ray.init(address="auto")`) | Where they are designed to be strongest |
 
 ## Data
 
@@ -68,7 +68,7 @@ export DAFT_RUNNER=native
 python benchmarks/run.py --benchmark tpch      --tier single
 python benchmarks/run.py --benchmark operators --tier single
 
-# the AI/data-plane lineup: batcher vs ray data vs daft
+# the AI and data-plane lineup
 python benchmarks/run.py --benchmark operators --tier multi
 
 # multimodal ingest
@@ -86,9 +86,9 @@ python benchmarks/scenarios/dist_bench.py --workers 4
 
 `benchmarks/BENCHMARK_RESULTS.md` is the complete record, including the runs that went
 badly. It keeps the regressions and what fixed them: the JSON writer that once took 65
-seconds, the image pipeline that started at 350 img/s and lost to both competitors before
-five fixes took it to 5,700, the distributed path that used 1 of 8 GPUs. A benchmark file
-with no failures in it is a marketing document, not a measurement.
+seconds, the image pipeline that started at 350 img/s before five fixes took it to 5,700,
+the distributed path that used 1 of 8 GPUs. A benchmark file with no failures in it is a
+marketing document, not a measurement.
 
 ## See also
 

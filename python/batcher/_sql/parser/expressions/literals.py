@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import datetime as _dt
 
-from batcher.plan.expr_ir import Binary, Expr, lit
+from sqlglot import expressions as exp
+
+from batcher.plan.expr_ir import Binary, Cast, Expr, lit
 from batcher.plan.expr_ir.func_nodes import DateOffset
 
 _AGG_FUNCS = {
@@ -218,17 +220,28 @@ def _literal(node) -> Expr:
 
 
 def _int_literal(node) -> int | None:
-    """The integer a literal node denotes, or `None` if it isn't an integer literal.
+    """The integer a constant node denotes, or `None` if it is not a constant integer.
 
     A negative number is not a literal in the parse tree: sqlglot renders `-2` as a `Neg`
     wrapping the literal `2`. Matching only `Literal` would therefore reject every negative
     argument, and `ROUND(x, -2)` is a legal query.
-    """
-    from sqlglot import expressions as exp
 
+    Constant *arithmetic* is folded for the same reason. A parser may rewrite a call into
+    one — Spark's `date_sub(d, 1)` arrives as `date_add(d, 1 * -1)` — and refusing it
+    reported "must be an integer literal" for an argument the user did write as a literal.
+    """
+    if isinstance(node, exp.Paren):
+        return _int_literal(node.this)
     if isinstance(node, exp.Neg):
         inner = _int_literal(node.this)
         return None if inner is None else -inner
+    if isinstance(node, (exp.Add, exp.Sub, exp.Mul)):
+        left, right = _int_literal(node.this), _int_literal(node.expression)
+        if left is None or right is None:
+            return None
+        if isinstance(node, exp.Add):
+            return left + right
+        return left - right if isinstance(node, exp.Sub) else left * right
     if isinstance(node, exp.Literal) and not node.is_string:
         try:
             return int(node.this)
@@ -245,8 +258,6 @@ def _const_str_arg(node, what: str, role: str = "argument") -> str:
     the function and `role` the argument, so the rejection reads e.g. `split_part()
     requires a constant string delimiter`.
     """
-    from sqlglot import expressions as exp
-
     if not (isinstance(node, exp.Literal) and node.is_string):
         raise NotImplementedError(f"{what} requires a constant string {role}")
     return node.this
@@ -277,8 +288,6 @@ def _fold_const_arith(node) -> Expr | None:
     """
     from decimal import Decimal, InvalidOperation
 
-    from sqlglot import expressions as exp
-
     op = {exp.Add: "+", exp.Sub: "-", exp.Mul: "*", exp.Div: "/"}.get(type(node))
     if op is None:
         return None
@@ -306,17 +315,42 @@ def _fold_const_arith(node) -> Expr | None:
     return lit(float(r))
 
 
+# INTERVAL units, by which component of `offset_by` they contribute to. Calendar
+# months clamp at end-of-month; days and microseconds are exact. Every DuckDB unit
+# spelling is here, singular and plural (`INTERVAL 2 HOURS`), so a unit that the
+# engine can express is never refused for a spelling.
+_INTERVAL_MONTHS = {
+    "MONTH": 1,
+    "QUARTER": 3,
+    "YEAR": 12,
+    "DECADE": 120,
+    "CENTURY": 1200,
+    "MILLENNIUM": 12000,
+}
+_INTERVAL_DAYS = {"DAY": 1, "WEEK": 7}
+_INTERVAL_MICROS = {
+    "HOUR": 3_600_000_000,
+    "MINUTE": 60_000_000,
+    "SECOND": 1_000_000,
+    "MILLISECOND": 1_000,
+    "MICROSECOND": 1,
+}
+
+
 def _apply_interval(date_expr: Expr, interval, *, subtract: bool) -> Expr:
     """`ts/date +/- INTERVAL n <unit>` for a DATE or TIMESTAMP operand.
 
-    DAY/WEEK add exact days and MONTH/YEAR add calendar months, both via the
-    type-preserving `offset_by` (`DateOffset`) node so the shift is applied
+    Calendar units (MONTH/QUARTER/YEAR/DECADE/CENTURY/MILLENNIUM) add months,
+    DAY/WEEK add exact days, and the sub-day units add exact microseconds — all via
+    the type-preserving `offset_by` (`DateOffset`) node so the shift is applied
     correctly whether the operand is a Date32 (epoch days) or a Timestamp
-    (microseconds). Returns the operand's own type (DuckDB promotes a DATE to
-    timestamp, but the calendar value is the same).
-    """
-    from sqlglot import expressions as exp
+    (microseconds).
 
+    A sub-day offset is not representable on a Date32, and DuckDB promotes the
+    operand to TIMESTAMP for exactly that reason (`DATE '2024-03-05' + INTERVAL 1
+    HOUR` is a timestamp there), so the cast is applied here rather than letting the
+    engine reject the shift. On a timestamp operand the cast is a no-op.
+    """
     if isinstance(interval, exp.Interval):
         n = int(interval.this.name)
         unit = (interval.text("unit") or "DAY").upper()
@@ -326,15 +360,14 @@ def _apply_interval(date_expr: Expr, interval, *, subtract: bool) -> Expr:
         raise NotImplementedError("only constant interval literals are supported")
     if subtract:
         n = -n
+    unit = unit.removesuffix("S")  # `INTERVAL 2 HOURS` — no unit name ends in S
 
-    if unit.startswith("DAY"):
-        return DateOffset(date_expr, 0, n, 0)
-    if unit.startswith("WEEK"):
-        return DateOffset(date_expr, 0, n * 7, 0)
-    if unit.startswith("MONTH"):
-        return DateOffset(date_expr, n, 0, 0)
-    if unit.startswith("YEAR"):
-        return DateOffset(date_expr, n * 12, 0, 0)
+    if unit in _INTERVAL_MONTHS:
+        return DateOffset(date_expr, n * _INTERVAL_MONTHS[unit], 0, 0)
+    if unit in _INTERVAL_DAYS:
+        return DateOffset(date_expr, 0, n * _INTERVAL_DAYS[unit], 0)
+    if unit in _INTERVAL_MICROS:
+        return DateOffset(Cast(date_expr, "timestamp"), 0, 0, n * _INTERVAL_MICROS[unit])
     raise NotImplementedError(f"INTERVAL unit {unit} is not supported")
 
 
@@ -390,8 +423,6 @@ def _dtype_name(to) -> str:
 
 
 def _build_binops():
-    from sqlglot import expressions as exp
-
     return {
         exp.Add: lambda a, b: a + b,
         exp.Sub: lambda a, b: a - b,

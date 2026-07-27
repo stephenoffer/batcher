@@ -52,12 +52,33 @@ def source_stats_key(source: object) -> str | None:
     identity = getattr(source, "identity", None)
     if not callable(identity):
         return None
+    prefix = _tenant_prefix()
     if not getattr(source, "stable_stats_identity", True):
-        return f"obj:{id(source)}"
+        return f"{prefix}obj:{id(source)}"
     try:
-        return f"id:{identity()}"
+        return f"{prefix}id:{identity()}"
     except Exception:  # pragma: no cover - a source that cannot key itself
         return None
+
+
+def _tenant_prefix() -> str:
+    """``"<tenant>/"`` inside a `tenant()` block, else ``""``.
+
+    Learned statistics include column `min`/`max` — real values out of real columns — and
+    the `MetadataHub` they live in may be a Redis or object-storage backend shared across
+    a whole fleet. Unqualified, one tenant's measured bounds are read back by every other
+    tenant's optimizer, which is a value leak dressed up as a cost estimate.
+
+    Empty outside a tenant scope, so an un-tenanted deployment keys exactly as before and
+    keeps every statistic it has already learned.
+    """
+    try:
+        from batcher.config import active_config
+
+        tenant_id = active_config().tenant.tenant_id
+    except Exception:  # pragma: no cover - config unavailable during early import
+        return ""
+    return f"{tenant_id}/" if tenant_id else ""
 
 
 @dataclass(frozen=True, slots=True)

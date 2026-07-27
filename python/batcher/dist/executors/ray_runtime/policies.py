@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 from collections import deque
 
+from batcher._internal import events
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
@@ -123,8 +124,11 @@ def _is_transient_udf_error(exc: BaseException) -> bool:
 def speculation_policy():
     """Build the straggler-speculation policy from the active config.
 
-    Default `max_backups=0` (speculation off → the barrier is a plain `ray.get`),
-    so distributed results are unchanged unless a config explicitly enables it.
+    `max_backups` defaults to 1 (`DistributedConfig.speculation_max_backups`), so one
+    straggler per barrier gets a duplicate. Setting it to 0 turns speculation off and makes
+    the barrier a plain `ray.get`. Either way distributed *results* are unchanged: a backup
+    is a duplicate of a deterministic task and the barrier keeps whichever copy finishes
+    first.
 
     The straggler *factor* (how many multiples of the median task time before a backup fires) is
     tuned from the measured task-time spread of prior shuffle stages (`_learned_straggler_factor`):
@@ -438,6 +442,17 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
         newly_dead = host not in dead
         dead.add(host)
         confirmed.discard(host)  # a host that completed earlier can still be preempted
+        if newly_dead:
+            # The first moment anything in the engine knows this worker is gone. Published
+            # only on the transition, so a host that fails ten sources is one event.
+            events.publish(
+                events.RECOVERY,
+                event="worker_lost",
+                worker=host,
+                src=src,
+                dead_total=len(dead),
+                workers=workers,
+            )
         return newly_dead  # progress: don't charge this retry to `src`'s budget
 
     def _on_done(src: int) -> None:
