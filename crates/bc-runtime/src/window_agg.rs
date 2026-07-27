@@ -398,3 +398,181 @@ fn unsupported(func: WindowFn, values: &ArrayRef) -> RuntimeError {
         dtype: values.data_type().to_string(),
     }
 }
+
+// --- explicit frames, via one generic two-stack slide ------------------------
+
+/// A sliding window over an **associative, commutative** fold, kept as two cumulative
+/// stacks — the "queue from two stacks" trick.
+///
+/// This is the generalization of `window_frame::FifoSum`, which is the same structure
+/// specialized to `+`. Nothing about it was ever specific to addition: it exists because
+/// the naive O(1) slide (apply the entering value, *un-apply* the leaving one) needs an
+/// **inverse**, and most folds do not have one. `product` cannot divide back out a zero;
+/// `bit_and` and `bool_and` cannot un-AND at all. The two-stack form never un-applies —
+/// the reported value is always the fold of exactly the elements currently in the window
+/// — so it serves every fold at O(1) amortized cost, which is why generalizing it gives
+/// all six a framed form at once instead of six hand-written kernels.
+///
+/// Commutativity is required because `value()` combines the two stacks' accumulators
+/// without regard to which side is older. Every fold routed here (`*`, `&`, `|`, `^`,
+/// `AND`, `OR`) is commutative; a non-commutative one would need the halves ordered.
+struct SlidingFold<T, F> {
+    /// `(value, fold of this entry and everything below it)` — the push side.
+    back: Vec<(T, T)>,
+    /// The pop side; filled by draining `back` in reverse when it empties.
+    front: Vec<(T, T)>,
+    combine: F,
+}
+
+impl<T: Clone, F: Fn(&T, &T) -> T> SlidingFold<T, F> {
+    fn new(combine: F) -> Self {
+        Self {
+            back: Vec::new(),
+            front: Vec::new(),
+            combine,
+        }
+    }
+
+    fn push(&mut self, v: T) {
+        let acc = match self.back.last() {
+            Some((_, a)) => (self.combine)(a, &v),
+            None => v.clone(),
+        };
+        self.back.push((v, acc));
+    }
+
+    fn pop(&mut self) {
+        if self.front.is_empty() {
+            // Reverse `back` into `front`, rebuilding accumulators bottom-up so the
+            // oldest entry ends on top of `front` and is popped first (FIFO order).
+            while let Some((v, _)) = self.back.pop() {
+                let acc = match self.front.last() {
+                    Some((_, a)) => (self.combine)(a, &v),
+                    None => v.clone(),
+                };
+                self.front.push((v, acc));
+            }
+        }
+        self.front.pop();
+    }
+
+    /// The fold of every value currently in the window, or `None` when it is empty.
+    fn value(&self) -> Option<T> {
+        match (self.back.last(), self.front.last()) {
+            (Some((_, a)), Some((_, b))) => Some((self.combine)(a, b)),
+            (Some((_, a)), None) => Some(a.clone()),
+            (None, Some((_, b))) => Some(b.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Explicit-frame form of the folds: slide a [`SlidingFold`] across each partition,
+/// pushing entering rows and popping leaving ones.
+///
+/// Null rows are simply not pushed, so an all-null frame reports `None` — the same rule
+/// the running and whole-partition forms follow, and the reason the fold's identity
+/// element is never needed (an empty frame is null, not `1`/`true`/`0`).
+pub(crate) fn framed(
+    func: WindowFn,
+    ordered: &[Vec<usize>],
+    values: &ArrayRef,
+    frame: crate::window_frame::Frame,
+    order_rows: Option<&Rows>,
+    num_rows: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    match func {
+        WindowFn::Product => {
+            let f = numeric(values, func)?;
+            let out = slide(
+                ordered,
+                frame,
+                order_rows,
+                num_rows,
+                |row| f.is_valid(row).then(|| f.value(row)),
+                |a, b| a * b,
+            );
+            Ok(Arc::new(Float64Array::from(out)))
+        }
+        WindowFn::BoolAnd | WindowFn::BoolOr => {
+            let b = boolean(values, func)?;
+            let is_and = func == WindowFn::BoolAnd;
+            let out = slide(
+                ordered,
+                frame,
+                order_rows,
+                num_rows,
+                |row| b.is_valid(row).then(|| b.value(row)),
+                move |x, y| if is_and { *x && *y } else { *x || *y },
+            );
+            Ok(Arc::new(BooleanArray::from(out)))
+        }
+        WindowFn::BitAnd | WindowFn::BitOr | WindowFn::BitXor => {
+            let a = integer(values, func)?;
+            let out = slide(
+                ordered,
+                frame,
+                order_rows,
+                num_rows,
+                |row| a.is_valid(row).then(|| a.value(row)),
+                move |x, y| bit_fold(func, Some(*x), *y),
+            );
+            Ok(Arc::new(Int64Array::from(out)))
+        }
+        // `var`/`stddev` keep a Welford state, whose combine is Chan's parallel formula
+        // rather than a plain operator, and `count_distinct` needs a multiset rather
+        // than a fold. Neither is served by this slide, so both keep refusing a frame
+        // rather than being given a wrong one.
+        other => Err(RuntimeError::UnsupportedWindow {
+            func: other.name().to_string(),
+            dtype: "explicit frame".to_string(),
+        }),
+    }
+}
+
+/// The shared slide: walk each partition's frame bounds once, maintaining the fold.
+///
+/// Both frame edges are non-decreasing in the row position, which is what lets the window
+/// be a FIFO and the whole pass be O(n) amortized rather than O(n · frame width).
+fn slide<T: Clone, G: Fn(usize) -> Option<T>, F: Fn(&T, &T) -> T + Copy>(
+    ordered: &[Vec<usize>],
+    frame: crate::window_frame::Frame,
+    order_rows: Option<&Rows>,
+    num_rows: usize,
+    get: G,
+    combine: F,
+) -> Vec<Option<T>> {
+    let mut out: Vec<Option<T>> = vec![None; num_rows];
+    for part in ordered {
+        let len = part.len();
+        let peers = crate::window_frame::peer_groups(frame, part, order_rows);
+        let (mut cur_a, mut cur_b) = (0usize, 0usize);
+        let mut fold = SlidingFold::new(combine);
+        // One FIFO entry per *physical* position, so the queue length tracks
+        // `cur_b - cur_a` exactly and pops stay aligned with the sliding window. A null
+        // row occupies a slot holding `None`, which the fold skips.
+        let mut slots: Vec<bool> = Vec::new();
+        for pos in 0..len {
+            let (a, b) = crate::window_frame::frame_bounds(frame, pos, len, peers.as_ref());
+            while cur_b < b {
+                match get(part[cur_b]) {
+                    Some(v) => {
+                        fold.push(v);
+                        slots.push(true);
+                    }
+                    None => slots.push(false),
+                }
+                cur_b += 1;
+            }
+            while cur_a < a {
+                if cur_a < cur_b && slots[cur_a] {
+                    fold.pop();
+                }
+                cur_a += 1;
+            }
+            cur_b = cur_b.max(cur_a);
+            out[part[pos]] = fold.value();
+        }
+    }
+    out
+}

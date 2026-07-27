@@ -126,11 +126,21 @@ WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE
 # Functions that honour an explicit frame: the reducing aggregates, plus the
 # positional value functions that pick the frame's first/last/nth row. `lag`/`lead`
 # and the fills carry no frame (theirs is fixed by their own offset / nullness).
-# Functions that honour an explicit `ROWS`/`GROUPS` frame. This is the *original* five
-# aggregates plus the positional value functions, NOT all of `WINDOW_AGGREGATES`: the
-# framed path in `bc_runtime::window_frame` has a hand-written sliding kernel per
-# function, and the twelve extended aggregates have only whole-partition and running
-# forms. Listing them here would send a frame to a kernel that cannot honour it.
+# Functions that honour an explicit `ROWS`/`GROUPS` frame.
+#
+# The six folds joined the original five once the framed path's two-stack slide was
+# generalized from `+` to any associative, commutative operator (`bc_runtime::window_agg`).
+# That structure exists because the naive O(1) slide needs an *inverse* to un-apply the
+# leaving value, and `product` cannot divide out a zero while `bit_and`/`bool_and` cannot
+# un-AND at all.
+#
+# `var`/`stddev` and `count_distinct` are still absent, and for reasons the slide cannot
+# fix: the moment pair keeps a Welford state whose combine is Chan's parallel formula
+# rather than an operator, and a distinct count needs a multiset rather than a fold.
+# Listing either here would send a frame to a kernel that cannot honour it.
 WINDOW_FRAMEABLE: Final = frozenset(
-    {"sum", "avg", "min", "max", "count", "first_value", "last_value", "nth_value"}
-)
+    {
+        "sum", "avg", "min", "max", "count", "first_value", "last_value", "nth_value",
+        "product", "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor",
+    }
+)  # fmt: skip

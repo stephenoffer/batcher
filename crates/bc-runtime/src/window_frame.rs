@@ -68,14 +68,14 @@ pub struct Frame {
 /// belongs to, and each group's `[start, end)` position range. Peers are adjacent
 /// ordered rows with an equal ORDER BY value. Used to resolve `RANGE`/`GROUPS` frame
 /// bounds to a contiguous position range (peers are contiguous once sorted).
-struct PeerGroups {
+pub(crate) struct PeerGroups {
     group_of: Vec<usize>,    // group index per ordered position
     group_start: Vec<usize>, // first position of each group
     group_end: Vec<usize>,   // one-past-last position of each group
 }
 
 impl PeerGroups {
-    fn new(part: &[usize], rows: &Rows) -> Self {
+    pub(crate) fn new(part: &[usize], rows: &Rows) -> Self {
         let len = part.len();
         let mut group_of = Vec::with_capacity(len);
         let mut group_start = Vec::new();
@@ -154,7 +154,7 @@ impl FifoSum {
 /// partition of length `len` for the row at `pos`. `ROWS` counts physical rows;
 /// `RANGE`/`GROUPS` count peer groups via `peers`. Both `a` and `b` are
 /// non-decreasing in `pos`, which is what lets the aggregate slide in one pass.
-fn frame_bounds(
+pub(crate) fn frame_bounds(
     frame: Frame,
     pos: usize,
     len: usize,
@@ -279,6 +279,11 @@ pub fn framed_aggregate(
                 dtype: other.to_string(),
             }),
         },
+        // The folds `window_agg` owns get a frame through the same two-stack slide, so
+        // this arm is now only reached by an aggregate with no sliding form at all.
+        other if crate::window_agg::is_extended_aggregate(other) => {
+            crate::window_agg::framed(other, ordered, values, frame, order_rows, num_rows)
+        }
         other => Err(RuntimeError::UnsupportedWindow {
             func: other.name().to_string(),
             dtype: "explicit frame".to_string(),
@@ -350,7 +355,11 @@ pub fn framed_value(
 
 /// Build the peer-group structure for a partition when the frame needs it (RANGE/
 /// GROUPS); `None` for ROWS frames.
-fn peer_groups(frame: Frame, part: &[usize], order_rows: Option<&Rows>) -> Option<PeerGroups> {
+pub(crate) fn peer_groups(
+    frame: Frame,
+    part: &[usize],
+    order_rows: Option<&Rows>,
+) -> Option<PeerGroups> {
     match frame.unit {
         FrameUnit::Rows => None,
         FrameUnit::Range | FrameUnit::Groups => Some(PeerGroups::new(

@@ -171,9 +171,25 @@ def test_variance_survives_a_large_mean_with_a_small_spread(duck):
 
 
 @pytest.mark.differential
-def test_an_explicit_frame_is_refused_for_the_extended_aggregates():
-    """The framed path has a hand-written sliding kernel per function and has none for
-    these, so a frame is rejected at plan time rather than silently ignored."""
-    ds = bt.from_pydict({"g": ["a", "a"], "o": [1, 2], "x": [1.0, 2.0]})
-    with pytest.raises(Exception, match="frame"):
-        ds.select(r=col("x").product().over("g", order_by="o", frame=(-1, 0))).collect()
+def test_the_frame_boundary_is_the_folds_versus_everything_else():
+    """Which of these accept an explicit frame, and why the line falls where it does.
+
+    When this file was written none of the nine did: the framed path had a hand-written
+    sliding kernel per function. Generalizing its two-stack slide from `+` to any
+    associative, commutative operator gave all six **folds** a frame at once (see
+    `test_diff_window_framed_folds.py`).
+
+    `var`/`stddev` and `count_distinct` did not follow, and cannot follow the same way:
+    the moment pair keeps a Welford state whose combine is Chan's parallel formula rather
+    than an operator, and a distinct count needs a multiset rather than a fold. They still
+    reject a frame at plan time rather than silently ignoring one.
+    """
+    ds = bt.from_pydict({"g": ["a", "a"], "o": [1, 2], "x": [1.0, 2.0], "i": [1, 2]})
+    # The folds now honour a frame.
+    assert ds.select(r=col("x").product().over("g", order_by="o", frame=(-1, 0))).to_pydict()[
+        "r"
+    ] == [1.0, 2.0]
+    # The two that are not folds still refuse one.
+    for build in (lambda: col("x").std(), lambda: col("x").var(), lambda: col("i").n_unique()):
+        with pytest.raises(Exception, match="frame"):
+            ds.select(r=build().over("g", order_by="o", frame=(-1, 0))).collect()
