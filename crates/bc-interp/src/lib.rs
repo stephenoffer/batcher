@@ -27,6 +27,7 @@ mod join_par;
 pub mod metrics;
 mod ops;
 pub mod par;
+mod rusage;
 pub mod stream;
 mod window_spill;
 
@@ -107,7 +108,7 @@ fn exec_seq(
                 })?;
             let rows = count_rows(&batches);
             let bytes = batch_bytes(&batches);
-            let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+            let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
             m.record(OpMetric {
                 op_id,
                 kind: "scan",
@@ -115,6 +116,7 @@ fn exec_seq(
                 rows_build: 0,
                 rows_out: rows,
                 elapsed_ns: t0.elapsed_ns(),
+                wall_span_ns: 0,
                 cpu_ns,
                 threads: 1,
                 peak_bytes: bytes,
@@ -123,6 +125,7 @@ fn exec_seq(
                 spill_bytes: 0,
                 peak_rss_bytes,
                 backend: "interp",
+                hw,
             });
             Ok(batches)
         }
@@ -504,7 +507,7 @@ fn record_op(
     spilled: bool,
 ) {
     let bytes = batch_bytes(out);
-    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
     m.record(OpMetric {
         op_id,
         kind,
@@ -512,6 +515,7 @@ fn record_op(
         rows_build: 0,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
+        wall_span_ns: 0,
         cpu_ns,
         threads: 1,
         peak_bytes: bytes,
@@ -520,6 +524,7 @@ fn record_op(
         spill_bytes: 0,
         peak_rss_bytes,
         backend: "interp",
+        hw,
     });
 }
 
@@ -540,7 +545,7 @@ fn record_breaker(
     spilled: bool,
 ) {
     let result_bytes = batch_bytes(out);
-    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
     m.record(OpMetric {
         op_id,
         kind,
@@ -548,6 +553,7 @@ fn record_breaker(
         rows_build,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
+        wall_span_ns: 0,
         cpu_ns,
         threads: 1,
         peak_bytes: in_bytes.saturating_add(result_bytes),
@@ -556,6 +562,7 @@ fn record_breaker(
         spill_bytes: 0,
         peak_rss_bytes,
         backend: "interp",
+        hw,
     });
 }
 

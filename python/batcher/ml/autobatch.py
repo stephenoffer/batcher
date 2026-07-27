@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -44,7 +45,7 @@ def learned_batch_size(hub: MetadataHub | None, signature: str | None) -> int | 
     if hub is None or signature is None:
         return None
     try:
-        s = hub.get_keyed_param(_LEARN_NS, signature) or {}
+        s = hub.get_keyed_param(scoped(_LEARN_NS), signature) or {}
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("ml", "read learned batch size", exc)
         return None
@@ -61,12 +62,12 @@ def record_batch_size(hub: MetadataHub | None, signature: str | None, size: int)
     try:
         from batcher.config import active_config
 
-        s = hub.get_keyed_param(_LEARN_NS, signature) or {}
+        s = hub.get_keyed_param(scoped(_LEARN_NS), signature) or {}
         alpha = float(active_config().optimizer.learning_smoothing_alpha)
         prior = s.get("size")
         new = float(size)
         smoothed = new if prior is None else alpha * new + (1.0 - alpha) * float(prior)
-        hub.put_keyed_param(_LEARN_NS, signature, {"size": smoothed})
+        hub.put_keyed_param(scoped(_LEARN_NS), signature, {"size": smoothed})
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("ml", "record autobatch size", exc)
         return

@@ -1912,21 +1912,25 @@ fn exec_join_pipeline(
             let (out, skewed) = join_partitioned(
                 &cur, &builds[i], left_keys, right_keys, *join_type, output, *strategy, opts,
             )?;
+            let elapsed_ns = t0.elapsed_ns();
+            let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
             m.record(OpMetric {
                 op_id: join_ids[n - 1 - i],
                 kind: "hash_join",
                 rows_in,
                 rows_build,
                 rows_out: count_rows(&out),
-                elapsed_ns: t0.elapsed_ns(),
-                cpu_ns: t0.cpu_ns(),
+                elapsed_ns,
+                wall_span_ns: 0,
+                cpu_ns,
                 threads: rayon::current_num_threads().max(1) as u32,
                 peak_bytes: batch_bytes(&out),
                 result_bytes: batch_bytes(&out),
                 spilled: false,
                 spill_bytes: 0,
-                peak_rss_bytes: 0,
+                peak_rss_bytes,
                 backend: if skewed { "interp-skew" } else { "interp" },
+                hw,
             });
             cur = out;
             i += 1;
@@ -1966,7 +1970,9 @@ fn exec_join_pipeline(
         // cardinalities Kyber learns from.
         let k = run.len() as u64;
         let elapsed = t0.elapsed_ns().max(1) / k;
-        let cpu = t0.cpu_ns() / k;
+        let (run_cpu, run_rss, run_hw) = t0.measure();
+        let cpu = run_cpu / k;
+        let hw = run_hw.split(k);
         let rows_out = count_rows(&out);
         let out_bytes = batch_bytes(&out);
         for (s, st) in run.iter().enumerate() {
@@ -1978,14 +1984,19 @@ fn exec_join_pipeline(
                 rows_build: st.rows_build,
                 rows_out: if last { rows_out } else { 0 },
                 elapsed_ns: elapsed,
+                wall_span_ns: 0,
                 cpu_ns: cpu,
                 threads: rayon::current_num_threads().max(1) as u32,
                 peak_bytes: if last { out_bytes } else { 0 },
                 result_bytes: if last { out_bytes } else { 0 },
                 spilled: false,
                 spill_bytes: 0,
-                peak_rss_bytes: 0,
+                // RSS growth is a high-water delta, not an additive quantity, so it is
+                // attributed whole to the stage that owns the materialized relation rather
+                // than split like the additive counters.
+                peak_rss_bytes: if last { run_rss } else { 0 },
                 backend: "interp-pipelined",
+                hw,
             });
         }
         cur = out;
@@ -2164,7 +2175,9 @@ fn exec_fused(
     // recursion does). Rows exact; wall-time split evenly; peak bytes to the outermost
     // op (the one whose output is `out`).
     let elapsed = t0.elapsed_ns().max(1) / n as u64;
-    let cpu = t0.cpu_ns() / n as u64;
+    let (fused_cpu, fused_rss, fused_hw) = t0.measure();
+    let cpu = fused_cpu / n as u64;
+    let hw = fused_hw.split(n as u64);
     let threads = rayon::current_num_threads().max(1) as u32;
     let out_bytes = batch_bytes(&out);
     for (i, stage) in stages.iter().enumerate() {
@@ -2176,6 +2189,7 @@ fn exec_fused(
             rows_in,
             rows_out: totals[i],
             elapsed_ns: elapsed,
+            wall_span_ns: 0,
             cpu_ns: cpu,
             threads,
             peak_bytes,
@@ -2183,8 +2197,11 @@ fn exec_fused(
             rows_build: 0,
             spilled: false,
             spill_bytes: 0,
-            peak_rss_bytes: 0,
+            // The high-water delta belongs to the outermost op, the one whose output is the
+            // materialized relation; splitting a high-water mark would be meaningless.
+            peak_rss_bytes: if stage.op_id() == op_id { fused_rss } else { 0 },
             backend: stage.backend(),
+            hw,
         });
     }
     Ok(out)
@@ -2468,7 +2485,9 @@ fn exec_agg_fused(
     }
     // Emit one metric per fused linear op (children before parents), as `exec_fused` does.
     let stage_elapsed = stage_t0.elapsed_ns().max(1) / n as u64;
-    let stage_cpu = stage_t0.cpu_ns() / n as u64;
+    let (fused_cpu, _fused_rss, fused_hw) = stage_t0.measure();
+    let stage_cpu = fused_cpu / n as u64;
+    let stage_hw = fused_hw.split(n as u64);
     let threads = rayon::current_num_threads().max(1) as u32;
     for (i, stage) in stages.iter().enumerate() {
         let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
@@ -2478,6 +2497,7 @@ fn exec_agg_fused(
             rows_in,
             rows_out: totals[i],
             elapsed_ns: stage_elapsed,
+            wall_span_ns: 0,
             cpu_ns: stage_cpu,
             threads,
             peak_bytes: 0,
@@ -2485,8 +2505,11 @@ fn exec_agg_fused(
             rows_build: 0,
             spilled: false,
             spill_bytes: 0,
+            // These linear stages hold no relation of their own (the aggregate downstream
+            // does), so there is no working set to attribute a high-water mark to.
             peak_rss_bytes: 0,
             backend: stage.backend(),
+            hw: stage_hw,
         });
     }
 
@@ -2571,7 +2594,7 @@ fn push_metric(
     backend: &'static str,
 ) {
     let bytes = batch_bytes(out);
-    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
     m.record(OpMetric {
         op_id,
         kind,
@@ -2579,6 +2602,7 @@ fn push_metric(
         rows_build: 0,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
+        wall_span_ns: 0,
         cpu_ns,
         threads: rayon::current_num_threads().max(1) as u32,
         peak_bytes: bytes,
@@ -2587,6 +2611,7 @@ fn push_metric(
         spill_bytes: 0,
         peak_rss_bytes,
         backend,
+        hw,
     });
 }
 
@@ -2650,7 +2675,7 @@ fn push_breaker_spilled(
     backend: &'static str,
 ) {
     let result_bytes = batch_bytes(out);
-    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
     m.record(OpMetric {
         op_id,
         kind,
@@ -2658,6 +2683,7 @@ fn push_breaker_spilled(
         rows_build,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
+        wall_span_ns: 0,
         cpu_ns,
         threads: rayon::current_num_threads().max(1) as u32,
         peak_bytes: in_bytes.saturating_add(result_bytes),
@@ -2666,6 +2692,7 @@ fn push_breaker_spilled(
         spill_bytes,
         peak_rss_bytes,
         backend,
+        hw,
     });
 }
 

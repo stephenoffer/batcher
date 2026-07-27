@@ -7,6 +7,7 @@ from the pool. These assert the plateau is now read back and recorded. Pure fake
 
 from __future__ import annotations
 
+from batcher.metadata.hardware_scope import scoped
 from batcher.ml.autobatch import _LEARN_NS
 from batcher.ml.inference import InferencePool
 
@@ -23,9 +24,11 @@ class _FakeHub:
 
 
 def test_pool_warm_starts_the_batch_size_from_the_hub():
-    hub = _FakeHub({(_LEARN_NS, "embed-job"): {"size": 999}})
+    # Seeded under the hardware-scoped namespace the warm-start reads: a learned batch
+    # size is measured against a specific GPU, so it is stored per machine class.
+    hub = _FakeHub({(scoped(_LEARN_NS), "embed-job"): {"size": 999}})
     pool = InferencePool(
-        lambda: (lambda b: b),
+        lambda: lambda b: b,
         objective="throughput",
         target_batch_rows=128,  # cold default...
         max_batch_rows=4096,
@@ -37,7 +40,5 @@ def test_pool_warm_starts_the_batch_size_from_the_hub():
 
 
 def test_pool_without_a_hub_is_the_pure_hill_climb():
-    pool = InferencePool(
-        lambda: (lambda b: b), objective="throughput", target_batch_rows=128
-    )
+    pool = InferencePool(lambda: lambda b: b, objective="throughput", target_batch_rows=128)
     assert pool._throughput_ctl.current() == 128

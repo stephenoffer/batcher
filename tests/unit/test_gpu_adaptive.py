@@ -15,6 +15,7 @@ from batcher.kyber.gpu.adaptive import learned_gpu_min_rows, record_backend_timi
 from batcher.kyber.gpu.policy import decide_gpu_backend
 from batcher.metadata import MetadataHub
 from batcher.metadata.backends import InProcessBackend
+from batcher.metadata.hardware_scope import scoped
 
 pytestmark = pytest.mark.unit
 
@@ -133,7 +134,7 @@ def test_record_cpu_crossover_feeds_the_learner_when_a_gpu_is_present(monkeypatc
     # a "cpu" bucket now exists in the crossover namespace
     from batcher.kyber.gpu.adaptive import _NS
 
-    assert (hub.get_keyed_param(_NS, "cpu") or {}).get("n", 0) == 1
+    assert (hub.get_keyed_param(scoped(_NS), "cpu") or {}).get("n", 0) == 1
 
 
 def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
@@ -145,7 +146,7 @@ def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
     ds = bt.from_pydict({"k": [1, 2], "v": [1.0, 2.0]})
     q = ds.group_by("k").agg(s=bt.col("v").sum())
     gpu_backend.record_cpu_crossover(q._plan, q._sources, hub, wall_ms=5.0)
-    assert hub.get_keyed_param(_NS, "cpu") is None  # nothing recorded on a CPU-only cluster
+    assert hub.get_keyed_param(scoped(_NS), "cpu") is None  # nothing recorded on a CPU-only cluster
 
 
 # --- the OLS fit needs a *relative* spread, not merely a non-zero one ---------------

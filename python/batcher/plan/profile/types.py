@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from batcher._internal.mathx import safe_div
+from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
 __all__ = ["Decision", "OpProfile", "QueryProfile"]
 
@@ -77,6 +78,45 @@ class OpProfile:
     backend: str = ""
     cpu_util: float = 0.0
     threads: int = 0
+    # --- Measured hardware consumption. 0 everywhere means unmeasured, not zero. ---
+    # Page faults the operator took; the major count is the one that matters most, because a
+    # nonzero value means the machine was paging against the query and every other field here
+    # is describing the symptom rather than the cause.
+    minor_faults: int = 0
+    major_faults: int = 0
+    # Context switches. The involuntary count measures contention for cores this process was
+    # told it owned; the voluntary count marks genuine blocking on I/O or a lock.
+    vol_ctx_switches: int = 0
+    invol_ctx_switches: int = 0
+    # Bytes that actually reached the block device, page-cache hits excluded. The difference
+    # between a warm and a cold scan, which no other field distinguishes.
+    io_read_bytes: int = 0
+    io_write_bytes: int = 0
+
+    @property
+    def preemption_rate(self) -> float:
+        """Involuntary context switches per core-second — how hard this op fought for cores.
+
+        Above `CONTENDED_PREEMPTIONS_PER_CORE_SECOND` the operator spent a meaningful share of
+        its life being evicted from the CPU, which means low utilization here is contention
+        rather than a plan that failed to parallelize.
+        """
+        return preemption_rate(self.invol_ctx_switches, self.elapsed_ms, self.threads)
+
+    @property
+    def contended(self) -> bool:
+        """Whether this operator was measurably competing for CPU with other work."""
+        return self.preemption_rate > CONTENDED_PREEMPTIONS_PER_CORE_SECOND
+
+    @property
+    def paging(self) -> bool:
+        """Whether the operator took disk-backed page faults — the box paging against it.
+
+        Deliberately a bare "any at all" rather than a rate: on a machine with headroom a
+        query's operators take essentially no major faults, so even a handful is a signal
+        worth surfacing rather than noise to be thresholded away.
+        """
+        return self.major_faults > 0
 
     @property
     def selectivity(self) -> float:
@@ -113,6 +153,13 @@ class OpProfile:
             "backend": self.backend,
             "cpu_util": self.cpu_util,
             "threads": self.threads,
+            "minor_faults": self.minor_faults,
+            "major_faults": self.major_faults,
+            "vol_ctx_switches": self.vol_ctx_switches,
+            "invol_ctx_switches": self.invol_ctx_switches,
+            "io_read_bytes": self.io_read_bytes,
+            "io_write_bytes": self.io_write_bytes,
+            "preemption_rate": self.preemption_rate,
             "selectivity": self.selectivity,
             "est_error": None if math.isnan(self.est_error) else self.est_error,
         }
@@ -288,6 +335,7 @@ class QueryProfile:
             f"{label:<32}{est} actual={o.rows_out:,}{err}"
             f"  {o.elapsed_ms:.1f}ms ({share:.0f}%){cpu}"
             f"  out={human_bytes(o.result_bytes)}{rss}  {o.backend}{spill}"
+            f"{_hardware_flags(o)}"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -310,6 +358,31 @@ class QueryProfile:
             "logical_ir": self.logical_ir,
             "optimized_ir": self.optimized_ir,
         }
+
+
+def _hardware_flags(o: OpProfile) -> str:
+    """The hardware conditions worth flagging on an operator's plan line, or `""`.
+
+    Only conditions that change what a reader should *do* appear here, and only when they are
+    actually present. A plan line is already dense, and a row of always-on counters would push
+    the fields people read every time off the right edge to make room for numbers that are
+    usually zero. Disk reads are the exception to "only when abnormal": knowing a scan reached
+    the device rather than the page cache is the difference between a timing worth trusting
+    and one that measured a warm cache.
+    """
+    parts = []
+    if o.paging:
+        # First, because it invalidates the reading of everything else on the line: an operator
+        # taking disk-backed faults is waiting on storage for its own memory, and its time and
+        # utilization describe that rather than its work.
+        parts.append(f"PAGING({o.major_faults:,} major faults)")
+    if o.contended:
+        parts.append(f"contended({o.preemption_rate:,.0f} preempt/core-s)")
+    if o.io_read_bytes:
+        parts.append(f"disk-read={human_bytes(o.io_read_bytes)}")
+    if o.io_write_bytes:
+        parts.append(f"disk-write={human_bytes(o.io_write_bytes)}")
+    return ("  " + " ".join(parts)) if parts else ""
 
 
 def human_bytes(n: int) -> str:

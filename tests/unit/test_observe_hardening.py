@@ -495,5 +495,11 @@ def test_load_per_core_uses_the_cores_this_process_may_use(monkeypatch):
 
     monkeypatch.setattr(_os, "getloadavg", lambda: (4.0, 4.0, 4.0))
     monkeypatch.setattr(_os, "cpu_count", lambda: 64)
-    monkeypatch.setattr("batcher._internal.hardware.available_cpu_count", lambda: 4, raising=True)
+    # Patched on `hardware.cpu`, which owns the probe and is where the divide reads it. The
+    # package façade only re-exports it, so patching the façade attribute changes nothing the
+    # probe sees — the patch would apply cleanly and the test would pass against the real
+    # core count, which is the shape of a test that has quietly stopped testing anything.
+    monkeypatch.setattr(
+        "batcher._internal.hardware.cpu.available_cpu_count", lambda: 4, raising=True
+    )
     assert resources.cpu_contention()["load_per_core"] == 1.0

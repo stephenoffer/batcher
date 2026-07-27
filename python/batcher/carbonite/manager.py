@@ -20,6 +20,7 @@ import dataclasses
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.base import (
     AdmissionPolicy,
     FlowControlPolicy,
@@ -41,6 +42,7 @@ from batcher.carbonite.policies import (
     learned_channel_morsel_bytes,
     load_shuffle_window,
 )
+from batcher.carbonite.policies.cpu_budget import effective_core_budget
 from batcher.carbonite.policies.morsel import (
     MIN_MORSEL_BYTES,
     MIN_MORSEL_ROWS,
@@ -232,18 +234,44 @@ class ResourceManager:
         # monitor (advancing its de-escalation average). Sizing a morsel must not.
         return morsel_target(self._config, self._pressure.classify(), self._mem_model, families)
 
+    def recommend_parallelism(self) -> int | None:
+        """Cores to fan out across when the machine is measurably oversubscribed, else `None`.
+
+        The CPU counterpart to `recommend_morsel_target`. Memory has a pressure monitor, a
+        budget, and a spill path; CPU had only the permitted core count, which says what the
+        cgroup allows and nothing about what the scheduler delivers. When two workers share a
+        node, a quota is binding, or a co-tenant has half the box, fanning out to the permitted
+        count adds context switches and cache pressure without adding throughput — the query
+        gets slower the harder the engine tries.
+
+        `None` on a quiet machine (the common case), so the engine keeps its own default and
+        nothing changes. See `policies.cpu_budget` for the deadband and the floor.
+
+        Returns:
+            The reduced core budget, or `None` to leave parallelism alone.
+        """
+        configured = self._config.execution.parallelism
+        if configured > 0:
+            return None  # an explicit setting is an instruction, not an estimate
+        budget = effective_core_budget()
+        return budget if budget < available_cpu_count() else None
+
     def recommended_config(self, families: Iterable[str] | None = None) -> Config | None:
-        """A `Config` with the pressure-scaled morsel target, or ``None`` to keep the
-        current one. The conductor activates it for the execution scope so the adapted
-        morsel reaches both the in-process engine and the shipped worker config. `families`
-        (the plan's operator kinds) narrows the learned width to this plan's own data."""
+        """A `Config` with the pressure-scaled morsel target and contention-scaled fan-out,
+        or ``None`` to keep the current one. The conductor activates it for the execution
+        scope so the adaptation reaches both the in-process engine and the shipped worker
+        config. `families` (the plan's operator kinds) narrows the learned width to this
+        plan's own data."""
         target = self.recommend_morsel_target(families)
-        if target is None:
+        parallelism = self.recommend_parallelism()
+        if target is None and parallelism is None:
             return None
-        rows, nbytes = target
-        execution = dataclasses.replace(
-            self._config.execution, morsel_rows=rows, morsel_bytes=nbytes
-        )
+        changes: dict[str, object] = {}
+        if target is not None:
+            changes["morsel_rows"], changes["morsel_bytes"] = target
+        if parallelism is not None:
+            changes["parallelism"] = parallelism
+        execution = dataclasses.replace(self._config.execution, **changes)
         return dataclasses.replace(self._config, execution=execution)
 
     def estimated_bytes(self, plan: PhysicalPlan) -> int:

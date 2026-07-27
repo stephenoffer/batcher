@@ -8,26 +8,106 @@ plans. Writes are non-blocking and must never raise into the hot path — a
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from batcher._internal.hardware import fingerprint
 from batcher.plan.ids import OpId
 
-__all__ = ["FeedbackSink", "OperatorFeedback", "cpu_utilization"]
+__all__ = [
+    "FeedbackSink",
+    "OperatorFeedback",
+    "cpu_utilization",
+    "faulted_bytes",
+    "preemption_rate",
+]
+
+# Involuntary context switches per core-second above which the operator is judged to have been
+# competing for its cores rather than owning them. A CPU-bound thread on an uncontended box is
+# preempted only by timer and kernel-thread activity, which lands in the low tens per second;
+# once another runnable thread wants the core, the scheduler swaps at its timeslice granularity
+# and the rate rises by an order of magnitude. The threshold sits between those regimes rather
+# than at either edge, so a busy-but-uncontended run is not misread as contended.
+CONTENDED_PREEMPTIONS_PER_CORE_SECOND = 200.0
 
 
-def cpu_utilization(cpu_ns: float, elapsed_ns: float, threads: int) -> float:
+def cpu_utilization(
+    cpu_ns: float, elapsed_ns: float, threads: int, wall_span_ns: float = 0.0
+) -> float:
     """Mean fraction of allocated cores kept busy, clamped to [0, 1].
 
-    `cpu_ns` is CPU-time summed across all worker threads during the operator;
-    dividing by ``elapsed_ns x threads`` (the engine's *actual* live thread count,
-    not a guessed host core count — which is wrong under a cgroup CPU quota) gives
-    the per-core busy fraction. 0.0 when the engine reported no CPU time (older
-    build), no wall time, or no thread count.
+    `cpu_ns` is CPU-time summed across all worker threads during the operator; dividing by
+    ``interval x threads`` (the engine's *actual* live thread count, not a guessed host core
+    count — which is wrong under a cgroup CPU quota) gives the per-core busy fraction. 0.0 when
+    the engine reported no CPU time (older build), no interval, or no thread count.
+
+    The interval is `wall_span_ns` when the engine reported one and `elapsed_ns` otherwise.
+    The two tiers differ here and getting it wrong is not a small error: on a materializing
+    executor an operator runs alone so `elapsed_ns` *is* its wall interval, but on the
+    streaming executor operators interleave and `elapsed_ns` is transform time summed over
+    every morsel and worker. Dividing that summed work by itself yields exactly ``1 / threads``
+    for every operator of every query.
+
+    Args:
+        cpu_ns: CPU time summed across the operator's worker threads.
+        elapsed_ns: The operator's own elapsed time.
+        threads: Worker threads the operator ran across.
+        wall_span_ns: The wall interval the operator occupied, when the engine tracks one.
+
+    Returns:
+        The per-core busy fraction in [0, 1], or `0.0` when unmeasured.
     """
-    if cpu_ns <= 0 or elapsed_ns <= 0 or threads <= 0:
+    interval = wall_span_ns if wall_span_ns > 0 else elapsed_ns
+    if cpu_ns <= 0 or interval <= 0 or threads <= 0:
         return 0.0
-    return min(1.0, cpu_ns / (elapsed_ns * threads))
+    return min(1.0, cpu_ns / (interval * threads))
+
+
+def preemption_rate(invol_ctx_switches: int, elapsed_ms: float, threads: int) -> float:
+    """Involuntary context switches per core-second — how hard the operator fought for cores.
+
+    An involuntary switch is the scheduler taking a CPU away, which happens only when another
+    runnable thread wants it. That makes this the one per-operator signal that separates the
+    two indistinguishable causes of poor scaling: an operator that failed to parallelize, and
+    an operator whose threads were repeatedly evicted by something else on the box. Utilization
+    reports both as low, and they have opposite fixes — widen the fan-out, or narrow it.
+
+    Normalized per core-second rather than per operator so the figure is comparable across
+    operators of wildly different durations and widths.
+
+    Args:
+        invol_ctx_switches: Involuntary switches measured during the operator.
+        elapsed_ms: The operator's wall-clock duration in milliseconds.
+        threads: Worker threads the operator ran across.
+
+    Returns:
+        Switches per core-second, or `0.0` when nothing was measured.
+    """
+    core_seconds = (elapsed_ms / 1000.0) * max(0, threads)
+    if invol_ctx_switches <= 0 or core_seconds <= 0:
+        return 0.0
+    return invol_ctx_switches / core_seconds
+
+
+def faulted_bytes(minor_faults: int, major_faults: int, page_bytes: int) -> int:
+    """Bytes of memory the operator forced the kernel to make resident.
+
+    Faults are the measured counterpart to the Arrow-size `m_peak_bytes` estimate: the estimate
+    models what the operator's data structures should occupy, while this counts pages the
+    kernel actually had to back. The two diverge exactly where the estimate is least
+    trustworthy — allocator fragmentation, transient scratch, buffers outside the pool — which
+    is why the learned memory model benefits from seeing both.
+
+    Args:
+        minor_faults: Faults served without disk I/O.
+        major_faults: Faults that required disk I/O.
+        page_bytes: The machine's page size in bytes.
+
+    Returns:
+        Bytes made resident, or `0` when no faults were measured.
+    """
+    total = max(0, minor_faults) + max(0, major_faults)
+    return total * max(0, page_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +177,47 @@ class OperatorFeedback:
     # whichever expressions the workload happened to contain. Paired with `backend`
     # (the tier that ran it), it is also what makes the JIT speedup measurable.
     expr_factor: float = 1.0
+    # --- Measured hardware consumption. Every field is 0 when unmeasured, never "none". ---
+    # Page faults served without disk I/O: the operator committing new memory. Times the page
+    # size (`faulted_bytes`) this is the *measured* working set, against which `m_peak_bytes`
+    # is only an Arrow-size model — the two diverge on fragmentation and off-pool scratch.
+    minor_faults: int = 0
+    # Page faults that required disk I/O. Any material count means the box was paging against
+    # the query: memory the operator believed it held was being fetched back from storage.
+    # This is invisible in every other field, and it is the one condition under which adding
+    # parallelism strictly makes things worse.
+    major_faults: int = 0
+    # Times the operator blocked and yielded the CPU. High against low `cpu_utilization` marks
+    # a genuinely I/O- or lock-bound operator, as opposed to one that simply failed to fan out.
+    vol_ctx_switches: int = 0
+    # Times the scheduler evicted the operator from a CPU. The direct measurement of core
+    # contention — see `preemption_rate` for the normalized form the sizing loops read.
+    invol_ctx_switches: int = 0
+    # Bytes actually fetched from a block device, page-cache hits excluded. A warm and a cold
+    # scan of the same file differ by two orders of magnitude and are otherwise identical in
+    # every field here, so an I/O cost coefficient calibrated without this is fitted across two
+    # populations at once and describes neither.
+    io_read_bytes: int = 0
+    # Bytes actually written to a block device, spill included. The measured counterpart to
+    # `spill_bytes`, which is the volume the operator *decided* to route to disk.
+    io_write_bytes: int = 0
+    # The fingerprint of the machine that measured this row (`_internal.hardware.fingerprint`).
+    # Every field above measured in machine units — times, bytes, faults, switches — is a
+    # statement about *this hardware*, and none of them transfers to a different one. Without
+    # this, a metadata store shared across a heterogeneous cluster, an autoscaling group that
+    # mixes instance generations, or a laptop and CI, fits one model across several machines
+    # and gets a model that is wrong for all of them, silently.
+    #
+    # Defaults to *this* machine, because a feedback row is constructed where the measurement
+    # was taken: a caller who does not say which machine measured it is, by construction,
+    # saying "here". The one case that is not true is a distributed worker's row, which the
+    # driver records on the worker's behalf — so `dist` stamps the worker's own fingerprint
+    # into the metrics document before it travels, and the transcription reads that.
+    #
+    # A stored row can still carry `""`: one written before this field existed. That is
+    # "measured on an unknown machine", which is not evidence about this one, so a
+    # hardware-scoped consumer excludes it rather than adopting it.
+    hw_fingerprint: str = field(default_factory=fingerprint)
 
 
 @runtime_checkable

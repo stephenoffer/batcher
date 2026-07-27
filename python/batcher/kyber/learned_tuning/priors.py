@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber import plan_cache
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -59,12 +60,12 @@ def _record_scalar(
     if hub is None or value < 0.0:
         return
     try:
-        entry = dict(hub.get_keyed_param(namespace, key) or {})
+        entry = dict(hub.get_keyed_param(scoped(namespace), key) or {})
         n = int(entry.get("n_obs", 0))
         prior = entry.get(field)
         entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        plan_cache.record_write(hub, namespace, key, entry)
+        plan_cache.record_write(hub, scoped(namespace), key, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record scalar prior", exc)
 
@@ -76,13 +77,13 @@ def record_join_sides(
     if hub is None:
         return
     try:
-        entry = dict(hub.get_keyed_param(_NS_SIDES, signature) or {})
+        entry = dict(hub.get_keyed_param(scoped(_NS_SIDES), signature) or {})
         n = int(entry.get("n_obs", 0))
         for field, value in (("left", left_rows), ("right", right_rows)):
             prior = entry.get(field)
             entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        plan_cache.record_write(hub, _NS_SIDES, signature, entry)
+        plan_cache.record_write(hub, scoped(_NS_SIDES), signature, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record join sides", exc)
 
@@ -97,7 +98,7 @@ def learned_build_sides(hub: MetadataHub | None, signature: str) -> tuple[float,
     if hub is None:
         return None
     try:
-        entry = hub.get_keyed_param(_NS_SIDES, signature) or {}
+        entry = hub.get_keyed_param(scoped(_NS_SIDES), signature) or {}
         left, right = entry.get("left"), entry.get("right")
         if left is None or right is None:
             return None
@@ -124,7 +125,7 @@ def learned_partition_count(
     if hub is None or target_rows <= 0:
         return None
     try:
-        entry = hub.get_keyed_param(_NS_PART, signature) or {}
+        entry = hub.get_keyed_param(scoped(_NS_PART), signature) or {}
         rows = entry.get("rows")
         if rows is None or float(rows) <= 0.0:
             return None
@@ -156,7 +157,7 @@ def learned_partial_agg(
     if hub is None:
         return None
     try:
-        entry = hub.get_keyed_param(_NS_GROUP, signature) or {}
+        entry = hub.get_keyed_param(scoped(_NS_GROUP), signature) or {}
         ratio = entry.get("ratio")
         return None if ratio is None else float(ratio) <= engage_below
     except Exception as exc:  # pragma: no cover - best-effort learned prior

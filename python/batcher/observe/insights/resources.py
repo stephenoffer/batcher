@@ -5,7 +5,6 @@ points at configuration rather than at the query."""
 
 from __future__ import annotations
 
-import pathlib
 from typing import Any
 
 from batcher.observe.insights.kinds import (
@@ -18,42 +17,47 @@ from batcher.observe.insights.kinds import (
     Insight,
     gib,
 )
+from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
 
 def cpu_contention() -> dict[str, float]:
-    """Run-queue length per core and CFS throttling, when the platform reports them.
+    """How much of the machine's CPU other work was taking, when the platform reports it.
+
+    A thin pass-through to the shared probe in `_internal.hardware`, which is the one place
+    that knows how to read these. It used to be a second implementation here, and the copy had
+    drifted in two ways that each silently disabled a finding:
+
+    * it emitted ``throttled_share`` while `stolen_cpu` reads ``throttled_ratio``, so the
+      `cpu-throttled` insight could never fire. A container throttled to a fraction of its
+      quota was told its query "may be too small to parallelize" — advice that sends the
+      reader to tune a query that was already fine, which is precisely the misdiagnosis this
+      pair of findings exists to prevent; and
+    * it read only ``/sys/fs/cgroup/cpu.stat``, the mount root. A process in a *delegated*
+      cgroup with no namespace — a Ray worker under a systemd slice, the common deployment —
+      has its quota enforced at a leaf the root file knows nothing about, so throttling there
+      read as zero.
 
     Empty when unavailable — the caller treats a missing reading as "cannot tell", never as
     "not contended", because blaming the plan for a busy box sends the reader to tune a query
     that was already fine.
+
+    Returns:
+        The measurable contention signals, each omitted when the platform cannot report it.
     """
-    out: dict[str, float] = {}
-    try:
-        import os
+    from batcher._internal.hardware import cpu_contention as probe
 
-        from batcher._internal.hardware import available_cpu_count
-
-        load1, _, _ = os.getloadavg()
-        # The cores this process may actually use (cgroup quota ∧ affinity), not the host's.
-        # `os.cpu_count()` reports the whole machine, so a container limited to 4 of 64 cores
-        # divided a saturating load of 4.0 by 64 and reported 0.06 — "idle" at exactly the
-        # moment it was pegged and throttled, which is the reading this metric exists to catch.
-        out["load_per_core"] = load1 / max(1, available_cpu_count())
-    except (OSError, AttributeError):
-        pass  # no getloadavg on this platform -> omit the metric rather than guess one
-    try:
-        stat = pathlib.Path("/sys/fs/cgroup/cpu.stat").read_text()
-        fields = dict(line.split(maxsplit=1) for line in stat.splitlines() if " " in line)
-        periods = float(fields.get("nr_periods", 0))
-        throttled = float(fields.get("nr_throttled", 0))
-        if periods > 0:
-            out["throttled_share"] = throttled / periods
-    except (OSError, ValueError):
-        pass  # not running under a cgroup v2 CPU controller -> omit the throttling metric
-    return out
+    return probe()
 
 
-__all__ = ["idle_cpu", "memory_headroom", "memory_underused", "spilled_operators", "stolen_cpu"]
+__all__ = [
+    "idle_cpu",
+    "memory_headroom",
+    "memory_underused",
+    "paging_operators",
+    "preempted_operators",
+    "spilled_operators",
+    "stolen_cpu",
+]
 
 
 def spilled_operators(
@@ -254,5 +258,127 @@ def memory_underused(
                 "it. Set memory.max_memory_bytes explicitly to claim the capacity."
             ),
             detail={"share": share, "peak_rss_bytes": peak, "memory_budget_bytes": budget},
+        )
+    ]
+
+
+def paging_operators(
+    _profile: dict[str, Any], ops: list[dict[str, Any]], _total_ms: float
+) -> list[Insight]:
+    """The machine was paging against the query — the one finding that outranks every other.
+
+    A major page fault is the kernel fetching back memory the process believed it already held.
+    While that is happening, every other number on the plan line describes the symptom rather
+    than the work: an operator's wall time is storage latency, its CPU utilization is low
+    because its threads are blocked, and its measured "peak memory" is whatever survived being
+    evicted. Reading those and tuning the query is the wrong move, and nothing else in a
+    profile distinguishes this state from ordinary slowness.
+
+    It is also the one condition under which more parallelism strictly hurts: extra threads
+    each fault in their own working set and evict each other's.
+
+    Args:
+        _profile: The query profile (unused; the evidence is per-operator).
+        ops: The measured operators.
+        _total_ms: Total wall time (unused).
+
+    Returns:
+        One insight when any operator took disk-backed faults, else `[]`.
+    """
+    faulting = [op for op in ops if int(op.get("major_faults", 0)) > 0]
+    if not faulting:
+        return []
+    total = sum(int(op.get("major_faults", 0)) for op in faulting)
+    names = ", ".join(sorted({str(op.get("kind", "?")) for op in faulting}))
+    return [
+        Insight(
+            severity="critical",
+            rule="memory-paging",
+            title=f"Machine paged {total:,} times during the query",
+            evidence=(
+                f"{len(faulting)} operator(s) took {total:,} disk-backed page faults — {names}. "
+                "The kernel was fetching back memory the process already believed it held, so "
+                "the timings above measure storage latency rather than the query's work."
+            ),
+            action=(
+                "Lower memory.max_memory_bytes so the engine spills deliberately instead of "
+                "being paged involuntarily, or give the process more RAM. Do not add "
+                "parallelism: each extra worker faults in its own working set and evicts the "
+                "others."
+            ),
+            op=names,
+            detail={"major_faults": total, "operators": len(faulting)},
+        )
+    ]
+
+
+def preempted_operators(
+    _profile: dict[str, Any], ops: list[dict[str, Any]], total_ms: float
+) -> list[Insight]:
+    """The cores were repeatedly taken away mid-operator, per operator rather than per box.
+
+    The machine-wide `cpu-contended` finding reads the run queue, which is an average over the
+    whole box across the last minute. This reads involuntary context switches *per operator*,
+    which is contention the query actually experienced, during the window it ran, attributed to
+    the operator that suffered it. The two disagree exactly when it matters: a short query that
+    lands inside someone else's burst sees heavy preemption and a calm-looking load average.
+
+    Reported at `info` because a busy shared box is often a deliberate choice rather than a
+    fault. The point is that the timing should not be trusted as a measurement of the plan.
+
+    Args:
+        _profile: The query profile (unused; the evidence is per-operator).
+        ops: The measured operators.
+        total_ms: Total wall time, to skip runs too short to judge.
+
+    Returns:
+        One insight when an operator was measurably fighting for cores, else `[]`.
+    """
+    if total_ms < _TRIVIAL_MS:
+        return []
+    contended = [
+        op
+        for op in ops
+        if preemption_rate(
+            int(op.get("invol_ctx_switches", 0)),
+            float(op.get("elapsed_ms", 0.0)),
+            int(op.get("threads", 0)),
+        )
+        >= CONTENDED_PREEMPTIONS_PER_CORE_SECOND
+    ]
+    if not contended:
+        return []
+    worst = max(
+        contended,
+        key=lambda op: preemption_rate(
+            int(op.get("invol_ctx_switches", 0)),
+            float(op.get("elapsed_ms", 0.0)),
+            int(op.get("threads", 0)),
+        ),
+    )
+    rate = preemption_rate(
+        int(worst.get("invol_ctx_switches", 0)),
+        float(worst.get("elapsed_ms", 0.0)),
+        int(worst.get("threads", 0)),
+    )
+    kind = str(worst.get("kind", "?"))
+    return [
+        Insight(
+            severity="info",
+            rule="cpu-preempted",
+            title=f"Operators evicted from the CPU ({rate:,.0f}/core-s)",
+            evidence=(
+                f"{len(contended)} operator(s) were preempted off their cores while running; "
+                f"{kind} was worst at {rate:,.0f} involuntary context switches per core-second. "
+                "Something else on this machine wanted the cores during the query, which the "
+                "1-minute run queue can miss on a short run."
+            ),
+            action=(
+                "Treat this run's timing as a lower bound on the plan's speed. Re-measure with "
+                "the process on its own cpuset, or reduce execution.parallelism so the engine "
+                "asks for cores it can actually hold."
+            ),
+            op=kind,
+            detail={"preemptions_per_core_second": rate, "operators": len(contended)},
         )
     ]

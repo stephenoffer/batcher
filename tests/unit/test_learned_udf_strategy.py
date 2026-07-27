@@ -16,6 +16,7 @@ import pytest
 import batcher as bt
 from batcher.core import default_hub
 from batcher.core.udf import strategy as strat
+from batcher.metadata.hardware_scope import scoped
 
 pytestmark = pytest.mark.unit
 
@@ -44,7 +45,7 @@ def test_process_verdict_seeds_from_hub_without_probing(monkeypatch):
     key = strat._fn_probe_key(op.fn)
     assert key is not None
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, key, {"proc": True})
+    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {"proc": True})
 
     # If the persisted verdict is honored, the probe never runs — make it explode to prove it.
     monkeypatch.setattr(
@@ -58,11 +59,11 @@ def test_process_verdict_persisted_after_a_cold_probe():
     op = _op_for(_double)
     key = strat._fn_probe_key(op.fn)
     _clear_caches()
-    assert default_hub().get_keyed_param(strat._LEARN_NS, key) is None  # cold
+    assert default_hub().get_keyed_param(scoped(strat._LEARN_NS), key) is None  # cold
 
     current = pa.table({"x": list(range(300_000))}).to_batches()
     verdict = strat._prefer_processes(op, total_rows=2_000_000, current=current)
-    stored = default_hub().get_keyed_param(strat._LEARN_NS, key) or {}
+    stored = default_hub().get_keyed_param(scoped(strat._LEARN_NS), key) or {}
     assert stored.get("proc") == verdict  # the cold probe wrote its verdict back
 
 
@@ -78,14 +79,14 @@ def test_learned_row_cost_changes_the_thread_batch_size():
     # Seeded HEAVY (per-row cost above the light threshold): the batch keeps the per-worker split
     # (floor stays at the morsel), so with many workers the target collapses toward the morsel.
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, key, {"row_secs": 1.0})
+    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {"row_secs": 1.0})
     heavy = strat.thread_batch_target(
         op, 4_000_000, num_workers=256, morsel=morsel, current=current
     )
 
     # Cold: the trivial `fn` probes as LIGHT, so the target lifts to the measured optimum.
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, key, {})  # explicitly cold
+    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {})  # explicitly cold
     light = strat.thread_batch_target(
         op, 4_000_000, num_workers=256, morsel=morsel, current=current
     )
@@ -98,10 +99,10 @@ def test_learned_row_cost_is_persisted_after_measuring():
     op = _op_for(_double)
     key = strat._fn_probe_key(op.fn)
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, key, {})
+    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {})
     current = pa.table({"x": list(range(300_000))}).to_batches()
     strat.thread_batch_target(op, 4_000_000, num_workers=8, morsel=16_384, current=current)
-    stored = default_hub().get_keyed_param(strat._LEARN_NS, key) or {}
+    stored = default_hub().get_keyed_param(scoped(strat._LEARN_NS), key) or {}
     assert isinstance(stored.get("row_secs"), (int, float))  # measured cost written back
 
 
@@ -114,11 +115,15 @@ def test_batch_size_policy_is_result_invariant():
     key = strat._fn_probe_key(op.fn)
 
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, key, {"row_secs": 1.0})  # heavy → fine batches
+    default_hub().put_keyed_param(
+        scoped(strat._LEARN_NS), key, {"row_secs": 1.0}
+    )  # heavy → fine batches
     heavy = bt.from_arrow(t).ml.map_batches(_double).to_pydict()
 
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, key, {"row_secs": 1e-12})  # light → coarse
+    default_hub().put_keyed_param(
+        scoped(strat._LEARN_NS), key, {"row_secs": 1e-12}
+    )  # light → coarse
     light = bt.from_arrow(t).ml.map_batches(_double).to_pydict()
 
     assert heavy == light  # batch size only shards — byte-identical result
@@ -146,12 +151,12 @@ def test_wide_rows_get_fewer_rows_than_the_light_target():
     wide = pa.table({"blob": pa.array([b"x" * 4096] * 40_000, pa.large_binary())}).to_batches()
 
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, strat._fn_probe_key(op.fn), {})
+    default_hub().put_keyed_param(scoped(strat._LEARN_NS), strat._fn_probe_key(op.fn), {})
     narrow_target = strat.thread_batch_target(
         op, 8_000_000, num_workers=8, morsel=morsel, current=narrow
     )
     _clear_caches()
-    default_hub().put_keyed_param(strat._LEARN_NS, strat._fn_probe_key(op.fn), {})
+    default_hub().put_keyed_param(scoped(strat._LEARN_NS), strat._fn_probe_key(op.fn), {})
     wide_target = strat.thread_batch_target(
         op, 8_000_000, num_workers=8, morsel=morsel, current=wide
     )

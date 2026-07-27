@@ -21,7 +21,15 @@ from batcher.observe.insights.resources import (
     idle_cpu,
     memory_headroom,
     memory_underused,
+    paging_operators,
+    preempted_operators,
     spilled_operators,
+)
+from batcher.observe.insights.stages import (
+    gpu_starved,
+    per_row_map,
+    row_exploding_stage,
+    udf_dominates,
 )
 
 __all__ = ["derive_insights"]
@@ -29,6 +37,8 @@ __all__ = ["derive_insights"]
 #: Every rule, in no significant order — the result is sorted by severity, not by registry
 #: position, so a rule can be added anywhere.
 _RULES = (
+    paging_operators,
+    preempted_operators,
     spilled_operators,
     bad_estimates,
     dominant_operator,
@@ -40,11 +50,23 @@ _RULES = (
     late_filter,
     long_tail,
     planning_dominates,
+    # ML-pipeline stage findings. They read the orchestrator's per-stage measurements
+    # rather than the engine's, which are the only numbers a batch-inference pipeline has.
+    gpu_starved,
+    udf_dominates,
+    row_exploding_stage,
+    per_row_map,
 )
 
 
 def derive_insights(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Findings for one query's profile, most severe first; `[]` for a healthy run.
+
+    On a **distributed** run the driver tree carries no measurements — the work happened on
+    the workers, and their map sub-plan arrives as `worker_ops` in its own op-id space. Rules
+    read that instead when the driver tree is empty. Without the fallback every rule went
+    silent on exactly the runs that most need them: a spill or a starved GPU on a cluster is
+    both more likely and more expensive than the same finding on one node.
 
     Args:
         profile: A `QueryProfile.to_dict()` document, or None if the query never produced
@@ -56,6 +78,8 @@ def derive_insights(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not profile:
         return []
     ops = [op for op in profile.get("ops", []) if op.get("measured")]
+    if not ops:
+        ops = [op for op in profile.get("worker_ops", []) if op.get("measured")]
     if not ops:
         return []
     total_ms = float(profile.get("total_ms", 0.0))

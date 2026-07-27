@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
 from batcher.kyber import plan_cache
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -110,7 +111,7 @@ def record_arm(
     if hub is None or reward_ms <= 0.0 or not arm:
         return
     try:
-        stored = hub.get_keyed_param(namespace, key) or {}
+        stored = hub.get_keyed_param(scoped(namespace), key) or {}
         # Every arm's evidence decays on every observation, not just the arm that ran. Decaying
         # only the observed arm would make the discount a function of how often an arm happens
         # to be chosen, so a rarely-picked arm would keep its ancient mean at full strength —
@@ -118,9 +119,9 @@ def record_arm(
         stats = {a: _decayed(v) for a, v in stored.items() if isinstance(v, dict)}
         stats[arm] = _welford_update(stats.get(arm), reward_ms)
         if invalidates_plans:
-            plan_cache.record_write(hub, namespace, key, stats)
+            plan_cache.record_write(hub, scoped(namespace), key, stats)
         else:
-            hub.put_keyed_param(namespace, key, stats)
+            hub.put_keyed_param(scoped(namespace), key, stats)
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "record a bandit arm observation", exc)
         return
@@ -276,7 +277,7 @@ def learned_arm(
     if hub is None:
         return None
     try:
-        stats = hub.get_keyed_param(namespace, key) or {}
+        stats = hub.get_keyed_param(scoped(namespace), key) or {}
         total = sum(float(s.get("n", 0.0)) for s in stats.values() if isinstance(s, dict))
         if total < min_total:
             return None
@@ -352,10 +353,10 @@ def record_adaptive_route(
     if hub is None or wall_ms <= 0.0 or not route:
         return
     try:
-        spent = dict(hub.get_keyed_param(_NS_ROUTE_COLD, signature) or {})
+        spent = dict(hub.get_keyed_param(scoped(_NS_ROUTE_COLD), signature) or {})
         if not spent.get(route):
             spent[route] = 1
-            hub.put_keyed_param(_NS_ROUTE_COLD, signature, spent)
+            hub.put_keyed_param(scoped(_NS_ROUTE_COLD), signature, spent)
             return
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "read the route cold-sample marker", exc)

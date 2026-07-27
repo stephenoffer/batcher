@@ -26,6 +26,7 @@ from batcher.config import CostCoefficients, CostWeights, active_config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.expr_cost import expr_cost, expr_cost_factor
 from batcher.kyber.stats.estimator import combine_ndv
+from batcher.kyber.storage_cost import spill_device_factor
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import (
     Aggregate,
@@ -152,11 +153,14 @@ class CostModel:
         plan that spills look exactly as cheap as one that does not, which is the single
         largest cost error a plan can contain — a spilled operator is disk-bound, and the
         optimizer's whole reason to prefer a smaller build side is to avoid it.
+
+        Scaled by the measured class of the spill device, so the same overflow is costed as
+        the cheap thing it is on local flash and the expensive thing it is on a network volume.
         """
         budget = self._memory_budget()
         if budget <= 0.0 or state_bytes <= budget:
             return 0.0
-        return _SPILL_WRITE_READ_PASSES * (state_bytes - budget)
+        return _SPILL_WRITE_READ_PASSES * (state_bytes - budget) * spill_device_factor()
 
     def _merge_passes(self, state_bytes: float) -> float:
         """External-merge passes an out-of-core sort of `state_bytes` needs.
@@ -324,7 +328,12 @@ class CostModel:
                 mem=state_bytes,
                 # An out-of-core sort rewrites its runs once per merge pass, and the pass count
                 # grows only logarithmically in how far over budget it is.
-                io=_SPILL_WRITE_READ_PASSES * state_bytes * self._merge_passes(state_bytes),
+                io=(
+                    _SPILL_WRITE_READ_PASSES
+                    * state_bytes
+                    * self._merge_passes(state_bytes)
+                    * spill_device_factor()
+                ),
             )
 
         if isinstance(node, Join):
