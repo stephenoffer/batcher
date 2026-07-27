@@ -1094,7 +1094,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `gpu_plan.py` | 350 | Translate a linear Batcher plan to a GPU dataframe execution (cuDF) — many ops, not one. |
 | `gpu_transform.py` | 201 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
-| `runtime.py` | 190 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
+| `runtime.py` | 208 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 160 | Column-statistics measurement — Core's lane. |
 | `streaming.py` | 416 | Streaming (incremental) aggregation — bounded-memory group-by over a source. |
@@ -1806,7 +1806,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 414 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `lib.rs` | 782 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 760 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
 | `shuffle.rs` | 548 | Shuffle FFI: partitioners and the concurrent reducer gather. |
@@ -2043,7 +2043,7 @@ Process-wide memory accounting for reserve-before-allocate.
 
 | file | lines | what it is |
 |---|---|---|
-| `cancel.rs` | 135 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
+| `cancel.rs` | 148 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
 | `lib.rs` | 358 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`

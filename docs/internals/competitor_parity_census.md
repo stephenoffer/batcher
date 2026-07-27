@@ -608,13 +608,14 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
   DuckDB and Batcher round half away from zero (`-3.0`). DuckDB is the oracle.
 * **`list_sum` of an empty list** is `NULL` here and in DuckDB, `0` in Polars.
 
-## The three censuses, and what each is good for
+## The four censuses, and what each is good for
 
 | Reference | Oracle | Surface probed | Result |
 |---|---|---|---|
 | DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 671 listed names, of which 331 are scored (see below), through `bt.sql` | **93 → 260 of 331 (79%)**; 15 wrong answers found |
 | Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, of which 268 are scored, through `bt.sql(dialect="spark")` | **75 → 160 of 268 (60%)**; 35 wrong answers found |
 | Polars | the live library | every zero-argument method on `pl.Expr` and its `.str`/`.dt`/`.list` namespaces | 53 supported, 31 absent, 14 differences (all but two are representation or a pinned semantic choice) |
+| Daft | the live library | every public method on `daft.Expression`, 226 of which are scored, resolved against Batcher's *whole* namespaced surface | **174 of 226 (77%)**; the 52 remaining are Daft's multimodal differentiator |
 
 ### What the denominators exclude, and why it matters
 
@@ -648,6 +649,28 @@ geospatial extension, an XPath/XML family, its own bitmap and variant encodings,
 and session introspection, or values that are nondeterministic by definition. Counting
 those as missing functions measures Spark's product scope, not Batcher's expression
 surface.
+
+### Daft, and the third denominator trap
+
+Daft keeps everything on a flat `Expression` namespace (`list_sum`, `upper`,
+`to_snake_case`); Batcher pushes breadth onto accessors (`.list.sum`, `.str.to_uppercase`).
+A naive `dir()` difference reports Batcher as missing **220** functions. Resolving each Daft
+name against the full namespaced surface, plus recorded aliases where the two engines chose
+different words (`avg`/`mean`, `eq_null_safe`/`eq_missing`, `lag`/`shift`) and recorded
+*parameterizations* where Daft spells as N functions what Batcher spells as one function
+with an argument, the real figure is **174 of 226, or 77%**.
+
+That parameterization category is worth reading twice. Daft's `as_int8`…`as_uuid` is **35
+names for one capability** — `.cast(dtype)` — exactly like DuckDB's 135 `icu_collate_*`.
+And its eight case converters (`to_snake_case`, `to_camel_case`, …) are all one argument of
+`.str.to_case(style)`, which Batcher implements with a *single* word splitter so the styles
+cannot disagree about where the words were. Three separate times in this pass an apparent
+gap family turned out to be already covered, better.
+
+The 52 that remain are almost entirely Daft's own differentiator rather than a relational
+gap: image operations (9), duration accessors (7), Iceberg partition transforms (6),
+tokenize/compress (6), file and object-store IO (5), HDF5 (3) and video (3). The Iceberg
+partition transforms and the duration accessors are the two families here worth taking.
 
 Spark deserves a note: **it needs no JVM.** There is no Java runtime on this machine, so
 `SparkSession` cannot start — but every builtin carries its expected output in an
