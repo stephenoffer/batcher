@@ -75,6 +75,49 @@ class _StructNamespace:
         """
         return StructField(self._e, name)
 
+    def keys(self) -> MapFunc:
+        """Return the struct's field names as a ``List`` column (DuckDB ``struct_keys``).
+
+        A struct's keys come from its *type*, so every row carries the same list. A null
+        struct row still answers null rather than the names, which is what distinguishes
+        this from a constant.
+
+        Returns:
+            A new List<Utf8> expression of the struct's field names.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]})
+                >>> ds.select(bt.col("s").struct.keys().alias("k")).to_pydict()
+                {'k': [['x', 'y'], ['x', 'y']]}
+        """
+        return MapFunc("map_keys", self._e)
+
+    def get(self, name: str) -> MapFunc:
+        """Return the named field, the subscript spelling of :meth:`field`.
+
+        This is what ``s['x']`` lowers to, and what DuckDB's ``struct_extract`` and
+        Spark's ``element_at(s, 'x')`` reach. Naming a field the struct does not have is
+        an error rather than a null, because a struct's fields are fixed by its type.
+
+        Args:
+            name: The struct field to project out.
+
+        Returns:
+            A new expression: the named field, under the struct's own row nulls.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]})
+                >>> ds.select(bt.col("s").struct.get("x").alias("x")).to_pydict()
+                {'x': [1, 2]}
+        """
+        return MapFunc("element_at", self._e, key=name)
+
 
 class _JsonNamespace:
     """JSON accessors on a string column: ``col("j").json.extract_string("$.a.b")``.

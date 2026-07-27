@@ -616,12 +616,12 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 237 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 389 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `anonymous.py` | 398 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
 | `collections.py` | 214 | SQL list/array functions — the Spark-shaped half, including the lambda forms. |
 | `functions.py` | 500 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 110 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 457 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
-| `maps.py` | 67 | SQL → `.map` accessor dispatch. |
+| `maps.py` | 83 | SQL → `.map` accessor dispatch. |
 | `scalar.py` | 469 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 256 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 68 | SQL string functions whose translation is more than a name lookup. |
@@ -1583,7 +1583,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | module | lines | what it is |
 |---|---|---|
 | `_bind.py` | 500 | Shared accessor-generation helper for the namespace families. |
-| `collections.py` | 1539 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1582 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `strings.py` | 3973 | The `.str` accessor namespace. |
 | `temporal.py` | 1068 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
@@ -1954,7 +1954,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
-| `eval/map.rs` | 84 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
+| `eval/map.rs` | 194 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 460 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/mod.rs` | 617 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |

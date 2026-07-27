@@ -644,6 +644,48 @@ DuckDB-typed call is a separate type-support question and is not claimed as pari
 **Verified** by eight differential cases, including the 1-based/absent pair that a 0-based
 implementation gets wrong and a `first`-is-not-`min` check.
 
+### 195-199. A struct is a keyed container, and one kernel now says so
+
+**Source:** the open list's item 4 — "`.struct` has one method (`field`); DuckDB has
+`struct_insert`/`struct_keys`/`struct_values`" — re-probed from SQL rather than from the
+DataFrame API.
+
+None of SQL's spellings of a struct field access reached the `.struct.field` that has
+worked all along. `s['a']` hit the `element_at` kernel, which rejected anything that was
+not a `Map`; `struct_extract(s, 'a')` was an unhandled typed node; `struct_keys(s)` had no
+implementation at all.
+
+**The fix is one kernel, not three.** A struct is a keyed container too, so `element_at`
+now resolves a *name* against the struct's fields where it scans a map's entries. That
+placement is the point: the translator has no schema and cannot tell `s['a']` from
+`m['a']`, so the disambiguation has to happen where the array's type is actually known.
+Doing it in the translator would have meant guessing.
+
+Three things the kernel has to get right, each with its own test:
+
+* **A null struct row answers null**, even though its children hold values underneath.
+  Arrow keeps the null mask on the parent and leaves the child buffer unconstrained, so a
+  bare `column_by_name` resurrects a value inside a null row. The child is returned with
+  the parent's nulls merged in.
+* **An absent field is an error, not a null** — the opposite of a map, whose missing key is
+  an ordinary result. A struct's fields come from its type, so naming one it lacks is a
+  mistake.
+* **`struct_keys` repeats the same list on every row** but still nulls a null row, which is
+  what keeps it from being a constant.
+
+`.struct` goes from one method to three (`field`, `get`, `keys`). `struct_values` is
+**not** implemented: DuckDB returns a container whose members need not share a type, which
+is not a `List`, and guessing a homogeneous one would be a different function.
+
+**The dot form `s.a` still fails**, and the reason is worth recording because it is not
+where anyone would look: sqlglot parses it as a `Column` qualified by table `s`, so it is
+rejected during *column resolution*, before expression dispatch runs. A different layer,
+and still open.
+
+**Verified** by nine differential cases and six Rust unit tests, including the null-parent
+case and a map-subscript regression check — teaching `element_at` about structs must not
+disturb the path it already served.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.

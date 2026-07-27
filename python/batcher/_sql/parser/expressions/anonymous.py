@@ -213,6 +213,13 @@ _ELEMENT_AT = frozenset(
     {"list_extract", "array_extract", "list_element", "array_element", "element_at"}
 )
 
+# `f(struct)` → a unary `.struct` method. A struct's keys come from its *type*, so the
+# same list is repeated on every row — and a null struct row still answers null, which is
+# what keeps this from being a constant.
+_UNARY_STRUCT = {
+    "struct_keys": "keys",
+}
+
 # `f(list)` → a unary `.list` method. These are DuckDB names whose `array_` twin does not
 # exist, so they never reached the `array_`/`list_` alias sweep that found the rest.
 _UNARY_LIST = {
@@ -324,6 +331,8 @@ def anonymous_scalar(tr, node):
             return getattr(tr._scalar(one).map, _UNARY_MAP[name])()
         if name in _UNARY_LIST:
             return getattr(tr._scalar(one).list, _UNARY_LIST[name])()
+        if name in _UNARY_STRUCT:
+            return getattr(tr._scalar(one).struct, _UNARY_STRUCT[name])()
 
     if len(args) == 2:
         left, right = args

@@ -11,6 +11,15 @@ here is what stops `_list_function` growing a second, unrelated concern — and 
 is where the bug was: every `exp.Bracket` was assumed to be a list index, so `m['a']` and
 Spark's `element_at(m, 'a')` (which parses as the same node) died on `int('a')`.
 
+A struct is served here too, not in a module of its own: `s['a']` and `struct_extract(s,'a')`
+are the same lookup as a map's, and the engine resolves which container it is from the
+array's own type. Splitting them would put one operation in two files.
+
+The dot form `s.a` is **not** handled here and still fails. sqlglot parses it as a
+`Column` qualified by table `s` rather than as a struct access, so it is rejected during
+*column resolution*, before any expression dispatch runs — a different layer, and a
+separate change.
+
 `map_extract` is deliberately not served here. DuckDB returns a *list* for it — `[1]` for a
 hit and `[]` for a miss — where the subscript returns the bare value, so mapping it to
 `.map.get` would answer a plausible result that is not DuckDB's. It needs a kernel.
@@ -35,6 +44,13 @@ def map_function(tr, node) -> Expr | None:
     Returns:
         The Batcher expression, or None when `node` is not served here.
     """
+    if isinstance(node, exp.StructExtract):
+        # `struct_extract(s, 'a')` is the subscript under another name, so it lands on
+        # the same kernel as `s['a']`.
+        name = node.expression
+        if isinstance(name, (exp.Literal, exp.Identifier)):
+            return tr._scalar(node.this).struct.get(name.name)
+        return None
     if isinstance(node, exp.MapKeys):
         # `map_values` arrives as `exp.Anonymous` and the anonymous table serves it;
         # `map_keys` gets a typed node, so without this branch it raises "unsupported SQL
