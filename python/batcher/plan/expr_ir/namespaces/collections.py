@@ -10,7 +10,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.core import Expr, _wrap
+from batcher.plan.expr_ir.core import Expr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import (
     ListBinary,
     ListContains,
@@ -270,6 +270,93 @@ class _JsonNamespace:
         """
         return StrFunc("json_type", self._e, pattern=path)
 
+    def value(self, path: str) -> StrFunc:
+        """The **scalar** at `path` as its JSON token, null for a container (→ Utf8).
+
+        DuckDB ``json_value``. The difference from :meth:`extract_string` is deliberate
+        and is DuckDB's: this one answers only for a scalar and keeps a string's quotes
+        (it returns the JSON token), where ``extract_string`` unquotes a string and
+        renders an object or array as compact JSON.
+
+        Args:
+            path: A JSONPath, e.g. ``"$.user.age"``.
+
+        Returns:
+            A new Utf8 expression; null at a container, an absent path, or a JSON null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a": 1, "b": "x", "c": [1]}']})
+                >>> ds.select(r=bt.col("j").json.value("$.b")).to_pydict()
+                {'r': ['"x"']}
+        """
+        return StrFunc("json_value", self._e, pattern=path)
+
+    def contains(self, value: str) -> StrFunc:
+        """Whether the document contains `value` as an element or field value (→ Boolean).
+
+        DuckDB ``json_contains``. `value` is itself JSON, so a string needs its quotes.
+        Comparison is on the parsed values, so whitespace and key order cannot change
+        the answer.
+
+        Args:
+            value: The JSON text to look for, e.g. ``"1"`` or ``'"needle"'``.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ["[1, 2, 3]", '{"a": 5}']})
+                >>> ds.select(r=bt.col("j").json.contains("5")).to_pydict()
+                {'r': [False, True]}
+        """
+        return StrFunc("json_contains", self._e, pattern=value)
+
+    def pretty(self) -> StrFunc:
+        """Re-render the document with two-space indentation (→ Utf8).
+
+        DuckDB ``json_pretty``. Text that is not valid JSON is null rather than an error.
+
+        Returns:
+            A new Utf8 expression: the indented document.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a":1}']})
+                >>> print(ds.select(r=bt.col("j").json.pretty()).to_pydict()["r"][0])
+                {
+                  "a": 1
+                }
+        """
+        return StrFunc("json_pretty", self._e)
+
+    def structure(self) -> StrFunc:
+        """The document's shape with each leaf replaced by its type name (→ Utf8).
+
+        DuckDB ``json_structure``: the schema-on-read summary to group by when you are
+        finding out what shapes a JSON column actually holds. An array is described by
+        its first element, as in DuckDB.
+
+        Returns:
+            A new Utf8 expression: the structure document.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a": 1, "b": "x"}']})
+                >>> ds.select(r=bt.col("j").json.structure()).to_pydict()
+                {'r': ['{"a":"UBIGINT","b":"VARCHAR"}']}
+        """
+        return StrFunc("json_structure", self._e)
+
     def exists(self, path: str) -> StrFunc:
         """Test whether a value exists at `path` (→ Boolean).
 
@@ -360,6 +447,54 @@ class _MapNamespace:
                 {'v': [[1, 2], [3]]}
         """
         return MapFunc("map_values", self._e)
+
+    def len(self) -> Expr:
+        """Count each row's entries (DuckDB ``cardinality``; → Int64).
+
+        Composed from :meth:`keys` rather than given its own kernel: the key list has one
+        element per entry by construction, so its length *is* the cardinality, and a null
+        map stays null through both steps.
+
+        Returns:
+            A new Int64 expression: the number of entries, or null for a null map.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> col = pa.array([[("a", 1), ("b", 2)], [("c", 3)]],
+                ...                type=pa.map_(pa.string(), pa.int64()))
+                >>> ds = bt.from_arrow(pa.table({"m": col}))
+                >>> ds.select(bt.col("m").map.len().alias("n")).to_pydict()
+                {'n': [2, 1]}
+        """
+        return self.keys().list.len()
+
+    def contains(self, key: object) -> Expr:
+        """Whether each row's map holds ``key`` (DuckDB ``map_contains``; → Boolean).
+
+        Composed from :meth:`keys`, so it answers null for a null map and ``False`` for an
+        empty one — matching DuckDB, and distinguishing "no such key" from "no map".
+
+        Args:
+            key: The map key to look for in every row; a plan-time literal.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> col = pa.array([[("a", 1), ("b", 2)], [("c", 3)]],
+                ...                type=pa.map_(pa.string(), pa.int64()))
+                >>> ds = bt.from_arrow(pa.table({"m": col}))
+                >>> ds.select(bt.col("m").map.contains("a").alias("has")).to_pydict()
+                {'has': [True, False]}
+        """
+        return self.keys().list.contains(key)
 
     def get(self, key: object) -> MapFunc:
         """Look up the value for a literal ``key`` in each row's map; null if absent.
@@ -782,7 +917,6 @@ class _ListNamespace:
                 >>> ds.select(r=bt.col("v").list.is_unit_norm()).to_pydict()
                 {'r': [True, False]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         return (self.l2_norm() - Lit(1.0)).abs() < Lit(tolerance)
 
@@ -828,8 +962,6 @@ class _ListNamespace:
         """
         import math
 
-        from batcher.plan.expr_ir.core import Lit
-
         return self.cosine_similarity(other).acos() / Lit(math.pi)
 
     def dim(self) -> ListFunc:
@@ -868,7 +1000,6 @@ class _ListNamespace:
                 >>> ds.select(r=bt.col("v").list.is_zero_vector()).to_pydict()
                 {'r': [False, True]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         return self.l2_norm() == Lit(0.0)
 
@@ -1001,6 +1132,25 @@ class _ListNamespace:
                 {'r': [[2, 4, 6]]}
         """
         return ListTransform(self._e, _wrap(func))
+
+    def drop_nulls(self) -> ListFilter:
+        """Drop the null elements of each list (Polars ``list.drop_nulls``, → List).
+
+        Returns:
+            A new List expression with the nulls removed; list lengths change, and a
+            null *list* stays null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, None, 3], [None]]})
+                >>> ds.select(r=bt.col("a").list.drop_nulls()).to_pydict()
+                {'r': [[1, 3], []]}
+        """
+        from batcher.plan.functions.collection import element
+
+        return self.filter(element().is_not_null())
 
     def filter(self, predicate: Any) -> ListFilter:
         """Keep the elements where ``predicate`` is true (→ List).

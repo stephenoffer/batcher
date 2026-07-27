@@ -17,11 +17,11 @@ Each namespace and the methods it carries:
 | Namespace | Covers |
 | --- | --- |
 | `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0, boundary="char")` (RAG document splitter; `boundary` may be `"char"`/`"word"`/`"sentence"`/`"line"` so a chunk never ends mid-word), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, `zfill(width)` (zero-pad numeric strings), `contains_any([...])` (true if any literal substring is present), and more |
-| `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `epoch_ms()` / `epoch_us()` / `epoch_ns()` (integer epoch at ms/µs/ns resolution), `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `l1_norm` (Manhattan magnitude), `max_abs` (MaxAbs-scaling divisor), `normalize`, `softmax` (per-row logits→probabilities), `arg_sort` (indices sorting ascending, so reverse for top-k), `cum_sum` (cumulative sum), `diff` (first difference with a leading null, for delta features), `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `concat(o)` (append, keeping duplicates — DuckDB `list_concat`, not a set op), `has_all(o)` / `has_any(o)` (containment tests, DuckDB `list_has_all`/`list_has_any`), `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`, `add(o)` / `subtract(o)` / `multiply(o)` (element-wise vector arithmetic → List<Float64>); vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `l1_distance(o)` (Manhattan), `hamming_distance(o)` (differing positions, for binary or quantized embeddings), `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature, the blocking key for a vector similarity join) |
+| `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `epoch_ms()` / `epoch_us()` / `epoch_ns()` (integer epoch at ms/µs/ns resolution), `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), `to_string(fmt)` (ISO-8601 by default), `timestamp(unit)` (the Polars epoch reader), `is_business_day()` (the weekday test, Polars' spelling of `is_weekday`), and more |
+| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `l1_norm` (Manhattan magnitude), `max_abs` (MaxAbs-scaling divisor), `normalize`, `softmax` (per-row logits→probabilities), `arg_sort` (indices sorting ascending, so reverse for top-k), `cum_sum` (cumulative sum), `diff` (first difference with a leading null, for delta features), `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `concat(o)` (append, keeping duplicates — DuckDB `list_concat`, not a set op), `has_all(o)` / `has_any(o)` (containment tests, DuckDB `list_has_all`/`list_has_any`), `transform(element()-expr)`, `filter(element()-pred)`, `drop_nulls()` (the null-dropping filter, Polars `list.drop_nulls`), `join(sep)`, `add(o)` / `subtract(o)` / `multiply(o)` (element-wise vector arithmetic → List<Float64>); vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `l1_distance(o)` (Manhattan), `hamming_distance(o)` (differing positions, for binary or quantized embeddings), `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature, the blocking key for a vector similarity join) |
 | `.struct` | `field(name)` |
 | `.json` | `extract_string(path)` |
-| `.map` | `get(key)`, `keys()`, `values()`, which read a `Map`-typed column |
+| `.map` | `get(key)`, `keys()`, `values()`, `len()` (entry count, DuckDB `cardinality`), `contains(key)` (DuckDB `map_contains`), which read a `Map`-typed column |
 | `.image` | `decode()` (header-only struct `{width, height, channels, mode}` from a single read), `to_tensor(width, height)`, `to_tensor_f32(width, height, mean=, std=, channels_first=)` (model-ready `float32` tensor: scale to `[0,1]`, per-channel normalize, HWC/CHW), `center_crop(width, height)` (centered crop, torchvision-style zero-pad when smaller), `to_grayscale(width, height)` (decode+resize to a single Rec.601 luma channel), `resize(width, height)` (re-encode to PNG bytes), `crop(x, y, width, height)` (an arbitrary window as PNG bytes, clipped at the edge rather than padded), `encode(format)` (re-encode as `png`/`jpeg`/`bmp`/`gif`), `convert(mode)` (change color mode to `L`/`LA`/`RGB`/`RGBA`; Rec. 601 luma, the same weighting `to_grayscale` and `dhash` use), `dhash()` (64-bit perceptual hash for near-duplicate detection) |
 | `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal), `resample(rate)` (decode + band-limited resample to `rate` Hz, the 16 kHz audio-ML preprocessing step), `mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80)` (the speech-model mel power-spectrogram front end; matches `torchaudio.transforms.MelSpectrogram`), `mfcc(rate, n_fft=400, hop_length=160, n_mels=128, n_mfcc=40)` (Mel-Frequency Cepstral Coefficients; matches `torchaudio.transforms.MFCC`) |
 | `.video` | `decode()` |
@@ -57,6 +57,8 @@ Each namespace and the methods it carries:
 | `.jaccard(target)` | Jaccard similarity of the two values' character *sets*, `[0,1]` (DuckDB `jaccard`, → Float64) |
 | `.url_encode()` / `.url_decode()` | percent-encode a URL *component* and its inverse (DuckDB `url_encode`/`url_decode`) |
 | `.regexp_escape()` | escape the regex metacharacters, so a value can be embedded in a pattern as a literal (DuckDB `regexp_escape`) |
+| `.escape_regex()` | the Polars spelling of `regexp_escape` |
+| `.join(sep)` | concatenate every value of the group into one string — an aggregate (SQL `string_agg`, Polars `str.join`) |
 | `.parse_filename()` | the final component of a path (DuckDB `parse_filename`) |
 | `.parse_dirname()` | the *first* component of a path — `/` for an absolute one (DuckDB `parse_dirname`) |
 | `.parse_dirpath()` | everything before the last separator, i.e. the containing directory (DuckDB `parse_dirpath`) |
@@ -85,8 +87,18 @@ of the month), and `.millennium()`. Each extracts the named field of a date/time
 | `.values(path="$")` | the array's elements at `path`, each rendered as `extract_string` renders a leaf (→ List<Utf8>) |
 | `.type_of(path="$")` | the JSON type at `path`: `object`, `array`, `string`, `number`, `boolean`, or `null` |
 | `.exists(path)` | whether a value is present at `path`; a JSON `null` counts as present (→ Bool) |
+| `.value(path)` | the **scalar** at `path` as its JSON token, null for an object or array (DuckDB `json_value`) |
+| `.contains(value)` | whether the document holds `value` (itself JSON) as an element or field value (→ Bool) |
+| `.pretty()` | the document re-rendered with two-space indentation (DuckDB `json_pretty`) |
+| `.structure()` | the document's shape with each leaf replaced by its type name (DuckDB `json_structure`) |
 
-The last five inspect a document's *shape* rather than pulling one leaf out of it, which
+`.value` and `.extract_string` answer different questions on purpose, as they do in
+DuckDB: `.value` returns the JSON token of a *scalar* and null for a container, where
+`.extract_string` unquotes a string and renders a container as compact JSON.
+`.structure()` is the one to group by when you are finding out what shapes a JSON column
+actually holds.
+
+The shape methods inspect a document's *shape* rather than pulling one leaf out of it, which
 is what a schema-on-read pipeline needs before it can extract anything. `type_of` routes
 a field whose type varies row to row; `exists` separates an absent key from a key whose
 value is JSON `null`, a distinction the `extract_*` methods can't express because both

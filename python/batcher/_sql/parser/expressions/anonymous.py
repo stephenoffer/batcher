@@ -93,6 +93,14 @@ _UNARY_STR = {
 _UNARY_MAP = {
     "map_values": "values",
     "map_keys": "keys",
+    "cardinality": "len",
+}
+
+# `f(m, key)` → a `.map` method taking one literal key. Spark's `map_contains_key` is
+# absent because sqlglot gives it a *typed* node, so it never reaches this table; adding
+# it here would be dead code.
+_MAP_KEY = {
+    "map_contains": "contains",
 }
 
 # `f(ts)` → a `.dt` method. These are the DuckDB date-part spellings sqlglot has no
@@ -187,7 +195,11 @@ _TERNARY_FN = {
 # plan-build time — which is also what makes them constant-foldable downstream.
 _NULLARY = {
     "pi": lambda: lit(math.pi),
+    "e": lambda: lit(math.e),
     "today": current_date,
+    # The lambda placeholder: `transform(xs, x -> x + 1)` rewrites its parameter to
+    # `element()` before translating the body, and this row is what resolves it.
+    "element": element,
 }
 
 # `f(list, i)` → 1-based element access. DuckDB's `list_extract`/`array_extract`/
@@ -293,6 +305,8 @@ def anonymous_scalar(tr, node):
         if name in _ELEMENT_AT:
             # DuckDB indexes lists from 1; `.list.get` is 0-based.
             return tr._scalar(left).list.get(_const_int_arg(right, f"{name}(): index") - 1)
+        if name in _MAP_KEY:
+            return getattr(tr._scalar(left).map, _MAP_KEY[name])(_raw_literal(right))
         if name in _LIST_PAIR:
             return getattr(tr._scalar(left).list, _LIST_PAIR[name])(tr._scalar(right))
         negated = _LIST_PAIR_NEGATED.get(name)
@@ -312,6 +326,18 @@ def anonymous_scalar(tr, node):
         return array(*(tr._scalar(a) for a in args))
 
     return None
+
+
+def _raw_literal(node) -> object:
+    """The Python value a constant argument denotes — map lookups take a plan-time key."""
+    from sqlglot import expressions as exp
+
+    if not isinstance(node, exp.Literal):
+        raise NotImplementedError("a map key must be a constant")
+    if node.is_string:
+        return node.name
+    text = node.name
+    return float(text) if ("." in text or "e" in text.lower()) else int(text)
 
 
 def _arith(tr, name: str, left, right) -> Expr:
