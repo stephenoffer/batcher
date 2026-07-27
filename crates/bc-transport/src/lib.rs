@@ -113,7 +113,23 @@ pub use tls::{TlsClientConfig, TlsIdentity, TlsServerConfig};
 
 /// Default number of in-flight `RecordBatch` credits for a credit-bounded
 /// exchange when the caller does not specify one.
-pub const DEFAULT_CREDITS: u32 = 4;
+///
+/// **Kept equal to `FlowControlConfig.default_credits` on the control-plane side.** This
+/// is the value in force whenever Carbonite does not hand one down: a `ShuffleSession`
+/// built without an explicit grant passes `credits=None`, and a producer that receives a
+/// missing or malformed seed falls back here too. It was 4 while the control plane's
+/// authority said 16, so exactly the paths where Carbonite had *not* spoken ran at the
+/// throttled window — measured on a 50 ms-RTT link, one 18 MiB partition moves at
+/// 2.4 MiB/s at 4 credits and 7.7 MiB/s at 16 (3.2x), because a cross-node fetch's
+/// throughput ceiling is `window x batch / RTT` and 4 batches do not fill the
+/// bandwidth-delay product.
+///
+/// This is a *starting* window, not a ceiling: the AIMD controller and the byte-budgeted
+/// `credit_ceiling` still govern what a channel may grow to, so raising the floor changes
+/// how fast a short fetch reaches its operating point, not how much memory it may hold.
+/// At the default 1 MiB morsel it is ~16 MiB per channel, well inside the 256 MiB
+/// per-channel budget.
+pub const DEFAULT_CREDITS: u32 = 16;
 
 /// HTTP/2 per-stream receive window for a bulk Arrow transfer.
 ///
@@ -842,6 +858,77 @@ mod tests {
         assert!(
             max_inflight >= 1 && max_inflight <= WINDOW as i64,
             "in-flight high-water mark {max_inflight} must be within (0, {WINDOW}]",
+        );
+    }
+
+    /// A consumer that over-grants must not be able to make the producer buffer past the
+    /// window it seeded.
+    ///
+    /// The credit bound used to be the *consumer's* arithmetic: the producer added
+    /// whatever permits arrived. A reducer with a buggy top-up — or one that simply
+    /// claimed more — made a healthy mapper encode and hold its whole partition, and a
+    /// large enough claim panicked the serve task outright on `add_permits`. This drives
+    /// the exchange by hand so it can grant dishonestly, then checks the producer's own
+    /// in-flight gauge.
+    #[tokio::test]
+    async fn an_over_granting_consumer_cannot_widen_the_producers_window() {
+        const N: i64 = 60;
+        const WINDOW: u32 = 4;
+
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(9, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, N)).await;
+
+        let mut client = FlightClient::connect(&addr).await.unwrap();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
+        let ticket_str = ticket.to_string();
+        let first = FlightData {
+            flight_descriptor: Some(arrow_flight::FlightDescriptor {
+                r#type: arrow_flight::flight_descriptor::DescriptorType::Path as i32,
+                path: vec![ticket_str, String::new()],
+                ..Default::default()
+            }),
+            app_metadata: handler::encode_credits(WINDOW).into(),
+            ..Default::default()
+        };
+        grant_tx.send(first).await.unwrap();
+
+        let request = futures::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(grant_rx),
+            Ok::<_, arrow_flight::error::FlightError>,
+        );
+        let mut response = client.do_exchange(request).await.unwrap();
+
+        // Drain, granting back a wildly inflated top-up after every batch.
+        let mut seen = 0i64;
+        while let Ok(Some(_batch)) = response.try_next().await {
+            seen += 1;
+            let _ = grant_tx
+                .send(FlightData {
+                    app_metadata: handler::encode_credits(100_000).into(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        drop(grant_tx);
+
+        assert_eq!(seen, N, "the transfer must still complete");
+        let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+        // `WINDOW + 1`, and the `+ 1` is real rather than slack. The clamp reads
+        // `available_permits()` to decide how much room a grant may fill, while the
+        // producer decrements that same count at `acquire()` and only marks the batch
+        // in-flight at `on_send()`. A grant landing between those two points sees one more
+        // slot free than the gauge will shortly show, so in-flight can transiently reach
+        // one past the window. Closing it would need the permit count and the gauge to move
+        // under one lock, on the per-batch path, to buy back a single batch slot.
+        //
+        // What matters is that the bound is *a* bound: without the clamp this same test
+        // observes 56 in flight against a seeded window of 4 — the producer encoding its
+        // whole partition because the consumer said it could.
+        assert!(
+            max_inflight <= WINDOW as i64 + 1,
+            "a dishonest consumer widened the producer's window to {max_inflight} (seeded {WINDOW})",
         );
     }
 

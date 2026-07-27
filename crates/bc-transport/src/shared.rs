@@ -29,21 +29,58 @@ use arrow::ipc::root_as_footer;
 use arrow::ipc::writer::FileWriter;
 use memmap2::Mmap;
 
+/// Create `dir` (and parents) **owner-only**, tightening it if it already exists.
+///
+/// The mode is both requested and asserted, because `create_dir_all` honours the process
+/// umask (so it may get less than it asks for) and silently leaves an *existing*
+/// directory's mode alone — which is the common case here, since the shm root outlives any
+/// one query and an earlier run may have created it 0755.
+///
+/// A directory this process does not own cannot be tightened; that is tolerated rather
+/// than fatal, because the files written inside are created 0600 regardless.
+#[cfg(unix)]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // Best-effort tightening of a pre-existing directory this process may not own.
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
 /// The directory same-node workers exchange shm partitions through, or `None` when no
 /// writable shared location exists. Prefers Linux tmpfs (`/dev/shm`, RAM-backed) and
 /// falls back to the OS temp dir (still cross-process via the page cache).
+///
+/// **Owner-only, and that is load-bearing.** A published bucket is the query's actual
+/// rows, and `/dev/shm` and `/tmp` are world-writable: at the default 0755/0644 any local
+/// user could read a shuffle's data, and — worse — *plant* a well-formed file under a
+/// ticket a reducer is about to fetch. The decode below is hardened against a corrupt
+/// file, but a planted file that decodes cleanly is read as authoritative shuffle data and
+/// silently changes the answer. This is the same exposure the tiered spill store closes
+/// with `private_dir`/`open_private`, and it is sharper here: the Flight path this
+/// replaces is token-authenticated and optionally mTLS, so the same-node fast path must
+/// not be the unauthenticated way in. Peers are the same OS user by construction (one Ray
+/// cluster, one worker account), so owner-only costs nothing that was ever intended to work.
 fn shm_root() -> Option<PathBuf> {
     for base in ["/dev/shm", "/tmp"] {
         let p = std::path::Path::new(base);
         if p.is_dir() {
             let root = p.join("batcher_shm");
-            if fs::create_dir_all(&root).is_ok() {
+            if create_private_dir(&root).is_ok() {
                 return Some(root);
             }
         }
     }
     let root = std::env::temp_dir().join("batcher_shm");
-    fs::create_dir_all(&root).ok().map(|()| root)
+    create_private_dir(&root).ok().map(|()| root)
 }
 
 /// Whether a shared-memory transfer directory is usable on this host.
@@ -62,8 +99,92 @@ fn sanitize(addr: &str) -> String {
 /// consumer derive the *same* path from data they both hold).
 fn shm_path(addr: &str, ticket: &str) -> Option<PathBuf> {
     let dir = shm_root()?.join(sanitize(addr));
-    fs::create_dir_all(&dir).ok()?;
+    create_private_dir(&dir).ok()?;
+    mark_owner(&dir);
     Some(dir.join(format!("{}.arrow", sanitize(ticket))))
+}
+
+/// Create `path` for writing with owner-only permissions, truncating any existing file.
+fn create_private_file(path: &std::path::Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// The marker naming the process that owns a peer directory.
+const OWNER_MARKER: &str = ".owner";
+
+/// Record this process as the owner of `dir`, so a later run can tell whether the
+/// directory belongs to a live worker. Best-effort; a missing marker only means the
+/// directory is never reaped.
+fn mark_owner(dir: &std::path::Path) {
+    let marker = dir.join(OWNER_MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Ok(mut f) = create_private_file(&marker) {
+        let _ = write!(f, "{}", std::process::id());
+    }
+}
+
+/// Whether process `pid` is alive on this host.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // `/proc` rather than `kill(pid, 0)`: no unsafe, no signal semantics to get wrong, and
+    // the answer is the same one the kernel would give. A non-Linux unix without `/proc`
+    // reads as "alive", which is the conservative direction — it never reaps a live peer.
+    if std::path::Path::new("/proc").is_dir() {
+        return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Delete shm directories left behind by workers that are no longer running.
+///
+/// The leak this closes is permanent memory. `clear_shared` frees a peer's buckets at
+/// teardown, but only if the process *reaches* teardown — and the cases Carbonite's
+/// resilience machinery exists for are exactly the ones where it does not: a SIGKILL, an
+/// OOM kill, a spot reclamation. tmpfs is RAM, so every such exit strands its buckets in
+/// `/dev/shm` until someone deletes them or the node reboots. A worker's advertised
+/// address carries an *ephemeral* port, so each restart takes a fresh directory and the
+/// dead ones accumulate: on a churning node that is an unbounded RAM leak whose only
+/// symptom is that the box has less memory than it used to.
+///
+/// Reaping is safe because shm is same-node by construction — every directory here was
+/// written by a process on *this* host, so its liveness is a local question. Only a
+/// directory whose owner marker names a dead pid is removed; one with no marker (written
+/// by an older build) or a live owner is left alone, so the check can never take a running
+/// peer's buckets. Best-effort throughout: this is a fast path Flight always backs.
+pub fn reap_stale_shm() {
+    let Some(root) = shm_root() else { return };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(owner) = fs::read_to_string(dir.join(OWNER_MARKER)) else {
+            continue; // no marker: an older build's directory, or a race — leave it
+        };
+        let Ok(pid) = owner.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid != std::process::id() && !pid_alive(pid) {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// Write `batches` as an Arrow IPC stream for a same-node reducer to mmap. The write
@@ -80,7 +201,9 @@ pub fn publish_shared(addr: &str, ticket: &str, batches: &[RecordBatch]) -> std:
         // Arrow IPC **file** format (with a footer of per-batch block offsets), 64-byte aligned,
         // so a same-node reader mmaps it and decodes each block ZERO-COPY — the arrays point
         // straight into the mmap instead of the reader copying every buffer out (`fetch_shared`).
-        let file = File::create(&tmp)?;
+        // 0600 at create, not by a later chmod: a chmod leaves a window in which the
+        // query's rows are world-readable, and the bucket is fully written inside it.
+        let file = create_private_file(&tmp)?;
         let opts = arrow::ipc::writer::IpcWriteOptions::try_new(
             64,
             false,
@@ -438,5 +561,125 @@ mod tests {
         let got = fetch_shared(addr, ticket).unwrap().expect("published");
         assert_eq!(got, vec![want]);
         clear_shared(addr);
+    }
+
+    /// The shm path holds the query's actual rows on a world-writable filesystem
+    /// (`/dev/shm`, `/tmp`). At the default 0755/0644 any local user could read a
+    /// shuffle's data, or plant a well-formed file under a ticket a reducer is about to
+    /// fetch — and a planted file that decodes cleanly is read as authoritative shuffle
+    /// data, silently changing the answer. The Flight path this replaces is
+    /// token-authenticated, so the same-node fast path must not be the way around that.
+    #[cfg(unix)]
+    #[test]
+    fn published_buckets_and_their_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let addr = "127.0.0.1:59991";
+        let ticket = "perm/0/0/0";
+        publish_shared(addr, ticket, &[batch(&[1])]).expect("publish");
+
+        let path = shm_path(addr, ticket).expect("a shm path");
+        let file_mode = fs::metadata(&path)
+            .expect("published file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            file_mode & 0o777,
+            0o600,
+            "the bucket is readable by other local users"
+        );
+
+        let dir_mode = fs::metadata(path.parent().expect("peer dir"))
+            .expect("peer dir")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "the peer directory is world-traversable"
+        );
+
+        let root_mode = fs::metadata(shm_root().expect("root"))
+            .expect("root")
+            .permissions()
+            .mode();
+        assert_eq!(root_mode & 0o777, 0o700, "the shm root is world-writable");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Tightening must also apply to a root some earlier run left world-writable, since
+    /// the directory outlives any one query and `create_dir_all` leaves an existing mode alone.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_loose_root_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = shm_root().expect("a shm root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("loosen");
+        let tightened = shm_root().expect("a shm root");
+        let mode = fs::metadata(&tightened).expect("root").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "a pre-existing loose root was left loose"
+        );
+    }
+
+    /// tmpfs is RAM, and `clear_shared` only runs if the process reaches teardown — which
+    /// a SIGKILL, an OOM kill, or a spot reclamation never does. Each restart advertises a
+    /// fresh ephemeral port, so dead directories accumulate rather than being reused. The
+    /// reaper must take those and must never take a live peer's.
+    #[cfg(unix)]
+    #[test]
+    fn stale_peer_directories_are_reaped_and_live_ones_are_not() {
+        let root = shm_root().expect("a shm root");
+
+        // A directory owned by a pid that cannot exist (pid_max is well under this).
+        let dead = root.join("reap_dead_peer");
+        create_private_dir(&dead).expect("dead dir");
+        fs::write(dead.join(OWNER_MARKER), "4294967290").expect("dead marker");
+        fs::write(dead.join("bucket.arrow"), b"x").expect("dead bucket");
+
+        // One owned by this very process, and one with no marker at all (an older build).
+        let live = root.join("reap_live_peer");
+        create_private_dir(&live).expect("live dir");
+        mark_owner(&live);
+        let unmarked = root.join("reap_unmarked_peer");
+        create_private_dir(&unmarked).expect("unmarked dir");
+
+        reap_stale_shm();
+
+        assert!(
+            !dead.exists(),
+            "a dead worker's shm directory was left in RAM"
+        );
+        assert!(live.exists(), "the reaper took a live peer's buckets");
+        assert!(
+            unmarked.exists(),
+            "an unmarked directory was reaped on no evidence"
+        );
+
+        let _ = fs::remove_dir_all(&live);
+        let _ = fs::remove_dir_all(&unmarked);
+    }
+
+    /// The marker must not itself be readable by other local users, and must name us.
+    #[cfg(unix)]
+    #[test]
+    fn the_owner_marker_is_private_and_names_this_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let addr = "127.0.0.1:59992";
+        publish_shared(addr, "own/0/0/0", &[batch(&[1])]).expect("publish");
+        let dir = shm_root().expect("root").join(sanitize(addr));
+        let marker = dir.join(OWNER_MARKER);
+
+        let owner = fs::read_to_string(&marker).expect("marker");
+        assert_eq!(owner.trim().parse::<u32>().ok(), Some(std::process::id()));
+        let mode = fs::metadata(&marker).expect("marker").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

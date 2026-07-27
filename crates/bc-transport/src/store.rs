@@ -38,9 +38,20 @@ impl InflightGauge {
     }
 
     /// Consumer acked one batch (a top-up credit arrived): drop in-flight.
+    ///
+    /// Saturates at zero. The count is a measurement of batches the producer has handed to
+    /// the encoder and the consumer has not yet acknowledged, so a negative value is not a
+    /// smaller number of batches — it is a broken instrument. It could go negative because
+    /// acks are driven by *granted credits*, and a consumer that grants more than it
+    /// consumed pushed the counter below zero and pinned the high-water `max` at whatever
+    /// it had reached first. That matters because `max` is what the crate's flow-control
+    /// tests read to *prove* the credit bound: an over-granting consumer could make the
+    /// proof pass while the bound it certifies was not being enforced.
     pub(crate) fn on_ack(&self) {
-        self.current
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self
+            .current
+            .fetch_update(Relaxed, Relaxed, |c| Some(c.saturating_sub(1).max(0)));
     }
 
     /// One credit-grant control message arrived from the consumer (independent of

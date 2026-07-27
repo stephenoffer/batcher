@@ -156,3 +156,24 @@ def test_the_peak_is_computed_once_per_plan() -> None:
 
     rm.estimated_bytes(_plan(credits=9))  # a different plan object re-derives
     assert estimator.calls == 2
+
+
+# --- the control plane and the data plane must agree on the default window ----
+
+
+def test_the_engine_default_credit_window_matches_carbonites_authority() -> None:
+    """`DEFAULT_CREDITS` is what runs whenever Carbonite has *not* handed a window down.
+
+    A `ShuffleSession` built without an explicit grant passes `credits=None`, and a
+    producer that receives a malformed seed falls back to the same constant — so the two
+    defaults drifting apart means precisely the un-granted paths run at the wrong window.
+    They did: the engine held 4 while `FlowControlConfig` said 16, and the config's own
+    comment records the measurement that retired 4 (2.4 MiB/s vs 7.7 MiB/s on a 50 ms-RTT
+    link, because 4 batches do not fill the bandwidth-delay product).
+    """
+    from batcher._internal.native import engine_or_none
+
+    native = engine_or_none()
+    if native is None or not hasattr(native, "default_credits"):
+        pytest.skip("engine not built, or it does not expose its default window")
+    assert native.default_credits() == FlowControlConfig().default_credits

@@ -131,6 +131,14 @@ impl ShuffleExchange {
         token: Option<String>,
         tls: Option<crate::TlsServerConfig>,
     ) -> TransportResult<Self> {
+        // A fresh worker is the only thing that reliably runs after a dead one. Shm
+        // buckets live in tmpfs (RAM) and are freed at teardown — which a SIGKILL, an OOM
+        // kill, or a spot reclamation never reaches — and each restart advertises a fresh
+        // ephemeral port, so the dead directories accumulate instead of being reused.
+        // Sweeping the ones whose owning pid is gone is what keeps that from being an
+        // unbounded RAM leak on a churning node.
+        crate::shared::reap_stale_shm();
+
         let store = Arc::new(PartitionStore::default());
         // Reuse FlightServer's binding logic but keep our own handle on the
         // store so publish() can register after the server is running.

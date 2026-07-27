@@ -37,6 +37,7 @@ mod bloom;
 mod errors;
 mod flight;
 mod normalize;
+mod pool;
 mod process;
 mod shuffle;
 mod sketches;
@@ -323,6 +324,17 @@ fn register_query(query_id: &str) {
 #[pyfunction]
 fn unregister_query(query_id: &str) {
     bc_resource::cancel::unregister(query_id);
+}
+
+/// The engine's default shuffle credit window (in-flight `RecordBatch` slots).
+///
+/// The window in force whenever the control plane has *not* handed one down: a session
+/// built without an explicit grant, or a producer that receives a malformed seed. Exposed
+/// so Carbonite can assert the two sides agree — when they drift, it is exactly the
+/// un-granted paths that silently run at the wrong window.
+#[pyfunction]
+fn default_credits() -> u32 {
+    bc_transport::DEFAULT_CREDITS
 }
 
 /// Ids of the queries currently executing in this process, sorted.
@@ -637,88 +649,6 @@ fn read_avro(
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
-/// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
-/// enforcement primitive, from `bc-resource`). Carbonite sets the limit from its
-/// memory envelope and reserves/releases against it so the engine spills instead
-/// of OOMing. Accounts bytes; it does not allocate them.
-#[pyclass]
-struct MemoryPool {
-    inner: std::sync::Arc<bc_resource::MemoryPool>,
-}
-
-#[pymethods]
-impl MemoryPool {
-    /// Create a pool admitting up to `limit_bytes` reserved at once.
-    #[new]
-    fn new(limit_bytes: u64) -> Self {
-        Self {
-            inner: bc_resource::MemoryPool::new(limit_bytes as usize),
-        }
-    }
-
-    /// Try to reserve `bytes`; returns `True` on success, `False` if the pool is
-    /// full (the caller should then spill / back-pressure). Never partially
-    /// reserves — a `False` leaves the pool untouched.
-    fn try_reserve(&self, bytes: u64) -> bool {
-        self.inner.try_reserve_bytes(bytes as usize).is_ok()
-    }
-
-    /// Release `bytes` back to the pool (clamped so a double-release can't underflow).
-    fn release(&self, bytes: u64) {
-        self.inner.release_bytes(bytes as usize);
-    }
-
-    /// Resize the envelope. Live reservations are untouched; only what future
-    /// reservations admit against changes (an autoscaler grew/shrank the budget).
-    fn set_limit(&self, limit_bytes: u64) {
-        self.inner.set_limit(limit_bytes as usize);
-    }
-
-    /// Bytes currently reserved.
-    #[getter]
-    fn used(&self) -> u64 {
-        self.inner.used() as u64
-    }
-
-    /// Bytes currently free (`limit - used`).
-    #[getter]
-    fn available(&self) -> u64 {
-        self.inner.available() as u64
-    }
-
-    /// The pool's hard limit in bytes.
-    #[getter]
-    fn limit(&self) -> u64 {
-        self.inner.limit() as u64
-    }
-
-    /// High-water mark of concurrently-reserved bytes over this pool's life.
-    ///
-    /// A live `used` reading cannot be recovered after the fact, and after the fact is
-    /// when anyone asks how close a query ran to its envelope. Measured in the data plane
-    /// so it also counts reservations the control plane never made.
-    #[getter]
-    fn peak_used(&self) -> u64 {
-        self.inner.peak_used() as u64
-    }
-
-    /// Reservations this pool refused for lack of headroom.
-    ///
-    /// The direct evidence that the envelope is what bound the workload, where a peak near
-    /// the limit is only circumstantial.
-    #[getter]
-    fn denied(&self) -> u64 {
-        self.inner.denied() as u64
-    }
-
-    /// Times the cooperative path asked a registered operator to spill so a reservation
-    /// could be granted — how often other operators had to pay for this one.
-    #[getter]
-    fn spill_requests(&self) -> u64 {
-        self.inner.spill_requests() as u64
-    }
-}
-
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
@@ -743,6 +673,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(unregister_query, m)?)?;
     m.add_function(wrap_pyfunction!(running_queries, m)?)?;
     m.add_function(wrap_pyfunction!(cancel_all_queries, m)?)?;
+    m.add_function(wrap_pyfunction!(default_credits, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(read_avro, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet_filtered, m)?)?;
@@ -781,7 +712,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flight::shm_available, m)?)?;
     m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
     m.add_class::<flight::ShuffleClient>()?;
-    m.add_class::<MemoryPool>()?;
+    m.add_class::<pool::MemoryPool>()?;
     // Classified shuffle-fetch exceptions: the control plane catches `Retryable` as
     // worker loss (recompute + retry) and lets `Fatal` propagate (fail fast).
     errors::register(m)?;
