@@ -192,3 +192,49 @@ def test_an_adaptive_session_reports_the_controllers_statistics() -> None:
         assert ctrl.window == 9
     finally:
         session.clear()
+
+
+# --- shared memory is RAM, so its lifetime is a memory bound -------------------
+
+
+def _shm_root() -> str:
+    import os
+
+    return "/dev/shm/batcher_shm" if os.path.isdir("/dev/shm") else "/tmp/batcher_shm"
+
+
+def _peer_dirs() -> set[str]:
+    import glob
+    import os
+
+    return {d for d in glob.glob(_shm_root() + "/*") if os.path.isdir(d)}
+
+
+@pytest.mark.skipif(not hasattr(ShuffleSession, "publish"), reason="transport not built")
+def test_a_dropped_session_frees_its_shared_memory_within_a_live_process() -> None:
+    """The startup reaper cannot cover this case, by design.
+
+    Shm buckets live in tmpfs, which is RAM. A worker that dies without teardown is
+    handled by the reaper a later process runs — but that reaper deliberately spares
+    directories owned by the *current* pid, because it cannot distinguish a dead session's
+    from a live one's and reaping a live peer's buckets would be far worse than leaking.
+    So a long-lived worker creating and dropping sessions (the session-fleet shape)
+    accumulated its own dead sessions' shm until the process exited. The server's `Drop`
+    is the same-process half of the pair.
+    """
+    import gc
+
+    before = _peer_dirs()
+    session = ShuffleSession(shm=True)
+    session.publish(ShuffleTicket(41, 0, 0, 0), [_batch(5_000)])
+    created = _peer_dirs() - before
+    if not created:
+        pytest.skip("no shared-memory directory available on this host")
+
+    # Dropped *without* calling clear(), in a process that keeps running.
+    del session
+    gc.collect()
+
+    assert not (created & _peer_dirs()), (
+        "a dropped session left its buckets in tmpfs — that is RAM the process never gets back"
+    )

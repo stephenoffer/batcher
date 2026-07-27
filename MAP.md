@@ -1612,10 +1612,10 @@ Automatic findings for one run — what is wrong, the evidence, and what to do.
 |---|---|---|
 | `dataflow.py` | 157 | Findings about rows: how many were read, discarded, or multiplied. |
 | `derive.py` | 91 | `derive_insights` — run every insight rule over one profile and rank what they find. |
-| `kinds.py` | 129 | What a finding is, the thresholds rules compare against, and prose helpers. |
+| `kinds.py` | 132 | What a finding is, the thresholds rules compare against, and prose helpers. |
 | `planning.py` | 166 | Findings about how the work was distributed and how well it was predicted. |
 | `resources.py` | 384 | Findings about the machine: memory, spill, and CPU the run did or did not get. |
-| `stages.py` | 212 | Findings about the Python-UDF stages of an ML pipeline. |
+| `stages.py` | 213 | Findings about the Python-UDF stages of an ML pipeline. |
 
 ### `batcher/observe/pipelines/` — 2 · neutral sinks
 
@@ -1932,7 +1932,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
-| `flight.rs` | 426 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 437 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `lib.rs` | 720 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |

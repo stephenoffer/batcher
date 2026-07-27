@@ -286,6 +286,17 @@ impl Drop for FlightShuffleServer {
         if tokio::runtime::Handle::try_current().is_err() {
             shared_runtime().block_on(self.exchange.clear());
         }
+        // Also drop this server's shared-memory buckets, which live in tmpfs (RAM) and are
+        // *not* part of the in-memory store cleared above.
+        //
+        // The startup reaper deliberately spares directories owned by our own pid — it
+        // cannot tell a dead session's from a live one's, and reaping a live peer's buckets
+        // would be far worse than leaking. So a long-lived worker that creates and drops
+        // many sessions (the session-fleet shape) accumulated its *own* dead sessions'
+        // shm until the process exited. Clearing here is the same-process half of that:
+        // the reaper covers processes that died without reaching any teardown, and this
+        // covers sessions that ended inside a process still running.
+        bc_transport::clear_shared(&self.addr);
     }
 }
 
