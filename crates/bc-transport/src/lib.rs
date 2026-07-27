@@ -987,6 +987,100 @@ mod tests {
         );
     }
 
+    /// A **slow** consumer, which is the case every other flow-control test misses.
+    ///
+    /// The existing tests drain as fast as the producer can send, so the semaphore is
+    /// almost never empty when the producer reaches it — the blocking path that *is* the
+    /// flow control is barely exercised. Pausing between reads forces the producer to park
+    /// at zero credits repeatedly, which is the condition the bound exists for: without it
+    /// a fast mapper encodes its whole partition into the transport while a busy reducer
+    /// works through the first few batches.
+    #[tokio::test]
+    async fn a_slow_consumer_parks_the_producer_at_its_window() {
+        const N: i64 = 40;
+        const WINDOW: u32 = 3;
+
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(11, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, N)).await;
+
+        let mut client = FlightClient::connect(&addr).await.unwrap();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
+        grant_tx
+            .send(FlightData {
+                flight_descriptor: Some(arrow_flight::FlightDescriptor {
+                    r#type: arrow_flight::flight_descriptor::DescriptorType::Path as i32,
+                    path: vec![ticket.to_string(), String::new()],
+                    ..Default::default()
+                }),
+                app_metadata: handler::encode_credits(WINDOW).into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = futures::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(grant_rx),
+            Ok::<_, arrow_flight::error::FlightError>,
+        );
+        let mut response = client.do_exchange(request).await.unwrap();
+
+        let mut seen = 0i64;
+        while let Ok(Some(_)) = response.try_next().await {
+            seen += 1;
+            // Work between reads: the producer must wait rather than run ahead.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let _ = grant_tx
+                .send(FlightData {
+                    app_metadata: handler::encode_credits(1).into(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        drop(grant_tx);
+
+        assert_eq!(seen, N, "a slow consumer must still receive every batch");
+        let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+        assert!(
+            max_inflight <= WINDOW as i64 + 1,
+            "the producer ran {max_inflight} ahead of a slow consumer (window {WINDOW})",
+        );
+        assert!(
+            max_inflight >= WINDOW as i64,
+            "the producer filled only {max_inflight} of {WINDOW} credits, so it never \
+             parked — this test is not exercising the blocking path it exists for"
+        );
+    }
+
+    /// The bound must hold across window sizes, not just the two the other tests pick.
+    #[tokio::test]
+    async fn the_credit_bound_holds_across_window_sizes() {
+        for (n, window) in [(1i64, 1u32), (7, 1), (25, 2), (25, 8), (60, 5), (13, 64)] {
+            let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+            let addr = producer.addr().to_string();
+            let ticket = ShuffleTicket::new(12, 0, 0, 0, 0);
+            producer.publish(&ticket, seq_batches(0, n)).await;
+
+            let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, window)
+                .await
+                .unwrap();
+            assert_eq!(got.len() as i64, n, "n={n} window={window}: lost batches");
+            for (i, b) in got.iter().enumerate() {
+                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(
+                    col.value(0),
+                    i as i64,
+                    "n={n} window={window}: out of order"
+                );
+            }
+            let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+            assert!(
+                max_inflight >= 1 && max_inflight <= window as i64,
+                "n={n} window={window}: in-flight high-water {max_inflight} outside (0, {window}]",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn credit_window_of_one_still_transfers_all() {
         // Tightest possible window: strict lock-step. Still correct.

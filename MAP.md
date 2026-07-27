@@ -1216,7 +1216,7 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 |---|---|---|
 | `apply.py` | 306 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
 | `async_udf.py` | 192 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
-| `call.py` | 215 | The per-batch `map_batches` call boundary (Core, layer 3). |
+| `call.py` | 242 | The per-batch `map_batches` call boundary (Core, layer 3). |
 | `execute.py` | 329 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 234 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 52 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
