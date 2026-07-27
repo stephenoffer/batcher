@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 904 Python modules across 140 packages and 174 Rust files across 13 crates.
+Covering 909 Python modules across 140 packages and 174 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -192,7 +192,7 @@ The `Dataset` builder package.
 | `_export.py` | 96 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` / `to_torch_dataloader`. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
-| `callbacks.py` | 225 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
+| `callbacks.py` | 249 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 5688 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2766 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
@@ -280,8 +280,8 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `run.py` | 468 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 163 | What the conductor needs to know about a plan's size before it runs it. |
+| `run.py` | 488 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `sizing.py` | 204 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 219 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
 ### `batcher/api/security/` — 5 · conductor
@@ -339,13 +339,13 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 463 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 799 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 806 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 396 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 488 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
-| `profile.py` | 410 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
+| `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 172 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
@@ -663,7 +663,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `shuffle_io.py` | 183 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 99 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 105 | Learned join-skew: persist the hot join-key values measured by the detection |
-| `spill.py` | 492 | Single-node out-of-core aggregation via partition-and-spill, plus the spill |
+| `spill.py` | 464 | Single-node out-of-core aggregation via partition-and-spill, plus the spill |
 | `window_stream.py` | 222 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window. |
 
 ### `batcher/dist/adaptive_sizing/` — 4 · backend
@@ -754,7 +754,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 193 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 216 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 105 | Turning a window of measured q-errors into one cardinality-correction factor. |
@@ -767,8 +767,8 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `pass_base.py` | 61 | The optimizer context — shared analysis threaded through every rule. |
 | `plan_cache.py` | 359 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 209 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
-| `registry.py` | 182 | The Kyber rule registry — where rules are discovered and assembled. |
-| `rule.py` | 188 | The Kyber rule abstraction — one small, pure unit of optimization. |
+| `registry.py` | 186 | The Kyber rule registry — where rules are discovered and assembled. |
+| `rule.py` | 220 | The Kyber rule abstraction — one small, pure unit of optimization. |
 | `signature.py` | 154 | Structural plan signatures. |
 | `streaming.py` | 194 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
 
@@ -824,7 +824,8 @@ The Kyber optimizer entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `driver.py` | 442 | The rule-application engine: phases, fixpoint, and the two levels of fusion. |
+| `driver.py` | 435 | The rule-application engine: phases, fixpoint, and the two levels of fusion. |
+| `expr_dispatch.py` | 234 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
 | `facade.py` | 364 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -838,7 +839,7 @@ Kyber rule modules.
 | `fusion.py` | 343 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `leaf_rewrite.py` | 139 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 58 | Ordering rewrites — drop work that the input's known order already provides. |
-| `projections.py` | 724 | Projection rewrites — collapse stacked projections and prune unread columns. |
+| `projections.py` | 735 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 487 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 437 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `zonemap_pruning.py` | 373 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
@@ -875,7 +876,7 @@ List-column rule families: order-insensitivity and constant folding.
 
 | module | lines | what it is |
 |---|---|---|
-| `branches.py` | 111 | Merge `CASE` branches that agree, and collapse one that re-tests a decided condition. |
+| `branches.py` | 113 | Merge `CASE` branches that agree, and collapse one that re-tests a decided condition. |
 | `push_calls.py` | 193 | Push a scalar call through a `CASE` onto each of its branch values. |
 
 ### `batcher/kyber/rules/exprs/` — 3 · subsystem
@@ -884,16 +885,17 @@ Expression-level Kyber rule families.
 
 | module | lines | what it is |
 |---|---|---|
-| `boolean_normalize.py` | 136 | Driving `NOT` down to the leaves: De Morgan and double negation. |
-| `cast_unwrap.py` | 186 | Unwrapping a widening cast out of a comparison against a literal. |
-| `comparisons.py` | 157 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
-| `complex_types.py` | 483 | Struct, list, and array algebra -- the extract-over-construct family. |
-| `conditionals.py` | 329 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
+| `boolean_normalize.py` | 139 | Driving `NOT` down to the leaves: De Morgan and double negation. |
+| `cast_unwrap.py` | 193 | Unwrapping a widening cast out of a comparison against a literal. |
+| `comparisons.py` | 163 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
+| `complex_types.py` | 492 | Struct, list, and array algebra -- the extract-over-construct family. |
+| `conditionals.py` | 334 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
 | `guards.py` | 205 | Schema-aware helpers for expression rules that may only fire on a known type. |
-| `numeric.py` | 484 | Numeric algebra the earlier arithmetic families leave on the table. |
-| `temporal.py` | 262 | Temporal identities: reading a date part through a truncation, and offset fusion. |
-| `text.py` | 315 | Regex de-specialization and the remaining string identities. |
-| `text_algebra.py` | 147 | String structure: de-specializing the remaining regex calls, and composing substrings. |
+| `numeric.py` | 482 | Numeric algebra the earlier arithmetic families leave on the table. |
+| `numeric_rounding.py` | 43 | Rounding calls whose digit argument makes them a different function. |
+| `temporal.py` | 266 | Temporal identities: reading a date part through a truncation, and offset fusion. |
+| `text.py` | 325 | Regex de-specialization and the remaining string identities. |
+| `text_algebra.py` | 150 | String structure: de-specializing the remaining regex calls, and composing substrings. |
 
 ### `batcher/kyber/rules/exprs/text_folds/` — 3 · subsystem
 
@@ -901,9 +903,9 @@ String constant folding, grouped by whether the function takes an argument.
 
 | module | lines | what it is |
 |---|---|---|
-| `args.py` | 197 | String folds whose function takes an argument beyond its input. |
+| `args.py` | 215 | String folds whose function takes an argument beyond its input. |
 | `literals.py` | 70 | The shared machinery every string-literal fold is built from. |
-| `plain.py` | 311 | No-argument string folds: lengths, digests, hex, the pads, and the trims. |
+| `plain.py` | 368 | No-argument string folds: lengths, digests, hex, the pads, and the trims. |
 
 ### `batcher/kyber/rules/extra/` — 3 · subsystem
 
@@ -915,25 +917,28 @@ Extended Kyber rule families.
 | `agg_extra.py` | 475 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
 | `agg_rules.py` | 498 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
 | `arith_algebra.py` | 355 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
-| `arith_extra.py` | 450 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
-| `boolean_algebra.py` | 499 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
-| `casts.py` | 427 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
+| `arith_extra.py` | 466 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
+| `boolean_algebra.py` | 411 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
+| `casts.py` | 457 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
 | `cse.py` | 172 | Common-subexpression elimination — compute a repeated expression once, not N times. |
 | `disjunction_infer.py` | 124 | NORMALIZE-phase implied-predicate inference from a multi-column disjunction. |
 | `empty_relation.py` | 124 | Empty-relation folding — turn a provably-empty subtree into the canonical marker. |
 | `filter_split.py` | 139 | Cost-based filter splitting — pay an expensive predicate only on surviving rows. |
 | `join_extra.py` | 213 | Structural join rewrites — collapse a join whose result is provably fixed. |
 | `limit_extra.py` | 315 | LIMIT / top-N rewrites that the existing limit rules leave on the table. |
+| `membership_simplify.py` | 118 | `IN`-list and `coalesce` simplifications. |
 | `metadata_adaptive.py` | 291 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
-| `nullability.py` | 500 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
+| `null_shapes.py` | 190 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
+| `nullability.py` | 364 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
 | `predicate_infer.py` | 490 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
-| `projection_scan.py` | 341 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
+| `projection_scan.py` | 350 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 458 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
-| `sargable.py` | 315 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
+| `sargable.py` | 326 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
 | `setops.py` | 254 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
-| `strings.py` | 500 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
-| `temporal_extra.py` | 439 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
+| `string_folds.py` | 159 | Constant folding of string functions over string literals. |
+| `strings.py` | 441 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
+| `temporal_extra.py` | 455 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
 | `temporal_folds.py` | 142 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
 | `temporal_sargable.py` | 279 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 127 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
@@ -946,8 +951,8 @@ NORMALIZE-phase rewrites for the conditional family — CASE / NULLIF / COALESCE
 
 | module | lines | what it is |
 |---|---|---|
-| `case.py` | 318 | CASE / NULLIF / COALESCE rewrites. |
-| `minmax.py` | 127 | GREATEST / LEAST rewrites. |
+| `case.py` | 329 | CASE / NULLIF / COALESCE rewrites. |
+| `minmax.py` | 131 | GREATEST / LEAST rewrites. |
 | `shared.py` | 138 | Shared guards for the conditional family: purity, type tags, and droppability. |
 
 ### `batcher/kyber/rules/extra/join_elim/` — 3 · subsystem
@@ -987,9 +992,9 @@ Numeric rule families that turn a computed comparison back into a sargable one.
 
 | module | lines | what it is |
 |---|---|---|
-| `absolute.py` | 234 | `abs` and `sign` inside a comparison, restated over the bare column. |
+| `absolute.py` | 243 | `abs` and `sign` inside a comparison, restated over the bare column. |
 | `float_predicates.py` | 75 | `isnan` / `isinf` see through the rounding functions. |
-| `rounding.py` | 487 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
+| `rounding.py` | 494 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
 
 ### `batcher/kyber/rules/normalize/` — 3 · subsystem
 
@@ -1010,7 +1015,7 @@ Null-reasoning rule families — three-valued logic and null-strictness.
 | module | lines | what it is |
 |---|---|---|
 | `strictness.py` | 347 | Push `IS NULL` / `IS NOT NULL` through the scalar functions that are null-strict. |
-| `three_valued.py` | 401 | Three-valued logic: collapsing the null predicates that other rules generate. |
+| `three_valued.py` | 413 | Three-valued logic: collapsing the null predicates that other rules generate. |
 
 ### `batcher/kyber/rules/predicate_algebra/` — 3 · subsystem
 
@@ -1018,7 +1023,7 @@ Predicate families that reason about *disjunctions* of bounds and sets.
 
 | module | lines | what it is |
 |---|---|---|
-| `bounds.py` | 303 | Union the disjuncts a generated predicate leaves on one column. |
+| `bounds.py` | 308 | Union the disjuncts a generated predicate leaves on one column. |
 
 ### `batcher/kyber/rules/relational/` — 3 · subsystem
 
@@ -1037,7 +1042,7 @@ Kyber rule families for streaming (unbounded-input) plans.
 | `blocking.py` | 354 | Blocking-operator avoidance under a stream. |
 | `state.py` | 500 | Streaming rule family: state minimization — shrink what a streaming operator retains. |
 | `watermark.py` | 159 | Pushdown through the watermark-bounded streaming operators. |
-| `windows.py` | 79 | Streaming rule family: windows -- collapsing nested event-time window alignment. |
+| `windows.py` | 80 | Streaming rule family: windows -- collapsing nested event-time window alignment. |
 
 ### `batcher/kyber/rules/temporal_algebra/` — 3 · subsystem
 
@@ -1045,8 +1050,8 @@ Temporal rule families that put a predicate back onto the raw timestamp column.
 
 | module | lines | what it is |
 |---|---|---|
-| `epoch.py` | 210 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
-| `offsets.py` | 191 | `offset_by(ts, …) OP instant` restated as `ts OP shifted_instant`. |
+| `epoch.py` | 216 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
+| `offsets.py` | 197 | `offset_by(ts, …) OP instant` restated as `ts OP shifted_instant`. |
 
 ### `batcher/kyber/rules/text_algebra/` — 3 · subsystem
 
@@ -1054,9 +1059,9 @@ String rule families: predicate absorption, predicate normalization, and lengths
 
 | module | lines | what it is |
 |---|---|---|
-| `absorption.py` | 175 | Two string predicates on one column where one implies the other. |
-| `lengths.py` | 147 | A comparison against a string's length is almost always an emptiness test. |
-| `predicates.py` | 200 | A string call whose *comparison* is the real predicate, restated as that predicate. |
+| `absorption.py` | 182 | Two string predicates on one column where one implies the other. |
+| `lengths.py` | 158 | A comparison against a string's length is almost always an emptiness test. |
+| `predicates.py` | 207 | A string call whose *comparison* is the real predicate, restated as that predicate. |
 
 ### `batcher/kyber/rules/window_algebra/` — 3 · subsystem
 
@@ -1208,14 +1213,14 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `apply.py` | 306 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
 | `async_udf.py` | 192 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
 | `call.py` | 147 | The per-batch `map_batches` call boundary (Core, layer 3). |
-| `execute.py` | 323 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
+| `execute.py` | 329 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 234 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 52 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 233 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 139 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
 | `sizing.py` | 233 | What the streaming UDF path learned last run, folded back into this run's sizing. |
 | `strategy.py` | 497 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
-| `stream.py` | 383 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
+| `stream.py` | 384 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem
 
@@ -1602,11 +1607,11 @@ Automatic findings for one run — what is wrong, the evidence, and what to do.
 | module | lines | what it is |
 |---|---|---|
 | `dataflow.py` | 157 | Findings about rows: how many were read, discarded, or multiplied. |
-| `derive.py` | 81 | `derive_insights` — run every insight rule over one profile and rank what they find. |
-| `kinds.py` | 124 | What a finding is, the thresholds rules compare against, and prose helpers. |
+| `derive.py` | 87 | `derive_insights` — run every insight rule over one profile and rank what they find. |
+| `kinds.py` | 129 | What a finding is, the thresholds rules compare against, and prose helpers. |
 | `planning.py` | 166 | Findings about how the work was distributed and how well it was predicted. |
 | `resources.py` | 258 | Findings about the machine: memory, spill, and CPU the run did or did not get. |
-| `stages.py` | 165 | Findings about the Python-UDF stages of an ML pipeline. |
+| `stages.py` | 212 | Findings about the Python-UDF stages of an ML pipeline. |
 
 ### `batcher/observe/pipelines/` — 2 · neutral sinks
 
@@ -1796,7 +1801,7 @@ Query profiles — the planned plan joined to the measured run, for `EXPLAIN`.
 | module | lines | what it is |
 |---|---|---|
 | `collect.py` | 281 | Profile assembly — join Kyber's estimates to Core's measurements by `op_id`. |
-| `stages.py` | 173 | Measuring the Python-UDF stages of a pipeline the engine cannot see into. |
+| `stages.py` | 191 | Measuring the Python-UDF stages of a pipeline the engine cannot see into. |
 | `types.py` | 325 | Profile value types and rendering — `Decision`, `OpProfile`, `QueryProfile`. |
 
 ### `batcher/plan/streaming/` — 1 · contract
@@ -1929,7 +1934,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `lib.rs` | 688 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 251 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/external_sort.rs` | 325 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
-| `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
+| `ops/joins.rs` | 600 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1139 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |

@@ -32,7 +32,7 @@ import tempfile
 import pyarrow as pa
 
 from batcher._internal.native import engine
-from batcher.carbonite.spill import SpillTier, TieredSpillStore
+from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source, _single_source
 from batcher.dist.executors.plan_analysis import empty_result_table
@@ -275,6 +275,15 @@ def spill_collect(
         from batcher.dist.executors.partition_io import _apply_above
 
         return _apply_above(above, inner)
+    # A plan whose peeling reaches a bare `Scan` has no stateful operator, so there is no
+    # state to partition and nothing here can help it. The caller falls back to the
+    # in-memory path, which resolves the whole input — for a selective filter that is a
+    # poor trade (measured: `scan -> filter` returning ONE row from 1.5M resolved the whole
+    # input), but running the row-wise plan chunk-by-chunk over `_iter_spill_morsels`
+    # instead was tried and is *worse*: 644 MB of growth against 532 MB on a 6M-row parquet
+    # scan, because the per-chunk `execute_plan` dispatches and the morsel re-chunking cost
+    # more than one pass does. The bound for this shape has to come from a streaming source
+    # handoff at the FFI boundary, not from re-chunking on the Python side.
     return None
 
 
@@ -370,10 +379,17 @@ def _empty_table(agg: Aggregate) -> pa.Table:
 
 
 # Max grace-recursion depth. Past it, re-partitioning has stopped helping: a bucket still
-# over budget after this many secondary hashes is one dominated by a *single group*, and
-# every row of a group hashes together by construction, so a fourth split produces the same
-# bucket again. The floor is correct; what used to happen at it was not — see
-# `_finalize_bucket`.
+# over budget after this many secondary hashes is dominated by group state that *no* hash of
+# the group key can separate — every row of a group hashes together by construction. Such a
+# bucket is finalized in memory, and that is a genuine ceiling: a single group whose state
+# exceeds RAM cannot be reduced out of core by partitioning, because partitioning is the
+# only tool the mergeable algebra gives us here.
+#
+# Routing this case to `combine_finalize_spilling` was tried and reverted. It grace-partitions
+# by the same group key, so it cannot split what this recursion already could not: measured
+# over 86 buckets that reached the floor over budget, peak RSS was identical (716 MB either
+# way) and it added a re-read and re-write of every one. Lifting this ceiling needs a
+# per-group spillable state in `bc-runtime`, not another partitioning pass.
 _MAX_SPILL_RECURSION = 3
 _SUB_BUCKETS = 8
 # Cap on simultaneously-open spill files: the partition phase holds one writer per
@@ -386,58 +402,6 @@ _FD_SAFE_PARTITIONS = 1024
 
 def _fd_safe(n_buckets: int) -> int:
     return max(1, min(n_buckets, _FD_SAFE_PARTITIONS))
-
-
-def _finalize_bucket(store, handle, gk, aj, nat, out, resident, bucket_max):
-    """Combine+finalize one bucket that will not be re-partitioned further.
-
-    Reached two ways, and they are not the same situation. A bucket *within* budget is
-    read whole and folded in memory — the common, fast case. A bucket that arrives here
-    still **over** budget is one grace recursion could not shrink: it is dominated by a
-    single group, and every row of a group hashes together by construction, so a fourth
-    split would produce the same bucket again.
-
-    That second case used to read the whole bucket into RAM anyway and hand it to
-    `combine_finalize`. It is precisely the case the recursion existed to protect against,
-    arriving at the one point that stopped protecting: a skewed key whose partials exceed
-    memory OOM'd the reduce, after three rounds of re-partitioning had already paid to
-    re-read and re-write the state.
-
-    The engine already contains the answer — `combine_finalize_spilling` reads Arrow-IPC
-    files one at a time and grace-partitions them to disk under a byte budget. The
-    distributed reducer uses it for exactly this; the single-node out-of-core aggregate
-    never did, so the two arms of the same out-of-core guarantee disagreed about what
-    happens to a skewed group. It is result-identical to the in-memory fold (the mergeable
-    algebra holds out of core; only group order differs).
-
-    It needs a real filesystem path, so a REMOTE bucket — one that overflowed to object
-    storage — falls back to the in-memory fold. That is not a regression: it is where the
-    behaviour already was, and a bucket only reaches the remote tier once the local disk is
-    exhausted, which is the case where there is nowhere to grace-partition to anyway.
-    """
-    over_budget = bucket_max > 0 and resident > bucket_max
-    if over_budget and handle.tier is SpillTier.LOCAL:
-        cfg = active_config().memory
-        result = nat.combine_finalize_spilling(
-            gk,
-            aj,
-            [handle.path],
-            bucket_max,
-            os.path.dirname(handle.path),
-            cfg.spill_compression,
-        )
-        if result.num_rows:
-            out.append(result)
-        return
-    # `read_reserved` accounts the resident footprint against the process-wide buffer pool
-    # for the duration of the read. Reading a bucket back is the one step of spilling that
-    # can undo it — the state went to disk because it did not fit — and nothing was
-    # checking the envelope before pulling it in again, so a concurrent query sizing its
-    # own state saw headroom this reduce was already using.
-    with store.read_reserved(handle) as stream:
-        partials = list(stream)
-    if partials:
-        out.append(nat.combine_finalize(gk, aj, partials))
 
 
 def _reduce_agg_bucket(store, handle, gk, aj, nat, key_idx, n_keys, out, depth):
@@ -458,7 +422,15 @@ def _reduce_agg_bucket(store, handle, gk, aj, nat, key_idx, n_keys, out, depth):
     # and OOM `combine_finalize`. `logical_nbytes` is the size `combine_finalize` actually pays.
     resident = handle.logical_nbytes or handle.nbytes
     if n_keys == 0 or resident <= bucket_max or depth >= _MAX_SPILL_RECURSION:
-        _finalize_bucket(store, handle, gk, aj, nat, out, resident, bucket_max)
+        # `read_reserved` accounts the resident footprint against the process-wide buffer
+        # pool for the duration of the read. Reading a bucket back is the one step of
+        # spilling that can undo it — the state went to disk because it did not fit — and
+        # nothing was checking the envelope before pulling it in again, so a concurrent
+        # query sizing its own state saw headroom this reduce was already using.
+        with store.read_reserved(handle) as stream:
+            partials = list(stream)
+        if partials:
+            out.append(nat.combine_finalize(gk, aj, partials))
         # This bucket is finished, and every group key hashes to exactly one bucket, so
         # nothing will read it again. Giving its disk back here bounds peak *scratch* to
         # the buckets still outstanding rather than to the whole spilled state — the disk
