@@ -39,13 +39,17 @@ class _FallbackPool:
     def __init__(self, limit_bytes: int) -> None:
         self._limit = limit_bytes
         self._used = 0
+        self._peak_used = 0
+        self._denied = 0
         self._lock = threading.Lock()
 
     def try_reserve(self, n_bytes: int) -> bool:
         with self._lock:
             if self._used + n_bytes > self._limit:
+                self._denied += 1
                 return False
             self._used += n_bytes
+            self._peak_used = max(self._peak_used, self._used)
             return True
 
     def release(self, n_bytes: int) -> None:
@@ -67,6 +71,14 @@ class _FallbackPool:
     @property
     def limit(self) -> int:
         return self._limit
+
+    @property
+    def peak_used(self) -> int:
+        return self._peak_used
+
+    @property
+    def denied(self) -> int:
+        return self._denied
 
 
 def _make_native_pool(limit_bytes: int):
@@ -139,13 +151,34 @@ class BufferPool:
     @property
     def peak_used(self) -> int:
         """The high-water mark of concurrently-reserved bytes over this pool's life — the
-        measured memory pressure (`peak_used / limit`) the workload actually hit."""
-        return self._peak_used
+        measured memory pressure (`peak_used / limit`) the workload actually hit.
+
+        Prefers the **engine's own** high-water mark when the compiled pool reports one.
+        The control plane only sees the reservations it makes itself; the data plane also
+        reserves for operator state and the Flight transit buffers, and those are most of
+        the footprint on exactly the queries whose peak anyone wants to know.
+        """
+        return max(self._peak_used, int(getattr(self._pool, "peak_used", 0) or 0))
 
     @property
     def denied(self) -> int:
-        """Reservations this pool refused for lack of headroom over its life."""
-        return self._denied
+        """Reservations refused for lack of headroom.
+
+        The **max** of the control plane's own count and the engine's, not their sum: the
+        engine's counter already includes every denial the control plane caused, so adding
+        them would double-count each one and report twice the refusals that happened.
+        Taking the max keeps the figure right whichever side saw more — the engine denies
+        reservations the control plane never makes (operator state, transit buffers), and
+        it reports nothing at all when the extension is not built.
+        """
+        return max(self._denied, int(getattr(self._pool, "denied", 0) or 0))
+
+    @property
+    def spill_requests(self) -> int:
+        """Times the engine's cooperative path made an operator spill to grant a
+        reservation — how often other operators paid for this query's memory. `0` without
+        the compiled engine, which has no cooperative path to count."""
+        return int(getattr(self._pool, "spill_requests", 0) or 0)
 
     @property
     def utilization(self) -> float:
@@ -167,14 +200,16 @@ class BufferPool:
             ratios a reader actually acts on.
         """
         limit = self._pool.limit
+        peak = self.peak_used
         return {
             "limit_bytes": limit,
             "used_bytes": self._pool.used,
             "available_bytes": self._pool.available,
-            "peak_used_bytes": self._peak_used,
-            "denied": self._denied,
+            "peak_used_bytes": peak,
+            "denied": self.denied,
+            "spill_requests": self.spill_requests,
             "utilization": self.utilization,
-            "peak_utilization": min(1.0, self._peak_used / limit) if limit > 0 else 1.0,
+            "peak_utilization": min(1.0, peak / limit) if limit > 0 else 1.0,
         }
 
     def set_limit(self, limit_bytes: int) -> None:

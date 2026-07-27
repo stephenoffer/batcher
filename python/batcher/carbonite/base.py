@@ -1,16 +1,23 @@
 """Policy seams for the Carbonite resource manager.
 
-`ResourceManager` is a thin orchestrator that composes one policy of each kind
-below. These `Protocol`s name the resource-policy decisions Carbonite makes —
-admission (is this plan feasible?), spill (should this state spill?), flow control
-(credit grants), and memory estimation (what envelope does this plan need?) — so
-that future policies (a real budgeting admission check, a learned spill predictor,
-AIMD flow control, a per-operator memory estimator) drop in by being constructed
-in place of the bootstrap defaults, without touching the manager's public surface
-or `api`'s call site.
+`ResourceManager` is a thin orchestrator that composes one policy of each kind below.
+These `Protocol`s name the four resource decisions it delegates:
 
-These are contracts only. The concrete bootstrap implementations live in
-`carbonite.policies`; each reproduces today's permissive single-node behavior.
+- **admission** — is this plan feasible, and if not, what is the counter-offer?
+- **flow control** — how many in-flight batch slots may a shuffle channel hold?
+- **memory estimation** — what envelope does this plan need?
+- **scheduling** — what per-task grant should a distributed worker be given?
+
+An alternate policy drops in by being constructed in place of the default, without
+touching the manager's public surface or `api`'s call site. The concrete
+implementations live in `carbonite.policies`.
+
+**Spilling is deliberately not a `Protocol` here.** It reads as a fifth policy and is
+not one: `policies.spill_advice.SpillAdvisor` is a concrete collaborator, because there
+is exactly one implementation and no second in sight, and a `Protocol` with one
+implementation is an empty frame around a class. The seam to widen when a second spill
+strategy actually arrives is that class — this docstring named a `SpillPolicy` that never
+existed, which is the kind of thing a reader trusts and then goes looking for.
 """
 
 from __future__ import annotations

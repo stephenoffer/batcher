@@ -325,16 +325,19 @@ fn unregister_query(query_id: &str) {
     bc_resource::cancel::unregister(query_id);
 }
 
-/// Ids of the queries currently executing in this process, in unspecified order.
+/// Ids of the queries currently executing in this process, sorted.
 #[pyfunction]
 fn running_queries() -> Vec<String> {
     bc_resource::cancel::running()
 }
 
 /// Ask every running query in this process to stop. For interpreter shutdown.
+///
+/// Returns how many were asked, so a shutdown path can report whether it interrupted
+/// anything instead of guessing.
 #[pyfunction]
-fn cancel_all_queries() {
-    bc_resource::cancel::cancel_all();
+fn cancel_all_queries() -> usize {
+    bc_resource::cancel::cancel_all()
 }
 
 /// Map any engine error into a Python exception. The error hierarchy mapping
@@ -687,6 +690,32 @@ impl MemoryPool {
     #[getter]
     fn limit(&self) -> u64 {
         self.inner.limit() as u64
+    }
+
+    /// High-water mark of concurrently-reserved bytes over this pool's life.
+    ///
+    /// A live `used` reading cannot be recovered after the fact, and after the fact is
+    /// when anyone asks how close a query ran to its envelope. Measured in the data plane
+    /// so it also counts reservations the control plane never made.
+    #[getter]
+    fn peak_used(&self) -> u64 {
+        self.inner.peak_used() as u64
+    }
+
+    /// Reservations this pool refused for lack of headroom.
+    ///
+    /// The direct evidence that the envelope is what bound the workload, where a peak near
+    /// the limit is only circumstantial.
+    #[getter]
+    fn denied(&self) -> u64 {
+        self.inner.denied() as u64
+    }
+
+    /// Times the cooperative path asked a registered operator to spill so a reservation
+    /// could be granted — how often other operators had to pay for this one.
+    #[getter]
+    fn spill_requests(&self) -> u64 {
+        self.inner.spill_requests() as u64
     }
 }
 

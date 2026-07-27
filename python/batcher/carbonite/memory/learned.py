@@ -81,7 +81,13 @@ def _upper_quantile(values: Sequence[float], q: float = _FOOTPRINT_QUANTILE) -> 
     low = math.floor(pos)
     high = min(low + 1, len(ordered) - 1)
     frac = pos - low
-    return ordered[low] * (1.0 - frac) + ordered[high] * frac
+    mixed = ordered[low] * (1.0 - frac) + ordered[high] * frac
+    # Clamped to the two order statistics it interpolates between. `a*(1-f) + b*f` is not
+    # exactly bounded by `[a, b]` in floating point — for a == b it can land one ulp
+    # outside — so without this the "quantile" of a constant sample can exceed every value
+    # in it. A per-row memory figure above every measurement is a small error that feeds
+    # straight into a byte budget, and it makes the function's own contract untrue.
+    return min(max(mixed, ordered[low]), ordered[high])
 
 
 # LogicalPlan node-class names (`PhysicalOp.kind`, e.g. "Aggregate", "Join") vs the

@@ -15,20 +15,18 @@ what makes Carbonite a transfer sublibrary rather than glue inside the engine.
 
 from __future__ import annotations
 
-import atexit
-import contextlib
 import threading
-import weakref
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher.carbonite.transfer.lifecycle import host_of, process_client, register_session
 from batcher.carbonite.transfer.locality import (
     TransferMode,
     locality_ratio_counts,
     select_mode,
 )
-from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleClient, ShuffleTicket
+from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleTicket
 
 if TYPE_CHECKING:
     from batcher.carbonite.memory.pressure import PressureMonitor
@@ -42,63 +40,6 @@ __all__ = ["ShuffleSession"]
 # running state. Matches the `shuffle_fan_in` config default (the same Carbonite
 # fan-in governor as the combiner tree).
 _DEFAULT_FAN_IN = 8
-
-# One pooled consumer per process, shared by every session: its channel pool is
-# keyed by peer address, so sharing is correct, and it bounds the process to a
-# single client runtime no matter how many sessions exist (a per-session runtime
-# would accumulate background threads and destabilize a many-actor worker).
-_shared_client: ShuffleClient | None = None
-# Guards the lazy build. A join reducer gathers its two sides on two threads, and both
-# reach this on the first fetch of a fresh worker: without the lock they each construct a
-# `ShuffleClient`, which means two tokio runtimes and two channel pools, one of which is
-# then dropped on the floor with its background threads still running. That is the exact
-# per-session-runtime accumulation the shared client exists to prevent.
-_client_lock = threading.Lock()
-
-
-def _process_client() -> ShuffleClient:
-    global _shared_client
-    client = _shared_client
-    if client is None:
-        with _client_lock:
-            if _shared_client is None:
-                _shared_client = ShuffleClient()
-            client = _shared_client
-    return client
-
-
-# Every live session, so a process-exit hook can retire the pyarrow-backed batches
-# their Flight servers still hold *while the interpreter is alive*. A published
-# partition is a zero-copy view of a pyarrow array whose release callback needs the
-# GIL; if a tokio serve thread drops it *after* Python has begun finalizing, the
-# GIL acquire turns into a thread-exit that unwinds through Rust and aborts the
-# process (`std::terminate`). Clearing here — on the main thread, GIL held, before
-# finalization — drops that data first, so no background thread touches the GIL at
-# shutdown. WeakSet ⇒ an already-collected session drops out on its own.
-_live_sessions: weakref.WeakSet = weakref.WeakSet()
-_atexit_registered = False
-
-
-def _drain_live_sessions() -> None:
-    """Evict every live session's published partitions at interpreter exit."""
-    for session in list(_live_sessions):
-        with contextlib.suppress(Exception):  # best-effort teardown must never raise
-            session.clear()
-
-
-def _register_session(session: ShuffleSession) -> None:
-    """Track `session` for exit-time draining, registering the hook once."""
-    global _atexit_registered
-    _live_sessions.add(session)
-    if not _atexit_registered:
-        atexit.register(_drain_live_sessions)
-        _atexit_registered = True
-
-
-def _host(addr: str) -> str:
-    """The node identity of a shuffle address — its host, dropping the `:port` (the
-    advertised address is `{node_ip}:{port}`, so equal hosts ⇒ same node)."""
-    return addr.rsplit(":", 1)[0]
 
 
 class ShuffleSession:
@@ -153,7 +94,7 @@ class ShuffleSession:
             from batcher.carbonite.memory.pressure import PressureMonitor
 
             self._pressure = PressureMonitor()
-        _register_session(self)
+        register_session(self)
 
     def set_credits(self, credits: int | None) -> None:
         """Re-grant this session's static credit window.
@@ -244,7 +185,7 @@ class ShuffleSession:
         # path's mode selection — and behavior — is exactly as before.
         if self._shm:
             mode = select_mode(
-                addr, self.addr, source_node=_host(addr), local_node=_host(self.addr)
+                addr, self.addr, source_node=host_of(addr), local_node=host_of(self.addr)
             )
         else:
             mode = select_mode(addr, self.addr)
@@ -267,7 +208,7 @@ class ShuffleSession:
         # NETWORK (or a shared-memory miss): stream over credit-bounded Flight. The
         # process-wide pooled client reuses one channel per peer across every session's
         # fetches. The window is adaptive when a flow controller is set.
-        out = _process_client().fetch(addr, ticket, credits=self._window(), token=self._token)
+        out = process_client().fetch(addr, ticket, credits=self._window(), token=self._token)
         with self._stats_lock:
             self._observe_backpressure()
         return out
@@ -327,7 +268,7 @@ class ShuffleSession:
         recompute at all. A source is `unreachable` only once every copy of it is gone.
         """
         payload, unreachable = self._server.gather_combine(
-            _process_client(),
+            process_client(),
             group_keys_json,
             aggregates_json,
             sources,
@@ -365,7 +306,7 @@ class ShuffleSession:
             fan_in = max(1, active_config().flow_control.shuffle_fetch_fan_in)
         fan_in = min(fan_in, max(1, len(sources)))
         paths, unreachable = self._server.gather_to_files(
-            _process_client(),
+            process_client(),
             sources,
             spill_dir,
             fan_in,
@@ -409,7 +350,7 @@ class ShuffleSession:
             fan_in = max(1, active_config().flow_control.shuffle_fetch_fan_in)
         fan_in = min(fan_in, max(1, len(sources)))  # never dial more peers than exist
         rows, unreachable = self._server.gather_concat(
-            _process_client(),
+            process_client(),
             sources,
             fan_in,
             credits=self._window(),
@@ -453,7 +394,14 @@ class ShuffleSession:
             "locality_ratio": self.locality_ratio,
             "bytes_published": self._server.bytes_published,
             "bytes_served_locally": self._server.bytes_served_locally,
+            # Byte-weighted, alongside the fetch-count ratio above. Nine tiny local fetches
+            # and one enormous remote one score 0.9 by count while moving almost everything
+            # over the wire, and that shape is exactly what placement exists to find.
+            "byte_locality_ratio": self._server.locality_ratio(),
             "partitions_retained": self._server.partition_count,
+            # The bytes behind that count. A worker holding four partitions says nothing
+            # about its footprint; a worker holding four gigabytes does.
+            "bytes_retained": self._server.retained_bytes,
         }
         if self._flow_control is not None:
             out.update({f"credit_{k}": v for k, v in self._flow_control.stats().items()})
@@ -483,3 +431,16 @@ class ShuffleSession:
     def max_inflight(self, ticket: ShuffleTicket) -> int | None:
         """Peak in-flight batches for a locally published `ticket` (test hook)."""
         return self._server.max_inflight(ticket)
+
+    def __enter__(self) -> ShuffleSession:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        """Evict everything this session published on the way out.
+
+        A session holds its buckets as zero-copy views of pyarrow arrays, so an
+        un-cleared one keeps that memory resident for as long as the session object
+        lives — and the exit hook that catches the leftovers runs at *interpreter* exit,
+        which on a long-lived worker actor is far too late to be the only answer.
+        """
+        self.clear()

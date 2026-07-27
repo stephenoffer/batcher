@@ -24,6 +24,7 @@ import errno
 import os
 import shutil
 import time
+from enum import IntEnum
 
 import pyarrow as pa
 
@@ -34,8 +35,10 @@ __all__ = [
     "DISK_FLOOR_BYTES",
     "FREE_DISK_TTL_SECONDS",
     "SPILL_DISK_FRACTION",
+    "DiskPressure",
     "clamp_to_free_disk",
     "disk_floor_bytes",
+    "disk_pressure",
     "free_disk_bytes",
     "fsspec_open",
     "ipc_options",
@@ -165,6 +168,56 @@ def disk_floor_bytes(path: str) -> int:
         return DISK_FLOOR_BYTES
     share = int(total * _DISK_FLOOR_CAPACITY_FRACTION)
     return max(1 << 20, min(DISK_FLOOR_BYTES, share))
+
+
+class DiskPressure(IntEnum):
+    """How full the scratch volume is, ordered so callers can compare with ``>=``.
+
+    The disk analogue of `PressureLevel`, and the gap it closes: Carbonite governs memory
+    with a four-level ladder every component reads, and governs disk with a single boolean
+    consulted at one place — so the only thing that ever happens about a filling scratch
+    volume is that a bucket routes elsewhere, and only if a remote tier happens to be
+    configured. A ladder lets the same volume be *reported* while there is still room to
+    act on it, which for disk is the whole game: an out-of-space write cannot be retried
+    or degraded, it fails the query.
+    """
+
+    NORMAL = 0  # ample room — nothing to do
+    ELEVATED = 1  # under a quarter free — prefer the remote tier for new buckets
+    FULL = 2  # under the reserve floor — the local tier is exhausted
+
+
+# Free-space fraction below which the volume reads as ELEVATED. Deliberately well above
+# the reserve floor: the point of the middle rung is to be reached while there is still
+# room to react, and the floor is by construction the point where there is not.
+_ELEVATED_FREE_FRACTION = 0.25
+
+
+def disk_pressure(path: str) -> DiskPressure:
+    """Classify how full the volume holding `path` is.
+
+    An unstat-able volume reads as `NORMAL`, matching every other probe here: a
+    measurement that could not be taken is not evidence of a problem, and treating it as
+    one would push every spill on an exotic filesystem to object storage.
+
+    Args:
+        path: Any path on the volume of interest.
+
+    Returns:
+        The pressure level.
+    """
+    free = free_disk_bytes(path)
+    if free is None:
+        return DiskPressure.NORMAL
+    if free < disk_floor_bytes(path):
+        return DiskPressure.FULL
+    try:
+        total = shutil.disk_usage(path).total
+    except OSError:  # pragma: no cover - stat'd for free but not for total
+        return DiskPressure.NORMAL
+    if total > 0 and free < total * _ELEVATED_FREE_FRACTION:
+        return DiskPressure.ELEVATED
+    return DiskPressure.NORMAL
 
 
 def clamp_to_free_disk(local_dir: str, budget: int | None) -> int | None:

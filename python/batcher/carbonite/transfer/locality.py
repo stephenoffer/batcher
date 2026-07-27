@@ -30,6 +30,28 @@ class TransferMode(Enum):
     SHARED_MEMORY = "shared_memory"  # same node, other process — Arrow IPC / mmap
     NETWORK = "network"  # different node — credit-bounded Flight
 
+    @property
+    def rank(self) -> int:
+        """Relative cost, `0` cheapest. `DIRECT_MEMORY` < `SHARED_MEMORY` < `NETWORK`.
+
+        The enum is declared cheapest-first and says so, but an `Enum` carries no order, so
+        anything wanting to compare two modes had to re-encode the ranking at the call
+        site — three places that must agree with this declaration and with each other.
+        """
+        return _COST_RANK[self]
+
+    @property
+    def is_local(self) -> bool:
+        """Whether this mode keeps the bytes off the network (direct or shared memory)."""
+        return self is not TransferMode.NETWORK
+
+
+_COST_RANK = {
+    TransferMode.DIRECT_MEMORY: 0,
+    TransferMode.SHARED_MEMORY: 1,
+    TransferMode.NETWORK: 2,
+}
+
 
 def select_mode(
     source_addr: str,
@@ -61,8 +83,7 @@ def locality_ratio(modes: Iterable[TransferMode]) -> float:
     modes = list(modes)
     if not modes:
         return 1.0
-    off_network = sum(m is not TransferMode.NETWORK for m in modes)
-    return off_network / len(modes)
+    return sum(m.is_local for m in modes) / len(modes)
 
 
 def locality_ratio_counts(off_network: int, total: int) -> float:

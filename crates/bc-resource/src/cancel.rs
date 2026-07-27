@@ -67,12 +67,33 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
+
+    /// Whether `other` is the *same* flag as this token, not merely an equal one.
+    ///
+    /// Identity, because that is the question the registry needs: two tokens for the same
+    /// query id are indistinguishable by value (both are a bool that is false) and are
+    /// completely different things.
+    #[must_use]
+    fn is(&self, other: &CancelToken) -> bool {
+        Arc::ptr_eq(&self.flag, &other.flag)
+    }
 }
 
 /// Process-wide map of query id to its token.
+///
+/// A poisoned lock is recovered rather than propagated (`into_inner`), matching the memory
+/// pool. A panic in one query must not make the whole process uncancellable: the map holds
+/// only `Arc`s to flags, so there is no invariant a panic could have left half-updated, and
+/// silently returning "not registered" for every future query would turn one panic into a
+/// process where Ctrl-C stops working.
 fn registry() -> &'static Mutex<HashMap<String, CancelToken>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, CancelToken>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The registry map, recovering a poisoned lock.
+fn locked() -> std::sync::MutexGuard<'static, HashMap<String, CancelToken>> {
+    registry().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Register `query_id` as running and return the token the executor should poll.
@@ -84,9 +105,7 @@ fn registry() -> &'static Mutex<HashMap<String, CancelToken>> {
 #[must_use]
 pub fn register(query_id: &str) -> CancelToken {
     let token = CancelToken::new();
-    if let Ok(mut map) = registry().lock() {
-        map.insert(query_id.to_string(), token.clone());
-    }
+    locked().insert(query_id.to_string(), token.clone());
     token
 }
 
@@ -100,13 +119,41 @@ pub fn register(query_id: &str) -> CancelToken {
 /// nothing happen.
 #[must_use]
 pub fn token_for(query_id: &str) -> Option<CancelToken> {
-    registry().lock().ok()?.get(query_id).cloned()
+    locked().get(query_id).cloned()
 }
 
 /// Drop `query_id` from the registry. Call when the query finishes, however it finished.
+///
+/// Prefer [`unregister_token`] wherever the caller still holds the token it registered.
+/// This unconditional form removes whatever entry is under the id, which is wrong in the
+/// one case the id is not unique — see there.
 pub fn unregister(query_id: &str) {
-    if let Ok(mut map) = registry().lock() {
-        map.remove(query_id);
+    locked().remove(query_id);
+}
+
+/// Drop `query_id` **only if** the registered token is still `token`.
+///
+/// The re-registration hazard, and the reason this exists. `register` documents that
+/// reusing an id replaces the entry and cannot orphan the running query — which is true of
+/// `register` and false of the cleanup that follows it. The first query finishes, calls
+/// `unregister(id)`, and removes the *second* query's registration: that query is now
+/// running with a token nothing can reach, so Ctrl-C on it does nothing at all and the
+/// caller is told `false` as though it had already finished.
+///
+/// Comparing identity closes it: a stale holder finds a token that is not its own and
+/// leaves the live registration alone.
+///
+/// Args are the id and the token `register` returned for it.
+///
+/// Returns whether an entry was removed.
+pub fn unregister_token(query_id: &str, token: &CancelToken) -> bool {
+    let mut map = locked();
+    match map.get(query_id) {
+        Some(current) if current.is(token) => {
+            map.remove(query_id);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -116,10 +163,7 @@ pub fn unregister(query_id: &str) {
 /// or never started, which is information for the caller and not an error — the race
 /// between a cancel and a completion has no correct loser.
 pub fn cancel(query_id: &str) -> bool {
-    let Ok(map) = registry().lock() else {
-        return false;
-    };
-    match map.get(query_id) {
+    match locked().get(query_id) {
         Some(token) => {
             token.cancel();
             true
@@ -128,22 +172,28 @@ pub fn cancel(query_id: &str) -> bool {
     }
 }
 
-/// Ids of every query currently registered, in unspecified order.
+/// Ids of every query currently registered, sorted.
+///
+/// Sorted rather than "unspecified order": this is a diagnostic that a human reads and a
+/// test asserts on, and `HashMap` iteration order varies run to run, which makes both
+/// harder for no benefit at these sizes.
 #[must_use]
 pub fn running() -> Vec<String> {
-    registry()
-        .lock()
-        .map(|map| map.keys().cloned().collect())
-        .unwrap_or_default()
+    let mut ids: Vec<String> = locked().keys().cloned().collect();
+    ids.sort();
+    ids
 }
 
 /// Cancel every registered query. For process shutdown.
-pub fn cancel_all() {
-    if let Ok(map) = registry().lock() {
-        for token in map.values() {
-            token.cancel();
-        }
+///
+/// Returns how many were cancelled, so a shutdown path can say whether it interrupted
+/// anything rather than guessing.
+pub fn cancel_all() -> usize {
+    let map = locked();
+    for token in map.values() {
+        token.cancel();
     }
+    map.len()
 }
 
 #[cfg(test)]
@@ -234,6 +284,61 @@ mod tests {
             "cancelling by id reached a superseded token"
         );
         unregister("q-reused");
+    }
+
+    #[test]
+    fn a_stale_unregister_cannot_orphan_the_live_registration() {
+        // Two queries reuse one id (a control plane recycling after a crash). The first
+        // finishes and cleans up; the second is still running and must stay cancellable.
+        let first = register("q-recycled");
+        let second = register("q-recycled");
+
+        assert!(
+            !unregister_token("q-recycled", &first),
+            "a stale token removed an entry"
+        );
+        assert!(cancel("q-recycled"), "the live query became uncancellable");
+        assert!(second.is_cancelled());
+        assert!(!first.is_cancelled());
+
+        assert!(unregister_token("q-recycled", &second));
+        assert!(!cancel("q-recycled"));
+    }
+
+    #[test]
+    fn unregister_token_reports_whether_it_removed_anything() {
+        let token = register("q-report");
+        assert!(unregister_token("q-report", &token));
+        assert!(
+            !unregister_token("q-report", &token),
+            "removing twice reported a removal"
+        );
+        assert!(!unregister_token("q-never", &token));
+    }
+
+    #[test]
+    fn running_is_sorted_so_a_reader_and_a_test_can_rely_on_it() {
+        for id in ["q-sort-c", "q-sort-a", "q-sort-b"] {
+            let _ = register(id);
+        }
+        let ids: Vec<String> = running()
+            .into_iter()
+            .filter(|s| s.starts_with("q-sort-"))
+            .collect();
+        assert_eq!(ids, vec!["q-sort-a", "q-sort-b", "q-sort-c"]);
+        for id in ["q-sort-a", "q-sort-b", "q-sort-c"] {
+            unregister(id);
+        }
+    }
+
+    #[test]
+    fn cancel_all_reports_how_many_it_interrupted() {
+        let a = register("q-all-1");
+        let b = register("q-all-2");
+        assert!(cancel_all() >= 2);
+        assert!(a.is_cancelled() && b.is_cancelled());
+        unregister("q-all-1");
+        unregister("q-all-2");
     }
 
     #[test]

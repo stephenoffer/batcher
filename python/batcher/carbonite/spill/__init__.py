@@ -8,8 +8,9 @@ measures the volume underneath. Re-exports only; the logic lives in the sibling 
 
 from __future__ import annotations
 
+from batcher.carbonite.spill.disk import DiskPressure
 from batcher.carbonite.spill.handle import SpillHandle, SpillTier
 from batcher.carbonite.spill.store import TieredSpillStore
 from batcher.carbonite.spill.writer import BucketWriter
 
-__all__ = ["BucketWriter", "SpillHandle", "SpillTier", "TieredSpillStore"]
+__all__ = ["BucketWriter", "DiskPressure", "SpillHandle", "SpillTier", "TieredSpillStore"]

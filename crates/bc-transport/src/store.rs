@@ -3,6 +3,7 @@
 //! prove the credit bound.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -61,27 +62,67 @@ impl InflightGauge {
     }
 }
 
-/// One registered partition: the batches plus its in-flight gauge.
+/// One registered partition: the batches, its in-flight gauge, and its footprint.
 pub(crate) struct Partition {
     batches: Arc<Vec<RecordBatch>>,
     gauge: Arc<InflightGauge>,
+    /// Resident bytes this partition holds, measured once at registration.
+    nbytes: usize,
+}
+
+/// Bytes a batch actually holds, including buffer padding and any slice it shares.
+///
+/// `get_array_memory_size`, not the logical size: what matters here is the memory the
+/// process cannot give back while the partition is registered, and a sliced batch keeps
+/// its whole parent buffer alive.
+fn batch_bytes(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::get_array_memory_size).sum()
 }
 
 /// In-memory registry mapping a ticket string to the batches served under it.
+///
+/// The store keeps a running byte total. It is the single largest thing the control
+/// plane's memory accounting cannot see: Carbonite's buffer pool tracks reservations the
+/// engine *asks* for, and a published shuffle partition is never asked for — it is simply
+/// held until a reducer fetches it. `PressureMonitor` names this store by name as the
+/// reason it has to fall back to reading process RSS. A number the store keeps itself is
+/// cheaper than that inference and, unlike RSS, attributes the memory to the shuffle.
 #[derive(Default)]
 pub(crate) struct PartitionStore {
     partitions: RwLock<HashMap<String, Partition>>,
+    /// Sum of every registered partition's `nbytes`. Atomic so a reader does not have to
+    /// take the map lock — the point is to be cheap enough to poll.
+    retained: AtomicUsize,
 }
 
 impl PartitionStore {
     pub(crate) async fn register(&self, ticket: String, batches: Vec<RecordBatch>) {
-        self.partitions.write().await.insert(
+        let nbytes = batch_bytes(&batches);
+        let previous = self.partitions.write().await.insert(
             ticket,
             Partition {
                 batches: Arc::new(batches),
                 gauge: Arc::new(InflightGauge::default()),
+                nbytes,
             },
         );
+        // Re-registering a ticket (a recompute republishing under a bumped epoch, or a
+        // retried map task) replaces the entry. Charging the new bytes without crediting
+        // back the old ones makes the total drift up forever, and a monotonically rising
+        // "retained bytes" that never falls is worse than no number at all: it reads as a
+        // leak in the one place someone would look to find one.
+        self.retained.fetch_add(nbytes, Ordering::Relaxed);
+        if let Some(old) = previous {
+            self.retained.fetch_sub(old.nbytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes currently held by registered partitions.
+    ///
+    /// The shuffle's resident footprint, which is anonymous memory the kernel cannot
+    /// reclaim and which no reservation accounts for.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn get(&self, ticket: &str) -> Option<Arc<Vec<RecordBatch>>> {
@@ -117,22 +158,30 @@ impl PartitionStore {
     /// batches. The store is otherwise append-only, so without this a long-lived
     /// worker accumulates every partition of every stage/epoch until it dies (OOM).
     pub(crate) async fn remove(&self, ticket: &str) {
-        self.partitions.write().await.remove(ticket);
+        if let Some(p) = self.partitions.write().await.remove(ticket) {
+            self.retained.fetch_sub(p.nbytes, Ordering::Relaxed);
+        }
     }
 
     /// Drop every partition whose ticket begins with `prefix` (e.g. `"{plan_id}/"`
     /// to evict a whole finished plan, or `"{plan_id}/{stage}/"` one stage).
     pub(crate) async fn remove_prefix(&self, prefix: &str) {
-        self.partitions
-            .write()
-            .await
-            .retain(|ticket, _| !ticket.starts_with(prefix));
+        let mut freed = 0usize;
+        self.partitions.write().await.retain(|ticket, p| {
+            let keep = !ticket.starts_with(prefix);
+            if !keep {
+                freed += p.nbytes;
+            }
+            keep
+        });
+        self.retained.fetch_sub(freed, Ordering::Relaxed);
     }
 
     /// Drop every published partition. Called at plan teardown to return the
     /// worker's shuffle memory to the OS without tearing down the actor.
     pub(crate) async fn clear(&self) {
         self.partitions.write().await.clear();
+        self.retained.store(0, Ordering::Relaxed);
     }
 
     /// Number of partitions currently retained (telemetry / leak tests).
@@ -187,6 +236,64 @@ mod tests {
         assert!(store.get("9/0/0/0").await.is_none());
         store.clear().await;
         assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn retained_bytes_tracks_registration_and_eviction() {
+        let store = PartitionStore::default();
+        assert_eq!(store.retained_bytes(), 0);
+
+        store.register("b/0/0/0".into(), vec![one_batch(1)]).await;
+        let one = store.retained_bytes();
+        assert!(
+            one > 0,
+            "a registered partition holds memory nothing accounts for"
+        );
+
+        store.register("b/0/0/1".into(), vec![one_batch(2)]).await;
+        assert_eq!(store.retained_bytes(), one * 2);
+
+        store.remove("b/0/0/0").await;
+        assert_eq!(store.retained_bytes(), one);
+        store.remove("b/0/0/0").await; // already gone — must not double-credit
+        assert_eq!(store.retained_bytes(), one);
+
+        store.clear().await;
+        assert_eq!(store.retained_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn re_registering_a_ticket_does_not_drift_the_total() {
+        // A recompute republishes under the same ticket. Charging the new bytes without
+        // crediting the old ones makes the total rise forever and read as a leak.
+        let store = PartitionStore::default();
+        store.register("r/0/0/0".into(), vec![one_batch(1)]).await;
+        let one = store.retained_bytes();
+        store
+            .register("r/0/0/0".into(), vec![one_batch(2), one_batch(3)])
+            .await;
+        assert_eq!(store.len().await, 1);
+        assert_eq!(
+            store.retained_bytes(),
+            one * 2,
+            "the superseded bytes were not credited back"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_prefix_credits_back_every_partition_it_evicts() {
+        let store = PartitionStore::default();
+        store.register("p9/0/0/0".into(), vec![one_batch(1)]).await;
+        store.register("p9/1/0/0".into(), vec![one_batch(2)]).await;
+        store.register("p8/0/0/0".into(), vec![one_batch(3)]).await;
+        let all = store.retained_bytes();
+
+        store.remove_prefix("p9/").await;
+        assert_eq!(
+            store.retained_bytes(),
+            all / 3,
+            "evicted bytes stayed on the books"
+        );
     }
 
     #[tokio::test]

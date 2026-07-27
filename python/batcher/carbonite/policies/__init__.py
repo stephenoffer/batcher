@@ -16,15 +16,19 @@ from batcher.carbonite.policies.flow_control import (
     load_shuffle_window,
     record_shuffle_window,
 )
+from batcher.carbonite.policies.morsel import morsel_target
 from batcher.carbonite.policies.scheduling import DefaultSchedulingPolicy
+from batcher.carbonite.policies.spill_advice import SpillAdvisor
 
 __all__ = [
     "AIMDFlowControl",
     "BudgetingAdmission",
     "DefaultSchedulingPolicy",
+    "SpillAdvisor",
     "StaticCreditFlowControl",
     "credit_ceiling",
     "learned_channel_morsel_bytes",
     "load_shuffle_window",
+    "morsel_target",
     "record_shuffle_window",
 ]

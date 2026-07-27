@@ -123,7 +123,7 @@ class DefaultSchedulingPolicy:
         model = ctx.memory_model
         peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
         # The configured value, not `morsel_rows * row_bytes`. The two agree only at the
-        # defaults (16,384 x 64 == 1 MiB); `ResourceManager.adapted_config` rewrites
+        # defaults (16,384 x 64 == 1 MiB); `ResourceManager.recommended_config` rewrites
         # `morsel_rows` (from the learned per-row width) and `morsel_bytes` (from the
         # pressure factor) *independently*, so after any adaptive resize the derivation
         # drifts from the real morsel — and this value is the per-task memory floor below.

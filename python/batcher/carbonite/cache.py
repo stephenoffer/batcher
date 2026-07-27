@@ -16,8 +16,6 @@ in `api` computes the key — Carbonite cannot import `kyber`).
 
 from __future__ import annotations
 
-import heapq
-import itertools
 import threading
 from dataclasses import dataclass
 from typing import ClassVar
@@ -39,7 +37,6 @@ class _Entry:
     keepalive: object
     cost: float  # wall-clock seconds the result took to compute (recompute cost)
     hits: int  # times served since insertion (access frequency)
-    seq: int = 0  # insertion order, the eviction tie-break (oldest goes first)
 
     def value(self) -> float:
         """Greedy-Dual-Size-Frequency keep-value: recompute-cost x frequency / size.
@@ -94,9 +91,6 @@ class CacheStore:
         # small — and those call for opposite responses.
         self._evictions = 0
         self._lock = threading.Lock()
-        # Monotonic insertion counter, so eviction ties break on insertion order (oldest
-        # first) with a total order that never compares two `_Entry` objects.
-        self._seq = itertools.count()
 
     @property
     def max_bytes(self) -> int:
@@ -175,9 +169,7 @@ class CacheStore:
             existing = self._entries.pop(key, None)
             if existing is not None:
                 self._used -= existing.table.nbytes
-            self._entries[key] = _Entry(
-                table=table, keepalive=keepalive, cost=cost, hits=0, seq=next(self._seq)
-            )
+            self._entries[key] = _Entry(table=table, keepalive=keepalive, cost=cost, hits=0)
             self._used += size
             self._evict_to(self._max_bytes)
 
@@ -248,25 +240,28 @@ class CacheStore:
         cold, large → goes first); ties break by insertion order (the oldest), so a
         never-hit zero-cost set degrades to size-then-FIFO.
 
-        A heap, not a sort. An entry's keep-value is independent of which *other* entries
-        remain, so the victims could be fully ordered up front — but the usual eviction
-        drops one or two entries out of many, and fully ordering `n` entries to remove two
-        is `O(n log n)` where `O(n + k log n)` will do. `heapify` pays the linear scan
-        either way and then charges only for the victims actually taken, which is the
-        common case; a bulk eviction (`on_pressure` halving the cache) degrades to the same
-        `O(n log n)` the sort had. Each `value()` is still computed exactly once.
+        An entry's keep-value is independent of which *other* entries remain, so the
+        eviction order is a single stable sort — not a fresh O(n) min-scan per victim.
+        That makes a bulk eviction (`on_pressure` halving the cache, a large insert pushing
+        out many small entries) O(n log n) instead of O(n²), and computes each `value()`
+        once instead of once per comparison per round. Stable sort keeps insertion order
+        among equal values, so a never-hit zero-cost set degrades to size-then-FIFO.
+
+        A heap was tried here for the common single-victim case, on the reasoning that
+        `heapify` is O(n) where the sort is O(n log n). Measured over 2k / 10k / 40k
+        entries it was 1.10x / 0.86x / 1.00x — a wash, because what dominates is computing
+        `value()` once per entry and materializing the key sequence, which both approaches
+        pay identically, while Timsort's extra comparisons run in C over precomputed keys.
+        The sort stays: same cost, less machinery. Recorded so the next reader does not
+        re-derive the same idea and re-measure it.
         """
         if self._used <= target_bytes or not self._entries:
             return
-        # `(value, seq, key)`: the seq makes the order total, so two equal-value entries
-        # never fall through to comparing keys or entries, and the older one goes first.
-        heap = [(e.value(), e.seq, k) for k, e in self._entries.items()]
-        heapq.heapify(heap)
-        while heap and self._used > target_bytes:
-            _, _, key = heapq.heappop(heap)
-            entry = self._entries.pop(key, None)
-            if entry is None:  # pragma: no cover - defensive: concurrent invalidate
-                continue
+        victims = sorted(self._entries.items(), key=lambda kv: kv[1].value())
+        for key, entry in victims:
+            if self._used <= target_bytes:
+                break
+            del self._entries[key]
             self._used -= entry.table.nbytes
             self._evictions += 1
 

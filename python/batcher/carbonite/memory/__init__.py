@@ -8,8 +8,12 @@ per-operator bounds. Re-exports only; the logic lives in the sibling modules.
 
 from __future__ import annotations
 
-from batcher.carbonite.memory.estimator import OperatorMemoryEstimator, peak_operator_bytes
-from batcher.carbonite.memory.pool import BufferPool, process_pool
+from batcher.carbonite.memory.estimator import (
+    OperatorMemoryEstimator,
+    binding_operator,
+    peak_operator_bytes,
+)
+from batcher.carbonite.memory.pool import BufferPool, process_pool, reset_process_pool
 from batcher.carbonite.memory.pressure import PressureLevel, PressureMonitor
 
 __all__ = [
@@ -17,6 +21,8 @@ __all__ = [
     "OperatorMemoryEstimator",
     "PressureLevel",
     "PressureMonitor",
+    "binding_operator",
     "peak_operator_bytes",
     "process_pool",
+    "reset_process_pool",
 ]

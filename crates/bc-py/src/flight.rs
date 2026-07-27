@@ -255,6 +255,18 @@ impl FlightShuffleServer {
     fn partition_count(&self, py: Python<'_>) -> usize {
         py.allow_threads(|| shared_runtime().block_on(self.exchange.partition_count()))
     }
+
+    /// Bytes this server's published partitions currently hold in memory.
+    ///
+    /// The shuffle's resident footprint, which Carbonite's buffer pool does not account
+    /// for: a published partition is never *reserved*, it is simply held until a reducer
+    /// fetches it. `PressureMonitor` names this store as the reason it falls back to
+    /// reading process RSS, and RSS cannot say which part of the footprint is the shuffle.
+    /// Lock-free, so it is safe to poll.
+    #[getter]
+    fn retained_bytes(&self) -> u64 {
+        self.exchange.retained_bytes() as u64
+    }
 }
 
 impl Drop for FlightShuffleServer {

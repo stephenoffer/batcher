@@ -1,13 +1,17 @@
 """The Carbonite resource manager entry point.
 
 Validates plans for feasibility, hands out credit windows and memory reservations,
-and decides when a query must spill. It is a thin orchestrator: it composes one
-policy of each kind (admission, spill, flow control, memory estimation — see
-`carbonite.base`) plus the memory subsystem (buffer pool + pressure monitor) and
-delegates to them. `validate` returns real counter-offers Kyber re-plans around;
-`reserve` accounts against the process-wide buffer pool; `should_spill` compares a
-plan's estimated envelope to live memory so a large query goes out-of-core instead
-of OOMing. An alternate policy plugs in by being passed to the constructor.
+and decides when a query must spill. It is a thin orchestrator: it composes one policy
+of each of the four kinds `carbonite.base` declares (admission, flow control, memory
+estimation, scheduling), the `SpillAdvisor` that owns every out-of-core decision, and
+the memory subsystem (buffer pool + pressure monitor), and delegates to them.
+
+`validate` returns real counter-offers Kyber re-plans around; `reserve` accounts against
+the process-wide buffer pool; `should_spill` — and `spill_reason`, which says *why* —
+compare a plan's estimated envelope and live memory so a large query goes out-of-core
+instead of OOMing; `stats` reads all of it back in one snapshot. An alternate policy plugs
+in by being passed to the constructor, and every delegation goes through it, including the
+learned-warm-start paths.
 """
 
 from __future__ import annotations
@@ -34,7 +38,6 @@ from batcher.carbonite.policies import (
     BudgetingAdmission,
     DefaultSchedulingPolicy,
     StaticCreditFlowControl,
-    credit_ceiling,
     learned_channel_morsel_bytes,
     load_shuffle_window,
 )
@@ -148,12 +151,13 @@ class ResourceManager:
         if signature is not None:
             learned = load_shuffle_window(self._hub, signature)
             if learned is not None and learned > 0:
-                # Honor the byte bound (`credit_byte_budget`) via the learned wide-row width,
-                # exactly as the static grant does — otherwise a wide-row shuffle's learned
-                # window would be clamped only by the un-corrected count ceiling and buffer far
-                # past the byte budget. Cold/narrow model → the plain count ceiling.
-                ceiling = credit_ceiling(self._config, learned_channel_morsel_bytes(self._ctx))
-                return max(1, min(learned, ceiling))
+                requested = learned
+        # Always through the policy, including the learned path. Clamping the learned window
+        # here instead — which is what this did — reproduced `StaticCreditFlowControl`'s band
+        # inline and so silently bypassed whichever policy the manager was actually
+        # constructed with: a deployment that supplied its own flow control got it for every
+        # cold channel and lost it for exactly the recurring ones it had tuned for. The
+        # static policy applies the identical clamp, so the default path is unchanged.
         return self._flow_control.grant(requested, self._ctx)
 
     def scheduling_envelope(
@@ -174,7 +178,10 @@ class ResourceManager:
             requested_workers=requested_workers,
             available_bytes=self._hard_budget(),
         )
-        max_credits = max((op.bounds.c_max_credits for op in plan.ops), default=0)
+        # The plan's widest credit request, taken from the memory estimator's envelope so
+        # this and every other consumer of "what does this plan want" read one derivation
+        # rather than each re-scanning `plan.ops` with its own default.
+        max_credits = self._memory.envelope(plan, self._ctx).c_max_credits
         return dataclasses.replace(env, credits=self.grant_credits(max_credits))
 
     def adaptive_flow_control(self, *, signature: str | None = None) -> AIMDFlowControl:
@@ -369,8 +376,7 @@ class ResourceManager:
         from batcher.carbonite.policies.concurrency import process_limiter
 
         limiter = process_limiter(self._config)
-        timeout = float(getattr(self._config.execution, "admission_timeout_s", 0.0) or 0.0)
-        grant = limiter.acquire(timeout=timeout)
+        grant = limiter.acquire(timeout=max(0.0, self._config.execution.admission_timeout_s))
         try:
             yield grant
         finally:

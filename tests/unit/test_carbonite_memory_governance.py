@@ -59,6 +59,55 @@ def test_denied_reservations_are_counted() -> None:
     assert pool.stats()["denied"] == 1
 
 
+def test_the_engines_own_counters_are_preferred_when_it_reports_them() -> None:
+    """The control plane sees only its own reservations; the data plane sees the rest."""
+
+    class _EngineBacked:
+        limit = 1000
+        used = 0
+        available = 1000
+        peak_used = 900  # the engine reserved for operator state Carbonite never saw
+        denied = 3
+        spill_requests = 7
+
+        def try_reserve(self, _n):
+            return True
+
+        def release(self, _n):
+            return None
+
+    pool = BufferPool(1000)
+    pool._pool = _EngineBacked()
+    assert pool.peak_used == 900
+    assert pool.denied == 3
+    assert pool.spill_requests == 7
+    assert pool.stats()["peak_utilization"] == pytest.approx(0.9)
+
+
+def test_denials_are_not_double_counted_across_the_boundary() -> None:
+    """The engine's counter already includes every denial the control plane caused."""
+
+    class _EngineBacked:
+        limit = 10
+        used = 10
+        available = 0
+        peak_used = 10
+        denied = 1  # the same refusal the Python side is about to record
+        spill_requests = 0
+
+        def try_reserve(self, _n):
+            return False
+
+        def release(self, _n):
+            return None
+
+    pool = BufferPool(10)
+    pool._pool = _EngineBacked()
+    with pool.reserve(100) as granted:
+        assert granted is False
+    assert pool.denied == 1, "summing would report two refusals where one happened"
+
+
 def test_utilization_and_stats_agree_with_the_accounting() -> None:
     pool = BufferPool(1000)
     assert pool.utilization == 0.0

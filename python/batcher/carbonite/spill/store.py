@@ -123,9 +123,24 @@ class TieredSpillStore:
         Measured, not accounted: this is what catches a disk filled by something other
         than this store. An unstat-able volume reads as "not low", so the budget alone
         decides and behavior is exactly as before.
+
+        The threshold is `ELEVATED`, not `FULL`. Waiting for the reserve floor means the
+        *first* bucket to notice is one that already has nowhere to go, and a bucket's tier
+        is fixed at open — so by the time the floor is crossed there can be several buckets
+        already streaming to a volume that cannot hold them, and an out-of-space write
+        cannot be recovered in place. Routing earlier costs those buckets object-storage
+        latency and costs nothing else, since the remote tier reads back identically.
         """
-        free = disk.free_disk_bytes(self._local_dir)
-        return free is not None and free < disk.disk_floor_bytes(self._local_dir)
+        return self.disk_pressure() >= disk.DiskPressure.ELEVATED
+
+    def disk_pressure(self) -> disk.DiskPressure:
+        """How full this store's scratch volume is (`NORMAL`/`ELEVATED`/`FULL`).
+
+        Returns:
+            The measured level. `NORMAL` for a volume that cannot be stat'd — a
+            measurement that could not be taken is not evidence of a problem.
+        """
+        return disk.disk_pressure(self._local_dir)
 
     @property
     def local_bytes(self) -> int:
@@ -157,13 +172,15 @@ class TieredSpillStore:
         """
         return self._overflowed
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | str]:
         """A snapshot of this store's accounting, for telemetry and tests.
 
         Returns:
-            Bytes and bucket counts per tier, plus how many buckets overflowed and the
-            local budget in force (`-1` when the local tier is unbounded).
+            Bytes and bucket counts per tier, how many buckets overflowed, the local budget
+            in force (`-1` when the local tier is unbounded), and the volume's measured
+            pressure and free space (`-1` when it cannot be stat'd).
         """
+        free = disk.free_disk_bytes(self._local_dir)
         return {
             "local_bytes": self._local_used,
             "remote_bytes": self._remote_used,
@@ -172,6 +189,8 @@ class TieredSpillStore:
             "overflowed": self._overflowed,
             "local_budget_bytes": -1 if self._local_budget is None else self._local_budget,
             "local_pending_bytes": self._local_pending,
+            "disk_pressure": self.disk_pressure().name,
+            "free_disk_bytes": -1 if free is None else free,
         }
 
     def writer(self, name: str) -> BucketWriter:
@@ -272,6 +291,39 @@ class TieredSpillStore:
             Its batches, materialized.
         """
         return list(self.read_stream(handle))
+
+    @contextlib.contextmanager
+    def read_reserved(self, handle: SpillHandle) -> Iterator[Iterator[pa.RecordBatch]]:
+        """Stream a bucket back with its resident footprint reserved against the pool.
+
+        Reading a bucket puts it *back* in memory, which is the one step of spilling that
+        can undo it: the state was written out because it did not fit, and nothing checked
+        the budget before pulling it in again. The figure to reserve is the handle's
+        `logical_nbytes` — the uncompressed size — because the on-disk size of a
+        compressible bucket can be many times smaller than what it occupies once read, so
+        budgeting against the file size under-reserves by exactly the compression ratio.
+
+        This is deliberately advisory rather than blocking: it accounts the read so
+        concurrent readers and the running query see one envelope, and a reservation that
+        does not fit still proceeds (the caller is already out of core, and refusing here
+        would strand the query with no way to make progress). What it buys is that the
+        *next* decision — another reader, an operator sizing its state — sees the memory
+        this read is holding instead of allocating on top of it blindly.
+
+        Args:
+            handle: The bucket to read.
+
+        Yields:
+            The bucket's batches, one at a time.
+        """
+        from batcher.carbonite.memory.pool import current_process_pool
+
+        pool = current_process_pool()
+        if pool is None:
+            yield self.read_stream(handle)
+            return
+        with pool.reserve(handle.logical_nbytes or handle.nbytes):
+            yield self.read_stream(handle)
 
     def read_stream(self, handle: SpillHandle) -> Iterator[pa.RecordBatch]:
         """Yield the partition's batches one at a time (never materializing it whole).

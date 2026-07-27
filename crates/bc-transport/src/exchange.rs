@@ -233,6 +233,18 @@ impl ShuffleExchange {
         self.store.len().await
     }
 
+    /// Bytes this worker's published partitions currently hold in memory.
+    ///
+    /// The shuffle's resident footprint. It is anonymous memory the kernel cannot reclaim
+    /// and that no reservation accounts for, so before this the only way the control plane
+    /// could see it was by inferring it from process RSS — which cannot attribute it to the
+    /// shuffle, and so cannot tell an operator whether the answer is "publish less" or
+    /// "hold less state". Synchronous and lock-free: it is meant to be polled.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.store.retained_bytes()
+    }
+
     /// Fetch a remote partition from `(addr, ticket)` with a credit-bounded
     /// stream using the default window ([`DEFAULT_CREDITS`]).
     ///

@@ -39,12 +39,20 @@ def reducer_affinity(
     (a skewed/co-located bucket); a uniformly-spread bucket is omitted, so the caller
     keeps its default placement for it. Deterministic: ties break on the node id.
     """
+    # A concentration at or below 0.5 is not a threshold but a contradiction: two nodes can
+    # each hold "at least" 40% of a bucket, so the rule would name whichever won the tie and
+    # call a near-uniform bucket concentrated. Held at just over a half, where "the top node
+    # holds this share" can be true of exactly one node.
+    concentration = max(concentration, 0.5 + 1e-9)
     out: dict[int, str] = {}
     for bucket, node_bytes in bucket_node_bytes.items():
         total = sum(node_bytes.values())
         if total <= 0:
             continue
-        node, nbytes = max(node_bytes.items(), key=lambda kv: (kv[1], kv[0]))
+        # Ties break on the *lowest* node id so the choice is stable and independent of dict
+        # order; `max` over `(bytes, id)` silently picked the highest, which is the same
+        # determinism but the opposite of what "ties break on the node id" reads as.
+        node, nbytes = min(node_bytes.items(), key=lambda kv: (-kv[1], kv[0]))
         share = nbytes / total
         n_with_data = sum(1 for b in node_bytes.values() if b > 0)
         # Concentrated = a clear majority (>= `concentration`) that also beats the
