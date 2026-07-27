@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 863 Python modules across 130 packages and 173 Rust files across 13 crates.
+Covering 863 Python modules across 130 packages and 174 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -280,7 +280,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `run.py` | 399 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 409 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 163 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 219 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
@@ -838,7 +838,7 @@ Kyber rule modules.
 | `projections.py` | 724 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 487 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 437 | SELECTION-phase rules — cost-based physical algorithm choice. |
-| `zonemap_pruning.py` | 307 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
+| `zonemap_pruning.py` | 373 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
 ### `batcher/kyber/rules/algebraic/` — 3 · subsystem
 
@@ -1032,7 +1032,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 |---|---|---|
 | `base.py` | 102 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 234 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 497 | The Carbonite resource manager entry point. |
+| `manager.py` | 499 | The Carbonite resource manager entry point. |
 | `spill.py` | 399 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1090,11 +1090,11 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 83 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
-| `executor.py` | 213 | The Core local executor. |
+| `executor.py` | 223 | The Core local executor. |
 | `gpu_plan.py` | 350 | Translate a linear Batcher plan to a GPU dataframe execution (cuDF) — many ops, not one. |
 | `gpu_transform.py` | 201 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
-| `runtime.py` | 67 | Process-wide runtime services for Core (the default MetadataHub). |
+| `runtime.py` | 190 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 160 | Column-statistics measurement — Core's lane. |
 | `streaming.py` | 416 | Streaming (incremental) aggregation — bounded-memory group-by over a source. |
@@ -1787,7 +1787,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `hierarchy.py` | 631 | The Batcher exception hierarchy. |
+| `hierarchy.py` | 642 | The Batcher exception hierarchy. |
 | `suggest.py` | 299 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 80 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
@@ -1804,9 +1804,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `errors.rs` | 68 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
+| `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 414 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `lib.rs` | 712 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 782 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
 | `shuffle.rs` | 548 | Shuffle FFI: partitioners and the concurrent reducer gather. |
@@ -1823,30 +1823,30 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg_par.rs` | 215 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 441 | Distributed-execution primitives. |
-| `error.rs` | 130 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
+| `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par.rs` | 320 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `lib.rs` | 688 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 251 | Per-operator execution metrics — the measure half of the adaptive loop. |
-| `ops/external_sort.rs` | 318 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
+| `ops/external_sort.rs` | 325 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1139 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
-| `ops/quantile_spill/histogram.rs` | 214 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
-| `ops/quantile_spill/mod.rs` | 735 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
+| `ops/quantile_spill/histogram.rs` | 215 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
+| `ops/quantile_spill/mod.rs` | 738 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 242 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 2752 | The multi-core executor. |
+| `par.rs` | 2793 | The multi-core executor. |
 | `stream/breaker.rs` | 427 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 213 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 779 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 972 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/mod.rs` | 780 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/parallel.rs` | 1019 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 158 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 351 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -2043,7 +2043,8 @@ Process-wide memory accounting for reserve-before-allocate.
 
 | file | lines | what it is |
 |---|---|---|
-| `lib.rs` | 354 | Process-wide memory accounting for reserve-before-allocate. |
+| `cancel.rs` | 135 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
+| `lib.rs` | 358 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
 

@@ -542,6 +542,43 @@ summary table, and every later wave would have been judged against it. Two of th
 bugs found here were in fixes written *during* this correction, and both were silent —
 which is why the classifier now has a test rather than a comment.
 
+### 184-186. A provably-empty join side, and the constant that stopped being one
+
+**Source:** Spark's `PropagateEmptyRelation` and DataFusion's `propagate_empty_relation`,
+against Batcher's rule of the same name — which folded through unary operators and unions
+and stopped dead at a join.
+
+Three things, and the middle one is the reason the other two could not work:
+
+* **The fold reaches joins.** An empty left empties `inner`, `left`, `semi` and `anti`; an
+  empty right empties `inner` and `semi`, and turns an `anti` join into *its own left
+  input*, removing the join and the entire right subtree.
+* **A boolean literal now decides itself** in `_predicate_status`. Constant folding runs in
+  NORMALIZE, but `filter_null_join_keys` runs later, in SELECTION, and rewrites a `false`
+  predicate under a join into `false AND k IS NOT NULL`. Nothing folds after that, so the
+  conjunction read as undecidable, the side was no longer recognizable as empty, and the
+  predicate shipped to the engine to be evaluated per row. This is a **phase-ordering
+  defect**, not a missing fold: the rewrite was correct, it just arrived after the pass
+  that would have simplified it.
+* **The asymmetry is stated, not assumed.** An empty *left* leaves a `right` or `full` join
+  **non-empty** — both keep the right side's rows padded with nulls. The first version of
+  the rule had all six join types in the empty-left set with a comment confidently
+  explaining why; it was wrong, and it was a wrong *answer*, not a slow plan.
+
+**What this does and does not buy.** The `anti` and `semi` rewrites remove a subtree, so
+they pay immediately. The rest produce `Limit(node, 0)`, the canonical empty marker — and
+that marker is currently plan-level only: `bc-interp`'s `Limit` arm executes its input and
+*then* discards every row, because `ops::limit` recovers the schema from the first input
+batch and there is no Rust-side plan schema inference. So zone-map pruning can prove a scan
+yields nothing and the scan still runs. Closing that needs a first-class `Empty { schema }`
+relation, which DataFusion (`EmptyRelation`), DuckDB (`LogicalEmptyResult`) and Spark
+(`LocalRelation`) all have and Batcher does not. It is the largest engine-level finding
+still open here.
+
+**Verified** by 16 differential cases: all six join types against an empty left and an
+empty right, plus the right-join asymmetry, the anti-join collapse, an ordinary join left
+untouched, and the `false AND k IS NOT NULL` shape asserted directly.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
