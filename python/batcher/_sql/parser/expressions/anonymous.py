@@ -213,6 +213,24 @@ _ELEMENT_AT = frozenset(
     {"list_extract", "array_extract", "list_element", "array_element", "element_at"}
 )
 
+# `f(list)` → a unary `.list` method. These are DuckDB names whose `array_` twin does not
+# exist, so they never reached the `array_`/`list_` alias sweep that found the rest.
+_UNARY_LIST = {
+    "list_first": "first",
+    "list_last": "last",
+    "list_median": "median",
+}
+
+# `f(list, value)` → a `.list` method taking one *literal* value (not an expression):
+# `list_position(l, 3)` is the 1-based index of `3`, and `.list.position` already returns
+# it 1-based, so unlike `list_extract` there is no origin to shift.
+_LIST_VALUE = {
+    "list_position": "position",
+    "array_position": "position",
+    "list_indexof": "position",
+    "array_indexof": "position",
+}
+
 # `f(a, b)` on two list expressions → a binary `.list` method.
 _LIST_PAIR = {
     "list_intersect": "intersect",
@@ -229,6 +247,14 @@ _LIST_PAIR = {
     "array_difference": "difference",
     "list_union": "union",
     "array_union": "union",
+    # DuckDB gives the fixed-size `ARRAY` type its own spelling of each vector metric;
+    # the kernel is the same, so the `array_` names are aliases rather than a second
+    # implementation.
+    "array_cosine_similarity": "cosine_similarity",
+    "array_cosine_distance": "cosine_distance",
+    "array_distance": "euclidean_distance",
+    "array_inner_product": "dot",
+    "array_dot_product": "dot",
 }
 
 # `f(a, b)` on two list expressions → the negation of a `.list` method. DuckDB's
@@ -296,6 +322,8 @@ def anonymous_scalar(tr, node):
             return derived(tr._scalar(one))
         if name in _UNARY_MAP:
             return getattr(tr._scalar(one).map, _UNARY_MAP[name])()
+        if name in _UNARY_LIST:
+            return getattr(tr._scalar(one).list, _UNARY_LIST[name])()
 
     if len(args) == 2:
         left, right = args
@@ -312,6 +340,8 @@ def anonymous_scalar(tr, node):
             return tr._scalar(left).list.get(_const_int_arg(right, f"{name}(): index") - 1)
         if name in _MAP_KEY:
             return getattr(tr._scalar(left).map, _MAP_KEY[name])(_raw_literal(right))
+        if name in _LIST_VALUE:
+            return getattr(tr._scalar(left).list, _LIST_VALUE[name])(_raw_literal(right))
         if name in _LIST_PAIR:
             return getattr(tr._scalar(left).list, _LIST_PAIR[name])(tr._scalar(right))
         negated = _LIST_PAIR_NEGATED.get(name)

@@ -610,6 +610,40 @@ one.
 subscript still being a list index, and Spark's 1-based list offset surviving the new
 branch.
 
+### 190-194. Five list names the alias sweep structurally could not see
+
+**Source:** the census run in reverse — instead of asking which DuckDB names Batcher
+lacks, asking which *Batcher methods* have a real DuckDB name that `bt.sql` cannot reach.
+83 methods qualified; 9 were unreachable.
+
+`list_first`, `list_last`, `list_median`, `list_position` and `array_position` all had a
+`.list` method that already returned DuckDB's answer, and no SQL spelling that reached it.
+They survived the earlier sweeps for a structural reason worth recording: that sweep
+paired every `list_X` with its `array_X` twin and probed the pair, and these four have **no
+twin in DuckDB's catalogue** — so they were never proposed as candidates at all. A census
+only finds what its generator can express.
+
+Two argument shapes, so two tables, following this module's rule that the shape is a
+property of the entry rather than something re-derived from arity: `_UNARY_LIST` for the
+bare calls and `_LIST_VALUE` for `list_position(l, v)`, which takes a *literal* value and
+returns a **1-based** index that `.list.position` already produces — unlike `list_extract`,
+there is no origin to shift, and shifting it would be a silent off-by-one.
+
+**The other four of the nine are not closed**, and the reason is a real engine limit rather
+than a missing name: `damerau_levenshtein`, `hamming`, `jaccard` and `jaro_similarity`
+accept only a *constant* second argument, because the `.str` methods take a Python `str`
+and not an expression. Passing a column raises `TypeError: Object of type Col is not JSON
+serializable` — a raw serializer error escaping to the user, which is its own defect.
+
+The `array_*` vector aliases added alongside (`array_cosine_similarity`, `array_distance`,
+`array_inner_product`, …) are **not** counted here. DuckDB's `ARRAY` names accept only its
+fixed-size type and reject a `LIST`; Batcher's kernel is the other way round. The names now
+reach the right kernel for a Batcher list, which is a strict improvement, but the
+DuckDB-typed call is a separate type-support question and is not claimed as parity.
+
+**Verified** by eight differential cases, including the 1-based/absent pair that a 0-based
+implementation gets wrong and a `first`-is-not-`min` check.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.

@@ -616,7 +616,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 237 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 359 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `anonymous.py` | 389 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
 | `collections.py` | 214 | SQL list/array functions — the Spark-shaped half, including the lambda forms. |
 | `functions.py` | 500 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 110 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
