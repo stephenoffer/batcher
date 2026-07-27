@@ -21,8 +21,8 @@ import pyarrow as pa
 import pytest
 
 from batcher._internal.errors import ResourceError
-from batcher.carbonite import spill as spill_mod
 from batcher.carbonite.spill import SpillTier, TieredSpillStore
+from batcher.carbonite.spill import disk as spill_disk
 
 pytestmark = pytest.mark.unit
 
@@ -38,7 +38,7 @@ def test_a_low_volume_routes_a_new_bucket_to_remote(tmp_path, monkeypatch) -> No
         remote_uri=f"memory://{tmp_path.name}",
         local_budget_bytes=1 << 40,  # enormous — the budget alone would stay LOCAL
     )
-    monkeypatch.setattr(spill_mod, "_free_disk_bytes", lambda _p: 1 << 20)  # 1 MiB left
+    monkeypatch.setattr(spill_disk, "free_disk_bytes", lambda _p: 1 << 20)  # 1 MiB left
 
     writer = store.writer("b0")
     writer.write(_batch())
@@ -55,7 +55,7 @@ def test_an_ample_volume_still_uses_the_local_tier(tmp_path, monkeypatch) -> Non
         remote_uri=f"memory://{tmp_path.name}",
         local_budget_bytes=1 << 40,
     )
-    monkeypatch.setattr(spill_mod, "_free_disk_bytes", lambda _p: 1 << 40)
+    monkeypatch.setattr(spill_disk, "free_disk_bytes", lambda _p: 1 << 40)
 
     writer = store.writer("b0")
     writer.write(_batch())
@@ -72,7 +72,7 @@ def test_a_low_volume_with_no_remote_tier_stays_local(tmp_path, monkeypatch) -> 
     try the local write and let `ENOSPC` (if it comes) produce the actionable error.
     """
     store = TieredSpillStore(str(tmp_path / "scratch"), local_budget_bytes=1 << 40)
-    monkeypatch.setattr(spill_mod, "_free_disk_bytes", lambda _p: 1 << 10)
+    monkeypatch.setattr(spill_disk, "free_disk_bytes", lambda _p: 1 << 10)
 
     writer = store.writer("b0")
     writer.write(_batch())

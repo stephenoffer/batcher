@@ -80,10 +80,15 @@ def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
 
 
 def verdict_summary(verdict) -> str:
-    """One-line human summary of Carbonite's admission verdict."""
+    """One-line human summary of Carbonite's admission verdict.
+
+    Names the *operator* that binds the constraint when Carbonite identified one. Which
+    resource ran out is rarely actionable on its own; which step ran it out is.
+    """
     if verdict.feasible:
         return "feasible"
-    return f"infeasible (binding: {verdict.binding_constraint}) → out-of-core / counter-offer"
+    at = f" at {verdict.binding_op}" if verdict.binding_op else ""
+    return f"infeasible (binding: {verdict.binding_constraint}{at}) → out-of-core / counter-offer"
 
 
 def admission_decision(verdict) -> Decision:
@@ -92,7 +97,11 @@ def admission_decision(verdict) -> Decision:
         subsystem="carbonite",
         category="admission",
         summary=verdict_summary(verdict),
-        detail={"feasible": verdict.feasible, "binding_constraint": verdict.binding_constraint},
+        detail={
+            "feasible": verdict.feasible,
+            "binding_constraint": verdict.binding_constraint,
+            "binding_op": verdict.binding_op,
+        },
     )
 
 

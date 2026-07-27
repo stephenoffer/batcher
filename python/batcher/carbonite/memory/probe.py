@@ -72,13 +72,21 @@ _total_cache: tuple[float, int | None] | None = None
 
 
 def reset_memory_sampling() -> None:
-    """Drop the memoized host RAM and the live-reading TTL caches. For tests that
-    patch the underlying OS readers and need the next sample to re-read them."""
+    """Drop every memoized memory reading, so the next sample re-reads the OS.
+
+    For tests that patch the underlying OS readers. This must clear the **cgroup cap**
+    too: it is the one figure memoized with `functools.lru_cache`, so a reset that only
+    cleared the module globals left `cgroup_limit_bytes` pinned to whatever the first
+    test in the process observed. Since `total_memory_bytes` takes the min of host RAM
+    and that cap, a stale cap silently overrode every later patch — the reset appeared to
+    work while the number it was supposed to refresh never moved.
+    """
     global _host_ram_bytes, _available_cache, _file_cache_cache, _total_cache
     _host_ram_bytes = None
     _available_cache = None
     _file_cache_cache = None
     _total_cache = None
+    cgroup_limit_bytes.cache_clear()
 
 
 @functools.lru_cache(maxsize=1)
@@ -225,14 +233,35 @@ def process_rss_bytes() -> int | None:
     """This process's resident set size (RSS) via `psutil`, or `None` without it.
 
     RSS captures the engine's true footprint — the Flight `PartitionStore`, pyarrow
-    buffers, everything — not just the buffer pool's accounted reservations."""
+    buffers, everything — not just the buffer pool's accounted reservations. Falls back
+    to `/proc/self/statm` on Linux, so a container without the optional dependency still
+    gets a real footprint reading rather than losing the safety-critical half of
+    `_engine_used_fraction` (which then cannot see anything the pool does not account).
+
+    Returns:
+        Resident bytes, or `None` when no reader is available.
+    """
     try:
         import psutil
     except ImportError:
-        return None
+        return _proc_statm_rss_bytes()
     try:
         return int(psutil.Process().memory_info().rss)
-    except Exception:
+    except (OSError, ValueError, AttributeError):
+        return _proc_statm_rss_bytes()
+
+
+def _proc_statm_rss_bytes() -> int | None:
+    """RSS from `/proc/self/statm` (Linux), in bytes, or `None` if unreadable.
+
+    Field two of `statm` is the resident set in pages. It costs one small read and needs
+    no dependency, which is exactly the situation the psutil-less container is in.
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
 
 

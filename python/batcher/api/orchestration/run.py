@@ -236,7 +236,11 @@ def _admit(opt, decisions, ctx, *, distributed: bool):
 
     must_spill = not verdict.feasible and verdict.binding_constraint == "memory"
     if not verdict.feasible and not must_spill:
-        raise PlanError(f"plan is infeasible (binding constraint: {verdict.binding_constraint})")
+        raise PlanError(
+            f"plan is infeasible (binding constraint: {verdict.binding_constraint}"
+            + (f" at {verdict.binding_op}" if verdict.binding_op else "")
+            + ")"
+        )
     return rm, verdict, must_spill
 
 
@@ -367,7 +371,9 @@ def _run_relational(
         if must_spill and not verdict.advisory:
             raise PlanError(
                 "plan does not fit the memory envelope and has no out-of-core path "
-                f"(binding constraint: {verdict.binding_constraint})"
+                f"(binding constraint: {verdict.binding_constraint}"
+                + (f" at {verdict.binding_op}" if verdict.binding_op else "")
+                + ")"
             )
 
     resolved = resolve_sources(sources, opt, ctx)

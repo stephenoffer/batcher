@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from batcher.carbonite.base import ResourceContext
     from batcher.plan.physical import PhysicalPlan
 
-__all__ = ["OperatorMemoryEstimator", "peak_operator_bytes"]
+__all__ = ["OperatorMemoryEstimator", "binding_operator", "peak_operator_bytes"]
 
 
 def peak_operator_bytes(plan: PhysicalPlan) -> int:
@@ -32,6 +32,28 @@ def peak_operator_bytes(plan: PhysicalPlan) -> int:
     operators would double-count memory that is never live at the same time.
     """
     return max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+
+
+def binding_operator(plan: PhysicalPlan):
+    """The operator whose memory estimate *is* the plan's envelope, or `None`.
+
+    Every Carbonite memory decision reduces the plan to one number — the dominant
+    breaker — and then reports that number with nothing attached. An operator reading
+    "this query will spill" has no way back from the figure to the operator that produced
+    it, which is the only actionable part: it names which join, aggregate, or sort to
+    reshape. Three call sites re-derived this `max` locally (admission's provenance check,
+    the estimator, the scheduling grant), so it also removes a triplicated rule.
+
+    Args:
+        plan: The annotated physical plan.
+
+    Returns:
+        The `PhysicalOp` holding the peak estimate, or `None` when nothing is sized.
+    """
+    sized = [op for op in plan.ops if op.bounds.m_max_bytes > 0]
+    if not sized:
+        return None
+    return max(sized, key=lambda op: op.bounds.m_max_bytes)
 
 
 class OperatorMemoryEstimator:
@@ -54,8 +76,24 @@ class OperatorMemoryEstimator:
         fc = ctx.config.flow_control
         model = ctx.memory_model
         peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
+        # Credits and parallelism take the plan's own widest request when Kyber emitted
+        # one, falling back to the configured defaults for an unsized plan. They used to be
+        # the configured constants unconditionally, which made the returned envelope a
+        # description of the *config* rather than of the plan for two of its three fields —
+        # so any consumer reading them (rather than only `m_max_bytes`) would have been
+        # told a 200-way shuffle wanted the default 4-way parallelism.
+        #
+        # `getattr` rather than attribute access for the same reason `plan_peak` uses it:
+        # a bare-sized bounds object (a test double carrying only `m_max_bytes`) is a
+        # supported shape, and an estimator is never the right place to fail a query.
         return ResourceBounds(
             m_max_bytes=peak,
-            c_max_credits=fc.default_credits,
-            n_max_parallelism=ctx.config.execution.parallelism or 0,
+            c_max_credits=_widest(plan, "c_max_credits") or fc.default_credits,
+            n_max_parallelism=_widest(plan, "n_max_parallelism")
+            or (ctx.config.execution.parallelism or 0),
         )
+
+
+def _widest(plan: PhysicalPlan, field: str) -> int:
+    """The largest `bounds.<field>` across `plan`'s operators; `0` when none declare it."""
+    return max((int(getattr(op.bounds, field, 0) or 0) for op in plan.ops), default=0)

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 864 Python modules across 130 packages and 174 Rust files across 13 crates.
+Covering 888 Python modules across 137 packages and 174 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -178,7 +178,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 |---|---|---|
 | `gating.py` | 209 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 90 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
-| `staging.py` | 379 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
+| `staging.py` | 397 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/dataset/` — 5 · conductor
 
@@ -193,7 +193,7 @@ The `Dataset` builder package.
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 225 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 5650 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 5688 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2719 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -280,7 +280,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `run.py` | 409 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 415 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 163 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 219 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
@@ -345,7 +345,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `gpu_backend.py` | 488 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
-| `profile.py` | 277 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
+| `profile.py` | 286 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 172 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
@@ -364,7 +364,8 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `dispatch.py` | 426 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `dispatch.py` | 455 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `union.py` | 83 | When a UNION streams branch by branch, and how its branches are addressed. |
 | `watermark.py` | 287 | Watermark-bounded streaming operators for `iter_batches` (control plane, `api`). |
 
 ### `batcher/api/tuning/` — 5 · conductor
@@ -752,7 +753,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 188 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 193 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 105 | Turning a window of measured q-errors into one cardinality-correction factor. |
@@ -850,6 +851,24 @@ Algebraic rewrites: small, local, unconditionally semantics-preserving simplific
 | `disjunctions.py` | 223 | Rewrites of a disjunction — factoring an `OR`, and folding one into `IN`. |
 | `identities.py` | 324 | Algebraic relational identities — small, local, always-correct simplifications. |
 
+### `batcher/kyber/rules/collections_algebra/` — 3 · subsystem
+
+List-column rule families: membership predicates, order-insensitivity, and folds.
+
+| module | lines | what it is |
+|---|---|---|
+| `folds.py` | 208 | Constant list calls, and the two list calls that are the identity. |
+| `membership.py` | 94 | `list_position(x, v)` compared against zero is `list_contains(x, v)`. |
+| `ordering.py` | 112 | Drop a list reordering that the operation above it cannot see. |
+
+### `batcher/kyber/rules/conditional_algebra/` — 3 · subsystem
+
+`CASE` rule families: pushing calls into the branches, and merging the branches.
+
+| module | lines | what it is |
+|---|---|---|
+| `push_calls.py` | 155 | Push a scalar call through a `CASE` onto each of its branch values. |
+
 ### `batcher/kyber/rules/exprs/` — 3 · subsystem
 
 Expression-level Kyber rule families.
@@ -861,7 +880,7 @@ Expression-level Kyber rule families.
 | `comparisons.py` | 127 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
 | `complex_types.py` | 483 | Struct, list, and array algebra -- the extract-over-construct family. |
 | `conditionals.py` | 329 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
-| `guards.py` | 180 | Schema-aware helpers for expression rules that may only fire on a known type. |
+| `guards.py` | 193 | Schema-aware helpers for expression rules that may only fire on a known type. |
 | `numeric.py` | 444 | Numeric algebra the earlier arithmetic families leave on the table. |
 | `temporal.py` | 262 | Temporal identities: reading a date part through a truncation, and offset fusion. |
 | `text.py` | 315 | Regex de-specialization and the remaining string identities. |
@@ -952,6 +971,15 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `range_join.py` | 366 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
 | `rewrites.py` | 469 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
 
+### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
+
+Numeric rule families that turn a computed comparison back into a sargable one.
+
+| module | lines | what it is |
+|---|---|---|
+| `absolute.py` | 231 | `abs` and `sign` inside a comparison, restated over the bare column. |
+| `rounding.py` | 302 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
+
 ### `batcher/kyber/rules/normalize/` — 3 · subsystem
 
 NORMALIZE-phase whole-tree rewrites, grouped by family.
@@ -962,6 +990,15 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `predicates.py` | 272 | Boolean-predicate normalizations in the NORMALIZE phase. |
 | `ranges.py` | 481 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
 | `simplify.py` | 145 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
+
+### `batcher/kyber/rules/nulls/` — 3 · subsystem
+
+Null-reasoning rule families — three-valued logic and null-strictness.
+
+| module | lines | what it is |
+|---|---|---|
+| `strictness.py` | 285 | Push `IS NULL` / `IS NOT NULL` through the scalar functions that are null-strict. |
+| `three_valued.py` | 387 | Three-valued logic: collapsing the null predicates that other rules generate. |
 
 ### `batcher/kyber/rules/relational/` — 3 · subsystem
 
@@ -981,6 +1018,25 @@ Kyber rule families for streaming (unbounded-input) plans.
 | `state.py` | 500 | Streaming rule family: state minimization — shrink what a streaming operator retains. |
 | `watermark.py` | 159 | Pushdown through the watermark-bounded streaming operators. |
 | `windows.py` | 79 | Streaming rule family: windows -- collapsing nested event-time window alignment. |
+
+### `batcher/kyber/rules/temporal_algebra/` — 3 · subsystem
+
+Temporal rule families that put a predicate back onto the raw timestamp column.
+
+| module | lines | what it is |
+|---|---|---|
+| `epoch.py` | 128 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
+| `offsets.py` | 115 | `offset_by(ts, …) OP instant` restated as `ts OP shifted_instant`. |
+
+### `batcher/kyber/rules/text_algebra/` — 3 · subsystem
+
+String rule families: predicate absorption, predicate normalization, and lengths.
+
+| module | lines | what it is |
+|---|---|---|
+| `absorption.py` | 174 | Two string predicates on one column where one implies the other. |
+| `lengths.py` | 146 | A comparison against a string's length is almost always an emptiness test. |
+| `predicates.py` | 199 | A string call whose *comparison* is the real predicate, restated as that predicate. |
 
 ### `batcher/kyber/shortcuts/` — 3 · subsystem
 
@@ -1007,11 +1063,11 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate_columns.py` | 248 | Aggregate output column statistics — the values a grouped/global aggregate produces. |
-| `columns.py` | 416 | Per-operator column-statistics propagation. |
+| `columns.py` | 445 | Per-operator column-statistics propagation. |
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 429 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 1428 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 1446 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 208 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1034,7 +1090,6 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 | `base.py` | 102 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 234 | The result cache — a memory-bounded LRU of materialized query results. |
 | `manager.py` | 499 | The Carbonite resource manager entry point. |
-| `spill.py` | 399 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1042,11 +1097,11 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 61 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `learned.py` | 309 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
-| `pool.py` | 173 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
-| `pressure.py` | 294 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
-| `probe.py` | 312 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
+| `estimator.py` | 99 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `learned.py` | 367 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
+| `pool.py` | 282 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
+| `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
+| `probe.py` | 341 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
 
 ### `batcher/carbonite/policies/` — 3 · subsystem
 
@@ -1054,7 +1109,7 @@ Carbonite's resource policies — admission, flow control, and scheduling.
 
 | module | lines | what it is |
 |---|---|---|
-| `admission.py` | 125 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
+| `admission.py` | 126 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 234 | Bounding how many queries run at once, and how wide each one gets. |
 | `flow_control.py` | 335 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `scheduling.py` | 184 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
@@ -1071,6 +1126,17 @@ Carbonite fault tolerance: Spark-style recompute-from-lineage on worker loss.
 | `recovery.py` | 129 | Shuffle recovery — the recompute-on-failure coordination loop. |
 | `replication.py` | 83 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
 | `speculative.py` | 232 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
+
+### `batcher/carbonite/spill/` — 3 · subsystem
+
+Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
+
+| module | lines | what it is |
+|---|---|---|
+| `disk.py` | 270 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
+| `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
+| `store.py` | 339 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
+| `writer.py` | 272 | One spill bucket, streamed to whichever tier its first batch can afford. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem
 
@@ -1540,7 +1606,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `ir_specs.py` | 102 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
 | `ir_tags.py` | 146 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
-| `resource.py` | 223 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
+| `resource.py` | 230 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 146 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
@@ -1560,7 +1626,7 @@ The scalar expression algebra.
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 265 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
-| `render.py` | 250 | A readable ``repr`` for the scalar `Expr` tree. |
+| `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 74 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 362 | Structural traversals over the expression tree. |
 
