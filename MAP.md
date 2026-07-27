@@ -2155,7 +2155,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 
 | file | lines | what it is |
 |---|---|---|
-| `exchange.rs` | 644 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
+| `exchange.rs` | 700 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 387 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 105 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `shared.rs` | 391 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |

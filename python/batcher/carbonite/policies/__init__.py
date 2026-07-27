@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from batcher.carbonite.policies.admission import BudgetingAdmission
 from batcher.carbonite.policies.cpu_budget import (
-    compute_bound_core_budget,
     effective_core_budget,
     oversubscription_note,
 )
@@ -37,7 +36,6 @@ __all__ = [
     "DefaultSchedulingPolicy",
     "SpillAdvisor",
     "StaticCreditFlowControl",
-    "compute_bound_core_budget",
     "credit_ceiling",
     "effective_core_budget",
     "learned_channel_morsel_bytes",

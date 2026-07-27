@@ -29,14 +29,9 @@ budget unchanged, so the ordinary case is untouched and the ordinary cost is one
 
 from __future__ import annotations
 
-from batcher._internal.hardware import (
-    available_cpu_count,
-    cpu_oversubscription,
-    physical_core_count,
-    smt_threads_per_core,
-)
+from batcher._internal.hardware import available_cpu_count, cpu_oversubscription
 
-__all__ = ["compute_bound_core_budget", "effective_core_budget", "oversubscription_note"]
+__all__ = ["effective_core_budget", "oversubscription_note"]
 
 # Never cut fan-out below this fraction of the permitted budget, however bad the contention
 # reading. A pathological measurement — a transient load spike, a PSI file reporting a
@@ -74,36 +69,6 @@ def effective_core_budget(configured: int = 0) -> int:
         return permitted
     floor = max(1, int(permitted * MIN_BUDGET_FRACTION))
     return max(floor, int(permitted / pressure))
-
-
-def compute_bound_core_budget(configured: int = 0) -> int:
-    """The core budget for work that saturates its execution units, at least 1.
-
-    SMT siblings share one core's execution units. They roughly double throughput on
-    latency-bound work — a hash probe spends most of its time waiting on memory, and a sibling
-    fills those stalls — and add close to nothing on work already keeping the units busy,
-    while halving the cache each thread sees either way. For a saturated operator the extra
-    threads are pure overhead: more context switches, more cache pressure, no more work done.
-
-    So a compute-bound operator sizes to physical cores where the topology is readable, and to
-    the ordinary budget where it is not. Contention still applies on top, because a busy box
-    is a busy box whatever the operator is doing.
-
-    Args:
-        configured: An explicit parallelism setting, or `0` to derive one.
-
-    Returns:
-        The core count for compute-bound fan-out, at least 1.
-    """
-    if configured > 0:
-        return configured
-    budget = effective_core_budget()
-    if smt_threads_per_core() <= 1.0:
-        return budget  # no SMT, or the sibling topology is unreadable
-    # Scale the contention-adjusted budget by the same ratio, rather than returning the raw
-    # physical count: a contended box must stay reduced, and taking the min of the two would
-    # apply only whichever cut happened to be larger.
-    return max(1, min(budget, physical_core_count()))
 
 
 def oversubscription_note() -> str:

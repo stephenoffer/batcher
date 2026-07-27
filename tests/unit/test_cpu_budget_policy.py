@@ -25,13 +25,9 @@ pytestmark = pytest.mark.unit
 def machine(monkeypatch):
     """Pin the permitted core count and the measured contention for a test."""
 
-    def configure(*, permitted: int, oversubscription: float, smt: float = 1.0, physical: int = 0):
+    def configure(*, permitted: int, oversubscription: float):
         monkeypatch.setattr(cpu_budget, "available_cpu_count", lambda: permitted)
         monkeypatch.setattr(cpu_budget, "cpu_oversubscription", lambda: oversubscription)
-        monkeypatch.setattr(cpu_budget, "smt_threads_per_core", lambda: smt)
-        monkeypatch.setattr(
-            cpu_budget, "physical_core_count", lambda: physical or int(permitted / max(1.0, smt))
-        )
 
     return configure
 
@@ -78,29 +74,10 @@ def test_the_budget_never_exceeds_what_is_permitted(machine):
 
 
 def test_an_explicit_setting_is_an_instruction_not_an_estimate(machine):
-    # `execution.parallelism` is a user decision. Silently overriding it under load would
-    # make the knob a lie, and a user who set it has context the process does not.
+    # `execution.parallelism` is a user decision. Silently overriding it under load would make
+    # the knob a lie, and a user who set it has context this process does not.
     machine(permitted=16, oversubscription=8.0)
     assert cpu_budget.effective_core_budget(configured=12) == 12
-    assert cpu_budget.compute_bound_core_budget(configured=12) == 12
-
-
-def test_compute_bound_work_sizes_to_physical_cores(machine):
-    # SMT siblings share execution units. On work already saturating them the extra threads
-    # add cache pressure and context switches without adding throughput.
-    machine(permitted=32, oversubscription=1.0, smt=2.0, physical=16)
-    assert cpu_budget.compute_bound_core_budget() == 16
-    # Without SMT the two budgets coincide — no correction to make.
-    machine(permitted=16, oversubscription=1.0, smt=1.0, physical=16)
-    assert cpu_budget.compute_bound_core_budget() == 16
-
-
-def test_contention_and_smt_corrections_compose(machine):
-    # A contended SMT box must get *both* cuts. Taking the min of two independently derived
-    # budgets would silently apply only the larger one.
-    machine(permitted=32, oversubscription=4.0, smt=2.0, physical=16)
-    # Contention alone would give 8; the physical-core cap is 16, so contention binds.
-    assert cpu_budget.compute_bound_core_budget() == 8
 
 
 def test_the_manager_leaves_a_quiet_machine_alone(monkeypatch):

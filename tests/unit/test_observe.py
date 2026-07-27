@@ -650,6 +650,18 @@ def test_system_snapshot_reports_real_host_facts():
     assert snap["cluster"]["attached"] in (True, False)
     assert "morsel_rows" in snap["config"]
 
+    # The measured machine profile, including the fingerprint every learned parameter is keyed
+    # by. Surfacing it is what answers "why did the optimizer start cold on this node?" — the
+    # answer is almost always that the fingerprint differs from the one that did the learning.
+    hardware = snap["hardware"]
+    assert len(hardware["fingerprint"]) == 12
+    assert hardware["label"]
+    assert hardware["logical_cpus"] >= 1
+    assert hardware["physical_cores"] >= 1
+    assert hardware["numa_nodes"] >= 1
+    assert hardware["page_bytes"] > 0
+    assert isinstance(hardware["caches"], dict)
+
 
 def test_ui_serves_pipelines_and_system(ui):
     url, store = ui
@@ -3934,3 +3946,177 @@ def test_the_changelog_and_gate_are_internally_consistent():
     assert loaded == list(_JS_MODULES), (
         f"the page loads {loaded}, the tests load {list(_JS_MODULES)}"
     )
+
+
+# --- ML-pipeline stage findings ------------------------------------------------------
+# A batch-inference pipeline produces no engine metrics, so until the orchestrator started
+# measuring its stages there was nothing for any rule to read. These pin the three findings
+# that became possible: a starved GPU, an opaque plan, and a fan-out stage.
+
+
+def _rules(profile):
+    from batcher.observe.insights import derive_insights
+
+    return {i["rule"] for i in derive_insights(profile)}
+
+
+def _stage(op_id, kind, **fields):
+    base = {
+        "measured": True,
+        "op_id": op_id,
+        "kind": kind,
+        "rows_in": 1000,
+        "rows_out": 1000,
+        "elapsed_ms": 10.0,
+        "cpu_util": 0.95,
+        "backend": "",
+    }
+    return {**base, **fields}
+
+
+def test_a_cpu_stage_out_costing_the_gpu_stage_it_feeds_is_named():
+    """The field guides' #1 cause of low GPU utilization, and it is invisible in a plan:
+    the pipeline is correct, the device is simply idle."""
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "ops": [
+            _stage(0, "MapBatches", elapsed_ms=100.0, backend="gpu"),
+            _stage(1, "MapBatches", elapsed_ms=400.0),
+            _stage(2, "Scan"),
+        ],
+    }
+    assert "gpu-starved" in _rules(profile)
+
+
+def test_a_balanced_cpu_gpu_pipeline_stays_silent():
+    """Overlapping hides CPU work up to the GPU stage's own cost; only genuine excess is a
+    finding. Firing here would train users to ignore the one reading that matters."""
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "ops": [
+            _stage(0, "MapBatches", elapsed_ms=400.0, backend="gpu"),
+            _stage(1, "MapBatches", elapsed_ms=200.0),
+            _stage(2, "Scan"),
+        ],
+    }
+    assert "gpu-starved" not in _rules(profile)
+
+
+def test_a_pure_inference_pipeline_is_not_told_to_use_expressions():
+    """A plan that is only UDFs has no relational half to speed up and nothing to push a
+    predicate through, so the advice would be noise."""
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "ops": [_stage(0, "MapBatches", elapsed_ms=500.0), _stage(1, "Scan")],
+    }
+    assert "udf-dominates" not in _rules(profile)
+
+
+def test_a_udf_owning_a_mixed_plan_is_named():
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "ops": [
+            _stage(0, "Aggregate", elapsed_ms=20.0),
+            _stage(1, "MapBatches", elapsed_ms=400.0),
+            _stage(2, "Scan"),
+        ],
+    }
+    assert "udf-dominates" in _rules(profile)
+
+
+def test_a_fan_out_stage_is_named_with_its_multiplier():
+    from batcher.observe.insights import derive_insights
+
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "ops": [
+            _stage(0, "MapBatches", rows_in=2000, rows_out=20000, elapsed_ms=50.0),
+            _stage(1, "Scan"),
+        ],
+    }
+    found = [i for i in derive_insights(profile) if i["rule"] == "row-exploding-stage"]
+    assert len(found) == 1
+    assert found[0]["detail"]["rows_out"] == 20000
+
+
+def test_a_stage_that_merely_filters_is_not_called_an_explosion():
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "ops": [
+            _stage(0, "MapBatches", rows_in=2000, rows_out=500, elapsed_ms=50.0),
+            _stage(1, "Scan"),
+        ],
+    }
+    assert "row-exploding-stage" not in _rules(profile)
+
+
+def test_findings_are_not_silent_on_a_distributed_run():
+    """A distributed run measures the *workers*, not the driver tree. Reading only the
+    driver tree made every rule go quiet on exactly the runs that most need them — a spill
+    or a starved GPU on a cluster costs more than the same finding on one node."""
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 1000,
+        "distributed": True,
+        "ops": [{"measured": False, "op_id": 0, "kind": "Aggregate"}],
+        "worker_ops": [
+            _stage(0, "MapBatches", elapsed_ms=100.0, backend="gpu"),
+            _stage(1, "MapBatches", elapsed_ms=400.0),
+        ],
+    }
+    assert "gpu-starved" in _rules(profile)
+
+
+def test_a_profile_with_no_measurements_anywhere_stays_empty():
+    """The fallback must not turn "nothing ran" into a finding."""
+    profile = {
+        "total_ms": 1.0,
+        "rows": 0,
+        "ops": [{"measured": False, "op_id": 0, "kind": "Scan"}],
+        "worker_ops": [],
+    }
+    assert _rules(profile) == set()
+
+
+def test_a_per_row_map_is_distinguished_from_a_batch_map():
+    """`map` and `map_batches` are the same operator to the engine — `map` lowers to
+    `map_batches` over a row loop — so only the profile can tell them apart. Without that
+    the run cannot report the 10-100x row-at-a-time cost the field guides put first."""
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 50000,
+        "ops": [
+            _stage(0, "MapRows", rows_in=50000, rows_out=50000, elapsed_ms=800.0),
+            _stage(1, "Scan", rows_in=50000, rows_out=50000, elapsed_ms=10.0),
+        ],
+    }
+    assert "per-row-map" in _rules(profile)
+
+
+def test_a_batch_map_is_never_called_per_row():
+    profile = {
+        "total_ms": 1000.0,
+        "rows": 50000,
+        "ops": [
+            _stage(0, "MapBatches", rows_in=50000, rows_out=50000, elapsed_ms=800.0),
+            _stage(1, "Scan", rows_in=50000, rows_out=50000, elapsed_ms=10.0),
+        ],
+    }
+    assert "per-row-map" not in _rules(profile)
+
+
+def test_a_small_per_row_map_stays_quiet():
+    """Per-row is sometimes exactly right — row-shaped work, or an async per-row API call.
+    Firing on every `map` is how a reader learns to ignore the section."""
+    profile = {
+        "total_ms": 100.0,
+        "rows": 100,
+        "ops": [_stage(0, "MapRows", rows_in=100, rows_out=100, elapsed_ms=90.0)],
+    }
+    assert "per-row-map" not in _rules(profile)
