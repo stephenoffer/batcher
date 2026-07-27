@@ -28,12 +28,27 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 
 
+_SPARK_SPEC = importlib.util.spec_from_file_location(
+    "_spark_census",
+    pathlib.Path(__file__).resolve().parents[2] / "tools" / "parity" / "spark_census.py",
+)
+
+
+def _load(spec):
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture(scope="module")
 def census():
     """The census module, loaded by path — `tools/` is not an installed package."""
-    module = importlib.util.module_from_spec(_SPEC)
-    _SPEC.loader.exec_module(module)
-    return module
+    return _load(_SPEC)
+
+
+@pytest.fixture(scope="module")
+def spark_census():
+    return _load(_SPARK_SPEC)
 
 
 # --- what counts as out of scope --------------------------------------------
@@ -90,3 +105,21 @@ def test_the_markers_are_lowercase(census):
     and keeps printing a number.
     """
     assert all(marker == marker.lower() for marker in census._ABSENT)
+
+
+# --- the Spark census got the same denominator audit ------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["st_srid", "xpath_int", "from_xml", "bitmap_bit_position", "current_user", "uuid"],
+)
+def test_sparks_out_of_engine_families_are_out_of_scope(spark_census, name):
+    """Geospatial, XPath/XML, bitmap and variant encodings, session introspection and
+    nondeterministic values measure Spark's product scope, not an expression surface."""
+    assert spark_census.out_of_scope(name) is not None
+
+
+@pytest.mark.parametrize("name", ["map_keys", "try_divide", "format_number", "zip_with"])
+def test_a_real_spark_function_is_in_scope(spark_census, name):
+    assert spark_census.out_of_scope(name) is None

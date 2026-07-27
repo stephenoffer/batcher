@@ -95,14 +95,53 @@ def normalize(value) -> str:
     return str(value)
 
 
+def out_of_scope(name: str) -> str | None:
+    """Why `name` is not a function Batcher is measured against, or None.
+
+    The same denominator audit the DuckDB census needed. Spark's builtin list carries a
+    large tail that says nothing about a query engine's expression surface: the cluster
+    and session it is running in, deliberately nondeterministic values, its own bitmap
+    and variant encodings, a geospatial extension, and an XPath/XML family. Counting them
+    as missing functions makes the figure a statement about Spark's product scope rather
+    than about Batcher.
+    """
+    if name.startswith("st_"):
+        return "geospatial extension"
+    if name.startswith("xpath") or "xml" in name:
+        return "XPath / XML family"
+    if name.startswith(("bitmap_", "variant_")) or "variant" in name:
+        return "Spark-internal bitmap or variant encoding"
+    if name in _SESSION:
+        return "session or cluster introspection"
+    if name in _NONDETERMINISTIC:
+        return "nondeterministic by definition"
+    return None
+
+
+_SESSION = frozenset(
+    {
+        "current_catalog", "current_database", "current_user", "current_schema",
+        "current_path", "version", "spark_partition_id", "monotonically_increasing_id",
+        "input_file_block_length", "input_file_block_start", "input_file_name",
+        "typeof", "collation", "assert_true", "reflect", "try_reflect", "java_method",
+    }
+)  # fmt: skip
+_NONDETERMINISTIC = frozenset({"random", "randn", "randstr", "uniform", "uuid", "shuffle"})
+
+
 def main() -> None:
     names = registered_names()
     examples = examples_by_class()
     gap, mismatch, match = [], [], []
+    scope: list[tuple[str, str]] = []
     probed = set()
     for klass, pairs in sorted(examples.items()):
         fn = names.get(klass)
         if fn is None:
+            continue
+        reason = out_of_scope(fn)
+        if reason is not None:
+            scope.append((fn, reason))
             continue
         for query, expected in pairs:
             sql = query.replace("_FUNC_", fn)
@@ -122,14 +161,24 @@ def main() -> None:
             break  # one example per function is enough for a census
     print(
         json.dumps(
-            {"match": sorted(set(match)), "gap": gap, "mismatch": mismatch},
+            {
+                "match": sorted(set(match)),
+                "gap": gap,
+                "mismatch": mismatch,
+                "out_of_scope": sorted(set(scope)),
+            },
             indent=1,
             default=str,
         )
     )
+    # The denominator is match + gap + mismatch; `out_of_scope` is excluded because it
+    # measures Spark's product scope rather than Batcher's expression surface.
+    scored = len(set(match)) + len(gap) + len(mismatch)
+    pct = 100.0 * len(set(match)) / scored if scored else 0.0
     print(
-        f"\n# registered={len(names)} documented={len(examples)} probed={len(probed)} "
-        f"match={len(set(match))} gap={len(gap)} mismatch={len(mismatch)}",
+        f"\n# scored={scored} match={len(set(match))} ({pct:.0f}%) gap={len(gap)} "
+        f"mismatch={len(mismatch)} | out_of_scope={len(set(scope))} "
+        f"(registered={len(names)} documented={len(examples)} probed={len(probed)})",
         file=sys.stderr,
     )
 

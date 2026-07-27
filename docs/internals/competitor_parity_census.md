@@ -613,10 +613,10 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
 | Reference | Oracle | Surface probed | Result |
 |---|---|---|---|
 | DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 671 listed names, of which 331 are scored (see below), through `bt.sql` | **93 → 260 of 331 (79%)**; 15 wrong answers found |
-| Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, through `bt.sql(dialect="spark")` | **75 → 108** supported; 4 wrong answers found (entries 107, 108, and the two in 127-151) |
+| Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, of which 268 are scored, through `bt.sql(dialect="spark")` | **75 → 160 of 268 (60%)**; 35 wrong answers found |
 | Polars | the live library | every zero-argument method on `pl.Expr` and its `.str`/`.dt`/`.list` namespaces | 53 supported, 31 absent, 14 differences (all but two are representation or a pinned semantic choice) |
 
-### What the DuckDB denominator excludes, and why it matters
+### What the denominators exclude, and why it matters
 
 The DuckDB row read **260 of 478 (54%)** until the denominator was audited. It was wrong,
 and the correction is larger than any single wave in this ledger:
@@ -642,6 +642,12 @@ now pins both halves of the classification.
 The lesson generalizes past this file: **a parity percentage is a claim about the
 denominator first.** Read what a reference engine's function list actually contains before
 dividing by its length.
+
+Spark needed the same audit and moved **51% to 60%**: 48 of its documented builtins are a
+geospatial extension, an XPath/XML family, its own bitmap and variant encodings, cluster
+and session introspection, or values that are nondeterministic by definition. Counting
+those as missing functions measures Spark's product scope, not Batcher's expression
+surface.
 
 Spark deserves a note: **it needs no JVM.** There is no Java runtime on this machine, so
 `SparkSession` cannot start — but every builtin carries its expected output in an
