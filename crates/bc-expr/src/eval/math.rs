@@ -289,8 +289,23 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         // above 2^53 — `round(2^53+1)` came back as `2^53`. `floor`/`ceil`/`sqrt` really
         // do yield double in DuckDB, so the promotion below stays right for them.
         (Round, DataType::Int64) => Ok(Arc::clone(arr)),
-        (_, DataType::Int64) => {
-            // Promote integers to Float64 and apply the float function.
+        (_, DataType::Int64) | (_, DataType::Decimal128(..)) | (_, DataType::Decimal256(..)) => {
+            // Promote to Float64 and apply the float function.
+            //
+            // **Decimal is here deliberately, and it is a trade.** Arithmetic, comparison,
+            // aggregation and negation all keep a `Decimal` exact — only this family
+            // promotes. Before, every one of them *rejected* a decimal column outright
+            // ("Abs expected a numeric argument, got Decimal128(10, 2)"), so a Parquet
+            // money column could be summed and compared but not rounded, floored, or
+            // passed to `abs`. Refusing was not preserving precision; it was refusing to
+            // answer.
+            //
+            // The result is DOUBLE. For `sqrt`/`ln`/the trig family that is also what
+            // DuckDB returns. For `abs`/`floor`/`ceil`/`round`/`sign` DuckDB keeps
+            // DECIMAL, so those diverge in *result type* — the divergence the census
+            // already pinned for `ceil`/`floor`, now covering the family — and lose
+            // exactness above 2^53. A decimal-preserving path for that subset is the
+            // follow-on; it needs a scale-aware kernel per op rather than this promotion.
             let f = cast(arr, &DataType::Float64)?;
             eval_math(func, &f)
         }

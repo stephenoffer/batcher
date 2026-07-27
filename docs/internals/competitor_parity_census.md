@@ -753,6 +753,44 @@ positive one: it says where *not* to look next.
 eleven more compared across encodings where DuckDB has no counterpart, the simhash
 identity, a nested `LargeList` flatten, and a non-list column still erroring.
 
+### 250-298. Every math function rejected a `DECIMAL` column
+
+**Source:** the encoding-coverage probe again, turned on the numeric axis — 146
+no-argument `Expr` methods across Int8/32/64, UInt64, Float32/64, dictionary-encoded, and
+`Decimal128`.
+
+The integer and float encodings were clean. **`Decimal128` rejected 82 methods against
+int64's 8.** The 8 are correct refusals (bitwise ops, `chr`, `factorial`). The other 74
+were not: every math function raised
+
+    RuntimeError: Abs expected a numeric argument, got Decimal128(10, 2)
+
+on a column that arithmetic, comparison, aggregation and negation all handle — **and
+handle exactly**. So a Parquet money column could be summed, compared and multiplied, but
+not rounded, floored, or passed to `abs`. That is not precision being protected; it is the
+question being refused.
+
+One arm of the type match fixed 49 of them: decimals now take the same Float64 promotion
+integers already took.
+
+**The result type is a stated trade.** For `sqrt`/`ln`/`exp`/trig, DOUBLE is what DuckDB
+returns too, so value *and* type agree. For `abs`/`floor`/`ceil`/`round`/`sign` DuckDB
+keeps DECIMAL — so the number matches and the type does not, and exactness is lost above
+2^53. This ledger already pinned that divergence for `ceil`/`floor`; it now covers the
+family, and the test asserts *both* halves (the values are equal, the types differ) so
+neither side can drift without failing. A decimal-preserving path for that subset needs a
+scale-aware kernel per operation and is the follow-on.
+
+**33 methods still refuse a decimal**, and the split matters: the bitwise family, `chr`
+and `factorial` are correct. `stddev`, `var`, `median` and the window aggregates are
+**not** — they reject decimals in `bc-runtime`'s aggregate/window dispatch, a different
+crate and a separate change. Recorded rather than left to be rediscovered.
+
+**Verified** by 29 differential cases: value equality for all thirteen functions, type
+equality where DuckDB also returns DOUBLE, the pinned type divergence asserted explicitly,
+and a check that the exact-decimal paths (`+`, `*`, unary minus, `sum`) still return
+`Decimal` and still sum to `4.250` exactly.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -765,8 +803,9 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
   *both* numbers so neither side can drift silently.
 * **Degenerate-group statistics.** `corr`, `regr_slope` and `regr_intercept` over a
   single-row group are `NaN` in DuckDB and `NULL` in Batcher.
-* **Result representation.** `ceil`/`floor` over a `DECIMAL` return `DECIMAL` in DuckDB
-  and `DOUBLE` here; `unhex` returns a `BLOB` there and `VARCHAR` here; `histogram`
+* **Result representation.** The whole math family over a `DECIMAL` returns `DECIMAL` in
+  DuckDB where DuckDB keeps it (`abs`/`floor`/`ceil`/`round`/`sign`) and `DOUBLE` here —
+  see entries 250-298; `unhex` returns a `BLOB` there and `VARCHAR` here; `histogram`
   returns a `MAP` there and a list of pairs here; `list_distinct` returns its elements in
   an unspecified order in both, which the census reports as a mismatch and is not one.
 * **Spark's semantics are not adopted with Spark's syntax.** `dialect="spark"` selects a
