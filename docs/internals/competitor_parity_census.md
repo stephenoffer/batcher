@@ -686,6 +686,36 @@ and still open.
 case and a map-subscript regression check — teaching `element_at` about structs must not
 disturb the path it already served.
 
+### 200-209. Half the `.list` namespace rejected an embedding column
+
+**Source:** the `array_*` aliases from entries 190-194, which routed correctly but failed
+in the kernel — pulling that thread found the real defect underneath.
+
+A vector column is a `FixedSizeList`: that is how Arrow and Parquet store one, and what
+DuckDB's `ARRAY` type maps to. **Half the `.list` namespace accepted it and half rejected
+it, on the same column.** `sum`, `l2_norm`, `normalize`, `softmax`, `dot`,
+`cosine_similarity`, `sort`, `reverse`, `unique`, `arg_sort`, `cum_sum`, `diff`, `median`
+and `n_unique` all worked. `get`, `slice`, `contains`, `position`, `first`, `last`,
+`concat`, `intersect`, `transform`, `filter` and `join` raised `expected a List argument,
+got FixedSizeList`.
+
+So an embedding could be normalized and summed but **not subscripted** — `e[0]` on a
+vector column was an error, in the same query where `e` could be normalized.
+
+The split was not a decision anyone made. The vector kernels had grown a coercion helper
+(`list_ops::coerce::as_var_list`, whose own doc comment says the widening cost is
+"negligible next to the embedding payload"), and the indexing half of the namespace simply
+never used it. `require_list` now routes through the same helper, so `.list` means one
+thing for both encodings, and the coercion lives in exactly one place.
+
+This is the kind of gap a function census structurally cannot find: every one of these
+names *exists* and answers correctly — on one of the two encodings the same column type
+has. Only running them against the encoding a real embedding arrives in shows it.
+
+**Verified** by ten differential cases against DuckDB over the same values in both
+encodings, plus two negative tests: a variable-size list is unaffected, and a genuine
+non-list argument still raises an error naming the function.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.

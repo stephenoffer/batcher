@@ -1941,16 +1941,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `error.rs` | 99 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 725 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 446 | `cast` evaluation with DuckDB float→int rounding semantics. |
-| `eval/dispatch.rs` | 387 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 389 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 249 | `x IN (lit, lit, …)` — hash-set membership. |
-| `eval/list.rs` | 774 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
+| `eval/list.rs` | 773 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 109 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
-| `eval/list_ops/list_hof.rs` | 81 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
+| `eval/list_ops/list_hof.rs` | 85 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
 | `eval/list_ops/list_reduce.rs` | 161 | Per-row, list-returning numeric transforms for `eval/list.rs` (`normalize`, `softmax`, `arg_sort`, `cum_sum`, `diff`). |
 | `eval/list_ops/list_reshape.rs` | 62 | Reshaping `List`-column operations that change nesting depth — currently `flatten` (`List<List<T>>` → `List<T>`). |
-| `eval/list_ops/list_set.rs` | 173 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
+| `eval/list_ops/list_set.rs` | 175 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 21 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |

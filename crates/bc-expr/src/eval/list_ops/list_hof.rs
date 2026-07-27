@@ -32,6 +32,8 @@ fn element_batch(child: &ArrayRef) -> Result<RecordBatch, ExprError> {
 /// length and null mask. → `List<func's output type>`.
 pub(crate) fn eval_list_transform(list: &ArrayRef, func: &Expr) -> Result<ArrayRef, ExprError> {
     let l = require_list(list, "list.transform")?;
+    use arrow::array::AsArray;
+    let l = l.as_list::<i32>();
     let new_child = func.eval(&element_batch(l.values())?)?;
     let field = Arc::new(Field::new_list_field(new_child.data_type().clone(), true));
     Ok(Arc::new(ListArray::new(
@@ -46,6 +48,8 @@ pub(crate) fn eval_list_transform(list: &ArrayRef, func: &Expr) -> Result<ArrayR
 /// is true, recomputing each row's offsets. Type-preserving. Null list rows stay null.
 pub(crate) fn eval_list_filter(list: &ArrayRef, pred: &Expr) -> Result<ArrayRef, ExprError> {
     let l = require_list(list, "list.filter")?;
+    use arrow::array::AsArray;
+    let l = l.as_list::<i32>();
     let child = l.values();
     let mask_arr = pred.eval(&element_batch(child)?)?;
     let mask = mask_arr

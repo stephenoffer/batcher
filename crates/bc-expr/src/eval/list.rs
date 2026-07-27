@@ -58,6 +58,7 @@ pub(crate) fn eval_list_join(list: &ArrayRef, sep: &str) -> Result<ArrayRef, Exp
     use arrow::array::{Array, AsArray, StringArray};
 
     let lst = require_list(list, "list_join")?;
+    let lst = lst.as_list::<i32>();
     let elems = cast(lst.values(), &DataType::Utf8)?;
     let elems = elems.as_string::<i32>();
     let offsets = lst.value_offsets();
@@ -190,20 +191,20 @@ pub(crate) fn element_identity(child: &ArrayRef) -> Result<arrow::row::Rows, Exp
     Ok(converter.convert_columns(std::slice::from_ref(&key))?)
 }
 
-/// Downcast to a `List` array or raise a clear type error.
-pub(crate) fn require_list<'a>(
-    arr: &'a ArrayRef,
-    func: &str,
-) -> Result<&'a arrow::array::GenericListArray<i32>, ExprError> {
-    use arrow::array::AsArray;
-    if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedType {
-            func: func.into(),
-            want: "a List argument",
-            got: arr.data_type().to_string(),
-        });
-    }
-    Ok(arr.as_list::<i32>())
+/// A `List` view of `arr`, accepting a `FixedSizeList` by widening it, or a clear
+/// type error.
+///
+/// Embeddings arrive as `FixedSizeList` — that is how Arrow and Parquet store a vector
+/// column, and what DuckDB's `ARRAY` type maps to. The vector kernels already coerced
+/// (see `list_ops::coerce::as_var_list`), but the *indexing* half of the namespace did
+/// not, so the same embedding column could be normalized and summed yet not subscripted,
+/// sliced, or searched. Coercing in one place is what makes `.list` mean the same thing
+/// for both list encodings.
+///
+/// Returns an owned array because widening allocates offsets; for an already-variable
+/// `List` it is a refcount bump, and next to an embedding payload the offsets are noise.
+pub(crate) fn require_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprError> {
+    crate::eval::list_ops::coerce::as_var_list(arr, func)
 }
 
 /// Rebuild a `List` column by choosing, for each row, which child indices (global)
@@ -247,6 +248,8 @@ pub(crate) fn eval_list_contains(arr: &ArrayRef, value: &Literal) -> Result<Arra
     use arrow::array::{Array, BooleanBuilder};
 
     let list = require_list(arr, "list.contains")?;
+    use arrow::array::AsArray;
+    let list = list.as_list::<i32>();
     let offsets = list.value_offsets();
     // Compare element-wise against the literal, both promoted to a common type so the
     // child is never narrowed onto the literal (that truncated `[2.5].contains(2)`).
@@ -272,6 +275,8 @@ pub(crate) fn eval_list_position(arr: &ArrayRef, value: &Literal) -> Result<Arra
     use arrow::array::{Array, Int64Builder};
 
     let list = require_list(arr, "list.position")?;
+    use arrow::array::AsArray;
+    let list = list.as_list::<i32>();
     let offsets = list.value_offsets();
     let eq = eq_against_literal(list.values(), value)?;
 
@@ -347,13 +352,7 @@ pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, Expr
     use arrow::array::{Array, AsArray, UInt32Array};
     use arrow::compute::take;
 
-    if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedType {
-            func: "list.get".into(),
-            want: "a List argument",
-            got: arr.data_type().to_string(),
-        });
-    }
+    let arr = require_list(arr, "list.get")?;
     let list = arr.as_list::<i32>();
     let offsets = list.value_offsets();
     let take_idx: UInt32Array = (0..list.len())

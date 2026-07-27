@@ -366,6 +366,8 @@ impl Expr {
             } => {
                 let arr = input.eval(batch)?;
                 let list = require_list(&arr, "list.slice")?;
+                use arrow::array::AsArray;
+                let list = list.as_list::<i32>();
                 rebuild_list(list, |s, e| {
                     // Saturating throughout: a huge `offset`/`length` (up to i64::MAX)
                     // otherwise overflows the `+` before the `.min(e)` clamp — panicking

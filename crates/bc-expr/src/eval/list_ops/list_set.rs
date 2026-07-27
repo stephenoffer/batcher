@@ -29,6 +29,8 @@ pub(crate) fn eval_list_set(
 ) -> Result<ArrayRef, ExprError> {
     let l = require_list(left, "list set op")?;
     let r = require_list(right, "list set op")?;
+    use arrow::array::AsArray;
+    let (l, r) = (l.as_list::<i32>(), r.as_list::<i32>());
     if matches!(op, ListSetOp::Concat) {
         return eval_list_concat(l, r);
     }
@@ -194,6 +196,7 @@ mod tests {
     }
 
     fn row(out: &ArrayRef, i: usize) -> Vec<i64> {
+        use arrow::array::AsArray;
         let l = out.as_list::<i32>();
         let v = l.value(i);
         v.as_primitive::<Int64Type>().values().to_vec()
@@ -233,6 +236,7 @@ mod tests {
         let a = flist(&[&[0.0]]);
         let b = flist(&[&[-0.0]]);
         let out = eval_list_set(ListSetOp::Intersect, &a, &b).unwrap();
+        use arrow::array::AsArray;
         let l = out.as_list::<i32>();
         let v = l.value(0);
         let f = v.as_primitive::<Float64Type>();
@@ -259,6 +263,7 @@ mod tests {
         let ints = list(&[Some(&[1, 2, 3])]);
         let floats = flist(&[&[2.0, 3.0, 4.0]]);
         let out = eval_list_set(ListSetOp::Intersect, &ints, &floats).unwrap();
+        use arrow::array::AsArray;
         let l = out.as_list::<i32>();
         let v = l.value(0);
         let f = v.as_primitive::<Float64Type>();
