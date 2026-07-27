@@ -932,6 +932,61 @@ mod tests {
         );
     }
 
+    /// A `ClientPool` is process-lifetime and keyed by advertised address, and a worker
+    /// advertises an *ephemeral* port — so every peer restart, autoscaling replacement, and
+    /// actor recycle mints a new key. Nothing ever removed one, so each dead peer kept its
+    /// entry and up to `connections_per_peer` live HTTP/2 connections: an unbounded leak of
+    /// memory and file descriptors in the one process that outlives every query.
+    #[tokio::test]
+    async fn a_peer_that_proves_unreachable_is_dropped_from_the_pool() {
+        let pool = ClientPool::new();
+        let ticket = ShuffleTicket::new(3, 0, 0, 0, 0);
+
+        // A port nothing is listening on: connect fails, the redial fails, the peer goes.
+        let dead = "127.0.0.1:1";
+        assert!(pool.fetch_with_credits(dead, &ticket, 4).await.is_err());
+        assert_eq!(
+            pool.connection_count(),
+            0,
+            "an unreachable peer kept its pool entry and its connections",
+        );
+    }
+
+    /// The eviction must be tied to proven unreachability, not to idleness: a live peer
+    /// that is merely quiet between queries should keep its warm connections, since
+    /// re-establishing them is exactly the cost this pool exists to avoid.
+    #[tokio::test]
+    async fn a_live_but_idle_peer_keeps_its_pooled_connections() {
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(4, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, 3)).await;
+
+        let pool = ClientPool::new();
+        assert_eq!(
+            pool.fetch_with_credits(&addr, &ticket, 4)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(pool.connection_count(), 1);
+
+        // A second fetch after the first finished must reuse the entry, not rebuild it.
+        assert_eq!(
+            pool.fetch_with_credits(&addr, &ticket, 4)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            pool.connection_count(),
+            1,
+            "a live peer's pool entry was dropped"
+        );
+    }
+
     #[tokio::test]
     async fn credit_window_of_one_still_transfers_all() {
         // Tightest possible window: strict lock-step. Still correct.

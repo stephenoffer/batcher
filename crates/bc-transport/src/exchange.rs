@@ -495,6 +495,11 @@ impl PeerChannels {
         self.channels.lock().await.clear();
     }
 
+    /// Whether this peer currently holds no connections.
+    async fn is_empty(&self) -> bool {
+        self.channels.lock().await.is_empty()
+    }
+
     async fn len(&self) -> usize {
         self.channels.lock().await.len()
     }
@@ -580,6 +585,26 @@ impl ClientPool {
         credits: u32,
         token: Option<&str>,
     ) -> TransportResult<Vec<RecordBatch>> {
+        let out = self
+            .fetch_once_with_retry(addr, ticket, credits, token)
+            .await;
+        if out.is_err() {
+            // Every failure path lands here, including a first `acquire` that could not
+            // connect at all — which is the common shape for a peer that has gone away, and
+            // the one that still leaves an entry behind. See `forget_unreachable`.
+            self.forget_unreachable(addr).await;
+        }
+        out
+    }
+
+    /// One pooled fetch, redialing once if the cached connections turn out to be stale.
+    async fn fetch_once_with_retry(
+        &self,
+        addr: &str,
+        ticket: &ShuffleTicket,
+        credits: u32,
+        token: Option<&str>,
+    ) -> TransportResult<Vec<RecordBatch>> {
         let channel = self.channel(addr).await?;
         let mut client = FlightClient::from_channel(channel);
         match credit_exchange(&mut client, ticket, credits, token).await {
@@ -591,6 +616,37 @@ impl ClientPool {
                 credit_exchange(&mut client, ticket, credits, token).await
             }
             other => other,
+        }
+    }
+
+    /// Drop a peer's entry once it has proved unreachable, freeing its connections.
+    ///
+    /// The map is keyed by advertised address and nothing ever removed from it. A
+    /// `ClientPool` is process-lifetime (one pooled consumer per worker, shared by every
+    /// session), and a worker advertises an *ephemeral* port — so every peer restart, every
+    /// autoscaling replacement, and every actor recycle mints a new key. The old entry
+    /// stayed forever holding up to `connections_per_peer` tonic channels, each a live
+    /// HTTP/2 connection with its own buffers and file descriptor. On a churning cluster
+    /// that is an unbounded leak of both memory and fds in the one process that must
+    /// outlive every query.
+    ///
+    /// Eviction is deliberately tied to *proven* unreachability — a connection error whose
+    /// redial also failed — rather than to idleness. A peer that is merely quiet between
+    /// queries should keep its warm connections: re-establishing them is the cost this pool
+    /// exists to avoid, and dropping them would trade a bounded leak for a per-query
+    /// handshake. `reset` alone was not enough because it clears the channel vector and
+    /// leaves the key.
+    async fn forget_unreachable(&self, addr: &str) {
+        // Only if it holds no connections: a concurrent fetch to the same peer may already
+        // have rebuilt it, and removing a live entry would drop channels those fetches are
+        // streaming on. An entry whose `acquire` never managed to connect is empty by
+        // construction, which is exactly the case that used to be left behind.
+        let gone = match self.peers.get(addr) {
+            Some(peer) => peer.value().is_empty().await,
+            None => return,
+        };
+        if gone {
+            self.peers.remove(addr);
         }
     }
 

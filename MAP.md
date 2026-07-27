@@ -187,7 +187,7 @@ The `Dataset` builder package.
 | module | lines | what it is |
 |---|---|---|
 | `_build.py` | 492 | Plan-construction helpers behind the thinner `Dataset` methods. |
-| `_dedup.py` | 280 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
+| `_dedup.py` | 321 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 213 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
 | `_export.py` | 96 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` / `to_torch_dataloader`. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
@@ -712,7 +712,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 133 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 98 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 55 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 119 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 172 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 430 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
@@ -2161,7 +2161,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `shared.rs` | 391 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 203 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 91 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
-| `tls.rs` | 158 | TLS configuration for the inter-node Flight shuffle. |
+| `tls.rs` | 184 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |
 
 ### `bc-resource`

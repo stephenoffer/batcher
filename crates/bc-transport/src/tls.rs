@@ -23,7 +23,15 @@ use crate::{TransportError, TransportResult};
 ///
 /// Serves as a server identity (what a node presents on its Flight port) and, under
 /// mTLS, as a client identity (what a node presents when fetching from a peer).
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written to **redact the key**. A derived one prints it, and this
+/// struct is reachable from `TlsServerConfig`/`TlsClientConfig`, which a transport error
+/// path or a `tracing` span could format at any time — putting a node's private key into
+/// the log stream, where it long outlives the process and is usually shipped off-box. The
+/// engine already takes this position elsewhere: an inline `hmac_sha256` key raises a
+/// `SecurityWarning` precisely because it would reach "any plan log / profile / explain
+/// output". A private key deserves at least that much.
+#[derive(Clone)]
 pub struct TlsIdentity {
     /// PEM-encoded certificate chain (leaf first).
     pub cert_pem: String,
@@ -42,6 +50,23 @@ impl TlsIdentity {
 
     fn to_tonic(&self) -> Identity {
         Identity::from_pem(self.cert_pem.as_bytes(), self.key_pem.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for TlsIdentity {
+    /// Shows the certificate's presence and the key's *length* only.
+    ///
+    /// The length rather than nothing at all, because the failure this is most often
+    /// formatted for is a malformed or empty PEM, and "key_pem: 0 bytes" answers that
+    /// without disclosing anything a holder of the file does not already know.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsIdentity")
+            .field("cert_pem_bytes", &self.cert_pem.len())
+            .field(
+                "key_pem",
+                &format_args!("<redacted, {} bytes>", self.key_pem.len()),
+            )
+            .finish()
     }
 }
 
@@ -154,5 +179,46 @@ pub(crate) fn check_pem(label: &str, pem: &str) -> TransportResult<()> {
         Err(TransportError::Io(format!(
             "{label} is not PEM-encoded (missing BEGIN/END markers)"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A derived `Debug` prints the private key, and this struct is reachable from both
+    /// TLS configs — so a transport error path or a `tracing` span formatting one puts a
+    /// node's key into the log stream, where it outlives the process and is usually
+    /// shipped off-box.
+    #[test]
+    fn debug_never_discloses_the_private_key() {
+        let id = TlsIdentity::from_pem(
+            "-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----",
+            "-----BEGIN PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END PRIVATE KEY-----",
+        );
+
+        for rendered in [
+            format!("{id:?}"),
+            format!("{:?}", TlsServerConfig::new(id.clone())),
+        ] {
+            assert!(
+                !rendered.contains("SUPERSECRETKEYMATERIAL"),
+                "the private key reached a Debug rendering: {rendered}",
+            );
+            assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+            assert!(
+                rendered.contains("redacted"),
+                "the redaction should be visible"
+            );
+        }
+    }
+
+    /// The length is kept deliberately: the failure this is usually formatted for is an
+    /// empty or malformed PEM, and the byte count answers that without disclosing anything.
+    #[test]
+    fn debug_still_reports_enough_to_diagnose_an_empty_pem() {
+        let empty = TlsIdentity::from_pem("", "");
+        let rendered = format!("{empty:?}");
+        assert!(rendered.contains("0 bytes"), "{rendered}");
     }
 }
