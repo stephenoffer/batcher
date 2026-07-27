@@ -525,6 +525,23 @@ now paid twice.
 (the projection context, the swapped `CASE`, the disjoint `IN` pair, the all-constant
 grouping over an empty input) carrying most of the weight.
 
+### 183. The census was measuring the wrong denominator
+
+**Source:** re-running the DuckDB census after entries 177-182 and reading the gap list
+instead of the total.
+
+Not an engine change — a correction to the instrument every number in this file comes
+from. The headline moved from **54% to 79%** with no change to Batcher, because 135 of
+the 478 "missing functions" were `icu_collate_*`, one per locale, and five more were the
+harness's own synthesized arguments being invalid. See *What the DuckDB denominator
+excludes* above for the full accounting.
+
+It is recorded as an entry rather than a silent edit because a wrong measurement is worth
+more attention than a missing function: it had already been quoted in this ledger's
+summary table, and every later wave would have been judged against it. Two of the three
+bugs found here were in fixes written *during* this correction, and both were silent —
+which is why the classifier now has a test rather than a comment.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -558,9 +575,36 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
 
 | Reference | Oracle | Surface probed | Result |
 |---|---|---|---|
-| DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 478 scalar/aggregate signatures, through `bt.sql` | **93 → 215** supported; 6 wrong answers found |
+| DuckDB | the live engine (`duckdb` is a test dependency) | `duckdb_functions()`, 671 listed names, of which 331 are scored (see below), through `bt.sql` | **93 → 260 of 331 (79%)**; 15 wrong answers found |
 | Spark | its own `@ExpressionDescription` examples, parsed out of the Scala source | 527 documented examples over 438 registered names, through `bt.sql(dialect="spark")` | **75 → 108** supported; 4 wrong answers found (entries 107, 108, and the two in 127-151) |
 | Polars | the live library | every zero-argument method on `pl.Expr` and its `.str`/`.dt`/`.list` namespaces | 53 supported, 31 absent, 14 differences (all but two are representation or a pinned semantic choice) |
+
+### What the DuckDB denominator excludes, and why it matters
+
+The DuckDB row read **260 of 478 (54%)** until the denominator was audited. It was wrong,
+and the correction is larger than any single wave in this ledger:
+
+* **144 out of scope.** `duckdb_functions()` lists **135** `icu_collate_*` entries, one
+  per locale. That is one capability, not 135 functions, and it is 40% of the listed
+  surface. The rest are DuckDB's catalog and session introspection (`current_schema`,
+  `duckdb_functions`, plan serialization), which belong to a database server rather than
+  to a query engine.
+* **5 unprobed.** `array_cat`, `array_concat`, `list_concat`, `list_pack` and `strftime`
+  were reported missing because the harness synthesizes *literal* arguments: sqlglot
+  cannot parse `list_concat([1,2],[3])`, and `strftime(ts, 'abc')` is an invalid format
+  Batcher is right to reject. All five work over columns, checked by hand.
+
+So a gap must now be **proven** by an error saying the function is unreachable, never
+assumed from any failure. Getting that backwards costs accuracy in both directions, and
+did: the first attempt classified by exclusion and reported eight working functions as
+missing; the second used a capitalized marker against lowercased text, matched nothing,
+and quietly moved eleven real gaps into "unprobed". Neither was visible from the output —
+the census ran and printed a number either way. `tests/unit/test_parity_census_classifier.py`
+now pins both halves of the classification.
+
+The lesson generalizes past this file: **a parity percentage is a claim about the
+denominator first.** Read what a reference engine's function list actually contains before
+dividing by its length.
 
 Spark deserves a note: **it needs no JVM.** There is no Java runtime on this machine, so
 `SparkSession` cannot start — but every builtin carries its expected output in an

@@ -89,6 +89,43 @@ SKIP_NAMES = {
 }
 
 
+def out_of_scope(name: str) -> str | None:
+    """Why `name` is not a function Batcher is measured against, or None.
+
+    Without this the denominator lies, and it lies by a lot: `duckdb_functions()` lists
+    **135** `icu_collate_*` entries, one per locale, which is 40% of the whole surface and
+    a single capability. Counting them as 135 missing functions turned a real 77% into a
+    reported 54%. The rest are DuckDB's own catalog and session introspection, which
+    belong to a database server rather than to a query engine.
+    """
+    if name.startswith("icu_collate_"):
+        return "locale collation (one entry per locale, one capability)"
+    if name.startswith(("duckdb_", "pragma_")):
+        return "DuckDB catalog introspection"
+    if name.startswith("current_") or name in {"getvariable", "nextval", "currval", "write_log"}:
+        return "session or transaction introspection"
+    if name.startswith("json_serialize_"):
+        return "DuckDB plan serialization"
+    return None
+
+
+# Error text that proves Batcher cannot reach the function at all, as opposed to
+# rejecting the arguments this harness happened to synthesize. Lowercase, because the
+# comparison lowercases the message — writing "unsupported SQL expression" here instead
+# silently matched nothing and moved eleven real gaps into `unprobed`.
+_ABSENT = (
+    "unknown function",
+    "unsupported sql expression",
+    "unsupported aggregate",
+    "no such function",
+)
+
+
+def _proves_absent(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _ABSENT)
+
+
 def arg_for(t: str) -> str | None:
     t = (t or "").upper()
     if t in SAMPLE:
@@ -137,8 +174,14 @@ def main() -> None:
     gaps: list[tuple[str, str, str]] = []
     mismatch: list[tuple[str, str, str, str]] = []
     match: list[str] = []
+    scope: list[tuple[str, str]] = []
+    unprobed: list[tuple[str, str]] = []
 
     for name, (ftype, overloads) in sorted(by_name.items()):
+        reason = out_of_scope(name)
+        if reason is not None:
+            scope.append((name, reason))
+            continue
         # Try every overload: a function counts as supported if *any* signature agrees
         # with DuckDB, so a single unrepresentable argument type (BLOB, BIT, LIST) does
         # not report the whole function as a gap.
@@ -156,8 +199,18 @@ def main() -> None:
             try:
                 got = bt.sql(sql).to_pydict()["r"][0]
             except Exception as exc:
-                if best is None:
-                    best = ("gap", f"{type(exc).__name__}: {exc}".split("\n")[0][:130], "")
+                detail = f"{type(exc).__name__}: {exc}".split("\n")[0][:130]
+                # A gap must be *proven* by an error that says the function is not
+                # reachable — never assumed from any failure. Everything else is the
+                # harness's own fault and is unprobed: sqlglot cannot parse the
+                # synthesized call (`list_concat([1,2],[3])` with literal lists, which
+                # works over columns), or the synthesized argument is invalid for the
+                # function (`strftime(x, 'abc')`, `list_pack()`), which Batcher is right
+                # to reject. Assuming the other way round reported eight working
+                # functions as missing.
+                kind = "gap" if _proves_absent(detail) else "unprobed"
+                if best is None or (kind == "gap" and best[0] == "unprobed"):
+                    best = (kind, detail, "")
                 continue
             if same(expected, got):
                 matched = True
@@ -167,8 +220,12 @@ def main() -> None:
             continue
         if matched:
             match.append(name)
-        elif best is None or best[0] == "gap":
-            gaps.append((name, ftype, best[1] if best else "no representable overload"))
+        elif best is None:
+            unprobed.append((name, "no representable overload"))
+        elif best[0] == "unprobed":
+            unprobed.append((name, best[1]))
+        elif best[0] == "gap":
+            gaps.append((name, ftype, best[1]))
         else:
             mismatch.append((name, ftype, best[1], best[2]))
 
@@ -176,10 +233,19 @@ def main() -> None:
         "match": sorted(match),
         "gap": sorted(gaps),
         "mismatch": sorted(mismatch),
+        "unprobed": sorted(unprobed),
+        "out_of_scope": sorted(scope),
     }
     print(json.dumps(out, indent=1, default=str))
+    # The denominator is match + gap + mismatch. `unprobed` and `out_of_scope` are
+    # deliberately excluded: neither says anything about what Batcher can do, and folding
+    # them in is what made this census read 54% when the answer was 77%.
+    scored = len(match) + len(gaps) + len(mismatch)
+    pct = 100.0 * len(match) / scored if scored else 0.0
     print(
-        f"\n# probed={len(seen)} match={len(match)} gap={len(gaps)} mismatch={len(mismatch)}",
+        f"\n# scored={scored} match={len(match)} ({pct:.0f}%) gap={len(gaps)} "
+        f"mismatch={len(mismatch)} | unprobed={len(unprobed)} "
+        f"out_of_scope={len(scope)} (of {len(by_name)} listed)",
         file=sys.stderr,
     )
 

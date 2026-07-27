@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 861 Python modules across 130 packages and 173 Rust files across 13 crates.
+Covering 863 Python modules across 130 packages and 173 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -280,7 +280,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `run.py` | 369 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 399 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 163 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 219 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
@@ -1032,7 +1032,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 |---|---|---|
 | `base.py` | 102 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 234 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 483 | The Carbonite resource manager entry point. |
+| `manager.py` | 497 | The Carbonite resource manager entry point. |
 | `spill.py` | 399 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1054,8 +1054,10 @@ Carbonite's resource policies — admission, flow control, and scheduling.
 | module | lines | what it is |
 |---|---|---|
 | `admission.py` | 125 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
+| `concurrency.py` | 234 | Bounding how many queries run at once, and how wide each one gets. |
 | `flow_control.py` | 335 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `scheduling.py` | 184 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
+| `spill_shape.py` | 98 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
 
@@ -1746,7 +1748,7 @@ Configuration: one frozen, typed `Config` object.
 
 | module | lines | what it is |
 |---|---|---|
-| `config.py` | 2318 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2335 | The single frozen `Config` and its typed sections. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 271 | Named fault-tolerance profiles for the distributed engine. |
