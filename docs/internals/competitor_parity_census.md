@@ -791,6 +791,38 @@ equality where DuckDB also returns DOUBLE, the pinned type divergence asserted e
 and a check that the exact-decimal paths (`+`, `*`, unary minus, `sum`) still return
 `Decimal` and still sum to `4.250` exactly.
 
+### 299-300. Two internal errors that reached the user
+
+**Source:** the reverse census (entries 190-194) found four string-similarity functions
+that "require a constant second argument". Looking at *how* they refuse turned out to be
+the finding.
+
+Several accessor methods take a value lowered into the JSON IR as a **constant**:
+`.str.jaccard(text)`, `.map.get(key)`, `.list.contains(value)`, `.list.position(value)`.
+Passing a column to one is a reasonable mistake, and nothing checked for it — so the
+failure surfaced far from the call, as an internal error, in two different shapes:
+
+* `.str.jaccard(col("t"))` reached `json.dumps` and raised **`TypeError: Object of type
+  Col is not JSON serializable`** — a serializer error naming neither the function nor the
+  argument, from a module the user has never heard of;
+* `.map.get(col("k"))` and the `.list` literal slots raised a bare **`TypeError:
+  unsupported literal type: Col`** at plan-build time, equally far from the line written.
+
+Both violate the same rule (`python-quality.md`): raise the project's typed exceptions
+with actionable messages, and validate user input **at the API edge**. Validation now runs
+where the node is constructed, so it fails on the line the user wrote, raises `PlanError`,
+and names the function they actually called — `jaccard_similarity()`, not `StrFunc`.
+
+The check is deliberately narrow: it rejects an `Expr` and nothing else, so the optional
+slots that legitimately hold `None` are untouched.
+
+Not a parity gap — no reference engine is involved — but it is the same category as the
+rest of this ledger: a capability that worked, reached through a path that did not.
+
+**Verified** by 16 unit cases across six methods, including that the message names the
+argument, that the error is *not* a `TypeError`, that plain literals still work, and that
+`.map.contains` correctly reports via the `list.contains` slot it is composed over.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.

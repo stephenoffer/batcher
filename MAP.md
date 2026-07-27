@@ -1556,7 +1556,7 @@ The scalar expression algebra.
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 5075 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 176 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
-| `func_nodes.py` | 319 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
+| `func_nodes.py` | 366 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 265 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
