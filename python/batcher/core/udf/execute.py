@@ -24,7 +24,7 @@ from batcher.core.udf.lifecycle import build_udf_callable
 from batcher.io.schema.evolution import reconcile_batches
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.schema import SchemaRef
-from batcher.plan.visitor import children, with_children
+from batcher.plan.visitor import children, scanned_source_ids, with_children
 
 __all__ = [
     "build_udf_callable",
@@ -189,21 +189,11 @@ def _run_whole_plan(
     nat = engine()
     # `execute_plan` addresses sources positionally by `Scan.source_id`, so the list must keep
     # each source at its own index; only the ones the plan actually scans are read.
-    scanned = _scanned_source_ids(plan)
+    scanned = scanned_source_ids(plan)
     inputs = [
         list(src.read(projections.get(i))) if i in scanned else [] for i, src in enumerate(sources)
     ]
     return list(nat.execute_plan(_to_json(plan), inputs, cfg))
-
-
-def _scanned_source_ids(node: LogicalPlan) -> set[int]:
-    """The `source_id`s the plan actually reads."""
-    if isinstance(node, Scan):
-        return {node.source_id}
-    ids: set[int] = set()
-    for child in children(node):
-        ids |= _scanned_source_ids(child)
-    return ids
 
 
 def _execute_node(

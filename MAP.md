@@ -163,7 +163,7 @@ The public, fluent, lazy, expression-first API surface.
 | module | lines | what it is |
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
-| `executors.py` | 279 | Execution strategies and their registry (the conductor's wiring). |
+| `executors.py` | 312 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 675 | Top-level expression constructors re-exported for the public API. |
 | `groupby.py` | 877 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
@@ -340,7 +340,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `_metadata.py` | 463 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 798 | Terminal/materialization operations for `Dataset`. |
-| `distributed_stream.py` | 115 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
+| `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 396 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 488 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
@@ -743,7 +743,7 @@ Distributed streaming heterogeneous execution — overlapped, resource-class sta
 | module | lines | what it is |
 |---|---|---|
 | `microbatch.py` | 397 | A streaming micro-batch, run across the cluster — one epoch, one transaction. |
-| `pipeline.py` | 445 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
+| `pipeline.py` | 446 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
 
 ### `batcher/kyber/` — 3 · subsystem
 
@@ -1539,7 +1539,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `resource.py` | 223 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 125 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 146 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
@@ -1746,7 +1746,7 @@ Configuration: one frozen, typed `Config` object.
 
 | module | lines | what it is |
 |---|---|---|
-| `config.py` | 2244 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2318 | The single frozen `Config` and its typed sections. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 271 | Named fault-tolerance profiles for the distributed engine. |

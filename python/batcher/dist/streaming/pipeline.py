@@ -166,9 +166,10 @@ def stream_distributed_pipeline(
     """
     from batcher.dist.executors.map import _gpu_options
     from batcher.dist.executors.partition_io import partition_descriptors
-    from batcher.dist.executors.plan_analysis import _source_ids, split_at_first_pool_boundary
+    from batcher.dist.executors.plan_analysis import split_at_first_pool_boundary
     from batcher.dist.executors.ray_runtime import _ensure_ray
     from batcher.dist.flight_worker import new_plan_id
+    from batcher.plan.visitor import scanned_source_ids
 
     _ensure_ray(workers)
     # Imported AFTER `_ensure_ray` so it is the Ray-remote-wrapped class (the rebind in
@@ -176,7 +177,7 @@ def stream_distributed_pipeline(
     from batcher.dist.executors.map import _MapActor
 
     cpu_stage, gpu_stage = split_at_first_pool_boundary(plan)
-    sid = next(iter(_source_ids(plan)))
+    sid = next(iter(scanned_source_ids(plan)))
     partitions = partition_descriptors(sources[sid], workers)
     n = len(partitions)
     if n == 0:

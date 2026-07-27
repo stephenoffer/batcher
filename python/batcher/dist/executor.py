@@ -42,7 +42,6 @@ from batcher.dist.executors.plan_analysis import (
     empty_result_table,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source as _relabel_single_source
-from batcher.dist.executors.plan_analysis import _source_ids as _source_ids
 from batcher.dist.executors.ray_runtime import _ensure_ray as _ensure_ray
 from batcher.dist.executors.ray_runtime import _rmtree as _rmtree
 from batcher.dist.executors.ray_runtime import (
@@ -75,6 +74,7 @@ from batcher.plan.logical import (
     Window,
 )
 from batcher.plan.resource import SchedulingEnvelope
+from batcher.plan.visitor import scanned_source_ids
 
 __all__ = ["execute_distributed", "resolve_worker_fanout"]
 
@@ -780,7 +780,7 @@ def _dispatch(
     # costs more than the parallel CPU saves). Reuses `_distributed_map`'s stateless
     # task path (no UDF/GPU ⇒ one task per partition).
     if _is_linear_map_pipeline(plan) and _single_source(plan):
-        sid = next(iter(_source_ids(plan)))
+        sid = next(iter(scanned_source_ids(plan)))
         if sid < len(sources) and _is_splittable_source(sources[sid]):
             from batcher.dist.executors.map import _distributed_map
 
@@ -810,7 +810,7 @@ def _dispatch(
         above, lim = limit_split
         n, offset, base = _collapse_limits(lim)
         if _single_source(base) and _is_linear_map_pipeline(base):
-            sid = next(iter(_source_ids(base)))
+            sid = next(iter(scanned_source_ids(base)))
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
@@ -832,7 +832,7 @@ def _dispatch(
     if rowid_split is not None:
         above, rowid = rowid_split
         if _single_source(rowid.input) and _is_linear_map_pipeline(rowid.input):
-            sid = next(iter(_source_ids(rowid.input)))
+            sid = next(iter(scanned_source_ids(rowid.input)))
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
@@ -1048,13 +1048,13 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
     to speak of, so executing it on one node is the correct plan, not a fallback.
 
     The splittable check is scoped to the sources **this plan actually reads**
-    (`_source_ids`), not the whole ambient `sources` list: a later adaptive stage — e.g. a
+    (`scanned_source_ids`), not the whole ambient `sources` list: a later adaptive stage — e.g. a
     trailing `project` over an in-memory intermediate materialized by an earlier stage —
     reads only that in-memory source and is correctly a single-node local transform, even
     though the original splittable scan source is still present in `sources` (unused here).
     Without this scoping such a tail stage would wrongly raise as "unsupported."
     """
-    read_ids = _source_ids(plan)
+    read_ids = scanned_source_ids(plan)
     if any(_is_splittable_source(sources[i]) for i in read_ids if i < len(sources)):
         from batcher._internal.errors import PlanError
         from batcher.dist.executors.plan_analysis import requires_staging

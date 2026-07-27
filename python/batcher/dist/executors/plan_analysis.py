@@ -31,6 +31,7 @@ from batcher.plan.logical import (
     remap_sources,
 )
 from batcher.plan.schema import SchemaRef
+from batcher.plan.visitor import children, scanned_source_ids
 
 # Single-input nodes we can carry as "post-aggregation" work above the breaker — re-run by
 # `_apply_above` over the breaker's fully-assembled driver-side result. Every one is a row-wise
@@ -91,12 +92,12 @@ def _split_at(plan: LogicalPlan, breaker_type: type):
 
 
 def _single_source(plan: LogicalPlan) -> bool:
-    return len(_source_ids(plan)) == 1
+    return len(scanned_source_ids(plan)) == 1
 
 
 def _relabel_single_source(plan: LogicalPlan) -> tuple[LogicalPlan, int]:
     """Rewrite a single-source subplan so its scan reads source 0; return its id."""
-    ids = _source_ids(plan)
+    ids = scanned_source_ids(plan)
     if len(ids) != 1:
         raise PlanError(
             f"expected a single-source subplan to relabel, found {len(ids)} sources: {sorted(ids)}"
@@ -229,21 +230,6 @@ def split_at_first_pool_boundary(plan: LogicalPlan) -> tuple[StageSpec, StageSpe
     return producer, consumer
 
 
-def _source_ids(plan: LogicalPlan) -> set[int]:
-    if isinstance(plan, Scan):
-        return {plan.source_id}
-    ids: set[int] = set()
-    for field in dataclasses.fields(plan):
-        value = getattr(plan, field.name)
-        if isinstance(value, LogicalPlan):
-            ids |= _source_ids(value)
-        elif isinstance(value, tuple):
-            for v in value:
-                if isinstance(v, LogicalPlan):
-                    ids |= _source_ids(v)
-    return ids
-
-
 def requires_staging(plan: LogicalPlan) -> bool:
     """Whether distributing `plan` in one shot is impossible, but staging it would work.
 
@@ -270,7 +256,7 @@ def requires_staging(plan: LogicalPlan) -> bool:
 
     if isinstance(plan, (Join, AsofJoin)):
         for side in (plan.left, plan.right):
-            if len(_source_ids(side)) > 1 or _has_breaker(side):
+            if len(scanned_source_ids(side)) > 1 or _has_breaker(side):
                 return True
     elif isinstance(plan, Aggregate) and _has_breaker(plan.input):
         if not _dispatcher_handles_aggregate_input(plan.input):
@@ -301,8 +287,8 @@ def _dispatcher_handles_aggregate_input(node: LogicalPlan) -> bool:
 
     if isinstance(node, (Join, AsofJoin)):
         return (
-            len(_source_ids(node.left)) == 1
-            and len(_source_ids(node.right)) == 1
+            len(scanned_source_ids(node.left)) == 1
+            and len(scanned_source_ids(node.right)) == 1
             and not _has_breaker(node.left)
             and not _has_breaker(node.right)
         )
@@ -310,15 +296,14 @@ def _dispatcher_handles_aggregate_input(node: LogicalPlan) -> bool:
 
 
 def _child_plans(plan: LogicalPlan):
-    """The `LogicalPlan` children of `plan`, in field order (including tuple fields)."""
-    for field in dataclasses.fields(plan):
-        value = getattr(plan, field.name)
-        if isinstance(value, LogicalPlan):
-            yield value
-        elif isinstance(value, tuple):
-            for v in value:
-                if isinstance(v, LogicalPlan):
-                    yield v
+    """The `LogicalPlan` children of `plan`, in field order (including tuple fields).
+
+    Delegates to `plan.visitor.children`, which is the one implementation of this walk and
+    caches each node class's child-bearing fields. The hand-rolled copy that used to live
+    here re-derived them per node *and* was a second place the discovery rules could drift
+    from the canonical one.
+    """
+    return children(plan)
 
 
 def empty_result_table(plan: LogicalPlan, names: list[str]) -> pa.Table:
