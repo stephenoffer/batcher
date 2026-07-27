@@ -268,19 +268,29 @@ impl ExecOptions {
 fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
     match opts.pool.as_ref() {
         // The pool accounts *actual* bytes, so it is the spill authority: reserve the
-        // footprint cooperatively (a full pool first asks the largest *other* consumer
-        // — operator or concurrent query — to spill, stranding this one only if that
-        // still isn't enough), and spill only when even that can't admit it. Deciding
+        // footprint cooperatively and spill only when the pool cannot admit it. Deciding
         // on actual bytes, not the per-operator *estimate*, is what stops a spurious
         // out-of-core pass when transient state exceeds a small estimate but still fits
         // RAM — e.g. a low-cardinality / global aggregate's pre-combine partials, whose
         // `op_budget` is the (tiny) combined-output size. The per-op budget still sizes
         // the grace fan-out once a spill is chosen.
+        //
+        // NOTE on "cooperatively". `try_reserve_cooperative` asks the largest *other*
+        // registered `Spillable` to give memory back before failing the requester — Spark's
+        // `MemoryConsumer` model, and the thing that stops a small operator dying while a
+        // large neighbour sits on the budget. **Nothing registers a consumer today**, so
+        // with an empty registry it is exactly `try_reserve` and the requester is always
+        // the one that spills, however little it holds and however much a neighbour does.
+        // The mechanism is real and tested; what is missing is a `Spillable` impl on the
+        // operators that own spillable state (the aggregate's hash table, the sort's runs),
+        // which is a `bc-runtime`/`bc-interp` change rather than a pool one. Until then
+        // this call is a no-op seam — accurate to say so here rather than describe the
+        // behaviour it will have.
         Some(pool) => match pool.try_reserve_cooperative(estimate_bytes) {
             Ok(reservation) => Admit::InMemory(Some(reservation)),
-            // Pool full even after cooperative spilling: spill if there is a path to
-            // spill to, else best-effort in memory (a pool without an envelope can't
-            // strand the operator).
+            // Pool full (and, once consumers register, still full after they spilled):
+            // spill if there is a path to spill to, else best-effort in memory (a pool
+            // without an envelope can't strand the operator).
             Err(_) if opts.agg_spill.is_some() => Admit::Spill,
             Err(_) => Admit::InMemory(None),
         },

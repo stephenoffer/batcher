@@ -712,12 +712,12 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 133 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 98 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 55 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 172 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 208 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 430 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `reduce.py` | 183 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
-| `scaling.py` | 495 | Live cluster topology and the autoscaler request lifecycle. |
+| `scaling.py` | 500 | Live cluster topology and the autoscaler request lifecycle. |
 | `scheduling.py` | 292 | The metadata-driven scheduling envelope and placement-group machinery. |
 
 ### `batcher/dist/fleet/` — 4 · backend
@@ -1969,7 +1969,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 2820 | The multi-core executor. |
+| `par.rs` | 2830 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `stream/breaker.rs` | 427 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
@@ -2173,7 +2173,7 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 198 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `lib.rs` | 497 | Process-wide memory accounting for reserve-before-allocate. |
+| `lib.rs` | 506 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
 

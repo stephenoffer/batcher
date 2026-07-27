@@ -72,6 +72,15 @@ pub enum Pressure {
 /// failing the requester — so a small operator no longer dies while a large
 /// neighbour (or a concurrent query) sits on the budget. A consumer that cannot
 /// spill simply does not register and is never asked.
+///
+/// **No operator implements this yet.** The registry is empty in every build, so
+/// [`MemoryPool::try_reserve_cooperative`] currently behaves exactly as
+/// [`MemoryPool::try_reserve`] and the operator that happens to ask last is always the one
+/// that spills — whatever its size relative to its neighbours. That is a seam waiting for
+/// its first occupant, not a behaviour in force, and it is recorded here because the
+/// surrounding prose reads as a description of what happens today. The natural first
+/// implementors are the operators that already own spillable state: the aggregate's hash
+/// table (`bc-runtime::agg::spill`) and the external sort's runs.
 pub trait Spillable: Send + Sync {
     /// Spill at least `target` bytes of in-memory state to disk if possible,
     /// returning the bytes actually freed (`0` if it cannot spill right now).
