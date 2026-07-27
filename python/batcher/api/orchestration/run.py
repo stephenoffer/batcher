@@ -62,6 +62,7 @@ def _log_decisions(opt, decisions, verdict, *, distributed: bool) -> None:
         ops=len(opt.ops),
         feasible=verdict.feasible,
         binding=verdict.binding_constraint or "none",
+        binding_op=verdict.binding_op or "none",
         distributed=distributed,
     )
     for i, decision in enumerate(decisions):
@@ -396,6 +397,15 @@ def _run_relational(
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started
     )
+    if ctx.profile is not None:
+        # Recorded *after* execution, not at admission: the interesting figures are the
+        # envelope's high-water mark and the cache's hit rate, and at admission neither has
+        # happened yet. Without it a profile shows the plan and the timings but not the
+        # memory conditions, and the same plan reads as fast with headroom and slow at the
+        # edge of the budget.
+        from batcher.api.terminal.profile import resource_decision
+
+        ctx.profile.decisions.append(resource_decision(rm))
     return table, decisions
 
 

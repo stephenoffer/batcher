@@ -1147,7 +1147,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 |---|---|---|
 | `admission.py` | 126 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
-| `cpu_budget.py` | 129 | How many cores the engine should ask for, given how many it is really getting. |
+| `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 420 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 209 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
@@ -1569,7 +1569,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `metrics.py` | 389 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
-| `system.py` | 176 | The host and engine the queries are running on — the dashboard's hardware panel. |
+| `system.py` | 185 | The host and engine the queries are running on — the dashboard's hardware panel. |
 | `theme.py` | 144 | Terminal capability detection, the color ramp, and the glyph set — the console's look. |
 
 ### `batcher/observe/analytics/` — 2 · neutral sinks
@@ -1970,7 +1970,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 2820 | The multi-core executor. |
-| `rusage.rs` | 163 | Reading the operating system's own account of what this process consumed. |
+| `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `stream/breaker.rs` | 427 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 279 | Per-operator metrics for the streaming executor. |
