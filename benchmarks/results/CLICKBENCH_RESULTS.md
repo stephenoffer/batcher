@@ -207,6 +207,58 @@ A bare date-range filter over `hits` went **24.7 ms -> 8.6 ms**, matching the
 already-typed `DATE '...'` spelling (7.5 ms). This shape -- an ISO string compared against
 a date column -- is ubiquitous in real SQL, so the win is not ClickBench-specific.
 
+## Further optimization attempts, all measured and rejected
+
+After the two wins above, 28 queries still trailed DuckDB's native store by 566 ms in
+total. Every remaining structural explanation was tested and none held. Recorded so the
+next attempt does not repeat them:
+
+| hypothesis | measurement |
+|---|---|
+| Dictionary-encode the string group keys (Arrow has `DictionaryArray`, so it is inside the columnar contract) | The columns are **high**-cardinality: `URL` 2.62M distinct of 10M rows (26%), `Referer` 27%, `Title` 16%, `SearchPhrase` 8%. Dictionary encoding buys almost nothing here and the group-by still faces millions of distinct keys |
+| Larger morsels to cut task-dispatch and epoch-GC pressure (worth 20% on a TPC-H filter) | Full-suite sweep: 16,384 rows 2107.7 ms, 65,536 2095.8, 262,144 2095.2 -- **0.6%**, inside noise, and only 22/43 queries improve. Does not generalize from the TPC-H case |
+| A hotspot in the heaviest group-by queries | q37's profile is flat: nothing above 5.7%, ~22% accounted across the top eight symbols. There is no q28-shaped lever left |
+
+### Worker over-subscription is real, but not shippable as a constant
+
+The one effect that reproduced on **both** benchmarks is that the engine uses every logical
+core and loses throughput doing it. Full-suite sweep at 10M rows:
+
+| workers | total | vs 96 |
+|--:|--:|--:|
+| 48 | 2150.1 ms | -0.1% |
+| 64 | **2018.9 ms** | **+6.0%**, better on 32/43 |
+| 80 | 2087.8 ms | +2.8% |
+| 96 (default) | 2147.6 ms | -- |
+
+At 64 workers Batcher wins **18/43** against the native store rather than 15/43. The effect
+is genuine and matches TPC-H, where 64 also beat 96 (filter-count 25.5 ms against 27.6 ms).
+
+It is **not** committed, because the optimum is not a topology boundary this host explains:
+the box is 48 physical cores / 96 logical, and **48 performs no better than 96**. A hardcoded
+64 would be tuning to one machine, which `.claude/rules/performance.md` forbids. The right
+form is an adaptive worker-width policy that *measures* -- a Carbonite resource decision, and
+exactly the adaptive re-optimization the contract calls the moat -- rather than a constant.
+
+### An open lead: the repartition gather
+
+Profiling q32 (the heaviest query, `GROUP BY WatchID, ClientIP` over ~10M near-unique
+groups) does show one hotspot worth chasing:
+
+| % | symbol |
+|--:|---|
+| 22.65% | `arrow_select::interleave::interleave_primitive<Int64Type>` |
+| 13.78% | `bc_runtime::agg::group::assign::assign_groups_int64_multi` |
+| 4.39% | `arrow_select::interleave::interleave_primitive<Float64Type>` |
+
+`ops/repartition.rs` already has a fast flat gather and falls back to arrow's `interleave`
+only for strings, nested types, or a source carrying nulls -- and q32's columns have
+`null_count = 0` and no validity buffer, so they should take the fast path. The `Float64`
+entry says the shuffle is running over *post-aggregation* partial states, so something in
+that path is declining the fast gather. Confirming it needs instrumentation rather than a
+profile, so it is written down as a lead rather than claimed as a fix; 27% of the heaviest
+query is worth the next session's time.
+
 ## Where Batcher still trails the native store
 
 The remaining losses are group-by-heavy queries with high-cardinality string keys
@@ -241,8 +293,8 @@ engine:
 Those cells read `wrong` in the tables above and are excluded from the affected engine's
 total and geomean, so no engine is credited for being fast at being wrong.
 
-**PyArrow and Ray Data are absent.** ClickBench is SQL-only in this suite and, unlike
-TPC-H, carries no hand-written native pipelines for them.
+**PyArrow is absent.** ClickBench is SQL-only in this suite and, unlike TPC-H, carries no
+hand-written native pipeline for it.
 
 ## Regression check
 
