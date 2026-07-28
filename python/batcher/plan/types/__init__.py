@@ -11,6 +11,7 @@ Neutral layer: imports only `pyarrow` and `plan`; never `kyber`/`carbonite`/
 
 from __future__ import annotations
 
+from batcher.plan.types.footprint import retained_bytes, total_retained_bytes
 from batcher.plan.types.infer import infer_type
 from batcher.plan.types.lattice import promote, widen
 from batcher.plan.types.registry import CAST_DTYPES, DTYPE_REGISTRY
@@ -23,6 +24,8 @@ __all__ = [
     "column_bytes",
     "infer_type",
     "promote",
+    "retained_bytes",
     "schema_row_bytes",
+    "total_retained_bytes",
     "widen",
 ]

@@ -16,6 +16,7 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher.io.source import Source
+from batcher.plan.types import retained_bytes
 
 __all__ = ["stream_stream_join", "stream_watermark_dedup"]
 
@@ -50,11 +51,16 @@ def _check_stream_state(table: pa.Table | None, label: str) -> None:
     from batcher.config import active_config
 
     cap = active_config().memory.streaming_state_budget_bytes()
-    if table.nbytes > cap:
+    # Retained, not logical: streaming state is built by filtering old rows out of a
+    # larger table, which in Arrow can leave a window pinning the pre-eviction parent.
+    # Measuring the window is measuring the wrong table — the state would read as
+    # shrinking on every eviction while the process held everything it ever buffered.
+    held = retained_bytes(table)
+    if held > cap:
         from batcher._internal.errors import ResourceError
 
         raise ResourceError(
-            f"{label} streaming state reached {table.nbytes} bytes (cap {cap}): the "
+            f"{label} streaming state reached {held} bytes (cap {cap}): the "
             "watermark is not advancing (a stalled or one-sided stream), so old rows "
             "never evict. Advance event time, narrow the keys, or raise "
             "memory.streaming_state_max_bytes."

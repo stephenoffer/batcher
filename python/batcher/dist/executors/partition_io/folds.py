@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 
+from batcher.plan.types import retained_bytes
+
 _FOLD_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_FOLD_CHUNK_BYTES", str(256 << 20))))
 
 
@@ -40,7 +42,7 @@ def streaming_partial_aggregate(
 
     for b in batches:
         chunk.append(b)
-        size += b.nbytes
+        size += retained_bytes(b)
         if size >= chunk_bytes:
             fold(chunk)
             chunk, size = [], 0
@@ -76,7 +78,7 @@ def streaming_topn(nat, local_ir, merge_ir, batches, engine_config, chunk_bytes=
 
     for b in batches:
         chunk.append(b)
-        size += b.nbytes
+        size += retained_bytes(b)
         if size >= chunk_bytes:
             fold(chunk)
             chunk, size = [], 0

@@ -24,6 +24,7 @@ from inspect import signature
 
 from batcher._internal.logging import note_suppressed
 from batcher.io.splits import Split
+from batcher.plan.types import retained_bytes
 
 # Splits a worker reads ahead concurrently while folding the current one. A distributed
 # scan is I/O-LATENCY-bound on object storage (a single connection is far below a node's
@@ -260,13 +261,15 @@ def _read_split_batches(splits, projection, predicate, on_read_error="error"):
         return
     # Miss: stream the fresh read while accumulating it for the cache. If the partition
     # outgrows the budget, stop accumulating and just stream (never balloon memory).
+    # Charged what each batch *retains*: a reader that hands back a window of a larger
+    # buffer holds the whole buffer, and this cap is on memory held, not rows addressed.
     acc: list | None = []
     acc_bytes = 0
     for batch in _read_split_batches_uncached(splits, projection, predicate):
         yield batch
         if acc is not None:
             acc.append(batch)
-            acc_bytes += batch.nbytes
+            acc_bytes += retained_bytes(batch)
             if acc_bytes > _SCAN_CACHE_CAP:
                 acc = None  # too large to cache; keep streaming
     if acc is not None:

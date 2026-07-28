@@ -418,6 +418,11 @@ try:
             for r in range(n_reducers):
                 bucket = buckets[r] if r < len(buckets) else []
                 self.session.publish(_ticket(0, src, r, epoch), bucket)
+                # `nbytes`, deliberately, where the memory guards nearby use
+                # `plan.types.retained_bytes`: this figure predicts what a reducer will
+                # *pull over the wire*, and Arrow IPC writes only the rows a batch
+                # addresses. A window's pinned parent costs this worker memory (which the
+                # store's own cap governs) but costs the transfer nothing.
                 self._bucket_bytes[r] = sum(b.nbytes for b in bucket)
             return self.session.addr
 

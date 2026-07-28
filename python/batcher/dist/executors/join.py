@@ -31,6 +31,7 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
+from batcher.plan.types import retained_bytes, total_retained_bytes
 
 # Join types for which broadcasting the right (build) side and range-splitting the
 # left (probe) side is correct. The output is driven by left rows, so emitting per
@@ -450,15 +451,60 @@ def _broadcast_join(
     workers: int,
     hub=None,
 ) -> pa.Table:
-    """Broadcast the small (right/build) side to every worker and range-split the
-    big (left/probe) side — no shuffle of either side's keys.
+    """Broadcast the small (right/build) side of an equi-join, falling back to the
+    shuffle join when it will not fit.
 
-    The build side is materialized once on the driver (it is broadcast-small by the
-    planner's threshold) and shipped to every probe task, which joins its left chunk
-    against the full right. Correct only for `_BROADCAST_SAFE` join types (the
-    dispatcher guarantees this). Falls back to the shuffle join when the build side
-    is empty, so left/anti semantics over an empty right stay correct without a
-    hand-built empty schema.
+    The shuffle fallback also covers the empty build side, so left/anti semantics over an
+    empty right stay correct without a hand-built empty schema.
+    """
+    result = broadcast_probe_join(
+        above, join, join.left, join.right, _join_reducer_ir(join), sources, workers, hub=hub
+    )
+    if result is None:
+        return _shuffle_join(above, join, sources, workers, hub=hub)
+    return result
+
+
+def broadcast_probe_join(
+    above: list[LogicalPlan],
+    node: LogicalPlan,
+    left: LogicalPlan,
+    right: LogicalPlan,
+    reducer_ir: dict,
+    sources: list[Source],
+    workers: int,
+    hub=None,
+) -> pa.Table | None:
+    """Broadcast the small (right/build) side to every worker and split the big
+    (left/probe) side — no shuffle of either side's keys.
+
+    The build side is materialized once on the driver and shipped to every probe task,
+    which joins its left chunk against the full right. Because each probe task sees the
+    **whole** right side, every left row's match set is computed within its own partition,
+    and each left row belongs to exactly one partition — so the union of the per-partition
+    results is the full relation, with nothing duplicated and nothing missed. That argument
+    holds for any join whose output is a function of (one left row, all right rows), which
+    is exactly `_BROADCAST_SAFE`: `right`/`full` are excluded because a right row's
+    matched-ness is a global question no single partition can answer.
+
+    Nothing here reads the join *condition*, only the `reducer_ir` the caller supplies —
+    which is what lets the equi-join and the inequality (`RangeJoin`) path share it. Their
+    only real difference is what to do when the build side does not fit, so that decision
+    is the caller's: this returns **None** when the right side is empty or exceeds the
+    broadcast budget, rather than picking a fallback the caller may not have.
+
+    Args:
+        above: Operators stacked above the join, re-applied to the result.
+        node: The join node itself, used for the empty result's schema.
+        left: The probe side, partitioned across workers.
+        right: The build side, broadcast whole to every worker.
+        reducer_ir: Per-task IR joining source 0 (left chunk) with source 1 (full right).
+        sources: The bound sources for the whole plan.
+        workers: Probe-task fan-out.
+        hub: Optional metadata hub for worker metrics.
+
+    Returns:
+        The joined table, or None if the build side is empty or too large to broadcast.
     """
     nat = engine()
     from batcher.dist.shuffle_io import read_ipc, write_ipc
@@ -467,11 +513,11 @@ def _broadcast_join(
     _ensure_ray(workers)
     cfg_json = engine_config_json()
 
-    left_plan, left_sid = _relabel_single_source(join.left)
-    right_plan, right_sid = _relabel_single_source(join.right)
+    left_plan, left_sid = _relabel_single_source(left)
+    right_plan, right_sid = _relabel_single_source(right)
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
-    join_ir = json.dumps(_join_reducer_ir(join))
+    join_ir = json.dumps(reducer_ir)
     left_proj, left_pred = source_pushdown(left_plan, 0)
     right_proj, right_pred = source_pushdown(right_plan, 0)
 
@@ -482,13 +528,17 @@ def _broadcast_join(
 
     right_in = read_source(sources[right_sid], right_proj, right_pred)
     right_full = nat.execute_plan(right_ir, [right_in], cfg_json)
+    # Measured on what the build side *retains*, not what it addresses: a batch cut by
+    # offset from a larger one pins the parent, so `nbytes` here would pass a side well
+    # over the threshold and then replicate it to every worker — the exact OOM this guard
+    # exists to prevent, reached through the guard.
     if (
         not right_full
         or sum(b.num_rows for b in right_full) == 0
-        or sum(b.nbytes for b in right_full)
+        or total_retained_bytes(right_full)
         > active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes())
     ):
-        return _shuffle_join(above, join, sources, workers, hub=hub)
+        return None
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
@@ -531,7 +581,7 @@ def _broadcast_join(
         _rmtree(work_dir)
 
     if not batches:
-        result = empty_result_table(join, [o.alias for o in join.output])
+        result = empty_result_table(node, node.available_columns())
     else:
         result = pa.Table.from_batches(batches)
     return result if not above else _apply_above(above, result)
@@ -623,12 +673,15 @@ def _stream_broadcast_join(
 
 def _byte_chunks(batches, target_bytes: int):
     """Group an iterable of batches into lists of about `target_bytes` each (always at
-    least one batch per chunk), so a streaming consumer bounds its working set."""
+    least one batch per chunk), so a streaming consumer bounds its working set.
+
+    Sized by retained bytes: the bound is on memory held, and a batch that windows a
+    larger parent holds the parent whatever `nbytes` reports."""
     chunk: list = []
     size = 0
     for b in batches:
         chunk.append(b)
-        size += b.nbytes
+        size += retained_bytes(b)
         if size >= target_bytes:
             yield chunk
             chunk, size = [], 0

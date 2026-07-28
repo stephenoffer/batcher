@@ -25,8 +25,15 @@ import pyarrow as pa
 from batcher._internal.mathx import safe_div
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import active_config
+from batcher.plan.types import retained_bytes as _retained_bytes
 
 __all__ = ["CacheStore", "current_result_cache", "reset_result_cache", "result_cache"]
+
+
+# `_retained_bytes` is `plan.types.retained_bytes`: what the table keeps resident, not the
+# size of the rows it addresses. Measured on this engine, `limit(10)` over 2M rows reports
+# 160 bytes from `nbytes` and retains 262,144 — morselization bounds the per-entry ratio at
+# one morsel, and a table from a source that does not morselize carries no bound at all.
 
 
 #: How many times a table's retained footprint may exceed its logical size before the
@@ -37,37 +44,6 @@ _COMPACT_RATIO = 4.0
 #: Below this, the excess is not worth a copy whatever the ratio says — a 200-byte entry
 #: pinning 4 KiB is not a memory problem, and the copy is pure overhead.
 _COMPACT_FLOOR_BYTES = 1 << 20
-
-
-def _retained_bytes(table: pa.Table) -> int:
-    """Bytes the process cannot reclaim while `table` is referenced.
-
-    **Not** `Table.nbytes`, which is the size of the *rows the table addresses*. A sliced
-    or zero-copy-derived table addresses a window of a parent buffer and keeps the whole
-    parent alive, so the two figures can differ by orders of magnitude: a 10-row slice of a
-    4M-row column reports 80 bytes from `nbytes` and pins 32 MB. A cache budgeted on
-    `nbytes` would then hold hundreds of times its budget in real memory, and the entry
-    that does it is the *cheapest-looking* one, so eviction never chooses it.
-
-    Measured on this engine: `bt.from_pydict(2M rows).limit(10).collect()` reports 160
-    bytes and retains 262,144 — a morsel's buffers, a 1,638x under-count. The engine's
-    morselization is what bounds the ratio per entry; a table handed in from a source that
-    does not morselize has no such bound.
-
-    `get_total_buffer_size` is the retained figure. It over-counts when two columns share a
-    buffer (a dictionary encoded twice), which is the safe direction: over-counting evicts
-    an entry sooner and costs a recompute, where under-counting costs the process.
-
-    Args:
-        table: The result to measure.
-
-    Returns:
-        The retained byte count, falling back to `nbytes` if the table cannot report one.
-    """
-    try:
-        return max(int(table.get_total_buffer_size()), int(table.nbytes))
-    except (AttributeError, TypeError):  # pragma: no cover - a table-like without the API
-        return int(table.nbytes)
 
 
 def _compacted(table: pa.Table, retained: int) -> tuple[pa.Table, int]:
