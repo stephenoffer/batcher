@@ -3,7 +3,7 @@
 //! prove the credit bound.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -228,8 +228,63 @@ impl PartitionStore {
         }
         let Some(dir) = self.spill_dir() else { return };
         let mut guard = self.partitions.write().await;
+        self.spill_down_to(&mut guard, dir, cap);
+    }
+
+    /// Free at least `target` bytes on demand, returning what was actually freed.
+    ///
+    /// This is the store's half of a *cooperative* reservation: when an operator cannot get
+    /// memory from `bc-resource`'s pool, the pool asks its registered consumers to yield
+    /// some, largest first, before refusing. Published shuffle output is the ideal thing to
+    /// ask — it is finished work sitting idle waiting to be collected, so spilling it costs
+    /// a re-read and stalls nobody, where spilling a half-built hash table costs the
+    /// operator that is actively using it.
+    ///
+    /// **Synchronous and non-blocking on purpose.** The pool calls this from whatever
+    /// thread lost a reservation, which may be a tokio worker; blocking on an async lock
+    /// there would deadlock the runtime serving the very fetches that would drain this
+    /// store. `try_write` instead: if the map is busy, this returns `0`, which the
+    /// `Spillable` contract explicitly allows and the pool treats as "this consumer cannot
+    /// help right now". A missed opportunity is recoverable; a hung shuffle server is not.
+    ///
+    /// Independent of `cap`: a store with no configured cap still answers, because the
+    /// caller here is real memory pressure rather than a configured bound.
+    pub(crate) fn try_spill_at_least(&self, target: usize) -> usize {
+        if target == 0 {
+            return 0;
+        }
+        let held = self.retained.load(Ordering::Relaxed);
+        if held == 0 {
+            return 0;
+        }
+        let Some(dir) = self.spill_dir() else {
+            return 0;
+        };
+        let Ok(mut guard) = self.partitions.try_write() else {
+            return 0;
+        };
+        let floor = held.saturating_sub(target);
+        self.spill_down_to(&mut guard, dir, floor)
+    }
+
+    /// Spill resident buckets, largest first, until `retained <= floor`. Returns bytes freed.
+    ///
+    /// Largest-first, because the point is to get back under the bound in the fewest
+    /// re-reads later: one big bucket costs one, many small ones cost many. Spilling is
+    /// result-preserving — the same batches return through the Arrow IPC round trip — so
+    /// this trades a re-read for a memory bound and can never change an answer.
+    ///
+    /// Caller holds the map's write guard, which is what lets the async cap enforcement and
+    /// the synchronous cooperative path share one implementation of the choice of victim.
+    fn spill_down_to(
+        &self,
+        guard: &mut HashMap<String, Partition>,
+        dir: &Path,
+        floor: usize,
+    ) -> usize {
+        let mut freed = 0usize;
         loop {
-            if self.retained.load(Ordering::Relaxed) <= cap {
+            if self.retained.load(Ordering::Relaxed) <= floor {
                 break;
             }
             // The largest still-resident bucket.
@@ -247,14 +302,16 @@ impl PartitionStore {
             };
             let path = dir.join(format!("{}.arrow", sanitize_ticket(&ticket)));
             if crate::shared::write_ipc_file(&path, batches).is_err() {
-                // Nowhere to put it: stop rather than spin. Staying over the cap is worse
+                // Nowhere to put it: stop rather than spin. Staying over the bound is worse
                 // than it was, but failing the publish would be worse still — the bucket
                 // is already produced and a reducer is waiting for it.
                 break;
             }
             p.body = Body::Spilled(path);
             self.retained.fetch_sub(p.nbytes, Ordering::Relaxed);
+            freed += p.nbytes;
         }
+        freed
     }
 
     /// This store's spill directory, created once on first use.
@@ -599,6 +656,106 @@ mod tests {
     /// far more than the cap and checks the process's own resident set, so a bug that
     /// merely stopped counting (rather than stopped holding) fails here.
     #[cfg(target_os = "linux")]
+    /// The cooperative-reservation entry point frees what it is asked for.
+    #[tokio::test]
+    async fn an_on_demand_spill_frees_at_least_what_was_asked() {
+        let store = PartitionStore::with_cap(0); // no cap: pressure, not a bound, drives this
+        for i in 0..6 {
+            store
+                .register(format!("70/0/{i}/0/0"), vec![wide_batch(i, 20_000)])
+                .await;
+        }
+        let held = store.retained_bytes();
+        assert!(held > 0);
+
+        let want = held / 2;
+        let freed = store.try_spill_at_least(want);
+
+        assert!(freed >= want, "freed {freed}, asked {want}");
+        assert_eq!(store.retained_bytes(), held - freed);
+    }
+
+    /// It must not spill the whole store to satisfy a small request.
+    ///
+    /// The pool asks for a deficit, not for everything. Over-spilling turns one tight
+    /// reservation into a re-read of every bucket on the node, which is how a memory
+    /// mechanism becomes a throughput problem.
+    #[tokio::test]
+    async fn an_on_demand_spill_stops_once_the_target_is_met() {
+        let store = PartitionStore::with_cap(0);
+        for i in 0..8 {
+            store
+                .register(format!("71/0/{i}/0/0"), vec![wide_batch(i, 20_000)])
+                .await;
+        }
+        let held = store.retained_bytes();
+        store.try_spill_at_least(1); // one byte: the smallest possible ask
+        assert!(
+            store.retained_bytes() > 0,
+            "a one-byte request emptied the whole store"
+        );
+        assert!(store.retained_bytes() < held, "nothing was spilled at all");
+    }
+
+    /// Spilled-on-demand buckets must still serve the identical rows.
+    ///
+    /// This is the property that makes the whole mechanism admissible: a memory strategy
+    /// that changed an answer would be a correctness bug wearing a performance costume.
+    #[tokio::test]
+    async fn an_on_demand_spilled_bucket_reads_back_identically() {
+        let store = PartitionStore::with_cap(0);
+        let mut expected = Vec::new();
+        for i in 0..4 {
+            let batch = wide_batch(i, 20_000);
+            expected.push(batch.clone());
+            store.register(format!("72/0/{i}/0/0"), vec![batch]).await;
+        }
+        store.try_spill_at_least(store.retained_bytes()); // spill everything
+
+        for (i, want) in expected.iter().enumerate() {
+            let got = store.get(&format!("72/0/{i}/0/0")).await.expect("bucket");
+            assert_eq!(got.len(), 1);
+            assert_eq!(&got[0], want, "bucket {i} changed across the spill");
+        }
+    }
+
+    /// A zero request is a no-op, and an empty store answers zero rather than churning.
+    #[tokio::test]
+    async fn an_on_demand_spill_declines_when_there_is_nothing_to_do() {
+        let store = PartitionStore::with_cap(0);
+        assert_eq!(store.try_spill_at_least(1 << 20), 0, "empty store spilled");
+
+        store
+            .register("73/0/0/0/0".to_string(), vec![wide_batch(0, 20_000)])
+            .await;
+        assert_eq!(store.try_spill_at_least(0), 0, "zero-byte request spilled");
+        assert!(store.retained_bytes() > 0);
+    }
+
+    /// It yields rather than waits when the map is busy.
+    ///
+    /// The pool may call this from a tokio worker thread. Blocking there on the store's
+    /// async lock would deadlock the runtime serving the very fetches that would drain the
+    /// store, so a contended call must return `0` and let the pool move on. `0` is an
+    /// explicitly permitted answer under the `Spillable` contract.
+    #[tokio::test]
+    async fn a_busy_store_declines_instead_of_blocking() {
+        let store = PartitionStore::with_cap(0);
+        store
+            .register("74/0/0/0/0".to_string(), vec![wide_batch(0, 20_000)])
+            .await;
+        let held = store.retained_bytes();
+
+        let guard = store.partitions.write().await;
+        let freed = store.try_spill_at_least(held);
+        drop(guard);
+
+        assert_eq!(freed, 0, "it took the slow path while the map was held");
+        assert_eq!(store.retained_bytes(), held);
+        // And it recovers once the lock is free — a decline is not a latch.
+        assert!(store.try_spill_at_least(held) > 0);
+    }
+
     #[tokio::test]
     async fn spilling_actually_returns_memory_to_the_process() {
         fn rss_bytes() -> usize {

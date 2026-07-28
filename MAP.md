@@ -366,7 +366,7 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 |---|---|---|
 | `dispatch.py` | 465 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
 | `union.py` | 83 | When a UNION streams branch by branch, and how its branches are addressed. |
-| `watermark.py` | 287 | Watermark-bounded streaming operators for `iter_batches` (control plane, `api`). |
+| `watermark.py` | 293 | Watermark-bounded streaming operators for `iter_batches` (control plane, `api`). |
 
 ### `batcher/api/tuning/` — 5 · conductor
 
@@ -661,7 +661,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 353 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 342 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 154 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1104 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1109 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 183 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 99 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 105 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -687,7 +687,7 @@ Per-operator distributed executor implementations.
 | `join.py` | 865 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `map.py` | 1444 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
-| `scan_read.py` | 519 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
+| `scan_read.py` | 522 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 216 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 49 | Distributed UNION — distribute each branch, then concatenate (and dedup). |
 | `window.py` | 144 | Distributed window functions over a disk Arrow-IPC shuffle. |
@@ -1933,7 +1933,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
-| `flight.rs` | 451 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 509 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `lib.rs` | 720 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
@@ -2156,11 +2156,11 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 
 | file | lines | what it is |
 |---|---|---|
-| `exchange.rs` | 700 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
+| `exchange.rs` | 715 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 387 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 105 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `shared.rs` | 411 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 350 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `store.rs` | 407 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 91 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 184 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |
@@ -2174,7 +2174,7 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 198 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `lib.rs` | 506 | Process-wide memory accounting for reserve-before-allocate. |
+| `lib.rs` | 515 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
 

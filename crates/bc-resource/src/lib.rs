@@ -73,14 +73,23 @@ pub enum Pressure {
 /// neighbour (or a concurrent query) sits on the budget. A consumer that cannot
 /// spill simply does not register and is never asked.
 ///
-/// **No operator implements this yet.** The registry is empty in every build, so
-/// [`MemoryPool::try_reserve_cooperative`] currently behaves exactly as
-/// [`MemoryPool::try_reserve`] and the operator that happens to ask last is always the one
-/// that spills — whatever its size relative to its neighbours. That is a seam waiting for
-/// its first occupant, not a behaviour in force, and it is recorded here because the
-/// surrounding prose reads as a description of what happens today. The natural first
-/// implementors are the operators that already own spillable state: the aggregate's hash
-/// table (`bc-runtime::agg::spill`) and the external sort's runs.
+/// **One occupant so far, and it frees a different currency than it is asked for.** The
+/// published shuffle store registers (`bc-py`'s `ShuffleSpiller`, over
+/// `bc-transport`'s `PartitionStore`), which makes the cooperative path do real work: it
+/// writes idle finished buckets to disk and hands their memory back to the process.
+///
+/// What it does *not* do is make the pending reservation fit. Those buckets were never
+/// reserved here — a mapper hands one over and it stays resident until a reducer collects
+/// it, which is precisely why they are the memory a reservation is most often losing to —
+/// so spilling them does not move `available()`. The progress check below sees that, stops
+/// after one round, and returns the failure. The caller is then refused, as it would have
+/// been, but into a process with room for its own spill path to run. Treat that as the
+/// honest reading of what the cooperative path buys today; the reservation only starts to
+/// *succeed* once a consumer's memory is charged to this pool in the first place.
+///
+/// The operators that would close that gap are the ones already owning spillable state
+/// they reserve for: the aggregate's hash table (`bc-runtime::agg::spill`) and the external
+/// sort's runs. Both are mid-`par_iter` state, which is why neither is here yet.
 pub trait Spillable: Send + Sync {
     /// Spill at least `target` bytes of in-memory state to disk if possible,
     /// returning the bytes actually freed (`0` if it cannot spill right now).
@@ -614,6 +623,62 @@ mod tests {
         fn spillable_bytes(&self) -> usize {
             self.reservation.lock().unwrap().size()
         }
+    }
+
+    /// A consumer whose memory was never charged here — the real first occupant's shape.
+    ///
+    /// The published shuffle store frees genuine process memory on `spill`, but those bytes
+    /// were never reserved against this pool, so `available()` does not move. Two things
+    /// must hold, and they pull in opposite directions: the consumer must actually be
+    /// *asked* (that is the whole benefit — real RAM comes back for the caller's own spill
+    /// path), and the loop must still terminate and return the failure rather than asking
+    /// forever for bytes that will never arrive.
+    ///
+    /// The progress check reads the pool, not the consumer's claim, which is exactly what
+    /// makes both true. This test exists so that check is never "simplified" into trusting
+    /// the returned figure.
+    struct OffPoolConsumer {
+        spill_calls: AtomicUsize,
+        held: AtomicUsize,
+    }
+
+    impl Spillable for OffPoolConsumer {
+        fn spill(&self, target: usize) -> usize {
+            self.spill_calls.fetch_add(1, Ordering::AcqRel);
+            // Frees memory somewhere else in the process; the pool's `used` is untouched.
+            let freed = target.min(self.held.load(Ordering::Acquire));
+            self.held.fetch_sub(freed, Ordering::AcqRel);
+            freed
+        }
+        fn spillable_bytes(&self) -> usize {
+            self.held.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn a_consumer_that_frees_untracked_memory_is_asked_once_and_then_gives_up() {
+        let pool = MemoryPool::new(1000);
+        let _hog = pool.try_reserve(900).unwrap();
+        let off_pool = Arc::new(OffPoolConsumer {
+            spill_calls: AtomicUsize::new(0),
+            held: AtomicUsize::new(1 << 30), // "holding" a gigabyte the pool cannot see
+        });
+        pool.register_consumer(&(Arc::clone(&off_pool) as Arc<dyn Spillable>));
+
+        assert!(
+            pool.try_reserve_cooperative(500).is_err(),
+            "the reservation cannot fit: freeing untracked memory does not free pool credit"
+        );
+        assert_eq!(
+            off_pool.spill_calls.load(Ordering::Acquire),
+            1,
+            "it must be asked exactly once — never zero (no benefit) and never repeatedly \
+             (an unterminating loop over bytes that never reach this pool)"
+        );
+        assert!(
+            off_pool.held.load(Ordering::Acquire) < 1 << 30,
+            "the ask did not reach the consumer"
+        );
     }
 
     #[test]

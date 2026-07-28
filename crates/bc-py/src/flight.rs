@@ -28,8 +28,51 @@ use crate::to_pyerr;
 /// own `ServerHandle` keeps this server's serve task alive for the object's life.
 #[pyclass]
 pub(crate) struct FlightShuffleServer {
-    pub(crate) exchange: bc_transport::ShuffleExchange,
+    pub(crate) exchange: std::sync::Arc<bc_transport::ShuffleExchange>,
     addr: String,
+    /// Keeps this server's [`ShuffleSpiller`] registration alive.
+    ///
+    /// The pool holds only a `Weak`, so it is this field that decides how long the shuffle
+    /// store is a spill candidate: exactly as long as the server serving it exists. Drop
+    /// the server and the entry goes dead, to be swept on the pool's next slow path.
+    _spiller: std::sync::Arc<dyn bc_resource::Spillable>,
+}
+
+/// The published shuffle store, offered to the memory pool as something it may spill.
+///
+/// **The first real occupant of a seam that had none.** `MemoryPool::try_reserve_cooperative`
+/// is written to ask registered consumers to yield memory before it refuses a reservation,
+/// but nothing in the workspace implemented [`bc_resource::Spillable`], so it behaved
+/// exactly as the plain `try_reserve` and every over-budget operator spilled *itself*
+/// regardless of what else on the node was holding more.
+///
+/// Published shuffle output is the right first answer to that. It is finished work sitting
+/// idle waiting to be collected, so writing it to disk stalls nobody and costs one re-read
+/// — where spilling the natural alternatives (an aggregate's half-built hash table, a
+/// sort's in-progress runs) interrupts an operator that is actively using them, mid-
+/// `par_iter`, and is a much larger piece of work. It is also the memory Carbonite's pool
+/// cannot otherwise see at all, which makes it exactly the memory a reservation is most
+/// likely to be losing to.
+struct ShuffleSpiller {
+    exchange: std::sync::Arc<bc_transport::ShuffleExchange>,
+}
+
+impl bc_resource::Spillable for ShuffleSpiller {
+    /// Free at least `target` bytes of published buckets, returning what was freed.
+    ///
+    /// Never re-enters the pool (it only writes files and drops `Arc`s), and never blocks:
+    /// the pool may call this from a tokio worker thread, where waiting on the store's lock
+    /// would deadlock the runtime serving the fetches that would otherwise drain it. A busy
+    /// store returns `0`, which the pool reads as "cannot help right now" and moves on to
+    /// the next consumer.
+    fn spill(&self, target: usize) -> usize {
+        self.exchange.try_spill_at_least(target)
+    }
+
+    /// Resident published bytes — the pool spills the largest consumer first.
+    fn spillable_bytes(&self) -> usize {
+        self.exchange.retained_bytes()
+    }
 }
 
 #[pymethods]
@@ -122,7 +165,22 @@ impl FlightShuffleServer {
             )) {
                 Ok(exchange) => {
                     let addr = exchange.advertised_addr().to_string();
-                    return Ok(Self { exchange, addr });
+                    let exchange = std::sync::Arc::new(exchange);
+                    let spiller: std::sync::Arc<dyn bc_resource::Spillable> =
+                        std::sync::Arc::new(ShuffleSpiller {
+                            exchange: std::sync::Arc::clone(&exchange),
+                        });
+                    // `0` gets-or-creates the process pool without disturbing its limit,
+                    // which only ever grows: a server built before the first `execute_plan`
+                    // registers against a pool the first query then sizes. Nothing reserves
+                    // in between, because reservations happen inside `execute_plan`, after
+                    // it has set the budget.
+                    crate::process::shared_memory_pool(0).register_consumer(&spiller);
+                    return Ok(Self {
+                        exchange,
+                        addr,
+                        _spiller: spiller,
+                    });
                 }
                 Err(e) => last_err = Some(e),
             }

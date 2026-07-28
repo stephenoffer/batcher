@@ -253,6 +253,21 @@ impl ShuffleExchange {
         self.store.retained_bytes()
     }
 
+    /// Yield at least `target` bytes of published shuffle output to disk, returning what
+    /// was actually freed.
+    ///
+    /// The hook a memory pool calls when a reservation it cannot grant would otherwise
+    /// fail. Published buckets are the right thing to ask for first: they are finished work
+    /// waiting to be collected, so spilling one costs a re-read and blocks nobody.
+    ///
+    /// Non-blocking. Returns `0` if the store is busy or has nothing resident, which the
+    /// caller must treat as "not right now" rather than as an error — the alternative,
+    /// blocking on the store's lock from an arbitrary thread, can deadlock the runtime
+    /// serving the fetches that would drain it.
+    pub fn try_spill_at_least(&self, target: usize) -> usize {
+        self.store.try_spill_at_least(target)
+    }
+
     /// Fetch a remote partition from `(addr, ticket)` with a credit-bounded
     /// stream using the default window ([`DEFAULT_CREDITS`]).
     ///
