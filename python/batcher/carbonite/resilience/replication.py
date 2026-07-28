@@ -66,7 +66,18 @@ def assign_replica_hosts(
         return out
 
     live = [w for w in range(len(nodes)) if w not in dead]
+    # Seed the load with the primaries each worker already holds, not zero.
+    #
+    # A primary copy and a replica copy are the same bucket and cost the same memory, so a
+    # worker hosting many primaries is genuinely the most loaded host on the cluster — and
+    # counting only replicas made it look like the emptiest one, so it attracted them.
+    # Measured on four workers where one held three of four primaries: that worker was
+    # handed a replica too and ended up with 4 of the 8 copies, against 1 each for two idle
+    # workers. Seeding drops its share to 3 and lifts the idle workers to 2.
     load = dict.fromkeys(live, 0)
+    for primary in primaries.values():
+        if primary in load:
+            load[primary] += 1
     for src in sorted(primaries):
         primary = primaries[src]
         primary_node = nodes[primary] if primary < len(nodes) else None

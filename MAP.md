@@ -1163,7 +1163,7 @@ Carbonite fault tolerance: Spark-style recompute-from-lineage on worker loss.
 | `lineage.py` | 103 | Shuffle lineage — how to recompute an output a lost worker produced. |
 | `preemption.py` | 236 | Spot-preemption detection so the engine drains proactively, not reactively. |
 | `recovery.py` | 135 | Shuffle recovery — the recompute-on-failure coordination loop. |
-| `replication.py` | 110 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
+| `replication.py` | 121 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
 | `speculative.py` | 269 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
 
 ### `batcher/carbonite/spill/` — 3 · subsystem
