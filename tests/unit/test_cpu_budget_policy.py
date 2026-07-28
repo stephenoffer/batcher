@@ -114,3 +114,51 @@ def test_oversubscription_folds_queueing_and_stalling(monkeypatch):
         hw_cpu, "cpu_contention", lambda: {"load_per_core": 3.0, "throttled_ratio": 0.5}
     )
     assert hw_cpu.cpu_oversubscription() == pytest.approx(6.0)
+
+
+def test_a_parallelism_only_recommendation_preserves_the_morsel_target(monkeypatch):
+    # `recommended_config` used to fire on one lever (the morsel target) and now folds in a
+    # second (fan-out). The merge is hand-rolled, so this pins the case that a hand-rolled
+    # merge gets wrong: changing only the new lever must leave the old one exactly as
+    # configured, not reset it to a default the engine would then run with.
+    from batcher.carbonite import manager as mgr
+
+    monkeypatch.setattr(mgr, "effective_core_budget", lambda: 3)
+    monkeypatch.setattr(mgr, "available_cpu_count", lambda: 16)
+    manager = mgr.ResourceManager()
+    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None: None)
+
+    recommended = manager.recommended_config()
+    assert recommended is not None
+    configured = mgr.active_config().execution
+    assert recommended.execution.parallelism == 3
+    assert recommended.execution.morsel_rows == configured.morsel_rows
+    assert recommended.execution.morsel_bytes == configured.morsel_bytes
+
+
+def test_both_levers_apply_together(monkeypatch):
+    # And when both move, neither silently wins: a pressured, contended machine needs the
+    # tighter morsel *and* the narrower fan-out.
+    from batcher.carbonite import manager as mgr
+
+    monkeypatch.setattr(mgr, "effective_core_budget", lambda: 4)
+    monkeypatch.setattr(mgr, "available_cpu_count", lambda: 32)
+    manager = mgr.ResourceManager()
+    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None: (2048, 65536))
+
+    recommended = manager.recommended_config()
+    assert recommended is not None
+    assert recommended.execution.parallelism == 4
+    assert recommended.execution.morsel_rows == 2048
+    assert recommended.execution.morsel_bytes == 65536
+
+
+def test_an_unpressured_uncontended_machine_still_gets_no_config(monkeypatch):
+    # The fast path must survive gaining a second lever: neither moving means no config is
+    # built and no engine config is reshipped.
+    from batcher.carbonite import manager as mgr
+
+    monkeypatch.setattr(mgr, "effective_core_budget", lambda: mgr.available_cpu_count())
+    manager = mgr.ResourceManager()
+    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None: None)
+    assert manager.recommended_config() is None
