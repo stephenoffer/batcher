@@ -1133,7 +1133,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 99 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 152 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `learned.py` | 373 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
@@ -1145,12 +1145,12 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 
 | module | lines | what it is |
 |---|---|---|
-| `admission.py` | 126 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
+| `admission.py` | 107 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 464 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
-| `scheduling.py` | 209 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
+| `scheduling.py` | 208 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 105 | How wide and how compressed a spilled state should be. |
 

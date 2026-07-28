@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import available_cpu_count
-from batcher.carbonite.memory.estimator import peak_operator_bytes
+from batcher.carbonite.memory.estimator import learned_plan_peak
 from batcher.plan.resource import SchedulingEnvelope
 
 if TYPE_CHECKING:
@@ -120,8 +120,7 @@ class DefaultSchedulingPolicy:
         # Kyber could not size the plan. Blended toward the measured peak (learned from
         # `m_peak_bytes`) when available, so each distributed worker gets a right-sized
         # grant instead of one sized from the plan guess; cold families pass through.
-        model = ctx.memory_model
-        peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
+        peak = learned_plan_peak(plan, ctx.memory_model)
         # The configured value, not `morsel_rows * row_bytes`. The two agree only at the
         # defaults (16,384 x 64 == 1 MiB); `ResourceManager.recommended_config` rewrites
         # `morsel_rows` (from the learned per-row width) and `morsel_bytes` (from the

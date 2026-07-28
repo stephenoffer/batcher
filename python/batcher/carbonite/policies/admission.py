@@ -8,11 +8,10 @@ letting the query OOM.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from batcher.carbonite.memory.estimator import binding_operator, learned_plan_peak
 from batcher.carbonite.memory.pressure import total_memory_bytes
-from batcher.plan.physical import PhysicalOp
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds
 from batcher.plan.stats import Provenance
 
@@ -77,11 +76,11 @@ class BudgetingAdmission:
         # against what the family really used — admitting a query the plan over-sized
         # (avoiding a needless spill route) and catching one the plan under-sized
         # (avoiding an OOM). Cold families pass through unchanged.
-        model = ctx.memory_model
-        if model is not None:
-            peak = model.plan_peak(plan.ops)
-        else:
-            peak = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+        #
+        # The shared rule, not a local `max`: admission and the distributed grant must
+        # size against the identical figure, or a query is admitted against one envelope
+        # and granted another.
+        peak = learned_plan_peak(plan, ctx.memory_model)
         if peak <= envelope:
             return FeasibilityVerdict(feasible=True)
         # Over budget: offer the envelope as the per-operator bound so the engine can
@@ -94,7 +93,7 @@ class BudgetingAdmission:
         # *advisory* — it still routes the plan out-of-core, but the conductor will not
         # fail a query on it. Rejecting on a guess breaks the admission contract that a
         # guess never fails a legitimate query.
-        binding = _binding_op(plan.ops)
+        binding = binding_operator(plan)
         return FeasibilityVerdict(
             feasible=False,
             binding_constraint="memory",
@@ -106,21 +105,3 @@ class BudgetingAdmission:
             binding_op=None if binding is None else f"{binding.kind}#{int(binding.op_id)}",
             advisory=binding is None or binding.properties.provenance is Provenance.DEFAULT,
         )
-
-
-def _binding_op(ops: Sequence[PhysicalOp]) -> PhysicalOp | None:
-    """The operator holding the plan's peak memory estimate, or `None` if none is sized.
-
-    This is the operator the verdict is *about*. Two things read it: whether the verdict
-    rests on a guess (`Provenance.DEFAULT` means the row count came from a Selinger
-    constant with nothing measured behind it, and a guess must never *fail* a legitimate
-    query), and which operator to name in `binding_op` so the answer is actionable.
-
-    Args:
-        ops: The plan's annotated operators.
-
-    Returns:
-        The peak-memory operator, or `None` when nothing was sizable.
-    """
-    sized = [op for op in ops if op.bounds.m_max_bytes > 0]
-    return max(sized, key=lambda op: op.bounds.m_max_bytes) if sized else None
