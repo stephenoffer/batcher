@@ -218,7 +218,13 @@ QUERIES: dict[str, str] = {
                             WHERE l_partkey = p_partkey)
     """,
     "tpch-q18": """
-        SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)
+        -- The aggregate carries an explicit alias. Unaliased, each engine invents its
+        -- own name ("sum(l_quantity)" in DuckDB, "l_quantity" in Daft) and the harness
+        -- compares by column name, so Daft was reported FAILED on a naming difference
+        -- while its values were right. A bare identifier (not a quoted one) is used
+        -- because Spark's parser rejects double-quoted identifiers outside ANSI mode.
+        SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice,
+               sum(l_quantity) AS sum_qty
         FROM customer, orders, lineitem
         WHERE o_orderkey IN (
                   SELECT l_orderkey FROM lineitem GROUP BY l_orderkey
@@ -291,9 +297,10 @@ QUERIES: dict[str, str] = {
     """,
 }
 
-# Register each query as the SQL fanout plus a native Ray Data pipeline where one
-# exists (`tpch_ray`), so Ray Data — which has no SQL surface — still competes on the
-# queries it can express instead of showing `n/a` on all 22.
+# Register each query as the SQL fanout plus the native DataFrame pipelines. Ray Data
+# has no SQL surface, so without `tpch_ray` it would show `n/a` on all 22; that package
+# now covers every query, so the distributed comparator is measured on the whole
+# benchmark rather than the four queries it once had.
 for _name, _query in QUERIES.items():
     REGISTRY.add(
         Case(family="tpch", name=_name, dataset="tpch", build=case_with_ray(_name, _query))

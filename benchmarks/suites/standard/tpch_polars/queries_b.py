@@ -174,14 +174,14 @@ def q18(t: dict[str, pl.LazyFrame]) -> pl.LazyFrame:
         .group_by("c_name", "o_custkey", "o_orderkey", "o_orderdate", "o_totalprice")
         # The SQL leaves this aggregate unaliased; DuckDB names it after the expression
         # and the harness compares on column names, so it is reproduced verbatim.
-        .agg(pl.col("l_quantity").sum().alias("sum(l_quantity)"))
+        .agg(pl.col("l_quantity").sum().alias("sum_qty"))
         .select(
             "c_name",
             pl.col("o_custkey").alias("c_custkey"),
             "o_orderkey",
             "o_orderdate",
             "o_totalprice",
-            "sum(l_quantity)",
+            "sum_qty",
         )
         .sort(["o_totalprice", "o_orderdate"], descending=[True, False])
         .head(100)
