@@ -134,7 +134,9 @@ class ResourceManager:
         """
         return self._admission.validate(plan, self._ctx)
 
-    def grant_credits(self, requested: int, *, signature: str | None = None) -> int:
+    def grant_credits(
+        self, requested: int, *, signature: str | None = None, channels: int | None = None
+    ) -> int:
         """Grant a credit window (in-flight `RecordBatch` slots) for a data channel.
 
         One credit = one buffered batch, so the returned window bounds a shuffle
@@ -160,7 +162,17 @@ class ResourceManager:
         # constructed with: a deployment that supplied its own flow control got it for every
         # cold channel and lost it for exactly the recurring ones it had tuned for. The
         # static policy applies the identical clamp, so the default path is unchanged.
-        return self._flow_control.grant(requested, self._ctx)
+        #
+        # `channels` is how many channels will actually fetch at once. The per-channel byte
+        # budget is divided by it rather than by the configured `shuffle_fetch_fan_in`,
+        # which caps concurrency without measuring it — a reducer with three upstreams was
+        # being handed a budget sized for eight, so its three channels could together
+        # buffer nearly three times the intended share. `None` keeps the configured fan-in,
+        # which is what a caller that cannot know its width gets.
+        ctx = self._ctx
+        if channels is not None and channels > 0:
+            ctx = dataclasses.replace(ctx, shuffle_channels=channels)
+        return self._flow_control.grant(requested, ctx)
 
     def scheduling_envelope(
         self, plan: PhysicalPlan, requested_workers: int | None = None

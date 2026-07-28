@@ -57,11 +57,19 @@ class ResourceContext:
     policy blends its plan estimate toward measured reality. `None` when no hub is
     wired (a standalone policy, or api not yet threading one) — every policy then falls
     back to the plan estimate, so sizing is byte-for-byte the plan-only behavior.
+
+    `shuffle_channels` is how many channels are *actually* fetching at once, which is what
+    the per-channel byte budget must be divided by. Without it the budget is divided by
+    `shuffle_fetch_fan_in`, and that is a configured *cap* on concurrency rather than a
+    measurement of it — so a reducer with three upstreams gets a share sized for eight and
+    its channels together buffer nearly three times the intended memory. `None` keeps the
+    configured fan-in, which is the behaviour for any caller that does not know its width.
     """
 
     config: Config
     envelope_bytes: int | None = None
     memory_model: LearnedMemoryModel | None = None
+    shuffle_channels: int | None = None
 
 
 class AdmissionPolicy(Protocol):

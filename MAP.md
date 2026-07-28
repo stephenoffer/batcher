@@ -374,7 +374,7 @@ Conductor adaptive-tuning: activate the learned decisions and close the feedback
 
 | module | lines | what it is |
 |---|---|---|
-| `decisions.py` | 383 | Conductor-level adaptive-tuning decisions — activate the learned choices, close the loops. |
+| `decisions.py` | 387 | Conductor-level adaptive-tuning decisions — activate the learned choices, close the loops. |
 
 ### `batcher/ml/` — 6 · front-end
 
@@ -1123,9 +1123,9 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 
 | module | lines | what it is |
 |---|---|---|
-| `base.py` | 109 | Policy seams for the Carbonite resource manager. |
+| `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 372 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 452 | The Carbonite resource manager entry point. |
+| `manager.py` | 464 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1148,7 +1148,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `admission.py` | 107 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
-| `flow_control.py` | 464 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
+| `flow_control.py` | 472 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 208 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
@@ -1643,7 +1643,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | module | lines | what it is |
 |---|---|---|
 | `bloom_index.py` | 119 | `BloomIndex` — a data-skipping membership index over a column's values. |
-| `feedback.py` | 227 | Execution feedback contract: Core → Kyber. |
+| `feedback.py` | 205 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
 | `ir_specs.py` | 102 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
 | `ir_tags.py` | 146 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
@@ -1909,15 +1909,15 @@ Effective hardware detection — what this process's machine really is and reall
 
 | module | lines | what it is |
 |---|---|---|
-| `cache.py` | 169 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
-| `cgroup.py` | 257 | cgroup file-format mechanics — the container limits that override what the host reports. |
+| `cache.py` | 106 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
+| `cgroup.py` | 237 | cgroup file-format mechanics — the container limits that override what the host reports. |
 | `cpu.py` | 163 | The CPU budget this process really has, and how much of it something else is taking. |
 | `isa.py` | 137 | CPU identity and instruction-set features — what this silicon can actually execute. |
-| `memory.py` | 122 | The memory ceiling and page geometry this process runs under. |
+| `memory.py` | 67 | The memory ceiling and page geometry this process runs under. |
 | `probes.py` | 44 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 306 | The machine's identity — one record of what this hardware is, and a key that names it. |
-| `storage.py` | 174 | The block device behind a directory — what spilling to it will actually cost. |
-| `topology.py` | 181 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
+| `storage.py` | 107 | The block device behind a directory — what spilling to it will actually cost. |
+| `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
 ## Rust data plane — `crates/`
 

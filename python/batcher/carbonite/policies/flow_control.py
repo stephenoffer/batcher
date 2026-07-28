@@ -189,7 +189,9 @@ class StaticCreditFlowControl:
 
     def grant(self, requested: int, ctx: ResourceContext) -> int:
         fc = ctx.config.flow_control
-        ceiling = credit_ceiling(ctx.config, learned_channel_morsel_bytes(ctx))
+        ceiling = credit_ceiling(
+            ctx.config, learned_channel_morsel_bytes(ctx), channels=ctx.shuffle_channels
+        )
         if requested <= 0:
             return min(fc.default_credits, ceiling)
         return min(max(requested, 1), ceiling)
@@ -263,6 +265,7 @@ class AIMDFlowControl:
         *,
         initial_window: int | None = None,
         effective_morsel_bytes: int | None = None,
+        channels: int | None = None,
     ) -> None:
         cfg = config or active_config()
         fc = cfg.flow_control
@@ -277,7 +280,12 @@ class AIMDFlowControl:
         # ceiling's *byte* bound (`credit_byte_budget`) is honored on this adaptive path exactly
         # as it is on the static grant — otherwise AIMD would grow the window to the un-corrected
         # count ceiling and a fast producer would buffer far past the byte budget.
-        self._ceiling = credit_ceiling(cfg, effective_morsel_bytes)  # count + byte bound
+        # `channels` for the same reason `effective_morsel_bytes` is here: the ceiling must
+        # be the *real* one on the adaptive path too. AIMD grows the window toward this
+        # ceiling, so a ceiling divided by the configured fan-in rather than the measured
+        # channel count is not a cosmetic difference — it is the value the controller
+        # converges to, and the memory it buffers there.
+        self._ceiling = credit_ceiling(cfg, effective_morsel_bytes, channels=channels)
         # A recurring shuffle warm-starts at the window its past runs converged to
         # (`initial_window`, learned per shuffle signature) instead of re-climbing from
         # `default_credits` every time — the AIMD control law still governs from there,

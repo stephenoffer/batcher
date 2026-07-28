@@ -224,7 +224,11 @@ def distributed_grant(
     envelope = rm.scheduling_envelope(opt, derived)
     max_credits = max((op.bounds.c_max_credits for op in opt.ops), default=0)
     if max_credits > 0:
-        window = rm.grant_credits(max_credits, signature=plan_signature(plan))
+        # `derived` is the worker count, and in a hash shuffle every reducer fetches from
+        # every mapper — so it is also the number of channels one reducer has open at once.
+        # This is the measurement `credit_ceiling(channels=)` was written for and, until
+        # now, never received from anything that runs.
+        window = rm.grant_credits(max_credits, signature=plan_signature(plan), channels=derived)
         envelope = dataclasses.replace(envelope, credits=window)
     return workers, envelope
 
