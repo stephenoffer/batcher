@@ -39,6 +39,7 @@ from batcher.carbonite.policies import (
     BudgetingAdmission,
     DefaultSchedulingPolicy,
     StaticCreditFlowControl,
+    credit_ceiling,
     learned_channel_morsel_bytes,
     load_shuffle_window,
 )
@@ -197,6 +198,25 @@ class ResourceManager:
         # rather than each re-scanning `plan.ops` with its own default.
         max_credits = self._memory.envelope(plan, self._ctx).c_max_credits
         return dataclasses.replace(env, credits=self.grant_credits(max_credits))
+
+    def credit_window_ceiling(self, *, channels: int | None = None) -> int:
+        """The maximum credit window a shuffle channel may hold, in batch slots.
+
+        The bound `grant_credits` clamps into, exposed because it has to travel. An AIMD
+        controller running in a Ray worker cannot derive it: the worker sees neither the
+        driver's `config_context` nor the metadata hub the learned row width comes from, so
+        every input to the calculation is wrong or absent there. The driver computes it once
+        and ships the integer.
+
+        Args:
+            channels: Channels actually fetching at once, or `None` for the configured cap.
+
+        Returns:
+            The ceiling in credits, at least 1.
+        """
+        return credit_ceiling(
+            self._config, learned_channel_morsel_bytes(self._ctx), channels=channels
+        )
 
     def adaptive_flow_control(self, *, signature: str | None = None) -> AIMDFlowControl:
         """Vend an AIMD credit controller for an adaptive shuffle channel.

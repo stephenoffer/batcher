@@ -189,6 +189,7 @@ try:
             preemption: bool = False,
             tls_config: ShuffleTlsConfig | None = None,
             port_range: tuple[int, int] | None = None,
+            credit_ceiling: int = 0,
         ) -> None:
             nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
@@ -281,7 +282,18 @@ try:
                     # adaptive credits `_window()` reads the controller, never the session's
                     # static `credits`, so a bare controller silently discarded all of it and
                     # every channel re-climbed from `default_credits` (4) on every query.
-                    flow_control=AIMDFlowControl(initial_window=credits),
+                    # The ceiling comes from the driver, not from this process. A Ray
+                    # actor sees neither the driver's `config_context` nor the metadata hub
+                    # the learned row width is fit from, so every input `credit_ceiling`
+                    # needs is wrong or missing here — and AIMD *grows toward* its ceiling,
+                    # so re-deriving a wrong one is not an approximation, it is the window
+                    # the controller settles at and the memory it buffers there. A
+                    # wide-row shuffle (embeddings, blobs) was the case that mattered: its
+                    # learned per-batch width is what holds the window under
+                    # `credit_byte_budget`, and it is invisible from inside the worker.
+                    flow_control=AIMDFlowControl(
+                        initial_window=credits, ceiling=credit_ceiling or None
+                    ),
                     pressure=PressureMonitor(),
                     advertise_host=advertise_host,
                     token=shuffle_token,
@@ -1061,6 +1073,16 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     port_range = _shuffle_port_range(os.environ.get("BATCHER_SHUFFLE_PORT_RANGE")) or (
         tuple(dc.shuffle_port_range) if dc.shuffle_port_range else None
     )
+    # The AIMD ceiling, computed once here where the driver's config and the metadata hub
+    # are both visible, and shipped to every actor as a plain int. `workers` is the channel
+    # width: in a hash shuffle every reducer fetches from every mapper. Only the adaptive
+    # path reads it, so a static-credit fleet pays one cheap call and ignores the result.
+    ceiling = 0
+    if adaptive:
+        from batcher.carbonite import ResourceManager
+
+        ceiling = ResourceManager().credit_window_ceiling(channels=max(1, workers))
+
     pg = create_worker_placement(workers, current_envelope())
     # Resolve the fleet-uniform actor options once (they read the live topology), then vary
     # only the per-bundle index — so spawning W workers is O(W), not O(W x nodes).
@@ -1081,6 +1103,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             preemption,
             dc.tls,
             port_range,
+            ceiling,
         )
         for i in range(workers)
     ]

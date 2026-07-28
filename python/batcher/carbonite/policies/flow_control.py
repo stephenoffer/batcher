@@ -266,6 +266,7 @@ class AIMDFlowControl:
         initial_window: int | None = None,
         effective_morsel_bytes: int | None = None,
         channels: int | None = None,
+        ceiling: int | None = None,
     ) -> None:
         cfg = config or active_config()
         fc = cfg.flow_control
@@ -285,7 +286,18 @@ class AIMDFlowControl:
         # ceiling, so a ceiling divided by the configured fan-in rather than the measured
         # channel count is not a cosmetic difference — it is the value the controller
         # converges to, and the memory it buffers there.
-        self._ceiling = credit_ceiling(cfg, effective_morsel_bytes, channels=channels)
+        #
+        # An explicit `ceiling` wins, for the case a controller runs somewhere that cannot
+        # derive the right one. A shuffle worker is exactly that: it is a Ray actor, so it
+        # sees neither the driver's `config_context` nor the metadata hub the learned
+        # row-width comes from, and every input to `credit_ceiling` is therefore wrong or
+        # missing there. The driver knows all of them, so it computes the ceiling once and
+        # ships the integer.
+        self._ceiling = (
+            max(1, ceiling)
+            if ceiling is not None and ceiling > 0
+            else credit_ceiling(cfg, effective_morsel_bytes, channels=channels)
+        )
         # A recurring shuffle warm-starts at the window its past runs converged to
         # (`initial_window`, learned per shuffle signature) instead of re-climbing from
         # `default_credits` every time — the AIMD control law still governs from there,

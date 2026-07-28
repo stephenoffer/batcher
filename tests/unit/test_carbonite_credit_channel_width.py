@@ -144,3 +144,54 @@ def test_a_grant_is_still_at_least_one_credit(small_node) -> None:
     with config_context(small_node):
         rm = ResourceManager()
         assert rm.grant_credits(0, channels=100_000) >= 1
+
+
+# --- the ceiling has to travel to where the controller runs -------------------
+
+
+def test_an_explicit_ceiling_overrides_the_derived_one(small_node) -> None:
+    """A shuffle worker is a Ray actor: it cannot derive the right ceiling.
+
+    It sees neither the driver's `config_context` nor the metadata hub the learned row
+    width is fit from, so every input to `credit_ceiling` is wrong or missing there. The
+    driver computes it and ships the integer, and the controller must honour it.
+    """
+    ctx = ResourceContext(config=small_node)
+    pinned = AIMDFlowControl(small_node, ceiling=3)
+    for _ in range(40):
+        pinned.observe(congested=False)
+    assert pinned.grant(0, ctx) == 3
+
+
+def test_a_shipped_ceiling_bounds_a_wide_row_shuffle(small_node) -> None:
+    """The case that motivated it: AIMD grows *toward* its ceiling.
+
+    Re-deriving a wrong ceiling in the worker is not an approximation — it is the window
+    the controller settles at, and the memory it buffers there.
+    """
+    ctx = ResourceContext(config=small_node)
+    shipped = AIMDFlowControl(small_node, ceiling=8)
+    derived = AIMDFlowControl(small_node)
+    for _ in range(40):
+        shipped.observe(congested=False)
+        derived.observe(congested=False)
+    assert shipped.grant(0, ctx) == 8 < derived.grant(0, ctx)
+
+
+def test_no_shipped_ceiling_keeps_the_derived_one(small_node) -> None:
+    """Zero or `None` must be byte-for-byte the previous behaviour."""
+    ctx = ResourceContext(config=small_node)
+    for ceiling in (None, 0):
+        c = AIMDFlowControl(small_node, ceiling=ceiling)
+        assert c.grant(0, ctx) == AIMDFlowControl(small_node).grant(0, ctx)
+
+
+def test_the_manager_publishes_the_ceiling_it_clamps_to(small_node) -> None:
+    """`credit_window_ceiling` and `grant_credits` must not be two different bounds."""
+    from batcher.config import config_context
+
+    with config_context(small_node):
+        rm = ResourceManager()
+        for channels in (None, 3, 128):
+            ceiling = rm.credit_window_ceiling(channels=channels)
+            assert rm.grant_credits(1_000_000, channels=channels) == ceiling
