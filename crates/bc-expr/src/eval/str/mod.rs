@@ -1456,32 +1456,6 @@ fn compile_regex(pattern: Option<&str>, func: StrFunc) -> Result<Arc<regex::Rege
 /// `regex::Regex::replace` instead interprets `$1` as a group and leaves `\1` untouched,
 /// so `regexp_replace('ab', '(a)(b)', '\2\1')` returned the literal `\2\1` rather than
 /// `ba`. This wraps the template so the substitution matches DuckDB.
-struct Re2Rewrite<'a>(&'a str);
-
-impl regex::Replacer for Re2Rewrite<'_> {
-    fn replace_append(&mut self, caps: &regex::Captures, dst: &mut String) {
-        let mut chars = self.0.chars();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
-                    Some(d) if d.is_ascii_digit() => {
-                        if let Some(m) = caps.get(d as usize - '0' as usize) {
-                            dst.push_str(m.as_str());
-                        }
-                    }
-                    Some('\\') => dst.push('\\'),
-                    // Unreachable for a template that passed `re2_rewrite_valid`; kept
-                    // total so the function never panics on a hand-written IR document.
-                    Some(other) => dst.push(other),
-                    None => {}
-                }
-            } else {
-                dst.push(c);
-            }
-        }
-    }
-}
-
 /// Whether a rewrite `template` is valid for a regex with `max_group` capture groups.
 ///
 /// RE2 rejects a template whose only escapes are not `\0`..`\9` or `\\`, or that
@@ -1505,20 +1479,119 @@ fn re2_rewrite_valid(template: &str, max_group: usize) -> bool {
     true
 }
 
+/// Expand one match's rewrite `template` into `dst`, reading groups out of `locs`.
+///
+/// DuckDB/RE2 rewrite semantics: `\N` expands to capture group `N`'s text, an unmatched
+/// group expands to nothing, and `\\` is a literal backslash. Groups are read from a
+/// reusable [`regex::CaptureLocations`] plus the subject string rather than an allocated
+/// `Captures`, which is what keeps the replace loop free of per-row allocation.
+fn expand_rewrite(template: &str, locs: &regex::CaptureLocations, hay: &str, dst: &mut String) {
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(d) if d.is_ascii_digit() => {
+                    if let Some((a, b)) = locs.get(d as usize - '0' as usize) {
+                        dst.push_str(&hay[a..b]);
+                    }
+                }
+                Some('\\') => dst.push('\\'),
+                // Unreachable for a template that passed `re2_rewrite_valid`; kept total
+                // so the function never panics on a hand-written IR document.
+                Some(other) => dst.push(other),
+                None => {}
+            }
+        } else {
+            dst.push(c);
+        }
+    }
+}
+
 /// Apply a `regexp_replace`/`regexp_replace_all` with DuckDB rewrite semantics.
 /// `global` picks first-match vs all-matches. An invalid rewrite template leaves each
 /// row unchanged (DuckDB behaviour).
+///
+/// Written against a **reused** capture buffer rather than `Regex::replace`, which is a
+/// per-row allocator: each call builds a fresh `Captures` (an owned slot vector) and a
+/// `CaptureMatches` iterator, then hands back a `Cow` that `into_owned` copies again. On
+/// ClickBench q28 (`regexp_replace` over 10M `Referer` values) that dominated the query --
+/// profiled at 29.9% in `Regex::create_captures`, 15.9% in `CaptureMatches::next` and 10.8%
+/// dropping the iterator, against only ~10% in the actual regex search.
+///
+/// `capture_locations` is allocated once per column and `captures_read_at` writes into it,
+/// so the per-row cost is the search plus the output bytes. Match semantics are the
+/// regex crate's own leftmost-first scan either way, and the rewrite expansion is shared
+/// with [`expand_rewrite`], so the result is bit-identical to the `Replacer` path.
 fn regexp_replace_with(s: &StringArray, re: &regex::Regex, rep: &str, global: bool) -> StringArray {
+    use arrow::array::{Array, StringBuilder};
+
     if !re2_rewrite_valid(rep, re.captures_len().saturating_sub(1)) {
         return map_str_borrow(s, |v| v);
     }
-    map_str(s, |v| {
-        if global {
-            re.replace_all(v, Re2Rewrite(rep)).into_owned()
-        } else {
-            re.replace(v, Re2Rewrite(rep)).into_owned()
+    let mut locs = re.capture_locations();
+    let mut out = String::new();
+    let mut b = StringBuilder::with_capacity(s.len(), s.value_data().len());
+    for row in s.iter() {
+        let Some(hay) = row else {
+            b.append_null();
+            continue;
+        };
+        // `at` is the byte offset the next search starts from; `copied` is how much of
+        // `hay` has already been written out. They differ only for an empty match, where
+        // the scan must advance a character to terminate but nothing has been consumed.
+        let mut at = 0usize;
+        let mut copied = 0usize;
+        let mut matched = false;
+        let mut last_end: Option<usize> = None;
+        while at <= hay.len() {
+            let Some(m) = re.captures_read_at(&mut locs, hay, at) else {
+                break;
+            };
+            let (ms, me) = (m.start(), m.end());
+            // The regex crate's match iterator drops an **empty** match that ends where the
+            // previous match ended, so `a*` over "ab" yields "a" then the empty match at 2 --
+            // not a second empty match at 1. Skipping it here is what makes this loop agree
+            // with `replace_all` (pinned by `regexp_replace_matches_the_regex_crates_own_replacer`).
+            if ms == me && Some(me) == last_end {
+                match hay[me..].chars().next() {
+                    Some(c) => {
+                        at = me + c.len_utf8();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            if !matched {
+                matched = true;
+                out.clear();
+                out.reserve(hay.len());
+            }
+            out.push_str(&hay[copied..ms]);
+            expand_rewrite(rep, &locs, hay, &mut out);
+            copied = me;
+            last_end = Some(me);
+            if !global {
+                break;
+            }
+            // An empty match would otherwise spin on the same offset forever; step one
+            // character past it, exactly as the regex crate's own `replace_all` does.
+            at = if me == ms {
+                match hay[me..].chars().next() {
+                    Some(c) => me + c.len_utf8(),
+                    None => break,
+                }
+            } else {
+                me
+            };
         }
-    })
+        if matched {
+            out.push_str(&hay[copied..]);
+            b.append_value(&out);
+        } else {
+            b.append_value(hay);
+        }
+    }
+    b.finish()
 }
 
 fn require_pattern(pattern: Option<&str>, func: StrFunc) -> Result<&str, ExprError> {
@@ -2430,5 +2503,117 @@ mod tests {
             out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
             "a"
         );
+    }
+
+    /// The allocation-free replace loop must be **bit-identical** to driving the `regex`
+    /// crate's own `replace`/`replace_all` with the same rewrite semantics.
+    ///
+    /// `regexp_replace_with` was rewritten to reuse one `CaptureLocations` instead of
+    /// allocating a `Captures` per row (29.9% of ClickBench q28 was `create_captures`).
+    /// That hand-rolls the scan loop, so the two places it could drift from the library
+    /// are pinned here: **empty matches**, where the scan must step a character to
+    /// terminate without consuming input, and **multibyte UTF-8**, where stepping by one
+    /// byte would slice a char boundary and panic. Patterns that can match empty (`a*`,
+    /// `x?`, `(?:)`) are included deliberately, as are non-ASCII subjects.
+    #[test]
+    fn regexp_replace_matches_the_regex_crates_own_replacer() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        // The reference: expand the RE2 template through the regex crate's `Captures`.
+        fn reference(hay: &str, re: &regex::Regex, rep: &str, global: bool) -> String {
+            let expand = |caps: &regex::Captures, dst: &mut String| {
+                let mut chars = rep.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        match chars.next() {
+                            Some(d) if d.is_ascii_digit() => {
+                                if let Some(m) = caps.get(d as usize - '0' as usize) {
+                                    dst.push_str(m.as_str());
+                                }
+                            }
+                            Some('\\') => dst.push('\\'),
+                            Some(other) => dst.push(other),
+                            None => {}
+                        }
+                    } else {
+                        dst.push(c);
+                    }
+                }
+            };
+            if global {
+                re.replace_all(hay, |c: &regex::Captures| {
+                    let mut s = String::new();
+                    expand(c, &mut s);
+                    s
+                })
+                .into_owned()
+            } else {
+                re.replace(hay, |c: &regex::Captures| {
+                    let mut s = String::new();
+                    expand(c, &mut s);
+                    s
+                })
+                .into_owned()
+            }
+        }
+
+        let subjects = [
+            "",
+            "ab",
+            "xaby",
+            "abab",
+            "aaa",
+            "no-match-here",
+            "https://www.example.com/a/b",
+            "héllo wörld",
+            "日本語テキスト",
+            "a日b日c",
+            "trailing",
+            "//",
+            "a",
+            "\\escaped",
+        ];
+        let patterns = [
+            "(a)(b)",
+            "a*",
+            "x?",
+            "(?:)",
+            "[^/]+",
+            "^https?://(?:www\\.)?([^/]+)/.*$",
+            "(\\w+)",
+            "日",
+            "(é)",
+            "$",
+            "^",
+        ];
+        let templates = [r"\1", r"\0", r"\2\1", "-", "", r"\\", r"[\1]"];
+
+        let arr: ArrayRef = Arc::new(StringArray::from(
+            subjects.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+        ));
+        for pat in patterns {
+            let re = regex::Regex::new(pat).unwrap();
+            for rep in templates {
+                if !super::re2_rewrite_valid(rep, re.captures_len().saturating_sub(1)) {
+                    continue; // invalid template is a documented no-op, covered elsewhere
+                }
+                for (func, global) in [
+                    (StrFunc::RegexpReplace, false),
+                    (StrFunc::RegexpReplaceAll, true),
+                ] {
+                    let out = eval_str(func, &arr, Some(pat), Some(rep), None, None).unwrap();
+                    let got = out.as_any().downcast_ref::<StringArray>().unwrap();
+                    for (i, hay) in subjects.iter().enumerate() {
+                        assert_eq!(
+                            got.value(i),
+                            reference(hay, &re, rep, global),
+                            "pattern={pat:?} template={rep:?} global={global} subject={hay:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

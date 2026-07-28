@@ -146,19 +146,40 @@ pub(crate) fn try_scalar_binary(
         // `StringArray` of *n* copies of the needle, offsets and bytes, once per morsel per
         // evaluation. A one-element `Scalar` broadcasts instead.
         //
-        // Served only on an **exact** type match, because that is what makes it
-        // bit-identical rather than merely equivalent. The array path applies three
-        // adjustments before comparing, and an exact match makes each provably the
-        // identity: `align_date_timestamp_for_cmp` only fires on a Date-vs-Timestamp pair,
+        // Served on an **exact** type match, because that is what makes it bit-identical
+        // rather than merely equivalent. The array path applies three adjustments before
+        // comparing, and an exact match makes each provably the identity:
+        // `align_date_timestamp_for_cmp` only fires on a Date-vs-Timestamp pair,
         // `align_decimals_for_cmp` only on two decimals of differing scale, and
         // `canon_float_array` is an `Arc::clone` for anything that is not a float. So a
         // mixed pair (`Utf8` vs `LargeUtf8`, a tz-aware timestamp against a naive literal,
         // an `Int64` column against a `Date` literal) is declined here and keeps the array
         // path's coercion, unchanged.
-        if arr.data_type() != lit_arr.data_type() {
+        //
+        // The one mixed pair served here is a **string literal against a temporal column**
+        // (`EventDate >= '2013-07-01'`), which `coerce_numeric` handles by casting the
+        // literal to the column's temporal type. That cast is elementwise, so casting the
+        // one-element literal and broadcasting is the same value as casting the
+        // materialized N-row copy — including the error, since an unparseable string fails
+        // identically on one element or N. What it saves is real: the array path re-parses
+        // the *same* ISO string once per row, which showed up as 6.3% of ClickBench q39 in
+        // `arrow_cast::parse::parse_date`, and a bare date range over `hits` measured
+        // 24.7 ms against 7.5 ms for the already-typed `DATE '...'` spelling.
+        let temporal_vs_string = matches!(
+            (arr.data_type(), lit_arr.data_type()),
+            (
+                DataType::Date32 | DataType::Date64 | DataType::Timestamp(..),
+                DataType::Utf8 | DataType::LargeUtf8
+            )
+        );
+        if temporal_vs_string {
+            let typed = cast(&lit_arr, arr.data_type())?;
+            (arr, typed)
+        } else if arr.data_type() != lit_arr.data_type() {
             return Ok(None);
+        } else {
+            (arr, lit_arr)
         }
-        (arr, lit_arr)
     };
 
     // Canonicalize both float operands for the comparison arms, exactly as the array path
@@ -1608,5 +1629,86 @@ mod floor_div_tests {
     #[test]
     fn empty_input() {
         assert_eq!(fd_i64(vec![], vec![]), Vec::<Option<i64>>::new());
+    }
+
+    /// A string literal against a temporal column must give the **same** answer through the
+    /// broadcasting scalar path as through the array path that materializes and casts the
+    /// literal per row.
+    ///
+    /// `try_scalar_binary` now serves this mixed pair (it parses the ISO string once instead
+    /// of once per row). The two paths are only equivalent because `cast` is elementwise, so
+    /// this pins that claim across both operand orders, all six comparison operators, a
+    /// Date32 and a Timestamp column, and rows on either side of the literal plus a null.
+    #[test]
+    fn temporal_column_against_a_string_literal_matches_the_array_path() {
+        use crate::{BinaryOp, Expr, Literal};
+        use arrow::array::{
+            ArrayRef, BooleanArray, Date32Array, RecordBatch, TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        // 2013-07-01 is day 15887; the timestamp column is the same instant in µs.
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(15886),
+            Some(15887),
+            Some(15888),
+            None,
+        ]));
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(15886 * 86_400_000_000),
+            Some(15887 * 86_400_000_000),
+            Some(15888 * 86_400_000_000),
+            None,
+        ]));
+        let cases: [(&str, ArrayRef, DataType, &str); 2] = [
+            ("d", date, DataType::Date32, "2013-07-01"),
+            (
+                "t",
+                ts,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "2013-07-01T00:00:00",
+            ),
+        ];
+
+        for (name, col, dt, lit) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, dt, true)]));
+            let batch = RecordBatch::try_new(schema, vec![col.clone()]).unwrap();
+            for op in [
+                BinaryOp::Eq,
+                BinaryOp::Ne,
+                BinaryOp::Lt,
+                BinaryOp::Le,
+                BinaryOp::Gt,
+                BinaryOp::Ge,
+            ] {
+                for lit_on_right in [true, false] {
+                    let c = Expr::Col { name: name.into() };
+                    let l = Expr::Lit {
+                        value: Literal::Str(lit.into()),
+                    };
+                    let (left, right) = if lit_on_right {
+                        (c.clone(), l.clone())
+                    } else {
+                        (l.clone(), c.clone())
+                    };
+                    // The fast path under test.
+                    let fast = super::try_scalar_binary(op, &left, &right, &batch)
+                        .unwrap()
+                        .expect("temporal-vs-string should take the scalar path");
+                    // The reference: materialize the literal to N rows, as the array path does.
+                    let n = batch.num_rows();
+                    let (la, ra) = if lit_on_right {
+                        (col.clone(), Literal::Str(lit.into()).to_array(n))
+                    } else {
+                        (Literal::Str(lit.into()).to_array(n), col.clone())
+                    };
+                    let slow = super::eval_binary(op, &la, &ra).unwrap();
+                    let f = fast.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let s = slow.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    assert_eq!(f, s, "col={name} op={op:?} lit_on_right={lit_on_right}");
+                }
+            }
+        }
     }
 }
