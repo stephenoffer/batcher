@@ -18,6 +18,7 @@ from __future__ import annotations
 from batcher._internal.mathx import ceil_div
 
 __all__ = [
+    "envelope_shortfall",
     "partitions_for_envelope",
     "partitions_for_volume",
     "should_compress",
@@ -78,16 +79,61 @@ def partitions_for_volume(basis: int, target_bytes: int = SPILL_BYTES_PER_PARTIT
 def partitions_for_envelope(basis: int, envelope_bytes: int) -> int:
     """Fewest buckets that make each bucket fit `envelope_bytes`.
 
+    **The fit is not guaranteed at the top of the range**, and the name promises more than
+    the clamp can deliver. Past `MAX_SPILL_PARTITIONS x envelope_bytes` of state the count
+    saturates, so each bucket is larger than the envelope by however far the basis exceeds
+    that product — at PB scale against a gigabyte envelope, by three orders of magnitude.
+    Raising the cap is not the answer: 4,096 buckets is already 4,096 files and 4,096 tasks,
+    and the count is a scheduling cost as much as a memory one.
+
+    What makes the shortfall safe rather than an OOM is downstream: the reduce re-partitions
+    an over-large bucket by grace recursion (`dist/spill.py`), so an oversized bucket costs
+    an extra split and a re-read rather than a failure. This function is a *first* shard,
+    not the last word — which is worth stating, because "fewest buckets that make each
+    bucket fit" reads like a guarantee that the caller can rely on, and it is not one.
+
     Args:
         basis: Bytes to shard, from `spill_basis`.
         envelope_bytes: The per-operator byte envelope admission offered as a counter-offer.
 
     Returns:
-        The minimum bucket count, or 0 when either input is unusable.
+        The minimum bucket count, capped at `MAX_SPILL_PARTITIONS`; `0` when either input
+        is unusable.
     """
     if basis <= 0 or envelope_bytes <= 0:
         return 0
     return min(MAX_SPILL_PARTITIONS, max(1, ceil_div(basis, envelope_bytes)))
+
+
+def envelope_shortfall(basis: int, envelope_bytes: int) -> int:
+    """Bytes by which `partitions_for_envelope` misses its own target, or `0` if it does not.
+
+    The clamp above is silent, and a caller that reasons "each bucket now fits" is wrong at
+    scale with nothing to tell it so. This is the number that says by how much, so a caller
+    that cares can log it, widen the envelope, or size a downstream grace recursion for the
+    split it is going to need anyway.
+
+    Args:
+        basis: Bytes to shard, from `spill_basis`.
+        envelope_bytes: The target per-bucket envelope.
+
+    Returns:
+        `per_bucket - envelope_bytes` when the clamp binds, else `0`.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.carbonite.policies.spill_shape import envelope_shortfall
+            >>> envelope_shortfall(1 << 30, 1 << 20)  # 1 GiB into 1 MiB buckets: fits
+            0
+            >>> envelope_shortfall(1 << 40, 1 << 20) > 0  # 1 TiB: past the 4,096 cap
+            True
+    """
+    parts = partitions_for_envelope(basis, envelope_bytes)
+    if parts <= 0:
+        return 0
+    per_bucket = ceil_div(basis, parts)
+    return max(0, per_bucket - envelope_bytes)
 
 
 def should_compress(peak: int) -> bool | None:

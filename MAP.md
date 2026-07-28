@@ -1152,7 +1152,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 208 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
-| `spill_shape.py` | 105 | How wide and how compressed a spilled state should be. |
+| `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
 
@@ -1184,8 +1184,8 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | module | lines | what it is |
 |---|---|---|
 | `lifecycle.py` | 93 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
-| `locality.py` | 98 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
-| `placement.py` | 90 | Locality-aware reducer placement — put a reducer where its data already is. |
+| `locality.py` | 117 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `placement.py` | 106 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 448 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
 | `session.py` | 446 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |

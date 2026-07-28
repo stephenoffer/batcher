@@ -66,10 +66,17 @@ def select_mode(
     node identities are known and equal ⇒ same host ⇒ `SHARED_MEMORY`. Everything
     else ⇒ `NETWORK`. Node identity is optional: with none supplied the selector
     conservatively treats a different address as remote.
+
+    **Two unknowns are not a match.** An empty address means "not known yet" — a server
+    that has not bound, a worker record built before its port was assigned — and equality
+    between two of them is an artifact of both being absent, not evidence of anything.
+    Read as `DIRECT_MEMORY` it sends the fetcher to a local store that does not hold the
+    bucket, which surfaces as a missing partition rather than as the address bug it is.
+    Unknown resolves to `NETWORK`: the mode that is always *correct*, only ever slower.
     """
-    if source_addr == local_addr:
+    if source_addr and local_addr and source_addr == local_addr:
         return TransferMode.DIRECT_MEMORY
-    if source_node is not None and local_node is not None and source_node == local_node:
+    if source_node and local_node and source_node == local_node:
         return TransferMode.SHARED_MEMORY
     return TransferMode.NETWORK
 
@@ -92,7 +99,19 @@ def locality_ratio_counts(off_network: int, total: int) -> float:
     The counter form a long-lived reducer accumulates instead of a per-fetch list,
     which would grow without bound. Empty (no fetches) is 1.0 by the same
     convention as `locality_ratio`.
+
+    Clamped to `[0, 1]`. These are two independently-incremented counters, so a
+    double-count on one of them yields a "ratio" above 1.0 — and this figure is read as a
+    fraction by the tuning loop, where a 1.3 does not look like corrupt input, it looks
+    like a strong signal and is acted on.
+
+    Args:
+        off_network: Fetches served without a socket.
+        total: Fetches attempted.
+
+    Returns:
+        The fraction in `[0, 1]`; `1.0` when nothing has been fetched.
     """
     if total <= 0:
         return 1.0
-    return off_network / total
+    return min(1.0, max(0.0, off_network / total))

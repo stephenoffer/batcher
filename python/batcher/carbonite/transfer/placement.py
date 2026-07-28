@@ -73,13 +73,29 @@ def assign_reducer_hosts(
     every other bucket keeps the default `reducer r → actor r` round-robin, so an
     unskewed shuffle's placement — and behavior — is exactly as before. `actor_nodes[i]`
     is the node id actor `i` runs on.
+
+    With no actors there is nowhere to place anything, and the answer is an empty list
+    rather than a list of zeros. `[0, 0, ...]` names actor `0` of a fleet that has none,
+    which either raises an `IndexError` far from here or, if the caller is lenient, routes
+    every reducer to a host that does not exist.
+
+    Args:
+        n_reducers: How many reducer buckets need a host.
+        actor_nodes: Node id per actor, indexed by actor.
+        affinity: Bucket to node, from `reducer_affinity`.
+
+    Returns:
+        An actor index per reducer, or an empty list when there are no actors.
     """
+    n_actors = len(actor_nodes)
+    if n_actors == 0:
+        return []
+
     nodes_to_actors: dict[str, list[int]] = defaultdict(list)
     for i, node in enumerate(actor_nodes):
         nodes_to_actors[node].append(i)
 
-    n_actors = len(actor_nodes)
-    hosts = [r % n_actors if n_actors else 0 for r in range(n_reducers)]
+    hosts = [r % n_actors for r in range(n_reducers)]
     cursor: dict[str, int] = defaultdict(int)
     for r in range(n_reducers):
         node = affinity.get(r)
