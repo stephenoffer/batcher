@@ -128,6 +128,23 @@ Ray object store. Which transport runs is one knob:
 The disk shuffle's working directory is driver-local, so `"auto"` will not pick it
 across nodes unless you also set `config.distributed.shared_filesystem`.
 
+### Published shuffle output is memory too
+
+A shuffle bucket is the one large footprint the buffer pool used to miss. Nobody reserves
+it. A mapper produces the bucket, hands it to the node's Flight store, and it stays
+resident until a reducer collects it, so with as many mappers as reducers a node holds its
+whole share of the shuffle in memory no reservation covers.
+
+The store now takes a reservation equal to what it holds, against the same envelope every
+operator draws on. When the pool cannot cover a growth, the store writes its largest
+buckets to local disk and reads them back on fetch. The rows are unchanged, so the cost is
+a re-read and nothing else, and a shuffle that fits the envelope never touches the disk.
+
+That reservation also makes published output the first thing the pool asks to spill when
+another operator cannot get memory. It is the right first victim: a published bucket is
+finished work waiting to be collected, so spilling it stalls nobody, where spilling a
+half-built hash table interrupts an operator that is still using it.
+
 ### Same-node zero-copy fast path (automatic)
 
 Within a shuffle, a reducer's sources fall into three tiers, and Carbonite picks the

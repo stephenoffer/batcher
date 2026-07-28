@@ -30,12 +30,13 @@ use crate::to_pyerr;
 pub(crate) struct FlightShuffleServer {
     pub(crate) exchange: std::sync::Arc<bc_transport::ShuffleExchange>,
     addr: String,
-    /// Keeps this server's [`ShuffleSpiller`] registration alive.
+    /// This server's pool citizenship: its reservation, and its spill registration.
     ///
     /// The pool holds only a `Weak`, so it is this field that decides how long the shuffle
-    /// store is a spill candidate: exactly as long as the server serving it exists. Drop
-    /// the server and the entry goes dead, to be swept on the pool's next slow path.
-    _spiller: std::sync::Arc<dyn bc_resource::Spillable>,
+    /// store is a spill candidate: exactly as long as the server serving it exists. Dropping
+    /// the server drops the reservation (returning its credit) and leaves a dead registry
+    /// entry, swept on the pool's next slow path.
+    spiller: std::sync::Arc<ShuffleSpiller>,
 }
 
 /// The published shuffle store, offered to the memory pool as something it may spill.
@@ -55,6 +56,55 @@ pub(crate) struct FlightShuffleServer {
 /// likely to be losing to.
 struct ShuffleSpiller {
     exchange: std::sync::Arc<bc_transport::ShuffleExchange>,
+    /// A pool reservation kept equal to the store's resident bytes.
+    ///
+    /// Registering as a `Spillable` alone frees real memory but no *pool credit*, because
+    /// published buckets were never charged here — so the cooperative loop sees no progress
+    /// and the reservation that triggered it still fails. Charging them is what closes that:
+    /// the shuffle's footprint becomes visible in the same envelope every operator reasons
+    /// about, and spilling it hands credit back where a waiting reservation can use it.
+    ///
+    /// Held behind a `Mutex` taken *before* the store's map in both directions, so the two
+    /// paths that touch both (reconciliation after a publish, and a pool-driven spill) can
+    /// never invert the order.
+    reservation: std::sync::Mutex<bc_resource::MemoryReservation>,
+    /// The pool being charged, kept so `reconcile` can ask whether it has an envelope yet.
+    pool: std::sync::Arc<bc_resource::MemoryPool>,
+}
+
+impl ShuffleSpiller {
+    /// Match the pool reservation to what the store now holds, spilling if it cannot.
+    ///
+    /// Called after anything that changes the store's footprint. Growth is attempted, and a
+    /// refusal is not an error but the signal it was always meant to be: the node is at its
+    /// envelope, so the store spills down to what the pool will actually cover.
+    ///
+    /// A publish is never failed for want of memory. The bucket already exists — the mapper
+    /// computed it — so refusing it would lose finished work to save memory that spilling
+    /// returns anyway. The reservation is therefore best-effort in one direction only: it
+    /// may under-report briefly if even the post-spill resize is refused, and it corrects on
+    /// the next call.
+    fn reconcile(&self) {
+        // An unsized pool governs nothing, and charging against it refuses *everything* —
+        // which here means spilling every bucket to disk the instant it is published. A
+        // Flight server is routinely built before the first `execute_plan` sets the budget,
+        // so this is the normal startup order, not an edge case. Measured: without this
+        // guard a worker published eight buckets and retained none of them.
+        if self.pool.limit() == 0 {
+            return;
+        }
+        let Ok(mut reservation) = self.reservation.lock() else {
+            return; // a poisoned lock is not worth failing a shuffle over
+        };
+        let held = self.exchange.retained_bytes();
+        if reservation.try_resize(held).is_ok() {
+            return;
+        }
+        // The pool will not cover the growth. Spill the excess and charge what remains.
+        let excess = held.saturating_sub(reservation.size());
+        self.exchange.try_spill_at_least(excess);
+        let _ = reservation.try_resize(self.exchange.retained_bytes());
+    }
 }
 
 impl bc_resource::Spillable for ShuffleSpiller {
@@ -66,7 +116,18 @@ impl bc_resource::Spillable for ShuffleSpiller {
     /// store returns `0`, which the pool reads as "cannot help right now" and moves on to
     /// the next consumer.
     fn spill(&self, target: usize) -> usize {
-        self.exchange.try_spill_at_least(target)
+        // `try_lock`, not `lock`: this is the only place the pool re-enters us, and while
+        // the pool's own reserve path is lock-free today, a busy-wait here would make that
+        // a load-bearing implementation detail of another crate. A contended call answers
+        // `0`, which the contract permits and the pool reads as "not right now".
+        let Ok(mut reservation) = self.reservation.try_lock() else {
+            return 0;
+        };
+        let freed = self.exchange.try_spill_at_least(target);
+        // Hand the credit back to the pool, which is the whole point of charging it: the
+        // reservation that provoked this spill can now be satisfied by the bytes it freed.
+        reservation.shrink(freed);
+        freed
     }
 
     /// Resident published bytes — the pool spills the largest consumer first.
@@ -166,20 +227,28 @@ impl FlightShuffleServer {
                 Ok(exchange) => {
                     let addr = exchange.advertised_addr().to_string();
                     let exchange = std::sync::Arc::new(exchange);
-                    let spiller: std::sync::Arc<dyn bc_resource::Spillable> =
-                        std::sync::Arc::new(ShuffleSpiller {
-                            exchange: std::sync::Arc::clone(&exchange),
-                        });
                     // `0` gets-or-creates the process pool without disturbing its limit,
                     // which only ever grows: a server built before the first `execute_plan`
                     // registers against a pool the first query then sizes. Nothing reserves
                     // in between, because reservations happen inside `execute_plan`, after
                     // it has set the budget.
-                    crate::process::shared_memory_pool(0).register_consumer(&spiller);
+                    let pool = crate::process::shared_memory_pool(0);
+                    let spiller = std::sync::Arc::new(ShuffleSpiller {
+                        exchange: std::sync::Arc::clone(&exchange),
+                        // Starts at zero and grows with the store. `reserve(0)` cannot fail.
+                        reservation: std::sync::Mutex::new(
+                            pool.try_reserve(0)
+                                .expect("a zero-byte reservation cannot fail"),
+                        ),
+                        pool: std::sync::Arc::clone(&pool),
+                    });
+                    let consumer: std::sync::Arc<dyn bc_resource::Spillable> =
+                        std::sync::Arc::clone(&spiller) as _;
+                    pool.register_consumer(&consumer);
                     return Ok(Self {
                         exchange,
                         addr,
-                        _spiller: spiller,
+                        spiller,
                     });
                 }
                 Err(e) => last_err = Some(e),
@@ -212,7 +281,12 @@ impl FlightShuffleServer {
             .iter()
             .map(|b| normalize_batch(&b.0))
             .collect::<PyResult<_>>()?;
-        py.allow_threads(|| shared_runtime().block_on(self.exchange.publish(&t, batches)));
+        py.allow_threads(|| {
+            shared_runtime().block_on(self.exchange.publish(&t, batches));
+            // Charge the new footprint (and spill if the pool will not cover it) while the
+            // GIL is still released: reconciliation can write a bucket to disk.
+            self.spiller.reconcile();
+        });
         Ok(())
     }
 
@@ -285,7 +359,10 @@ impl FlightShuffleServer {
     /// Evict one published partition (its reducers have fetched it), freeing it.
     fn release(&self, py: Python<'_>, ticket: &str) -> PyResult<()> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        py.allow_threads(|| shared_runtime().block_on(self.exchange.release(&t)));
+        py.allow_threads(|| {
+            shared_runtime().block_on(self.exchange.release(&t));
+            self.spiller.reconcile(); // credit the freed bucket back to the pool
+        });
         Ok(())
     }
 
@@ -295,6 +372,7 @@ impl FlightShuffleServer {
         let addr = self.addr.clone();
         py.allow_threads(|| {
             shared_runtime().block_on(self.exchange.clear_plan(plan_id));
+            self.spiller.reconcile();
             // The shm half, which nothing freed before. `/dev/shm` is RAM-backed, so a
             // stale bucket file is a second memory leak on the same node — and unlike the
             // in-memory store it has no eviction of any kind. `clear`/`clear_shared` are
@@ -305,7 +383,10 @@ impl FlightShuffleServer {
 
     /// Evict every published partition on this server.
     fn clear(&self, py: Python<'_>) {
-        py.allow_threads(|| shared_runtime().block_on(self.exchange.clear()));
+        py.allow_threads(|| {
+            shared_runtime().block_on(self.exchange.clear());
+            self.spiller.reconcile();
+        });
     }
 
     /// Number of partitions currently retained (telemetry / leak tests).
