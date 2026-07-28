@@ -240,6 +240,22 @@ mod tunables {
     /// link and gives up fast on incompressible data (near-free there).
     static COMPRESSION: AtomicU64 = AtomicU64::new(1);
 
+    /// Byte cap on the in-memory shuffle-output store, `0` = unbounded (the default, and
+    /// the historical behaviour). Above it the store spills its largest published buckets
+    /// to local disk and reads them back on fetch — result-preserving, so this trades a
+    /// re-read for a memory bound. Set per worker from Carbonite, which knows the envelope.
+    static SHUFFLE_STORE_CAP: AtomicU64 = AtomicU64::new(0);
+
+    /// Set the in-memory shuffle-store cap in bytes (`0` disables spilling).
+    pub fn set_shuffle_store_cap(bytes: u64) {
+        SHUFFLE_STORE_CAP.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The current in-memory shuffle-store cap in bytes (`0` = unbounded).
+    pub fn shuffle_store_cap() -> usize {
+        SHUFFLE_STORE_CAP.load(Ordering::Relaxed) as usize
+    }
+
     /// Set the shuffle wire-compression codec (0 none / 1 lz4 / 2 zstd). Values outside
     /// that range are ignored (keep current). Settable per worker from Carbonite.
     pub fn set_compression(code: u64) {
@@ -290,7 +306,8 @@ mod tunables {
 
 pub use tunables::{
     client_tls, compression, connections_per_peer, fetch_idle_timeout, keepalive, set_client_tls,
-    set_compression, set_connections_per_peer, set_transport_timeouts,
+    set_compression, set_connections_per_peer, set_shuffle_store_cap, set_transport_timeouts,
+    shuffle_store_cap,
 };
 
 impl From<tonic::Status> for TransportError {

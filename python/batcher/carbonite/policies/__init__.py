@@ -25,6 +25,7 @@ from batcher.carbonite.policies.flow_control import (
     learned_channel_morsel_bytes,
     load_shuffle_window,
     record_shuffle_window,
+    shuffle_store_cap,
 )
 from batcher.carbonite.policies.morsel import morsel_target
 from batcher.carbonite.policies.scheduling import DefaultSchedulingPolicy
@@ -43,4 +44,5 @@ __all__ = [
     "morsel_target",
     "oversubscription_note",
     "record_shuffle_window",
+    "shuffle_store_cap",
 ]

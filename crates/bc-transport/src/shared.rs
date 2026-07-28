@@ -39,7 +39,7 @@ use memmap2::Mmap;
 /// A directory this process does not own cannot be tightened; that is tolerated rather
 /// than fatal, because the files written inside are created 0600 regardless.
 #[cfg(unix)]
-fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -51,7 +51,7 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)
 }
 
@@ -105,7 +105,7 @@ fn shm_path(addr: &str, ticket: &str) -> Option<PathBuf> {
 }
 
 /// Create `path` for writing with owner-only permissions, truncating any existing file.
-fn create_private_file(path: &std::path::Path) -> std::io::Result<File> {
+pub(crate) fn create_private_file(path: &std::path::Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -196,6 +196,20 @@ pub fn publish_shared(addr: &str, ticket: &str, batches: &[RecordBatch]) -> std:
         return Ok(());
     }
     let path = shm_path(addr, ticket).ok_or_else(|| std::io::Error::other("no shm directory"))?;
+    write_ipc_file(&path, batches)
+}
+
+/// Write `batches` to `path` as a 64-byte-aligned Arrow IPC **file**, atomically.
+///
+/// The file format (not the stream format) because it carries a footer of per-batch block
+/// offsets, which is what lets [`read_ipc_file`] mmap it and decode each block zero-copy.
+/// The write goes to a temp sibling and is renamed, so a reader never observes a partial
+/// file. Owner-only at create — the destinations are world-writable directories and the
+/// bytes are the query's rows.
+pub(crate) fn write_ipc_file(
+    path: &std::path::Path,
+    batches: &[RecordBatch],
+) -> std::io::Result<()> {
     let tmp = path.with_extension("arrow.tmp");
     {
         // Arrow IPC **file** format (with a footer of per-batch block offsets), 64-byte aligned,
@@ -219,7 +233,26 @@ pub fn publish_shared(addr: &str, ticket: &str, batches: &[RecordBatch]) -> std:
         let mut file = writer.into_inner().map_err(std::io::Error::other)?;
         file.flush()?;
     }
-    fs::rename(&tmp, &path)
+    fs::rename(&tmp, path)
+}
+
+/// Read an Arrow IPC file written by [`write_ipc_file`], zero-copy over an mmap.
+///
+/// `Ok(None)` for a missing file; a corrupt or truncated one is also `Ok(None)` so a
+/// best-effort caller can fall back rather than fail. Only a genuine I/O fault is `Err`.
+pub(crate) fn read_ipc_file(path: &std::path::Path) -> std::io::Result<Option<Vec<RecordBatch>>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: the file is published atomically (write-temp-then-rename) and never mutated
+    // in place, so the mapping's bytes do not change under us while we read.
+    let mmap = unsafe { Mmap::map(&file)? };
+    if mmap.len() < 10 {
+        return Ok(None);
+    }
+    Ok(read_mmap_zero_copy(mmap).ok())
 }
 
 /// Read the batches a same-node peer published under `(addr, ticket)`, or `None` if no
@@ -235,20 +268,7 @@ pub fn fetch_shared(addr: &str, ticket: &str) -> std::io::Result<Option<Vec<Reco
     let Some(path) = shm_path(addr, ticket) else {
         return Ok(None);
     };
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    // SAFETY: the file is published atomically (write-temp-then-rename) and never
-    // mutated in place, so the mapping's bytes don't change under us while we read.
-    let mmap = unsafe { Mmap::map(&file)? };
-    if mmap.len() < 10 {
-        return Ok(None); // too short to hold an IPC-file trailer — treat as a miss
-    }
-    // A malformed/corrupt file is a miss (⇒ fall back to Flight), not an error: the shm
-    // dir is world-writable, so a bad file is expected and must be transparently ignored.
-    Ok(read_mmap_zero_copy(mmap).ok())
+    read_ipc_file(&path)
 }
 
 /// Decode the IPC-file `mmap` into batches whose buffers point INTO the mmap (zero-copy).

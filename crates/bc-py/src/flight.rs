@@ -332,20 +332,34 @@ pub(crate) fn flight_fetch(
 /// instead of the per-flow cap; `compression` is the shuffle wire codec (0 none / 1 lz4
 /// / 2 zstd, `None` keeps the current value) — moving fewer bytes over a NIC-bound link
 /// lifts effective throughput past line rate for the compressible data a real shuffle
-/// carries. Called once per worker process when its Flight server starts.
+/// carries.
+///
+/// `shuffle_store_cap_bytes` bounds the *in-memory* shuffle-output store: above it a
+/// worker spills its largest published buckets to local disk and reads them back on
+/// fetch. This is the one large footprint Carbonite's buffer pool cannot see — a published
+/// bucket is never *reserved*, it is simply held until a reducer fetches it, so with
+/// `workers` mappers each producing `workers` buckets a node holds its whole share of the
+/// shuffle in memory no reservation covers. Spilling is result-preserving (the same
+/// batches return through an Arrow IPC round trip), so it trades a re-read for a memory
+/// bound. `0` (the default) is unbounded, which is the historical behaviour.
+///
+/// Called once per worker process when its Flight server starts. The cap is captured by
+/// each store at construction, so it must be set before the server is created.
 #[pyfunction]
-#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None))]
+#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0))]
 pub(crate) fn set_flight_transport_config(
     idle_timeout_ms: u64,
     keepalive_ms: u64,
     connections_per_peer: u64,
     compression: Option<u64>,
+    shuffle_store_cap_bytes: u64,
 ) {
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
     bc_transport::set_connections_per_peer(connections_per_peer);
     if let Some(code) = compression {
         bc_transport::set_compression(code);
     }
+    bc_transport::set_shuffle_store_cap(shuffle_store_cap_bytes);
 }
 
 /// Install (or clear) the process-wide client TLS for outbound shuffle fetches.

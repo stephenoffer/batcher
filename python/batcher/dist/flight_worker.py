@@ -212,8 +212,21 @@ try:
             # a dead peer is detected, and set keepalive to catch a dropped connection
             # promptly. A long GC pause under a generous idle window is not misread as
             # death. 0 keeps the process default.
+            # The cap on this worker's *published* shuffle output — the one large
+            # footprint Carbonite's buffer pool cannot see, since a bucket is held for a
+            # reducer rather than reserved by anyone. Above it the store spills its
+            # largest buckets to local disk and reads them back on fetch, which is
+            # result-preserving. Set before the server is created: each store captures the
+            # cap at construction so its bound cannot shift mid-query.
+            from batcher.carbonite.policies import shuffle_store_cap
+            from batcher.config import active_config
+
             nat.set_flight_transport_config(
-                idle_timeout_ms, keepalive_ms, connections_per_peer, compression
+                idle_timeout_ms,
+                keepalive_ms,
+                connections_per_peer,
+                compression,
+                shuffle_store_cap(active_config()),
             )
 
             # Shuffle TLS (off unless the operator mounted certs and enabled it). Read

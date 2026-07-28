@@ -25,6 +25,7 @@ __all__ = [
     "learned_channel_morsel_bytes",
     "load_shuffle_window",
     "record_shuffle_window",
+    "shuffle_store_cap",
 ]
 
 # Learned-parameter namespace for the converged AIMD credit window, keyed by a shuffle
@@ -65,6 +66,49 @@ def credit_ceiling(
     morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
     byte_ceiling = max(1, _channel_byte_budget(config, channels) // morsel_bytes)
     return max(1, min(count_ceiling, byte_ceiling))
+
+
+#: Share of the machine's memory a worker's *published* shuffle output may hold resident.
+#:
+#: The in-flight fraction below bounds bytes on the wire; this bounds the bytes a mapper
+#: has already produced and is holding for reducers to collect. They are different pools
+#: and the second is the larger one: with `workers` mappers each producing `workers`
+#: buckets, a node holds its whole share of the shuffle in anonymous memory that no
+#: reservation covers and the kernel cannot reclaim.
+#:
+#: A quarter rather than the transit fraction's tenth, because this memory is doing the
+#: query's actual work rather than moving it, and because exceeding it costs a disk
+#: round-trip rather than a stall. Above the cap the store spills its largest buckets to
+#: local disk and reads them back on fetch — result-preserving, so the only cost is the
+#: re-read.
+_SHUFFLE_STORE_FRACTION = 0.25
+
+
+def shuffle_store_cap(config: Config, envelope_bytes: int | None = None) -> int:
+    """Bytes a worker's published shuffle output may hold in memory before it spills.
+
+    Carbonite's buffer pool cannot see this memory: a published bucket is never *reserved*,
+    it is simply held until a reducer fetches it. `PressureMonitor` names the store as the
+    reason it must fall back to reading process RSS. Giving it an explicit cap is what turns
+    the largest un-governed footprint on a shuffle-heavy worker into a bounded one.
+
+    Args:
+        config: The active config, for the memory envelope's limits.
+        envelope_bytes: The query's sampled memory envelope; `None` reads the machine's.
+
+    Returns:
+        The cap in bytes, or `0` when no envelope can be determined — which the engine
+        reads as unbounded, preserving the historical behaviour rather than guessing.
+    """
+    envelope = envelope_bytes if envelope_bytes is not None else total_memory_bytes()
+    if envelope <= 0:
+        return 0
+    # Held under the hard limit as well as the fraction: the shuffle store is not entitled
+    # to memory the query as a whole may not use.
+    return max(
+        config.execution.morsel_bytes,
+        int(min(envelope * _SHUFFLE_STORE_FRACTION, envelope * config.memory.hard_limit)),
+    )
 
 
 #: Share of the machine's memory the *whole* shuffle may hold in flight across all its
