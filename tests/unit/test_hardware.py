@@ -192,6 +192,52 @@ def test_gpu_absence_keys_on_device_nodes_not_the_driver_control_node(monkeypatc
     assert hardware.gpu_devices_absent() is False
 
 
+def test_physical_cores_collapse_smt_siblings(monkeypatch, tmp_path):
+    # 8 logical CPUs on 4 physical cores. The physical count is what the machine fingerprint
+    # records, and two boxes with the same logical count but different SMT are different
+    # hardware — an 8-core-no-SMT and a 4-core-2-way perform very differently on the same plan.
+    for cpu_id in range(8):
+        d = tmp_path / f"cpu{cpu_id}" / "topology"
+        d.mkdir(parents=True)
+        sibling = cpu_id ^ 1  # pair (0,1), (2,3), ...
+        (d / "thread_siblings_list").write_text(f"{min(cpu_id, sibling)},{max(cpu_id, sibling)}")
+    monkeypatch.setattr(
+        topology.glob, "glob", lambda pat: [str(tmp_path / f"cpu{i}") for i in range(8)]
+    )
+    monkeypatch.setattr(topology.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 8)
+    hardware.reset_hardware_probes()
+    assert topology.physical_core_count() == 4
+
+
+def test_physical_cores_fall_back_to_the_logical_count(monkeypatch):
+    # No sibling files (not Linux, or a kernel that omits them) must keep the pre-existing
+    # behavior of treating every logical CPU as its own core, not report zero cores.
+    monkeypatch.setattr(topology.glob, "glob", lambda pat: [])
+    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 6)
+    hardware.reset_hardware_probes()
+    assert topology.physical_core_count() == 6
+
+
+def test_storage_class_is_coarse_enough_to_be_stable():
+    # The class feeds both the machine fingerprint and the spill cost term, so it must be
+    # stable across reboots and identical across instances of one shape — which a device name
+    # or serial number would not be.
+    assert storage.device_class("/") in {
+        "nvme",
+        "ssd",
+        "rotational",
+        "network",
+        "loopback",
+        "raid",
+        "mapped",
+        "memory",
+        "unknown",
+    }
+    # An unresolvable path must not raise: this runs on the planning path.
+    assert storage.device_class("/nonexistent-path-for-a-test") in {"memory", "unknown"}
+
+
 def test_gpu_absence_never_false_negatives_off_linux(monkeypatch):
     # macOS Metal devices have no device node, so the cheap path must decline to answer there
     # rather than report "no GPU" on a machine that has one.
@@ -210,6 +256,33 @@ def test_cache_size_is_parsed_from_sys():
     # A malformed size must degrade to "unknown" rather than raise: this runs on the query
     # path, and a `/sys` file that a kernel spells differently must not fail a query.
     assert cache._parse_cache_size("bogusM") == 0
+
+
+def test_cpu_list_parsing_covers_ranges_and_singletons():
+    assert topology._parse_cpu_list("0-3,8,10-11") == {0, 1, 2, 3, 8, 10, 11}
+    assert topology._parse_cpu_list("") == set()
+    # A kernel that spells the list in a way we do not expect must yield nothing rather than
+    # raise: topology is an optimization input, never a correctness one.
+    assert topology._parse_cpu_list("not-a-list") == set()
+
+
+def test_simd_width_reports_the_widest_available_lane(monkeypatch):
+    monkeypatch.setattr(isa, "_cpuinfo_fields", lambda: {"flags": "sse2 avx avx2 avx512f"})
+    hardware.reset_hardware_probes()
+    monkeypatch.setattr(isa, "_cpuinfo_fields", lambda: {"flags": "sse2 avx avx2 avx512f"})
+    assert isa.simd_width_bits() == 512
+    assert "avx2" in isa.cpu_features()
+    # Unrecognized flags are dropped, so a microcode update that adds a flag the engine cannot
+    # exploit does not change the fingerprint and discard everything learned on the machine.
+    assert "fpu" not in isa.cpu_features()
+
+
+def test_simd_width_floors_at_the_universal_baseline(monkeypatch):
+    monkeypatch.setattr(isa, "_cpuinfo_fields", dict)
+    hardware.reset_hardware_probes()
+    monkeypatch.setattr(isa, "_cpuinfo_fields", dict)
+    # 128, not 0: every 64-bit target Batcher supports has at least SSE2 or NEON.
+    assert isa.simd_width_bits() == 128
 
 
 def test_cache_hierarchy_skips_instruction_caches(monkeypatch, tmp_path):
@@ -232,33 +305,6 @@ def test_cache_hierarchy_skips_instruction_caches(monkeypatch, tmp_path):
     hardware.reset_hardware_probes()
     out = cache.cache_hierarchy()
     assert out == {"l1d": 32 << 10, "l2": 1 << 20, "l3": 32 << 20, "line": 64}
-    assert cache.cache_line_bytes() == 64
-
-
-def test_cache_line_falls_back_to_the_near_universal_size(monkeypatch):
-    monkeypatch.setattr(cache, "cache_hierarchy", dict)
-    # 64 rather than 0: every callsite is an alignment or padding decision that needs some
-    # number, and 64 is correct on every architecture Batcher targets except Apple silicon.
-    assert cache.cache_line_bytes() == 64
-
-
-def test_per_core_cache_divides_the_shared_last_level(monkeypatch):
-    # A threshold sized against the whole L3 is the standard way a single-threaded measurement
-    # collapses under full parallelism, because every core then evicts every other core's lines.
-    monkeypatch.setattr(cache, "l3_cache_bytes", lambda: 32 << 20)
-    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 8)
-    assert cache.per_core_cache_bytes() == (32 << 20) // 8
-    # Unknown cache size stays unknown; it is never turned into a fabricated share.
-    monkeypatch.setattr(cache, "l3_cache_bytes", lambda: 0)
-    assert cache.per_core_cache_bytes() == 0
-
-
-def test_cpu_list_parsing_covers_ranges_and_singletons():
-    assert topology._parse_cpu_list("0-3,8,10-11") == {0, 1, 2, 3, 8, 10, 11}
-    assert topology._parse_cpu_list("") == set()
-    # A kernel that spells the list in a way we do not expect must yield nothing rather than
-    # raise: topology is an optimization input, never a correctness one.
-    assert topology._parse_cpu_list("not-a-list") == set()
 
 
 def test_numa_node_count_counts_only_nodes_this_process_may_use(monkeypatch, tmp_path):
@@ -275,41 +321,11 @@ def test_numa_node_count_counts_only_nodes_this_process_may_use(monkeypatch, tmp
     monkeypatch.setattr(topology.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}, raising=False)
     hardware.reset_hardware_probes()
     assert topology.numa_node_count() == 1
-    assert topology.is_numa() is False
 
     monkeypatch.setattr(topology.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
     hardware.reset_hardware_probes()
     assert topology.numa_node_count() == 2
     assert topology.cpus_per_numa_node() == {0: 4, 1: 4}
-    assert topology.is_numa() is True
-
-
-def test_physical_cores_collapse_smt_siblings(monkeypatch, tmp_path):
-    # 8 logical CPUs on 4 physical cores. A compute-bound operator sized to 8 runs half its
-    # threads for no gain while halving the cache each of them sees.
-    for cpu_id in range(8):
-        d = tmp_path / f"cpu{cpu_id}" / "topology"
-        d.mkdir(parents=True)
-        sibling = cpu_id ^ 1  # pair (0,1), (2,3), ...
-        (d / "thread_siblings_list").write_text(f"{min(cpu_id, sibling)},{max(cpu_id, sibling)}")
-    monkeypatch.setattr(
-        topology.glob, "glob", lambda pat: [str(tmp_path / f"cpu{i}") for i in range(8)]
-    )
-    monkeypatch.setattr(topology.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
-    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 8)
-    hardware.reset_hardware_probes()
-    assert topology.physical_core_count() == 4
-    assert topology.smt_threads_per_core() == 2.0
-
-
-def test_physical_cores_fall_back_to_the_logical_count(monkeypatch):
-    # No sibling files (not Linux, or a kernel that omits them) must keep the pre-existing
-    # behavior of treating every logical CPU as its own core, not report zero cores.
-    monkeypatch.setattr(topology.glob, "glob", lambda pat: [])
-    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 6)
-    hardware.reset_hardware_probes()
-    assert topology.physical_core_count() == 6
-    assert topology.smt_threads_per_core() == 1.0
 
 
 def test_machine_memory_takes_the_min_of_host_and_cgroup(monkeypatch):
@@ -336,54 +352,6 @@ def test_a_cgroup_sentinel_is_treated_as_unlimited(tmp_path):
     real = tmp_path / "real"
     real.write_text(str(8 << 30))
     assert cgroup.read_cgroup_bytes(str(real)) == 8 << 30
-
-
-def test_simd_width_reports_the_widest_available_lane(monkeypatch):
-    monkeypatch.setattr(isa, "_cpuinfo_fields", lambda: {"flags": "sse2 avx avx2 avx512f"})
-    hardware.reset_hardware_probes()
-    monkeypatch.setattr(isa, "_cpuinfo_fields", lambda: {"flags": "sse2 avx avx2 avx512f"})
-    assert isa.simd_width_bits() == 512
-    assert "avx2" in isa.cpu_features()
-    # Unrecognized flags are dropped, so a microcode update that adds a flag the engine cannot
-    # exploit does not change the fingerprint and discard everything learned on the machine.
-    assert "fpu" not in isa.cpu_features()
-
-
-def test_simd_width_floors_at_the_universal_baseline(monkeypatch):
-    monkeypatch.setattr(isa, "_cpuinfo_fields", dict)
-    hardware.reset_hardware_probes()
-    monkeypatch.setattr(isa, "_cpuinfo_fields", dict)
-    # 128, not 0: every 64-bit target Batcher supports has at least SSE2 or NEON.
-    assert isa.simd_width_bits() == 128
-
-
-def test_storage_class_is_coarse_enough_to_be_stable():
-    # The class feeds the fingerprint, so it must be stable across reboots and identical
-    # across instances of one shape — which a device name or serial number would not be.
-    assert storage.device_class("/") in {
-        "nvme",
-        "ssd",
-        "rotational",
-        "network",
-        "loopback",
-        "raid",
-        "mapped",
-        "memory",
-        "unknown",
-    }
-    # An unresolvable path must not raise on the query path.
-    assert storage.device_class("/nonexistent-path-for-a-test") in {"memory", "unknown"}
-    assert storage.is_rotational("/nonexistent-path-for-a-test") is None
-    assert storage.filesystem_free_bytes("/nonexistent-path-for-a-test") == 0
-
-
-def test_filesystem_free_bytes_excludes_the_root_reservation(tmp_path):
-    # f_bavail, not f_bfree: a default ext4 reserves 5% for root, and spilling into it fails
-    # late with a disk-full error having already written most of the data.
-    free = storage.filesystem_free_bytes(str(tmp_path))
-    assert free >= 0
-    st = os.statvfs(str(tmp_path))
-    assert free == st.f_bavail * st.f_frsize
 
 
 def test_fingerprint_is_stable_and_short():

@@ -18,7 +18,6 @@ from batcher._internal.mathx import ceil_div
 
 __all__ = [
     "cfs_quota_count",
-    "cgroup_memory_events",
     "cgroup_pressure",
     "cgroup_throttled_ratio",
     "cgroup_v2_dirs",
@@ -206,25 +205,6 @@ def _psi_some_avg10(path: str) -> float | None:
     except (OSError, ValueError):
         return None
     return None
-
-
-def cgroup_memory_events() -> dict[str, int]:
-    """Reclaim and OOM counters from ``memory.events`` — how close the cgroup came to dying.
-
-    ``max`` counts the times allocation hit the hard limit and had to reclaim; ``oom`` and
-    ``oom_kill`` count the times it could not. A run whose ``max`` counter moved spent real
-    time in direct reclaim, which reads as unexplained slowness with normal CPU and no spill —
-    the memory-side analogue of CFS throttling, and equally invisible without the counter.
-
-    Returns:
-        The available event counters (``high``, ``max``, ``oom``, ``oom_kill``), empty when
-        the cgroup does not publish them.
-    """
-    for base in reversed(cgroup_v2_dirs()):
-        stat = _cgroup_stat(base, "memory.events")
-        if stat:
-            return {k: v for k, v in stat.items() if k in ("high", "max", "oom", "oom_kill")}
-    return {}
 
 
 def read_cgroup_bytes(path: str) -> int | None:

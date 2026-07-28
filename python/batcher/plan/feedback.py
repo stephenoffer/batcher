@@ -18,7 +18,6 @@ __all__ = [
     "FeedbackSink",
     "OperatorFeedback",
     "cpu_utilization",
-    "faulted_bytes",
     "preemption_rate",
 ]
 
@@ -87,27 +86,6 @@ def preemption_rate(invol_ctx_switches: int, elapsed_ms: float, threads: int) ->
     if invol_ctx_switches <= 0 or core_seconds <= 0:
         return 0.0
     return invol_ctx_switches / core_seconds
-
-
-def faulted_bytes(minor_faults: int, major_faults: int, page_bytes: int) -> int:
-    """Bytes of memory the operator forced the kernel to make resident.
-
-    Faults are the measured counterpart to the Arrow-size `m_peak_bytes` estimate: the estimate
-    models what the operator's data structures should occupy, while this counts pages the
-    kernel actually had to back. The two diverge exactly where the estimate is least
-    trustworthy — allocator fragmentation, transient scratch, buffers outside the pool — which
-    is why the learned memory model benefits from seeing both.
-
-    Args:
-        minor_faults: Faults served without disk I/O.
-        major_faults: Faults that required disk I/O.
-        page_bytes: The machine's page size in bytes.
-
-    Returns:
-        Bytes made resident, or `0` when no faults were measured.
-    """
-    total = max(0, minor_faults) + max(0, major_faults)
-    return total * max(0, page_bytes)
 
 
 @dataclass(frozen=True, slots=True)

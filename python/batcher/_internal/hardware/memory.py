@@ -13,10 +13,8 @@ import os
 from batcher._internal.hardware.cgroup import cgroup_v2_dirs, read_cgroup_bytes
 
 __all__ = [
-    "hugepage_bytes",
     "machine_memory_bytes",
     "page_size_bytes",
-    "swap_configured",
 ]
 
 
@@ -67,56 +65,3 @@ def page_size_bytes() -> int:
         return int(os.sysconf("SC_PAGE_SIZE"))
     except (ValueError, OSError, AttributeError):
         return 4096
-
-
-@functools.lru_cache(maxsize=1)
-def hugepage_bytes() -> int:
-    """The default transparent-hugepage size in bytes, or `0` when THP is off/unavailable.
-
-    A 2 MiB page maps 512x the memory per TLB entry, which is the difference between a large
-    hash table's probes hitting the TLB and missing it on nearly every row. Whether the
-    machine offers them is therefore a real performance property of the box, not a detail:
-    the same join can be TLB-bound on one host and not on another with identical cores.
-
-    Returns:
-        The hugepage size in bytes, or `0` when transparent hugepages are disabled.
-    """
-    enabled = ""
-    try:
-        with open("/sys/kernel/mm/transparent_hugepage/enabled") as f:
-            enabled = f.read().strip()
-    except OSError:
-        return 0
-    # The active mode is the one in brackets; "[never]" means no hugepages will be handed out.
-    if "[never]" in enabled or not enabled:
-        return 0
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("Hugepagesize:"):
-                    parts = line.split()
-                    return int(parts[1]) * 1024  # reported in kB
-    except (OSError, ValueError, IndexError):
-        return 0
-    return 0
-
-
-@functools.lru_cache(maxsize=1)
-def swap_configured() -> bool:
-    """Whether this machine has swap the kernel can push our pages into.
-
-    Changes what memory pressure *means*. Without swap, exceeding the limit is an immediate
-    OOM kill, so the memory budget must be respected exactly. With swap, the same overshoot
-    degrades into disk latency instead — survivable, but it makes a query mysteriously slow
-    with healthy-looking CPU and no spill of our own. The two failure modes want different
-    responses, and nothing else distinguishes them.
-
-    Returns:
-        `True` when any swap device is configured.
-    """
-    try:
-        with open("/proc/swaps") as f:
-            # Line 1 is the header; any line after it is a configured swap device.
-            return len(f.read().strip().splitlines()) > 1
-    except OSError:
-        return False

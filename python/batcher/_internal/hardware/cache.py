@@ -20,11 +20,7 @@ import os
 
 __all__ = [
     "cache_hierarchy",
-    "cache_line_bytes",
-    "l1d_cache_bytes",
-    "l2_cache_bytes",
     "l3_cache_bytes",
-    "per_core_cache_bytes",
 ]
 
 
@@ -95,31 +91,6 @@ def cache_hierarchy() -> dict[str, int]:
     return out
 
 
-def l1d_cache_bytes() -> int:
-    """Bytes of L1 data cache per core, or `0` if undetectable.
-
-    The residency bound for a per-morsel scratch buffer: a radix pass whose per-partition
-    write buffers exceed L1 pays a cache miss on every row it emits.
-
-    Returns:
-        L1 data cache size in bytes, or `0` when the platform cannot report it.
-    """
-    return cache_hierarchy().get("l1d", 0)
-
-
-def l2_cache_bytes() -> int:
-    """Bytes of L2 cache in this core's cache domain, or `0` if undetectable.
-
-    The bound that governs morsel sizing: a morsel wants to be large enough to amortize
-    per-batch overhead and small enough that one operator's working set over it stays in L2,
-    which is the level a single core owns outright and therefore the one it can rely on.
-
-    Returns:
-        L2 cache size in bytes, or `0` when the platform cannot report it.
-    """
-    return cache_hierarchy().get("l2", 0)
-
-
 def l3_cache_bytes() -> int:
     """Bytes of last-level (L3) cache in this core's cache domain, or `0` if undetectable.
 
@@ -133,37 +104,3 @@ def l3_cache_bytes() -> int:
         L3 cache size in bytes, or `0` when the platform cannot report it.
     """
     return cache_hierarchy().get("l3", 0)
-
-
-def cache_line_bytes() -> int:
-    """The cache-line size in bytes, or `64` when the platform cannot report it.
-
-    Falls back to 64 rather than 0 because every architecture Batcher targets uses 64 except
-    Apple silicon at 128, so a zero here would be a worse answer than the near-universal one:
-    the callers are alignment and padding decisions that need *some* number.
-
-    Returns:
-        The coherency line size in bytes.
-    """
-    return cache_hierarchy().get("line", 0) or 64
-
-
-def per_core_cache_bytes() -> int:
-    """The last-level cache each core can count on when every core is busy, or `0`.
-
-    L3 is *shared*, so a fully parallel operator does not get all of it — it gets roughly its
-    share. Sizing a per-worker working set against the whole L3 is the standard way a
-    threshold that measured well single-threaded collapses under full parallelism, because
-    every core then evicts every other core's lines. Dividing by the core budget is a
-    deliberately conservative model of a set-associative cache under contention, and a
-    conservative bound is the right side to err on here.
-
-    Returns:
-        Per-core last-level cache share in bytes, or `0` when the cache size is unknown.
-    """
-    from batcher._internal.hardware.cpu import available_cpu_count
-
-    shared = l3_cache_bytes()
-    if shared <= 0:
-        return 0
-    return max(1, shared // max(1, available_cpu_count()))

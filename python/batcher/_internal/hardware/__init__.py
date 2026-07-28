@@ -35,14 +35,9 @@ from batcher._internal.accelerators import (
 )
 from batcher._internal.hardware.cache import (
     cache_hierarchy,
-    cache_line_bytes,
-    l1d_cache_bytes,
-    l2_cache_bytes,
     l3_cache_bytes,
-    per_core_cache_bytes,
 )
 from batcher._internal.hardware.cgroup import (
-    cgroup_memory_events,
     cgroup_pressure,
     cgroup_v2_dirs,
     read_cgroup_bytes,
@@ -56,25 +51,18 @@ from batcher._internal.hardware.cpu import (
 )
 from batcher._internal.hardware.isa import cpu_features, cpu_model_name, cpu_vendor, simd_width_bits
 from batcher._internal.hardware.memory import (
-    hugepage_bytes,
     machine_memory_bytes,
     page_size_bytes,
-    swap_configured,
 )
 from batcher._internal.hardware.probes import reset_hardware_probes
 from batcher._internal.hardware.profile import HardwareProfile, fingerprint, hardware_profile
 from batcher._internal.hardware.storage import (
     device_class,
-    device_queue_depth,
-    filesystem_free_bytes,
-    is_rotational,
 )
 from batcher._internal.hardware.topology import (
     cpus_per_numa_node,
-    is_numa,
     numa_node_count,
     physical_core_count,
-    smt_threads_per_core,
 )
 
 __all__ = [
@@ -83,8 +71,6 @@ __all__ = [
     "accelerator_backend",
     "available_cpu_count",
     "cache_hierarchy",
-    "cache_line_bytes",
-    "cgroup_memory_events",
     "cgroup_pressure",
     "cgroup_v2_dirs",
     "cpu_contention",
@@ -94,27 +80,17 @@ __all__ = [
     "cpu_vendor",
     "cpus_per_numa_node",
     "device_class",
-    "device_queue_depth",
-    "filesystem_free_bytes",
     "fingerprint",
     "gpu_devices_absent",
     "gpu_inventory",
     "hardware_profile",
-    "hugepage_bytes",
-    "is_numa",
-    "is_rotational",
-    "l1d_cache_bytes",
-    "l2_cache_bytes",
     "l3_cache_bytes",
     "machine_memory_bytes",
     "numa_node_count",
     "page_size_bytes",
-    "per_core_cache_bytes",
     "physical_core_count",
     "process_start_method_context",
     "read_cgroup_bytes",
     "reset_hardware_probes",
     "simd_width_bits",
-    "smt_threads_per_core",
-    "swap_configured",
 ]

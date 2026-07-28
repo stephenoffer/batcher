@@ -661,7 +661,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 353 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 342 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 154 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1109 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1132 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 183 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 99 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 105 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -1125,7 +1125,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 |---|---|---|
 | `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 372 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 464 | The Carbonite resource manager entry point. |
+| `manager.py` | 484 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1148,7 +1148,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `admission.py` | 107 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
-| `flow_control.py` | 472 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
+| `flow_control.py` | 484 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 208 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |

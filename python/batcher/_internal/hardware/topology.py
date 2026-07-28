@@ -28,10 +28,8 @@ import os
 
 __all__ = [
     "cpus_per_numa_node",
-    "is_numa",
     "numa_node_count",
     "physical_core_count",
-    "smt_threads_per_core",
 ]
 
 
@@ -109,19 +107,6 @@ def cpus_per_numa_node() -> dict[int, int]:
     return out
 
 
-def is_numa() -> bool:
-    """Whether this process spans more than one NUMA node.
-
-    The gate on every locality optimization: on a single-node machine they are pure overhead,
-    so each one checks this first rather than paying to partition work that has nowhere else
-    to go.
-
-    Returns:
-        `True` when usable CPUs live on two or more NUMA nodes.
-    """
-    return numa_node_count() > 1
-
-
 @functools.lru_cache(maxsize=1)
 def physical_core_count() -> int:
     """Physical cores backing this process's usable CPUs — never fewer than 1.
@@ -160,22 +145,3 @@ def physical_core_count() -> int:
             siblings &= allowed
         cores.add(frozenset(siblings) if siblings else frozenset({cpu_id}))
     return max(1, len(cores)) if cores else logical
-
-
-def smt_threads_per_core() -> float:
-    """Logical CPUs per physical core — ``1.0`` with SMT off, ``2.0`` on typical hyperthreading.
-
-    The correction factor between the two fan-out denominators. An operator whose measured
-    per-core utilization is already near saturation gains nothing from the extra sibling
-    threads and loses cache to them, so it should size to `physical_core_count`; a
-    latency-bound operator should size to the logical count and use the stalls.
-
-    Returns:
-        Logical CPUs per physical core, at least 1.0.
-    """
-    from batcher._internal.hardware.cpu import available_cpu_count
-
-    physical = physical_core_count()
-    if physical <= 0:
-        return 1.0
-    return max(1.0, available_cpu_count() / physical)
