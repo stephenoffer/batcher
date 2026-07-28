@@ -4120,3 +4120,33 @@ def test_a_small_per_row_map_stays_quiet():
         "ops": [_stage(0, "MapRows", rows_in=100, rows_out=100, elapsed_ms=90.0)],
     }
     assert "per-row-map" not in _rules(profile)
+
+
+def test_a_badly_starved_gpu_is_not_suppressed_by_the_size_floor():
+    """The floor must be on the *pipeline's* time, not the GPU stage's.
+
+    A starved GPU is by definition one that spends little time working, so gating on the GPU
+    stage's own duration suppresses the finding precisely when the starvation is worst. This
+    is the shape that was silently missed: 11x starved, GPU stage well under the floor."""
+    profile = {
+        "total_ms": 200.0,
+        "rows": 3000,
+        "ops": [
+            _stage(0, "MapBatches", elapsed_ms=13.0, backend="gpu"),
+            _stage(1, "MapBatches", elapsed_ms=145.0),
+        ],
+    }
+    assert "gpu-starved" in _rules(profile)
+
+
+def test_a_tiny_run_is_still_too_small_to_conclude_from():
+    """The floor still has to do its job: a millisecond-scale run says nothing."""
+    profile = {
+        "total_ms": 20.0,
+        "rows": 10,
+        "ops": [
+            _stage(0, "MapBatches", elapsed_ms=1.0, backend="gpu"),
+            _stage(1, "MapBatches", elapsed_ms=11.0),
+        ],
+    }
+    assert "gpu-starved" not in _rules(profile)

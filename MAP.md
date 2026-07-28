@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 924 Python modules across 141 packages and 176 Rust files across 13 crates.
+Covering 925 Python modules across 141 packages and 176 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -661,7 +661,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 353 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 342 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 154 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1091 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1104 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 183 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 99 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 105 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -684,7 +684,7 @@ Per-operator distributed executor implementations.
 |---|---|---|
 | `aggregate.py` | 245 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 48 | Distributed DISTINCT — deduplicate across workers via the aggregate shuffle. |
-| `join.py` | 857 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
+| `join.py` | 865 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `map.py` | 1444 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 519 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
@@ -700,7 +700,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 | module | lines | what it is |
 |---|---|---|
 | `_sources.py` | 498 | Shared partitioning + post-breaker helpers for the distributed operators. |
-| `folds.py` | 87 | Streaming, byte-bounded folds of a shuffle map-side partition. |
+| `folds.py` | 89 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 80 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
 ### `batcher/dist/executors/ray_runtime/` — 4 · backend
@@ -712,7 +712,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 133 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 98 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 55 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 208 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 209 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 430 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
@@ -827,8 +827,8 @@ The Kyber optimizer entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `driver.py` | 468 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
-| `expr_dispatch.py` | 234 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
+| `driver.py` | 486 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
+| `expr_dispatch.py` | 241 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
 | `facade.py` | 364 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1124,7 +1124,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 109 | Policy seams for the Carbonite resource manager. |
-| `cache.py` | 307 | The result cache — a memory-bounded LRU of materialized query results. |
+| `cache.py` | 372 | The result cache — a memory-bounded LRU of materialized query results. |
 | `manager.py` | 452 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1148,7 +1148,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `admission.py` | 126 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
-| `flow_control.py` | 420 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
+| `flow_control.py` | 464 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 209 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
@@ -1806,7 +1806,7 @@ Query profiles — the planned plan joined to the measured run, for `EXPLAIN`.
 |---|---|---|
 | `collect.py` | 318 | Profile assembly — join Kyber's estimates to Core's measurements by `op_id`. |
 | `stages.py` | 191 | Measuring the Python-UDF stages of a pipeline the engine cannot see into. |
-| `types.py` | 398 | Profile value types and rendering — `Decision`, `OpProfile`, `QueryProfile`. |
+| `types.py` | 424 | Profile value types and rendering — `Decision`, `OpProfile`, `QueryProfile`. |
 
 ### `batcher/plan/streaming/` — 1 · contract
 
@@ -1823,6 +1823,7 @@ The neutral type vocabulary and inference for the plan layer.
 
 | module | lines | what it is |
 |---|---|---|
+| `footprint.py` | 86 | How much memory live Arrow data actually keeps resident. |
 | `infer.py` | 485 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
@@ -1914,7 +1915,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `isa.py` | 137 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 122 | The memory ceiling and page geometry this process runs under. |
 | `probes.py` | 44 | The one hook that clears every memoized hardware reading. |
-| `profile.py` | 286 | The machine's identity — one record of what this hardware is, and a key that names it. |
+| `profile.py` | 306 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 174 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 181 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
@@ -1932,7 +1933,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
-| `flight.rs` | 437 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 451 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `lib.rs` | 720 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
@@ -2158,8 +2159,8 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `exchange.rs` | 700 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 387 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 105 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
-| `shared.rs` | 391 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 203 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `shared.rs` | 411 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
+| `store.rs` | 350 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 91 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 184 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |

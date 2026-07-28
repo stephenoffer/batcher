@@ -211,8 +211,20 @@ print(profile["rows"], profile["spilled"], profile["carbonite_summary"])
 ```
 
 The document also carries `logical_ir` and `optimized_ir` (the plan before and after
-Kyber), `decisions`, `adaptive_stages`, and the memory budget. Asserting on
+Kyber), `decisions`, `adaptive_stages`, the memory budget, and `machine`. Asserting on
 `optimized_ir` is how you write a regression test that a predicate stays pushed down.
+
+`machine` names the hardware the run was measured on, as a readable label and a fingerprint:
+
+```text
+machine: GenuineIntel/16c/64GiB/l3=32MiB/nvme [a2f5aeb968ef]
+```
+
+Every timing above it is relative to that machine, so it's what makes two profiles from
+different nodes comparable. The fingerprint is also the key the engine stores its learned
+costs under, which makes it the answer to "why did this node plan worse than that one?" — a
+different fingerprint means the two learned separately and neither inherited the other's
+measurements. {doc}`performance` covers what that changes.
 
 ## What the operator cost the machine
 

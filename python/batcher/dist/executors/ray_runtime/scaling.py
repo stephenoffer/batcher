@@ -256,7 +256,12 @@ def cluster_hardware_profile() -> HardwareProfile | None:
     worker_count = len(classes)
     min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
     gpu_devices = int(sum(c["gpus"] for c in classes))
-    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_l3_cache_bytes
+    from batcher.dist.executors.ray_runtime.hardware_probe import (
+        cluster_l3_cache_bytes,
+        warn_once_if_fleet_is_mixed,
+    )
+
+    warn_once_if_fleet_is_mixed()
 
     return HardwareProfile.for_cluster(
         cpu_cores=min_cores,

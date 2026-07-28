@@ -20,6 +20,7 @@ import json
 import pytest
 
 import batcher as bt
+from batcher._internal import hardware
 from batcher.plan.feedback import (
     CONTENDED_PREEMPTIONS_PER_CORE_SECOND,
     OperatorFeedback,
@@ -233,3 +234,34 @@ def test_distributed_merge_sums_the_event_counters():
     # Wall time and peak bytes keep their non-additive merges.
     assert merged[0]["elapsed_ns"] == 1_000
     assert merged[0]["peak_bytes"] == 4096
+
+
+def test_the_profile_names_the_machine_it_was_measured_on():
+    from batcher.plan.profile.types import QueryProfile
+
+    # Every timing in a profile is relative to a machine, and a profile read out of a log or
+    # compared against one from another node is otherwise unattributed. The same string is the
+    # key the engine's learned costs are stored under, so it also answers "would what this run
+    # learned apply to that other node?".
+    op = OpProfile(op_id=0, kind="scan", depth=0, measured=True, elapsed_ms=5.0, threads=4)
+    profile = QueryProfile(ops=(op,), total_ms=5.0, measured=True, rows=1)
+
+    machine = profile.machine
+    assert machine and "[" in machine and machine.endswith("]")
+    assert hardware.fingerprint() in machine
+
+    rendered = profile.render(analyze=True)
+    assert f"machine: {machine}" in rendered
+    assert profile.to_dict()["machine"] == machine
+
+    # A planned-only profile prints no measurements, so naming the machine there would be
+    # answering a question nobody asked.
+    assert "machine:" not in QueryProfile(ops=(op,)).render(analyze=False)
+
+    # And a distributed profile is assembled on the driver while the work ran on the workers.
+    # Printing the driver's machine there would attribute every timing above it to hardware
+    # that ran none of it — a head node is routinely a different shape from its fleet.
+    distributed = QueryProfile(ops=(op,), total_ms=5.0, measured=True, rows=1, distributed=True)
+    assert "machine:" not in distributed.render(analyze=True)
+    # Still in the JSON, where a consumer can see which node assembled the document.
+    assert distributed.to_dict()["machine"] == machine

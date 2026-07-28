@@ -181,3 +181,47 @@ def test_unlike_machines_do_not_share_a_fingerprint():
     )
     assert small.fingerprint() != large.fingerprint()
     assert scoped("ns") != f"ns@{large.fingerprint()}"
+
+
+def test_a_mixed_cluster_is_detectable_from_the_driver(monkeypatch):
+    # A driver cannot see what its workers are. That matters because it is the usual
+    # explanation for a learned model that will not converge: an autoscaling group quietly
+    # substituting a newer instance generation makes every node's history half about a machine
+    # it is not, and nothing about the symptom says so.
+    from batcher.dist.executors.ray_runtime import hardware_probe as probe
+
+    big = {"fingerprint": "aaaaaaaaaaaa", "caches": {"l3": 64 << 20}}
+    small = {"fingerprint": "bbbbbbbbbbbb", "caches": {"l3": 8 << 20}}
+
+    monkeypatch.setattr(probe, "cluster_hardware_profiles", lambda: (big, small))
+    assert probe.cluster_is_heterogeneous() is True
+    # The *smallest* cache binds: a broadcast table sized to the big node's cache spills out
+    # of the small node's, and the plan does not choose which node it lands on.
+    assert probe.cluster_l3_cache_bytes() == 8 << 20
+
+    monkeypatch.setattr(probe, "cluster_hardware_profiles", lambda: (big, dict(big)))
+    assert probe.cluster_is_heterogeneous() is False
+    assert probe.cluster_l3_cache_bytes() == 64 << 20
+
+
+def test_an_unprobeable_cluster_reports_unknown_rather_than_a_guess(monkeypatch):
+    # Every failure here — Ray down, the probe unschedulable, a worker past the timeout — must
+    # leave planning exactly as it was. A driver-local reading substituted for a worker's is
+    # the specific wrong answer: a head node is routinely a different machine from the fleet.
+    from batcher.dist.executors.ray_runtime import hardware_probe as probe
+
+    monkeypatch.setattr(probe, "cluster_hardware_profiles", tuple)
+    assert probe.cluster_l3_cache_bytes() == 0
+    assert probe.cluster_is_heterogeneous() is False
+
+    # A node shape whose cache is undetectable must be dropped, not allowed to drag the
+    # minimum to zero and disable the broadcast threshold cluster-wide.
+    monkeypatch.setattr(
+        probe,
+        "cluster_hardware_profiles",
+        lambda: (
+            {"fingerprint": "a", "caches": {}},
+            {"fingerprint": "b", "caches": {"l3": 1 << 20}},
+        ),
+    )
+    assert probe.cluster_l3_cache_bytes() == 1 << 20

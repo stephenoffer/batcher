@@ -162,6 +162,37 @@ print(joined.collect(adaptive=True).to_pydict())
 # {'tier': ['gold', 'silver'], 'total': [112.0, 20.0]}
 ```
 
+## What the engine learns is per machine
+
+Adaptive re-optimization improves one query while it runs. A second loop improves the *next*
+run: Batcher fits per-row costs, memory per group, batch sizes, and VRAM footprints from what
+it measured last time, so a query that runs often is planned better each time.
+
+Every one of those numbers is a property of a workload **on a machine**. A per-row coefficient
+fitted on a 3 GHz AVX-512 core is wrong on a small ARM core by several times over, and a VRAM
+figure measured on an A100 is wrong on a T4 by five. So each is stored under a fingerprint of
+the machine that measured it: core and cache counts, memory capacity, vector width, NUMA
+nodes, the scratch device's class, the attached accelerators.
+
+Two consequences worth knowing.
+
+Machines that are alike share a fingerprint, so a fleet of identical nodes pools everything it
+learns and converges as fast as the whole fleet can produce feedback. Machines that differ do
+not, so on a cluster that mixes instance types each shape converges on its own share of the
+runs. That is slower, and it is the correct trade: a model averaged across unlike hardware is
+wrong everywhere rather than slow anywhere. Batcher logs a line the first time it notices a
+mixed fleet, so the slower convergence has an explanation.
+
+Changing the machine resets the learning for that machine class. Adding memory, attaching a
+GPU, or moving from a spinning disk to NVMe all produce a different fingerprint, and the
+engine starts from its priors rather than from measurements of hardware that no longer exists.
+The fingerprint is in `bt.start_ui()`'s system panel if you need to confirm which class a node
+belongs to.
+
+Statistics about the *data* are deliberately not scoped this way. Distinct counts, quantiles,
+column widths, and selectivities describe the data and are identical wherever it is read, so
+they are shared across every machine that touches the dataset.
+
 ## Out-of-core spilling
 
 Stateful operators spill to disk when they would exceed the memory envelope, which covers

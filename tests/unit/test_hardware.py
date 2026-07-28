@@ -470,3 +470,33 @@ def test_memory_per_core_distinguishes_memory_rich_from_core_rich():
     assert rich.memory_per_core_bytes == 16 * lean.memory_per_core_bytes
     # No cores reported → no ratio, rather than a division by zero on the query path.
     assert profile.HardwareProfile(logical_cpus=0, memory_bytes=1 << 30).memory_per_core_bytes == 0
+
+
+def test_the_fingerprint_does_not_import_a_gpu_framework(monkeypatch):
+    # `gpu_inventory` falls back to `torch.cuda` when NVML is absent, and importing torch costs
+    # ~1.6 s. `fingerprint()` runs on the first feedback row in every process — on a Ray
+    # cluster, every worker — so paying that to discover a CPU-only box has no GPU turned a
+    # 5 ms probe into a 1.6 s one. `gpu_devices_absent` is the cheap device-node check that
+    # exists for exactly this, and the profile must go through it.
+    import batcher._internal.hardware.profile as profile_mod
+
+    def explode():  # pragma: no cover - the point is that it is never called
+        raise AssertionError("the profile probed the GPU inventory on a device-less machine")
+
+    monkeypatch.setattr(profile_mod, "gpu_devices_absent", lambda: True)
+    monkeypatch.setattr(profile_mod, "gpu_inventory", explode)
+    hardware.reset_hardware_probes()
+    assert profile_mod._accelerator_names() == ()
+    assert len(hardware.fingerprint()) == 12
+
+
+def test_a_machine_with_devices_still_gets_its_inventory(monkeypatch):
+    # The guard must not become a blanket "assume no GPU". `gpu_devices_absent` returns False
+    # both when devices exist and when the platform cannot tell (macOS Metal), and in either
+    # case the real inventory is what the fingerprint needs — an A100 and a T4 are different
+    # machine classes and must not collapse into one.
+    import batcher._internal.hardware.profile as profile_mod
+
+    monkeypatch.setattr(profile_mod, "gpu_devices_absent", lambda: False)
+    monkeypatch.setattr(profile_mod, "gpu_inventory", lambda: [{"name": "T4"}, {"name": "A100"}])
+    assert profile_mod._accelerator_names() == ("A100", "T4")

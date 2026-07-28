@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from batcher._internal.hardware import hardware_profile
 from batcher._internal.mathx import safe_div
 from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
@@ -195,6 +196,23 @@ class QueryProfile:
     worker_ops: tuple[OpProfile, ...] = ()
 
     @property
+    def machine(self) -> str:
+        """A short name for the machine class this profile was assembled on.
+
+        Every timing here is relative to a machine, and a profile read out of a log or compared
+        against one from another node is otherwise unattributed. It is also the key the
+        engine's learned costs are stored under, so it answers the two questions a surprising
+        plan raises: which machine shape ran this, and would what it learned apply anywhere
+        else.
+
+        On a **distributed** profile this is the *driver's* machine, which ran none of the
+        operators — so `render` omits it there rather than inviting the timings above it to be
+        read as facts about this box.
+        """
+        profile = hardware_profile()
+        return f"{profile.label()} [{profile.fingerprint()}]"
+
+    @property
     def spilled(self) -> bool:
         """Whether any operator spilled to disk during the run."""
         return any(o.spilled for o in self.ops)
@@ -289,6 +307,13 @@ class QueryProfile:
             util = self.utilization_summary()
             if util:
                 lines.append(util)
+            # Only on a single-node run. On a distributed one the profile is assembled on the
+            # driver while the work happened on the workers, so naming the driver's machine
+            # here would attribute every timing above it to hardware that ran none of it —
+            # and a head node is routinely a different shape from the fleet. The workers'
+            # own section below is where their facts belong.
+            if not self.distributed:
+                lines.append(f"machine: {self.machine}")
         if self.decisions:
             lines.append("")
             lines.append("decisions:")
@@ -351,6 +376,7 @@ class QueryProfile:
             "memory_budget_bytes": self.memory_budget_bytes,
             "total_spill_bytes": self.total_spill_bytes,
             "carbonite_summary": self.carbonite_summary,
+            "machine": self.machine,
             "ops": [o.to_dict() for o in self.ops],
             "worker_ops": [o.to_dict() for o in self.worker_ops],
             "decisions": [d.to_dict() for d in self.decisions],

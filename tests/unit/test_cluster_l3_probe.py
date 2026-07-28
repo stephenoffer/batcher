@@ -5,6 +5,10 @@ query fell back to the config broadcast threshold. The probe collects it from th
 properties matter on a heterogeneous cluster: it samples one worker per distinct node shape (not
 one worker, assuming uniformity), and it takes the minimum (a broadcast table sized to the
 biggest cache would spill out of the smallest node's).
+
+The probe returns each shape's whole `HardwareProfile` rather than one cache figure — the round
+trip is the cost, so every additional field is free once a task has been scheduled — and the
+binding minimum is taken by `cluster_l3_cache_bytes` over those profiles.
 """
 
 from __future__ import annotations
@@ -50,6 +54,18 @@ def test_nodes_without_cpus_or_ids_are_skipped():
     assert hp._representative_node_ids(nodes) == ["ok"]
 
 
+def _fake_scheduling_strategies(monkeypatch):
+    """Stand in for the Ray scheduling-strategy import `_probe_representatives` performs."""
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ray.util.scheduling_strategies",
+        types.SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None),
+    )
+
+
 def test_the_binding_minimum_is_taken_across_shapes(monkeypatch):
     """A big-cache node and a small-cache node → the threshold binds to the small one."""
 
@@ -71,16 +87,20 @@ def test_the_binding_minimum_is_taken_across_shapes(monkeypatch):
             return refs, []
 
         def get(self, ready):
-            return [36 * 1024 * 1024, 8 * 1024 * 1024]  # 36 MiB EPYC vs 8 MiB small node
+            # 36 MiB EPYC vs 8 MiB small node, as whole profiles.
+            return [
+                {"fingerprint": "epyc00000000", "caches": {"l3": 36 * 1024 * 1024}},
+                {"fingerprint": "small0000000", "caches": {"l3": 8 * 1024 * 1024}},
+            ]
 
-    # Patch the strategy import target used inside _probe_representatives.
-    import sys
-    import types
-
-    fake_mod = types.SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None)
-    monkeypatch.setitem(sys.modules, "ray.util.scheduling_strategies", fake_mod)
-    got = hp._probe_representatives(_FakeRay(), ["a", "b"])
-    assert got == 8 * 1024 * 1024  # the smaller cache binds
+    _fake_scheduling_strategies(monkeypatch)
+    profiles = hp._probe_representatives(_FakeRay(), ["a", "b"])
+    assert len(profiles) == 2
+    monkeypatch.setattr(hp, "cluster_hardware_profiles", lambda: profiles)
+    assert hp.cluster_l3_cache_bytes() == 8 * 1024 * 1024  # the smaller cache binds
+    # Two shapes, two fingerprints: the fleet is mixed, and everything learned on one node is
+    # kept apart from the other's rather than averaged into a model wrong for both.
+    assert hp.cluster_is_heterogeneous() is True
 
 
 def test_a_shape_reporting_zero_cache_does_not_drag_the_min_to_zero(monkeypatch):
@@ -102,14 +122,14 @@ def test_a_shape_reporting_zero_cache_does_not_drag_the_min_to_zero(monkeypatch)
             return refs, []
 
         def get(self, ready):
-            return [0, 16 * 1024 * 1024]  # one node's cache is undetectable
+            # One node's cache is undetectable; dropping it beats letting a `0` disable the
+            # broadcast threshold for the whole cluster.
+            return [
+                {"fingerprint": "unknown00000", "caches": {}},
+                {"fingerprint": "known0000000", "caches": {"l3": 16 * 1024 * 1024}},
+            ]
 
-    import sys
-    import types
-
-    monkeypatch.setitem(
-        sys.modules,
-        "ray.util.scheduling_strategies",
-        types.SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None),
-    )
-    assert hp._probe_representatives(_FakeRay(), ["a", "b"]) == 16 * 1024 * 1024
+    _fake_scheduling_strategies(monkeypatch)
+    profiles = hp._probe_representatives(_FakeRay(), ["a", "b"])
+    monkeypatch.setattr(hp, "cluster_hardware_profiles", lambda: profiles)
+    assert hp.cluster_l3_cache_bytes() == 16 * 1024 * 1024

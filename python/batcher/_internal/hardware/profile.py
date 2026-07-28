@@ -35,7 +35,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
-from batcher._internal.accelerators import gpu_inventory
+from batcher._internal.accelerators import gpu_devices_absent, gpu_inventory
 from batcher._internal.hardware.cache import cache_hierarchy
 from batcher._internal.hardware.cpu import available_cpu_count
 from batcher._internal.hardware.isa import cpu_model_name, cpu_vendor, simd_width_bits
@@ -218,6 +218,26 @@ class HardwareProfile:
         }
 
 
+def _accelerator_names() -> tuple[str, ...]:
+    """Attached accelerator model names, without paying for a framework import to find none.
+
+    `gpu_inventory` falls back to `torch.cuda` when NVML is unavailable, and importing torch
+    costs ~1.6 s. That is affordable on a machine that has a GPU and absurd on one that does
+    not — and this runs on the first `fingerprint()` call in every process, which on a Ray
+    cluster means every worker.
+
+    `gpu_devices_absent` is the cheap device-node check that exists for exactly this: it
+    returns `True` only when it can *prove* there is no accelerator, so a machine that has one
+    (or a platform that cannot tell, such as macOS Metal) still gets the real inventory.
+
+    Returns:
+        Sorted accelerator model names, empty when the machine provably has none.
+    """
+    if gpu_devices_absent():
+        return ()
+    return tuple(sorted(str(d.get("name", "")) for d in gpu_inventory()))
+
+
 # Assembled once per process. Not `functools.lru_cache`d because `HardwareProfile` holds a
 # mutable `caches` dict, and a memo would hand the same dict to every caller; the module-level
 # binding is cleared by `reset_hardware_probes` alongside the probes it is built from.
@@ -254,7 +274,7 @@ def hardware_profile() -> HardwareProfile:
             model=cpu_model_name(),
             page_bytes=page_size_bytes(),
             storage_class=device_class(tempfile.gettempdir()),
-            accelerators=tuple(sorted(str(d.get("name", "")) for d in gpu_inventory())),
+            accelerators=_accelerator_names(),
             platform_system=platform.system(),
         )
     return _PROFILE
