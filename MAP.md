@@ -863,7 +863,7 @@ Kyber rule modules.
 | `ordering.py` | 58 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 724 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 487 | Predicate pushdown — evaluate filters as early as possible. |
-| `selection.py` | 437 | SELECTION-phase rules — cost-based physical algorithm choice. |
+| `selection.py` | 452 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `zonemap_pruning.py` | 373 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem

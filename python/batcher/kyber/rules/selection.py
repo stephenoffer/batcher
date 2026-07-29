@@ -333,7 +333,22 @@ def _rewrite(
         # the precondition for letting it stand down the sort-merge memory guard. Sized from
         # the build's own base scan, so a filter that the estimator mis-prices can only make
         # the real build *smaller* than what was compared against the floor.
-        build_side = node.left if swap else node.right
+        # `node.right`, unconditionally: `node` has already been reassigned to the swapped
+        # join above, and after a swap the right input *is* the build side — which is what
+        # the comment four lines up says. Reading `node.left` on a swapped node named the
+        # **probe** side instead, so `_bounded_build_bytes` measured the wrong input and
+        # `max(build_bytes, bounded)` below then inflated `build_bytes` to it.
+        #
+        # Measured on a 5,000-row left joined to a 20,000,000-row right (the ordinary
+        # small-on-the-left shape): the build is the 40,000-byte left, and the decision
+        # reported `build_bytes = 320,000,000` — the probe. Two consumers read that figure
+        # and both were wrong. `BuildSideDecision.build_bytes` exists so the learned
+        # broadcast crossover can be fitted in *bytes*, so the fit was against the wrong
+        # side entirely; and the sort-merge memory guard (`build_bytes > smb`) is what
+        # decides that a hash table would strain memory, so an inflated figure steers a
+        # join whose real build is 40 KB toward the bounded-memory merge — the 7x penalty
+        # `_SORT_MERGE_MEMORY_SHARE` was written to prevent.
+        build_side = node.right
         bounded = _bounded_build_bytes(build_side, est, cost)
         build_measured = bounded is not None
         if bounded is not None:
