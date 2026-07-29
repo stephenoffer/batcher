@@ -14,16 +14,10 @@ from __future__ import annotations
 
 import pytest
 
-from batcher.kyber import cost as cost_mod
 from batcher.kyber import storage_cost
+from batcher.kyber.cost import terms
 
 pytestmark = pytest.mark.unit
-
-
-@pytest.fixture
-def model():
-    """A `CostModel` with no estimator — only the device-factor arithmetic is under test."""
-    return cost_mod.CostModel.__new__(cost_mod.CostModel)
 
 
 @pytest.fixture
@@ -36,7 +30,7 @@ def spill_device(monkeypatch):
     return configure
 
 
-def test_local_flash_is_the_unchanged_baseline(model, spill_device):
+def test_local_flash_is_the_unchanged_baseline(spill_device):
     # `_SPILL_WRITE_READ_PASSES` was calibrated on local flash, so flash must stay at 1.0.
     # Anything else would be a silent re-tuning of the whole spill cost term.
     for device in ("nvme", "ssd", "raid", "mapped"):
@@ -44,7 +38,7 @@ def test_local_flash_is_the_unchanged_baseline(model, spill_device):
         assert storage_cost.spill_device_factor() == 1.0, device
 
 
-def test_an_unidentifiable_device_changes_nothing(model, spill_device):
+def test_an_unidentifiable_device_changes_nothing(spill_device):
     # The property that makes this a refinement rather than a re-tuning: absence of a
     # measurement must never move a plan. A container with no /sys access must plan exactly
     # as it did before this model existed.
@@ -54,7 +48,7 @@ def test_an_unidentifiable_device_changes_nothing(model, spill_device):
     assert storage_cost.spill_device_factor() == 1.0
 
 
-def test_slow_devices_cost_more(model, spill_device):
+def test_slow_devices_cost_more(spill_device):
     # The whole point. A network volume and a spinning disk are genuinely far slower, and the
     # ordering between them must hold too.
     spill_device("network")
@@ -64,7 +58,7 @@ def test_slow_devices_cost_more(model, spill_device):
     assert 1.0 < network < rotational
 
 
-def test_tmpfs_is_costed_honestly_as_fast(model, spill_device):
+def test_tmpfs_is_costed_honestly_as_fast(spill_device):
     # Spilling to RAM relieves no memory pressure, which is a real trap — but it is a
     # feasibility question, not a ranking one. Encoding the warning as a fake throughput
     # number would put it in the one place nobody reads, and would make the cost model lie
@@ -73,23 +67,29 @@ def test_tmpfs_is_costed_honestly_as_fast(model, spill_device):
     assert storage_cost.spill_device_factor() == 1.0
 
 
-def test_the_factor_scales_the_spill_io_term(model, spill_device, monkeypatch):
+def test_the_factor_scales_the_spill_io_term(spill_device, monkeypatch):
     # A factor nothing consults changes nothing. Both spill sites — the flat write-and-read
     # term and the external-merge term — must scale, or a sort and an aggregate would
     # disagree about the same disk.
-    monkeypatch.setattr(model, "_memory_budget", lambda: 1_000.0)
+    #
+    # Patched at the `terms` module rather than on a `CostModel` instance: the budget is one
+    # rule shared by every spill site, so binding the fake to the module is what proves all
+    # of them move together. (A per-instance patch silently became a no-op when the term
+    # moved out of the class — the failure mode `.claude/rules/concurrent-agents.md` names.)
+    monkeypatch.setattr(terms, "memory_budget", lambda: 1_000.0)
     spill_device("nvme")
-    flash = model._spill_io(state_bytes=5_000.0)
+    flash = terms.spill_io(state_bytes=5_000.0)
     spill_device("rotational")
-    disk = model._spill_io(state_bytes=5_000.0)
+    disk = terms.spill_io(state_bytes=5_000.0)
     assert disk == flash * storage_cost.SPILL_DEVICE_FACTOR["rotational"]
     # Below the budget nothing spills, so the device is irrelevant on both.
-    assert model._spill_io(state_bytes=500.0) == 0.0
+    assert terms.spill_io(state_bytes=500.0) == 0.0
 
 
-def test_an_unbounded_budget_still_charges_no_spill(model, spill_device, monkeypatch):
+def test_an_unbounded_budget_still_charges_no_spill(spill_device, monkeypatch):
     # `spill_budget_bytes() == 0` means the user opted out of bounded memory: nothing spills,
     # so the device factor must not conjure an IO cost out of a disabled term.
-    monkeypatch.setattr(model, "_memory_budget", lambda: 0.0)
+    monkeypatch.setattr(terms, "memory_budget", lambda: 0.0)
     spill_device("rotational")
-    assert model._spill_io(state_bytes=10**12) == 0.0
+    assert terms.spill_io(state_bytes=10**12) == 0.0
+    assert terms.merge_io(state_bytes=10**12) == 0.0

@@ -12,7 +12,7 @@ import math
 
 import pytest
 
-from batcher.kyber.cost import _sort_comparisons
+from batcher.kyber.cost.terms import sort_comparisons
 
 pytestmark = pytest.mark.unit
 
@@ -27,7 +27,7 @@ def test_top_n_is_costed_as_one_pass_plus_a_few_insertions():
     indifferent to fusing the limit into the sort.
     """
     n, k = 100_000_000.0, 10.0
-    cost = _sort_comparisons(n, k)
+    cost = sort_comparisons(n, k)
     assert cost < 1.05 * n, f"top-N should be about one pass, got {cost / n:.2f} passes"
     assert cost < n * math.log2(k) / 3, "must be far below the every-row-sifts model"
     # And still strictly more than a free scan: the insertions are real work.
@@ -36,23 +36,23 @@ def test_top_n_is_costed_as_one_pass_plus_a_few_insertions():
 
 def test_top_n_never_costs_more_than_the_full_sort_it_replaces():
     n = 1_000_000.0
-    full = _sort_comparisons(n, n)
+    full = sort_comparisons(n, n)
     for k in (1.0, 10.0, 1_000.0, 100_000.0, n):
-        assert _sort_comparisons(n, k) <= full, f"top-{k} above a full sort"
+        assert sort_comparisons(n, k) <= full, f"top-{k} above a full sort"
 
 
 def test_a_limit_larger_than_the_input_degenerates_to_a_full_sort():
     n = 1_000.0
-    assert _sort_comparisons(n, n * 10) == _sort_comparisons(n, n)
+    assert sort_comparisons(n, n * 10) == sort_comparisons(n, n)
 
 
 def test_full_sort_is_n_log_n():
     n = 1_048_576.0
-    assert _sort_comparisons(n, n) == pytest.approx(n * 20.0)
+    assert sort_comparisons(n, n) == pytest.approx(n * 20.0)
 
 
 def test_top_n_cost_grows_with_the_limit():
     """Monotone in `k`: keeping more rows can only cost more."""
     n = 10_000_000.0
-    costs = [_sort_comparisons(n, k) for k in (1.0, 10.0, 100.0, 10_000.0, 1_000_000.0)]
+    costs = [sort_comparisons(n, k) for k in (1.0, 10.0, 100.0, 10_000.0, 1_000_000.0)]
     assert costs == sorted(costs)

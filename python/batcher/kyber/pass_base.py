@@ -57,5 +57,9 @@ class OptimizerContext:
         if self.cost_model is None:
             from batcher.kyber.cost import CostModel
 
-            self.cost_model = CostModel(self.estimator, self.config.optimizer.cost_coeffs)
+            self.cost_model = CostModel(
+                self.estimator,
+                self.config.optimizer.cost_coeffs,
+                workers=self.hardware.worker_count,
+            )
         return self.cost_model

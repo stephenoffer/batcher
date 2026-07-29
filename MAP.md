@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 934 Python modules across 144 packages and 178 Rust files across 13 crates.
+Covering 937 Python modules across 145 packages and 178 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -659,13 +659,13 @@ Subquery handling and decorrelation for the SQL translator.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 1337 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 636 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_join.py` | 353 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
-| `flight_sort.py` | 342 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
-| `flight_window.py` | 154 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 625 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_join.py` | 370 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
+| `flight_sort.py` | 357 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
+| `flight_window.py` | 173 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1132 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 187 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
-| `shuffle_replication.py` | 114 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
+| `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
 | `spill.py` | 498 | Single-node out-of-core aggregation via partition-and-spill, plus the spill |
 | `window_stream.py` | 241 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window. |
@@ -762,13 +762,12 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
-| `cost.py` | 494 | Cost model — what will this plan *cost* to run? |
 | `cpu_shares.py` | 173 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 475 | Cross-execution learning — the metadata feedback loop. |
 | `measured_selectivity.py` | 133 | Filter selectivity derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 426 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
-| `pass_base.py` | 61 | The optimizer context — shared analysis threaded through every rule. |
+| `pass_base.py` | 65 | The optimizer context — shared analysis threaded through every rule. |
 | `plan_cache.py` | 359 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 209 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 186 | The Kyber rule registry — where rules are discovered and assembled. |
@@ -776,6 +775,16 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `signature.py` | 158 | Structural plan signatures. |
 | `storage_cost.py` | 79 | What spilling costs on *this* machine's storage. |
 | `streaming.py` | 194 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
+
+### `batcher/kyber/cost/` — 3 · subsystem
+
+Cost model — what will this plan *cost* to run?
+
+| module | lines | what it is |
+|---|---|---|
+| `model.py` | 410 | The four-axis cost model and its per-operator closed forms. |
+| `shuffle.py` | 279 | The `net` axis — what a plan costs to move across a cluster. |
+| `terms.py` | 184 | The machine-shaped multipliers the per-operator cost forms fold in. |
 
 ### `batcher/kyber/expr_cost/` — 3 · subsystem
 
@@ -831,7 +840,7 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 486 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 241 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 364 | The `Optimizer` façade and the module-level entry points. |
+| `facade.py` | 367 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
 
@@ -1854,7 +1863,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `infer.py` | 485 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
-| `widths.py` | 96 | Static per-column byte widths derived from a column's Arrow type. |
+| `widths.py` | 207 | Static per-column byte widths derived from a column's Arrow type. |
 
 ### `batcher/metadata/` — 1 · contract
 
@@ -1888,7 +1897,7 @@ Configuration: one frozen, typed `Config` object.
 
 | module | lines | what it is |
 |---|---|---|
-| `config.py` | 2335 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2338 | The single frozen `Config` and its typed sections. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 271 | Named fault-tolerance profiles for the distributed engine. |
@@ -1980,24 +1989,24 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg_par.rs` | 215 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 441 | Distributed-execution primitives. |
 | `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
-| `join_par.rs` | 320 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par.rs` | 538 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `lib.rs` | 695 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 298 | Per-operator execution metrics — the measure half of the adaptive loop. |
-| `ops/external_sort.rs` | 325 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
+| `ops/external_sort.rs` | 410 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1139 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1141 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
-| `ops/quantile_spill/histogram.rs` | 215 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
-| `ops/quantile_spill/mod.rs` | 738 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
+| `ops/quantile_spill/histogram.rs` | 216 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
+| `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 242 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 2830 | The multi-core executor. |
+| `par.rs` | 2842 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `stream/breaker.rs` | 427 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
@@ -2019,7 +2028,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg/accum.rs` | 625 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 97 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
-| `agg/distinct.rs` | 381 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
+| `agg/distinct.rs` | 401 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/fused.rs` | 418 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1079 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
 | `agg/group/combine.rs` | 649 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
@@ -2029,7 +2038,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/mod.rs` | 796 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/qsketch.rs` | 87 | APPROX_QUANTILE / APPROX_MEDIAN — bounded-memory quantiles via per-group DDSketch. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
-| `agg/spill/store.rs` | 470 | The two spill stores and the codec that writes them. |
+| `agg/spill/store.rs` | 576 | The two spill stores and the codec that writes them. |
 | `agg/stats.rs` | 399 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 271 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 41 | The crate's error type: how the stateful runtime structures report failure. |
@@ -2048,7 +2057,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/stream.rs` | 243 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 207 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 36 | `bc-runtime` — the engine's runtime library. |
-| `shuffle.rs` | 935 | Hash repartitioning — the shuffle primitive. |
+| `shuffle.rs` | 997 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window.rs` | 1097 | Window functions — partition, order, and append one column per function. |
 | `window_agg.rs` | 578 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |

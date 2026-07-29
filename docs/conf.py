@@ -164,6 +164,16 @@ exclude_patterns = [
     # user-supplied UDFs and callables (map_batches/map, class model UDFs, the batch-inference
     # plane, and the threads/processes/GPU scheduling beneath). A working record, not a user page.
     "internals/udf_improvements_ledger.md",
+    # The running index of the work that makes Batcher survive and go fast on data larger
+    # than memory: the spill stores, the out-of-core operators, the memory envelopes that
+    # decide when to spill, and the failure modes that turn a bounded-memory design back
+    # into an OOM. A working record, not a user page.
+    "internals/spill_oom_improvements_ledger.md",
+    # The running index of improvements that make Kyber's and Carbonite's *decisions* right
+    # across every data type (structured, semi-structured, unstructured, multimodal) and
+    # every scale (single node to a fleet of tens of thousands). A working record, not a
+    # user page.
+    "internals/decision_quality_ledger.md",
     # The running record of the Daft-versus-Batcher capability gap: what was measured, what
     # closed, what is open, and where the comparison runs the other way. A contributor
     # working document (and deliberately blunt about what it does not claim), not a site page.

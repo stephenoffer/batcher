@@ -73,7 +73,10 @@ class Optimizer:
         # Coefficients calibrated from measured op_stats (defaults until a workload
         # has run): this is what lets the cost model reflect the real engine.
         coeffs = calibrate(self._hub, self._config)
-        cost_model = CostModel(estimator, coeffs)
+        # The fleet the plan will run across drives the `net` axis. `1` single-node, which
+        # makes that axis identically zero — so a single-node plan is ranked exactly as it
+        # was before shuffle volume was costed at all.
+        cost_model = CostModel(estimator, coeffs, workers=self._hardware.worker_count)
         return OptimizerContext(
             config=self._config,
             sources=self._sources,
