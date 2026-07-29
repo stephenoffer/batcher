@@ -372,3 +372,27 @@ the properties of *its* buckets decide whether "bounded" is true.
   This is the exact hazard `.claude/rules/concurrent-agents.md` names about moved files.
 - **The import path is unchanged.** Everything either half exposes is re-exported, including
   the underscore-prefixed names other modules and tests reach for.
+
+### #23 — The out-of-core window re-splits a skewed bucket
+
+- **Was:** `stream_spilling_window` hash-partitioned into a constant number of buckets and
+  read each one **whole** for the kernel. A skewed `PARTITION BY` left one bucket far over
+  the envelope, so it OOMed at exactly the point spilling was meant to prevent it. (This is
+  the control-plane out-of-core window, a separate implementation from the in-engine one
+  fixed in #13.)
+- **Now:** the handle's resident size is checked *before* the read — which is the point, since
+  the decision must happen without pulling in the thing that does not fit — and an over-large
+  bucket is streamed into salted sub-buckets and recursed on, bounded by depth. The parent is
+  released as soon as it has been re-partitioned, so recursion costs the same disk at each
+  level rather than more.
+- **`logical_nbytes`, not `nbytes`:** the uncompressed size is what reading it back costs in
+  RAM; the on-disk size can be several times smaller for a compressible bucket and would let
+  an over-large one through.
+- **Why the salt is load-bearing here too:** without it, re-partitioning a power-of-two bucket
+  count into another power of two reads the same low hash bits and moves no rows — the same
+  inert recursion as #21.
+- **Proof:** `test_spill_partitioned_window_resplits_a_skewed_bucket` — one key holding 4,000
+  of 4,200 rows against an 8 KiB per-bucket envelope must both engage the split (a bucket
+  processed below depth 0) and keep `row_number` equal to the in-memory kernel. This is a
+  forward guard rather than a red-to-green regression: before the change there was no split
+  to test.

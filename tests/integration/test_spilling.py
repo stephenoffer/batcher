@@ -519,6 +519,70 @@ def test_spill_global_window_matches_in_memory(descending, num_partitions):
     assert _norm(spilled) == _norm(in_memory)
 
 
+def test_spill_partitioned_window_resplits_a_skewed_bucket(monkeypatch):
+    """A skewed PARTITION BY must re-split rather than materialize the hot bucket.
+
+    The bucket count is a constant, so a skewed PARTITION BY leaves one bucket far over the
+    envelope -- and the window kernel needs its bucket materialized, so that is an OOM at
+    exactly the point spilling was meant to prevent one.
+
+    The correctness bar here is stricter than a join's: a window partition landing in two
+    sub-buckets would be *ranked twice*, not merely joined more slowly. So this asserts both
+    that the split engaged (a bucket was processed below depth 0) and that `row_number` still
+    matches the in-memory kernel -- row_number being exactly the function a split partition
+    cannot survive.
+    """
+    import dataclasses
+
+    from batcher.config import active_config, set_config
+    from batcher.dist.spill_breakers import window as win_mod
+
+    depths: list[int] = []
+    real = win_mod._window_bucket
+
+    def traced(nat, store, handle, win_json, cfg_json, pk_indices, depth):
+        depths.append(depth)
+        yield from real(nat, store, handle, win_json, cfg_json, pk_indices, depth)
+
+    monkeypatch.setattr(win_mod, "_window_bucket", traced)
+
+    # One hot key carrying most rows, plus many cold ones.
+    keys = ["hot"] * 4000 + [f"k{i}" for i in range(200)]
+    vals = list(range(len(keys)))
+    batches = [
+        pa.record_batch({"k": pa.array(keys[i : i + 500]), "v": pa.array(vals[i : i + 500])})
+        for i in range(0, len(keys), 500)
+    ]
+    schema = batches[0].schema
+    table = pa.Table.from_batches(batches)
+
+    def q(ds):
+        return ds.window(
+            partition_by=["k"], order_by=[("v", False)], functions={"rn": "row_number"}
+        )
+
+    in_memory = q(bt.from_arrow(table)).collect()
+
+    cfg = active_config()
+    mem = dataclasses.replace(cfg.memory, spill_bucket_max_bytes=8192)
+    set_config(cfg.replace(memory=mem))
+    try:
+        spilled = q(bt.from_batches(lambda: iter(batches), schema)).collect(
+            spill=True, num_partitions=4
+        )
+    finally:
+        set_config(cfg)
+
+    assert max(depths) > 0, (
+        "no window bucket was re-split even though one holds 4,000 of 4,200 rows against an "
+        "8 KiB per-bucket envelope -- the hot bucket was materialized whole"
+    )
+    assert _norm(spilled) == _norm(in_memory), (
+        "a re-split window bucket diverged from the in-memory kernel: a partition was split "
+        "across sub-buckets and ranked twice"
+    )
+
+
 def test_spill_global_window_streams_via_iter_batches():
     # iter_batches() over a global window streams the same bounded-memory pipeline.
     factory, schema, table = _sort_dataset()
