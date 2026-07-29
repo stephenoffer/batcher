@@ -240,24 +240,33 @@ the box is 48 physical cores / 96 logical, and **48 performs no better than 96**
 form is an adaptive worker-width policy that *measures* -- a Carbonite resource decision, and
 exactly the adaptive re-optimization the contract calls the moat -- rather than a constant.
 
-### An open lead: the repartition gather
+### Resolved: the combine gather is memory-bound, not instruction-bound
 
 Profiling q32 (the heaviest query, `GROUP BY WatchID, ClientIP` over ~10M near-unique
-groups) does show one hotspot worth chasing:
+groups) showed 27% of it inside `arrow_select::interleave` -- 22.65% on `Int64` plus 4.39%
+on `Float64`. The call site is **not** `ops/repartition.rs` (instrumenting that file showed
+it never runs for this query) but `bc-runtime::agg::group::combine`, which gathers each key
+and state column out of the partials by `(partial, row)` address.
 
-| % | symbol |
-|--:|---|
-| 22.65% | `arrow_select::interleave::interleave_primitive<Int64Type>` |
-| 13.78% | `bc_runtime::agg::group::assign::assign_groups_int64_multi` |
-| 4.39% | `arrow_select::interleave::interleave_primitive<Float64Type>` |
+That looked like the same trade `ops/repartition.rs` already makes on the shuffle side,
+where a flat typed gather replaced `interleave` precisely because the pair form costs
+"sixteen bytes of index per output row". So it was implemented the same way: `u32` planes
+for the addresses instead of `Vec<(usize, usize)>`, and a direct value copy for a null-free
+primitive column, falling back to `interleave` for strings, nested types and nulls.
 
-`ops/repartition.rs` already has a fast flat gather and falls back to arrow's `interleave`
-only for strings, nested types, or a source carrying nulls -- and q32's columns have
-`null_count = 0` and no validity buffer, so they should take the fast path. The `Float64`
-entry says the shuffle is running over *post-aggregation* partial states, so something in
-that path is declining the fast gather. Confirming it needs instrumentation rather than a
-profile, so it is written down as a lead rather than claimed as a fix; 27% of the heaviest
-query is worth the next session's time.
+**It did not pay, and the change was reverted.** The fast path was confirmed taken -- the
+profile's top symbol became `combine::gather_primitive<Int64Type>` at 18.84%, replacing
+`interleave_primitive` at 22.65% -- but end-to-end time did not move (q32 203.7 ms ->
+213.8 ms, inside noise) and the string-key queries **regressed** (q33 0.91x, q16 0.87x,
+q17 0.87x) because the fallback now builds both index forms.
+
+The conclusion is the useful part: this gather is **memory-latency-bound**. It reads 10M
+rows scattered across the partials, so the cost is cache misses, and halving the index
+bytes or skipping Arrow's builder changes nothing. The same reasoning explains why
+`assign_groups_int64_multi` (15.21%) sits beside it -- a hash table with ~10M live entries
+is misses all the way down. Making these queries faster needs a different data structure
+(a radix-partitioned layout with sequential access, or a cache-conscious aggregation), not
+a cheaper gather.
 
 ## Where Batcher still trails the native store
 
