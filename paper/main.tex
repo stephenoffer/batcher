@@ -773,13 +773,37 @@ quickly, with duplicate rows, and nothing turns red. Everything else in the
 optimizer may consume an estimate, because the worst outcome there is a slower
 plan.
 
-Provenance also names a live defect. The gate that turns on adaptive staging
-reads provenance as a proxy for ``we do not know this size.'' After the seeding
-fix below, TPC-H q5's operands are estimated to within $1.0\times$ of actual and
-\emph{still} carry the default provenance label, because the one-shot path never
-records an intermediate join's measured cardinality. A label that has diverged
-from the evidence it stands for is the characteristic failure of this design;
-\cref{sec:limits} reports what it costs.
+Provenance also produced the sharpest defect this design has had, which is worth
+reporting because the fix generalizes. The gate deciding whether a query pays for
+stage-by-stage re-optimization read provenance as a proxy for ``we do not know
+this size.'' Those are different statements. Provenance describes where a number
+came from; it says nothing about whether the number was right. And the label is
+sticky, because the one-shot path never records an intermediate operator's
+measured cardinality against its signature, so a shape can be estimated to within
+a percent of actual forever and still read as a guess. After the seeding fix
+above, TPC-H q5's operands land within $1.0\times$ of actual and carried the
+default label anyway.
+
+The gate now asks the evidence rather than the label. Core already records, per
+operator signature, the rows produced alongside the rows predicted, which the
+optimizer folds into a bounded window of $\log(\text{actual}/\text{estimated})$
+to derive its correction factor. A shape is treated as confidently sized when
+that window holds at least a few observations and \emph{every one of them} sits
+inside the re-optimization threshold. Reusing that threshold rather than
+inventing one is the point: it is the q-error at which the adaptive loop re-plans,
+so a history that never crossed it is a history in which a stage boundary would
+never have fired. The maximum is used rather than the mean, because alternating
+$4\times$ over- and under-estimates average to $1.0$ and would read as flawless
+while being exactly the shape a stage boundary exists to correct.
+
+Measured over the 22 TPC-H queries, counting routing decisions rather than time
+so a loaded machine cannot move the number
+(\texttt{benchmarks/internals/adaptive\_gate\_routing.py}): \textbf{15 of 22
+queries routed to staging on a cold hub, and 0 once their estimates had
+demonstrably held up}. All 15 still route to staging when the recorded history
+shows the estimates missing, so the correction suppresses the cost without
+suppressing the case staging exists for. A cold hub knows nothing and behaves
+exactly as before, which keeps a first run's plan unchanged.
 
 \subsection{Cardinality: four sources, strict precedence}
 
@@ -1256,14 +1280,16 @@ with row groups sized to Ray's own target block size.
 A roadmap beats a scoreboard, so this section is specific about what does not
 work yet. Each item is measured and each is localized to named work.
 
-\textbf{The adaptive loop costs 20\% on TPC-H today.} At sf10, with both routes
-given their own learned state, one-shot planning beats the adaptive route on 20
-of 22 queries: 3{,}889\,ms against 4{,}669\,ms. The cause is diagnosable rather
-than fundamental. The loop materializes one breaker per stage, forfeiting fusion
-and executor width, and the gate that turns it on reads the provenance
-\emph{label} of \cref{sec:provenance} rather than the error history the hub
-already collects. We report the loss instead of disabling the feature and quoting
-the better number.
+\textbf{The adaptive loop's cost is half-fixed, and we have not re-timed it.} At
+sf10 it used to lose to one-shot planning on 20 of 22 queries, 3{,}889\,ms against
+4{,}669\,ms, for two reasons. One is now closed: the gate read a provenance label
+instead of the measured error history, and firing on 15 of 22 queries that did not
+need it (\cref{sec:provenance}). The other is not: the loop still materializes one
+breaker per stage, so when it does fire it forfeits operator fusion and the
+streaming executor's width. We report the routing count rather than a new suite
+time because the machine these measurements ran on was shared, and at load average
+16--41 the harness swings $\pm$25\%, which is larger than the effect. The
+re-measurement on a quiet box is the open item.
 
 \textbf{We are not finer-grained than Spark AQE at the stage clock.} An earlier
 version of our own documentation claimed otherwise. It is stage-boundary

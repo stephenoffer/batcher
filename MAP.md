@@ -1459,14 +1459,14 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `autoloader.py` | 293 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
+| `autoloader.py` | 295 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 235 | Development streaming sources — `rate` and `socket` (Spark parity). |
 | `eventhubs.py` | 230 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 335 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kinesis.py` | 408 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 181 | Google Cloud Pub/Sub broker source — subscription pull batches. |
-| `pulsar.py` | 324 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
-| `seen_store.py` | 178 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
+| `pulsar.py` | 364 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
+| `seen_store.py` | 168 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
 | `sinks.py` | 335 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
 ### `batcher/io/formats/streaming/broker/` — 2 · neutral IO

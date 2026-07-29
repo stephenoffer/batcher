@@ -210,7 +210,15 @@ against the text to do it.
 - **The central claim is evaluated by testing, not measurement.** Section 8.2
   says so and admits the one place the fork reappeared: a distributability gate
   that never checked the watermark.
-- **The adaptive loop is a net loss on the headline benchmark** (20% at sf10).
-  Reported in Section 9. If the gate fix lands, re-measure and lead with it.
+- **The adaptive loop was a net loss on the headline benchmark** (20% at sf10).
+  Half of that is now fixed: the confidence gate read a provenance *label* where
+  the hub already had measured q-error history. It now reads the history
+  (`kyber.correction.estimate_is_reliable`), and
+  `benchmarks/internals/adaptive_gate_routing.py` measures the effect
+  deterministically: **15 of 22 TPC-H queries routed to staging on a cold hub, 0
+  once estimates had demonstrably held up, and still 15 when they had missed.**
+  The other half (one breaker materialized per stage) is untouched, and the
+  wall-clock re-measurement is pending a quiet machine. Section 12 says exactly
+  this.
 - **DuckDB wins at sf10.** Reported, and split into storage (q1/q6 at ~1.5x) vs.
   engine (q5/q7/q9/q21 at ~3-4x), which is what keeps it from being fatal.

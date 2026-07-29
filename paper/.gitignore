@@ -1,0 +1,10 @@
+# LaTeX build artifacts; main.pdf is committed deliberately so the paper is
+# readable without a TeX install.
+*.aux
+*.log
+*.out
+*.blg
+*.bbl
+*.toc
+*.fls
+*.fdb_latexmk
