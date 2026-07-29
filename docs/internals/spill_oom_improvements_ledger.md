@@ -606,3 +606,36 @@ had drifted away from the thing they claimed to mirror.
   which is the evidence that it does not false-fire; the negative case is pinned at the store
   level by `crates/bc-runtime/tests/spill_truncation.rs`, which is the same row-count
   mechanism.
+
+---
+
+## Program 9 — Measuring the relation honestly
+
+Every spill decision is made from one number: how big the relation is. An over-count there
+does not fail anything — it makes the engine spill a query that would have fitted, which reads
+as slowness rather than as a bug.
+
+### #37 — A shared dictionary is counted once for the relation, not once per morsel
+
+- **Was:** `batch_bytes` summed each column's slice size. Morsels of a dictionary-encoded
+  column all point at the *same* values array, but each morsel's slice size includes that whole
+  dictionary — so the relation was counted as `morsels x dictionary` instead of
+  `dictionary + indices`.
+- **Measured in the real code path:** 600 morsels over a 50,000-entry string dictionary
+  reported **609 MB for 40 MB resident — a 15.1x over-count**.
+- **Why it is the common case:** dictionary encoding exists *for* low-cardinality string
+  columns, so this is the most common encoding's normal shape. The consequence is a sort,
+  join, window, or grace fan-out spilling when it would have fitted in memory, and the
+  streaming breakers handing off to the materializing executor 15x too early.
+- **Now:** each distinct dictionary is charged once, identified by its buffer address —
+  unambiguous because every morsel being measured is alive, so two live dictionaries cannot
+  share one. The walk covers the whole array tree, so a dictionary nested in a struct or list
+  is deduplicated too. A relation with no dictionary anywhere in its schema takes a fast path
+  and is measured byte-identically to before.
+- **This is the same bug the function's own docstring already recorded, one level down.** The
+  slice fix ("122 morsels made this report 3.9 GB") solved re-counting a shared *buffer*; this
+  solves re-counting a shared *dictionary*, which the slice fix does not reach.
+- **Proof:** four unit tests beside the function — the shared-dictionary case (asserting both
+  that the count is honest and that the naive sum it replaces was many times larger), two
+  distinct dictionaries both counted, a struct-nested dictionary deduplicated, and a
+  dictionary-free relation measured `assert_eq!`-identically to the naive sum.

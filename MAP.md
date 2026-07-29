@@ -628,7 +628,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `json.py` | 110 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 457 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `maps.py` | 83 | SQL → `.map` accessor dispatch. |
-| `scalar.py` | 469 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
+| `scalar.py` | 474 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 256 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 68 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 419 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
@@ -2003,7 +2003,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `dist.rs` | 463 | Distributed-execution primitives. |
 | `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par.rs` | 574 | Parallel join strategies shared by the multi-core executor (`par`). |
-| `lib.rs` | 696 | `bc-interp` — the Tier-0 interpreter. |
+| `lib.rs` | 783 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 298 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/external_sort.rs` | 451 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
