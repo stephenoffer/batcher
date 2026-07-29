@@ -426,21 +426,10 @@ class CSVSink(FileSink):
         """
         from itertools import chain
 
-        from batcher.io.base import _safe_size
-        from batcher.io.manifest import WrittenFile
+        def encode(first, rest, fh) -> int:
+            return self._encode_stream_parallel(chain([first], rest), fh)
 
-        fs = resolve_filesystem(path)
-        if resume and fs.exists(path):
-            return WrittenFile(path=path, rows=0, bytes=_safe_size(fs, path))
-        it = iter(batches)
-        first = next(it, None)
-        rows = 0
-        with fs.atomic_writer(path) as fh:
-            if first is None:
-                self._write_file(schema.empty_table() if schema is not None else pa.table({}), fh)
-            else:
-                rows = self._encode_stream_parallel(chain([first], it), fh)
-        return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
+        return self._stream_to_file(batches, path, schema=schema, resume=resume, encode=encode)
 
     def _encode_stream_parallel(self, batches: Iterator[pa.RecordBatch], fh: IO[Any]) -> int:
         import pyarrow.csv as pacsv

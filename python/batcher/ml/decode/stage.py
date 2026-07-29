@@ -83,6 +83,37 @@ def _bounded_map(
         yield _take()
 
 
+def _require_source_column(ds: Any, column: str, *, who: str, param: str) -> None:
+    """Reject a source column that is not in `ds`, before the decode stage runs.
+
+    The image and audio stages get this for free — their output is a projection, whose own
+    validation names the missing column — but the video, download, and upload stages read
+    the column inside a `map_batches` callback, so a typo reached Arrow and came back as
+    ``KeyError: 'Field "nope" does not exist in schema'``: no mention of the function, the
+    argument, or the columns that do exist. The same slip therefore reported two different
+    ways depending on which modality you were decoding.
+    """
+    if column in ds.columns:
+        return
+    from batcher._internal.errors import ColumnNotFoundError, unknown_message
+
+    raise ColumnNotFoundError(
+        unknown_message("column", column, ds.columns, hint=f"{who} reads {param}.")
+    )
+
+
+def _require_frames(num_frames: int, who: str) -> int:
+    """Reject a non-positive frame count, which the tensor type cannot express.
+
+    Zero surfaced as ``ArrowInvalid: list_size needs to be a strict positive integer`` and a
+    negative as NumPy's ``negative dimensions are not allowed`` — two internal messages for
+    one argument, neither naming it.
+    """
+    if num_frames < 1:
+        raise PlanError(f"{who} num_frames must be >= 1, got {num_frames}")
+    return num_frames
+
+
 def _require_size(size: tuple[int, int] | None, who: str) -> tuple[int, int]:
     if size is None:
         raise PlanError(f"{who} requires size=(height, width), e.g. size=(224, 224)")

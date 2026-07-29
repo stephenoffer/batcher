@@ -7,10 +7,13 @@ object storage take over for shared clusters behind the same protocol.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sqlite3
 from collections.abc import Iterator
 
 from batcher._internal.errors import ConfigError
+from batcher._internal.paths import private_dir
 from batcher.metadata.store import Key, decode_key, encode_key
 
 __all__ = ["SQLiteBackend"]
@@ -39,7 +42,23 @@ class SQLiteBackend:
             )
         self._uri = uri
         try:
+            # The learned-stats database holds persisted column statistics, and those
+            # include `min`/`max` — real values out of real columns. Owner-only before the
+            # first connect, since sqlite creates the file under the default umask.
+            #
+            # Tightens an existing directory; deliberately does NOT create a missing one.
+            # Creating it would swallow the "unable to open database file" error that names
+            # the bad path — turning a clear misconfiguration into a database silently
+            # appearing somewhere the operator did not intend. Hardening must not move a
+            # failure.
+            if uri != ":memory:":
+                parent = os.path.dirname(os.path.abspath(uri))
+                if parent and os.path.isdir(parent):
+                    private_dir(parent)
             self._conn = sqlite3.connect(uri)
+            if uri != ":memory:":
+                with contextlib.suppress(OSError):
+                    os.chmod(uri, 0o600)
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS kv ("
                 "  tbl TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,"

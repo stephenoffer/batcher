@@ -11,6 +11,7 @@
 //! code path partitions on any key types.
 
 use std::collections::HashSet;
+use std::hash::BuildHasher;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Float64Array, GenericBinaryArray, GenericStringArray,
@@ -29,10 +30,10 @@ use crate::error::RuntimeError;
 /// fans the hash across every core.
 const PAR_HASH_MIN_ROWS: usize = 1 << 16;
 
-// Fixed seeds → deterministic partitioning within a process (so the two sides of
-// a join hash identically). Not for security; collision resistance is irrelevant.
-const SEED: ahash::RandomState =
-    ahash::RandomState::with_seeds(0x1234_5678, 0x9abc_def0, 0x0fed_cba9, 0x8765_4321);
+// Which reducer a key belongs to, and therefore a value that MUST be identical on every
+// machine in the cluster. `crate::keys` owns that decision along with the rest of key
+// identity; see `SHUFFLE_HASHER` there for why this is not `ahash`.
+use crate::keys::SHUFFLE_HASHER as SEED;
 
 /// Partition `batch` into `num_partitions` buckets by a hash of `key_indices`.
 /// Returns one `RecordBatch` per bucket (some may be empty), each with the input

@@ -149,9 +149,8 @@ print(small.schema.field("thumb").type, small.column("thumb")[0].as_py()[:4] == 
 | `.image.to_tensor(w, h)` | a fixed-shape `(H, W, 3)` tensor column | the next stage is a model that takes pixels directly |
 
 Both run natively in the data plane, SIMD-decoded and SIMD-resized across every core, which
-is why image decode + resize runs at 5,693 img/s on a 96-core node (2.4× Daft, 6.1× Ray
-Data). Do it in a Python UDF instead and that stage becomes the
-bottleneck the GPU waits on.
+is why image decode and resize runs at 5,693 img/s on a 96-core node, 2.4x Daft. Do it in a
+Python UDF instead and that stage becomes the bottleneck the GPU waits on.
 
 ## Keep the GPU fed
 

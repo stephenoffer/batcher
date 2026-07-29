@@ -218,6 +218,150 @@ fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
     lo_val + (hi_val - lo_val) * frac
 }
 
+/// Base-2 Shannon entropy per group (DuckDB `entropy`): `-Σ pᵢ·log₂(pᵢ)` over the
+/// value frequencies. Reads the same value-list state as MEDIAN, so it is type-general
+/// through the row encoding; an empty group → null, and a single distinct value → 0.
+pub(crate) fn finalize_entropy(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
+    let mut counts = per_group_value_counts(state)?;
+    let mut out = Float64Builder::with_capacity(counts.len());
+    for group in &mut counts {
+        // Sum in a deterministic order. The frequencies come out of a hash map, whose
+        // iteration order is arbitrary, and float addition is not associative — so
+        // without this the same group summed in a different order on a different
+        // partition count, and the answers differed in the last ULP.
+        group.sort_unstable();
+    }
+    for group in counts {
+        let total: i64 = group.iter().sum();
+        if total == 0 {
+            out.append_null();
+            continue;
+        }
+        let n = total as f64;
+        let h: f64 = group
+            .iter()
+            .map(|&c| {
+                let p = c as f64 / n;
+                -p * p.log2()
+            })
+            .sum();
+        // A single distinct value gives `-1·log₂(1)` = `-0.0`; report the 0.0 DuckDB does.
+        out.append_value(if h == 0.0 { 0.0 } else { h });
+    }
+    Ok(Arc::new(out.finish()))
+}
+
+/// Median absolute deviation per group (DuckDB `mad`): `median(|x - median(x)|)`. Two
+/// passes over the group's values, both by quickselect. Always Float64; empty → null.
+pub(crate) fn finalize_mad(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
+    finalize_select(state, "mad", |v| {
+        let centre = quickselect_median(v);
+        let mut deviations: Vec<f64> = v.iter().map(|x| (x - centre).abs()).collect();
+        quickselect_median(&mut deviations)
+    })
+}
+
+/// Discrete quantile per group (DuckDB `quantile_disc`): the element at rank
+/// `ceil(q·n) - 1`, i.e. the smallest value whose cumulative share reaches `q`.
+///
+/// The distinction from [`finalize_quantile`] is not cosmetic: the continuous quantile
+/// interpolates *between* two elements and so can return a value that is not in the
+/// data at all, which is wrong for an ordinal column and is why SQL has both.
+pub(crate) fn finalize_quantile_disc(state: &ArrayRef, q: f64) -> Result<ArrayRef, RuntimeError> {
+    finalize_select(state, "quantile_disc", move |v| {
+        use crate::keys::float_total_cmp;
+        let n = v.len();
+        let rank = ((q.clamp(0.0, 1.0) * n as f64).ceil() as usize).saturating_sub(1);
+        let rank = rank.min(n - 1);
+        let (_, at, _) = v.select_nth_unstable_by(rank, |a, b| float_total_cmp(*a, *b));
+        *at
+    })
+}
+
+/// The `k` most frequent values per group as a `List` (DuckDB `approx_top_k`), most
+/// frequent first, ties broken by the smaller value so the answer is deterministic and
+/// partition-order-independent.
+///
+/// Exact, not approximate: the value-list state already carries every value, so the
+/// space-saving sketch the name refers to would only *lose* accuracy here. The name is
+/// DuckDB's, so a ported query reads the same.
+pub(crate) fn finalize_top_k(state: &ArrayRef, k: usize) -> Result<ArrayRef, RuntimeError> {
+    let list = state.as_list::<i32>();
+    let child_ref = list.values();
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(child_ref));
+    let child: &ArrayRef = canon.as_ref().map_or(child_ref, |c| &c[0]);
+    let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
+    let rows = converter.convert_columns(std::slice::from_ref(child))?;
+    let offsets = list.value_offsets();
+
+    let mut keep: Vec<u32> = Vec::new();
+    let mut out_offsets: Vec<i32> = Vec::with_capacity(list.len() + 1);
+    out_offsets.push(0);
+    for row in 0..list.len() {
+        let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+        // (row bytes → count, first index) so the winner can be `take`n back out.
+        let mut seen: std::collections::HashMap<Vec<u8>, (i64, u32)> =
+            std::collections::HashMap::new();
+        for i in lo..hi {
+            if child.is_null(i) {
+                continue; // DuckDB's top-k ignores nulls, as every value aggregate does
+            }
+            let key = rows.row(i).as_ref().to_vec();
+            let entry = seen.entry(key).or_insert((0, i as u32));
+            entry.0 += 1;
+        }
+        let mut ranked: Vec<(i64, Vec<u8>, u32)> = seen
+            .into_iter()
+            .map(|(bytes, (c, i))| (c, bytes, i))
+            .collect();
+        // Descending by count, then ascending by the encoded value: the row encoding is
+        // order-preserving, so comparing its bytes is comparing the values themselves.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, _, idx) in ranked.into_iter().take(k) {
+            keep.push(idx);
+        }
+        out_offsets.push(keep.len() as i32);
+    }
+    let values = take(child.as_ref(), &UInt32Array::from(keep), None)?;
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        values.data_type().clone(),
+        true,
+    ));
+    Ok(Arc::new(arrow::array::ListArray::try_new(
+        field,
+        arrow::buffer::OffsetBuffer::new(out_offsets.into()),
+        values,
+        None,
+    )?))
+}
+
+/// Per-group value frequencies, as one count vector per group. Shared by the aggregates
+/// that read a distribution rather than an order statistic. Nulls are ignored, matching
+/// every other value aggregate.
+fn per_group_value_counts(state: &ArrayRef) -> Result<Vec<Vec<i64>>, RuntimeError> {
+    let list = state.as_list::<i32>();
+    let child_ref = list.values();
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(child_ref));
+    let child: &ArrayRef = canon.as_ref().map_or(child_ref, |c| &c[0]);
+    let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
+    let rows = converter.convert_columns(std::slice::from_ref(child))?;
+    let offsets = list.value_offsets();
+    let mut out = Vec::with_capacity(list.len());
+    for row in 0..list.len() {
+        let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let mut seen: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        for i in lo..hi {
+            if child.is_null(i) {
+                continue;
+            }
+            *seen.entry(rows.row(i).as_ref().to_vec()).or_insert(0) += 1;
+        }
+        out.push(seen.into_values().collect());
+    }
+    Ok(out)
+}
+
 /// Mode per group: the most frequent value in each group's list (same list state
 /// as MEDIAN, so it is type-general). Ties are broken by the **smallest** value, so
 /// the result is deterministic and partition-independent regardless of merge order.

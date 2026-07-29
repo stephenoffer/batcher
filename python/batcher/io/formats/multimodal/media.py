@@ -24,7 +24,6 @@ registry; a new media kind is one new file overriding `_meta_fields` /
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import pyarrow as pa
@@ -36,10 +35,16 @@ from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.multimodal._batching import pack_by_count_and_bytes, probe_sizes
 from batcher.io.formats.multimodal._mime import sniff_mime
 from batcher.io.formats.multimodal._pruning import prune_files
+from batcher.io.formats.multimodal._split import MediaSplit
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = ["MediaSource", "MediaSplit"]
+
+#: One file's read: header bytes, payload (None in reference mode), size, parsed header
+#: metadata (None when the source declares no metadata columns). `None` for the whole
+#: tuple means the file was unreadable and the error was tolerated.
+_Read = tuple[bytes, "bytes | None", int, "dict[str, Any] | None"] | None
 
 # In reference mode (no full-byte materialization) we still read a header chunk so
 # MIME sniffing and header-only metadata work; large enough for image/audio/video
@@ -101,6 +106,7 @@ class MediaSource:
         "_fs",
         "_materialize_bytes",
         "_path",
+        "_size_cache",
         "_with_meta",
     )
 
@@ -130,6 +136,7 @@ class MediaSource:
         self._errors = ErrorPolicy(on_error)
         self._files_cache: list[str] | None = None
         self._chunk_cache: list[list[str]] | None = None
+        self._size_cache: dict[str, int] = {}
 
     # ---- shared, do-not-override ------------------------------------------
     def _files(self) -> list[str]:
@@ -171,7 +178,20 @@ class MediaSource:
         return self._chunk_cache
 
     def _file_sizes(self, files: list[str]) -> list[int]:
-        """Every file's size, probed concurrently (see `_batching.probe_sizes`)."""
+        """Every file's size — from a completed read where possible, else stat-probed.
+
+        A stat is a full object-store round trip per file, and on a corpus of many small
+        files that is not the negligible cost it looks like next to the payload read: it is
+        a second round trip against the same latency. Measured on 100 S3 JPEGs it was 86 ms
+        of a 272 ms read, a third of the whole thing, spent asking for a number the payload
+        read returns anyway.
+
+        So `read()` fetches first and fills `_size_cache` from what came back; this then
+        answers from it. `iter_batches` still probes, and must: it bounds memory *before*
+        fetching, which is the entire point of the byte bound on the streaming path.
+        """
+        if all(f in self._size_cache for f in files):
+            return [self._size_cache[f] for f in files]
         return probe_sizes(files, self._fs.size)
 
     def schema(self) -> pa.Schema:
@@ -188,14 +208,21 @@ class MediaSource:
         concurrent wave (a single thread pool) and slices them into `batch_files`-sized
         batches — removing the per-chunk pool churn + cross-chunk serialization of a fresh
         pool per file-batch that held image/clip ingest under the raw parallel-read rate.
-        `iter_batches` keeps its per-chunk streaming for the larger-than-RAM consumer.
+        The fetch happens *before* chunking so the sizes come from it rather than from a
+        stat per file (see `_file_sizes`). `iter_batches` keeps its per-chunk streaming,
+        and its stat probe, for the larger-than-RAM consumer.
         """
         files = self._files()
-        chunks = self._chunks()
-        if len(chunks) <= 1:
-            return list(self.iter_batches(projection))
         # one concurrent wave over every file, header-only when `bytes` is projected away
         reads = self._read_chunk(files, self._effective_materialize(projection))
+        # Every read reports its file's size, so record them before chunking: `_chunks`
+        # then needs no stat round trip. Chunk *boundaries* are unchanged — this only
+        # changes where the sizes come from, so `read`, `iter_batches` and `splits` still
+        # share the one definition.
+        self._size_cache.update(
+            {f: r[2] for f, r in zip(files, reads, strict=True) if r is not None}
+        )
+        chunks = self._chunks()
         out: list[pa.RecordBatch] = []
         start = 0
         for chunk in chunks:
@@ -305,15 +332,16 @@ class MediaSource:
         """
         return self._assemble(chunk, self._read_chunk(chunk, materialize))
 
-    def _assemble(
-        self, chunk: list[str], reads: list[tuple[bytes, bytes | None, int]]
-    ) -> pa.RecordBatch:
+    def _assemble(self, chunk: list[str], reads: list[_Read]) -> pa.RecordBatch:
         """Build one `RecordBatch` from files and their already-read payloads.
 
         Split from the read so `read()` can bulk-fetch every file in one wide concurrent
         wave and then assemble the batches, instead of a fresh thread pool + a serial
         read per file-batch (which left a many-file scan far under the raw parallel-read
         throughput — the ingest floor for a directory of many small images/clips).
+
+        Header metadata arrives already extracted (see `_read_payload_safe`), so this
+        loop is list-appending only.
         """
         uris: list[str] = []
         blobs: list[bytes | None] = []
@@ -324,13 +352,13 @@ class MediaSource:
         for path, read in zip(chunk, reads, strict=True):
             if read is None:  # unreadable and tolerated — contributes no row
                 continue
-            header, payload, size = read
+            header, payload, size, meta = read
             uris.append(path)
             blobs.append(payload)  # None in reference mode
             sizes.append(size)
             mimes.append(sniff_mime(path, header))
-            if self._with_meta:
-                meta_rows.append(self._safe_extract(header, meta_fields))
+            if meta is not None:
+                meta_rows.append(meta)
         arrays: list[pa.Array] = [
             pa.array(uris, pa.string()),
             pa.array(blobs, pa.large_binary()),
@@ -343,9 +371,7 @@ class MediaSource:
             names.append(name)
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
-    def _read_chunk(
-        self, chunk: list[str], materialize: bool
-    ) -> list[tuple[bytes, bytes | None, int]]:
+    def _read_chunk(self, chunk: list[str], materialize: bool) -> list[_Read]:
         """Read every file in ``chunk`` concurrently, preserving order.
 
         Each media file is one object-store round trip; the read releases the GIL, so a
@@ -369,15 +395,26 @@ class MediaSource:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(read, chunk))  # order preserved
 
-    def _read_payload_safe(
-        self, path: str, materialize: bool
-    ) -> tuple[bytes, bytes | None, int] | None:
-        """`_read_payload`, honoring `on_error` — None marks a file to drop."""
+    def _read_payload_safe(self, path: str, materialize: bool) -> _Read:
+        """Fetch one file and parse its header metadata; None marks a file to drop.
+
+        Extraction runs **here**, inside the pool task, not in a serial loop after it: the
+        fetch was already concurrent, so one Pillow / soundfile / av header parse per file
+        on one thread was the part that was not. Each `_extract_meta` parses an independent
+        `BytesIO` and shares no state, so it fans out safely — unlike the footer *parse*
+        the pool-sizing comment below warns about.
+        """
         try:
-            return self._read_payload(path, materialize)
+            header, payload, size = self._read_payload(path, materialize)
         except Exception as exc:
             self._errors.tolerate(path, exc, format_name=self.format_name)
             return None
+        if not self._with_meta:
+            return header, payload, size, None
+        try:
+            return header, payload, size, self._extract_meta(header)
+        except Exception:  # a corrupt header nulls this file's metadata, not the batch
+            return header, payload, size, dict.fromkeys(n for n, _ in self._meta_fields())
 
     def corrupt_files(self) -> list[str]:
         """The paths this source skipped, in failure order (empty unless `on_error="skip"`).
@@ -412,20 +449,6 @@ class MediaSource:
             header = fh.read(_HEADER_BYTES)
         return header, None, self._fs.size(path)
 
-    def _safe_extract(
-        self, data: bytes, meta_fields: list[tuple[str, pa.DataType]]
-    ) -> dict[str, Any]:
-        """Extract header metadata, tolerating an unreadable/corrupt header.
-
-        A file whose header cannot be parsed yields nulls for its metadata
-        columns rather than failing the whole batch — a partial-listing read must
-        not be derailed by one bad file.
-        """
-        try:
-            return self._extract_meta(data)
-        except Exception:  # header parse errors are per-file, non-fatal
-            return dict.fromkeys((n for n, _ in meta_fields))
-
     # ---- override points --------------------------------------------------
     def _meta_fields(self) -> list[tuple[str, pa.DataType]]:
         """The format-specific metadata columns this source adds (name, type)."""
@@ -439,61 +462,3 @@ class MediaSource:
         Returns a dict keyed by the names in `_meta_fields`.
         """
         return {}
-
-
-@dataclass(frozen=True, slots=True)
-class MediaSplit:
-    """One file-batch of a media source, reconstructed on a worker via `SOURCES`.
-
-    Carries only ``(format_name, files, with_meta)`` — a tuple of file-path
-    locators, never data — so it pickles cheaply to a remote worker that then
-    reads just its files directly from storage. Mirrors the `Split` read surface
-    so a worker treats a split exactly like a source.
-    """
-
-    format_name: str
-    files: tuple[str, ...]
-    with_meta: bool
-    materialize_bytes: bool = True
-
-    @property
-    def rows(self) -> int:
-        """This split's exact row count — one row per file, known with no I/O.
-
-        The distributed planner reads `rows` off a split to size its task fan-out and to
-        weight the partition balance. Without it a media source looked *uncountable*: the
-        fan-out fell back to a blunt worker count and every split weighed the same, so a
-        split of 200 MB videos was balanced against one of thumbnails as if equal.
-        """
-        return len(self.files)
-
-    def _source(self) -> MediaSource:
-        """Rebuild a source restricted to this split's files (no re-listing)."""
-        from batcher.io.formats.base import SOURCES
-
-        cls = SOURCES.get(self.format_name)
-        # Reuse the source's batch assembly but pin its file list to this split's
-        # files; batch_files is set so the whole split assembles as one batch.
-        src: MediaSource = cls(
-            self.files[0],
-            batch_files=len(self.files),
-            with_meta=self.with_meta,
-            materialize_bytes=self.materialize_bytes,
-        )
-        src._files_cache = list(self.files)
-        return src
-
-    def schema(self) -> pa.Schema:
-        return self._source().schema()
-
-    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return self._source().read(projection)
-
-    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        yield from self._source().iter_batches(projection)
-
-    def row_count(self) -> int | None:
-        return len(self.files)
-
-    def identity(self) -> str:
-        return f"{self.format_name}:{self.files[0]}+{len(self.files)}"

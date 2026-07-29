@@ -149,11 +149,8 @@ pub(crate) fn assign_groups(
     // Group via a raw hash table keyed by *row index* — we store only the
     // first-seen row of each group and compare encoded rows directly, avoiding
     // the per-row owned-key allocation an `IndexMap<OwnedRow, _>` would incur.
-    // Size for the worst case (all rows distinct): the table holds at most
-    // `num_rows` entries, so pre-sizing avoids the rehash cascade a small initial
-    // capacity forces on a high-cardinality group-by (the hot per-morsel path).
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
     let mut group_ids = Vec::with_capacity(num_rows);
 
@@ -208,6 +205,47 @@ pub(crate) const DENSE_SPAN_MAX: usize = 1 << 20;
 pub(crate) fn dense_budget(n: usize) -> usize {
     n.saturating_mul(DENSE_SPAN_ROW_FACTOR)
         .clamp(1024, DENSE_SPAN_MAX)
+}
+
+/// Ceiling on a group table's *initial* capacity. See [`group_table_capacity`].
+///
+/// Four morsels' worth of rows (`bc_arrow`'s morsel is 16,384). That placement is the whole
+/// point: every per-morsel call sizes at its exact row count, unchanged, while only the
+/// whole-relation calls — where `num_rows` is a wildly pessimistic proxy for the group
+/// count — are bounded.
+const GROUP_TABLE_INITIAL_CAP: usize = 4 * 16_384;
+
+// Enforced at compile time rather than by a test: a cap at or below the morsel size would put
+// *every* per-morsel call into a rehash cascade, which is a silent 1.8x throughput loss and not
+// a wrong answer, so nothing else would catch it.
+const _: () = assert!(
+    GROUP_TABLE_INITIAL_CAP >= 16_384,
+    "the group-table cap must stay above bc-arrow's morsel size"
+);
+
+/// Initial capacity for a group table over `num_rows` input rows.
+///
+/// The table holds one entry per distinct **group**, not per row, and an analytical
+/// `GROUP BY` is overwhelmingly low-cardinality against its input — `l_returnflag` has
+/// three groups over six million rows. Sizing at `num_rows` allocates a control array
+/// orders of magnitude larger than the live set, and that costs twice: the allocation and
+/// its zero-fill, and then a probe pattern scattered across a region far past L2 rather
+/// than a compact table that stays resident. Capping it measured **2.6x** on a single
+/// 6M-row `GROUP BY` over a 50,000-group string key (345 ms -> 133 ms), and left the
+/// per-morsel path unchanged.
+///
+/// The cap sits *above* the morsel size deliberately. A per-morsel call sees
+/// `num_rows <= 16,384` and is sized exactly as before, because for a small batch the row
+/// count is a *good* group-count bound and starting under it forces a rehash cascade — at
+/// a 4,096 cap the high-cardinality per-morsel path measured 1.8x SLOWER. Only the
+/// whole-relation callers, where the two counts diverge by orders of magnitude, are
+/// bounded; they pay at most a few doublings, each rehashing only the entries that already
+/// exist.
+///
+/// Capacity is a pure allocation hint: group ids, first-seen order, and every produced
+/// column are identical at any value, which is what lets this be tuned by measurement alone.
+fn group_table_capacity(num_rows: usize) -> usize {
+    num_rows.clamp(1, GROUP_TABLE_INITIAL_CAP)
 }
 
 fn dense_span<T>(a: &arrow::array::PrimitiveArray<T>, num_rows: usize) -> Option<(isize, usize)>
@@ -314,7 +352,7 @@ where
     }
 
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut null_gid: Option<u32> = None;
     for i in 0..num_rows {
         if a.is_null(i) {
@@ -460,7 +498,7 @@ where
         }
     }
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
                                          // Each group's representative bytes, held beside its id. Equality then compares the
                                          // probe value against this slice directly, instead of re-fetching the rep row through
@@ -755,7 +793,7 @@ fn assign_groups_int64_multi(
     };
     let eq_rows = |a: usize, b: usize| -> bool { cols.iter().all(|c| c.value(a) == c.value(b)) };
 
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
     let mut group_ids = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
@@ -868,7 +906,7 @@ fn assign_groups_multi_raw(
     };
     let eq_rows = |a: usize, b: usize| -> bool { cols.iter().all(|c| c.eq_at(a, b)) };
 
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
     let mut group_ids = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
@@ -1000,7 +1038,7 @@ fn assign_groups_packed(
     };
 
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new();
     let mut keys: Vec<u128> = Vec::new();
     let mut group_ids = Vec::with_capacity(num_rows);
@@ -1432,5 +1470,46 @@ mod tests {
         let (ids, n, _) = assign_groups(&[a, b], 4).unwrap();
         assert_eq!(ids, vec![0, 1, 0, 2]);
         assert_eq!(n, 3);
+    }
+
+    /// The group-table capacity hint sizes a per-morsel call at its exact row count and only
+    /// bounds the whole-relation ones. Pinning both sides matters because the two regressions
+    /// this constant sits between are opposite: sizing at `num_rows` costs a whole-relation
+    /// `GROUP BY` its cache residency, and sizing *under* a morsel's row count costs a
+    /// high-cardinality morsel a rehash cascade.
+    #[test]
+    fn group_table_capacity_bounds_only_whole_relation_calls() {
+        assert_eq!(group_table_capacity(0), 1, "capacity is never zero");
+        for morsel_rows in [1usize, 1024, 16_384, GROUP_TABLE_INITIAL_CAP] {
+            assert_eq!(
+                group_table_capacity(morsel_rows),
+                morsel_rows,
+                "a morsel-sized call must keep its exact pre-sizing"
+            );
+        }
+        assert_eq!(group_table_capacity(6_000_000), GROUP_TABLE_INITIAL_CAP);
+    }
+
+    /// Capacity is an allocation hint, never a semantic one: a group-by whose distinct count
+    /// far exceeds the cap must still assign one id per distinct key, in first-seen order.
+    /// This is the case the cap could plausibly break, since it forces the table to grow.
+    #[test]
+    fn high_cardinality_beyond_the_cap_still_groups_exactly() {
+        let n = GROUP_TABLE_INITIAL_CAP * 2 + 3;
+        // Each key appears exactly twice, so the distinct count is `n / 2` rounded up and
+        // every id must repeat once — a mis-sized table that dropped or aliased an entry
+        // would show up as a wrong group count or a broken first-seen order.
+        let keys: Vec<i64> = (0..n as i64).map(|i| i / 2).collect();
+        let arr: ArrayRef = Arc::new(Int64Array::from(keys));
+        let (ids, groups, cols) = assign_groups(&[arr], n).unwrap();
+        assert_eq!(groups, n.div_ceil(2));
+        assert_eq!(cols[0].len(), groups);
+        for (row, id) in ids.iter().enumerate() {
+            assert_eq!(
+                *id as usize,
+                row / 2,
+                "first-seen order must survive growth"
+            );
+        }
     }
 }

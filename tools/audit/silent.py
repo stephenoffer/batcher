@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from collections import defaultdict
 from collections.abc import Iterator
 
@@ -11,6 +12,7 @@ from tools.audit.context import (
     DUP_SKIP_NAMES,
     MIN_STATEMENTS,
     NEAR_DUP_JACCARD,
+    SILENT_ALLOW,
     Context,
     Finding,
     _decorator_names,
@@ -39,7 +41,17 @@ _SIGNAL = (
 
 
 def _handler_is_silent(handler: ast.ExceptHandler) -> bool:
-    """True when the handler neither reports nor re-raises — the failure just vanishes."""
+    """True when the handler neither reports nor re-raises — the failure just vanishes.
+
+    A handler that *reads* its bound exception is also not silent: threading the error into a
+    value the caller reports later (`reason = f"unavailable ({type(exc).__name__})"`) carries
+    it just as well as logging it here, and the log statement is often deliberately placed
+    outside the `try` so it fires on both the raised and the returned-None branch.
+    """
+    if handler.name and any(
+        isinstance(n, ast.Name) and n.id == handler.name for n in ast.walk(handler)
+    ):
+        return False
     for node in ast.walk(handler):
         if isinstance(node, ast.Raise):
             return False
@@ -58,19 +70,67 @@ def _is_broad(handler: ast.ExceptHandler) -> bool:
     return isinstance(handler.type, ast.Name) and handler.type.id in {"Exception", "BaseException"}
 
 
+#: A handler body made only of these is a *fallback*: it substitutes a default and moves on,
+#: without inspecting, reporting, or re-raising anything. That is the shape a swallowed error
+#: takes in this codebase — `return None`, `return {}`, `factor = None` — far more often than
+#: a bare `pass`.
+_FALLBACK_STATEMENTS = (ast.Pass, ast.Continue, ast.Return, ast.Assign, ast.AugAssign, ast.Break)
+
+#: Phrases an author writes when *declaring* a path best-effort. This, not the handler's
+#: syntax, is the signal that separates the 47 real findings from the ~150 legitimate
+#: fallbacks: a broad `except Exception: return None` on an optional-dependency probe is fine,
+#: while the same handler on a path the author has promised "must never break a query" is the
+#: learned-stats loop going quietly dead. Declaring the path best-effort is what makes silence
+#: on it dangerous, because nothing downstream will ever notice.
+_BEST_EFFORT = re.compile(
+    r"never break|best.?effort|must not (fail|break)|learning is|feedback must|degrade", re.I
+)
+
+
+def _is_fallback_only(handler: ast.ExceptHandler) -> bool:
+    return all(isinstance(s, _FALLBACK_STATEMENTS) for s in handler.body)
+
+
+def _handler_text(source: list[str], handler: ast.ExceptHandler) -> str:
+    end = handler.end_lineno or handler.lineno
+    return "\n".join(source[handler.lineno - 1 : min(end, len(source))])
+
+
+def _has_comment(text: str) -> bool:
+    """True when the handler carries a `#` comment explaining why it is silent.
+
+    The house convention is that a deliberately-silent handler says so: `except ImportError:
+    pass  # no torch -> fall through`. Treating the comment as the signal is what separates a
+    documented control-flow fall-through from an error nobody decided to drop.
+    """
+    return "#" in text
+
+
 def detect_swallowed(ctx: Context) -> Iterator[Finding]:
     """`except` handlers that hide a failure instead of handling it.
 
-    Deliberately reports only the two shapes that are wrong regardless of intent, because a
-    broad `except` returning a documented fallback (an optional dependency probe, a source
-    that cannot describe itself) is a legitimate idiom here and flagging it buries the real
-    findings:
+    Three shapes, in descending order of how often they are real. The ordering matters: the
+    first rule is the one that found 47 sites the other two were blind to, because it keys on
+    *silence* rather than on the handler's syntax.
 
-    * the handler body is exactly `pass` or `continue` — the failure leaves no trace at all;
-    * a broad `except` wraps a large `try` — it catches the bug you did not anticipate along
-      with the error you did, and turns it into a plausible wrong answer.
+    * a handler the author has *declared* best-effort ("must never break a query", "learning
+      is best-effort") that substitutes a fallback and leaves no trace. That declaration is
+      what makes the silence dangerous: nothing downstream will ever notice, so the learned-
+      stats loop can be dead for months and every gate stays green. `note_suppressed`
+      (`_internal.logging`) exists for exactly this, and a handler that calls it is not
+      reported. Keying on the declaration rather than on the handler's syntax is deliberate —
+      the syntax-only version of this rule reported 190 sites, ~150 of them legitimate
+      optional-dependency fallbacks.
+    * a bare `pass` body with no explanatory comment. With a comment this is the documented
+      fall-through idiom (an optional import, a parse that is meant to be tried and abandoned)
+      and reporting it buries the real findings — calibrated against all 18 `pass` sites in the
+      tree, every one of which turned out to be legitimate control flow.
+    * a broad `except` wrapping a large `try` — it catches the bug you did not anticipate along
+      with the error you did, and turns it into a plausible wrong answer. A blast-radius
+      warning rather than a silence one, so it is reported last and lowest.
     """
     for path, tree in ctx.modules.items():
+        source = ctx.sources[path].split("\n")
         for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
                 continue
@@ -78,21 +138,38 @@ def detect_swallowed(ctx: Context) -> Iterator[Finding]:
             for handler in node.handlers:
                 if not _handler_is_silent(handler):
                     continue
+                if f"{_rel(path)}:{handler.lineno}" in SILENT_ALLOW:
+                    continue
                 broad = _is_broad(handler)
-                vanishes = all(isinstance(s, ast.Pass | ast.Continue) for s in handler.body)
-                if vanishes:
+                text = _handler_text(source, handler)
+                # `continue` is not silence: inside a loop it says "skip this entry", which is
+                # the whole meaning of the handler. Only a bare `pass` leaves nothing behind.
+                # Calibrated against all 16 `continue` sites in the tree — every one was a
+                # legitimate skip-this-file / skip-this-line loop body.
+                vanishes = all(isinstance(s, ast.Pass) for s in handler.body)
+                if _is_fallback_only(handler) and _BEST_EFFORT.search(text):
+                    yield Finding(
+                        "swallowed-error",
+                        "high",
+                        _rel(path),
+                        handler.lineno,
+                        "declared best-effort but leaves no trace — a path that is allowed to "
+                        "fail is not allowed to fail invisibly; call "
+                        "note_suppressed(subsystem, step, exc)",
+                    )
+                elif vanishes and not _has_comment(text):
                     yield Finding(
                         "swallowed-error",
                         "high" if broad else "medium",
                         _rel(path),
                         handler.lineno,
-                        f"{'broad' if broad else 'narrow'} except with a `pass` body — the "
-                        "failure leaves no trace; log it or record it on the event bus",
+                        f"{'broad' if broad else 'narrow'} except with a `pass` body and no "
+                        "comment saying why — either trace it, or say what is being ignored",
                     )
                 elif broad and span >= BROAD_TRY_NODES:
                     yield Finding(
                         "swallowed-error",
-                        "medium",
+                        "low",
                         _rel(path),
                         handler.lineno,
                         f"broad except over a {span}-node try body — narrow the try to the "

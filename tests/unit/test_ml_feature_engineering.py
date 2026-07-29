@@ -201,7 +201,11 @@ def test_validate_can_ignore_dtypes() -> None:
 def test_validate_ignores_extra_columns_but_holds_the_order() -> None:
     # Extra columns are fine as long as the feature columns are present in the pinned order.
     spec = FeatureSpec(["a", "b"], {"a": "int64", "b": "double"})
-    spec.validate(bt.from_pydict({"a": [1], "b": [2.0], "extra": ["x"]}))
+    assert spec.validate(bt.from_pydict({"a": [1], "b": [2.0], "extra": ["x"]})) is None
+    # ...and the order really is pinned: the same columns in the wrong order must be rejected,
+    # which is the half of this test's name that nothing was checking.
+    with pytest.raises(PlanError):
+        spec.validate(bt.from_pydict({"b": [2.0], "a": [1], "extra": ["x"]}))
 
 
 # --- FeatureSpec: align ----------------------------------------------------------------
@@ -216,7 +220,13 @@ def test_align_reorders_and_selects() -> None:
 def test_align_then_validate_is_the_serving_recipe() -> None:
     spec = FeatureSpec(["a", "b"], {"a": "int64", "b": "double"})
     messy = bt.from_pydict({"b": [2.0], "extra": ["x"], "a": [1]})
-    spec.validate(spec.align(messy))  # no raise
+    aligned = spec.align(messy)
+    assert aligned.columns == ["a", "b"]
+    assert spec.validate(aligned) is None
+    # The recipe is what makes serving safe, so prove it was needed: the unaligned frame
+    # is exactly what validate rejects.
+    with pytest.raises(PlanError):
+        spec.validate(messy)
 
 
 def test_align_can_cast_to_the_pinned_dtypes() -> None:

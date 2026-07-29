@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import cleanliness as c
+from batcher.plan.functions.metrics.text import quality as c
 
 pytestmark = pytest.mark.unit
 

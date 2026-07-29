@@ -54,6 +54,28 @@ _LONG_TAIL_MAX_SHARE = 0.30
 #: Planning dominates when the steps account for little of the wall clock.
 _PLANNING_MIN_MS = 5.0
 _PLANNING_SHARE = 0.6
+#: A GPU stage is "starved" when the CPU stages around it cost this many times more than it
+#: does. The field guides name CPU preprocessing starving the GPU as the single most common
+#: cause of low GPU utilization, and 2x is where the device is idle at least half the time.
+_GPU_STARVED_RATIO = 2.0
+#: Total measured stage time below which a run is too small to conclude anything from the
+#: ratio. Deliberately on the **pipeline's** time, not the GPU stage's: a starved GPU is by
+#: definition one that spends little time working, so gating on the GPU stage would suppress
+#: the finding precisely when the starvation is worst.
+_GPU_STARVED_MIN_MS = 50.0
+#: Share of runtime owned by Python UDF stages above which the plan is mostly opaque to the
+#: optimizer — pushdown, fusion, and reordering all stop at a `map_batches`.
+_UDF_DOMINATES_SHARE = 0.5
+_UDF_DOMINATES_MIN_MS = 50.0
+#: A stage "explodes" rows when it emits this many times what it consumed, on enough rows to
+#: matter. The memory shape of everything downstream changes at that point.
+_STAGE_EXPLOSION_RATIO = 4.0
+_STAGE_EXPLOSION_MIN_ROWS = 1_000
+#: Rows above which a per-row `map` is worth naming, and the share of runtime it must own.
+#: The field guides put row-at-a-time Python at 10-100x a vectorized batch call, so this
+#: fires only when the stage is both large enough to matter and actually the expensive one.
+_PER_ROW_MIN_ROWS = 10_000
+_PER_ROW_SHARE = 0.3
 
 
 @dataclass(frozen=True, slots=True)

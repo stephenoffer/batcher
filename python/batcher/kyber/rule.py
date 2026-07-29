@@ -101,6 +101,52 @@ class Rule:
     # node). `fn`/`node_fn` remain the equivalent standalone forms, so a rule is still
     # unit-testable on its own and a phase that cannot fuse runs it exactly as before.
     expr_fn: Callable[[Expr], Expr] | None = field(default=None, compare=False)
+    # The schema-dependent twin of `expr_fn`, for a rule whose body is a leaf
+    # `(Expr, SchemaRef) -> Expr` lifted by `guards.schema_rule`. Without it each such rule
+    # resolves the node's schema and walks every expression *itself*: with several dozen of
+    # them that was a third of planning time, all of it re-walking the same trees. Declaring
+    # the leaf lets the driver resolve the schema once per node and run every schema leaf in
+    # the same single traversal the plain leaves already share.
+    #
+    # A schema leaf can only fire where `guards.node_schema` has an answer, so a rule whose
+    # `matches` is wider than that silently stops firing on the difference. It is a *safe*
+    # failure -- the rule declines rather than guessing -- which is exactly what makes it
+    # easy to miss. `node_schema` covers every expression-carrying node type
+    # (Filter/Project/Aggregate/Sort/Window), so match no wider than that.
+    expr_schema_fn: Callable[[Expr, object], Expr] | None = field(default=None, compare=False)
+    # The expression shapes this rule *needs present in the plan* to have any chance of
+    # firing. It does two jobs, and both read it the same way:
+    #
+    #   * the driver drops the rule entirely for a plan whose expressions contain none of
+    #     them (`_applicable`), so a string rule never runs on a numeric query;
+    #   * when the rule also supplies `expr_fn`/`expr_schema_fn`, it is the fused chain's
+    #     dispatch key — the expression is offered only to leaves declaring its type.
+    #
+    # The two jobs impose slightly different obligations, and the stricter one governs. A
+    # rule with a leaf MUST name every type the leaf can *rewrite*, because a missing type
+    # means the leaf is never offered that expression. A rule without one need only name a
+    # type whose presence is *necessary* — `date_trunc_lt_to_range` rewrites a `Binary` but
+    # cannot fire without a `DateTrunc` somewhere, so declaring `DateTrunc` is both correct
+    # and a much sharper filter than `Binary`, which nearly every plan has.
+    #
+    # With ~500 leaves in NORMALIZE, dispatching on this is the difference between one dict
+    # lookup and 500 function calls per expression node. `None` means "any expression type"
+    # and is the safe default: an undeclared rule keeps running everywhere, so omitting it
+    # costs speed and never correctness. Declaring it *wrongly* is the hazard — the rule
+    # silently stops firing, results stay correct, and only plan quality degrades — which is
+    # why `BATCHER_VERIFY_EXPR_MATCHES=1` re-runs both the chain and the whole phase
+    # undeclared and fails on any difference.
+    expr_matches: frozenset[type] | None = field(default=None, compare=False)
+    # A second-level discriminator *within* a declared type, naming the `op`/`fn` strings the
+    # leaf can rewrite. `expr_matches` alone bottoms out on the types the engine leans on
+    # hardest: `Binary` is one type carrying arithmetic, comparison, and the boolean
+    # connectives, so a predicate made of `and`/`or` was still being offered to every leaf
+    # that handles *any* binary — profiled at ~50,000 calls into a single comparison guard for
+    # one plan. Keying the index on `(type, op)` splits that one bucket into the dozen the
+    # rules actually distinguish. `None` means "any operator of the declared types" and is the
+    # safe default; the same "name everything you can act on" obligation as `expr_matches`
+    # applies, and `BATCHER_VERIFY_EXPR_MATCHES=1` checks both together.
+    expr_ops: frozenset[str] | None = field(default=None, compare=False)
 
     def apply(self, plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
         return self.fn(plan, ctx)
@@ -113,12 +159,16 @@ def plan_rule(
     *,
     matches: tuple[type, ...] | None = None,
     category: RuleCategory = RuleCategory.REWRITE,
+    expr_matches: tuple[type, ...] | None = None,
+    expr_ops: tuple[str, ...] | None = None,
 ) -> Rule:
     """Wrap a whole-plan function `fn(plan, ctx) -> plan` as a `Rule`.
 
     Use for holistic rewrites and cost-based transforms that reason over the whole
     tree. `matches` (if given) lets the driver skip the rule when none of those node
-    types are present.
+    types are present, and `expr_matches`/`expr_ops` do the same for the expression
+    shapes it needs — which is the sharper filter for a whole-plan rule, since it has
+    no node type to be indexed on and would otherwise run against every plan.
     """
     return Rule(
         name=name,
@@ -126,6 +176,8 @@ def plan_rule(
         fn=fn,
         matches=frozenset(matches) if matches is not None else None,
         category=category,
+        expr_matches=frozenset(expr_matches) if expr_matches is not None else None,
+        expr_ops=frozenset(expr_ops) if expr_ops is not None else None,
     )
 
 
@@ -137,6 +189,9 @@ def node_rule(
     matches: tuple[type, ...],
     category: RuleCategory = RuleCategory.REWRITE,
     expr_fn: Callable[[Expr], Expr] | None = None,
+    expr_schema_fn: Callable[[Expr, object], Expr] | None = None,
+    expr_matches: tuple[type, ...] | None = None,
+    expr_ops: tuple[str, ...] | None = None,
 ) -> Rule:
     """Wrap a node-local function `fn(node, ctx) -> node | None` as a `Rule`.
 
@@ -165,4 +220,7 @@ def node_rule(
         category=category,
         node_fn=fn,
         expr_fn=expr_fn,
+        expr_schema_fn=expr_schema_fn,
+        expr_matches=frozenset(expr_matches) if expr_matches is not None else None,
+        expr_ops=frozenset(expr_ops) if expr_ops is not None else None,
     )

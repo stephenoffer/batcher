@@ -19,7 +19,14 @@ from batcher.plan.logical.aggregate import (
     SortKeySpec,
 )
 from batcher.plan.logical.base import LogicalPlan
-from batcher.plan.logical.join import AsofJoin, Join, JoinOutputCol, WatermarkStreamJoin
+from batcher.plan.logical.join import (
+    AsofJoin,
+    Join,
+    JoinOutputCol,
+    RangeCondition,
+    RangeJoin,
+    WatermarkStreamJoin,
+)
 from batcher.plan.logical.relational import (
     Distinct,
     Filter,
@@ -35,9 +42,11 @@ from batcher.plan.logical.relational import (
 from batcher.plan.logical.reshape import RowId, Unnest, Unpivot
 from batcher.plan.logical.transforms import (
     empty_result_schema,
+    hoist_computed_keys,
     is_cartesian_key_pair,
     is_partition_independent,
     is_streamable,
+    project_columns,
     remap_sources,
 )
 from batcher.plan.logical.window import Window, WindowFrame, WindowFuncSpec
@@ -55,6 +64,8 @@ __all__ = [
     "MapBatches",
     "Project",
     "Projection",
+    "RangeCondition",
+    "RangeJoin",
     "RowId",
     "Sample",
     "Scan",
@@ -69,8 +80,10 @@ __all__ = [
     "WindowFrame",
     "WindowFuncSpec",
     "empty_result_schema",
+    "hoist_computed_keys",
     "is_cartesian_key_pair",
     "is_partition_independent",
     "is_streamable",
+    "project_columns",
     "remap_sources",
 ]

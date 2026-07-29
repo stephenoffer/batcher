@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .kinds import (
+from batcher.observe.insights.kinds import (
     _EXPLODING_JOIN_MIN_ROWS,
     _EXPLODING_JOIN_RATIO,
     _LATE_FILTER_KEEP,

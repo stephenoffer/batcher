@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -177,7 +179,8 @@ def metadata_count(
         if result is not None:
             return result
         return kyber.answer_filter_count(plan, sources, stats, hub)
-    except Exception:  # the metadata shortcut must never break a runnable query
+    except Exception as exc:  # the metadata shortcut must never break a runnable query
+        note_suppressed("api", "answer count() from metadata", exc)
         return None
 
 
@@ -198,7 +201,8 @@ def metadata_is_empty(
         if result is not None:
             return result
         return kyber.answer_filter_is_empty(plan, sources, stats, hub)
-    except Exception:  # the metadata shortcut must never break a runnable query
+    except Exception as exc:  # the metadata shortcut must never break a runnable query
+        note_suppressed("api", "answer is-empty from metadata", exc)
         return None
 
 
@@ -257,7 +261,8 @@ def _scalar_answer(kyber_fn, column: str, plan: LogicalPlan, sources, source_sta
     try:
         stats = _source_stats(sources, source_stats)
         return kyber_fn(column, plan, sources, stats, core.default_hub())
-    except Exception:  # the metadata shortcut must never break a runnable query
+    except Exception as exc:  # the metadata shortcut must never break a runnable query
+        note_suppressed("api", "answer a scalar aggregate from metadata", exc)
         return None
 
 
@@ -331,7 +336,8 @@ def metadata_approx_n_unique(
     try:
         stats = _source_stats(sources, source_stats)
         return approx_count_distinct(column, plan, sources, stats, core.default_hub())
-    except Exception:  # the metadata shortcut must never break a runnable query
+    except Exception as exc:  # the metadata shortcut must never break a runnable query
+        note_suppressed("api", "answer approx_n_unique from metadata", exc)
         return None
 
 
@@ -357,5 +363,6 @@ def metadata_learned_quantile(
     try:
         key = source_stats_key(sources[0]) if len(sources) == 1 else None
         return answer_learned_quantile(column, q, core.default_hub(), key)
-    except Exception:  # the metadata shortcut must never break a runnable query
+    except Exception as exc:  # the metadata shortcut must never break a runnable query
+        note_suppressed("api", "answer a quantile from learned stats", exc)
         return None

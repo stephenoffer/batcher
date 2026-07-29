@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use bc_ir::RelOp;
+use bc_resource::CancelToken;
 use rayon::prelude::*;
 
 use bc_runtime::agg;
@@ -58,7 +59,61 @@ pub fn execute_streaming_parallel(
     workers: usize,
     budget: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    in_scoped_pool(workers, || run(plan, sources, workers, None, budget))
+    execute_streaming_parallel_or_hand_off(plan, sources, workers, budget, false, None)
+}
+
+/// [`execute_streaming_parallel`], optionally allowed to **decline** a plan it cannot shard.
+///
+/// With `handoff` set, a plan whose probe spine holds a hash join too large to probe per morsel
+/// returns [`InterpError::PreferMaterializing`] instead of running. That is not a failure and not
+/// a fallback the executor can take itself: the materializing executor needs the caller's full
+/// resource policy (its spill options and memory pool), which this entry point is not given, and
+/// the caller is also the only party that knows whether that executor's memory profile is
+/// affordable for this query. So the decision is reported, not made.
+///
+/// Why here and not from the plan alone: whether a join gets a per-morsel probe depends on its
+/// build side's *actual* row count, which a filter or an aggregate below it can change by orders
+/// of magnitude. The build sides are prepared first and the answer read off them — exact, at the
+/// cost of discarding that preparation when the answer is "hand it over".
+pub fn execute_streaming_parallel_or_hand_off(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    workers: usize,
+    budget: usize,
+    handoff: bool,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    in_scoped_pool(workers, || {
+        run(plan, sources, workers, None, budget, handoff, cancel)
+    })
+}
+
+/// Wrap a pipeline's output iterator so each morsel it yields is preceded by a cancellation
+/// check.
+///
+/// The streaming executor is pull-based: one `next()` drives one morsel through *every*
+/// operator in the pipeline. So a single check here is a per-morsel check for the whole
+/// pipeline, rather than one per operator — and it sits at the only point where nothing is
+/// half-built, since the morsel it would have produced has not been started.
+///
+/// It does not bound a **breaker**. A sort or an aggregate build consumes its entire input
+/// inside one `next()`, so a query that spends ten minutes building a hash table notices a
+/// cancel when that build finishes. The materializing executor's operator-boundary check and
+/// the external sort's per-merge-pass check cover the cases where that matters most; a
+/// breaker-internal poll is a further step, not this one.
+fn with_cancellation<'a>(
+    it: Box<dyn Iterator<Item = Result<RecordBatch, InterpError>> + 'a>,
+    cancel: Option<&CancelToken>,
+) -> Box<dyn Iterator<Item = Result<RecordBatch, InterpError>> + 'a> {
+    let Some(token) = cancel.cloned() else {
+        return it; // not cancellable: the iterator is handed back untouched
+    };
+    Box::new(it.map(move |b| {
+        if token.is_cancelled() {
+            return Err(InterpError::Cancelled);
+        }
+        b
+    }))
 }
 
 /// Run `f` inside a width-sized scoped rayon pool — **never** rayon's global pool.
@@ -91,8 +146,22 @@ pub fn execute_streaming_parallel_metered(
     workers: usize,
     budget: usize,
 ) -> Result<(Vec<RecordBatch>, ExecMetrics), InterpError> {
+    execute_streaming_parallel_metered_or_hand_off(plan, sources, workers, budget, false, None)
+}
+
+/// [`execute_streaming_parallel_or_hand_off`], with per-operator metrics.
+pub fn execute_streaming_parallel_metered_or_hand_off(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    workers: usize,
+    budget: usize,
+    handoff: bool,
+    cancel: Option<&CancelToken>,
+) -> Result<(Vec<RecordBatch>, ExecMetrics), InterpError> {
     let m = Meter::new(plan, workers.max(1) as u32);
-    let out = in_scoped_pool(workers, || run(plan, sources, workers, Some(&m), budget))?;
+    let out = in_scoped_pool(workers, || {
+        run(plan, sources, workers, Some(&m), budget, handoff, cancel)
+    })?;
     Ok((out, m.finish()))
 }
 
@@ -102,8 +171,12 @@ pub(super) fn run(
     workers: usize,
     meter: Option<&Meter>,
     budget: usize,
+    handoff: bool,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    run_with_cache(plan, sources, workers, meter, budget, None, None)
+    run_with_cache(
+        plan, sources, workers, meter, budget, None, None, handoff, cancel,
+    )
 }
 
 /// [`run`], reusing everything the caller has already prepared for this plan — build sides and
@@ -115,6 +188,7 @@ pub(super) fn run(
 /// second time. Dropping either one is the recurring bug in this file: it does not change the
 /// answer, so no test fails; it silently doubles the work, and only `explain(analyze=True)` (a
 /// scan whose `actual` is 2x its table's row count) shows it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_reusing(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
@@ -123,8 +197,14 @@ pub(super) fn run_reusing(
     budget: usize,
     cache: Option<&BuildCache>,
     mats: Option<&MatCache>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    run_with_cache(plan, sources, workers, meter, budget, cache, mats)
+    // Never hands off: this re-entry is made from *inside* a running pipeline, which has already
+    // produced work the caller cannot rewind. Whether to hand the plan over is settled once, at
+    // the top, before any of that exists.
+    run_with_cache(
+        plan, sources, workers, meter, budget, cache, mats, false, cancel,
+    )
 }
 
 /// `run`, optionally reusing build sides a caller has already executed.
@@ -140,6 +220,7 @@ pub(super) fn run_reusing(
 /// borrowed subtree of the very plan the cache was built from, so the joins under it are the same
 /// nodes at the same addresses. It is also complete: `collect_builds` descends the whole tree, so
 /// a cache built for the parent covers every join in the child.
+#[allow(clippy::too_many_arguments)]
 fn run_with_cache(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
@@ -148,6 +229,8 @@ fn run_with_cache(
     budget: usize,
     prebuilt: Option<&BuildCache>,
     prebuilt_mats: Option<&MatCache>,
+    handoff: bool,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     let workers = workers.max(1);
 
@@ -178,6 +261,8 @@ fn run_with_cache(
             budget,
             prebuilt,
             prebuilt_mats,
+            handoff,
+            cancel,
         )?;
         let rows_in = crate::count_rows(&rows);
         let held = crate::batch_bytes(&rows);
@@ -248,6 +333,8 @@ fn run_with_cache(
                 budget,
                 prebuilt,
                 prebuilt_mats,
+                handoff,
+                cancel,
             )?;
             let id = meter.map(|m| m.id(plan));
             let t = std::time::Instant::now();
@@ -292,7 +379,8 @@ fn run_with_cache(
     let mats: Option<&MatCache> = if prebuilt_mats.is_some() {
         prebuilt_mats
     } else if workers > 1 {
-        owned_mats = materialize_spine_breakers(plan, sources, workers, meter, budget, cache)?;
+        owned_mats =
+            materialize_spine_breakers(plan, sources, workers, meter, budget, cache, cancel)?;
         (!owned_mats.is_empty()).then_some(&owned_mats)
     } else {
         None
@@ -310,11 +398,25 @@ fn run_with_cache(
         // the executor as `Project(Filter(Aggregate))` on a join's *build* side, so its 6M-row
         // lineitem aggregate — 26.8 ms sharded, and faster than DuckDB's on its own — ran serial
         // and cost ~5x that.
+        // One reason for refusing is worth handing back to the caller rather than absorbing: a
+        // hash join whose build side is past the per-morsel probe's ceiling. Everything else that
+        // lands here still runs across cores in some fashion — the row-wise peel below, the
+        // prepared build sides, the materialized spine breakers. That one does not: the probe
+        // side is materialized whole and the join, the gather and the fold above it all run
+        // through a single pipeline. Measured at sf10 on a 60M x 15M join: 5.7x parallelism
+        // streaming against 62x on the materializing executor, which partitions the same join
+        // across every core. The caller can run it there; see
+        // [`execute_streaming_parallel_or_hand_off`] for why the choice is reported, not taken.
+        if handoff && workers > 1 {
+            if let Some(reason) = spine_join_blocks_sharding(plan, cache, mats, sources) {
+                return Err(InterpError::PreferMaterializing { reason });
+            }
+        }
         return match plan {
             RelOp::Project { .. } | RelOp::Filter { .. } => {
-                peel_row_wise(plan, sources, workers, meter, budget, cache, mats)
+                peel_row_wise(plan, sources, workers, meter, budget, cache, mats, cancel)
             }
-            _ => fallback_with(plan, sources, meter, budget, cache, workers, mats),
+            _ => fallback_with(plan, sources, meter, budget, cache, workers, mats, cancel),
         };
     };
     let driving_rows: usize = sources
@@ -322,7 +424,7 @@ fn run_with_cache(
         .map(|b| b.iter().map(|x| x.num_rows()).sum())
         .unwrap_or(0);
     if workers == 1 || driving_rows < MIN_ROWS_TO_SHARD {
-        return fallback_with(plan, sources, meter, budget, cache, workers, mats);
+        return fallback_with(plan, sources, meter, budget, cache, workers, mats, cancel);
     }
 
     // (2) Contiguous shards of the driving scan, in row order — each materialized as the
@@ -359,7 +461,12 @@ fn run_with_cache(
                 .par_iter()
                 .map(|srcs| {
                     let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
-                    fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)
+                    fold_partial(
+                        with_cancellation(build_with(input, ctx)?, cancel),
+                        group_keys,
+                        aggregates,
+                        &jit,
+                    )
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
 
@@ -419,7 +526,8 @@ fn run_with_cache(
                 .par_iter()
                 .map(|srcs| {
                     let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
-                    build_with(input, ctx)?.collect::<Result<Vec<_>, _>>()
+                    with_cancellation(build_with(input, ctx)?, cancel)
+                        .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
             let batches: Vec<RecordBatch> = parts.into_iter().flatten().collect();
@@ -454,7 +562,7 @@ fn run_with_cache(
                 .par_iter()
                 .map(|srcs| {
                     let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
-                    build_with(plan, ctx)?.collect::<Result<Vec<_>, _>>()
+                    with_cancellation(build_with(plan, ctx)?, cancel).collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
             // Shards are contiguous, in-order row ranges, so concatenating them in shard order
@@ -483,22 +591,41 @@ fn peel_row_wise(
     budget: usize,
     cache: &BuildCache,
     mats: Option<&MatCache>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     // `run` only routes the two row-wise roots here; anything else keeps the old behaviour.
     let input = match plan {
         RelOp::Project { input, .. } | RelOp::Filter { input, .. } => input,
-        _ => return fallback_with(plan, sources, meter, budget, cache, workers, mats),
+        _ => return fallback_with(plan, sources, meter, budget, cache, workers, mats, cancel),
     };
     let id = meter.map(|m| m.id(plan));
     // Hand the child the builds *and* the materialized spine breakers we already have. Re-entering
     // through plain `run` would execute every one of them again — see `run_with_cache`.
-    let rows = run_with_cache(input, sources, workers, meter, budget, Some(cache), mats)?;
+    let rows = run_with_cache(
+        input,
+        sources,
+        workers,
+        meter,
+        budget,
+        Some(cache),
+        mats,
+        false,
+        cancel,
+    )?;
     let mut out = Vec::with_capacity(rows.len());
+    // Hoisted out of the loop on purpose: this is one operator over many morsels, so the
+    // conjunct order is measured across them rather than restarted at each.
+    let order = match plan {
+        RelOp::Filter { predicate, .. } => bc_expr::ConjunctOrder::new(predicate),
+        _ => None,
+    };
     for b in &rows {
         let t = std::time::Instant::now();
         let done = match plan {
             RelOp::Project { exprs, .. } => ops::project_batch(b, exprs)?,
-            RelOp::Filter { predicate, .. } => ops::filter_batch(b, predicate)?,
+            RelOp::Filter { predicate, .. } => {
+                ops::filter_batch_jit(b, predicate, &None, order.as_ref())?
+            }
             _ => unreachable!("guarded above"),
         };
         if let (Some(m), Some(id)) = (meter, id) {
@@ -523,13 +650,15 @@ fn fallback_with(
     cache: &BuildCache,
     workers: usize,
     mats: Option<&MatCache>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     // This path is *not* inside a rayon loop, so its stages may still fan out — which matters
     // because the plan reached it precisely by being un-shardable, and everything in it would
     // otherwise be serial. It reads `mats`, so even a plan that declines to shard collects the
     // parallel evaluation of whatever spine breaker made it decline.
     let ctx = Ctx::with_workers(sources, cache, meter, budget, workers).with_mats(mats);
-    let out: Vec<RecordBatch> = build_with(plan, ctx)?.collect::<Result<_, _>>()?;
+    let out: Vec<RecordBatch> =
+        with_cancellation(build_with(plan, ctx)?, cancel).collect::<Result<_, _>>()?;
     Ok(strip_empties(out))
 }
 
@@ -673,6 +802,84 @@ fn spine_is_shardable(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>)
     }
 }
 
+/// Why the probe spine cannot be sharded, when the reason is a hash join — `None` otherwise.
+///
+/// This is [`spine_is_shardable`]'s one *interesting* refusal. The others (a breaker, a `Limit`,
+/// a `RowId`) leave a plan the executor still spreads: a breaker was already evaluated across
+/// every core by `materialize_spine_breakers`, and a row-wise root is peeled onto its
+/// parallelized child. A join whose build side got no per-morsel probe leaves nothing — the
+/// probe relation is drained and concatenated whole, joined, gathered, and folded through one
+/// pipeline — so it is the refusal worth telling the caller about.
+///
+/// Walks the same spine `spine_is_shardable` walks, and stops where it stops: at a materialized
+/// node (already a leaf) and at a scan.
+///
+/// **One hash join in the whole plan, and no more.** That bound is about memory, and it is the
+/// reason this is not simply "prefer the faster executor". With a single join the two executors
+/// hold the same thing: the streaming fallback already drains and concatenates the entire probe
+/// relation to feed that join, so handing it over costs no peak the query was not already paying.
+/// More than one join is the opposite — streaming holds one join's output at a time while the
+/// materializing executor holds every one of them at once, which is precisely the intermediate
+/// blow-up the streaming executor exists to remove. Measured: TPC-H q5 at sf10 (five joins)
+/// reaches 99 GB and is OOM-killed on the materializing executor, while streaming answers it in
+/// a few GB. Speed is worth trading for memory only where there is no memory to lose.
+///
+/// The count is over the **whole plan**, not the probe spine, and that distinction is the bug it
+/// was written to fix: a bushy join tree puts most of its joins under *build* sides, so a q5 whose
+/// spine holds one join still asks the materializing executor to hold five join outputs at once.
+/// **And the probe side must be the bigger half.** What the materializing executor buys here is a
+/// probe spread across every core; what it costs is the build side, executed once for the cache
+/// this call is about to throw away. That trade only pays when the probe is the dominant term.
+/// TPC-H q4 is the counter-example that motivated the condition: `orders SEMI lineitem` filters
+/// its probe to ~57k rows and builds over ~3.8M, so the two executors measured within 1% of each
+/// other (164 ms vs 163 ms at sf10) and handing it over bought nothing while paying for the
+/// discarded build. Comparing the driving relation's row count against the build's exact one
+/// keeps the hand-off to the shape where it was worth 3-11x.
+fn spine_join_blocks_sharding(
+    plan: &RelOp,
+    cache: &BuildCache,
+    mats: Option<&MatCache>,
+    sources: &[Vec<RecordBatch>],
+) -> Option<&'static str> {
+    if count_hash_joins(plan) != 1 {
+        return None;
+    }
+    // The root aggregate/distinct is not itself on the spine — each worker's `Partial` is
+    // combined rather than finalized — so look through it, exactly as `shardable_source` does.
+    let spine = match plan {
+        RelOp::Aggregate { input, .. } | RelOp::Distinct { input } => input.as_ref(),
+        other => other,
+    };
+    let driving_rows: usize = leftmost_scan(spine, mats)
+        .and_then(|sid| sources.get(sid))
+        .map(|b| b.iter().map(|x| x.num_rows()).sum())
+        .unwrap_or(0);
+    let mut node = spine;
+    loop {
+        if is_materialized(node, mats) {
+            return None;
+        }
+        if let RelOp::HashJoin { .. } = node {
+            let build = cache.get(&node_key(node))?;
+            if build.has_morsel_probe() || driving_rows <= build.side.num_rows() {
+                return None;
+            }
+            return Some("a hash join's build side is too large to probe one morsel at a time");
+        }
+        node = spine_child(node)?;
+    }
+}
+
+/// Hash joins anywhere in `plan` — build sides included.
+fn count_hash_joins(plan: &RelOp) -> usize {
+    let here = usize::from(matches!(plan, RelOp::HashJoin { .. }));
+    here + plan
+        .children()
+        .iter()
+        .map(|c| count_hash_joins(c))
+        .sum::<usize>()
+}
+
 /// The source the spine's driving scan reads, or `None` when there is nothing to shard.
 ///
 /// **Stops at a materialized node**, and that is load-bearing rather than tidy. The scans under a
@@ -755,6 +962,7 @@ fn materialize_spine_breakers(
     meter: Option<&Meter>,
     budget: usize,
     cache: &BuildCache,
+    cancel: Option<&CancelToken>,
 ) -> Result<MatCache, InterpError> {
     let mut mats = MatCache::new();
     let Some(mut node) = spine_child(plan) else {
@@ -765,7 +973,17 @@ fn materialize_spine_breakers(
             // The builds are handed down (`collect_builds` descends the probe spine, so the cache
             // already covers every join under here); the mats are not, because this subtree owns
             // whatever lies below it.
-            let batches = run_with_cache(node, sources, workers, meter, budget, Some(cache), None)?;
+            let batches = run_with_cache(
+                node,
+                sources,
+                workers,
+                meter,
+                budget,
+                Some(cache),
+                None,
+                false,
+                cancel,
+            )?;
             mats.insert(node_key(node), Arc::new(batches));
             return Ok(mats);
         }

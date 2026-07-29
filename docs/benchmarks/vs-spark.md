@@ -1,21 +1,24 @@
 # vs Spark
 
-:::{warning}
+This page compares Batcher and Spark on architecture: where each one re-plans a query, what
+moves the bulk data, and what that means for a single node. It carries no timings, and the
+reason comes first.
+
+:::{important}
 **There are no head-to-head Spark timings in this repository, and this page invents none.**
-Everything else on the benchmarks site is a measurement; this page is a positioning
-argument, and it is labeled as one. Every other `vs-*` page opens with a scorecard of wins
-and losses. This one cannot, because nothing has been run. When a Spark run lands in
-`benchmarks/BENCHMARK_RESULTS.md`, the numbers will appear here and this admonition will go.
+Every other page on this site is a measurement. This one is an architectural comparison, and
+it is labeled as one so nothing here reads as a speed result. When a Spark run lands in
+`benchmarks/BENCHMARK_RESULTS.md`, the numbers will appear here.
 :::
 
-What follows is an architectural comparison against the system Spark actually is, which is
-worth writing down because the design difference is specific and testable.
+What follows is a comparison against the system Spark actually is, which is worth writing
+down because the design difference is specific and testable.
 
 | | Status |
 |---|---|
 | Head-to-head Spark timings | **None.** Not run, not published, not claimed. |
 | Architectural comparison | Below, and it is an argument rather than a measurement. |
-| Measured distributed results | Real, but against {doc}`vs-ray-data` and {doc}`vs-daft`, not Spark. See {doc}`scaling`. |
+| Measured distributed results | Real, but against {doc}`vs-daft`, not Spark. See {doc}`scaling`. |
 | API migration | Mapped verb by verb in the {doc}`../migration/index`. |
 
 ## Adaptation: stage boundaries versus pipeline breakers
@@ -67,10 +70,10 @@ refuses to make without a correctness-gated measurement. Do not cite this page a
 result. It is not one.
 :::
 
-What *is* measured, and does bear on the comparison, is the layer beneath: Batcher's
-distributed path beats Ray Data on every pipeline at every scale tested, beats Daft on 4 of
-5 distributed pipelines, and keeps per-node memory bounded through the mergeable algebra and
-spill. See {doc}`scaling`.
+What *is* measured, and does bear on the comparison, is the layer beneath: on a 128-CPU
+cluster Batcher's distributed path takes the join, the group-by, and the metadata count
+against Daft's Ray runner, and keeps per-node memory bounded through the mergeable algebra
+and spill. See {doc}`scaling`.
 
 ## Migrating
 

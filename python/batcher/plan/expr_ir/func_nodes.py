@@ -12,19 +12,54 @@ fields with the `child`/`scalar`/`literal` factories, and the generic
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.fn_names import (
     DATE_FNS,
     KEYED_STR_FNS,
     LIST_FNS,
+    MAKE_TEMPORAL_FNS,
     STR_FNS,
     ListBinaryFn,
     ListSetFn,
     ListZipFn,
     MapFn,
 )
-from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, literal, scalar
+from batcher.plan.expr_ir.node_base import (
+    IRNode,
+    child,
+    children,
+    expr_node,
+    literal,
+    scalar,
+)
 from batcher.plan.ir_tags import ExprTag
+
+
+def _require_plan_time_literal(node: IRNode, **args: object) -> None:
+    """Reject an `Expr` where a plan-time constant is required, naming what to do.
+
+    These slots are lowered into the JSON IR as *values*, so an expression in one cannot
+    be evaluated — but nothing checked, and the failure surfaced far from the call. A
+    column passed to `.str.jaccard` reached `json.dumps` and raised
+    ``TypeError: Object of type Col is not JSON serializable``, naming neither the
+    function nor the argument; the `.map`/`.list` literal slots raised a bare
+    ``TypeError: unsupported literal type: Col`` at plan-build time, equally far away.
+
+    Both are internal errors escaping to a user who wrote an ordinary expression. Checked
+    here, at construction, the message names the method, the argument and the constraint —
+    and it is a `PlanError`, which is what the rest of the API raises.
+    """
+    # Prefer the function the user actually called (`jaccard`) over the node class
+    # (`StrFunc`) — the class name is an implementation detail they never typed.
+    called = getattr(node, "fn", None) or type(node).__name__
+    for name, value in args.items():
+        if isinstance(value, Expr):
+            raise PlanError(
+                f"{called}(): {name!r} must be a plain Python value known when the plan "
+                f"is built, not an expression (got {value!r}). This argument is lowered "
+                "into the plan as a constant, so it cannot be computed per row."
+            )
 
 
 @expr_node
@@ -39,6 +74,11 @@ class StrFunc(IRNode):
     replacement: str | None = scalar(omit_none=True, default=None)
     start: int | None = scalar(omit_none=True, default=None)
     length: int | None = scalar(omit_none=True, default=None)
+
+    def __post_init__(self) -> None:
+        """Validate the family vocabulary, then the plan-time-constant slots."""
+        super().__post_init__()
+        _require_plan_time_literal(self, pattern=self.pattern, replacement=self.replacement)
 
     def __repr__(self) -> str:
         """Render the node, redacting an inline `pattern` key for the crypto functions.
@@ -71,6 +111,22 @@ class DateFunc(IRNode):
     vocab = DATE_FNS
     fn: str = scalar()
     input: Expr = child()
+
+
+@expr_node
+class MakeTemporal(IRNode):
+    """Build a Date/Timestamp from integer parts or an epoch count.
+
+    The inverse direction of `DateFunc`. One node covers both shapes because they
+    share their whole contract: every argument is coerced to Int64, a null in any
+    argument nulls the row, and a value that names no real instant (month 13,
+    February 30, an epoch count that overflows) yields null rather than raising.
+    """
+
+    tag = ExprTag.MAKE_TEMPORAL
+    vocab = MAKE_TEMPORAL_FNS
+    fn: str = scalar()
+    args: list[Expr] = children()
 
 
 @expr_node
@@ -252,6 +308,11 @@ class ListContains(IRNode):
     input: Expr = child()
     value: int | float | bool | str = literal()
 
+    def __post_init__(self) -> None:
+        """Reject an expression in the literal slot."""
+        super().__post_init__()
+        _require_plan_time_literal(self, value=self.value)
+
 
 @expr_node
 class ListPosition(IRNode):
@@ -261,6 +322,11 @@ class ListPosition(IRNode):
     tag = ExprTag.LIST_POSITION
     input: Expr = child()
     value: int | float | bool | str = literal()
+
+    def __post_init__(self) -> None:
+        """Reject an expression in the literal slot."""
+        super().__post_init__()
+        _require_plan_time_literal(self, value=self.value)
 
 
 @expr_node
@@ -293,3 +359,8 @@ class MapFunc(IRNode):
     fn: str = scalar()
     input: Expr = child()
     key: object | None = literal(omit_none=True, default=None)
+
+    def __post_init__(self) -> None:
+        """Validate the family vocabulary, then the plan-time-constant key."""
+        super().__post_init__()
+        _require_plan_time_literal(self, key=self.key)

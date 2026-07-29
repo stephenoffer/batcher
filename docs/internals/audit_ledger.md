@@ -33,7 +33,7 @@ the regime it affects.
 | L21 | `CacheStore.on_pressure` — the pressure ladder the module docstring advertises as "the storage-vs-execution split Spark's `UnifiedMemoryManager` makes" — had **no production caller**, only a unit test. Cache bytes are not accounted against the buffer pool, so `result_cache_max_bytes` (256 MiB default) sat entirely *outside* the envelope every other Carbonite decision sizes against: the two budgets were disjoint and could stack past physical RAM, and the cache never yielded RAM until a reservation happened to hit an exact deficit. `ResourceManager.reserve` now applies the ladder (3/4 at ELEVATED, 1/2 at SPILL, all at CRITICAL) before the deficit check, reading `classify()` so it does not consume the AIMD round's sample. `NORMAL` leaves the cache untouched, so the common path costs nothing. Evicting a cache only forces a recompute — result-invariant. | `carbonite/manager.py` | all, memory-pressured | `test_carbonite_cache.py` |
 | L20 | The join-strategy UCB1 bandit was greedy in all but name, on two counts. (a) Its reward was **raw wall time**, but UCB1 assumes a stationary per-arm reward: the same signature runs over 1M rows today and 50M tomorrow, so an arm sampled once on a large input carried a permanently inflated mean and was never chosen again. Simulated (hash truly 2x faster, first run on a 50x input): cumulative regret **312 ms, hash pulled once in 80 rounds**. `record_join_strategy` now divides by the join's input rows -> regret **4 ms**, hash pulled 80/81. (b) The confidence radius `c*sqrt(2 ln N / n)` was **dimensionless while the mean was in ms** — against a 500 ms mean it is a 0.19% nudge. Scaling it by the pooled reward spread (recovered from the `sumsq` `record_arm` was already storing and **nothing ever read**) makes `c` dimensionless: verified that regret and arm pulls are now *identical* whether the reward is recorded in ms/Mrow, ms/row or us/Mrow. Namespace bumped to `join_arm_v2` so ms-scale history cannot mix with the new per-row scale. Bounded honestly: the scaled radius does **not** resurrect a genuinely worse arm (pooled spread decays as `1/sqrt(N)`) — that is what the normalization is for, and a test pins the boundary. | `kyber/learned_tuning.py`, `api/tuning/decisions.py` | joins, all scales | `test_join_strategy_bandit.py` |
 | L19 | `execute_spilling_aggregate` answered an empty input to a **global** aggregate with `combine_finalize(..., [])`, which has no partial state to type the result from and raises `aggregation over empty input is not yet supported`. So `group_by().agg(median(v))` over an empty relation *crashed* on the spill path while the single-node engine and DuckDB both return one NULL row. A schema-carrying empty batch is now routed through the same map -> partial -> finalize pipeline, so the aggregate's identity element falls out of the mergeable algebra instead of being special-cased. (Pre-existing at HEAD; confirmed by running the test in a HEAD worktree.) | `dist/spill.py` | distributed + spill | `test_adaptive_stress.py::test_tiny_budget_spill_matches_baseline[global_median-empty]` |
-| L18 | The adaptive loop gauged estimate accuracy with `isinstance(result, pa.Table)`, but a distributed stage parks a `MaterializedSource`/`FlightMaterializedSource` — never a table. So `flipped` stayed `False` on every distributed run and `learned_adaptive_helps` could **never** turn on for a distributed shape: the adaptive gate could not learn from precisely the queries that most need it. Both source types already carry an exact `row_count` from their reduce tasks; `_stage_row_count` now reads it, returning `None` only for a genuinely unbounded (streaming) source. The single-node-only early-exit is left as documented. | `api/adaptive.py` | distributed + adaptive | `test_distributed_feedback.py` |
+| L18 | The adaptive loop gauged estimate accuracy with `isinstance(result, pa.Table)`, but a distributed stage parks a `MaterializedSource`/`FlightMaterializedSource` — never a table. So `flipped` stayed `False` on every distributed run and the learned adaptive verdict could **never** turn on for a distributed shape: the adaptive gate could not learn from precisely the queries that most need it. Both source types already carry an exact `row_count` from their reduce tasks; `_stage_row_count` now reads it, returning `None` only for a genuinely unbounded (streaming) source. The single-node-only early-exit is left as documented. | `api/adaptive.py` | distributed + adaptive | `test_distributed_feedback.py` |
 | L17 | Only the **disk-aggregate map task** was metered. Distributed sorts, windows, joins, distinct and the broadcast probe all called the unmetered `execute_plan`, so a distributed run contributed **nothing** to the cost calibration or the learned memory model — while being the path that runs the largest inputs and the one that spills. `Core measures` held single-node only. A worker-side `execute_metered` + driver-side `record_worker_metrics` seam now closes it for the sort map+reduce, the window map+reduce, the shuffle-join reduce (the hash-join breaker, carrying `rows_build`/`peak_bytes`), the broadcast probe (one document per chunk), and distinct (which rides the aggregate shuffle). Degrades to the unmetered call on an engine without the metered entry point — a worker never fails a query to collect a statistic. `metrics_out` (the profile's map-sub-plan display channel) is deliberately **not** fed from the new sites: `merge_metric_ops` merges by `op_id`, and reduce ops share ids with map ops of a different sub-plan. | `dist/executors/ray_runtime/metering.py`, `dist/executor.py`, `dist/executors/{sort,window,join,distinct,aggregate}.py` | distributed | `test_distributed_feedback.py` |
 | L16 | `op_cost(Join)` prices the build side as the right input, but the build-side rule runs in SELECTION — *after* JOIN_REORDER. With `hash_build_row` twice `hash_probe_row`, the reorder penalized every order that put the large table on the right, even though SELECTION would have swapped it. Ordering now uses `join_op_cost`, which prices the cheaper (commutative) orientation; `op_cost` stays orientation-specific because the build-side rule compares the two against each other. Non-inner joins are priced as written. | `kyber/cost.py`, `kyber/rules/join_order.py` | large joins | `test_contract_loop.py` |
 | L11 | `_apply_node_rules` fused a phase's node rules into one bottom-up walk and claimed observational equivalence. It is not: `transform_up` has already visited a node's children when a rule fires on it, so a rule that rewrites a node into a **new subtree** leaves those children unvisited by the later rules of that run. A fixpoint phase recovers them next iteration; the once-run SELECTION/ENFORCE phases lost the rewrite outright. Fusing is now confined to the phases that iterate. | `kyber/optimizer.py` | all | `test_contract_loop.py` |
@@ -68,6 +68,44 @@ the regime it affects.
 | E3 | A join's `rows_in` was the **sum** of both sides, so `rows_out / rows_in` was neither the probe rate nor the fan-out, and one calibrated coefficient conflated the asymmetric build and probe costs. `rows_in` is now the probe side and `rows_build` reports the hashed side. | `bc-interp/src/{metrics,lib,par}.rs`, `plan/feedback.py`, `core/executor.py` | same |
 
 ---
+
+### Enterprise security floor (2026-07-26)
+
+Four fixes, each verified by running the failure rather than reasoning about it. Full
+detail in `databricks_parity.md`; the short form:
+
+1. **UDF workers inherited the engine's credentials.** A `forkserver` child got the whole
+   parent environment, including `env:` secret material and `BATCHER_SECRET_COMMAND` —
+   which names a program that hands out arbitrary secrets on request. Closed by
+   `core/udf/isolation.py` (`execution.udf_isolation`, default `"env"`). Demonstrated:
+   under `"none"` a worker reads `AWS_SECRET_ACCESS_KEY`, under `"env"` it reads nothing.
+   **Covers the process path only** — a UDF on the thread path *is* the engine process, and
+   that limit is pinned as a test rather than left to be discovered.
+
+2. **Every artifact was world-readable.** Measured, not assumed: spill files 0644 with the
+   directory protected only by a `chmod` that ignores its own failure; shuffle scratch root
+   0755 on a shared cluster mount; `/dev/shm` UDF shards (the query's batches) 0644 in a
+   world-writable directory; event-log documents (which carry literal predicate constants)
+   0644; the learned-stats database 0644. Now 0700/0600 by construction, via
+   `_internal/paths.py` and `bc-runtime/agg/spill.rs::create_private`.
+
+3. **A governed column's bloom filter was an exact membership oracle.** Persisted on every
+   write into a `MetadataHub` whose backends include Redis and object storage. Probing the
+   *actually persisted* artifact through its *actual* consumer answered PRESENT for both
+   real SSNs and absent for three fabricated ones — a read of a governed column that never
+   touches the table, and (no false negatives) an `absent` is proof of absence. Now
+   redacted for masked/invisible columns; cardinalities survive so the optimizer still
+   orders joins.
+
+4. **Governance failed open.** Enforcement applied only inside a `security()` block, so
+   forgetting the block silently unmasked a column. `GovernanceConfig.mode`
+   (`off`/`advisory`/`strict`) makes it mandatory; `strict` also refuses sources that
+   cannot be governed at all rather than exempting them. `advisory` is what makes `strict`
+   adoptable and is not optional polish.
+
+**Still open, and unchanged by any of the above:** Batcher does not authenticate. A
+`Principal` is caller-asserted, so in-process code can claim any identity. The trust
+boundary is the process. `docs/user-guide/hardening.md` says so in the user's language.
 
 ## Open — ranked
 

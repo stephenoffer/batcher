@@ -2,7 +2,7 @@
 
 This page reports Batcher's TPC-H results against DuckDB, Daft, and Polars, and explains where the remaining gap comes from.
 
-TPC-H shows both sides of the engine. Against DuckDB reading the same Arrow, Batcher wins all 22 queries. Against DuckDB on its own compressed store, where DuckDB never pays an ingest and decompresses as it scans, DuckDB still wins 15 of 22. Both numbers are below. Publishing only the first would be marketing and publishing only the second would be false modesty.
+TPC-H shows both sides of the engine. Against DuckDB reading the same Arrow, which is the like-for-like execution comparison, Batcher wins all 22 queries. Against DuckDB on its own compressed store, where DuckDB never pays an ingest and decompresses as it scans, DuckDB wins 15 of 22. Both columns are below, because they answer different questions.
 
 All 22 queries, scale factor 1 (`lineitem` = 6,001,215 rows), single node, 16 cores, 30 GB,
 release build, measured 2026-07-18.
@@ -38,14 +38,13 @@ attributed the error to `interval '1' year`, which was wrong.
 ## Where the suite stands
 
 **Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
-wins all 22 queries**, by 1.1x to 6.9x. That is the comparison Batcher's Arrow-only contract makes fair. q21 runs too, because correlated subqueries are supported, so all 22 are comparable.
+wins all 22 queries**, by 1.1x to 7.1x. That is the comparison Batcher's Arrow-only contract makes fair. q21 runs too, because correlated subqueries are supported, so all 22 are comparable.
 
-:::{warning}
+:::{note}
 **Against DuckDB on its own native compressed store, DuckDB is faster on 15 of 22**, geometric
-mean **≈1.40× in DuckDB's favor** (≈1.29× excluding q17, an 8× outlier). That is not a
-like-for-like execution comparison, because DuckDB decompresses its own format on the fly and never pays an Arrow ingest. It is the number you get from `duckdb` at a prompt, so it's published here. Batcher wins the scan-and-aggregate-dominated queries (q15 0.46×, q12 0.74×,
-q11 0.80×, q1/q9 0.88×) and loses the join- and subquery-heavy ones (q17 7.9×, q20 2.8×,
-q3 2.6×, q21 2.4×).
+mean about **1.40x in DuckDB's favor** (about 1.29x excluding q17, an 8x outlier). That comparison is not like-for-like: DuckDB decompresses its own format on the fly and never pays an Arrow ingest, which is the storage advantage an Arrow-only engine trades away by design. It is also the number you get from `duckdb` at a prompt, so it is published here. Batcher wins the scan-and-aggregate-dominated queries (q15 0.46x, q12 0.74x,
+q11 0.80x, q1 and q9 0.88x) and trails on the join- and subquery-heavy ones (q17 7.9x, q20 2.8x,
+q3 2.6x, q21 2.4x).
 :::
 
 :::{dropdown} Per-query ratios vs DuckDB
@@ -77,6 +76,10 @@ All 22 queries, measured 2026-07-18 on a release build, correctness-gated. The r
 | q21 | **0.53×** | 2.38× |
 | q22 | **0.78×** | 2.08× |
 | **total** | **22 of 22 won** | 7 of 22 won, geomean 1.40× |
+
+A later sweep in `benchmarks/BENCHMARK_RESULTS.md` puts the native-store standing at **8 of 22**,
+and takes **q17 from 8.69x to 1.49x** after the join work described below. The table above is the
+last full per-query publication, kept whole rather than edited row by row.
 :::
 
 :::{dropdown} Per-query ratios vs Daft (re-measured 2026-07-18)
@@ -155,7 +158,7 @@ no longer flying blind.
 
 ```bash
 python benchmarks/run.py --benchmark tpch --tier single --scale 1  # vs DuckDB / Polars
-python benchmarks/run.py --benchmark tpch --engines batcher,daft   # vs Daft (Ray Data has no SQL)
+python benchmarks/run.py --benchmark tpch --engines batcher,daft   # vs Daft
 ```
 
 ## See also

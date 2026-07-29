@@ -71,6 +71,114 @@ def columns_arg(columns: str | Sequence[str], *, what: str) -> list[str]:
     return cols
 
 
+def append_projections(
+    ds: Dataset, projections: dict[str, Any], sources: list[str], *, drop_original: bool
+) -> Dataset:
+    """Append derived columns, optionally dropping the columns they were derived from.
+
+    The tail every *featurizer* shares: it expands each source column into several derived
+    ones (`DateTimeFeaturizer` into calendar parts, `CyclicalEncoder` into sin/cos pairs,
+    `TextStatFeaturizer` into text statistics), and each then has to decide whether the
+    source survives. Written out per class it is the same three lines, which is what
+    `lint-duplication` is for.
+
+    Args:
+        ds: The dataset to extend.
+        projections: The derived ``{name: Expr}`` columns to append.
+        sources: The columns they were derived from.
+        drop_original: Remove `sources` after appending.
+
+    Returns:
+        A new lazy `Dataset` with the derived columns appended.
+    """
+    out = ds.with_columns(**projections)
+    return out.drop(*sources) if drop_original else out
+
+
+def column_arg(column: str, *, what: str) -> str:
+    """Normalize a single-column argument, rejecting the list form with the reason.
+
+    Most preprocessors take `columns` and accept either spelling, so reaching for
+    ``LabelEncoder(["label"])`` is the natural mistake — and it produced a `select()` error
+    about "column names, col(...) references, aliased expressions", from three layers away,
+    naming neither the preprocessor nor its argument. The single-column ones are single by
+    design, matching sklearn: `LabelEncoder` encodes *the target*, and `Tokenizer` tokenizes
+    *the text column*. So the fix is to say that, not to widen the signature.
+
+    Args:
+        column: The column name the caller passed.
+        what: The caller's class name, used in the error message.
+
+    Returns:
+        The column name unchanged.
+
+    Raises:
+        PlanError: If `column` is not a single string.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.preprocessors.base import column_arg
+            >>> column_arg("label", what="LabelEncoder")
+            'label'
+    """
+    if isinstance(column, str):
+        return column
+    raise PlanError(
+        f"{what} takes a single column name, got {type(column).__name__} {column!r}. "
+        f"It works on one column by design; use a separate {what} per column, or a "
+        f"preprocessor that takes a `columns` list (StandardScaler, OneHotEncoder, ...)."
+    )
+
+
+def require_column_kind(ds: Dataset, columns: list[str], *, what: str, kind: str) -> None:
+    """Reject a column whose Arrow type this preprocessor cannot use, before the engine does.
+
+    A calendar or text featurizer pointed at the wrong column is an ordinary slip in feature
+    engineering, and the engine's answer was a raw kernel message —
+    ``Compute error: Hour does not support: Float64``, ``string function Len expected a Utf8
+    argument, got Float64`` — that names an internal function and neither the preprocessor
+    nor the column. The schema already knows, and reading it costs no scan.
+
+    A **string** column passes the ``"temporal"`` check on purpose: it may hold parseable
+    timestamps, and the schema cannot tell. That case still yields nulls rather than an
+    error, which is why `DateTimeFeaturizer` documents it.
+
+    Args:
+        ds: The dataset being transformed.
+        columns: The columns to check.
+        what: The preprocessor class name, for the message.
+        kind: ``"temporal"`` or ``"string"``.
+
+    Raises:
+        PlanError: If a column's type cannot serve `kind`.
+    """
+    import pyarrow as pa
+
+    def _is_text(dtype: pa.DataType) -> bool:
+        return pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+
+    if kind == "temporal":
+        wanted = "a timestamp/date column (or a string of parseable timestamps)"
+        cast_to = "timestamp"
+    else:
+        wanted = "a string column"
+        cast_to = "string"
+
+    schema = ds.schema
+    for column in columns:
+        if column not in schema.names:
+            continue  # a missing column is the projection's error to report, not this one
+        dtype = schema.field(column).type
+        if _is_text(dtype) or (kind == "temporal" and pa.types.is_temporal(dtype)):
+            continue
+        raise PlanError(
+            f"{what} needs {wanted}, but {column!r} is {dtype}. Point it at the right column, "
+            f"or cast this one first: ds.with_columns({column}=bt.col({column!r})"
+            f".cast({cast_to!r}))."
+        )
+
+
 # The default ceiling on a learned category set. Every categorical encoder lowers to a
 # per-category `CASE` arm (ordinal/target) or a per-category output column (one-hot), so
 # the fitted cardinality is also the size of the resulting expression or schema. 1,000 is

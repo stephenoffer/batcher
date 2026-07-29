@@ -3,9 +3,10 @@
 The seam: this module is the *router*. It inspects a plan and picks the most
 bounded-memory way to yield its result, then drives the two paths that are pure plan
 shape — the breaker-free pipeline and the exact-size rebatcher. Strategies with their
-own retained state live beside it (`watermark`), as do the distributed
-(`distributed_stream`), map (`map_stream`), running-state (`core.streaming`), and
-out-of-core bucket (`dist.spill_breakers`) drivers it delegates to. Preference order:
+own retained state live beside it (`watermark`), as do their proof obligations (`union`)
+and the distributed (`distributed_stream`), map (`map_stream`), running-state
+(`core.streaming`), and out-of-core bucket (`dist.spill_breakers`) drivers it delegates
+to. Preference order:
 
 1. a breaker-free pipeline streams one source batch at a time (`_iter_streaming`);
 2. a top-level aggregate / distinct / top-N / limit over such a pipeline streams via
@@ -13,7 +14,12 @@ out-of-core bucket (`dist.spill_breakers`) drivers it delegates to. Preference o
 3. a top-level pipeline breaker (sort / join / window) over bounded sources streams
    from the out-of-core bucket pipeline in `dist.spill_breakers` — input consumed to
    disk, then the result yielded one bounded bucket at a time;
-4. anything else materializes via `_collect` and re-chunks.
+4. row-wise operators stacked above a breaker are peeled and re-applied per batch;
+5. anything else materializes via `_collect` and re-chunks.
+
+A top-level UNION ALL is decomposed *before* any of these (and before the distributed
+routes): each branch re-enters this router on its own, so it streams by whichever of the
+five suits it, and the driver ever holds one branch's one batch (`union`).
 
 An unbounded (streaming) source whose plan must materialize raises `PlanError`
 instead of hanging.
@@ -25,6 +31,8 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher.api.terminal.stream.rebatch import _rebatch_exact
+from batcher.api.terminal.stream.union import union_branch_sources, union_streams_branchwise
 from batcher.api.terminal.stream.watermark import stream_stream_join, stream_watermark_dedup
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -58,13 +66,14 @@ def _iter_batches(
     from batcher.plan.logical import (
         Aggregate,
         Distinct,
-        Filter,
         Limit,
-        Project,
         Sort,
+        Union,
         WatermarkDedup,
         WatermarkStreamJoin,
+        is_partition_independent,
         is_streamable,
+        remap_sources,
     )
 
     # `batch_size` is an *exact* output-granularity contract ("rebatch the output to
@@ -90,6 +99,26 @@ def _iter_batches(
             transport=transport,
         )
         yield from _rebatch_exact(raw, batch_size)
+        return
+
+    # UNION ALL is decomposed BEFORE the generic distributed-breaker route below, both
+    # single-node and distributed. `_distributed_union` runs each branch to a driver table
+    # and concatenates, so routing a union there materializes the whole result on the driver
+    # — exactly what streaming exists to avoid. Decomposing first sends each branch through
+    # this router on its own, where a branch that is itself a breaker takes the distributed
+    # bucket-at-a-time path and a breaker-free branch takes the fan-out scan. The driver then
+    # holds one branch's one bucket.
+    if isinstance(plan, Union) and union_streams_branchwise(plan, sources):
+        for branch, sid in union_branch_sources(plan):
+            yield from _iter_batches(
+                remap_sources(branch, -sid),
+                [sources[sid]],
+                branch.available_columns(),
+                None,
+                distributed=distributed,
+                num_workers=num_workers,
+                transport=transport,
+            )
         return
 
     # A distributed breaker streams its result off the workers one bucket at a time,
@@ -173,12 +202,14 @@ def _iter_batches(
             if isinstance(plan, Aggregate) and plan.watermark is not None:
                 from batcher.core.streaming import stream_windowed_aggregate
 
-                yield from stream_windowed_aggregate(plan, sources[0], batch_size)
+                yield from stream_windowed_aggregate(
+                    plan, sources[0], batch_size, projection=_pushdown(plan)
+                )
                 return
             from batcher.core.streaming import stream_aggregate, stream_distinct
 
             driver = stream_distinct if isinstance(plan, Distinct) else stream_aggregate
-            yield from driver(plan, sources[0], batch_size)
+            yield from driver(plan, sources[0], batch_size, projection=_pushdown(plan))
             return
         # Top-N (`head` over a sort) streams with memory bounded by N: keep only the
         # running best N rows.
@@ -191,7 +222,9 @@ def _iter_batches(
         ):
             from batcher.core.streaming import stream_topn
 
-            yield from stream_topn(plan.input, plan.n, sources[0], batch_size)
+            yield from stream_topn(
+                plan.input, plan.n, sources[0], batch_size, projection=_pushdown(plan)
+            )
             return
         # A plain `Limit` over a breaker-free pipeline streams and stops early.
         if (
@@ -201,7 +234,7 @@ def _iter_batches(
         ):
             from batcher.core.streaming import stream_limit
 
-            yield from stream_limit(plan, sources[0], batch_size)
+            yield from stream_limit(plan, sources[0], batch_size, projection=_pushdown(plan))
             return
 
     # Pipeline breakers (sort / join / window) over bounded sources stream their result
@@ -253,20 +286,28 @@ def _iter_batches(
             return
 
     # Row-wise operators stacked *above* a breaker — `group_by().agg().select()`, SQL
-    # `HAVING` (`Filter(Aggregate)`), a renamed aggregate output — matched none of the
-    # exact-shape branches above, because each of those tests the top node only. They
-    # therefore fell through to `_collect` and materialized the whole result, even though
-    # the breaker underneath already streams and `Project`/`Filter` are per-batch valid.
+    # `HAVING` (`Filter(Aggregate)`), a renamed aggregate output, `group_by().agg().explode()`
+    # — matched none of the exact-shape branches above, because each of those tests the top
+    # node only. They therefore fell through to `_collect` and materialized the whole result,
+    # even though the breaker underneath already streams and a row-wise op is per-batch valid.
     # Peel them, stream the breaker, and re-apply them to each emitted batch.
+    #
+    # The peelable set is `is_partition_independent`, not a hand-written tuple. That predicate
+    # is the neutral definition of "safe to run per batch", which is the exact property this
+    # re-application needs — and it already admitted `Unnest`/`Unpivot`/fraction-`Sample`
+    # while the tuple here listed only `Project`/`Filter`, so an `explode` or a `melt` above an
+    # aggregate materialized for no reason. Deferring to it also means a future row-wise node
+    # is peelable the moment it is classified once, rather than in two places that drift.
     #
     # `Limit` is deliberately NOT peeled, though `dist.spill._peel_to_breaker` does peel it:
     # that path re-applies to one materialized table, where a limit is well defined. Here the
     # re-application is per batch, and `LIMIT n` applied per batch would keep n rows from
     # EVERY batch instead of n overall. `Sort` is likewise not peeled — it is a breaker, not
-    # a row-wise op, and reordering per batch is not a global sort.
+    # a row-wise op, and reordering per batch is not a global sort. Neither is partition-
+    # independent, so the predicate excludes both without a special case.
     peeled: list[LogicalPlan] = []
     below: LogicalPlan = plan
-    while isinstance(below, (Project, Filter)):
+    while is_partition_independent(below):
         peeled.append(below)
         below = below.input
     if peeled:
@@ -310,8 +351,11 @@ def _apply_peeled(
 ) -> Iterator[pa.RecordBatch]:
     """Re-apply row-wise operators peeled from above a breaker to each streamed batch.
 
-    The caller guarantees every entry of `peeled` is row-wise (`Project`/`Filter`), which
-    is what makes per-batch application equal to whole-relation application.
+    The caller guarantees every entry of `peeled` is `is_partition_independent` — a
+    stateless, row-wise transform — which is exactly what makes per-batch application equal
+    to whole-relation application. That admits the row-multiplying reshapers (`Unnest`,
+    `Unpivot`) as well as `Project`/`Filter`: they hold no state, so a batch's output does
+    not depend on how the input was split.
 
     The chain is rebuilt over a `Scan(0)` and optimized **once**, not per batch. Kyber's
     `optimize` is plan-shaped work that does not depend on the data, so running it inside
@@ -342,27 +386,28 @@ def _apply_peeled(
                 yield b
 
 
-def _rebatch_exact(batches: Iterator[pa.RecordBatch], batch_size: int) -> Iterator[pa.RecordBatch]:
-    """Re-chunk a batch stream so every emitted batch holds exactly `batch_size` rows.
+def _pushdown(plan: LogicalPlan) -> list[str] | None:
+    """The columns source 0 must produce for `plan` — Kyber's answer, for a core driver.
 
-    `pyarrow`'s per-batch slicing / ``to_batches(max_chunksize=…)`` chunks each input
-    batch independently, so a stream of unevenly-sized engine batches leaks a short
-    batch at every boundary rather than at the end only. Buffering across boundaries and
-    cutting on the exact row count restores the "N rows per batch" contract: only the
-    final remainder is smaller. An empty input yields nothing (matching the unbatched
-    path, which emits no batch for an empty result).
+    The bounded-state drivers in `core.streaming` read the source directly, and every one of
+    them read it *whole*: a `group_by("user").sum("cents")` over a forty-column event decoded
+    thirty-eight columns per micro-batch and threw them away. `_iter_streaming` on the
+    neighbouring branch has always read through the pushdown; this is the same answer for the
+    branches that bypass it.
+
+    Computed over the plan the driver will actually execute, not over an optimized rewrite of
+    it, so the projection is exactly the set that plan's own IR references. Asking Kyber keeps
+    the decision in Kyber's lane; `core` only reads what it is handed.
+
+    Args:
+        plan: The logical plan the driver runs, rooted at the operator being streamed.
+
+    Returns:
+        The projection for source 0, or ``None`` when the plan does not narrow it.
     """
-    acc: pa.Table | None = None
-    for b in batches:
-        if b.num_rows == 0:
-            continue
-        t = pa.Table.from_batches([b])
-        acc = t if acc is None else pa.concat_tables([acc, t])
-        while acc.num_rows >= batch_size:
-            yield acc.slice(0, batch_size).combine_chunks().to_batches()[0]
-            acc = acc.slice(batch_size)
-    if acc is not None and acc.num_rows > 0:
-        yield from acc.combine_chunks().to_batches()
+    from batcher import kyber
+
+    return kyber.required_columns_per_source(plan).get(0)
 
 
 def _iter_streaming(
@@ -398,7 +443,13 @@ def _iter_streaming(
         def run_window(window_batches):
             return core.execute_with_udfs(resident, [InMemorySource(window_batches)])
 
-        yield from stream_windowed(source, run_window, target_rows, batch_size)
+        try:
+            yield from stream_windowed(source, run_window, target_rows, batch_size)
+        finally:
+            # `prebuild_factories` made this generator the models' owner, and `teardown_udf`
+            # declines a prebuilt instance for exactly that reason — so without this a
+            # streamed model held its GPU allocation for the life of the process.
+            core.release_prebuilt(resident)
         return
 
     # Relational (no UDF) breaker-free pipeline: optimize once, then stream micro-batches.

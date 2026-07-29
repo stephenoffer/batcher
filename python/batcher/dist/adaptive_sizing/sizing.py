@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -69,15 +70,22 @@ def _alpha() -> float:
 
 
 def _ema(hub: MetadataHub, namespace: str, key: str, value: float) -> None:
-    """Fold one observation into a per-signature EMA bucket ``{ema, n}``. Best-effort."""
+    """Fold one observation into a per-signature EMA bucket ``{ema, n}``. Best-effort.
+
+    Scoped to the machine class: every value stored here is a partition row count or a worker
+    pool size, chosen against the node's memory and cores. A partition sized for a 244 GiB
+    worker is an OOM on a 16 GiB one, and averaging the two teaches a size that is wrong on
+    both. An autoscaling group that mixes instance types is the ordinary case, not the exotic
+    one, so the scoping is on by default rather than a cluster-mode flag.
+    """
     if hub is None or value != value or value < 0.0:  # None hub / NaN / negative guard
         return
     try:
-        s = hub.get_keyed_param(namespace, key) or {}
+        s = hub.get_keyed_param(scoped(namespace), key) or {}
         prior = s.get("ema")
         a = _alpha()
         ema = float(value) if prior is None else a * float(value) + (1.0 - a) * float(prior)
-        hub.put_keyed_param(namespace, key, {"ema": ema, "n": int(s.get("n", 0)) + 1})
+        hub.put_keyed_param(scoped(namespace), key, {"ema": ema, "n": int(s.get("n", 0)) + 1})
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("dist", "fold sizing ema", exc)
         return
@@ -88,7 +96,7 @@ def _read_ema(hub: MetadataHub | None, namespace: str, key: str) -> float | None
     if hub is None:
         return None
     try:
-        s = hub.get_keyed_param(namespace, key) or {}
+        s = hub.get_keyed_param(scoped(namespace), key) or {}
     except Exception:  # pragma: no cover
         return None
     if int(s.get("n", 0)) < _MIN_SAMPLES or "ema" not in s:
@@ -251,7 +259,8 @@ def aggregate_reducer_count(agg, base_reducers: int) -> int:
         from batcher.kyber.signature import plan_signature
 
         rows = learned_signature_rows(default_hub(), plan_signature(agg))
-    except Exception:  # learning is best-effort; a miss keeps the default fan-out
+    except Exception as exc:  # learning is best-effort; a miss keeps the default fan-out
+        note_suppressed("dist", "read learned reducer count", exc)
         return base_reducers
     if rows is None or rows <= 0:
         return base_reducers
@@ -270,5 +279,6 @@ def record_aggregate_cardinality(agg, output_rows: int) -> None:
         from batcher.kyber import record_execution
 
         record_execution(default_hub(), agg, output_rows)
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("dist", "record aggregate cardinality", exc)
         return

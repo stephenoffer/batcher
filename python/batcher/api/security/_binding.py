@@ -15,7 +15,9 @@ decision is made — including the denial, which never produces a plan at all.
 
 from __future__ import annotations
 
-from batcher._internal.errors import AccessDeniedError
+import warnings
+
+from batcher._internal.errors import AccessDeniedError, SecurityWarning
 from batcher._internal.logging import get_logger
 from batcher.api.security._context import SecurityContext, current_security
 from batcher.governance import GovernanceEvent, Principal, enforce
@@ -104,9 +106,15 @@ def govern_scan(plan: LogicalPlan, source: Source) -> LogicalPlan:
     """
     ctx = current_security()
     if ctx is None:
+        _require_governed(source, reason="no security() block is active")
         return plan
     table = table_name(source)
     if not table:
+        # An in-memory table or a live stream: there is no durable name to write a policy
+        # about, so it cannot be governed. Strict mode refuses it rather than exempting it,
+        # which is the honest answer — silently passing it through is how an ungoverned
+        # read hides inside a governed pipeline.
+        _require_governed(source, reason="the source has no durable name to govern")
         return plan
     try:
         governed, events = enforce(plan, [table], ctx.principal, ctx.catalog)
@@ -116,3 +124,37 @@ def govern_scan(plan: LogicalPlan, source: Source) -> LogicalPlan:
     for event in events:
         _emit(ctx, event)
     return governed
+
+
+def _require_governed(source: Source, *, reason: str) -> None:
+    """Enforce `governance.mode` for a read that no policy covers.
+
+    ``off`` (the default) does nothing, so an existing deployment is untouched.
+    ``strict`` refuses. ``advisory`` warns and proceeds — and that middle setting is not
+    padding: it is the only way an operator can find every ungoverned read in a real
+    workload *before* switching to strict. Without it strict mode cannot be adopted
+    incrementally, and a security control nobody can adopt protects nobody.
+
+    Args:
+        source: The source being read, named in the message.
+        reason: Why this read is ungoverned.
+
+    Raises:
+        AccessDeniedError: Under ``strict``.
+    """
+    from batcher.config import active_config
+
+    mode = active_config().governance.mode
+    if mode == "off":
+        return
+    identity = getattr(source, "identity", lambda: "<unnamed>")()
+    message = f"Refusing an ungoverned read of {identity!r}: {reason}."
+    if mode == "strict":
+        raise AccessDeniedError(
+            message,
+            hint=(
+                "Wrap the read in `with bt.security(catalog, principal):`, or set "
+                "`governance.mode` to 'advisory' to warn instead of refusing."
+            ),
+        )
+    warnings.warn(f"{message} (governance.mode='advisory')", SecurityWarning, stacklevel=3)

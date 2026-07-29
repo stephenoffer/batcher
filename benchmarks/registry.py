@@ -47,7 +47,7 @@ def sql_case(query: str) -> CaseBuilder:
     The context exposes ``sql_runners()`` — a mapping of engine name to a
     pre-registered ``query -> pa.Table`` callable — so the standard suites
     (TPC-H / TPC-DS / ClickBench) express each query exactly once. Engines without a
-    SQL surface (PyArrow, Ray Data) are simply absent from the mapping and show as
+    SQL surface (such as PyArrow) are simply absent from the mapping and show as
     ``n/a``, never a wrong answer.
     """
 

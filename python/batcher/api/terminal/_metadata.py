@@ -219,6 +219,20 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
     HyperLogLog (~1% error) recorded through the same `SKETCH`-provenance channel as the
     post-run learner, so they can never answer an exact `count_distinct`. Best-effort: a
     failure here never affects the query result.
+
+    **`ephemeral` sources are skipped, and that is what makes the idempotence above true.**
+    An adaptive stage boundary hands the next stage its intermediate wrapped as an
+    in-memory source, and an in-memory source is keyed by object identity — so a stage
+    source's key is *new on every execution*. Nothing it recorded could ever be read again,
+    and three things followed from recording it anyway, each worse than the last: the
+    sketch was recomputed every run (TPC-H Q8 at sf10 re-sketched 807k rows per collect,
+    and 280M on the first); the learned store grew by one dead `obj:<id>` entry per
+    execution, without bound; and because a column absent from the store is by definition
+    "measured for the first time", `record_column_stats` bumped the learned **generation**
+    every single execution — which is the plan cache's key, so the cache never once hit and
+    every run re-planned from scratch (Q8 130 ms, Q2 50 ms, against DuckDB's 84 ms and
+    46 ms for the *whole query*). A statistic keyed by an identity that cannot recur is not
+    a statistic; it is a leak that also reports itself as news.
     """
     if hub is None:
         return
@@ -229,7 +243,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
         learned = kyber.load_learned_stats(hub)
         max_cells = active_config().optimizer.ndv_sketch_max_cells
         for src in sources:
-            if not getattr(src, "resident", False):
+            if not getattr(src, "resident", False) or getattr(src, "ephemeral", False):
                 continue
             source_key = source_stats_key(src)
             if source_key is None:
@@ -385,6 +399,12 @@ def learn_column_stats(
             source_key = source_stats_key(source) if source is not None else None
             if source_key is None:
                 continue  # unkeyable: cannot be told apart from another source's columns
+            # An adaptive stage boundary's intermediate is keyed by object identity and does
+            # not survive the execution, so everything sketched from it is written under a
+            # key no later query can name. See `seed_column_ndv` for the three costs that
+            # carries; this pass is the expensive one (KLL + Misra-Gries, ~56 ns a cell).
+            if getattr(source, "ephemeral", False):
+                continue
             known = set(kyber.columns_for(learned, kyber.AVG_BYTES_KEY, source_key))
             cols = [
                 c

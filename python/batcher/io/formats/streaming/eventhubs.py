@@ -25,6 +25,12 @@ from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
 __all__ = ["EventHubsSource"]
 
+#: How long the *first* partition of a poll waits for events. The partitions after it drain
+#: what has already arrived without waiting again — otherwise an idle eight-partition hub cost
+#: eight full waits per poll, serially, and the trigger cadence became `partitions x wait`.
+_FIRST_WAIT_SECONDS = 1.0
+_DRAIN_WAIT_SECONDS = 0.01
+
 
 def _as_bytes(value: Any) -> bytes | None:
     """Coerce an Event Hub field to the ``bytes`` the broker schema declares.
@@ -92,7 +98,7 @@ class EventHubsSource(BrokerSource):
 
     format_name = "eventhubs"
 
-    __slots__ = ("_client_obj", "_partitions")
+    __slots__ = ("_client_obj", "_consumers", "_partition_ids", "_partitions")
 
     def __init__(
         self,
@@ -115,6 +121,12 @@ class EventHubsSource(BrokerSource):
         )
         self._partitions = partitions
         self._client_obj: Any = None
+        # Per-partition AMQP consumers, kept across polls. See `_consumer`.
+        self._consumers: dict[int, Any] = {}
+        # The hub's partition ids, fetched once. `_poll` asked the service for them on
+        # *every* poll, a management round-trip per trigger for a value that changes only
+        # when the hub is rescaled.
+        self._partition_ids: list[int] | None = None
 
     def _client(self) -> Any:
         if self._client_obj is None:
@@ -129,8 +141,58 @@ class EventHubsSource(BrokerSource):
     def _discover_partitions(self) -> list[int]:
         if self._partitions is not None:
             return list(self._partitions)
+        if self._partition_ids is None:
+            client = self._client()
+            self._partition_ids = sorted(int(pid) for pid in client.get_partition_ids())
+        return list(self._partition_ids)
+
+    def _consumer(self, partition_id: int) -> Any:
+        """A partition-scoped consumer, opened once and reused across polls.
+
+        Opening one per poll and closing it in a `finally` fixed a leak (S7) at the cost of
+        a full AMQP link setup and teardown *per partition, per poll*. On a 100ms trigger
+        over an eight-partition hub that is eighty link negotiations a second before a
+        single event is read, and it also throws away the consumer's own prefetch — every
+        poll started with an empty local buffer.
+
+        Reuse is safe because the consumer's position advances with what it has delivered,
+        which is exactly the "resume strictly after" contract the checkpoint wants.
+        `_apply_seek` drops the cached consumer for a partition being repositioned, so a
+        recovery still rebuilds at the checkpointed offset.
+        """
+        consumer = self._consumers.get(partition_id)
+        if consumer is not None:
+            return consumer
         client = self._client()
-        return sorted(int(pid) for pid in client.get_partition_ids())
+        # Resume from the checkpointed offset when recovering this partition; otherwise the
+        # configured start. Without this the source always restarted from
+        # `starting_position`, silently replaying or skipping on every recovery — every
+        # other broker here (`kafka`, `kinesis`, `pulsar`) honors its checkpoint, and this
+        # one quietly did not. `seek` populates `_resume_from`; a live offset is exclusive,
+        # so the consumer resumes strictly after the last delivered event.
+        event_position = self._resume_from.get(partition_id, self._options["starting_position"])
+        consumer = client._create_consumer(
+            consumer_group=self._options["consumer_group"],
+            partition_id=str(partition_id),
+            event_position=event_position,
+            on_event_received=lambda *_: None,
+        )
+        self._consumers[partition_id] = consumer
+        return consumer
+
+    def _apply_seek(self, partition: int, token: Any) -> None:  # noqa: ARG002
+        """Drop this partition's cached consumer so the next poll reopens it at `token`.
+
+        The base records the position in `_resume_from`; a consumer already open is still
+        sitting at its old position, so without this a recovery would silently keep reading
+        from wherever the pre-crash consumer had got to.
+        """
+        consumer = self._consumers.pop(partition, None)
+        if consumer is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                consumer.close()
 
     def close(self) -> None:
         """Close the consumer client, releasing its AMQP connection and background threads.
@@ -139,40 +201,30 @@ class EventHubsSource(BrokerSource):
         consumer abandons the generator mid-stream — previously the AMQP link stayed open
         until garbage collection, which for a reference cycle never happens.
         """
+        import contextlib
+
+        consumers, self._consumers = self._consumers, {}
+        for consumer in consumers.values():
+            with contextlib.suppress(Exception):
+                consumer.close()
+        # Dropped before the call that releases it: a `close()` that raises used to leave the
+        # attribute set, so the second `close()` `iter_batches` guarantees from its `finally`
+        # re-closed a dead client and raised again over the original error.
         if self._client_obj is not None:
-            self._client_obj.close()
-            self._client_obj = None
+            client, self._client_obj = self._client_obj, None
+            client.close()
 
     def _poll(self) -> list[BrokerMessage] | None:
-        client = self._client()
         messages: list[BrokerMessage] = []
-        partitions = (
-            self._partitions
-            if self._partitions is not None
-            else [int(p) for p in client.get_partition_ids()]
-        )
-        for partition_id in partitions:
-            # Resume from the checkpointed offset when recovering this partition; otherwise the
-            # configured start. Without this the source always restarted from
-            # `starting_position`, silently replaying or skipping on every recovery — every
-            # other broker here (`kafka`, `kinesis`, `pulsar`) honors its checkpoint, and this
-            # one quietly did not. `seek` populates `_resume_from`; a live offset is exclusive,
-            # so the consumer resumes strictly after the last delivered event.
-            event_position = self._resume_from.get(partition_id, self._options["starting_position"])
-            consumer = client._create_consumer(
-                consumer_group=self._options["consumer_group"],
-                partition_id=str(partition_id),
-                event_position=event_position,
-                on_event_received=lambda *_: None,
+        # Only the first partition waits. The rest take whatever has already arrived, so an
+        # idle hub costs one wait per poll rather than one per partition — the serial loop
+        # made the effective trigger cadence `partitions x max_wait_time`, which on eight
+        # partitions was eight seconds of latency for a stream that had nothing to say.
+        for index, partition_id in enumerate(self._discover_partitions()):
+            consumer = self._consumer(partition_id)
+            wait = _FIRST_WAIT_SECONDS if index == 0 else _DRAIN_WAIT_SECONDS
+            events = consumer.receive_message_batch(
+                max_batch_size=self.poll_size, max_wait_time=wait
             )
-            # Each `_create_consumer` opens its own AMQP link. Without this `finally` a
-            # continuous stream leaked one consumer (a socket plus background threads) per
-            # partition on *every* poll — seconds apart, for the life of the query.
-            try:
-                events = consumer.receive_message_batch(
-                    max_batch_size=self.poll_size, max_wait_time=1.0
-                )
-                messages.extend(_event_to_message(ev, partition_id, self.topic) for ev in events)
-            finally:
-                consumer.close()
+            messages.extend(_event_to_message(ev, partition_id, self.topic) for ev in events)
         return messages

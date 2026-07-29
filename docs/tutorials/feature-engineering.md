@@ -1,7 +1,7 @@
 # Feature engineering with preprocessors
 
 Build a **model-ready feature matrix** from a raw table with Batcher's
-scikit-learn-style [preprocessors](../ml/preprocessors.md). You impute missing
+scikit-learn-style [preprocessors](../ml/preprocessors/index.md). You impute missing
 values, scale the numerics, encode a categorical, bin a continuous column, and compose
 the lot with `Chain`, fitting every step on the training split and replaying it on the
 test split with the *same* learned statistics. That last discipline is what keeps a
@@ -312,7 +312,7 @@ written once, and it is itself a `Preprocessor`, so it nests.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`stack;1.1em` Preprocessors guide
-:link: ../ml/preprocessors
+:link: ../ml/preprocessors/index
 :link-type: doc
 Every preprocessor there is, plus splitting, fuzzy dedup, and where the transforms run.
 :::

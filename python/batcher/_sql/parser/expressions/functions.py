@@ -8,6 +8,12 @@ translator instance (`tr`) as its first argument and recurses through `tr._scala
 
 from __future__ import annotations
 
+import math
+
+from sqlglot import expressions as exp
+
+from batcher._sql.parser.expressions.collections import collection_function
+from batcher._sql.parser.expressions.json import json_function
 from batcher._sql.parser.expressions.literals import (
     _DATE_PART,
     _EXTRACT_PART,
@@ -17,14 +23,40 @@ from batcher._sql.parser.expressions.literals import (
     _const_str_arg,
     _int_literal,
 )
-from batcher.plan.expr_ir import Cast, Expr, lit
+from batcher._sql.parser.expressions.maps import map_function, map_subscript
+from batcher._sql.parser.expressions.spark import spark_function
+from batcher._sql.parser.expressions.strings import string_function
+from batcher._sql.parser.expressions.temporal import datetime_pattern, temporal_function
+from batcher.plan.expr_ir import Cast, Expr, atan2, lit
+from batcher.plan.functions.temporal import current_date, make_date
+
+# sqlglot node names for the nullary constant functions → the literal they denote.
+_NULLARY_CONST = {
+    "Pi": lambda: lit(math.pi),
+    "CurrentDate": current_date,
+}
+
+# Typed sqlglot nodes of the shape `f(value, constant-string)`: the engine's method
+# takes the second operand as a Python `str` (a pattern, delimiter or comparison
+# string), not an expression. The value is the `.str` method and the role name used in
+# the rejection message when the argument is not a literal.
+_STR_CONST_ARG = {
+    "Split": ("split", "delimiter"),
+    "Levenshtein": ("levenshtein", "comparison string"),
+    "RegexpSplit": ("regexp_split", "pattern"),
+    "JarowinklerSimilarity": ("jaro_winkler_similarity", "comparison string"),
+    "JaroSimilarity": ("jaro_similarity", "comparison string"),
+}
 
 
 def _scalar_function(tr, node):
     """Map a SQL scalar function call to its `Expr` builder, or None."""
-    from sqlglot import expressions as exp
-
     name = type(node).__name__
+    if name in _NULLARY_CONST:
+        # `pi()` / `today()` — DuckDB spells them as nullary functions, and sqlglot has a
+        # typed node for each. There is nothing per-row to compute, so they lower to a
+        # literal at plan-build time (which also makes them constant-foldable downstream).
+        return _NULLARY_CONST[name]()
     if name == "Trunc" and node.args.get("decimals") is not None:
         # `trunc(x, n)` truncates to `n` decimal places; the one-arg `.trunc()`
         # ignores `n` and silently truncated to a whole number. Scale, truncate,
@@ -35,6 +67,15 @@ def _scalar_function(tr, node):
     if name in _UNARY_MATH:
         return getattr(tr._scalar(node.this), _UNARY_MATH[name])()
     if name in _UNARY_STR:
+        if name == "ToBinary" and node.args.get("format") is not None:
+            # DuckDB's `to_binary(s)` is a `0`/`1` *bit string*; Spark's
+            # `to_binary(s, charset)` is the encoded *bytes*. Same name, different
+            # function — so the two-argument form is refused rather than answered with
+            # the bit string, which is what it silently did.
+            raise NotImplementedError(
+                "to_binary(value, charset) is Spark's binary encoding, not DuckDB's "
+                "bit-string to_binary; the two-argument form is not supported"
+            )
         return getattr(tr._scalar(node.this).str, _UNARY_STR[name])()
     if name in _DATE_PART:
         return getattr(tr._scalar(node.this).dt, _DATE_PART[name])()
@@ -107,11 +148,74 @@ def _scalar_function(tr, node):
         pat = _const_str_arg(node.expression, f"{name.lower()}()")
         method = "ends_with" if name == "EndsWith" else "contains"
         return getattr(tr._scalar(node.this).str, method)(pat)
-    if name == "RegexpExtract":
-        pat = _const_str_arg(node.expression, "regexp_extract()", "pattern")
+    if name in _STR_CONST_ARG:
+        # `f(s, t)` where the engine's method takes `t` as a Python string, not an
+        # expression: `split`/`str_split`, the edit-distance metrics, and
+        # `regexp_extract_all`. Each already exists on `.str`; only the row was missing.
+        method, role = _STR_CONST_ARG[name]
+        text = _const_str_arg(node.expression, f"{name.lower()}()", role)
+        return getattr(tr._scalar(node.this).str, method)(text)
+    if name == "Translate":
+        # `translate(s, from, to)` — both character sets must be constants. sqlglot
+        # names the source set `from_`, not `expression`.
+        frm = _const_str_arg(node.args.get("from_"), "translate()", "source character set")
+        to = _const_str_arg(node.args.get("to"), "translate()", "target character set")
+        return tr._scalar(node.this).str.translate(frm, to)
+    if name == "TimeToStr":  # strftime(ts, fmt) / Spark date_format(ts, fmt)
+        raw = _const_str_arg(node.args.get("format"), "strftime()", "format")
+        pattern = datetime_pattern(raw)
+        if pattern is None:
+            raise NotImplementedError(f"datetime format {raw!r} is not supported")
+        return tr._scalar(node.this).dt.strftime(pattern)
+    if name == "TsOrDsToDate":
+        # Spark's implicit "this is a date" wrapper — `year('2016-07-30')` parses as
+        # `Year(TsOrDsToDate('2016-07-30'))`. With a format it is `to_date(s, fmt)`;
+        # without, it is a plain cast, which is what Spark means by it.
+        fmt = node.args.get("format")
+        value = tr._scalar(node.this)
+        if fmt is None:
+            return Cast(value, "date")
+        raw = _const_str_arg(fmt, "to_date()", "format")
+        pattern = datetime_pattern(raw)
+        if pattern is None:
+            raise NotImplementedError(f"datetime format {raw!r} is not supported")
+        return value.str.to_date(pattern)
+    if name == "TimeToUnix":
+        # `epoch(ts)` is DuckDB's *fractional* seconds since the epoch (a DOUBLE), not
+        # the whole seconds `.dt.epoch()` returns — `epoch('…:08.123456')` is
+        # `1709618828.123456`. Divide the microsecond count instead of truncating.
+        return tr._scalar(node.this).dt.epoch_us() / lit(1_000_000.0)
+    if name == "Atan2":
+        return atan2(tr._scalar(node.this), tr._scalar(node.expression))
+    if name == "DateFromParts":  # make_date(y, m, d)
+        return make_date(
+            tr._scalar(node.args["year"]),
+            tr._scalar(node.args["month"]),
+            tr._scalar(node.args["day"]),
+        )
+    if name == "SHA2":
+        # `sha256(s)` parses as SHA2 with a digest length; only 256 is implemented, so
+        # any other width is refused rather than silently answered with sha256.
+        width = node.args.get("length")
+        bits = _const_int_arg(width, "sha2(): digest length") if width is not None else 256
+        if bits != 256:
+            raise NotImplementedError(f"sha2 digest length {bits} is not supported (only 256)")
+        return tr._scalar(node.this).str.sha256()
+    if name == "ArrayIntersect":
+        # sqlglot gives both operands in `expressions` with no `this`.
+        operands = node.expressions
+        if len(operands) == 2:
+            return tr._scalar(operands[0]).list.intersect(tr._scalar(operands[1]))
+    if name in ("RegexpExtract", "RegexpExtractAll"):
+        # Both carry an optional capture-group index. `regexp_extract_all` used to drop
+        # it, so `regexp_extract_all('100-200', '(\\d+)-(\\d+)', 1)` collected the whole
+        # matches (`['100-200']`) where DuckDB collects the group (`['100']`).
+        label = "regexp_extract()" if name == "RegexpExtract" else "regexp_extract_all()"
+        pat = _const_str_arg(node.expression, label, "pattern")
         grp = node.args.get("group")
-        group = _const_int_arg(grp, "regexp_extract() capture group") if grp is not None else 0
-        return tr._scalar(node.this).str.regexp_extract(pat, group)
+        group = _const_int_arg(grp, f"{label} capture group") if grp is not None else 0
+        method = "regexp_extract" if name == "RegexpExtract" else "regexp_extract_all"
+        return getattr(tr._scalar(node.this).str, method)(pat, group)
     if name == "StrPosition":
         pat = node.args["substr"]
         if not isinstance(pat, exp.Literal) or not pat.is_string:
@@ -142,6 +246,20 @@ def _scalar_function(tr, node):
         if method is None:
             raise NotImplementedError(f"date_part field {args[0].this!r} is not supported")
         return getattr(tr._scalar(args[1]).dt, method)()
+    # Families that carry enough of their own dispatch to live in a module of their own.
+    # Each returns None for a name it does not serve, so the caller's "unknown function"
+    # error still names it.
+    for family in (
+        json_function,
+        temporal_function,
+        string_function,
+        collection_function,
+        spark_function,
+        map_function,
+    ):
+        built = family(tr, node)
+        if built is not None:
+            return built
     return None
 
 
@@ -162,25 +280,34 @@ _UNARY_ML = {
 }
 
 
-# Typed `Array*`/`SortArray` reduction nodes → `.list` method name.
+# Typed `Array*` reduction nodes → `.list` method name. `SortArray` is *not* here: it
+# carries a direction (`list_reverse_sort` parses as `SortArray(asc=False)`) that a bare
+# method name cannot express, and folding it in here sorted descending calls ascending.
 _LIST_REDUCE = {
     "ArrayMin": "min",
     "ArrayMax": "max",
     "ArraySum": "sum",
     "ArrayDistinct": "unique",
-    "SortArray": "sort",
 }
-# `list_*` functions that sqlglot parses as `Anonymous` → `.list` method name.
+# `list_*` functions that sqlglot parses as `Anonymous` → `.list` method name. DuckDB
+# spells every one of these `array_*` as well; `_list_anon_method` strips either prefix,
+# so the keys are the bare operation.
+#
+# `unique` is the trap: DuckDB's `list_unique` returns the **count** of distinct
+# elements, and `list_distinct` returns the distinct elements. Mapping both to the
+# distinct list returned a list where DuckDB returns an integer.
 _LIST_ANON = {
-    "list_sum": "sum",
-    "list_avg": "mean",
-    "list_mean": "mean",
-    "list_product": "product",
-    "list_reverse": "reverse",
-    "list_unique": "unique",
-    "list_count": "len",
-    "list_min": "min",
-    "list_max": "max",
+    "sum": "sum",
+    "avg": "mean",
+    "mean": "mean",
+    "product": "product",
+    "reverse": "reverse",
+    "unique": "n_unique",
+    "distinct": "unique",
+    "count": "len",
+    "length": "len",
+    "min": "min",
+    "max": "max",
 }
 
 # Two-argument vector functions → the binary `.list` method. Both DuckDB's canonical
@@ -219,20 +346,68 @@ _LIST_TYPED_BINARY = {
 
 def _list_function(tr, node):
     """List/array operations dispatched to the `.list` namespace, or None."""
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.ArraySize):  # array_length / len(list)
         return tr._scalar(node.this).list.len()
+    if isinstance(node, exp.ArrayContainsAll):  # array_has_all / arrays_contain_all
+        return tr._scalar(node.this).list.has_all(tr._scalar(node.expression))
+    if isinstance(node, exp.ArrayOverlaps):  # list_has_any / arrays_overlap
+        return tr._scalar(node.this).list.has_any(tr._scalar(node.expression))
+    if isinstance(node, exp.ArrayConcat):
+        # `list_concat`/`array_cat` — sqlglot puts the first operand in `this` and the
+        # rest in `expressions`, so a three-way concat folds left to right.
+        result = tr._scalar(node.this)
+        for operand in node.expressions:
+            result = result.list.concat(tr._scalar(operand))
+        return result
+    if isinstance(node, exp.Flatten):  # flatten(list-of-lists) — one level
+        return tr._scalar(node.this).list.flatten()
+    if isinstance(node, exp.ArraySort):  # array_sort(l) without a comparator
+        if node.expression is not None:
+            raise NotImplementedError("array_sort with a comparator is not supported")
+        return tr._scalar(node.this).list.sort()
+    if isinstance(node, exp.ArrayToString):  # array_join(l, sep) / list_aggr concat
+        sep = _const_str_arg(node.expression, "array_join()", "separator")
+        return tr._scalar(node.this).list.join(sep)
+    if isinstance(node, exp.ArrayPosition):
+        # Spark's `array_position(l, v)` is the 1-based index of `v`, 0 when absent —
+        # which is what `.list.position` returns.
+        return tr._scalar(node.this).list.position(_raw_value(node.expression))
+    if isinstance(node, exp.ArraySlice):
+        # `slice(l, start, length)`. SQL counts the start from 1 and `.list.slice` from
+        # 0, so the index is shifted; sqlglot names the second operand `end`, but Spark's
+        # is a *length*, so it passes through as the length rather than as an index.
+        # Getting either wrong returns a plausible window one element along.
+        start = _const_int_arg(node.args["start"], "slice(): start")
+        size = node.args.get("end")
+        length = _const_int_arg(size, "slice(): length") if size is not None else None
+        return tr._scalar(node.this).list.slice(start - 1, length)
     if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
         return tr._scalar(node.this).list.contains(_raw_value(node.expression))
-    if isinstance(node, exp.Bracket):  # a[i] — sqlglot already 0-bases the index
+    if isinstance(node, exp.Bracket):
+        # `a[i]`. sqlglot 0-bases the index for the dialects whose subscript is 1-based
+        # (duckdb, postgres) and leaves `offset` unset; where it cannot, it keeps the
+        # written index and records the base in `offset` — Spark's `element_at(a, 2)`
+        # becomes `Bracket(expressions=[2], offset=1)`. Ignoring `offset` made every such
+        # subscript return the *next* element: `element_at(array(1,2,3), 2)` answered 3.
         idxs = node.expressions
         if len(idxs) == 1 and not isinstance(idxs[0], exp.Slice):
-            return tr._scalar(node.this).list.get(int(idxs[0].name))
+            # A map subscript is the same node as a list one, so `maps` reads it first.
+            if (as_map := map_subscript(tr, node)) is not None:
+                return as_map
+            offset = int(node.args.get("offset") or 0)
+            return tr._scalar(node.this).list.get(int(idxs[0].name) - offset)
         return None  # slices (a[lo:hi]) not supported
     reduce = _LIST_REDUCE.get(type(node).__name__)
     if reduce is not None:
         return getattr(tr._scalar(node.this).list, reduce)()
+    if isinstance(node, exp.SortArray):
+        # `list_sort(l)` ascending; `list_reverse_sort(l)` descending — the latter
+        # parses as the same node with `asc=False`, which used to be dropped, so
+        # `list_reverse_sort` returned the ascending order.
+        sorted_list = tr._scalar(node.this).list.sort()
+        asc = node.args.get("asc")
+        descending = asc is not None and not _boolean_arg(asc)
+        return sorted_list.list.reverse() if descending else sorted_list
     # sqlglot promotes a few vector functions to typed nodes (two args in `this`/`expression`)
     # rather than `Anonymous`; dispatch them to the same binary `.list` methods.
     typed_binary = _LIST_TYPED_BINARY.get(type(node).__name__)
@@ -240,7 +415,7 @@ def _list_function(tr, node):
         return getattr(tr._scalar(node.this).list, typed_binary)(tr._scalar(node.expression))
     if isinstance(node, exp.Anonymous):
         name = node.name.lower()
-        method = _LIST_ANON.get(name)
+        method = _list_anon_method(name)
         if method is not None and node.expressions:
             return getattr(tr._scalar(node.expressions[0]).list, method)()
         binary = _LIST_BINARY_ANON.get(name)
@@ -251,10 +426,27 @@ def _list_function(tr, node):
     return None
 
 
+def _list_anon_method(name: str) -> str | None:
+    """The `.list` method for a `list_*`/`array_*` DuckDB spelling, or None.
+
+    DuckDB gives every list operation both prefixes; stripping either here keeps one
+    row per operation instead of two tables that can drift apart.
+    """
+    for prefix in ("list_", "array_"):
+        if name.startswith(prefix):
+            return _LIST_ANON.get(name.removeprefix(prefix))
+    return None
+
+
+def _boolean_arg(node) -> bool:
+    """The boolean a sqlglot `Boolean`/literal argument denotes."""
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    return str(node.this).lower() not in ("false", "0")
+
+
 def _raw_value(node):
     """The Python value of a literal node (for `.list.contains`)."""
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.Literal):
         raise NotImplementedError("list_contains requires a constant value")
     if node.is_string:
@@ -271,7 +463,6 @@ def _regexp_replace(tr, node) -> Expr:
     (replace-all) variant, and ``'i'``/``'s'``/``'c'`` map to an inline regex flag prefix
     (`_regexp_flags_prefix`). Previously the whole options arg was ignored, so
     ``regexp_replace(s, 'abc', 'X', 'i')`` matched case-sensitively (wrong vs DuckDB)."""
-    from sqlglot import expressions as exp
 
     from batcher._sql.parser.expressions.literals import _regexp_flags_prefix
 

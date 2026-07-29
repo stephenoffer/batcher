@@ -202,7 +202,7 @@ generalization to a new user and measuring memorization of an old one. See
 - [Window functions](../../user-guide/window-functions.md): frames, ranks, and lag/lead in full.
 - [Aggregations](../../user-guide/aggregations.md): the mergeable aggregate surface.
 - [Joins](../../user-guide/joins.md): left, anti, and cross joins, and what each one costs.
-- [Preprocessors](../../ml/preprocessors.md): `MultiHotEncoder` and the rest of the estimators.
+- [Preprocessors](../../ml/preprocessors/index.md): `MultiHotEncoder` and the rest of the estimators.
 - [Data loaders](../../ml/data-loaders.md): getting the finished rows into a training loop.
 - [ML API reference](../../api/ml.md): `ds.ml.train_test_split` and the `batcher.ml` estimators.
 - [Mergeable algebra](../../deep-dives/mergeable-algebra.md): why these aggregates give the

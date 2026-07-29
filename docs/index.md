@@ -2,12 +2,13 @@
 
 ```{raw} html
 <div class="bt-hero">
-  <p class="bt-hero-eyebrow">Any data &middot; Any AI workload &middot; Batch &amp; streaming</p>
-  <p class="bt-hero-tagline">One engine for every kind of data, and every kind of AI.</p>
+  <p class="bt-hero-eyebrow">Any data &middot; Any workload &middot; Batch &amp; streaming</p>
+  <p class="bt-hero-tagline">One engine for every kind of data, from SQL to models.</p>
   <p class="bt-hero-sub">
     Structured tables, unstructured text, images, audio, video. SQL, DataFrames, and
-    expressions. Batch jobs and live streams. Batcher runs all of it on a single
-    engine &mdash; from a laptop to a cluster &mdash; and tunes itself as the query runs.
+    expressions. Batch jobs and live streams, analytics and inference. Batcher runs all
+    of it on a single engine &mdash; from a laptop to a cluster &mdash; and tunes itself
+    as the query runs.
   </p>
   <p class="bt-hero-cta">
     <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
@@ -216,7 +217,7 @@ Batch inference, embeddings, and training data.
 S3, GCS, Azure, and Delta / Iceberg / Hudi.
 :::
 
-:::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from pandas / Polars / Spark
+:::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from pandas / Polars / Spark / SQL
 :link: migration/index
 :link-type: doc
 Translate the API you already know, side by side.
@@ -225,7 +226,7 @@ Translate the API you already know, side by side.
 :::{grid-item-card} {octicon}`meter;1.1em` Benchmarks
 :link: benchmarks/index
 :link-type: doc
-Correctness-gated numbers across every workload, including where Batcher still loses.
+Correctness-gated numbers across every workload, with the methodology behind each one.
 :::
 
 :::{grid-item-card} {octicon}`book;1.1em` Recipes
@@ -270,22 +271,21 @@ Each tool stops somewhere. Batcher aims at the whole range on one engine.
 <th>DuckDB</th>
 <th>Polars</th>
 <th>Spark</th>
-<th>Ray&nbsp;Data</th>
 </tr></thead><tbody>
-<tr><td>Runs in-process, no cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Sub-second small queries</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
-<tr><td>Scales to a cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="p">~</span></td></tr>
-<tr><td>SQL</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
-<tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Cross-query learned statistics</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td></tr>
-<tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Out-of-core spill</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Runs in-process, no cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Sub-second small queries</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Scales to a cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
+<tr><td>SQL</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Cross-query learned statistics</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
+<tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
+<tr><td>Out-of-core spill</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
 </tbody></table>
 <p class="bt-matrix-legend"><span class="y">✓</span> built-in &nbsp; <span class="p">~</span> partial or via an add-on &nbsp; <span class="n">—</span> not supported. A capability view, not a benchmark.</p>
 ```
@@ -301,23 +301,8 @@ on every engine, checks they return the identical result, and only then trusts t
 fast wrong answer is a bug, not a win. The gate earns its keep. On TPC-H q6 both Daft and
 Polars compute the wrong revenue, and the harness refuses to time them.
 
-These are the headline results. The full picture, including the shapes where Batcher is
-slower and the methodology behind every figure, is in {doc}`benchmarks/index`.
-
-### AI and multimodal: the widest margin
-
-Ten GPU workload families on 8×T4, real models, every one at least 2× Ray Data.
-
-![Horizontal bar chart of GPU throughput, Batcher against Ray Data on 8xT4 with real models and 100 percent output agreement. Text embeddings with sentence-transformers MiniLM is 47 times faster, audio feature extraction 12.5 times, LLM batch inference on gpt2 11.1 times, image generation by diffusion 8.6 times, training ingest 3 times, and ResNet-50 batch inference 2.05 times. A dashed line marks 1x parity.](_static/diagrams/gpu_speedup.svg)
-
-Decoding images into tensors beats **both** competitors: 2.4× Daft and 6.1× Ray Data. And on
-`map_batches(Model, num_gpus=1)` with no batch size given, Ray Data hard-errors where Batcher
-just runs.
-
-Stage-overlapped streaming is why. The CPU decode of the next morsel runs while the GPU
-forward of the current one is still in flight, so the device stays fed.
-
-![Two panels comparing a two-stage ResNet-50 pipeline before and after stage overlap, with the same result and the same order. Throughput rises from 942 to 2,504 images per second. GPU utilization rises from 30 percent to 81 percent of the device kept busy.](_static/diagrams/stage_overlap.svg)
+These are the headline results. The full picture, including the methodology behind every
+figure, is in {doc}`benchmarks/index`.
 
 ### Analytics: three suites, measured 2026-07-18
 
@@ -326,21 +311,44 @@ input**, so this compares execution rather than storage formats.
 
 | suite | vs DuckDB on the same Arrow |
 |---|---|
-| **TPC-H**, 22 comparable queries | **won 22 of 22**, 1.1× to 6.9× faster |
+| **TPC-H**, 22 comparable queries | **won 22 of 22**, 1.1x to 7.1x faster |
 | **ClickBench**, 43 queries | **won 42 of 43**, and 43/43 correct |
-| **Semi-structured JSON**, 5 queries | **won 5 of 5**, 3.5× to 12.7× faster |
+| **Semi-structured JSON**, 5 queries | **won 5 of 5**, 3.6x to 12.5x faster |
 | **Operator mix**, 11 kernels | **won 10 of 11** |
 
-Against Polars the JSON suite is **12× to 81× faster**, and Polars' SQL front-end cannot
+Against Polars the JSON suite is **11x to 100x faster**, and Polars' SQL front-end cannot
 express most of TPC-H at all (multi-table `FROM`, `EXISTS`, non-equi joins).
+
+Run TPC-H against DuckDB's own compressed store instead, where it decompresses as it scans and
+never pays an Arrow ingest, and DuckDB leads on the join-heavy queries. Both columns are
+published per query in {doc}`benchmarks/tpch`.
 
 Seven ClickBench queries return in about 0.2 ms because Kyber answers them from **metadata**,
 meaning footer statistics and sketches, rather than scanning at all. Those are excluded from
 the ranges above, so the headline reflects execution rather than planning.
 
-Reading data is where the gap to Ray Data is structural rather than incidental. Reading Parquet
-and summing a column is **20.8×**, CSV **14.3×**, and `count()` roughly **1,400×**, because the
-count comes from metadata rather than a scan.
+The same lazy control plane answers `count()` in **0.05 ms** after a chain of transformations,
+and reading 20M rows across 64 Parquet files and summing a column takes **72 ms**.
+
+### AI and multimodal
+
+Models are one workload family the engine runs, alongside the SQL, streaming, and lakehouse
+work above, and they run on the same operators and the same plan. Ten GPU workload families
+on 8xT4, real models, every run gated on prediction agreement. On every family where device
+utilization was sampled, the GPU holds at or above the 80% target:
+
+![Horizontal bar chart of sustained GPU utilization by workload family on 8xT4 with real models and 100 percent output agreement. Compute-bound ResNet-50 FP16 inference holds 100 percent at 4,707 images per second, a decode-heavy JPEG to ResNet pipeline 93.4 percent at 3,860, fractional GPU packing of EfficientNet-B0 89 percent at 6,764, zero-config inference with no batch size given 82 percent at 2,451, ResNet-50 batch inference 81 percent at 2,504, and image embeddings 80 percent at 2,502. A dashed line marks the 80 percent target.](_static/diagrams/gpu_utilization.svg)
+
+Throughput on the model workloads runs from **33,611 text/s** embedding with MiniLM and
+**38,546 clip/s** on audio feature extraction down to **169 img/s** on a diffusion model, and
+`iter_torch_batches` feeds a training loop at **1.06 M rows/s** zero-copy. Decoding JPEGs into
+tensors runs at 5,693 img/s, 2.4x Daft. `map_batches(Model, num_gpus=1)` with no batch size
+given picks a VRAM-safe default and lands within 2% of the hand-tuned path.
+
+Stage-overlapped streaming is what produces those utilization figures. The CPU decode of the
+next morsel runs while the GPU forward of the current one is still in flight.
+
+![Two panels comparing a two-stage ResNet-50 pipeline before and after stage overlap, with the same result and the same order. Throughput rises from 942 to 2,504 images per second. GPU utilization rises from 30 percent to 81 percent of the device kept busy.](_static/diagrams/stage_overlap.svg)
 
 ### Cluster against cluster
 
@@ -353,23 +361,24 @@ The mergeable algebra means the *same* operators run distributed. TPC-H sf10 q6 
 | Daft | 536 ms | ❌ wrong answer |
 | DuckDB (single-node, its best) | 457 ms | ✅ |
 
-**2.4× faster than Daft on equal hardware, and correct where Daft is not.**
+**2.4x faster than Daft on equal hardware, and correct where Daft is not.**
 
-**[Full benchmarks, methodology, and where Batcher loses](benchmarks/index.md)**
+**[Full benchmarks and methodology](benchmarks/index.md)**
 
 ### Why the wins happen
 
-None of this is tuning. Each speedup traces to a design choice you can read about in the
+None of this is tuning. Each result traces to a design choice you can read about in the
 [architecture guide](architecture/index.md).
 
-Batcher runs in-process and native over Arrow, with no task-scheduler or object-store hop
-per operation, so the fixed cost that dominates Ray Data's small and medium queries is
-never paid at all. That alone is most of the 50× to 450×.
+Batcher runs in-process and native over Arrow, with no task-scheduler or object-store hop per
+operation, so a small query pays almost no fixed cost before it starts doing real work. On the
+same input, that is what lets an execution engine win a suite outright rather than query by
+query.
 
 On the AI side, GPU inference loads a model once per session and overlaps CPU prep with the
-GPU forward pass, which is where the 2× to 47× comes from. And plans re-tune on measured
-cardinalities mid-query, so a bad estimate corrects itself rather than stalling or running
-out of memory.
+GPU forward pass, which is what holds the device at or above 80% utilization wherever it was
+sampled. And plans re-tune on measured cardinalities mid-query, so a bad estimate corrects
+itself rather than stalling or running out of memory.
 
 ## Where to start
 
@@ -377,8 +386,8 @@ The docs branch by what you are doing, not by what part of the engine you are to
 
 - **New here?** {doc}`getting-started/index` installs Batcher and runs a first query, then
   {doc}`getting-started/concepts/index` covers the one idea the rest of the API rests on.
-- **Porting something?** {doc}`migration/index` maps Spark, pandas, Polars, DuckDB, Ray
-  Data, and Daft verb by verb.
+- **Porting something?** {doc}`migration/index` maps Spark, pandas, Polars, and SQL verb by
+  verb, and proves the port returns the same rows.
 - **Building something specific?** {doc}`user-guide/index` is one page per capability, and
   {doc}`examples/index` is working code you can paste and change.
 - **Running a model?** {doc}`ml/index` covers inference, embeddings, retrieval, and feeding
@@ -396,6 +405,7 @@ If you would rather be handed an ordered reading list for your role, use
 getting-started/index
 tutorials/index
 examples/index
+cookbook/index
 learning-paths/index
 ```
 

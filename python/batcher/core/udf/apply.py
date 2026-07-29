@@ -18,7 +18,12 @@ from batcher._internal.mathx import ceil_div
 from batcher.config import active_config
 from batcher.core.udf import strategy as strat
 from batcher.core.udf.async_udf import is_async_udf, run_async_batches
-from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
+from batcher.core.udf.call import (
+    _check_declared_columns,
+    _coerce_udf_result,
+    _formatted,
+    _resilient_call,
+)
 from batcher.core.udf.lifecycle import build_udf_callable, teardown_udf
 from batcher.core.udf.resilience import wrap_resilient
 from batcher.plan.logical import MapBatches
@@ -76,7 +81,17 @@ def apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordBa
 
     When `op.batch_format` is not ``"pyarrow"``, each Arrow batch is converted to the
     requested framework object (numpy/pandas/torch) for the call and the result
-    converted back — the data plane stays Arrow, only the call is reframed."""
+    converted back — the data plane stays Arrow, only the call is reframed.
+
+    Every dispatch route funnels back through here, which is why the `output_columns`
+    declaration is checked at this one point rather than inside each of them."""
+    out = _dispatch_udf(current, op)
+    _check_declared_columns(out, op)
+    return out
+
+
+def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordBatch]:
+    """Route one stage to the async / GPU-autobatch / process / thread path and run it."""
     if not current:
         return current
     batches = current
@@ -184,8 +199,10 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
     try:
         call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
         if op.num_gpus > 0:
-            from batcher.ml.gpu import autocast_call
+            from batcher.ml.gpu import autocast_call, inference_mode_call
 
+            # Autograd off first (pure win, no numerics change), then half precision.
+            call = inference_mode_call(call)
             call = autocast_call(call)  # tensor-core half precision (no-op when off/CPU)
         # Retry a transient failure / bound a hung call BEFORE the error-budget bisection below,
         # so only a failure that survives every retry is charged against `max_errored_rows`.
@@ -263,7 +280,7 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
 
     Two things are taken from the streaming path rather than re-invented, so the same model
     behaves the same way whichever path a plan's shape routes it to. The **seed batch size** is
-    the model's learned VRAM-safe size (`stream._learned_gpu_cap`), not a hardcoded 256
+    the model's learned VRAM-safe size (`sizing.learned_gpu_cap`), not a hardcoded 256
     that cold-started the two paths differently and discarded what the last run measured; the
     hill-climb still moves from there. And the **dispatch width** is at least
     `stream._GPU_SOLO_PIPELINE_DEPTH`: a GPU stage resolves to ``num_workers == 1``, which left
@@ -271,12 +288,14 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
     batch's host-side tensorize and copy while the streaming path overlapped exactly that. The
     slots share one built model and one CUDA context, so this buys overlap, not a second load.
     """
-    from batcher.core.udf.stream import _GPU_SOLO_PIPELINE_DEPTH, _learned_gpu_cap
-    from batcher.ml.gpu import autocast_call
+    from batcher.core.udf.sizing import learned_gpu_cap
+    from batcher.core.udf.stream import _GPU_SOLO_PIPELINE_DEPTH
+    from batcher.ml.gpu import autocast_call, inference_mode_call
     from batcher.ml.inference import InferencePool
 
     fn = build_udf_callable(op.fn)
     call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
+    call = inference_mode_call(call)  # autograd off — frees the activation memory that caps batches
     call = autocast_call(call)  # tensor-core half precision (GPU stage; no-op when off/CPU)
     call = wrap_resilient(call, op)  # transient-retry / timeout, inside the OOM-halving pool
 
@@ -293,7 +312,7 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
     pool = InferencePool(
         lambda: worker,
         num_workers=max(op.num_workers, _GPU_SOLO_PIPELINE_DEPTH),
-        target_batch_rows=_learned_gpu_cap(op),
+        target_batch_rows=learned_gpu_cap(op),
         objective="throughput",
     )
     try:

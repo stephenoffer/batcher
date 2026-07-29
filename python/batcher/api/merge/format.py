@@ -46,7 +46,7 @@ def target_format(target: str, explicit: str | None = None) -> str:
     try:
         return detect_format(target, explicit)
     except FormatError:
-        pass
+        pass  # nothing at the target to sniff yet -> fall through to the extension probe
 
     fs = resolve_filesystem(target)
     try:

@@ -12,7 +12,8 @@ reads the partition straight from this server's store with no socket hop.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -22,7 +23,14 @@ from batcher._internal.native import engine
 if TYPE_CHECKING:
     from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
 
-__all__ = ["FlightShuffleServer", "ShuffleClient", "ShuffleTicket", "fetch"]
+__all__ = [
+    "FlightShuffleServer",
+    "ShuffleClient",
+    "ShuffleTicket",
+    "bytes_fetched",
+    "fetch",
+    "reset_bytes_fetched",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +42,23 @@ class ShuffleTicket:
     src_partition: int
     dst_partition: int
     epoch: int = 0
+    # The wire form, built once. An all-to-all shuffle has `workers²` tickets and every
+    # transport call re-formats the one it is passed — `gather_*` builds a fresh
+    # `[(addr, str(ticket))]` list per round — so the string was being rebuilt on the
+    # per-fetch path. Excluded from equality and repr: it is a rendering of the five
+    # fields above, never an independent part of the ticket's identity.
+    _wire: str = field(init=False, repr=False, compare=False, default="")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_wire",
+            f"{self.plan_id}/{self.stage_id}/{self.src_partition}/"
+            f"{self.dst_partition}/{self.epoch}",
+        )
 
     def __str__(self) -> str:
-        return (
-            f"{self.plan_id}/{self.stage_id}/{self.src_partition}/{self.dst_partition}/{self.epoch}"
-        )
+        return self._wire
 
 
 class FlightShuffleServer:
@@ -85,6 +105,11 @@ class FlightShuffleServer:
         # network hop. Against `bytes_published` this is the shuffle *locality* ratio: how
         # much data placement kept local (cheap) vs forced over the wire (the reducer fetches).
         self._bytes_served_locally = 0
+        # Both counters are read-modify-written from every publishing and fetching thread —
+        # a mapper publishes its buckets while a join reducer serves two gathers at once —
+        # so an unguarded `+=` silently loses bytes from the pair whose whole purpose is to
+        # measure how much data placement kept off the wire.
+        self._bytes_lock = threading.Lock()
 
     @property
     def addr(self) -> str:
@@ -94,7 +119,9 @@ class FlightShuffleServer:
     def publish(self, ticket: ShuffleTicket, batches: list[pa.RecordBatch]) -> None:
         """Expose `batches` under `ticket` for reducers to fetch."""
         batches = list(batches)
-        self._bytes_published += sum(b.nbytes for b in batches)
+        nbytes = sum(b.nbytes for b in batches)
+        with self._bytes_lock:
+            self._bytes_published += nbytes
         self._srv.publish(str(ticket), batches)
 
     @property
@@ -111,8 +138,33 @@ class FlightShuffleServer:
         """
         batches = self._srv.local_fetch(str(ticket))
         if batches is not None:
-            self._bytes_served_locally += sum(b.nbytes for b in batches)
+            self._add_local_bytes(batches)
         return batches
+
+    def _add_local_bytes(self, batches: list[pa.RecordBatch]) -> None:
+        """Charge `batches` to the off-network served total, under the counter lock."""
+        nbytes = sum(b.nbytes for b in batches)
+        with self._bytes_lock:
+            self._bytes_served_locally += nbytes
+
+    def locality_ratio(self) -> float:
+        """Fraction of this server's published bytes that were served without a network hop.
+
+        The *byte-weighted* companion to the session's fetch-count ratio. A reducer that
+        made nine tiny local fetches and one enormous remote one has a count ratio of 0.9
+        and moved almost all of its data over the wire, which is the case placement exists
+        to find — and the count ratio is precisely blind to it.
+
+        Returns:
+            The ratio in ``[0, 1]``; `1.0` before anything is published, by the same
+            convention as `locality_ratio` over an empty set of transfers.
+        """
+        with self._bytes_lock:
+            published = self._bytes_published
+            local = self._bytes_served_locally
+        if published <= 0:
+            return 1.0
+        return min(1.0, local / published)
 
     @property
     def bytes_served_locally(self) -> int:
@@ -132,7 +184,7 @@ class FlightShuffleServer:
         caller falls back to Flight (empty bucket / un-shm'd peer / shm off)."""
         batches = self._srv.shm_fetch(source_addr, str(ticket))
         if batches is not None:
-            self._bytes_served_locally += sum(b.nbytes for b in batches)
+            self._add_local_bytes(batches)
         return batches
 
     def clear_shared(self) -> None:
@@ -163,6 +215,21 @@ class FlightShuffleServer:
     def partition_count(self) -> int:
         """Partitions currently retained (telemetry / leak tests)."""
         return self._srv.partition_count
+
+    @property
+    def retained_bytes(self) -> int:
+        """Bytes this server's published partitions currently hold in memory.
+
+        The shuffle's resident footprint, measured by the store that holds it. Carbonite's
+        buffer pool does not account for it — a published partition is never *reserved*, it
+        is simply held until a reducer fetches it — which is why `PressureMonitor` has to
+        fall back to reading process RSS to see it at all, and why RSS cannot say how much
+        of a worker's footprint is shuffle output waiting to be collected.
+
+        `0` on an engine build without the counter, so a stale extension degrades to the
+        previous "invisible" behaviour rather than raising.
+        """
+        return int(getattr(self._srv, "retained_bytes", 0) or 0)
 
     def gather_combine(
         self,
@@ -317,12 +384,11 @@ class ShuffleClient:
 
         `token` is the shuffle auth secret presented to an auth-gated peer.
         """
-        global _BYTES_FETCHED
         if credits is None:
             batches = self._client.fetch(addr, str(ticket), token=token)
         else:
             batches = self._client.fetch(addr, str(ticket), credits, token)
-        _BYTES_FETCHED += sum(b.nbytes for b in batches)
+        _add_bytes_fetched(sum(b.nbytes for b in batches))
         return batches
 
     @property
@@ -332,6 +398,30 @@ class ShuffleClient:
 
 
 _BYTES_FETCHED = 0
+# The reducer-ingress counter is written from every fetching thread (a join reducer runs
+# two gathers at once, and each `gather_*` fans out further). `+=` on a module global is a
+# read-modify-write, so concurrent fetches silently lost bytes from the one figure that is
+# supposed to measure how much data actually crossed the wire.
+_BYTES_LOCK = threading.Lock()
+
+
+def _add_bytes_fetched(n: int) -> None:
+    """Fold `n` fetched bytes into the process-wide ingress counter."""
+    global _BYTES_FETCHED
+    with _BYTES_LOCK:
+        _BYTES_FETCHED += n
+
+
+def reset_bytes_fetched() -> None:
+    """Zero the process-wide shuffle-ingress counter.
+
+    A per-process lifetime total cannot answer "how much did *this query* fetch", which is
+    the question a benchmark and a per-query profile both ask. Zeroing at a known point and
+    reading `bytes_fetched()` after gives the delta.
+    """
+    global _BYTES_FETCHED
+    with _BYTES_LOCK:
+        _BYTES_FETCHED = 0
 
 
 def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[pa.RecordBatch]:
@@ -341,14 +431,13 @@ def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[
     fetches so the gRPC channel is reused. `credits` is the flow-control window
     Carbonite grants; `None` uses the engine's conservative default window.
     """
-    global _BYTES_FETCHED
     flight_fetch = engine().flight_fetch
     batches = (
         flight_fetch(addr, str(ticket))
         if credits is None
         else flight_fetch(addr, str(ticket), credits)
     )
-    _BYTES_FETCHED += sum(b.nbytes for b in batches)
+    _add_bytes_fetched(sum(b.nbytes for b in batches))
     return batches
 
 

@@ -13,9 +13,11 @@ If the query is *wrong*, stop: use `debug-a-batcher-query`. A fast wrong answer 
 
 ## 0. Rule out the trivial causes
 
-- **Are you on a release build?** A debug build is roughly 10x slower.
-  `just build-release` (`maturin develop --release`). The benchmark harness warns about
-  this automatically; nothing else does.
+- **Are you on a release build?** A debug build is roughly 10x slower. Ask the engine
+  rather than guessing: `bt.versions()["engine_profile"]` is `release` or `debug`, and
+  `bt.show_versions()` prints it. Fix with `just build-release`
+  (`maturin develop --release`). The benchmark harness refuses to run on a debug engine
+  at all, so a stray `just build` cannot produce a table of numbers that look real.
 - **Are you timing the plan or the work?** `Dataset` is lazy — transformations cost
   nothing and terminal ops cost everything. Time the terminal op.
 - **Is the wall clock dominated by a warm-up?** Time a second run too.

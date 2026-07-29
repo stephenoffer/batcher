@@ -47,11 +47,35 @@ def _is_throttle(exc: BaseException) -> bool:
     ``ClientError`` error code so the optional ``botocore`` need not be importable to
     recognize it.
     """
-    if type(exc).__name__ == "ProvisionedThroughputExceededException":
+    return _is_aws_error(exc, "ProvisionedThroughputExceededException")
+
+
+def _is_expired_iterator(exc: BaseException) -> bool:
+    """Whether `exc` is an expired Kinesis shard iterator.
+
+    A shard iterator is valid for five minutes. Any trigger interval longer than that — and
+    any shard that simply goes quiet while the query polls its siblings — outlives its
+    iterator, and the next `GetRecords` fails with `ExpiredIteratorException`. That is a
+    routine, expected condition on a long-cadence stream, and letting it escape killed the
+    whole query. The cure is to re-obtain the iterator from the last delivered sequence,
+    which is exactly what recovery does.
+    """
+    return _is_aws_error(exc, "ExpiredIteratorException")
+
+
+def _is_aws_error(exc: BaseException, name: str) -> bool:
+    """Match a boto exception by class name or by its `ClientError` error code.
+
+    Both spellings are needed and neither is sufficient: `boto3` synthesizes per-service
+    exception classes at runtime (so the class name matches) while a generic `ClientError`
+    carries only the code in its response. Matching by name rather than by `isinstance`
+    keeps the optional `botocore` out of the import path.
+    """
+    if type(exc).__name__ == name:
         return True
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
-        return response.get("Error", {}).get("Code") == "ProvisionedThroughputExceededException"
+        return response.get("Error", {}).get("Code") == name
     return False
 
 
@@ -59,6 +83,11 @@ def _is_throttle(exc: BaseException) -> bool:
 # with `InvalidArgumentException`. The engine's usual 16,384-row morsel is therefore not a
 # legal request here, so every poll is clamped to the API's ceiling.
 _GET_RECORDS_MAX_LIMIT = 10_000
+
+# Ceiling on concurrent `GetRecords` calls from one reader. A shard is rate-limited on its
+# own, so more threads than shards buys nothing; this only stops a thousand-shard stream from
+# opening a thousand sockets in one worker.
+_MAX_FETCH_THREADS = 16
 
 
 @SOURCES.register("kinesis")
@@ -76,7 +105,14 @@ class KinesisSource(BrokerSource):
 
     format_name = "kinesis"
 
-    __slots__ = ("_client_obj", "_closed", "_iterators", "_partitions", "_shard_ids")
+    __slots__ = (
+        "_client_obj",
+        "_closed",
+        "_iterators",
+        "_partitions",
+        "_pool_obj",
+        "_shard_ids",
+    )
 
     def __init__(
         self,
@@ -99,6 +135,8 @@ class KinesisSource(BrokerSource):
         self._client_obj: Any = None
         self._shard_ids: list[str] | None = None
         self._iterators: dict[str, str] = {}
+        # Lazily built; only a multi-shard reader ever needs it. See `_get_records`.
+        self._pool_obj: Any = None
         # Shards drained to their end (a `GetRecords` returning no `NextShardIterator`).
         # Their records already flowed through the children a reshard created, so they must
         # never be polled again — reusing their final iterator raises `ExpiredIterator`.
@@ -187,10 +225,16 @@ class KinesisSource(BrokerSource):
         (keyed by the stable shard number); the iterator is then obtained with
         ``AFTER_SEQUENCE_NUMBER`` so no record is replayed or skipped. Otherwise
         the configured ``iterator_type`` (``TRIM_HORIZON`` / ``LATEST``) applies.
+
+        The *live* position (`_positions`, updated after every poll) takes precedence over
+        the recovery position, because this is also the path that rebuilds an iterator that
+        expired mid-run. Falling back to `_resume_from` there would have re-read the whole
+        micro-batch history since the restart, and falling back to ``TRIM_HORIZON`` — which
+        is what an absent `_resume_from` means — would have replayed the entire shard.
         """
         if shard_id not in self._iterators:
             client = self._client()
-            resume = self._resume_from.get(shard_number)
+            resume = self._positions.get(shard_number, self._resume_from.get(shard_number))
             if resume is not None:
                 resp = client.get_shard_iterator(
                     StreamName=self.topic,
@@ -208,47 +252,124 @@ class KinesisSource(BrokerSource):
         return self._iterators[shard_id]
 
     def _poll(self) -> list[BrokerMessage] | None:
-        client = self._client()
+        shards = self._active_shards()
+        if not shards:
+            return []
+        responses = self._get_records(shards)
         messages: list[BrokerMessage] = []
-        for shard_number, shard_id in self._active_shards():
-            try:
-                resp = client.get_records(
-                    ShardIterator=self._iterator(shard_id, shard_number),
-                    Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
-                )
-            except Exception as exc:
-                if _is_throttle(exc):
-                    # Back-pressure on this shard: skip it for this poll (its iterator is
-                    # unchanged, so its records are read next poll) rather than failing the
-                    # whole query. No sleep here — the trigger cadence paces the retry, and a
-                    # blocking sleep would stall the loop's stop signal.
-                    continue
-                raise
-            next_iter = resp.get("NextShardIterator")
-            if next_iter is not None:
-                self._iterators[shard_id] = next_iter
-            else:
-                # No next iterator means this shard is closed and fully drained. Retire it:
-                # drop the now-invalid iterator and stop `_active_shards` from polling it,
-                # rather than reusing the stale token forever (an `ExpiredIterator` loop).
-                self._closed.add(shard_id)
-                self._iterators.pop(shard_id, None)
-            for rec in resp.get("Records", []):
-                ts = rec.get("ApproximateArrivalTimestamp")
-                messages.append(
-                    BrokerMessage(
-                        value=rec["Data"],
-                        partition=shard_number,
-                        offset=_seq_to_offset(rec["SequenceNumber"]),
-                        # The raw sequence is the resume token (the int64 offset is a
-                        # lossy hash); `AFTER_SEQUENCE_NUMBER` needs the exact string.
-                        resume_token=rec["SequenceNumber"],
-                        timestamp=int(ts.timestamp() * 1000) if ts is not None else 0,
-                        topic=self.topic,
-                        key=(rec.get("PartitionKey") or "").encode("utf-8") or None,
-                    )
-                )
+        for (shard_number, shard_id), resp in zip(shards, responses, strict=True):
+            if resp is None:
+                continue  # throttled or expired: retried on the next poll
+            self._advance(shard_id, resp)
+            messages.extend(self._decode(shard_number, resp))
         return messages
+
+    def _get_records(self, shards: list[tuple[int, str]]) -> list[dict | None]:
+        """One `GetRecords` per shard — concurrently when there is more than one.
+
+        This was a sequential loop, so a micro-batch on a 64-shard stream cost 64 serialized
+        HTTPS round-trips before a single row reached the plan. Latency scaled with the shard
+        count, which is exactly backwards: shards are the unit of parallelism, and Kinesis
+        rate-limits each one *independently*, so the calls have no reason to queue behind each
+        other. A botocore client is thread-safe, so the fan-out shares one client; results come
+        back positionally and every mutation of `_iterators` happens back on this thread.
+
+        Args:
+            shards: The ``(shard_number, shard_id)`` pairs to poll, in output order.
+
+        Returns:
+            One response per shard, positionally aligned; ``None`` where the shard was skipped
+            for back-pressure or a stale iterator.
+        """
+        if len(shards) == 1:
+            shard_number, shard_id = shards[0]
+            return [self._get_records_one(shard_number, shard_id)]
+        pool = self._pool(len(shards))
+        futures = [pool.submit(self._get_records_one, n, sid) for n, sid in shards]
+        return [f.result() for f in futures]
+
+    def _pool(self, shards: int) -> Any:
+        """The shared fetch pool, sized to the shards this reader owns."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self._pool_obj is None:
+            self._pool_obj = ThreadPoolExecutor(
+                max_workers=min(shards, _MAX_FETCH_THREADS),
+                thread_name_prefix="batcher-kinesis",
+            )
+        return self._pool_obj
+
+    def _get_records_one(self, shard_number: int, shard_id: str) -> dict | None:
+        """`GetRecords` for one shard, tolerating the two routine AWS refusals.
+
+        Back-pressure leaves the iterator untouched so the records are read next poll. An
+        *expired* iterator cannot be reused at all, so it is dropped: the next poll rebuilds
+        it with `AFTER_SEQUENCE_NUMBER` from the last delivered sequence, which resumes at
+        exactly the right place. Both used to escape and kill the query.
+        """
+        client = self._client()
+        try:
+            return client.get_records(  # type: ignore[no-any-return]
+                ShardIterator=self._iterator(shard_id, shard_number),
+                Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
+            )
+        except Exception as exc:
+            if _is_throttle(exc):
+                # Back-pressure on this shard: skip it for this poll (its iterator is
+                # unchanged, so its records are read next poll) rather than failing the
+                # whole query. No sleep here — the trigger cadence paces the retry, and a
+                # blocking sleep would stall the loop's stop signal.
+                return None
+            if _is_expired_iterator(exc):
+                self._iterators.pop(shard_id, None)
+                return None
+            raise
+
+    def _advance(self, shard_id: str, resp: dict) -> None:
+        """Carry the shard's iterator forward, or retire a shard that has been drained."""
+        next_iter = resp.get("NextShardIterator")
+        if next_iter is not None:
+            self._iterators[shard_id] = next_iter
+            return
+        # No next iterator means this shard is closed and fully drained. Retire it: drop the
+        # now-invalid iterator and stop `_active_shards` from polling it, rather than reusing
+        # the stale token forever (an `ExpiredIterator` loop).
+        self._closed.add(shard_id)
+        self._iterators.pop(shard_id, None)
+        # A shard closes for exactly one reason: a reshard replaced it with children. Those
+        # children are absent from the cached shard list, and the cache lives for the whole
+        # run — so retiring the parent without invalidating the cache made the reader go
+        # permanently quiet on the resharded key range. Every poll returned nothing, the
+        # empty-poll back-off made it look like an idle stream, and the records that flowed
+        # into the children were never read. Dropping the cache costs one `list_shards` per
+        # reshard, which is as rare as a reshard is.
+        self._shard_ids = None
+
+    def _decode(self, shard_number: int, resp: dict) -> list[BrokerMessage]:
+        """One shard's `GetRecords` response as broker messages."""
+        messages = []
+        for rec in resp.get("Records", []):
+            ts = rec.get("ApproximateArrivalTimestamp")
+            messages.append(
+                BrokerMessage(
+                    value=rec["Data"],
+                    partition=shard_number,
+                    offset=_seq_to_offset(rec["SequenceNumber"]),
+                    # The raw sequence is the resume token (the int64 offset is a
+                    # lossy hash); `AFTER_SEQUENCE_NUMBER` needs the exact string.
+                    resume_token=rec["SequenceNumber"],
+                    timestamp=int(ts.timestamp() * 1000) if ts is not None else 0,
+                    topic=self.topic,
+                    key=(rec.get("PartitionKey") or "").encode("utf-8") or None,
+                )
+            )
+        return messages
+
+    def close(self) -> None:
+        """Shut the fetch pool down; the boto client owns no socket worth closing here."""
+        if self._pool_obj is not None:
+            pool, self._pool_obj = self._pool_obj, None
+            pool.shutdown(wait=False)
 
 
 def _shard_number(shard_id: str) -> int:

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import sys
 
+from sqlglot import expressions as exp
+
 from batcher._internal.errors import PlanError
 from batcher._sql.parser import windowing
 from batcher._sql.parser.core_utils import (
@@ -26,8 +28,6 @@ def _filter_to_case(node):
     `COUNT(*) FILTER (WHERE c)` becomes `COUNT(CASE WHEN c THEN 1 END)` — counting
     the non-null CASE values is exactly counting the rows where `c` holds.
     """
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.Filter):
         return node
     agg = node.this.copy()
@@ -86,7 +86,12 @@ def _select(tr, node) -> Dataset:
     node = node.transform(_filter_to_case)
     # `agg(...) WITHIN GROUP (ORDER BY x)` → the ordinary aggregate over `x`, so the
     # ordered column is not silently dropped (the fraction was being read as it).
-    node = node.transform(_within_group_to_agg)
+    #
+    # `copy=False` because the tree is already exclusively ours: `transform` copies by
+    # default, so the call above detached it from any enclosing AST. Letting the second
+    # rewrite copy as well deep-copied the entire statement a second time, which measured
+    # as a sixth of the cost of translating a SELECT — for a tree nothing else can see.
+    node = node.transform(_within_group_to_agg, copy=False)
     # Sources that expose the same column name (a self-join, or two different tables
     # sharing a name) are rewritten so the alias-blind column resolver sees distinct,
     # uniquely-named columns.
@@ -230,8 +235,6 @@ def _qualify_windows(tr, ds: Dataset, qualify):
     Returns:
         The dataset with any window columns appended, and the rewritten predicate.
     """
-    from sqlglot import expressions as exp
-
     pred = qualify.this.copy()
     windows = list(pred.find_all(exp.Window))
     if not windows:
@@ -269,8 +272,6 @@ def _order(tr, ds: Dataset, order, projections=None) -> Dataset:
     # resolved the same way as any scalar — including aggregate outputs in a
     # grouped query (via `_scalar`'s aggregate-output resolution) — and the
     # 1-based positional form `ORDER BY <n>` referring to a SELECT item.
-    from sqlglot import expressions as exp
-
     keys: list = []
     desc: list[bool] = []
     nulls_first: list[bool] = []

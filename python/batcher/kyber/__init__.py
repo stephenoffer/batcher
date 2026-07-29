@@ -15,6 +15,7 @@ estimators, and join ordering land on top of this seam.
 
 from __future__ import annotations
 
+from batcher.kyber.correction import estimate_is_reliable
 from batcher.kyber.learning import (
     AVG_BYTES_KEY,
     MCV_KEY,
@@ -63,6 +64,7 @@ __all__ = [
     "answer_is_empty",
     "approx_count_distinct",
     "columns_for",
+    "estimate_is_reliable",
     "hot_join_values",
     "load_learned_stats",
     "optimize",

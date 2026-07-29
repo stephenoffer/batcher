@@ -48,6 +48,7 @@ from batcher.plan.schema import SchemaRef
 
 __all__ = [
     "factor_common_mul",
+    "fold_add_across_two_offsets",
     "fold_add_sub_constants",
     "fold_const_minus_sum",
     "fold_mul_constants",
@@ -191,6 +192,44 @@ def fold_add_sub_constants(node: LogicalPlan, _ctx: OptimizerContext) -> Logical
     whole chain in one pass; nested products (`x*3`) ride through untouched as `x`.
     """
     return _apply(node, _combine_add_sub)
+
+
+# --- fold_add_across_two_offsets --------------------------------------------
+
+
+def _combine_two_offsets(expr: Expr, int_cols: frozenset[str]) -> Expr:
+    """`(x + c1) + (y + c2)` → `(x + y) + (c1 + c2)`, both operands carrying a constant."""
+    if not (isinstance(expr, Binary) and expr.op == "add"):
+        return expr
+    left = _var_offset(expr.left, int_cols)
+    right = _var_offset(expr.right, int_cols)
+    if left is None or right is None:
+        return expr
+    (lv, lk), (rv, rk) = left, right
+    return _offset(Binary("add", lv, rv), lk + rk)
+
+
+@rule(name="fold_add_across_two_offsets", phase=Phase.NORMALIZE, matches=(Filter, Project))
+def fold_add_across_two_offsets(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Gather the constants from *both* sides of a sum: `(x + c1) + (y + c2) →
+    (x + y) + (c1 + c2)` (Spark's `ReorderAssociativeOperator`).
+
+    `fold_add_sub_constants` already collapses a chain nested down **one** side
+    (`(x + c1) + c2`), which is the shape a bottom-up rewrite produces. It cannot see this
+    one: neither operand is a bare literal, so there is nothing for it to match, and the
+    two constants stay one addition apart no matter how many fixpoint passes run. A
+    `SELECT (a + 1) + (b + 2)` therefore paid two additions per row forever.
+
+    Exact for the same reason its sibling is: the integers modulo ``2**64`` form a
+    commutative ring, and the engine's `add`/`sub` wrap rather than trapping, so
+    reassociating is exact **including across overflow**. Gated on the same
+    signed-integer guard, because float addition is not associative — `(x + 1e16) +
+    (y + 1)` and `(x + y) + 1e16 + 1` genuinely differ.
+
+    NULL is preserved: every operand still appears exactly once, so a null `x` or `y`
+    still nulls the result.
+    """
+    return _apply(node, _combine_two_offsets)
 
 
 # --- fold_mul_constants -----------------------------------------------------

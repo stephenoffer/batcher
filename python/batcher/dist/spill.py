@@ -112,6 +112,34 @@ def _make_store(work_dir: str) -> TieredSpillStore:
 _SPILL_INPUT_CHUNK_BYTES = 8 << 20  # 8 MiB
 
 
+def map_projection(plan: LogicalPlan, source_id: int) -> list[str] | None:
+    """The columns `source_id` must produce for `plan` — Kyber's answer, for a spill phase.
+
+    Every out-of-core partition phase reads its source through `_iter_spill_morsels`, and
+    every one of them read it *whole*: the `projection` parameter existed and no call site
+    ever passed one. Out-of-core is exactly where that costs the most, because the source
+    read is the dominant IO of a spilling aggregate, join, sort, or window, and a column the
+    plan never touches is decoded, chunked, hash-partitioned, compressed, written to disk,
+    and read back again.
+
+    Asked of the **breaker**, not of its map sub-plan. The sub-plan a partition phase
+    executes per morsel is often a bare `Scan`, which requires every column by definition —
+    what narrows the read is the operator above it (the aggregate's keys and arguments, the
+    sort's key and output, the join's keys and projection). Asking Kyber keeps the decision
+    in Kyber's lane.
+
+    Args:
+        plan: The breaker being spilled, rooted above the scan.
+        source_id: The scan whose projection is wanted.
+
+    Returns:
+        The projection for that source, or ``None`` when the plan does not narrow it.
+    """
+    from batcher import kyber
+
+    return kyber.required_columns_per_source(plan).get(source_id)
+
+
 def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
     """Yield `source`'s batches normalized to ~``_SPILL_INPUT_CHUNK_BYTES``.
 
@@ -275,6 +303,15 @@ def spill_collect(
         from batcher.dist.executors.partition_io import _apply_above
 
         return _apply_above(above, inner)
+    # A plan whose peeling reaches a bare `Scan` has no stateful operator, so there is no
+    # state to partition and nothing here can help it. The caller falls back to the
+    # in-memory path, which resolves the whole input — for a selective filter that is a
+    # poor trade (measured: `scan -> filter` returning ONE row from 1.5M resolved the whole
+    # input), but running the row-wise plan chunk-by-chunk over `_iter_spill_morsels`
+    # instead was tried and is *worse*: 644 MB of growth against 532 MB on a 6M-row parquet
+    # scan, because the per-chunk `execute_plan` dispatches and the morsel re-chunking cost
+    # more than one pass does. The bound for this shape has to come from a streaming source
+    # handoff at the FFI boundary, not from re-chunking on the Python side.
     return None
 
 
@@ -304,7 +341,7 @@ def execute_spilling_aggregate(
 
     try:
         # --- partition phase: stream source, partial-aggregate, spill by key ---
-        for batch in _iter_spill_morsels(source):
+        for batch in _iter_spill_morsels(source, map_projection(agg, source_id)):
             mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not mapped:
                 continue
@@ -358,6 +395,12 @@ def execute_spilling_aggregate(
             )
         return _empty_table(agg)
     finally:
+        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
+        # open (a partition phase abandoned by an exception) and deletes both tiers' files
+        # — the `rmtree` only ever reached the *local* one, so a failed query that had
+        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
+        # with nothing recording that they existed.
+        store.cleanup()
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -369,9 +412,18 @@ def _empty_table(agg: Aggregate) -> pa.Table:
     return empty_result_table(agg, names)
 
 
-# Max grace-recursion depth: a bucket that is still over budget after this many
-# secondary re-partitions is finalized as-is (a single dominant *group* cannot be
-# split by hashing the key, so deeper recursion would not shrink it).
+# Max grace-recursion depth. Past it, re-partitioning has stopped helping: a bucket still
+# over budget after this many secondary hashes is dominated by group state that *no* hash of
+# the group key can separate — every row of a group hashes together by construction. Such a
+# bucket is finalized in memory, and that is a genuine ceiling: a single group whose state
+# exceeds RAM cannot be reduced out of core by partitioning, because partitioning is the
+# only tool the mergeable algebra gives us here.
+#
+# Routing this case to `combine_finalize_spilling` was tried and reverted. It grace-partitions
+# by the same group key, so it cannot split what this recursion already could not: measured
+# over 86 buckets that reached the floor over budget, peak RSS was identical (716 MB either
+# way) and it added a re-read and re-write of every one. Lifting this ceiling needs a
+# per-group spillable state in `bc-runtime`, not another partitioning pass.
 _MAX_SPILL_RECURSION = 3
 _SUB_BUCKETS = 8
 # Cap on simultaneously-open spill files: the partition phase holds one writer per
@@ -404,9 +456,21 @@ def _reduce_agg_bucket(store, handle, gk, aj, nat, key_idx, n_keys, out, depth):
     # and OOM `combine_finalize`. `logical_nbytes` is the size `combine_finalize` actually pays.
     resident = handle.logical_nbytes or handle.nbytes
     if n_keys == 0 or resident <= bucket_max or depth >= _MAX_SPILL_RECURSION:
-        partials = store.read(handle)
+        # `read_reserved` accounts the resident footprint against the process-wide buffer
+        # pool for the duration of the read. Reading a bucket back is the one step of
+        # spilling that can undo it — the state went to disk because it did not fit — and
+        # nothing was checking the envelope before pulling it in again, so a concurrent
+        # query sizing its own state saw headroom this reduce was already using.
+        with store.read_reserved(handle) as stream:
+            partials = list(stream)
         if partials:
             out.append(nat.combine_finalize(gk, aj, partials))
+        # This bucket is finished, and every group key hashes to exactly one bucket, so
+        # nothing will read it again. Giving its disk back here bounds peak *scratch* to
+        # the buckets still outstanding rather than to the whole spilled state — the disk
+        # analogue of the credit window, and the difference between a PB-scale aggregate
+        # needing room for its largest bucket and needing room for all of them at once.
+        store.release(handle)
         return
 
     sub_writers: dict[int, object] = {}
@@ -423,6 +487,11 @@ def _reduce_agg_bucket(store, handle, gk, aj, nat, key_idx, n_keys, out, depth):
                 w.write(pb)
     for sb, w in sub_writers.items():
         sub_handles[sb] = w.close()
+    # The parent has been fully re-partitioned into the sub-buckets, so its own file is
+    # dead weight from here on — and it is the *largest* file in the recursion, since every
+    # sub-bucket is a fraction of it. Holding it while the sub-buckets are reduced is what
+    # makes grace recursion cost more disk at each level instead of the same.
+    store.release(handle)
     for sb in range(_SUB_BUCKETS):
         h = sub_handles.get(sb)
         if h is not None:

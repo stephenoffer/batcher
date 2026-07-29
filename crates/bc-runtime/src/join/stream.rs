@@ -115,10 +115,6 @@ impl BroadcastProbe {
         bloom_fp_rate: f64,
         bloom_min_build_rows: usize,
     ) -> Option<Self> {
-        if !is_probe_driven(join_type) {
-            return None;
-        }
-        let shape = KeyShape::of(build_keys)?;
         let build_rows = build_keys.first().map_or(0, |a| a.len());
         // A build past the cache-radix floor belongs on the partitioned path, whose
         // per-partition table stays cache-resident. Streaming would probe one flat table
@@ -129,6 +125,43 @@ impl BroadcastProbe {
         if build_rows > super::RADIX_MIN_BUILD_ROWS_BROADCAST {
             return None;
         }
+        Self::over_any_build(
+            build_keys,
+            join_type,
+            probe_rows,
+            bloom_fp_rate,
+            bloom_min_build_rows,
+        )
+    }
+
+    /// [`BroadcastProbe::new`] **without** the cache ceiling on the build side.
+    ///
+    /// The ceiling in `new` compares a flat probe against the *partitioned* join and is right
+    /// for that comparison: past L3, one shared table pays a cache miss per probe row where the
+    /// radix path keeps each partition resident.
+    ///
+    /// A caller that is **fusing an aggregate onto the probe** is not making that comparison.
+    /// Its alternative is not a partitioned probe, it is materializing the join's entire output
+    /// and taking a second pass over it to group — and that output is the largest thing in the
+    /// query. On the sf10 `lineitem ⋈ orders` group-by, declining here produced a 2.0 GB
+    /// intermediate and a separate 60M-row grouping pass; the cache misses a flat probe pays are
+    /// bounded by the build side, which is smaller than the output it avoids writing.
+    ///
+    /// So this is not "ignore the ceiling", it is "the ceiling answers a question this caller is
+    /// not asking". Everything else `new` checks — a probe-driven join type, a supported key
+    /// shape — still applies, and the table, the probe loop and the emitted rows are identical.
+    pub fn over_any_build(
+        build_keys: &[ArrayRef],
+        join_type: JoinType,
+        probe_rows: usize,
+        bloom_fp_rate: f64,
+        bloom_min_build_rows: usize,
+    ) -> Option<Self> {
+        if !is_probe_driven(join_type) {
+            return None;
+        }
+        let shape = KeyShape::of(build_keys)?;
+        let build_rows = build_keys.first().map_or(0, |a| a.len());
         let build_null = null_mask(build_keys, build_rows);
         let use_bloom = use_probe_bloom_with(build_rows, probe_rows, bloom_min_build_rows);
         // The build loop reads only the right side of a `JoinKeys`, so the left may be the

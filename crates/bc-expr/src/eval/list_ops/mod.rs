@@ -6,6 +6,7 @@
 //! keep `eval/` within its file-count limit.
 
 pub(crate) mod coerce;
+pub(crate) mod jaccard_str;
 pub(crate) mod list_hof;
 pub(crate) mod list_reduce;
 pub(crate) mod list_reshape;

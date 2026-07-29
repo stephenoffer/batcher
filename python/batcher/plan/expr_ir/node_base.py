@@ -104,16 +104,74 @@ def literal(*, key: str | None = None, omit_none: bool = False, default: Any = _
     return _make_field(_FieldSpec(_Kind.LITERAL, key, omit), default)
 
 
-def _encode(kind: _Kind, value: Any) -> Any:
-    if kind is _Kind.CHILD:
-        return value.to_ir()
-    if kind is _Kind.CHILDREN:
-        return [e.to_ir() for e in value]
-    if kind is _Kind.LITERAL:
+def _encode_child(value: Any) -> Any:
+    return value.to_ir()
+
+
+def _encode_children(value: Any) -> Any:
+    return [e.to_ir() for e in value]
+
+
+# `core` is this module's own dependency, so `Lit` cannot come in at module level — and it
+# was re-imported for every literal-valued field of every node lowered.
+_LIT: type | None = None
+
+
+def _encode_literal(value: Any) -> Any:
+    global _LIT
+    if _LIT is None:
         from batcher.plan.expr_ir.core import Lit
 
-        return Lit(value).to_ir()["value"]
-    return value  # SCALAR
+        _LIT = Lit
+    return _LIT(value).to_ir()["value"]
+
+
+# Per-kind encoder, resolved once when a class's wire plan is built. `SCALAR` maps to
+# `None`, the "emit the attribute unchanged" sentinel, so the overwhelmingly common
+# field kind costs a truth test rather than a function call.
+_ENCODERS: dict[_Kind, Any] = {
+    _Kind.CHILD: _encode_child,
+    _Kind.CHILDREN: _encode_children,
+    _Kind.LITERAL: _encode_literal,
+    _Kind.SCALAR: None,
+}
+
+# Class attributes holding a node class's precomputed shape: its serialization plan
+# (`_wire_plan`) and its sub-expression fields (`child_fields`).
+_PLAN_ATTR = "_ir_wire_plan"
+_CHILDREN_ATTR = "_ir_child_fields"
+
+
+def _wire_plan(cls: type) -> tuple[tuple[str, str, Any, bool, bool], ...]:
+    """`cls`'s serialization plan: ``(attr, ir_key, encoder, omit_none, omit_falsy)`` per field.
+
+    `to_ir` used to re-derive this on every node it serialized: `dataclasses.fields`
+    materializes a fresh tuple per call, each field's metadata mapping is then probed for
+    the wire spec, and the encoder is chosen by a chain of enum comparisons — all of it a
+    pure function of the *class*, recomputed per *instance*. Expression trees are built and
+    lowered constantly (every `select`, every optimizer re-lowering), so this is one of the
+    hottest loops in the control plane.
+
+    Resolving it once per class turns the per-node work into a walk over a flat tuple of
+    pre-resolved values. Stored on the class (not a module dict) so a class that is
+    garbage-collected takes its plan with it, and looked up through `cls.__dict__` so a
+    subclass never inherits its parent's plan.
+    """
+    plan = cls.__dict__.get(_PLAN_ATTR)
+    if plan is None:
+        plan = tuple(
+            (
+                f.name,
+                spec.ir_key or f.name,
+                _ENCODERS[spec.kind],
+                spec.omit is _Omit.IF_NONE,
+                spec.omit is _Omit.IF_FALSY,
+            )
+            for f in fields(cls)
+            if (spec := f.metadata.get(_META)) is not None
+        )
+        setattr(cls, _PLAN_ATTR, plan)
+    return plan
 
 
 class IRNode(Expr):
@@ -157,21 +215,18 @@ class IRNode(Expr):
         if cached is not None:
             return cached
         out: dict[str, Any] = {"e": self.tag}
-        for f in fields(self):
-            spec = f.metadata.get(_META)
-            if spec is None:
-                continue  # constructor-only field, not part of the wire shape
-            value = getattr(self, f.name)
-            if spec.omit is _Omit.IF_NONE and value is None:
+        for name, key, encode, omit_none, omit_falsy in _wire_plan(type(self)):
+            value = getattr(self, name)
+            if omit_none and value is None:
                 continue
-            if spec.omit is _Omit.IF_FALSY and not value:
+            if omit_falsy and not value:
                 continue
-            out[spec.ir_key or f.name] = _encode(spec.kind, value)
+            out[key] = value if encode is None else encode(value)
         self.__dict__["_ir_cache"] = out
         return out
 
 
-def child_fields(node: IRNode) -> list[tuple[str, bool]]:
+def child_fields(node: IRNode) -> tuple[tuple[str, bool], ...]:
     """The ``(field_name, is_list)`` of each sub-expression field of an `IRNode`.
 
     A generic view of a node's shape drawn from the same field metadata `to_ir` uses:
@@ -179,16 +234,23 @@ def child_fields(node: IRNode) -> list[tuple[str, bool]]:
     It lets a caller recurse into and rebuild an arbitrary node (via
     ``dataclasses.replace``) without a hand-written per-node visitor — used by the
     aggregate-expression splitter to swap aggregate leaves for column references.
+
+    Like `to_ir`'s wire plan, the shape is a property of the *class*, so it is resolved
+    once and cached on it. The generic walks in `expr_ir.walk` — column collection,
+    column remapping, the aggregate splitter — call this on every node of every
+    expression they visit, and each call otherwise rebuilt the field tuple and re-probed
+    every field's metadata to rediscover a fixed answer.
     """
-    out: list[tuple[str, bool]] = []
-    for f in fields(node):
-        spec = f.metadata.get(_META)
-        if spec is None:
-            continue
-        if spec.kind is _Kind.CHILD:
-            out.append((f.name, False))
-        elif spec.kind is _Kind.CHILDREN:
-            out.append((f.name, True))
+    cls = type(node)
+    out = cls.__dict__.get(_CHILDREN_ATTR)
+    if out is None:
+        out = tuple(
+            (f.name, spec.kind is _Kind.CHILDREN)
+            for f in fields(cls)
+            if (spec := f.metadata.get(_META)) is not None
+            and spec.kind in (_Kind.CHILD, _Kind.CHILDREN)
+        )
+        setattr(cls, _CHILDREN_ATTR, out)
     return out
 
 

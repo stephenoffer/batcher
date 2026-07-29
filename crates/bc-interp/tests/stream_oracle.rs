@@ -771,7 +771,72 @@ fn a_semi_join_with_a_huge_build_matches_the_oracle() {
                 "strategy":"hash"}}"#
         );
         assert_ordered(&json, &[left.clone(), right.clone()]);
+
+        // The same plan, with the caller willing to take it back. It must NOT be handed back:
+        // the probe side here is 5,000 rows against a 2.2M-row build, and what the materializing
+        // executor buys is a parallel *probe* — nothing, at this shape, against the cost of
+        // re-running the build. `spine_join_blocks_sharding` requires the probe to be the bigger
+        // half for exactly this reason.
+        let plan: RelOp = RelOp::from_json(&json).expect("plan");
+        let sources = [left.clone(), right.clone()];
+        let kept =
+            bc_interp::execute_streaming_parallel_or_hand_off(&plan, &sources, 4, 0, true, None);
+        assert!(
+            kept.is_ok(),
+            "{jt}: a tiny probe against a huge build buys nothing by being handed over, got \
+             {kept:?}"
+        );
     }
+}
+
+/// The hand-off fires when the shape is the one it was measured on: a **large probe** against a
+/// build too big for the per-morsel probe. There the streaming executor drains and concatenates
+/// the whole probe relation and runs the join, the gather and everything above it through a
+/// single pipeline, while the materializing executor partitions the probe across every core.
+///
+/// The default entry point must never do this — declining is opt-in, and a caller that has not
+/// opted in (it may have nowhere to hand the plan to) still gets an answer, not an error.
+#[test]
+fn a_large_probe_against_a_huge_build_is_handed_back_only_when_the_caller_asks() {
+    // Build: > 2.1M rows, so the per-morsel probe declines.
+    let n_build = 2_200_000usize;
+    let b_k: ArrayRef = Arc::new(Int64Array::from(
+        (0..n_build)
+            .map(|i| Some((i % 1000) as i64))
+            .collect::<Vec<_>>(),
+    ));
+    let build = vec![RecordBatch::try_from_iter(vec![("k", b_k)]).unwrap()];
+
+    // Probe: larger than the build, which is what makes spreading it worth the trade.
+    let n_probe = 3_000_000usize;
+    let p_k: ArrayRef = Arc::new(Int64Array::from(
+        (0..n_probe)
+            .map(|i| Some((i % 1000) as i64))
+            .collect::<Vec<_>>(),
+    ));
+    let probe = vec![RecordBatch::try_from_iter(vec![("k", p_k)]).unwrap()];
+    let sources = [probe, build];
+
+    let json = format!(
+        r#"{{"op":"hash_join","left":{SCAN},"right":{{"op":"scan","source_id":1}},
+            "left_keys":["k"],"right_keys":["k"],"join_type":"semi",
+            "output":[{{"side":"left","name":"k","alias":"k"}}],"strategy":"hash"}}"#
+    );
+    let plan: RelOp = RelOp::from_json(&json).expect("plan");
+
+    let handed_off =
+        bc_interp::execute_streaming_parallel_or_hand_off(&plan, &sources, 4, 0, true, None);
+    assert!(
+        matches!(
+            handed_off,
+            Err(bc_interp::InterpError::PreferMaterializing { .. })
+        ),
+        "opted in, this shape should be handed back, got {handed_off:?}"
+    );
+
+    // Not opted in: the same plan runs, and answers.
+    let ran = bc_interp::execute_streaming_parallel(&plan, &sources, 4, 0);
+    assert!(ran.is_ok(), "not opted in, it must still answer: {ran:?}");
 }
 
 // ---- a breaker ON THE PROBE SPINE: materialized in parallel, then treated as a leaf ---------

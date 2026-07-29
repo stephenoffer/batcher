@@ -25,6 +25,7 @@ from batcher.kyber.stats.selectivity.scalars import (
     _outside_bounds,
     _point_mass,
     comparison_col_side,
+    fraction_left_below_right,
 )
 from batcher.plan.expr_ir import (
     Binary,
@@ -293,6 +294,39 @@ def _date_part_range_selectivity(expr: Binary, op: str) -> float | None:
     return 1.0 - frac_le + eq  # ge
 
 
+def _column_pair_selectivity(
+    expr: Binary, op: str, cfg: CardinalityConfig, bounds: dict[str, tuple[Any, Any]]
+) -> float | None:
+    """`col OP col` selectivity, from both columns' bounds where they are known.
+
+    Returns None only when this is not a two-column comparison at all; a two-column one
+    always gets an answer, because the constant it would otherwise fall back to is both the
+    wrong constant and an incoherent one.
+
+    **Wrong constant.** `cfg.range_selectivity` (1/3) is Selinger's figure for `col OP
+    literal`, encoding "a range predicate is usually selective". That is a claim about
+    literals and does not transfer to comparing two columns. It also ignores statistics
+    already in hand: source footers carry exact bounds for every column from the first query
+    on. TPC-H q4 and q21 both filter `l_receiptdate > l_commitdate` over 6,001,215 `lineitem`
+    rows, and both were estimated at exactly 2,000,405 against an actual 3,793,296.
+
+    **Incoherent constant.** Giving 1/3 to `a < b` *and* 1/3 to `a >= b` makes the two sum
+    to 2/3, so one of a predicate and its complement must be wrong. With no bounds to work
+    from, `cfg.default_filter_selectivity` (0.5) is both the maximum-entropy answer and the
+    only one that keeps `sel(p) + sel(NOT p) = 1`.
+
+    Correlation is still not modelled, so this does not make such a predicate exact — two
+    dates a few days apart are far from independent. It gets the estimate onto the right side
+    of a half, and turns non-overlapping spans into the certainties they already are.
+    """
+    if not (isinstance(expr.left, Col) and isinstance(expr.right, Col)):
+        return None
+    p_lt = fraction_left_below_right(bounds.get(expr.left.name), bounds.get(expr.right.name))
+    if p_lt is None:
+        return cfg.default_filter_selectivity
+    return p_lt if op in ("lt", "le") else 1.0 - p_lt
+
+
 def _range_selectivity(
     expr: Binary,
     op: str,
@@ -322,7 +356,8 @@ def _range_selectivity(
         return date_part
     side = comparison_col_side(expr)
     if side is None:
-        return cfg.range_selectivity
+        pair = _column_pair_selectivity(expr, op, cfg, bounds)
+        return cfg.range_selectivity if pair is None else pair
     col, value, col_on_left = side
     x = _ordinal(value)
     if x is None:

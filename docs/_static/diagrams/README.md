@@ -53,7 +53,7 @@ not required to work on the documentation.
 
 ## Charts
 
-`gpu_speedup` and `stage_overlap` are charts rather than diagrams, so they answer to
+`gpu_utilization` and `stage_overlap` are charts rather than diagrams, so they answer to
 `.claude/rules/documentation.md`'s charts rule as well: every figure traces to a committed
 benchmark, named in the generating script's docstring, and the axes carry their units. Both
 were color-checked against each surface rather than eyeballed. The light "before" bar in
@@ -61,4 +61,4 @@ were color-checked against each surface rather than eyeballed. The light "before
 
 Current diagrams: `hub`, `lifecycle`, `mergeable`, `two_planes`, `layer_stack`,
 `data_flow`, `pipeline_breakers`, `carbonite_loop`, `adaptive_loop`, `transfer_modes`,
-`inference_stages`. Charts: `gpu_speedup`, `stage_overlap`.
+`inference_stages`. Charts: `gpu_utilization`, `stage_overlap`.

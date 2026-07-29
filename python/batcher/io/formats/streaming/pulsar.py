@@ -34,6 +34,19 @@ from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
 __all__ = ["PulsarSource"]
 
+#: How long a *drain* `receive` waits. Not zero: the Pulsar client reads ``0`` as "block
+#: until a message arrives", which would turn the drain into a hang on an idle topic. One
+#: millisecond is long enough to pick up anything already in the client's local queue and
+#: short enough that finding it empty costs nothing measurable.
+_DRAIN_TIMEOUT_MILLIS = 1
+
+#: Bits of a Pulsar ``MessageId``'s entry id preserved in the int64 ``offset`` column.
+#: Twenty was too few: a BookKeeper ledger routinely holds far more than a million entries,
+#: and past that the entry id wrapped, so two different messages in one ledger folded to the
+#: same offset — silently breaking the ordering and de-duplication the column exists for.
+#: Thirty-two leaves 31 bits for the ledger id, which stays inside int64.
+_ENTRY_ID_BITS = 32
+
 
 def _import_pulsar() -> Any:
     """Import the ``pulsar`` client module or raise a guiding ``BackendError``."""
@@ -111,15 +124,23 @@ class PulsarSource(BrokerSource):
         return [f"{self.topic}-partition-{p}" for p in self._partitions]
 
     def _client(self) -> Any:
+        """The live consumer, built on first use.
+
+        The import is inside the construction branch, not above it. `_client()` runs on every
+        poll and every commit, and `_import_pulsar` was re-entering the import machinery each
+        time — a module-cache lookup plus a try/except on the latency-critical path, for a
+        module the already-built consumer proves is present.
+        """
+        if self._consumer is not None:
+            return self._consumer
         pulsar = _import_pulsar()
         if self._client_obj is None:
             self._client_obj = pulsar.Client(self._options["service_url"])
-        if self._consumer is None:
-            self._consumer = self._client_obj.subscribe(
-                self._topic_names(),
-                subscription_name=self._options["subscription"],
-                consumer_type=pulsar.ConsumerType.Shared,
-            )
+        self._consumer = self._client_obj.subscribe(
+            self._topic_names(),
+            subscription_name=self._options["subscription"],
+            consumer_type=pulsar.ConsumerType.Shared,
+        )
         return self._consumer
 
     def _discover_partitions(self) -> list[int]:
@@ -132,9 +153,17 @@ class PulsarSource(BrokerSource):
         consumer = self._client()
         messages: list[BrokerMessage] = []
         raw: list[Any] = []
-        for _ in range(self.poll_size):
+        # Wait out `receive_timeout_millis` for the *first* message only, then drain what the
+        # client has already buffered with a near-zero timeout. Charging every `receive` the
+        # full timeout meant the last one — the one that finds the queue empty and ends the
+        # drain — cost a full second on *every* poll, so a topic delivering ten messages a
+        # trigger paid a fixed second of latency to notice it had run out. That is the same
+        # shape as the Kafka `consume()` trap, and it hid in the same place: a loop that looks
+        # like it is reading is in fact mostly waiting to be told there is nothing left.
+        for i in range(self.poll_size):
             try:
-                msg = consumer.receive(timeout_millis=self._receive_timeout_millis)
+                timeout = self._receive_timeout_millis if i == 0 else _DRAIN_TIMEOUT_MILLIS
+                msg = consumer.receive(timeout_millis=timeout)
             except pulsar.Timeout:
                 break
             raw.append(msg)
@@ -176,27 +205,71 @@ class PulsarSource(BrokerSource):
             consumer.acknowledge(msg)
         self._unacked = []
 
+    def seek(self, position: dict) -> None:
+        """Resume from a checkpoint, refusing an ambiguous multi-partition one.
+
+        A Pulsar seek is per *consumer*, and one consumer here can span several partitions.
+        The base `seek` walks the checkpoint partition by partition, so a multi-partition
+        checkpoint issued one seek per entry and the last one silently won: every other
+        partition resumed at a position belonging to a different partition, replaying or
+        skipping records with nothing to show for it. Recovery that quietly loses data is
+        worse than recovery that refuses, so this names the condition and the fix.
+
+        Args:
+            position: The checkpointed ``{"offsets": {partition: token}}`` mapping.
+
+        Raises:
+            PlanError: If the checkpoint carries distinct positions for more than one
+                partition while this consumer covers them all at once.
+        """
+        offsets = position.get("offsets", {})
+        if len(offsets) > 1 and (self._partitions is None or len(self._partitions) > 1):
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"cannot resume Pulsar topic {self.topic!r}: a Pulsar seek repositions the "
+                f"whole consumer, but the checkpoint carries {len(offsets)} distinct "
+                "partition positions. Read the topic with one split per partition (a "
+                "distributed or partitioned read) so each partition seeks its own consumer."
+            )
+        super().seek(position)
+
     def _apply_seek(self, partition: int, token: Any) -> None:  # noqa: ARG002
         """Reposition the consumer to a checkpointed `MessageId`.
 
         Without this the base `_apply_seek` was a no-op, so `seek` recorded a position that
         nothing ever applied: a restart resumed from wherever the *subscription* happened to
         sit, silently ignoring the checkpoint and replaying or skipping accordingly. Pulsar
-        seeks are per-consumer rather than per-partition, and this source's consumer is scoped
-        to the partitions it was constructed with, so the partition id is implicit.
+        seeks are per-consumer rather than per-partition, and `seek` above guarantees this
+        consumer covers exactly one checkpointed partition, so the partition id is implicit.
         """
         message_id = _deserialize_message_id(token)
         if message_id is not None:
             self._client().seek(message_id)
+        # A seek invalidates everything polled but not yet acknowledged: those messages are
+        # about to be delivered again from the new position, and acking the stale handles
+        # would acknowledge records the engine never published.
+        self._unacked = []
 
     def close(self) -> None:
-        """Close the consumer and client, releasing their sockets and background threads."""
-        if self._consumer is not None:
-            self._consumer.close()
-            self._consumer = None
-        if self._client_obj is not None:
-            self._client_obj.close()
-            self._client_obj = None
+        """Close the consumer and client, releasing their sockets and background threads.
+
+        Each handle is dropped *before* the call that releases it. A `close()` that raises
+        (a broker already gone, a client whose IO threads have died) used to leave the
+        attribute set, so the next `close()` — and `iter_batches` guarantees one from its
+        `finally` — re-closed a dead handle and raised again, masking the original error.
+        The client is closed even when the consumer's close fails, so a half-failed shutdown
+        cannot strand the client's background threads.
+        """
+        consumer, self._consumer = self._consumer, None
+        client, self._client_obj = self._client_obj, None
+        self._unacked = []
+        try:
+            if consumer is not None:
+                consumer.close()
+        finally:
+            if client is not None:
+                client.close()
 
 
 def _message_id_to_offset(message_id: Any) -> int:
@@ -208,7 +281,8 @@ def _message_id_to_offset(message_id: Any) -> int:
     try:
         ledger = int(message_id.ledger_id())
         entry = int(message_id.entry_id())
-        return ((ledger << 20) | (entry & 0xFFFFF)) % (1 << 63)
+        mask = (1 << _ENTRY_ID_BITS) - 1
+        return ((ledger << _ENTRY_ID_BITS) | (entry & mask)) % (1 << 63)
     except (AttributeError, ValueError):
         return _stable_offset(str(message_id))
 

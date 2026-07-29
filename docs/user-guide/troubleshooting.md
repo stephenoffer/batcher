@@ -5,6 +5,25 @@ from the same few causes: a column that does not exist, a string passed where an
 expression belongs, or a method that lives somewhere other than where you remembered
 it.
 
+## Start from the symptom
+
+If your problem is not an exception message, find the row that matches what you are seeing
+and follow it. The rest of this page covers the exceptions themselves.
+
+| Symptom | Read this |
+|---|---|
+| Nothing ran, or the result is a `Dataset` repr | "Nothing happened when I called a transformation", below |
+| The answer is wrong | {doc}`explain-plans`, then {doc}`data-quality` to assert what you expected |
+| Correct, but too slow | {doc}`performance`, then {doc}`../tutorials/optimizing-a-slow-query` |
+| A query is taking far too long and you want it to stop | "Stopping a query that is taking too long", below |
+| Out of memory | "A large query runs out of memory", below, and {doc}`../deep-dives/spilling` |
+| The same query keeps recomputing | {doc}`caching` |
+| A file will not read, or the schema disagrees across files | {doc}`reading-data` and {doc}`type-system` |
+| Credentials or an object-store path fail | {doc}`cloud-storage` and {doc}`secrets` |
+| A write failed, or two writers collided | {doc}`writing-data` and {doc}`lakehouse` |
+| A distributed run hangs, or a worker died | {doc}`../architecture/fault-tolerance` and {doc}`../integrations/ray` |
+| You want to know what the engine actually did | {doc}`observability` |
+
 ```python
 import batcher as bt
 
@@ -155,6 +174,36 @@ reachable as `bt.<Name>`:
 Because several also subclass a builtin, existing `except ValueError` /
 `except ImportError` handlers keep working unchanged.
 
+## Stopping a query that is taking too long
+
+Ctrl-C during a long `collect()` stops it. That is worth stating because it did not always: the engine releases the interpreter lock while it runs, so Python had no opportunity to deliver the signal until the query finished on its own, and Ctrl-C appeared to do nothing.
+
+Cancellation is *cooperative*. The engine checks between morsels, between operators, and between the merge passes of a spilling sort, so a query stops at the next such point rather than instantly. A query part-way through building a join's hash table stops when that build completes. A cancelled query raises `QueryCancelledError`; it never returns a partial result, because rows that look complete and are not are worse than an error.
+
+To stop a query from somewhere other than the keyboard, such as another thread or a notebook cell, list what is running and cancel by id:
+
+```python
+import batcher as bt
+
+print(bt.running_queries())
+# []
+```
+
+Each terminal operation registers one id for its duration, so `running_queries()` is empty between queries. From a second thread, `bt.cancel_query(query_id)` asks that one to stop and returns whether it was still running:
+
+```python
+import batcher as bt
+
+print(bt.cancel_query("q-already-finished"))
+# False
+```
+
+`False` means the query had already finished. That is not an error: a cancel and a completion racing has no correct loser.
+
+```{note}
+This covers a query running in *this* process. On a distributed run the driver cancels its own execution and the Ray tasks it launched, but there is no cluster-wide admission queue to cancel a query queued on another driver.
+```
+
 ## A large query runs out of memory
 
 Stateful operators hold state in memory by default. Pass `spill=True` to let
@@ -169,8 +218,18 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 
 ## See also
 
+- [Explain plans](explain-plans.md): the first thing to read when the answer or the
+  runtime surprises you, and how to tell whether a predicate reached the scan.
 - [Performance and memory](performance.md): caching, spill tuning, reading a query
   plan.
+- [Exceptions API](../api/exceptions.md): the reference for every type in the table above,
+  including the attributes they carry.
+- [Data quality](data-quality.md): turn "the answer looks wrong" into an assertion that
+  fails loudly, with the offending rows quarantined.
+- [Observability](observability.md): the event stream, the progress reporter, and
+  `bt.start_ui()` for watching a running query.
+- [Spilling](../deep-dives/spilling.md): what `spill=True` actually does, and why a spilled
+  query gets slower rather than dying.
 - [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing a
   failed task, shuffle, or node.
 - [Configuration options](../configuration/options.md): every tunable and its default.

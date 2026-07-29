@@ -187,13 +187,13 @@ this pass is worth doing, which is the only scale where it is worth doing.
 For dedup on *meaning* rather than on words (two descriptions of the same product, written
 independently), `ds.ml.similarity_join` is the same two-stage recipe over embeddings:
 SimHash bands the candidates, exact cosine verifies them. See
-[preprocessors](../../ml/preprocessors.md).
+[preprocessors](../../ml/preprocessors/index.md).
 
 ## See also
 
 - [Train/test split](train-test-split.md): dedup first, then split, in that order.
 - [Text embeddings](text-embeddings.md): the embedding half of `similarity_join`.
-- [Preprocessors](../../ml/preprocessors.md): MinHash, SimHash, and the LSH banding math.
+- [Preprocessors](../../ml/preprocessors/index.md): MinHash, SimHash, and the LSH banding math.
 - [Embeddings](../../ml/embeddings.md): the encoder that makes semantic dedup possible.
 - [Distinct and dedup](../../user-guide/distinct-and-dedup.md): the exact-match surface, and
   when it is enough.

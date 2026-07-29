@@ -396,3 +396,113 @@ def test_probe_allowed_by_default():
         return batch
 
     assert gpu._autocast_probe_allowed(plain) is True
+
+
+# --- autograd-off wrap (`inference_mode_call`) --------------------------------------
+# PyTorch tracks a backward graph on every forward unless told not to. An inference stage
+# never runs that backward pass, so the graph is pure waste: host overhead per op, plus the
+# activations it pins, which is what caps the batch size. Ray Data makes each UDF author
+# remember `torch.inference_mode()`; these pin that the engine applies it instead.
+
+
+class _FakeGuard:
+    """Records that it was entered, standing in for `torch.inference_mode()`."""
+
+    def __init__(self, log: list[str], name: str) -> None:
+        self._log = log
+        self._name = name
+
+    def __call__(self) -> _FakeGuard:
+        return self
+
+    def __enter__(self) -> None:
+        self._log.append(self._name)
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _fake_torch(log: list[str], *, with_inference_mode: bool = True) -> types.ModuleType:
+    mod = types.ModuleType("torch")
+    mod.no_grad = _FakeGuard(log, "no_grad")
+    if with_inference_mode:
+        mod.inference_mode = _FakeGuard(log, "inference_mode")
+    return mod
+
+
+def test_forward_runs_under_inference_mode(monkeypatch):
+    log: list[str] = []
+    monkeypatch.setattr(gpu, "_torch", lambda: _fake_torch(log))
+
+    def model(batch):
+        return batch
+
+    batch = pa.record_batch({"x": pa.array([1, 2])})
+    assert gpu.inference_mode_call(model)(batch) is batch
+    assert log == ["inference_mode"]
+
+
+def test_falls_back_to_no_grad_on_older_torch(monkeypatch):
+    """`inference_mode` landed in torch 1.9; older builds still get the backward graph off."""
+    log: list[str] = []
+    monkeypatch.setattr(gpu, "_torch", lambda: _fake_torch(log, with_inference_mode=False))
+    gpu.inference_mode_call(lambda b: b)(pa.record_batch({"x": pa.array([1])}))
+    assert log == ["no_grad"]
+
+
+def test_non_torch_udf_pays_nothing(monkeypatch):
+    """No torch means no guard and no import cost — the call still runs exactly once."""
+    calls = {"n": 0}
+    monkeypatch.setattr(gpu, "_torch", lambda: None)
+
+    def plain(batch):
+        calls["n"] += 1
+        return batch
+
+    gpu.inference_mode_call(plain)(pa.record_batch({"x": pa.array([1])}))
+    assert calls["n"] == 1
+
+
+def test_gradient_producing_udf_can_opt_out(monkeypatch):
+    """A UDF whose *output* is a gradient (saliency, adversarial perturbation) needs the
+    backward graph the wrap removes, and nothing about the callable says so from outside."""
+    log: list[str] = []
+    monkeypatch.setattr(gpu, "_torch", lambda: _fake_torch(log))
+
+    def saliency(batch):
+        return batch
+
+    saliency.batcher_inference_mode = False
+    assert gpu.inference_mode_call(saliency) is saliency
+    saliency(pa.record_batch({"x": pa.array([1])}))
+    assert log == []
+
+
+def test_opt_out_honored_on_a_class_udf_too(monkeypatch):
+    log: list[str] = []
+    monkeypatch.setattr(gpu, "_torch", lambda: _fake_torch(log))
+
+    class Saliency:
+        batcher_inference_mode = False
+
+        def __call__(self, batch):
+            return batch
+
+    model = Saliency()
+    assert gpu.inference_mode_call(model) is model
+
+
+def test_wrap_never_re_executes_the_udf(monkeypatch):
+    """Unlike the autocast probe, this wrap costs no extra execution — safe for a UDF that
+    bills a request or writes."""
+    log: list[str] = []
+    calls = {"n": 0}
+    monkeypatch.setattr(gpu, "_torch", lambda: _fake_torch(log))
+
+    def paid(batch):
+        calls["n"] += 1
+        return batch
+
+    wrapped = gpu.inference_mode_call(paid)
+    wrapped(pa.record_batch({"x": pa.array([1])}))
+    assert calls["n"] == 1

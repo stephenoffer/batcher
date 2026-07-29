@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
@@ -73,14 +73,14 @@ class CaseBuilder:
 
     def then(self, value: IntoExpr) -> CaseBuilder:
         if self._pending is None:
-            raise ValueError("then() must follow when()")
+            raise PlanError("then() must follow when()")
         self._branches.append((self._pending, _wrap(value)))
         self._pending = None
         return self
 
     def otherwise(self, value: IntoExpr) -> Case:
         if self._pending is not None:
-            raise ValueError("dangling when() without then()")
+            raise PlanError("dangling when() without then()")
         return Case(self._branches, _wrap(value))
 
 
@@ -358,11 +358,8 @@ def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [20, 20, 20]}
     """
-    if n < 1:
-        from batcher._internal.errors import PlanError
-
-        raise PlanError(f"nth_value(n) requires n >= 1, got {n}")
-    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, int(n))
+    n = require_int(n, func="nth_value", arg="n", minimum=1)
+    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, n)
 
 
 def row_number() -> WindowExpr:
@@ -491,8 +488,5 @@ def ntile(n: int) -> WindowExpr:
             >>> ds.with_columns(r=bt.ntile(2).over(order_by=["x"])).select("r").to_pydict()
             {'r': [1, 1, 2, 2]}
     """
-    if n < 1:
-        from batcher._internal.errors import PlanError
-
-        raise PlanError(f"ntile(n) requires n >= 1, got {n}")
-    return WindowExpr("ntile", None, [], [], None, int(n))
+    n = require_int(n, func="ntile", arg="n", minimum=1)
+    return WindowExpr("ntile", None, [], [], None, n)

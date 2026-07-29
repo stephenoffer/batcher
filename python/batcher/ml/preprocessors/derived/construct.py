@@ -82,9 +82,15 @@ class Binarizer(Preprocessor):
         Returns:
             A new lazy `Dataset` with the fitted columns replaced by 0/1 integers.
         """
+        # A null compares false against the threshold, so the `otherwise` claimed it as a 0 —
+        # a *below-threshold* value, indistinguishable from a real one. The null arm has to
+        # come first. Its `then` is reached only where the value IS null, so casting that null
+        # to the output type yields a null of the right type without an IR null literal.
         return ds.with_columns(
             **{
-                name: when(col(name) > lit(self.threshold)).then(lit(1)).otherwise(lit(0))
+                name: when(col(name).is_null())
+                .then(col(name).cast("int64"))
+                .otherwise(when(col(name) > lit(self.threshold)).then(lit(1)).otherwise(lit(0)))
                 for name in self.columns
             }
         )

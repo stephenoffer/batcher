@@ -1,4 +1,4 @@
-"""Shared Ray bootstrap for the standalone cluster benchmark scripts.
+"""Shared bootstrap and helpers for the standalone cluster benchmark scripts.
 
 These scripts differ from the `gpu_backend/` ones in that they exercise Batcher's own
 distributed path, so they must *ship the working-tree Batcher* to the workers
@@ -20,7 +20,7 @@ import dataclasses
 import os
 from typing import Any
 
-__all__ = ["init_batcher_ray", "init_ray", "strip_broken_runtime_env_hook"]
+__all__ = ["init_batcher_ray", "init_ray", "strip_broken_runtime_env_hook", "with_timeout"]
 
 
 def strip_broken_runtime_env_hook() -> None:
@@ -124,3 +124,42 @@ def init_batcher_ray(
             logging_level="ERROR",
             log_to_driver=False,
         )
+
+
+def with_timeout(fn, timeout_s: float):
+    """Wrap `fn` so each call raises `TimeoutError` if it runs past `timeout_s`.
+
+    Runs the call on a **daemon** thread and waits up to `timeout_s`. A timed-out call's
+    thread is abandoned but, being a daemon, never keeps the process alive — so a
+    pathological engine (e.g. Ray Data's distributed join) cannot leave a zombie driver
+    holding cluster actors after the sweep ends. (A plain ThreadPoolExecutor uses
+    non-daemon threads, which did exactly that.)
+
+    Args:
+        fn: The zero-argument call to guard.
+        timeout_s: Seconds to wait before giving up on it.
+
+    Returns:
+        A zero-argument callable running `fn` under that deadline.
+    """
+    import threading
+
+    def wrapped():
+        box: dict = {}
+
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout_s)
+        if thread.is_alive():
+            raise TimeoutError
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+
+    return wrapped

@@ -109,7 +109,7 @@ def query_shuffle_scope():
     if _QUERY_PLAN_ID.get() is not None:
         yield  # an enclosing query scope owns the fence; nesting must not re-mint or recount
         return
-    _plan_id, token = mint_query_plan_id()
+    plan_id, token = mint_query_plan_id()
     with _SCOPE_LOCK:
         _ACTIVE_SCOPES += 1
     try:
@@ -117,6 +117,18 @@ def query_shuffle_scope():
     finally:
         with _SCOPE_LOCK:
             _ACTIVE_SCOPES = max(0, _ACTIVE_SCOPES - 1)
+        # Free this query's shuffle buckets. This scope is the right — and only — place:
+        # it *means* "one query", it is reentrant so it fires exactly once even for an
+        # adaptive query whose stages each open a nested scope, and it already wraps both
+        # entry points (`session_fleet_lease` for the staged path, the
+        # `@with_query_shuffle_scope` decorator on `dist/executor.py` for the one-shot).
+        #
+        # Ordering is safe by construction: for a *query* fleet this runs while the lease
+        # is still held, and by then the actors are already dead, so eviction no-ops. The
+        # fleet it actually frees is the *session* fleet — which is the leaking one.
+        from batcher.dist.fleet.eviction import evict_plan, fleet_actors_for_eviction
+
+        evict_plan(fleet_actors_for_eviction(), plan_id)
         reset_query_plan_id(token)
 
 

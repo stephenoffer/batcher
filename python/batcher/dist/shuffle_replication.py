@@ -70,7 +70,11 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
     try:
         nodes = ray.get([actors[i].node_id.remote() for i in range(workers)])
         worker_addrs = ray.get([actors[i].addr.remote() for i in range(workers)])
-    except Exception:  # replication is an optimization; a probe failure keeps recompute
+    except Exception as exc:  # replication is an optimization; a probe failure keeps recompute
+        # Noted, not silent: a probe that always fails turns replication permanently off,
+        # and every worker loss then pays a full map-stage recompute with nothing on the
+        # record to say the cheaper path was never available.
+        note_suppressed("dist", "probe workers for replica placement", exc)
         return None
 
     index_of = {a: i for i, a in enumerate(worker_addrs)}
@@ -90,6 +94,17 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
                 )
 
     replicas: list[list[str]] = [[] for _ in range(len(addrs))]
+    if not refs:
+        return None
+    # Wait for every ack **together**, then read them. Each `ray.get` used to block in
+    # turn, so the acks were collected serially — `workers x factor` sequential round trips
+    # on the map barrier, the point of the query where the reduce is already waiting. One
+    # `ray.wait` for all of them makes the waiting concurrent, and reading each ref
+    # afterwards keeps the per-source error isolation the degradation story depends on: a
+    # source whose replica never acked must keep recompute, not fail the query.
+    pending = list(refs.values())
+    with contextlib.suppress(Exception):
+        ray.wait(pending, num_returns=len(pending))
     for (src, _host), ref in refs.items():
         try:
             replicas[src].append(ray.get(ref))

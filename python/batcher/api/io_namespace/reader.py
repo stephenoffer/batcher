@@ -356,6 +356,32 @@ class Reader:
         """
         return _read(path, format="xml", **opts)
 
+    def msgpack(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read MessagePack file(s) — a file, directory, or glob — into columnar rows.
+
+        The counterpart of `ds.write.msgpack`. Without it, MessagePack was the one format
+        this engine could write by name and not read by name: `ds.write.msgpack(p)` succeeded,
+        `bt.read.msgpack(p)` raised `FormatError: Unknown format 'msgpack'`, and the reader
+        the registry already held was reachable only through the untyped
+        ``bt.read(p, format="msgpack")``.
+
+        Needs the optional extra: ``pip install 'batcher-engine[msgpack]'``.
+
+        Args:
+            path: A MessagePack file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the MessagePack source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.msgpack("data/events.msgpack")  # doctest: +SKIP
+        """
+        return _read(path, format="msgpack", **opts)
+
     def logs(self, path: PathLike, **opts: Any) -> Dataset:
         """Read line-delimited log file(s) as rows, one raw line per row by default.
 
@@ -401,6 +427,43 @@ class Reader:
                 {'line_number': [1, 2], 'text': ['hello', 'world']}
         """
         return _read(path, format="text", **opts)
+
+    def warc(self, path: PathLike, **opts: Any) -> Dataset:
+        r"""Read web-archive (WARC) file(s) as one row per record.
+
+        The front door of a web-scale text corpus: Common Crawl and every major crawler
+        ship WARC. Filter to ``warc_type == "response"``, then take the payload apart with
+        the string accessors — ``.str.strip_html()``, ``.str.chunk()`` — without leaving
+        the engine.
+
+        The named WARC headers become typed columns; every other header is carried as JSON
+        in ``warc_headers``, so a crawl's own extension fields stay reachable through
+        ``.json``. ``.warc.gz`` is read transparently, including the per-record gzip
+        members a crawler normally writes.
+
+        Args:
+            path: A ``.warc`` / ``.warc.gz`` file, directory, or glob.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the WARC records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> body = b"<html>hi</html>"
+                >>> rec = (
+                ...     b"WARC/1.0\r\nWARC-Type: response\r\n"
+                ...     b"WARC-Target-URI: https://example.com/\r\n"
+                ...     b"Content-Length: %d\r\n\r\n" % len(body)
+                ... ) + body + b"\r\n\r\n"
+                >>> p = os.path.join(tempfile.mkdtemp(), "c.warc")
+                >>> _ = open(p, "wb").write(rec)
+                >>> bt.read.warc(p).select("warc_type", "warc_target_uri").to_pydict()
+                {'warc_type': ['response'], 'warc_target_uri': ['https://example.com/']}
+        """
+        return _read(path, format="warc", **opts)
 
     def binary(self, path: PathLike, **opts: Any) -> Dataset:
         """Read whole files as ``{uri, bytes, size, mime}`` rows.

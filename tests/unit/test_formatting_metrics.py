@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import formatting as f
+from batcher.plan.functions.metrics.text import formatting as f
 
 pytestmark = pytest.mark.unit
 

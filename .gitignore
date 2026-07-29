@@ -34,5 +34,7 @@ docs/_static/diagrams/*.dot
 # Local working notes, one-off comparison scripts, and their output
 scratchpad/
 
-dist/
+# Python packaging output. Anchored: a bare `dist/` also matches the source package
+# `python/batcher/dist/`, which silently swallowed a new module there on `git add`.
+/dist/
 wt-build.sh

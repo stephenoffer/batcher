@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import builtins
 import pickle
+import sys
 from collections.abc import Callable
 from itertools import pairwise
 
@@ -179,6 +180,15 @@ def test_missing_driver_raises_for_each(
             raise ImportError(f"no {blocked}")
         return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
 
+    # Evicting the driver from `sys.modules` is what makes the block bite. `require_driver`
+    # reaches the module through `importlib.import_module`, which returns a cached entry
+    # *without* consulting `builtins.__import__` — so patching the hook alone is a no-op the
+    # moment anything earlier in the session has already imported the driver. That is not
+    # hypothetical: with `boto3` resident, this test sailed past the guard, really built a
+    # DynamoDB client, and failed on botocore's own `EndpointVariantError` instead. It passed
+    # alone and failed in the full suite, which is the suite CI runs.
+    for name in [m for m in sys.modules if m == blocked or m.startswith(blocked + ".")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(builtins, "__import__", _block)
     with pytest.raises(BackendError, match=rf"\[{extra}\]"):
         make()

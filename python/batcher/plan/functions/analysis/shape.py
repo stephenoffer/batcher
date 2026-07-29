@@ -110,6 +110,17 @@ def jarque_bera(column: str | Expr) -> Expr:
     column, and far above it is not. Useful as a *screen* over hundreds of features rather
     than as a formal test, because at a large `n` it rejects normality for any real column.
 
+    `S` and `K` are the **population** (biased, ``1/n``) moments, which is what Jarque-Bera is
+    defined on and what its asymptotic chi-squared null distribution is derived for. The
+    `skewness` and `kurtosis` aggregates are the bias-corrected ``G1``/``G2`` estimators that
+    pandas and Excel report, so they are converted here rather than substituted: feeding the
+    corrected moments into this formula gives a different statistic under the same name, and at
+    a small `n` it moves the p-value enough to flip a decision (at ``n = 50`` on a normal
+    sample, ``p = 0.083`` against the correct ``0.136``). The conversion is exact, so nothing
+    is lost relative to computing the moments a second time.
+
+    Null for fewer than four rows, because ``G2`` is undefined there.
+
     Args:
         column: The column (or expression) to summarize.
 
@@ -122,9 +133,11 @@ def jarque_bera(column: str | Expr) -> Expr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
             >>> round(ds.agg(m=bt.jarque_bera("x")).to_pydict()["m"][0], 4)
-            9.334
+            1.8815
     """
     value = _as_column(column)
-    skew = value.skewness()
-    excess = value.kurtosis()
-    return value.count() / 6.0 * (skew * skew + excess * excess / 4.0)
+    n = value.count()
+    # G1 = S·sqrt(n(n-1))/(n-2)  and  G2 = [(n+1)·K + 6]·(n-1)/((n-2)(n-3)), inverted.
+    skew = value.skewness() * (n - 2.0) / (n * (n - 1.0)).sqrt()
+    excess = (value.kurtosis() * (n - 2.0) * (n - 3.0) / (n - 1.0) - 6.0) / (n + 1.0)
+    return n / 6.0 * (skew * skew + excess * excess / 4.0)

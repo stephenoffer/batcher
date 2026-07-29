@@ -15,20 +15,18 @@ what makes Carbonite a transfer sublibrary rather than glue inside the engine.
 
 from __future__ import annotations
 
-import atexit
-import contextlib
 import threading
-import weakref
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher.carbonite.transfer.lifecycle import host_of, process_client, register_session
 from batcher.carbonite.transfer.locality import (
     TransferMode,
     locality_ratio_counts,
     select_mode,
 )
-from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleClient, ShuffleTicket
+from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleTicket
 
 if TYPE_CHECKING:
     from batcher.carbonite.memory.pressure import PressureMonitor
@@ -42,53 +40,6 @@ __all__ = ["ShuffleSession"]
 # running state. Matches the `shuffle_fan_in` config default (the same Carbonite
 # fan-in governor as the combiner tree).
 _DEFAULT_FAN_IN = 8
-
-# One pooled consumer per process, shared by every session: its channel pool is
-# keyed by peer address, so sharing is correct, and it bounds the process to a
-# single client runtime no matter how many sessions exist (a per-session runtime
-# would accumulate background threads and destabilize a many-actor worker).
-_shared_client: ShuffleClient | None = None
-
-
-def _process_client() -> ShuffleClient:
-    global _shared_client
-    if _shared_client is None:
-        _shared_client = ShuffleClient()
-    return _shared_client
-
-
-# Every live session, so a process-exit hook can retire the pyarrow-backed batches
-# their Flight servers still hold *while the interpreter is alive*. A published
-# partition is a zero-copy view of a pyarrow array whose release callback needs the
-# GIL; if a tokio serve thread drops it *after* Python has begun finalizing, the
-# GIL acquire turns into a thread-exit that unwinds through Rust and aborts the
-# process (`std::terminate`). Clearing here — on the main thread, GIL held, before
-# finalization — drops that data first, so no background thread touches the GIL at
-# shutdown. WeakSet ⇒ an already-collected session drops out on its own.
-_live_sessions: weakref.WeakSet = weakref.WeakSet()
-_atexit_registered = False
-
-
-def _drain_live_sessions() -> None:
-    """Evict every live session's published partitions at interpreter exit."""
-    for session in list(_live_sessions):
-        with contextlib.suppress(Exception):  # best-effort teardown must never raise
-            session.clear()
-
-
-def _register_session(session: ShuffleSession) -> None:
-    """Track `session` for exit-time draining, registering the hook once."""
-    global _atexit_registered
-    _live_sessions.add(session)
-    if not _atexit_registered:
-        atexit.register(_drain_live_sessions)
-        _atexit_registered = True
-
-
-def _host(addr: str) -> str:
-    """The node identity of a shuffle address — its host, dropping the `:port` (the
-    advertised address is `{node_ip}:{port}`, so equal hosts ⇒ same node)."""
-    return addr.rsplit(":", 1)[0]
 
 
 class ShuffleSession:
@@ -143,7 +94,7 @@ class ShuffleSession:
             from batcher.carbonite.memory.pressure import PressureMonitor
 
             self._pressure = PressureMonitor()
-        _register_session(self)
+        register_session(self)
 
     def set_credits(self, credits: int | None) -> None:
         """Re-grant this session's static credit window.
@@ -234,26 +185,47 @@ class ShuffleSession:
         # path's mode selection — and behavior — is exactly as before.
         if self._shm:
             mode = select_mode(
-                addr, self.addr, source_node=_host(addr), local_node=_host(self.addr)
+                addr, self.addr, source_node=host_of(addr), local_node=host_of(self.addr)
             )
         else:
             mode = select_mode(addr, self.addr)
-        self._fetches += 1
+        # Under the same lock the concurrent gathers use. A join reducer fetches its two
+        # sides on two threads and both land here, so the un-guarded `+= 1` pair could lose
+        # increments — under-reporting exactly the locality ratio that is supposed to prove
+        # placement is working, and silently, since a slightly-low ratio reads as a
+        # slightly-worse shuffle rather than as a broken counter.
+        self._count_fetch(1, off_network=mode is not TransferMode.NETWORK)
         if mode is TransferMode.DIRECT_MEMORY:
-            self._off_network += 1
             local = self._server.local_fetch(ticket)
             return local if local is not None else []
         if mode is TransferMode.SHARED_MEMORY:
             shared = self._server.shm_fetch(addr, ticket)
             if shared is not None:  # a miss (empty/un-shm'd bucket) falls back to Flight
-                self._off_network += 1
                 return shared
+            # The bucket was not in shared memory after all, so this fetch does cross the
+            # network: take back the off-network credit the mode selection had assumed.
+            self._count_fetch(0, off_network=False, correction=True)
         # NETWORK (or a shared-memory miss): stream over credit-bounded Flight. The
         # process-wide pooled client reuses one channel per peer across every session's
         # fetches. The window is adaptive when a flow controller is set.
-        out = _process_client().fetch(addr, ticket, credits=self._window(), token=self._token)
-        self._observe_backpressure()
+        out = process_client().fetch(addr, ticket, credits=self._window(), token=self._token)
+        with self._stats_lock:
+            self._observe_backpressure()
         return out
+
+    def _count_fetch(self, n: int, *, off_network: bool, correction: bool = False) -> None:
+        """Fold `n` fetches into the locality counters under the stats lock.
+
+        `correction=True` reverses one previously-credited off-network fetch: the shared
+        memory path has to guess before it knows, and a miss must not be left counted as a
+        local hit.
+        """
+        with self._stats_lock:
+            self._fetches += n
+            if correction:
+                self._off_network -= 1
+            elif off_network:
+                self._off_network += n
 
     def gather(self, sources: list[tuple[str, ShuffleTicket]]) -> list[pa.RecordBatch]:
         """Fetch from every `(addr, ticket)` and concatenate into one batch list.
@@ -296,7 +268,7 @@ class ShuffleSession:
         recompute at all. A source is `unreachable` only once every copy of it is gone.
         """
         payload, unreachable = self._server.gather_combine(
-            _process_client(),
+            process_client(),
             group_keys_json,
             aggregates_json,
             sources,
@@ -307,8 +279,9 @@ class ShuffleSession:
             shm=self._shm,
             replicas=replicas,
         )
-        self._fetches += len(sources)
-        self._observe_backpressure()
+        with self._stats_lock:
+            self._fetches += len(sources)
+            self._observe_backpressure()
         return payload, unreachable
 
     def gather_to_files(
@@ -333,7 +306,7 @@ class ShuffleSession:
             fan_in = max(1, active_config().flow_control.shuffle_fetch_fan_in)
         fan_in = min(fan_in, max(1, len(sources)))
         paths, unreachable = self._server.gather_to_files(
-            _process_client(),
+            process_client(),
             sources,
             spill_dir,
             fan_in,
@@ -342,8 +315,9 @@ class ShuffleSession:
             shm=self._shm,
             replicas=replicas,
         )
-        self._fetches += len(sources)
-        self._observe_backpressure()
+        with self._stats_lock:
+            self._fetches += len(sources)
+            self._observe_backpressure()
         return paths, unreachable
 
     def gather_concat(
@@ -376,7 +350,7 @@ class ShuffleSession:
             fan_in = max(1, active_config().flow_control.shuffle_fetch_fan_in)
         fan_in = min(fan_in, max(1, len(sources)))  # never dial more peers than exist
         rows, unreachable = self._server.gather_concat(
-            _process_client(),
+            process_client(),
             sources,
             fan_in,
             credits=self._window(),
@@ -401,6 +375,40 @@ class ShuffleSession:
         """
         return locality_ratio_counts(self._off_network, self._fetches)
 
+    def stats(self) -> dict[str, int | float]:
+        """Everything this session measured about its shuffle, in one reading.
+
+        Locality was already exposed as a bare ratio, which cannot distinguish "one remote
+        fetch out of two" from "a million out of two million", and said nothing about the
+        *bytes* or about how the credit window behaved. Reading them together is what turns
+        a slow shuffle into a diagnosis: a low locality ratio with a healthy window is a
+        placement problem, and a high ratio with a high backoff rate is a memory problem.
+
+        Returns:
+            Fetch counts and the locality ratio, the server's published/local byte volumes,
+            and — under adaptive flow control — the credit controller's window statistics.
+        """
+        out: dict[str, int | float] = {
+            "fetches": self._fetches,
+            "off_network_fetches": self._off_network,
+            "locality_ratio": self.locality_ratio,
+            "bytes_published": self._server.bytes_published,
+            "bytes_served_locally": self._server.bytes_served_locally,
+            # Byte-weighted, alongside the fetch-count ratio above. Nine tiny local fetches
+            # and one enormous remote one score 0.9 by count while moving almost everything
+            # over the wire, and that shape is exactly what placement exists to find.
+            "byte_locality_ratio": self._server.locality_ratio(),
+            "partitions_retained": self._server.partition_count,
+            # The bytes behind that count. A worker holding four partitions says nothing
+            # about its footprint; a worker holding four gigabytes does.
+            "bytes_retained": self._server.retained_bytes,
+        }
+        if self._flow_control is not None:
+            out.update({f"credit_{k}": v for k, v in self._flow_control.stats().items()})
+        elif self._credits is not None:
+            out["credit_window"] = self._credits
+        return out
+
     def release(self, ticket: ShuffleTicket) -> None:
         """Evict one published partition once its reducers have fetched it."""
         self._server.release(ticket)
@@ -423,3 +431,16 @@ class ShuffleSession:
     def max_inflight(self, ticket: ShuffleTicket) -> int | None:
         """Peak in-flight batches for a locally published `ticket` (test hook)."""
         return self._server.max_inflight(ticket)
+
+    def __enter__(self) -> ShuffleSession:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        """Evict everything this session published on the way out.
+
+        A session holds its buckets as zero-copy views of pyarrow arrays, so an
+        un-cleared one keeps that memory resident for as long as the session object
+        lives — and the exit hook that catches the leftovers runs at *interpreter* exit,
+        which on a long-lived worker actor is far too late to be the only answer.
+        """
+        self.clear()

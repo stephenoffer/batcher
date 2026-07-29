@@ -30,6 +30,17 @@ from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
 __all__ = ["PubSubSource"]
 
+#: Pub/Sub caps a synchronous `pull` at 1,000 messages and rejects a larger request with
+#: `InvalidArgument`. The engine's 16,384-row default poll size is therefore not a legal
+#: request, so every poll is clamped to the API's ceiling rather than sent.
+_PULL_MAX_MESSAGES = 1_000
+
+#: Ack ids per `acknowledge` request. The API bounds a request at 512 KiB, and an ack id runs
+#: to a couple of hundred bytes, so a full poll's worth in one call is over the limit and
+#: fails the *commit* — the step that turns an at-least-once read into a completed epoch.
+#: Chunking keeps each request comfortably inside the bound.
+_ACK_CHUNK = 1_000
+
 
 def _stable_offset(message_id: str) -> int:
     """A process-stable int64 offset for an opaque Pub/Sub message id.
@@ -114,7 +125,10 @@ class PubSubSource(BrokerSource):
         client = self._client()
         try:
             response = client.pull(
-                request={"subscription": self.topic, "max_messages": self.poll_size},
+                request={
+                    "subscription": self.topic,
+                    "max_messages": min(self.poll_size, _PULL_MAX_MESSAGES),
+                },
                 timeout=self._pull_timeout,
             )
         except Exception as exc:
@@ -151,7 +165,17 @@ class PubSubSource(BrokerSource):
         """
         if not self._pending_acks:
             return
-        self._client().acknowledge(
-            request={"subscription": self.topic, "ack_ids": list(self._pending_acks)}
-        )
+        client = self._client()
+        pending = self._pending_acks
+        # Chunked: a single `acknowledge` carrying a whole poll's ack ids exceeds the API's
+        # 512 KiB request bound and fails, which fails the *commit* rather than the read —
+        # so the epoch was published and then the acks were lost, and every message came
+        # back on the next poll.
+        for start in range(0, len(pending), _ACK_CHUNK):
+            client.acknowledge(
+                request={
+                    "subscription": self.topic,
+                    "ack_ids": pending[start : start + _ACK_CHUNK],
+                }
+            )
         self._pending_acks = []

@@ -16,6 +16,7 @@ from batcher.plan.expr_ir.core import (
     Aliased,
     Expr,
     InList,
+    Lit,
 )
 from batcher.plan.expr_ir.func_nodes import ListFilter, ListTransform
 from batcher.plan.expr_ir.node_base import IRNode, child_fields
@@ -199,7 +200,18 @@ _HIDDEN_AGG_PREFIX = "__batcher_agg_"
 
 
 def contains_aggregate(expr: object) -> bool:
-    """True if `expr` is, or transitively contains, an `AggExpr` leaf."""
+    """True if `expr` is, or transitively contains, an `AggExpr` leaf.
+
+    A bare column or literal answers by type. That is not a micro-optimization on a rare
+    shape: the projection builder asks this of *every* output column, and a `select` or
+    `with_columns` over a wide relation is overwhelmingly bare `Col` pass-throughs, so
+    this is the per-column inner loop of building any wide projection. Answering it with
+    one type check instead of four `isinstance` tests and a field walk is what keeps that
+    proportional to the columns the call actually computes.
+    """
+    kind = type(expr)
+    if kind is Col or kind is Lit:
+        return False
     if isinstance(expr, AggExpr):
         return True
     # `Case` and `MakeStruct` carry their sub-expressions in irregular fields (paired
@@ -299,4 +311,52 @@ def split_aggregate_leaves(expr: Expr | AggExpr, registry: AggregateLeafRegistry
     # Hand-written leaf nodes (Col, Lit, ...) carry no aggregate children; an aggregate
     # hidden in an unsupported node surfaces as a clear error when `referenced_columns`
     # or `AggExpr.to_ir()` reaches it.
+    return expr
+
+
+def broadcast_aggregate_leaves(expr: Expr | AggExpr) -> Expr:
+    """Return `expr` with each `AggExpr` leaf turned into a whole-frame window.
+
+    The rewrite behind ``with_columns(total=col("x").sum())`` and the mixed
+    ``select("g", total=col("x").sum())``: an aggregate used where a *row-shaped* value
+    is expected means the aggregate over the whole frame, broadcast to every row — which
+    is exactly ``agg.over()``, the relational `Window` operator with no partition. Polars
+    and pandas both read it that way, and reading it any other way would need a second
+    evaluation model for aggregates.
+
+    A `select` whose items are *all* aggregates is the other reading (collapse to one
+    row) and is handled by the caller before this is reached.
+
+    Args:
+        expr: An expression that may contain `AggExpr` leaves.
+
+    Returns:
+        The same expression with every aggregate leaf replaced by its `.over()` window.
+    """
+    if isinstance(expr, AggExpr):
+        _reject_nested_aggregate(expr)
+        return expr.over()
+    if isinstance(expr, Case):
+        return Case(
+            [
+                (broadcast_aggregate_leaves(cond), broadcast_aggregate_leaves(then))
+                for cond, then in expr.branches
+            ],
+            broadcast_aggregate_leaves(expr.otherwise),
+        )
+    if isinstance(expr, MakeStruct):
+        return MakeStruct(
+            [(name, broadcast_aggregate_leaves(value)) for name, value in expr.fields]
+        )
+    if isinstance(expr, IRNode):
+        updates = {}
+        for name, is_list in child_fields(expr):
+            value = getattr(expr, name)
+            if is_list:
+                updates[name] = [broadcast_aggregate_leaves(v) for v in value]
+            else:
+                updates[name] = broadcast_aggregate_leaves(value)
+        if not updates:
+            return expr
+        return dataclasses.replace(expr, **updates)
     return expr

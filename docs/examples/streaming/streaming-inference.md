@@ -1,5 +1,8 @@
 # Streaming inference
 
+This recipe scores an unbounded stream with a model, keeping the model loaded across
+micro-batches. One decision dominates whether it works at all, so it comes first.
+
 :::{warning}
 The classic way to make a streaming inference job useless is to pass a plain function to
 `map_batches` that loads the model inside it. The model then loads once per batch. On a

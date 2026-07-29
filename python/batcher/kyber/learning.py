@@ -18,6 +18,7 @@ from typing import Any
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber.correction import correction_factor
+from batcher.kyber.measured_selectivity import measured_selectivities
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
 from batcher.plan.logical import LogicalPlan
@@ -33,6 +34,7 @@ __all__ = [
     "generation",
     "is_material_change",
     "load_learned_stats",
+    "q_error_window",
     "qualify",
     "record_column_stats",
     "record_execution",
@@ -208,6 +210,12 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
     corrections = _cardinality_corrections(hub)
     if corrections:
         stats[CARDINALITY_CORRECTION_KEY] = corrections
+    for sig, sel in measured_selectivities(hub).items():
+        # `setdefault`: an explicit `record_selectivity` entry still wins. The two agree
+        # wherever both fire, so this only fills a signature that had nothing.
+        entry = dict(stats.get(sig) or {})
+        entry.setdefault("selectivity", sel)
+        stats[sig] = entry
     return stats
 
 
@@ -257,7 +265,8 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
         return cached[2]
     try:
         samples = _q_error_samples(hub, window)
-    except Exception:  # pragma: no cover - learning must never break planning
+    except Exception as exc:  # pragma: no cover - learning must never break planning
+        note_suppressed("kyber", "read learned cardinality corrections", exc)
         return {}
     out: dict[str, float] = {}
     for sig, log_qs in samples.items():
@@ -266,6 +275,16 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
             out[sig] = factor
     _CORRECTION_CACHE[hub] = (hub.version, fingerprint, out)
     return out
+
+
+def q_error_window(hub: MetadataHub, signature: str, window: int) -> deque[float] | None:
+    """One signature's bounded window of `log(actual / estimated)`, or `None` if untracked.
+
+    The narrow read `kyber.correction` needs to judge whether a shape's estimate has held
+    up. Kept here because this module owns the incremental fold; exposed rather than
+    reaching into `_q_error_samples` so the fold's caching contract stays internal.
+    """
+    return _q_error_samples(hub, window).get(signature)
 
 
 def _q_error_samples(hub: MetadataHub, window: int) -> dict[str, deque[float]]:

@@ -214,7 +214,14 @@ pub(crate) fn finalize_var(
             b.append_null();
             continue;
         }
-        let var = (m2.value(i) / (n - 1) as f64).max(0.0); // guard tiny negatives
+        // `max(0.0)` clips the tiny negative M2 that cancellation can leave behind, but
+        // `f64::max` returns the *other* operand when one is NaN — so it also turned a
+        // NaN M2 (any NaN or infinity in the input) into a confident `0.0`, which reads as
+        // "this column is constant". `mean` and `sum` propagate NaN over the same input, so
+        // the two disagreed, and a zero-variance check silently mis-classified the column.
+        // Clip only a genuine negative; let a non-finite M2 through as itself.
+        let raw = m2.value(i) / (n - 1) as f64;
+        let var = if raw < 0.0 { 0.0 } else { raw };
         b.append_value(if stddev { var.sqrt() } else { var });
     }
     Ok(Arc::new(b.finish()))
@@ -292,5 +299,43 @@ mod tests {
             s.add(v);
         }
         assert_eq!(s.total(), 2.0);
+    }
+
+    /// `finalize_var` over a one-group state with the given `M2` and count.
+    fn finalized(m2: f64, n: i64, stddev: bool) -> Option<f64> {
+        let mean: ArrayRef = Arc::new(Float64Array::from(vec![0.0]));
+        let m2: ArrayRef = Arc::new(Float64Array::from(vec![m2]));
+        let count: ArrayRef = Arc::new(Int64Array::from(vec![n]));
+        let out = finalize_var(&mean, &m2, &count, stddev).unwrap();
+        let a = out.as_primitive::<Float64Type>();
+        a.is_valid(0).then(|| a.value(0))
+    }
+
+    /// A NaN `M2` must stay NaN rather than becoming a confident zero.
+    ///
+    /// `f64::max` returns the *non*-NaN operand, so the `max(0.0)` that clips a tiny
+    /// negative M2 also reported `var = 0` — "this column is constant" — for any input
+    /// containing a NaN or an infinity, while `mean` and `sum` over the same input
+    /// propagated NaN. A zero-variance test then silently mis-classified the column.
+    #[test]
+    fn a_non_finite_second_moment_does_not_become_zero_variance() {
+        assert!(finalized(f64::NAN, 3, false).expect("not null").is_nan());
+        assert!(finalized(f64::NAN, 3, true).expect("not null").is_nan());
+        assert_eq!(finalized(f64::INFINITY, 3, false), Some(f64::INFINITY));
+    }
+
+    /// ...while the negative-M2 clip it was written for still works.
+    #[test]
+    fn a_tiny_negative_second_moment_is_still_clipped_to_zero() {
+        assert_eq!(finalized(-1e-18, 5, false), Some(0.0));
+        assert_eq!(finalized(-1e-18, 5, true), Some(0.0));
+    }
+
+    /// The ordinary path is unchanged: `var = M2 / (n − 1)`, null below two values.
+    #[test]
+    fn the_ordinary_variance_is_unchanged() {
+        assert_eq!(finalized(8.0, 5, false), Some(2.0));
+        assert_eq!(finalized(8.0, 5, true), Some(2.0f64.sqrt()));
+        assert_eq!(finalized(0.0, 1, false), None);
     }
 }

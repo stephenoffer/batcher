@@ -41,9 +41,6 @@ from batcher.ml.llm.engines.vllm import (
     _group_indices_by_adapter as _group_indices_by_adapter,
 )
 from batcher.ml.llm.engines.vllm import (
-    _truncate_to_window as _truncate_to_window,
-)
-from batcher.ml.llm.engines.vllm import (
     _vllm_batch_defaults as _vllm_batch_defaults,
 )
 from batcher.ml.llm.engines.vllm import (
@@ -52,5 +49,6 @@ from batcher.ml.llm.engines.vllm import (
 from batcher.ml.llm.engines.vllm import (
     vllm_engine,
 )
+from batcher.ml.llm.sizing import _truncate_to_window as _truncate_to_window
 
 __all__ = ["Engine", "EngineFactory", "anthropic_engine", "http_engine", "vllm_engine"]

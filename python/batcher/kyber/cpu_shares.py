@@ -149,6 +149,16 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
     return out
 
 
+def refit_version(hub) -> int:
+    """The hub version at which the utilization medians now in force were refreshed (`0` if
+    never). The same role `calibration.refit_version` plays, for the same reason: these medians
+    steer per-task CPU shares, which are annotated onto a plan, so a memoized plan is keyed by
+    which refresh it was annotated under.
+    """
+    cached = _CPU_CACHE.get(hub) if hub is not None else None
+    return int(cached[0]) if cached is not None else 0
+
+
 def recommend_num_cpus(util: float | None, base: float, config: Config | None = None) -> float:
     """Adapt a per-task CPU share from measured utilization, falling back to `base`.
 

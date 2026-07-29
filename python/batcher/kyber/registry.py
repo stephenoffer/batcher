@@ -50,6 +50,9 @@ class RuleRegistry:
         matches: tuple[type, ...],
         category: RuleCategory = RuleCategory.REWRITE,
         expr: Callable | None = None,
+        expr_schema: Callable | None = None,
+        expr_matches: tuple[type, ...] | None = None,
+        expr_ops: tuple[str, ...] | None = None,
     ) -> Callable[
         [Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None]],
         Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None],
@@ -68,6 +71,9 @@ class RuleRegistry:
                     matches=matches,
                     category=category,
                     expr_fn=expr,
+                    expr_schema_fn=expr_schema,
+                    expr_matches=expr_matches,
+                    expr_ops=expr_ops,
                 )
             )
             return fn
@@ -89,17 +95,26 @@ def rule(
     matches: tuple[type, ...],
     category: RuleCategory = RuleCategory.REWRITE,
     expr: Callable | None = None,
+    expr_schema: Callable | None = None,
+    expr_matches: tuple[type, ...] | None = None,
+    expr_ops: tuple[str, ...] | None = None,
 ):
     """Register a node-local rule into the default registry (see `RuleRegistry.rule`).
 
     `expr` declares the rule's body as a leaf `Expr -> Expr` rewrite, letting the driver run
-    it in one shared expression traversal with every other expression rule in the phase."""
+    it in one shared expression traversal with every other expression rule in the phase.
+    `expr_schema` is its schema-dependent twin, a leaf `(Expr, SchemaRef) -> Expr`: the
+    driver resolves the node's schema once and runs every such leaf in that same traversal,
+    instead of each rule resolving the schema and walking the tree itself."""
     return DEFAULT_REGISTRY.rule(
         name=name,
         phase=phase,
         matches=matches,
         category=category,
         expr=expr,
+        expr_schema=expr_schema,
+        expr_matches=expr_matches,
+        expr_ops=expr_ops,
     )
 
 

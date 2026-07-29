@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .kinds import (
+from batcher.observe.insights.kinds import (
     _BOTTLENECK_SHARE,
     _EST_ERROR_HIGH,
     _EST_ERROR_LOW,

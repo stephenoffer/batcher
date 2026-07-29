@@ -75,6 +75,7 @@ class IncrementalFileSource:
 
     __slots__ = (
         "_completed",
+        "_completed_set",
         "_format",
         "_fs",
         "_max_files",
@@ -82,6 +83,7 @@ class IncrementalFileSource:
         "_pending",
         "_schema_cache",
         "_state_dir",
+        "_store_obj",
         "_suffix",
     )
 
@@ -114,13 +116,34 @@ class IncrementalFileSource:
         # in the durable store, so a crash before the commit re-offers them.
         self._pending: list[str] = []
         # The subset of `_pending` whose every row has been emitted — what `confirm()`
-        # promotes to the durable store.
+        # promotes to the durable store. The set mirrors the list purely for membership:
+        # `complete()` is called once per file per epoch, and the linear `not in` scan it
+        # used made draining a large backlog quadratic in the backlog.
         self._completed: list[str] = []
+        self._completed_set: set[str] = set()
+        self._store_obj: SeenStore | None = None
 
     # ---- discovery --------------------------------------------------------
     def _store(self) -> SeenStore:
-        self._fs.mkdirs(self._state_dir, exist_ok=True)
-        return SeenStore(os.path.join(self._state_dir, f"{self._format}_seen.sqlite"))
+        """The durable seen-store, opened once and kept for the life of the source.
+
+        This used to open a fresh SQLite connection — preceded by a `mkdirs` — on every
+        `discover()` *and* every `confirm()`. A streaming query calls both once per trigger,
+        so a 200ms cadence paid four filesystem round-trips a second before listing a single
+        file, and the driver's idle poll (which re-lists while waiting for new files) paid
+        them again. The connection is cheap to hold and the store is single-writer by design.
+        """
+        if self._store_obj is None:
+            self._fs.mkdirs(self._state_dir, exist_ok=True)
+            path = os.path.join(self._state_dir, f"{self._format}_seen.sqlite")
+            self._store_obj = SeenStore(path)
+        return self._store_obj
+
+    def close(self) -> None:
+        """Release the seen-store connection. Idempotent; safe on a never-opened source."""
+        if self._store_obj is not None:
+            store, self._store_obj = self._store_obj, None
+            store.close()
 
     def _list_candidates(self, store: SeenStore) -> list[str]:
         """List directory files, applying the lexical fast-path against `store`.
@@ -145,10 +168,10 @@ class IncrementalFileSource:
         yet durable. `confirm()` makes them durable once their epoch is published; until
         then a restart re-offers them (see the module docstring).
         """
-        with self._store() as store:
-            candidates = self._list_candidates(store)
-            held = set(self._pending)
-            new_files = [f for f in store.unseen(candidates) if f not in held]
+        store = self._store()
+        candidates = self._list_candidates(store)
+        held = set(self._pending)
+        new_files = [f for f in store.unseen(candidates) if f not in held]
         if self._max_files is not None:
             # `candidates` comes back sorted, so capping the head drains the backlog in a
             # stable, oldest-name-first order; the tail is left undiscovered for a later pass.
@@ -163,17 +186,21 @@ class IncrementalFileSource:
         at discovery (or part-way through a large file) is what loses data: the store would
         claim rows the sink never saw.
         """
-        self._completed.extend(f for f in files if f not in self._completed)
+        for f in files:
+            if f not in self._completed_set:
+                self._completed_set.add(f)
+                self._completed.append(f)
 
     def confirm(self) -> None:
         """Durably mark the fully-read files as seen — their epoch is now published."""
         if not self._completed:
             return
-        with self._store() as store:
-            store.mark_many([(f, _safe_size(self._fs, f), _safe_mtime(f)) for f in self._completed])
-        done = set(self._completed)
+        store = self._store()
+        store.mark_many([(f, _safe_size(self._fs, f), _safe_mtime(f)) for f in self._completed])
+        done = self._completed_set
         self._pending = [f for f in self._pending if f not in done]
-        self._completed.clear()
+        self._completed = []
+        self._completed_set = set()
 
     def snapshot_position(self) -> dict:
         """The files fully read but not yet durably confirmed (the write-ahead position)."""
@@ -187,12 +214,19 @@ class IncrementalFileSource:
         discovered stays unconfirmed and is picked up again.
         """
         self._completed = [str(f) for f in position.get("pending", [])]
+        self._completed_set = set(self._completed)
         self.confirm()
         self._pending.clear()
 
     # ---- Source protocol --------------------------------------------------
     def schema(self) -> pa.Schema:
-        """The file format's schema, sampled from the first available file."""
+        """The file format's schema, sampled from the first available file.
+
+        An empty directory is reported as the "no files yet" condition it is. Some
+        filesystems raise from `expand` when nothing matches and some return an empty list;
+        only the first was handled, so the other spelling reached `files[0]` and surfaced as
+        a bare `IndexError` with no mention of the path or the suffix.
+        """
         if self._schema_cache is None:
             try:
                 files = self._fs.expand(self._path, suffix=self._suffix)
@@ -200,6 +234,10 @@ class IncrementalFileSource:
                 raise IOError(
                     f"cannot infer schema: no {self._suffix} files yet under {self._path!r}"
                 ) from exc
+            if not files:
+                raise IOError(
+                    f"cannot infer schema: no {self._suffix} files yet under {self._path!r}"
+                )
             reader = SOURCES.get(self._format)(files[0])
             self._schema_cache = reader.schema()
         return self._schema_cache

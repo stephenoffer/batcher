@@ -17,11 +17,14 @@ import atexit
 import threading
 import webbrowser
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from batcher._internal.logging import ensure_configured, get_logger, suppress_console_handler
 from batcher.observe.console import ConsoleReporter, should_render
-from batcher.observe.server import UIServer
 from batcher.observe.store import ActivityStore
+
+if TYPE_CHECKING:
+    from batcher.observe.server import UIServer
 
 __all__ = ["ensure_sinks", "start_ui", "stop_ui", "ui_url"]
 
@@ -147,6 +150,12 @@ def _bind(host: str, port: int) -> tuple[UIServer, str, bool]:
     Returns the started server, its URL, and whether a fallback port was used. `port=0`
     already means "any free port" to the OS, so it is never walked.
     """
+    # The HTTP server, its routes, and the JSON handlers are imported the first time a
+    # dashboard is actually started, not when `batcher` is. Nothing else in the package
+    # touches them, and they were a third of what importing `observe` cost — paid by every
+    # process, to be ready for a UI almost none of them open.
+    from batcher.observe.server import UIServer
+
     last: OSError | None = None
     tries = 1 if port == 0 else _PORT_FALLBACK_TRIES
     for offset in range(tries):

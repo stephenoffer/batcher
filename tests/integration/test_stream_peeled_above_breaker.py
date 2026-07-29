@@ -9,6 +9,12 @@ them per emitted batch.
 
 `Limit` is deliberately NOT peeled: applied per batch it would keep n rows from EVERY
 batch. `test_limit_above_breaker_is_not_peeled` pins that.
+
+The peelable set is the neutral `is_partition_independent` predicate rather than a
+hand-written tuple. The tuple listed only `Project`/`Filter` while the predicate already
+admitted the row-multiplying reshapers, so `group_by().agg().explode()` and
+`sort().unpivot()` materialized for no reason —
+`test_row_multiplying_reshapers_are_peeled` pins that they no longer do.
 """
 
 from __future__ import annotations
@@ -91,6 +97,43 @@ def test_limit_above_breaker_is_not_peeled(big):
     streamed = _rows(ds)
     assert len(streamed) == 10
     assert streamed == ds.collect().to_pylist()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda d: d.group_by("g").agg(vs=bt.col("v").array_agg()).explode("vs"),
+        lambda d: (
+            d.group_by("g").agg(vs=bt.col("v").array_agg()).explode("vs").filter(bt.col("vs") > 500)
+        ),
+        lambda d: d.sort("v").unpivot(index=["g"], on=["v"]),
+        lambda d: d.group_by("g").agg(s=bt.col("v").sum()).unpivot(index=["g"], on=["s"]),
+    ],
+    ids=["agg-explode", "agg-explode-filter", "sort-unpivot", "agg-unpivot"],
+)
+def test_row_multiplying_reshapers_are_peeled(big, shape, monkeypatch):
+    """`Unnest`/`Unpivot` multiply rows but hold no state, so a batch's output does not
+    depend on how the input was split — they are peelable, and used not to be."""
+    import batcher.api.terminal.core as tc
+
+    calls: list[int] = []
+    original = tc._collect
+    monkeypatch.setattr(tc, "_collect", lambda *a, **k: (calls.append(1), original(*a, **k))[1])
+
+    ds = shape(big)
+    assert _rows(ds) == ds.collect().to_pylist()
+    assert calls == []
+
+
+@pytest.mark.integration
+def test_peeling_a_reshaper_preserves_the_breakers_order(big):
+    """The risky shape: the breaker below establishes a global order and the peeled
+    reshaper fans each batch out. Row order must survive the fan-out."""
+    ds = big.sort("v", descending=True).unpivot(index=["g"], on=["v"])
+    values = [r["value"] for r in _rows(ds)]
+    assert len(values) == 50_000
+    assert values == sorted(values, reverse=True)
 
 
 @pytest.mark.integration

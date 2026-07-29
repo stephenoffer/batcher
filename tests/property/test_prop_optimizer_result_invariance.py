@@ -107,6 +107,60 @@ def _table(draw: st.DrawFn) -> pa.Table:
 
 
 @st.composite
+def _nested_scalar(draw: st.DrawFn):
+    """A *nested* scalar function chain over the base columns.
+
+    The generator's derived-column stage builds integer arithmetic only, which leaves the
+    expression families that rewrite *function composition* -- string, math, cast, and the
+    list algebra below -- outside the randomized search entirely. Two rules shipped with
+    wrong-answer bugs (`arg_sort`/`flatten` idempotence) precisely because no generated
+    pipeline ever nested one call inside another of the same family.
+
+    Chains are built two-deep so a collapse rule has a pair to act on.
+    """
+    kind = draw(st.sampled_from(["str", "math", "cast", "trim"]))
+    if kind == "str":
+        outer = draw(st.sampled_from(["upper", "lower", "reverse", "initcap"]))
+        inner = draw(st.sampled_from(["upper", "lower", "reverse", "initcap"]))
+        return getattr(getattr(col("s").str, inner)().str, outer)()
+    if kind == "trim":
+        outer = draw(st.sampled_from(["strip", "lstrip", "rstrip"]))
+        inner = draw(st.sampled_from(["strip", "lstrip", "rstrip"]))
+        return getattr(getattr(col("s").str, inner)().str, outer)()
+    if kind == "cast":
+        # `cast(int -> float) OP literal` is the unwrap-cast family's exact shape.
+        op = draw(st.sampled_from(["<", "<=", ">", ">=", "==", "!="]))
+        rhs = draw(st.sampled_from([0.0, 1.0, -1.5, 2.5, 3.0]))
+        lhs = col("v").cast("float64")
+        return {
+            "<": lhs < rhs,
+            "<=": lhs <= rhs,
+            ">": lhs > rhs,
+            ">=": lhs >= rhs,
+            "==": lhs == rhs,
+            "!=": lhs != rhs,
+        }[op]
+    outer = draw(st.sampled_from(["abs", "floor", "ceil", "trunc", "sign"]))
+    inner = draw(st.sampled_from(["abs", "floor", "ceil", "trunc", "sign"]))
+    return getattr(getattr(col("f"), inner)(), outer)()
+
+
+@st.composite
+def _nested_list(draw: st.DrawFn):
+    """A two-deep list-function chain over a list built from the integer columns.
+
+    This is the family the two shipped bugs lived in: `arg_sort` and `flatten` are not
+    idempotent, and collapsing them returned wrong answers. Nothing in the generator
+    could build `arr.arg_sort().arg_sort()` before, so nothing caught it.
+    """
+    base = bt.array(col("v"), col("w"))
+    inner = draw(st.sampled_from(["sort", "reverse", "unique", "arg_sort"]))
+    chained = getattr(base.list, inner)()
+    outer = draw(st.sampled_from(["sort", "reverse", "unique", "arg_sort", "len", "min", "max"]))
+    return getattr(chained.list, outer)()
+
+
+@st.composite
 def _predicate(draw: st.DrawFn, cols: tuple[str, ...], depth: int = 0):
     """A bounded random boolean predicate over `cols` — the shape the filter rules chew on.
 
@@ -174,6 +228,19 @@ def _query(draw: st.DrawFn) -> tuple[bt.Dataset, bool]:
             y=col("v") - col("w"),
         )
         cols += ["x", "y"]
+    # Nested function chains -- the shapes the composition-collapsing families rewrite,
+    # and the ones nothing in this generator could previously build. Added as a *terminal*
+    # stage that returns immediately: the downstream terminals reference columns by name
+    # (`sort` orders by all of them, `union` re-projects), and a list-valued column is not
+    # a legal sort or group key. Returning here keeps the added column in the output --
+    # which is what makes the optimizer-vs-no-optimizer comparison actually see it -- while
+    # leaving the existing terminal coverage untouched on the other draws.
+    if draw(st.booleans()):
+        ds = ds.with_columns(nested=draw(_nested_scalar()))
+        return ds, False
+    if draw(st.booleans()):
+        ds = ds.with_columns(nested_list=draw(_nested_list()))
+        return ds, False
     if draw(st.booleans()):
         ds = ds.filter(draw(_predicate(tuple(cols))))
 
@@ -337,3 +404,180 @@ def test_rules_converge_within_production_cap_and_deterministically(case: tuple[
         "combination needs more passes than the engine runs → silent under-optimization)"
     )
     assert _optimize_at(8) == at_prod, "optimizer output is non-deterministic across runs"
+
+
+# --- exhaustive: the list-function composition cross-product -------------------
+
+
+@pytest.mark.parametrize("inner", ["sort", "reverse", "unique", "arg_sort", "flatten", "normalize"])
+@pytest.mark.parametrize(
+    "outer",
+    ["sort", "reverse", "unique", "arg_sort", "normalize", "len", "min", "max", "n_unique"],
+)
+def test_every_list_function_pair_is_result_preserving(inner: str, outer: str) -> None:
+    """Enumerate every two-deep list-function chain and pin optimized == unoptimized.
+
+    The randomized generator above *can* build these, but it dilutes any particular pair
+    to roughly one draw in thirty, so it does not reliably fire on the one that matters.
+    That is not hypothetical: `arg_sort` and `flatten` shipped in the idempotent-collapse
+    set, both are non-idempotent (`arg_sort` twice is the *inverse* permutation, `flatten`
+    removes one nesting level per call), and both returned wrong answers. Re-introducing
+    either bug leaves the random test green and turns this one red.
+
+    Exhaustive beats random here because the family is small and closed -- there are only
+    a few dozen pairs, so enumerating them costs less than hoping to hit one.
+    """
+    # THREE elements, not two. With two-element lists `arg_sort` is a fixed point --
+    # every 2-permutation squares to itself -- so a two-column array cannot distinguish
+    # `arg_sort(arg_sort(x))` from `arg_sort(x)` and the whole guard passes vacuously.
+    # `arg_sort([3,1,2])` is `[1,2,0]` and applying it again gives `[2,0,1]`, which is the
+    # smallest input that actually separates them. Nulls and a duplicate value are kept so
+    # the null-handling and tie-breaking paths run too.
+    table = pa.table(
+        {
+            "v": [3, 1, None, 2, 2, -5],
+            "w": [2, 5, 4, 2, None, 7],
+            "u": [1, 9, 6, 2, 3, 0],
+        }
+    )
+    base = bt.from_arrow(table)
+    chained = getattr(bt.array(col("v"), col("w"), col("u")).list, inner)()
+    try:
+        expr = getattr(chained.list, outer)()
+    except Exception:
+        pytest.skip(f"{outer} is not defined over the output of {inner}")
+    ds = base.with_columns(r=expr)
+
+    logical, sources = ds._plan, ds._sources
+    try:
+        none = run_with_rules(logical, sources, NO_RULES)
+    except Exception:
+        pytest.skip(f"engine rejects {outer}({inner}(...))")
+    full = run_with_rules(logical, sources, FULL_RULES)
+    assert full.column("r").to_pylist() == none.column("r").to_pylist(), (
+        f"optimizer changed {outer}({inner}(x)):\n"
+        f"  optimized:   {full.column('r').to_pylist()}\n"
+        f"  unoptimized: {none.column('r').to_pylist()}"
+    )
+
+
+# --- exhaustive: the string-function composition cross-product -----------------
+
+#: Unary string functions the optimizer has collapse/involution rules over. Composing
+#: any two must leave the result unchanged; `extra/strings` collapses the idempotent
+#: ones and `exprs/text` unwraps the involutions.
+_STR_UNARY = ["upper", "lower", "reverse", "initcap", "strip", "lstrip", "rstrip"]
+
+
+@pytest.mark.parametrize("inner", _STR_UNARY)
+@pytest.mark.parametrize("outer", _STR_UNARY)
+def test_every_string_function_pair_is_result_preserving(inner: str, outer: str) -> None:
+    """Enumerate every two-deep unary string chain and pin optimized == unoptimized.
+
+    The same guard shape as the list cross-product above, for the same reason: three
+    wrong-answer bugs lived in composition rules, and reasoning about which functions are
+    idempotent or involutive is exactly where I got them wrong. `upper(lower(x))` is the
+    one to watch here -- it is *not* `upper(x)` in general Unicode, which is why no rule
+    collapses it and why this test would go red if one were added.
+
+    The input carries the cases the collapse rules turn on: mixed case, leading and
+    trailing whitespace, a non-ASCII string (where Python and Rust case mapping may
+    differ), the empty string, and a null.
+    """
+    table = pa.table({"s": ["AbC dEf", "  padded  ", "straße", "", None]})
+    base = bt.from_arrow(table)
+    chained = getattr(col("s").str, inner)()
+    ds = base.with_columns(r=getattr(chained.str, outer)())
+
+    logical, sources = ds._plan, ds._sources
+    full = run_with_rules(logical, sources, FULL_RULES)
+    none = run_with_rules(logical, sources, NO_RULES)
+    assert full.column("r").to_pylist() == none.column("r").to_pylist(), (
+        f"optimizer changed {outer}({inner}(s)):\n"
+        f"  optimized:   {full.column('r').to_pylist()}\n"
+        f"  unoptimized: {none.column('r').to_pylist()}"
+    )
+
+
+# --- exhaustive: date part over date_trunc ------------------------------------
+
+#: Every truncation unit the engine accepts, and every date part the optimizer has a
+#: lift-through rule for. The rules turn on a hand-written granularity rank table, and a
+#: single wrong rank silently returns a different date field -- so the whole cross-product
+#: is enumerated rather than sampled.
+_TRUNC_UNITS = [
+    "microsecond",
+    "millisecond",
+    "second",
+    "minute",
+    "hour",
+    "day",
+    "week",
+    "month",
+    "quarter",
+    "year",
+    "decade",
+    "century",
+    "millennium",
+]
+_DATE_PARTS = [
+    "second",
+    "minute",
+    "hour",
+    "day",
+    "day_of_week",
+    "day_of_year",
+    "isodow",
+    "week",
+    "iso_year",
+    "month",
+    "quarter",
+    "year",
+    "decade",
+    "century",
+    "millennium",
+]
+
+
+@pytest.mark.parametrize("unit", _TRUNC_UNITS)
+@pytest.mark.parametrize("part", _DATE_PARTS)
+def test_date_part_over_trunc_is_result_preserving(part: str, unit: str) -> None:
+    """`part(date_trunc(unit, t))` must mean the same optimized and unoptimized.
+
+    The lift-through rules fire only when the truncation is at or below the part's own
+    granularity, and that ordering is a table I wrote by hand. `week` is the trap: a week
+    nests inside neither a month nor a quarter, so truncating to a month genuinely moves
+    which week an instant falls in. `epoch` is excluded from the rules entirely because it
+    reports microseconds, which every truncation changes.
+
+    Timestamps span pre-epoch, a leap day, a year boundary, and a month end, so an
+    off-by-one in the rank table shows up as a changed field rather than passing on
+    mid-month data that happens to agree.
+    """
+    table = pa.table(
+        {
+            "t": pa.array(
+                [
+                    "1969-07-20T20:17:40",
+                    "2020-02-29T23:59:59",
+                    "2021-01-01T00:00:00",
+                    "2021-03-31T12:34:56",
+                    None,
+                ]
+            )
+        }
+    )
+    ds = bt.from_arrow(table).select(ts=col("t").cast("timestamp"))
+    ds = ds.with_columns(r=getattr(col("ts").dt.truncate(unit).dt, part)())
+
+    logical, sources = ds._plan, ds._sources
+    try:
+        none = run_with_rules(logical, sources, NO_RULES)
+    except Exception:
+        pytest.skip(f"engine rejects {part}(date_trunc('{unit}', t))")
+    full = run_with_rules(logical, sources, FULL_RULES)
+    assert full.column("r").to_pylist() == none.column("r").to_pylist(), (
+        f"optimizer changed {part}(date_trunc('{unit}', t)):\n"
+        f"  optimized:   {full.column('r').to_pylist()}\n"
+        f"  unoptimized: {none.column('r').to_pylist()}"
+    )

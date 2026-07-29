@@ -7,14 +7,14 @@ instance (`tr`) as their first argument.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import lit
 
 
 def _is_window(p) -> bool:
-    from sqlglot import expressions as exp
-
     return isinstance(_unwrap_alias(p), exp.Window)
 
 
@@ -25,8 +25,6 @@ def _own_windows(p) -> list:
     when that subquery is translated, so it is excluded — the same scoping rule
     `_has_aggregate` applies to aggregates.
     """
-    from sqlglot import expressions as exp
-
     return [
         w for w in _unwrap_alias(p).find_all(exp.Window) if w.find_ancestor(exp.Subquery) is None
     ]
@@ -59,8 +57,6 @@ def hoist_nested_windows(projections) -> tuple[list, list]:
     Returns:
         The rewritten projections and the synthetic window items to materialize.
     """
-    from sqlglot import expressions as exp
-
     synthetic: list = []
     out: list = []
     for p in projections:
@@ -98,8 +94,6 @@ def rewrite_aggs_in_windows(tr, items) -> None:
         tr: The translator, read for its live `_agg_map`.
         items: The window projection items to rewrite, in place.
     """
-    from sqlglot import expressions as exp
-
     if not tr._agg_map:
         return
     for item in items:
@@ -115,8 +109,6 @@ def _inline_named_windows(node) -> None:
     A named-window reference parses as a `Window` whose `alias` is the window
     name and whose own spec is empty; resolve it from the SELECT's `windows`.
     """
-    from sqlglot import expressions as exp
-
     named = {w.this.name: w for w in (node.args.get("windows") or [])}
     if not named:
         return
@@ -261,8 +253,6 @@ def _frame_bound(value, side) -> int | None:
 
 
 def _window_partition(win) -> tuple:
-    from sqlglot import expressions as exp
-
     cols = win.args.get("partition_by") or []
     keys = []
     for c in cols:
@@ -273,8 +263,6 @@ def _window_partition(win) -> tuple:
 
 
 def _window_order(win) -> tuple:
-    from sqlglot import expressions as exp
-
     order = win.args.get("order")
     if order is None:
         return ()
@@ -294,13 +282,11 @@ def _const_int(node, ctx: str) -> int:
     naive ``int(node.this)`` reads the inner node and raises ``TypeError``. ``to_py()``
     folds ``Neg``/``Literal`` to a Python value; a non-constant argument is rejected.
     """
-    from sqlglot import expressions as exp
-
     if isinstance(node, (exp.Literal, exp.Neg)):
         try:
             return int(node.to_py())
         except (TypeError, ValueError):
-            pass
+            pass  # a non-constant frame bound -> fall through and reject it below
     raise NotImplementedError(f"window function {ctx!r} requires a constant integer argument")
 
 
@@ -328,8 +314,6 @@ def _ignore_nulls_func(win, fn, order):
     Returns:
         The `ds.window` functions-value — a `(fill, column)` pair.
     """
-    from sqlglot import expressions as exp
-
     name = type(fn).__name__.lower()
     if not order:
         raise NotImplementedError(f"window function {name!r} requires ORDER BY")
@@ -369,8 +353,6 @@ def _ignore_nulls_func(win, fn, order):
 
 def _window_func(win, order):
     """Map a window function node to a `ds.window` functions-value."""
-    from sqlglot import expressions as exp
-
     fn = win.this
     if type(fn).__name__.lower() == "ignorenulls":
         return _ignore_nulls_func(win, fn.this, order)

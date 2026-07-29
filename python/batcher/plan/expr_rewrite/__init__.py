@@ -27,7 +27,12 @@ from batcher.plan.expr_rewrite.algebra import (
     substitute_columns,
 )
 from batcher.plan.expr_rewrite.nodes import map_node_expressions
-from batcher.plan.expr_rewrite.subtrees import expr_key, replace_subtrees, subexpressions
+from batcher.plan.expr_rewrite.subtrees import (
+    contained_types,
+    expr_key,
+    replace_subtrees,
+    subexpressions,
+)
 from batcher.plan.expr_rewrite.traverse import ExprRule, transform_expr_up
 
 __all__ = [
@@ -35,6 +40,7 @@ __all__ = [
     "ExprRule",
     "combine_conjuncts",
     "combine_disjuncts",
+    "contained_types",
     "expr_key",
     "hoist_windows",
     "is_bare_window",

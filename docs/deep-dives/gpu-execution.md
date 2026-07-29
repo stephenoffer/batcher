@@ -45,9 +45,9 @@ A *higher* GPU utilization percentage isn't automatically better, and it cuts bo
 
 ## Warm pools
 
-Ray Data respawns its actor pool, and reloads the model, on every execution. Batcher keeps GPU inference pools warm across `collect()` calls within a session (`distributed.warm_inference_pools`, on by default), so the model loads once per *session*.
+A pool that respawns per execution reloads the model every time. Batcher keeps GPU inference pools warm across `collect()` calls within a session (`distributed.warm_inference_pools`, on by default), so the model loads once per *session*.
 
-That's worth about 2x on iterative or repeated inference, and it's the single biggest contributor to the 11x on LLM batch inference. A gpt2 FP16 load takes 7 to 10 s while generation takes about 1 s, so a per-execution reload *is* the cost. Measured over 8xT4 with 2,048 prompts, Batcher took 2.51 s against Ray Data's 27.98 s, with 100% text match.
+That's worth about 2x on iterative or repeated inference, and far more when the load dominates. A gpt2 FP16 load takes 7 to 10 s while generation takes about 1 s, so paying it once rather than per execution is most of the wall clock. Measured over 8xT4 with 2,048 prompts, Batcher generated at 814.8 prompt/s, finishing in 2.51 s with 100% text match.
 
 Pools are keyed by UDF identity, healed when an actor dies to preemption, and freed at process exit or through `release_inference_pools()`.
 
@@ -122,12 +122,12 @@ class Classifier:
         with torch.no_grad():
             return {"pred": self.model(batch["img"].cuda()).argmax(1).cpu().numpy()}
 
-# No batch_size. Ray Data hard-errors here; Batcher picks a VRAM-safe default.
+# No batch_size given. Batcher picks a VRAM-safe default.
 ds = bt.read.images("s3://bucket/frames/", decode=True, size=(224, 224))
 out = ds.ml.map_batches(Classifier, num_gpus=1, batch_format="torch").collect()
 ```
 
-Ray Data raises `ValueError: You must provide batch_size to map_batches when requesting GPUs`. Batcher starts the throughput hill-climb from a VRAM-safe 256 rows, streams it with stage overlap, and self-corrects on a CUDA OOM by halving the batch. That reaches 82% utilization at 2,451 img/s on 131k images across 8xT4, matching the hand-tuned `batch_size=128` path at 2,504 img/s and 81%, with no knobs.
+Batcher starts the throughput hill-climb from a VRAM-safe 256 rows, streams it with stage overlap, and self-corrects on a CUDA OOM by halving the batch. That reaches 82% utilization at 2,451 img/s on 131k images across 8xT4, matching the hand-tuned `batch_size=128` path at 2,504 img/s and 81%, with no knobs.
 
 ## Autocast, and why it probes
 
@@ -155,11 +155,11 @@ The measurements feed a learned loop. Per-model peak VRAM and utilization are re
 
 ## Dirty data
 
-Real corpora contain rows that fail to decode. `core/udf/call.py::_resilient_call` bisects a failing batch to isolate the bad rows and drops them against the `max_errored_rows` budget, and halves the batch on a CUDA OOM before retrying. With about 1% corrupt rows injected across 200k, Batcher retains 198,000 rows, or 99%, where Ray Data's per-block granularity retains 0%. One bad image should cost you one image, not the job.
+Real corpora contain rows that fail to decode. `core/udf/call.py::_resilient_call` bisects a failing batch to isolate the bad rows and drops them against the `max_errored_rows` budget, and halves the batch on a CUDA OOM before retrying. Tolerance is per row rather than per block, so with about 1% corrupt rows injected across 200k, Batcher retains 198,000 rows. One bad image costs you one image, not the job.
 
 ## Requirements and limitations
 
-The honest ceiling is that a *single, maximally large, compute-bound* job reaches roughly parity with Ray Data, at 2,504 against 2,383 img/s. Both engines saturate the same device at the same FLOPs, and no scheduling cleverness changes arithmetic. One T4 sustains about 400 img/s at 100% utilization on ResNet-50, and eight actors reach about 3,200 with no parallel penalty. Every win described above comes from the pipeline, so once the pipeline isn't the bottleneck there's nothing left to win.
+The ceiling is arithmetic. A *single, maximally large, compute-bound* job runs at the device's FLOPs and no scheduling changes that: one T4 sustains about 400 img/s at 100% utilization on ResNet-50, and eight actors reach about 3,200 with no parallel penalty. Every mechanism described above works on the pipeline around the model, so once the pipeline isn't the bottleneck, going faster means fewer FLOPs through FP16 or quantization.
 
 A GPU `fn` never runs in a process pool, because it has to keep a single process and CUDA context. The GIL is therefore a real constraint on a GPU stage whose Python glue is heavy.
 

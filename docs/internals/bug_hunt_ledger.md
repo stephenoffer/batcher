@@ -97,6 +97,35 @@ absent**, and the moment it could see, it was wrong.
 
 *(none — B26 closed in wave 22 below.)*
 
+### Closed 2026-07-26 — the recursion-limit abort
+
+`RelOp::from_json` called `de.disable_recursion_limit()` on the stated grounds that "the Python
+control plane already caps plan depth at its own recursion limit (~1000), which the native stack
+comfortably handles." Both halves were wrong. A plan built iteratively (`for _ in range(N): ds =
+ds.filter(...)`) reaches depth N with **zero** Python recursion, and `sys.setrecursionlimit` is
+user-settable. What had been a catchable `Err` became a stack overflow, which Rust reports as an
+**uncatchable `SIGABRT`** — no Python exception, no message, and on a shuffle actor just an opaque
+`ActorDiedError`.
+
+Measured, on the debug profile (the conservative case, and a real one — `just build` installs it):
+
+| stack | deepest that parses | first that aborts |
+|---|---|---|
+| 2 MiB (rayon worker default) | 650 | 700 |
+| 8 MiB (the thread that calls `from_json`) | 2500 | 3000 |
+
+Fixed with `bc_ir::json_max_depth` — a non-recursive byte scan that skips string literals — run
+before deserialization, returning `IrError::PlanTooDeep` past `MAX_PLAN_DEPTH = 512`. The limit is
+chosen against three bounds: above a 100-operator filter chain (measured at 103 levels) and far
+above an ordinary plan (5-6); above what Python's own recursive `to_ir()` can emit at the default
+recursion limit (~500), so **it rejects nothing that used to work**; and clear of 650 on the
+smallest stack in the process. `node_count` and `contains_media_decode` also became worklist-based,
+since they recursed and so aborted on a deep plan that had already parsed.
+
+Surfaces as `batcher._internal.errors.PlanTooDeepError`. Verified end to end through the FFI:
+depth 511 executes, depth 701 raises. Tests: `crates/bc-ir/tests/plan_depth.rs`, including a
+20,000-deep walk that a recursive implementation cannot survive.
+
 ---
 
 ## Wave 2 — the whole-engine parallel sweep (2026-07-14)
@@ -1018,11 +1047,43 @@ were all reviewed **sound**. One latent panic:
 |---|-----|--------|-------|------|
 | B292 | S2 | **`range_partition_by_i64_key` / `range_partition_by_str_key` panic (task crash) when handed more boundaries than `n_buckets`** — `partition_point` returns an id up to `boundaries.len()`, which when `>= n_buckets` indexes `scatter_into_buckets`'s histogram out of bounds (`index out of bounds: the len is 4 but the index is 5`), killing the reducer/sort task. The f64 sibling `range_partition_by_key_array` was clamped for exactly this (B58); the i64 and string scatter variants — same contract, same `partition_point` routing, same `scatter_into_buckets` — never got the clamp. Fixed with the identical monotonic `b.min(n_buckets-1)` clamp (degrades to fewer non-empty buckets, every row preserved, equal keys still co-located). Latent today (the sample-sort caller passes exactly `parts-1` boundaries) but a crash the moment these `pub` fns are wired to the worker-sized-boundary path their f64 sibling already guards against. | `crates/bc-runtime/src/shuffle.rs` (`range_partition_by_{i64,str}_key`) | rust `shuffle::tests::range_{i64,str}_more_boundaries_than_buckets_does_not_panic` |
 
-**Flagged structural risk (not fixed — needs a design decision):** hash partitioning uses `ahash`
-with fixed seeds, scoped "within a process" by the code. `ahash` is not guaranteed identical across
-CPUs with vs without AES-NI, so a **heterogeneous** cluster could route equal keys to different
-reducers (join misses / split groups). Not reproducible on one host; a cross-node-deterministic hash
-(non-`ahash`) for the routing path would be the fix.
+**Flagged structural risk — FIXED 2026-07-26, and it was not merely a risk.** Hash partitioning
+used `ahash` with fixed seeds, scoped "within a process" by the code. `ahash` selects an AES-NI
+backend from the **compile-time** `target_feature`, so a heterogeneous cluster could route equal
+keys to different reducers (join misses / split groups).
+
+It was *demonstrated*, not inferred. Compiling `bc-runtime` twice on one machine, identical source
+and identical seeds, differing only in `-C target-feature=+aes`:
+
+| key set | default build | `+aes` build |
+|---|---|---|
+| single `Int64` | `[7,1,1,2,6,7,7,7]` | `[2,0,3,6,5,6,1,7]` |
+| mixed `Int64`+`Utf8` | `[1,7,2]` | `[4,7,3]` |
+
+Every trigger is a documented, supported configuration: `.cargo/config.toml` explicitly invites
+`-C target-cpu=native` for a "known-homogeneous" cluster (which enables `+aes`);
+`_self_ship_runtime_env` returns `None` whenever `distributed.runtime_env` is set or a managed
+platform's `RAY_RUNTIME_ENV_HOOK` intervenes, so each worker runs its own wheel; and a cross-arch
+cluster ships a per-arch binary by design.
+
+Fix: `bc_arrow::PortableBuildHasher` (`crates/bc-arrow/src/hash.rs`) — xxHash64 written out and
+pinned by the published specification vectors, with every integer write explicitly little-endian.
+Applied to **only** the sites whose value crosses a process boundary: `shuffle.rs` (via
+`keys::SHUFFLE_HASHER`, so key identity stays in one place), `agg/hll.rs`, and
+`bc-sketches::SEED`. The last two carried the same false claim — `bc-sketches` said in a comment
+that its fixed seed made partition-built sketches merge identically *across* processes, which was
+untrue for the same reason, and whose failure is quieter still: a wrong `approx_count_distinct`
+with no error anywhere.
+
+Intra-process hash tables (`agg/group/*`, `join/*`, `agg/distinct.rs`, `agg/spill.rs`,
+`in_list.rs`) deliberately **stay** on `ahash` — they are faster there and unobservable from
+outside. `window_parallel.rs` kept `ahash` but got a distinct seed constant, because it had been
+byte-identical to the shuffle's and that invited the wrong inference.
+
+Tests: `crates/bc-runtime/tests/shuffle_hash_golden.rs` pins the routing per `bucket_of_rows`
+branch, `crates/bc-expr/tests/xxhash_crosscheck.rs` differential-tests the implementation against
+`twox-hash` over 4 seeds x 256 lengths, and `just check-hash-portability` runs the golden vectors
+twice under different ISA flags — which is the part that actually proves the property.
 
 ### Wave 23 parallel sweep — Avro logical types
 
@@ -1136,3 +1197,113 @@ both inputs; `Union` is positional but node-enforced identical columns); `audit.
 `PlanError`); no-role principals deny-all; a row filter over a masked column reads the raw value (catalog
 authority) while masking output, and a filter over a non-granted column restricts without exposing it.
 55 governance tests pass. Corroborates B87/B120/B152–154/B270.
+
+## Wave 24 — statistics, model fitting, constant folds, executor parity (2026-07-24)
+
+A sweep of the surfaces the earlier waves reached least: `ml/stats`, `ml` model fitting, the
+`plan.functions.analysis` free functions, the `kyber/rules/exprs` rewrite families, and the two
+execution paths. Ten defects, and an unusually high proportion of them were **silent by
+construction** — an answer that is confidently wrong with nothing executing to contradict it.
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B301 | S1 | **A Gaussian mixture could converge to two copies of the whole column and report success.** Means were seeded from a hash-sampled row per component while *every* component started with the **global** covariance, so two nearby seeds made every responsibility ~1/K. Identical components reproduce identical responsibilities, which is a fixed point EM cannot leave — and the log-likelihood stops changing, so `fit` sets `converged_`. On 300 trivially bimodal points (150 near -3, 150 near +3), `seed=7` returned means `[-0.1506, -0.0042]` with both covariances at the global 9.391 (variance 9.398), `n_iter_=3`, `converged_=True`, against sklearn's -3.017 and 2.989. `predict` returns labels and `score_samples` returns finite log-likelihoods, so nothing surfaces. Means are now seeded at evenly spaced quantiles, which cannot collide unless the column is genuinely degenerate; `seed` selects the offset inside each bucket so it stays meaningful. | `python/batcher/ml/mixture.py` | `test_ml_gaussian_mixture.py::test_every_seed_starts_the_components_apart` |
+| B302 | S1 | **Every confidence level below 0.97 was served the 95% interval.** `mean_ci_half_width` and `proportion_ci_half_width` picked `_Z95 if confidence < 0.97 else 2.5758`, so a 90% interval came back 15% too wide and a 50% interval nearly 3x too wide, and the half-width was not even monotone in the level — three different levels returned one number. On a rate of 0.4 over 200 rows: 0.50→0.0673 (correct 0.0234), 0.90→0.0673 (correct 0.0570). Out-of-range levels were accepted too (`confidence=1.5` returned the 99% width). The driver already had an accurate inverse normal CDF, so the multiplier is now `normal_ppf(1 - (1-c)/2)` — one scalar evaluation per plan — and a level outside (0,1) raises. 0.95/0.99 unchanged. | `python/batcher/plan/functions/analysis/inference.py` | `test_analysis_inference.py` (the module had **no tests at all**) |
+| B303 | S1 | **A constant fold disagreed with the runtime, making an equality predicate unsatisfiable.** `hex` folded via Python's `bytes.hex()` (lowercase) where the engine and DuckDB return uppercase, so `WHERE hex(col) = hex('needle')` compared an uppercase column against a lowercase constant and matched **nothing, for every input**. A fold fires only on a literal, so a column-based test cannot see it and a literal-based test cannot either. | `python/batcher/kyber/rules/exprs/text_folds.py` | `test_diff_expr_rewrite_rules.py::test_folding_a_literal_equals_running_on_a_column` |
+| B304 | S1 | **`lpad`/`rpad` folds failed to truncate.** Both used `str.rjust`/`str.ljust`, which return the input untouched when it is already wider than the target, where SQL pads *to* a width and truncates: `lpad('Hello World', 10)` folded to `'Hello World'` against the runtime's and DuckDB's `'Hello Worl'`. Fixed by `text[:width]` before justifying, which leaves the padding branch unchanged. | same | same |
+| B305 | S1 | **Jarque-Bera was computed from the wrong moments.** `jarque_bera` fed `skewness()`/`kurtosis()` — the bias-corrected `G1`/`G2` estimators pandas reports — into `n/6·(S² + K²/4)`, but JB is defined on the population (`1/n`) moments and the chi-squared-with-2-df null `normality_test` uses is derived for that version. So it returned a statistic that was not Jarque-Bera and a p-value describing a statistic nobody computed. At n=50 on a normal sample: p=0.083 against the correct 0.136 — across a 0.10 threshold. Now inverts the `G1`/`G2` definitions (exact, keeps the stable aggregates); matches `scipy.stats.jarque_bera` to 5.3e-13 across normal/exponential/uniform at eight sizes. The old tests asserted only which side of 0.01 the p-value fell on, which both versions satisfy. | `python/batcher/plan/functions/analysis/shape.py` | `test_ml_hypothesis.py::test_normality_statistic_and_pvalue_match_scipy` |
+| B306 | S2 | **A per-row flag had to be encoded the one way each test expected, and the conventions were opposite.** `binomial_test`/`proportion_ztest` compared `col == 1`; `mcnemar_test` compared `col == True`. Each rejects the other encoding with a raw `RuntimeError: Invalid comparison operation: Int64 == Boolean` from inside Arrow, so no single habit worked across one module — and `mcnemar_test` documents booleans while `proportion_ztest`'s own doctest uses integers. A shared `indicator()` in `ml/stats/_shared.py` casts to boolean, accepting boolean/integer/float and keeping nulls null so a missing observation is not a failure. All nine combinations now return byte-identical results. | `python/batcher/ml/stats/{_shared,hypothesis}.py` | `test_ml_hypothesis.py::test_indicator_tests_accept_every_flag_encoding` |
+| B307 | S1 | **Two feature scorers returned the same maximal score for every continuous column.** `chi2_scores` and `mutual_info_scores` score a categorical feature through a contingency table; handed a continuous column they returned that table's structural maximum — exactly the row count, and exactly `H(target)` — *identically for every feature*, because a column with one level per row determines the target by construction. `select_k_best` then ranked features that had all scored the same and returned whichever the dict ordered first: a confident selection resting on no information. Easy to reach because all four scorers in the module share `(ds, target, features)` and the other two are *for* continuous features. Now rejects a feature with one distinct value per row, naming the column, the ratio, and the scorer to use instead. | `python/batcher/ml/feature_scores.py` | `test_ml_feature_scores.py::test_a_categorical_scorer_refuses_an_all_distinct_column` |
+| B308 | S2 | **`pinball_loss` accepted a quantile outside [0,1] and returned a negative loss.** Inside `[0,1]` the under- and over-prediction weights share a sign, which is what makes the result a loss; outside they do not. On a forecast overshooting every actual by 10: `quantile=1.5`→-5.0, `quantile=90` (the percentile-for-quantile typo)→**-890.0**, against 1.0 for the correct 0.9 — a spectacular-looking score, and anything minimizing the metric is driven away from the data. NaN propagated silently. The four sibling quantile-taking functions all already validated their domain; this was the only gap in five. | `python/batcher/plan/functions/metrics/model/errors.py` | `test_ml_metrics.py::test_pinball_loss_rejects_a_quantile_outside_the_unit_interval` |
+| B309 | S3 | **A re-granted shuffle channel snapped back to the previous query's window.** `AIMDFlowControl.rewindow` exists because a warm fleet outlives its query, and it reset `_window` and `_slow_start` but not the CUBIC state. `_w_max` and `_rounds_since_backoff` describe the *previous* query, so the first uncongested round after a re-grant evaluated that stale curve at a large `t` and `(t-k)³` restored the old window at once: a channel re-granted 4 credits went to 64 (the ceiling) in one round where a warm-started channel goes to 5. The re-grant held for exactly one round — the stale-grant regression `rewindow` exists to prevent, one round later. | `python/batcher/carbonite/policies/flow_control.py` | `test_carbonite_flow_control.py::test_a_regrant_is_not_undone_by_the_previous_querys_cubic_curve` |
+| B310 | S2 | **An SCD type-1 first load could not create its own table.** `ds.scd.type1` delegated straight to `ds.write.merge` with no branch for an absent target, unlike its three siblings, which each check `resolve_filesystem(target).exists(target)`. Harmless for a file target (a MERGE to a missing Parquet just writes it) but for a transactional format there is no table to merge into, so the dimension's very first load raised `IOError: path '...' does not exist`. Verified per format before the fix: parquet OK, csv OK, delta failed. | `python/batcher/api/dataset/scd.py` | `test_merge_scd.py` (2 tests, both fail without) |
+| B311 | S4 | **A mistyped window duration escaped as an untyped error advising a unit the same function refuses.** `_duration_micros` raised `PlanError` for a calendar unit and a non-positive duration but let `parse_offset`'s bare `ValueError` propagate — and that message recommends `y`/`mo`, the two units it rejects on the next line as having no fixed length, so following the advice produces a second error. It also called the argument an "offset", which is neither `duration` nor `slide`. | `python/batcher/plan/functions/temporal.py` | `test_window_duration_errors.py` |
+| B312 | S4 | **A window width and a watermark delay accepted disjoint duration spellings.** One pipeline writes both, and they were parsed by different functions with vocabularies that never fell back to each other: seven of twelve ordinary durations worked on exactly one side. `"1d"` sized a window but could not delay a watermark; `"10 seconds"` did the reverse. Both now fall back to the other parser and `d`/`w`/`day`/`week` join the spelled-out table, so the two accept the same set and agree on the value in microseconds for every shared spelling. The one remaining difference is semantic, not syntactic: `"0s"` is a valid watermark and not a valid window width. | `python/batcher/plan/streaming/_duration.py` (split out of `spec.py`), `plan/functions/temporal.py` | `test_window_duration_errors.py::test_a_window_and_a_watermark_accept_the_same_durations` |
+
+**Hardened, not a defect: `union_ndv` ignored a row cap of exactly zero.** The cap ran under
+`if rows is not None and rows > 0.0`, so a *known* row count of zero skipped it and the
+`max(1.0, combined)` floor then reported at least one distinct value: `union_ndv([1e9, 1e9], 0)`
+returned 1e9 while every positive `rows` capped correctly. Unreachable from either caller —
+`columns.py` passes `total_rows or None` and `estimator.py` only sees `total == 0` when every
+branch is empty (which returns `None` from the `known` filter) *and* independently caps with
+`min(total, ...)`. Both were checked before changing anything. Fixed because the parameter is
+documented as capping whenever the count is known. `test_cardinality_estimator_domains.py`.
+
+### Clean audits — do not re-sweep these
+
+Recorded so a later wave does not repeat them. Each was a full sweep that found nothing, and in
+this wave the ratio was roughly 3 defects per 18 sweeps.
+
+- **Distribution tails (the p-value engine).** `chi2_sf`, `f_sf`, `students_t_two_sided_p`,
+  `normal_two_sided_p` against SciPy over 200+ points, df 1–1000, probabilities down to 7e-51.
+  Worst *relative* error 4.4e-13. The existing tests used `abs=1e-10`, which any answer satisfies
+  once the true value drops below it, so the tolerance was moved to `rel=1e-9` with deep-tail cases
+  added and `normal_two_sided_p` given its first test.
+- **Metadata shortcuts vs forced execution.** 832 real comparisons: every shortcut-able terminal
+  (`count`, `is_empty`, `min`/`max`, `n_unique`, global aggregates) against the same query with
+  `_metadata_answerable` patched closed, over 8 data shapes x 12 plan shapes including
+  filter-to-empty, limit-zero, distinct, union, sort and chained combinations. (A further 192 pairs
+  were vacuous — `ds.null_count()` takes no column argument, so both sides raised the same
+  `TypeError` and the comparator counted that as agreement. Corrected in the count.)
+- **`ds.meta`.** 520 comparisons against ground truth computed in Python, over the whole surface:
+  `ColumnMeta` summaries (also cross-checked against an executed aggregate), `NullsMeta`,
+  `SchemaMeta` type classification, `count_where`/`is_empty_where` against an executed filter, and
+  every `ColumnChecks` predicate. `is_binary_valued` documents "at most two distinct values", so a
+  constant column qualifying is correct; the vacuous-truth answers on empty input are standard.
+  First tests: `test_dataset_meta_answers.py`.
+- **The expression rewrite rules** (~50 across `kyber/rules/exprs/`). Self-comparisons keep NULL
+  semantics for all six operators on int and float (`x = x` is NULL, not TRUE); `x*0`, `x%1`, `x/1`
+  keep the null; `is_nan`/`is_infinite` on an integer are FALSE where present and NULL where not;
+  17 regex patterns spanning every prefix/suffix/anchored rewrite target including `a.c` vs `a\.c`
+  and a value with a newline; `min`/`max` push through `unique` while `sum`/`len`/`mean` correctly
+  do not; `reverse`/`unique` involutions, slice composition, `struct_field_of_make_struct`.
+  `combine_adjacent_date_offsets` correctly fires only on zero-months — month clamping is
+  non-associative (Jan 31 +1mo +1mo is Mar 29, +2mo is Mar 31; 4 of 7 month-end dates differ, in
+  both engines), and that guard is now pinned. The other 24 folds (cast rounding at `.5`, overflow,
+  string parsing, Unicode case, `len`, `substr`) all match fold-vs-runtime-vs-DuckDB.
+- **The two executors.** 18 query shapes on `execution.streaming` True and False, plus
+  `shrink_output_dtypes` on and off, compared row for row with sorts compared **in order**. All
+  agree. First tests: `test_diff_executor_parity.py`.
+- **Sorts under a forced spill budget.** 1 MB budget over 40k rows, ascending and descending,
+  single and two-key, `collect` and `iter_batches` agreeing row-for-row across batch boundaries,
+  nulls/NaN contiguous at one end, sort+limit equalling the head of the full sort, and the
+  degenerate shapes. Checked with ordered assertions throughout.
+- **Model fitting vs sklearn.** GLM coefficients and intercepts (Poisson/Gamma/Tweedie),
+  Lasso/ElasticNet coefficients plus the huge-L1-zeroes-everything invariant, LDA/QDA predictions,
+  Mahalanobis distance, all three `outlier_bounds` methods, KMeans centroids.
+- **Preprocessors and the rest of `ml/stats`.** Five scalers against sklearn including degenerate
+  scales and null survival; `normal_ppf` to 5.4e-9; the nonparametric tests (Mann-Whitney,
+  Kruskal-Wallis with ties, Wilcoxon — which matches `method="approx", correction=True` as
+  documented, not SciPy's default — Friedman, Cliff's delta), Levene/Bartlett, partial correlation,
+  VIF, the robust estimators (`trimmed_mean` is quantile-based **by documentation**, which differs
+  from SciPy's count-based trim), and the descriptive measures.
+- **The 13 order-statistic functions** in `plan.functions.analysis` that no test mentioned —
+  `midhinge`, `trimean`, `bowley_skew`, `quartile_dispersion`, `interdecile_range`, `decile_ratio`,
+  `moors_kurtosis`, `geometric_std`, `pearson_mode_skew`, `correlation_ratio`, `point_biserial`,
+  `signal_ratio`, `weighted_covariance` — all match their documented closed forms.
+  `test_analysis_order_statistics.py`.
+- **Cross-validation and permutations.** k-fold predicts every row exactly once from a model that
+  did not see it; `epoch_permutation` is a bijection at every size/epoch/seed; `constant_columns`,
+  `correlated_columns`, `partial_dependence`.
+- **The approximation family.** HLL well inside its documented 2% (worst 1.10% at 1000 distinct);
+  `approx_quantile`/`approx_median` inside the observed range and monotone in `q` across five
+  distributions including a 1e9 heavy tail; empty and all-null give no value rather than a wrong
+  one. (Corroborates the earlier DDSketch clamp.)
+- **`expr_key` and the predicate combiners.** Zero collisions across 30 structurally distinct
+  expressions — `a+b` vs `b+a`, `lit(1)` vs `lit(1.0)` vs `lit("1")`, `a>1` vs `a>=1`,
+  `cast(a,int64)` vs `cast(a,float64)` all distinct, which is what CSE correctness requires.
+- **Order-independent assertions on sorts.** An AST audit of every test found 12 that call `.sort()`
+  and assert only with the multiset `assert_same`; all 12 are justified in place (the `GROUP BY`
+  above discards row order, and `array_agg`'s list order is compared element-wise *as a value*),
+  and the sort-heavy files use `assert_same_ordered`. No weak assertion on a sort remains.
+- **The four export paths.** `to_pydict`, `to_pylist`, `collect().to_pydict`, `to_polars` agree
+  across int/float/string/bool/date/list columns with nulls, NaN and -0.0. `to_pandas` differs only
+  where pandas itself cannot represent the value (a null in a float64 column becomes NaN).
+- **`smape`** honours every claim in its docstring: bounded in [0,2], finite when the actual is
+  zero, and a both-zero row contributes 0 rather than dividing by zero.
+
+**Left open — needs a human.** The B303/B304 fix lives in `kyber/rules/exprs/text_folds.py`, which
+was an *untracked* new file from a concurrent session at the time; committing it would have taken
+that session's whole work-in-progress under an unrelated message. The three-line change is in the
+working tree and `test_diff_expr_rewrite_rules.py` (committed) fails loudly if the file lands
+without it. Confirm the fix is present when that file is committed.

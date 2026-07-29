@@ -1,13 +1,15 @@
-"""Per-signature learned scalars — the priors that seed sizing, pre-aggregation and the re-opt gate.
+"""Per-signature learned scalars — the priors that seed sizing and pre-aggregation.
 
 Where `bandit` picks between algorithms and `crossover` learns a threshold, this module learns a
 *number* per plan signature from what actually happened: how big each join side was, how many rows
-a breaker shuffled, how far an aggregate collapsed its input, how often adaptive re-optimization
-changed the plan. Each is folded into O(1) sufficient statistics by a `record_*` function and read
-back by a `learned_*` one.
+a breaker shuffled, how far an aggregate collapsed its input. Each is folded into O(1)
+sufficient statistics by a `record_*` function and read back by a `learned_*` one.
+
+Whether to re-optimize *between* stages is not here: it is a two-sided cost question, so it
+lives with the other regret-minimizing choices in `bandit.learned_adaptive_route`.
 
 Every one of them steers sizing, sharding or planning effort only — a build orientation, a
-partition count, whether to pre-aggregate, whether to re-optimize — so a wrong learned value costs
+partition count, whether to pre-aggregate — so a wrong learned value costs
 throughput and never correctness. The family contract is in the package docstring.
 """
 
@@ -19,17 +21,16 @@ from typing import TYPE_CHECKING
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber import plan_cache
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
 
 __all__ = [
-    "learned_adaptive_helps",
     "learned_build_sides",
     "learned_partial_agg",
     "learned_partition_count",
     "learned_signature_rows",
-    "record_adaptive_flip",
     "record_group_reduction",
     "record_join_sides",
     "record_partition_rows",
@@ -38,7 +39,6 @@ __all__ = [
 _NS_SIDES = "tuning.join_sides"  # per-signature measured (left_rows, right_rows)
 _NS_PART = "tuning.partition_rows"  # per-signature measured shuffle rows
 _NS_GROUP = "tuning.group_reduction"  # per-signature measured groups / input rows
-_NS_ADAPT = "tuning.adaptive_flip"  # per-signature re-optimization flip counts
 
 
 # Decision family — per-signature priors (build sides, partitions, pre-aggregation).
@@ -60,12 +60,12 @@ def _record_scalar(
     if hub is None or value < 0.0:
         return
     try:
-        entry = dict(hub.get_keyed_param(namespace, key) or {})
+        entry = dict(hub.get_keyed_param(scoped(namespace), key) or {})
         n = int(entry.get("n_obs", 0))
         prior = entry.get(field)
         entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        plan_cache.record_write(hub, namespace, key, entry)
+        plan_cache.record_write(hub, scoped(namespace), key, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record scalar prior", exc)
 
@@ -77,13 +77,13 @@ def record_join_sides(
     if hub is None:
         return
     try:
-        entry = dict(hub.get_keyed_param(_NS_SIDES, signature) or {})
+        entry = dict(hub.get_keyed_param(scoped(_NS_SIDES), signature) or {})
         n = int(entry.get("n_obs", 0))
         for field, value in (("left", left_rows), ("right", right_rows)):
             prior = entry.get(field)
             entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        plan_cache.record_write(hub, _NS_SIDES, signature, entry)
+        plan_cache.record_write(hub, scoped(_NS_SIDES), signature, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record join sides", exc)
 
@@ -98,7 +98,7 @@ def learned_build_sides(hub: MetadataHub | None, signature: str) -> tuple[float,
     if hub is None:
         return None
     try:
-        entry = hub.get_keyed_param(_NS_SIDES, signature) or {}
+        entry = hub.get_keyed_param(scoped(_NS_SIDES), signature) or {}
         left, right = entry.get("left"), entry.get("right")
         if left is None or right is None:
             return None
@@ -125,7 +125,7 @@ def learned_partition_count(
     if hub is None or target_rows <= 0:
         return None
     try:
-        entry = hub.get_keyed_param(_NS_PART, signature) or {}
+        entry = hub.get_keyed_param(scoped(_NS_PART), signature) or {}
         rows = entry.get("rows")
         if rows is None or float(rows) <= 0.0:
             return None
@@ -157,7 +157,7 @@ def learned_partial_agg(
     if hub is None:
         return None
     try:
-        entry = hub.get_keyed_param(_NS_GROUP, signature) or {}
+        entry = hub.get_keyed_param(scoped(_NS_GROUP), signature) or {}
         ratio = entry.get("ratio")
         return None if ratio is None else float(ratio) <= engage_below
     except Exception as exc:  # pragma: no cover - best-effort learned prior
@@ -165,7 +165,7 @@ def learned_partial_agg(
         return None
 
 
-# Decision family — learned selectivity-primed estimate and the adaptive-re-opt gate.
+# Decision family — learned selectivity-primed estimate.
 def learned_signature_rows(hub: MetadataHub | None, signature: str) -> float | None:
     """The measured output rows recorded for a (sub)plan signature, or `None` if never seen.
 
@@ -184,40 +184,3 @@ def learned_signature_rows(hub: MetadataHub | None, signature: str) -> float | N
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "read signature rows", exc)
         return None
-
-
-def record_adaptive_flip(hub: MetadataHub | None, signature: str, flipped: bool) -> None:
-    """Record whether a stage's adaptive re-optimization changed the plan (`flipped`)."""
-    if hub is None:
-        return
-    try:
-        entry = dict(hub.get_keyed_param(_NS_ADAPT, signature) or {})
-        entry["flips"] = int(entry.get("flips", 0)) + (1 if flipped else 0)
-        entry["total"] = int(entry.get("total", 0)) + 1
-        plan_cache.record_write(hub, _NS_ADAPT, signature, entry)
-    except Exception as exc:  # pragma: no cover - best-effort learned prior
-        note_suppressed("kyber", "record adaptive flip", exc)
-
-
-def learned_adaptive_helps(
-    hub: MetadataHub | None, signature: str, *, min_total: int = 3, threshold: float = 0.25
-) -> bool:
-    """Whether stage-by-stage re-optimization has historically helped this signature.
-
-    Turns the adaptive gate itself into a learned decision: enable per-stage re-opt only for shapes
-    where measured re-optimization actually *flipped* a plan often enough (a flip fraction above
-    `threshold`), so cheap stable queries skip the re-opt overhead. `False` cold — the caller keeps
-    its own default heuristic. Re-optimization only re-plans equivalent algebra, so gating it never
-    changes a result; this only trades planning overhead.
-    """
-    if hub is None:
-        return False
-    try:
-        entry = hub.get_keyed_param(_NS_ADAPT, signature) or {}
-        total = int(entry.get("total", 0))
-        if total < min_total:
-            return False
-        return int(entry.get("flips", 0)) / total >= threshold
-    except Exception as exc:  # pragma: no cover - best-effort learned prior
-        note_suppressed("kyber", "read adaptive flip", exc)
-        return False

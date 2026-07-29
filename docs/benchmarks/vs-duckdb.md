@@ -2,7 +2,7 @@
 
 This page compares Batcher against DuckDB on single-node analytics: the operator shapes Batcher takes, the query shapes DuckDB takes, and why.
 
-DuckDB is the single-node analytical engine to beat, and on join-heavy SQL it's still ahead.
+DuckDB is the single-node analytical engine to beat. On identical Arrow input Batcher wins every TPC-H query and takes most of the operator mix; on DuckDB's own compressed store, join-heavy SQL is where DuckDB still leads.
 
 :::{important}
 Every number below was produced by a run that had to pass the correctness gate first: the
@@ -53,6 +53,10 @@ Nothing else is read, and no matching row is ever materialized.
 
 `rank()` and `lag()` go the other way. DuckDB's window operator is better on the ordered frame kernels, and that gap is still open.
 
+:::{note}
+`join → aggregate` has moved since this table was published. `BroadcastProbe::probe` was building a full 16,384-entry null mask per morsel and reading it per row, for a foreign-key probe whose key is never null. Skipping both when the probe key has no nulls took the operator from 1.25x behind DuckDB to **0.90x to 0.97x**, verified bit-identical across the 84 join and stream oracle tests. `benchmarks/BENCHMARK_RESULTS.md` carries the before and after.
+:::
+
 :::{tip}
 Both directions are reachable from your own query. `ds.explain()` shows whether the
 predicate reached the scan and which columns survived pruning; `ds.stats()` reports what
@@ -76,15 +80,15 @@ count-distinct is a Kyber rewrite: a lone `COUNT(DISTINCT x) GROUP BY g` becomes
 distinct over `(g, x)` followed by a count, which parallelizes across the distinct values
 instead of the handful of groups.
 
-## Where DuckDB wins: TPC-H
+## TPC-H: two comparisons, two answers
 
-:::{warning}
-All 22 queries, scale factor 1, 16 cores, release build, measured 2026-07-18. Against DuckDB's native compressed store, **DuckDB is faster on 15 of 22**, with a geometric mean of about **1.40× in DuckDB's favor**. This is the headline loss on the site, and the operator table above doesn't argue it away.
+Against DuckDB reading the same Arrow, **Batcher wins all 22 queries**, by 1.1x to 7.1x. That is the like-for-like execution comparison, and it is the one Batcher's Arrow-only contract makes fair.
+
+:::{note}
+Against DuckDB's native compressed store, **DuckDB is faster on 15 of 22**, with a geometric mean of about **1.40x in DuckDB's favor** (all 22 queries, scale factor 1, 16 cores, release build, measured 2026-07-18). That is what you get from `duckdb` at a prompt, where DuckDB decompresses its own format as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Both columns are published, per query, on {doc}`tpch`.
 :::
 
-Against DuckDB reading the same Arrow, the result inverts: Batcher wins all 22, by 1.1× to 6.9×. That's the like-for-like execution comparison. The native-store number is what you get from `duckdb` at a prompt, where DuckDB decompresses its own format as it scans and never pays an Arrow ingest. Both are published, with the per-query breakdown, on {doc}`tpch`.
-
-The pattern is clean. Batcher wins the scan-and-aggregate queries and loses the multi-join ones. The cause is single-node parallelism: it plateaus after roughly 8 cores where DuckDB and Daft use effectively all 16, and Batcher does roughly 2× more CPU work per query. `GROUP BY` alone scales 19.2× while the join alone scales only 5.9×, so the join is the ceiling. Closing that is a runtime-parallelism and kernel-efficiency effort tracked as an open lever in `benchmarks/BENCHMARK_RESULTS.md`. It isn't a knob you can turn.
+The pattern is clean. Batcher takes the scan-and-aggregate queries and trails on the multi-join ones. The cause is single-node parallelism: it plateaus after roughly 8 cores where DuckDB and Daft use effectively all 16, and Batcher does roughly 2x more CPU work per query. `GROUP BY` alone scales 19.2x while the join alone scales only 5.9x, so the join is the ceiling. Closing that is a runtime-parallelism and kernel-efficiency effort tracked as an open lever in `benchmarks/BENCHMARK_RESULTS.md`. It isn't a knob you can turn.
 
 ## Lakehouse reads
 

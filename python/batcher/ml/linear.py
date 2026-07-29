@@ -16,6 +16,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import (
+    argmax_prediction,
+    linear_score,
+    require_fitted,
+    require_rows,
+)
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -27,7 +33,7 @@ __all__ = ["LinearRegression", "LogisticRegression", "Ridge", "RidgeClassifier"]
 
 
 def _solve(
-    ds: Dataset, features: Sequence[str], target: str, alpha: float
+    ds: Dataset, features: Sequence[str], target: str, alpha: float, estimator: object
 ) -> tuple[list[float], float]:
     """Fit linear coefficients and intercept from the moments of `features` and `target`."""
     import numpy as np
@@ -43,16 +49,25 @@ def _solve(
             raise ColumnNotFoundError(
                 unknown_message("column", name, ds.columns, hint="Pass an existing column.")
             )
+    d = len(features)
+    n = ds.count()
+    require_rows(estimator, n, 2, because="the covariance it is built from divides by n - 1")
     means = ds.agg(**{name: mean_(col(name)) for name in columns}).collect()
     center = {name: float(means.column(name)[0].as_py()) for name in columns}
-    n = ds.count()
     covariance = covariance_matrix(ds, columns).to_pydict()
     matrix = np.array([covariance[name] for name in columns], dtype=float).T
-    d = len(features)
     sxx = matrix[:d, :d]
     sxy = matrix[:d, d]
     system = (n - 1) * sxx + alpha * np.eye(d)
-    coefficients = np.linalg.solve(system, (n - 1) * sxy)
+    try:
+        coefficients = np.linalg.solve(system, (n - 1) * sxy)
+    except np.linalg.LinAlgError as exc:
+        # Singular means the features are linearly dependent, which `LinAlgError` never says.
+        raise PlanError(
+            f"the features {list(features)} are linearly dependent, so the least-squares "
+            f"system has no unique solution. Drop the redundant column (a duplicate, a "
+            f"constant, or a one-hot keeping every level), or use Ridge(alpha=...)."
+        ) from exc
     intercept = center[target] - sum(
         coefficients[i] * center[name] for i, name in enumerate(features)
     )
@@ -115,7 +130,7 @@ class LinearRegression:
         Returns:
             ``self``, fitted.
         """
-        self.coef_, self.intercept_ = _solve(ds, self.features, self.target, self._alpha)
+        self.coef_, self.intercept_ = _solve(ds, self.features, self.target, self._alpha, self)
         return self
 
     def predict(self, ds: Dataset) -> Dataset:
@@ -137,11 +152,8 @@ class LinearRegression:
         Returns:
             A new lazy `Dataset` with the prediction column appended.
         """
-        if not self.coef_:
-            raise PlanError("LinearRegression must be fitted before predict.")
-        expression = lit(self.intercept_)
-        for weight, name in zip(self.coef_, self.features, strict=True):
-            expression = expression + lit(weight) * col(name)
+        require_fitted(self, self.coef_)
+        expression = linear_score(self.features, self.coef_, self.intercept_)
         return ds.with_columns(**{self.output_column: expression})
 
 
@@ -290,6 +302,7 @@ class LogisticRegression:
                 )
         terms = [lit(1.0), *[col(name) for name in self.features]]
         m = len(terms)
+        require_rows(self, ds.count(), m, because="IRLS needs one row per fitted term")
         beta = np.zeros(m)
         for iteration in range(self.max_iter):
             eta = self._linear_predictor(list(beta[1:]), float(beta[0]))
@@ -337,8 +350,7 @@ class LogisticRegression:
         Returns:
             A new lazy `Dataset` with the probability column appended.
         """
-        if not self.coef_:
-            raise PlanError("LogisticRegression must be fitted before predict.")
+        require_fitted(self, self.coef_)
         eta = self._linear_predictor(self.coef_, self.intercept_)
         probability = lit(1.0) / (lit(1.0) + (-eta).exp())
         return ds.with_columns(**{self.output_column: probability})
@@ -362,8 +374,7 @@ class LogisticRegression:
         Returns:
             A new lazy `Dataset` with the 0/1 label column appended.
         """
-        if not self.coef_:
-            raise PlanError("LogisticRegression must be fitted before predict.")
+        require_fitted(self, self.coef_)
         eta = self._linear_predictor(self.coef_, self.intercept_)
         label = when(eta >= lit(0.0)).then(lit(1)).otherwise(lit(0))
         return ds.with_columns(**{self.output_column: label})
@@ -453,7 +464,9 @@ class RidgeClassifier:
         for label in labels:
             indicator = when(col(self.target) == lit(label)).then(lit(1.0)).otherwise(lit(-1.0))
             one_vs_rest = ds.with_columns(__bt_ind=indicator)
-            coefficients, intercept = _solve(one_vs_rest, self.features, "__bt_ind", self.alpha)
+            coefficients, intercept = _solve(
+                one_vs_rest, self.features, "__bt_ind", self.alpha, self
+            )
             self.classes_.append(label)
             self.weights_[label] = coefficients
             self.bias_[label] = intercept
@@ -461,10 +474,7 @@ class RidgeClassifier:
 
     def _score(self, label: object):
         """The ridge regression score expression for one class."""
-        expression = lit(self.bias_[label])
-        for weight, name in zip(self.weights_[label], self.features, strict=True):
-            expression = expression + lit(weight) * col(name)
-        return expression
+        return linear_score(self.features, self.weights_[label], self.bias_[label])
 
     def predict(self, ds: Dataset) -> Dataset:
         """Append the highest-scoring class label for each row.
@@ -485,13 +495,6 @@ class RidgeClassifier:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("RidgeClassifier must be fitted before predict.")
-        prediction = lit(self.classes_[0])
-        best = self._score(self.classes_[0])
-        for label in self.classes_[1:]:
-            score = self._score(label)
-            closer = score > best
-            prediction = when(closer).then(lit(label)).otherwise(prediction)
-            best = when(closer).then(score).otherwise(best)
+        require_fitted(self, self.classes_)
+        prediction = argmax_prediction(self.classes_, self._score)
         return ds.with_columns(**{self.output_column: prediction})

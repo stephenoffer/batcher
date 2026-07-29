@@ -10,8 +10,9 @@ The `Sink` protocol itself lives in `io.sink`; this base structurally satisfies 
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import IO, Any, ClassVar
@@ -20,6 +21,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
 from batcher.io.base._paths import normalize_path
+from batcher.io.base._transient import with_retry
 from batcher.io.filesystem import FileSystem, resolve_filesystem
 from batcher.io.manifest import WriteManifest, WrittenFile
 
@@ -54,6 +56,12 @@ def _partition_run_starts(ordered: pa.Table, cols: list[str], pc: Any) -> list[i
         changed = differs if changed is None else pc.or_(changed, differs)
     # `changed[i]` compares row i+1 against row i, so a True at i starts a run at i+1.
     return [0, *(i + 1 for i, flag in enumerate(changed.to_pylist()) if flag)]
+
+
+# Write-side retry, mirroring the read path's `_READ_RETRY_*` so a deployment tunes one
+# idea rather than two. See `FileSink.write` for why retrying a write is safe.
+_WRITE_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_WRITE_RETRY_ATTEMPTS", "3")))
+_WRITE_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_WRITE_RETRY_BACKOFF_S", "0.5")))
 
 
 class FileSink(ABC):
@@ -115,6 +123,14 @@ class FileSink(ABC):
         Data's overwrite data-loss (ray#62019). Local writes go via a temp file +
         atomic rename; object stores write directly (a single PUT is already atomic).
 
+        A **transient** failure is retried with jittered backoff, as the read path already
+        does. A fast pipeline feeding a directory write bursts concurrent PUTs at one key
+        prefix, which is what makes a store answer `SlowDown`/503 — a property of the moment,
+        not of the data, that used to kill a job at 99%. Safe here because a failed attempt
+        publishes nothing: the atomic writer discards the partial and the table is still in
+        memory, so the retry writes the same bytes. `write_stream` has no equivalent — its
+        batches are an iterator a retry cannot rewind.
+
         Examples:
             .. doctest::
 
@@ -138,8 +154,12 @@ class FileSink(ABC):
         fs = self._resolve(path)
         if resume and fs.exists(path):
             return WrittenFile(path=path, rows=table.num_rows, bytes=_safe_size(fs, path))
-        with fs.atomic_writer(path) as fh:
-            self._write_file(table, fh)
+
+        def _put() -> None:
+            with fs.atomic_writer(path) as fh:
+                self._write_file(table, fh)
+
+        with_retry(_put, attempts=_WRITE_RETRY_ATTEMPTS, backoff_base_s=_WRITE_RETRY_BACKOFF_S)
         return WrittenFile(path=path, rows=table.num_rows, bytes=_safe_size(fs, path))
 
     def write_stream(
@@ -180,6 +200,53 @@ class FileSink(ABC):
         """
         from itertools import chain
 
+        def encode(first: pa.RecordBatch, rest: Iterator[pa.RecordBatch], fh: IO[Any]) -> int:
+            rows = 0
+            if (writer := self._open_stream_writer(fh, first.schema)) is None:
+                table = pa.Table.from_batches(list(chain([first], rest)))
+                self._write_file(table, fh)
+                return table.num_rows
+            for batch in chain([first], rest):
+                if batch.num_rows:
+                    self._write_batch(writer, batch)
+                    rows += batch.num_rows
+            self._close_stream_writer(writer)
+            return rows
+
+        return self._stream_to_file(batches, path, schema=schema, resume=resume, encode=encode)
+
+    def _stream_to_file(
+        self,
+        batches: Iterator[pa.RecordBatch],
+        path: str,
+        *,
+        schema: pa.Schema | None,
+        resume: bool,
+        encode: Callable[[pa.RecordBatch, Iterator[pa.RecordBatch], IO[Any]], int],
+    ) -> WrittenFile:
+        """Run `encode` inside the scaffold every single-file streaming write shares.
+
+        Destination normalization, filesystem resolution, the `resume` short-circuit, the
+        atomic writer, the empty-stream case, and the `WrittenFile` accounting are identical
+        for every format; only the encoding differs. A subclass that wants a different
+        encoding strategy (NDJSON straight-through, a parallel CSV window) overrides
+        `write_stream` and calls this with its own `encode` rather than restating the
+        scaffold — which is how two of them came to resolve the filesystem with the
+        module-level `resolve_filesystem`, silently dropping the caller's `storage_options`
+        and `filesystem`, and to skip `_dest`, recording an un-normalized path in the
+        manifest.
+
+        Args:
+            batches: The batches to persist, consumed one at a time.
+            path: Destination file URI, normalized here.
+            schema: Schema used to write a valid empty file when `batches` yields nothing.
+            resume: Leave an already-present (hence complete) file untouched.
+            encode: Given the first batch, the rest of the iterator, and the open file
+                handle, write them and return the row count.
+
+        Returns:
+            The file that was written, with its row count and size on storage.
+        """
         path = self._dest(path)
         fs = self._resolve(path)
         if resume and fs.exists(path):
@@ -193,16 +260,8 @@ class FileSink(ABC):
             if first is None:
                 empty = schema.empty_table() if schema is not None else pa.table({})
                 self._write_file(empty, fh)
-            elif (writer := self._open_stream_writer(fh, first.schema)) is None:
-                table = pa.Table.from_batches(list(chain([first], it)))
-                self._write_file(table, fh)
-                rows = table.num_rows
             else:
-                for batch in chain([first], it):
-                    if batch.num_rows:
-                        self._write_batch(writer, batch)
-                        rows += batch.num_rows
-                self._close_stream_writer(writer)
+                rows = encode(first, it, fh)
         return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any | None:  # noqa: ARG002 (extension-point args used by overrides)

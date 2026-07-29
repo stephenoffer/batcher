@@ -57,10 +57,10 @@ clips never all co-resides. Keep `batch_size` small for multi-GB clips.
 Decode is fast because it runs in the data plane, not a Python loop. Image decode uses
 SIMD JPEG, including a DCT-scaled path for large frames feeding small model inputs, and
 SIMD resize, fanned out per row across every core. The result crosses into a shaped
-tensor column with no per-batch re-type step. On a 96-core node this makes image decode
-and resize **2.4x faster than Daft and 6.1x faster than Ray Data**, and LiDAR
-point-cloud loading **2.4x faster than Ray Data**. See
-[Multimodal and physical-AI ingest](../user-guide/performance.md) and the reproducible
+tensor column with no per-batch re-type step. On a 96-core node that decodes and resizes
+**5,693 images per second**, which is **2.4x Daft**, and streams LiDAR point clouds at
+**21,467 frames per second**. See
+[Multimodal ingest benchmarks](../benchmarks/multimodal-ingest.md) and the reproducible
 head-to-heads under `benchmarks/scenarios/`.
 
 You can also decode inside a pipeline with the `.image` expression after a download:
@@ -119,6 +119,30 @@ thumbnail = resized.column("small")[0].as_py()
 print(resized.schema.field("small").type, thumbnail[:4] == b"\x89PNG")
 # binary True
 ```
+
+Two more expressions stay in the bytes-to-bytes lane. `.image.crop(x, y, width, height)`
+cuts a named window out of each image, which is what a detection pipeline does with a
+bounding box. `.image.encode(format)` rewrites the container without touching the pixels,
+for normalizing a mixed-format corpus onto one codec or trading a PNG for a smaller JPEG.
+
+```python
+cut = ds.with_columns(
+    region=col("bytes").image.crop(0, 0, 4, 4),
+    as_jpeg=col("bytes").image.encode("jpeg"),
+)
+print(cut.select(d=col("region").image.decode()).to_pydict())
+# {'d': [{'width': 4, 'height': 4, 'channels': 4, 'mode': 'RGBA'}]}
+```
+
+`.image.convert(mode)` completes the set: it changes only the channels, which is what
+normalizing a corpus that mixes RGB and RGBA needs before a model that wants one of them.
+The mode names are the ones `decode` reports, so a mode read off one goes straight into
+the other, and grayscale uses the same Rec. 601 luma as `to_grayscale` and `dhash`.
+
+`crop` clips at the edge rather than padding. `center_crop` pads, because it feeds a model
+that needs a fixed input size; a cropped image is something a person or another tool will
+look at, and inventing black pixels there would be inventing data. A window starting past
+the image entirely yields null.
 
 The audio counterpart is `.audio.to_waveform()`, which decodes an encoded clip and
 averages its channels down to a single mono PCM signal. That is a `list<float>` per row,
@@ -454,6 +478,6 @@ print(unit.select("id", score=col("u").list.dot(array(1.0, 0.0))).to_pydict())
 ## Next steps
 
 - [Inference](inference.md): run a model over the decoded tensors.
-- [Preprocessors](preprocessors.md): assemble the decoded features into a training matrix.
+- [Preprocessors](preprocessors/index.md): assemble the decoded features into a training matrix.
 - [Expressions API](../api/expressions.md): the `.image`/`.audio`/`.video` and vector
   `.list` method reference.

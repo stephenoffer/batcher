@@ -60,7 +60,7 @@ print(first.column("x").to_pylist())
 ```
 
 For learned feature statistics such as standardization, encoding, or imputation, fit a
-[preprocessor](preprocessors.md) on the training split and `transform` the stream. The
+[preprocessor](preprocessors/index.md) on the training split and `transform` the stream. The
 fit is one mergeable pass, and the transform stays inside the engine. Neither touches the
 training hot path.
 
@@ -240,7 +240,6 @@ properties a distributed training run depends on.
 | `DistributedSampler` | in-RAM index list (O(n) per rank) | no | yes (pads) | no |
 | WebDataset | shard order + local buffer (approximate) | no | `ddp_equalize` heuristic | no |
 | MosaicML Streaming | shard/block shuffle, bounded | yes (`state_dict`) | yes | yes |
-| Ray Data `streaming_split` | local buffer only | no | not guaranteed | n/a |
 | **Batcher** | **exact, O(1) memory** | **yes (`state_dict`)** | **yes (drop or pad)** | **yes** |
 
 One distinction is worth being precise about. WebDataset and MosaicML shuffle
@@ -278,6 +277,6 @@ the model has already trained on. And because the global order does not depend o
 
 - [PyTorch integration](pytorch.md): feed Arrow batches to a `DataLoader`, device
   transfer, and DDP and FSDP.
-- [Preprocessors](preprocessors.md): fit feature transforms before the stream.
+- [Preprocessors](preprocessors/index.md): fit feature transforms before the stream.
 - [Inference](inference.md): batch prediction and embeddings.
 - [GPU scheduling](gpu.md): run transforms on GPU workers.

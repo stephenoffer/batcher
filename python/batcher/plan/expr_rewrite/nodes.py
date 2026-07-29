@@ -82,11 +82,23 @@ def map_node_expressions(node: LogicalPlan, rule: ExprRule) -> LogicalPlan:
 def _map_tuple(
     items: tuple[_T, ...], rule: ExprRule, fn: Callable[[_T, ExprRule], _T]
 ) -> tuple[_T, ...] | None:
-    """Map `fn` over `items`, or return `None` when every element kept its identity."""
-    mapped = tuple(fn(it, rule) for it in items)
-    if all(a is b for a, b in zip(mapped, items, strict=True)):
-        return None
-    return mapped
+    """Map `fn` over `items`, or return `None` when every element kept its identity.
+
+    Written as one pass that allocates nothing until something actually changes. The
+    unchanged answer is by far the common one — a rule matches a handful of nodes and
+    passes over the rest — and this runs for every rule against every expression-carrying
+    node of the plan, so building a full tuple and then walking a `zip` inside an `all`
+    to discover "nothing moved" was the bulk of what the fixpoint spent here.
+    """
+    mapped: list[_T] | None = None
+    for i, item in enumerate(items):
+        new = fn(item, rule)
+        if mapped is None:
+            if new is item:
+                continue
+            mapped = list(items[:i])  # first change: catch up on the untouched prefix
+        mapped.append(new)
+    return None if mapped is None else tuple(mapped)
 
 
 def _apply_rule(expr: Expr, rule: ExprRule) -> Expr:

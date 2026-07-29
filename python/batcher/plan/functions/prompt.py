@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float, require_int
 from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit
 from batcher.plan.functions.aggregate import _as_column
 from batcher.plan.functions.string import concat
@@ -126,5 +126,9 @@ def truncate_to_token_budget(text: str | Expr, budget: int, chars_per_token: flo
             >>> ds.select(r=bt.truncate_to_token_budget("t", budget=1)).to_pydict()
             {'r': ['hell']}
     """
+    budget = require_int(budget, func="truncate_to_token_budget", arg="budget")
+    chars_per_token = require_float(
+        chars_per_token, func="truncate_to_token_budget", arg="chars_per_token"
+    )
     char_budget = int(budget * chars_per_token)
     return _as_column(text).str.truncate_chars(char_budget)

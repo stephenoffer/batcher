@@ -24,7 +24,19 @@ _ENVELOPE: contextvars.ContextVar[SchedulingEnvelope | None] = contextvars.Conte
 def _placement_timeout_s() -> float:
     """How long to wait for a placement group to be schedulable before falling back
     to default scheduling. Generous (a real cluster may need to autoscale up), but
-    bounded so an over-subscribed request degrades gracefully instead of hanging."""
+    bounded so the *reservation* cannot hang.
+
+    Note what this does and does not buy. Timing out here bounds the wait for the
+    bundles; it does not bound the query. The fallback tasks ask for the same per-task
+    CPUs the bundles did, so the reason the group was unsatisfiable is usually the
+    reason they will not schedule either — and unlike this call, the barrier that
+    gathers them (`gather_with_backups`) has no deadline. Measured on a 96-CPU node
+    with two concurrent distributed sessions: all 96 CPUs held inside one session's
+    placement group, `{'CPU': 48.0}: 2+ pending tasks/actors` for the other, and its
+    window shuffle stuck in `ray.wait` for 17+ minutes with no error. The barrier now
+    says so after two minutes; making it *fail* instead of wait is an open decision,
+    because a legitimately slow first task looks identical from inside `ray.wait`.
+    """
     return active_config().distributed.placement_timeout_s
 
 

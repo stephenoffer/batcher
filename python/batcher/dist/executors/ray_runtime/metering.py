@@ -61,7 +61,42 @@ def execute_metered(
     metered = getattr(nat, "execute_plan_metered", None)
     if metered is None:
         return nat.execute_plan(plan_ir, sources, engine_config), ""
-    return metered(plan_ir, sources, engine_config)
+    batches, metrics_json = metered(plan_ir, sources, engine_config)
+    return batches, _stamped_with_this_worker(metrics_json)
+
+
+def _stamped_with_this_worker(metrics_json: str) -> str:
+    """Tag every op in a metrics document with the fingerprint of the node that ran it.
+
+    A worker's measurements — times, bytes, faults — describe the *worker's* hardware, but
+    they are recorded into the hub on the driver, which is frequently a different machine and
+    on a heterogeneous cluster is a different machine from most of the workers. Stamping here,
+    where the measurement was taken, is what keeps the attribution honest across the trip: the
+    driver's transcription then reads this rather than assuming its own.
+
+    Without it, a fleet of large workers driven from a small head node teaches Kyber the head
+    node's cost coefficients for work that ran on the workers, and every plan sized from them
+    is wrong in the same direction. Best-effort: an unparseable document is passed through
+    unchanged rather than dropping a worker's whole contribution over a tagging step.
+
+    Args:
+        metrics_json: The raw `ExecMetrics` document from this worker's engine.
+
+    Returns:
+        The document with `hw_fingerprint` set on every op, or the original on any failure.
+    """
+    if not metrics_json:
+        return metrics_json
+    from batcher._internal.hardware import fingerprint
+
+    try:
+        doc = json.loads(metrics_json)
+        here = fingerprint()
+        for op in doc.get("ops", []):
+            op["hw_fingerprint"] = here
+        return json.dumps(doc)
+    except (ValueError, TypeError, AttributeError):
+        return metrics_json
 
 
 def record_worker_metrics(

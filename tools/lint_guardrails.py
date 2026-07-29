@@ -17,13 +17,18 @@ So the guidance is linted like code:
 * every `just <recipe>` named must be a real recipe in the justfile.
 
 The check is deliberately conservative — it only flags strings that clearly *look* like a repo
-path (they contain a `/` and start with a known top-level directory), so prose stays free.
+path (they contain a `/` and start with a known top-level directory), so prose stays free. It
+also ignores paths git ignores: a build artifact like `python/batcher/_native.abi3.so` exists
+only after `just build`, so its absence says nothing about whether the guidance is true. Without
+that carve-out the same unchanged rule file passed or failed depending on whether anyone had
+built the extension yet.
 """
 
 from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -98,6 +103,33 @@ def _resolves(path: str) -> bool:
     return False
 
 
+def _git_ignored(paths: list[str]) -> set[str]:
+    """Return the subset of `paths` that git ignores, i.e. generated build output.
+
+    A generated path is unverifiable by existence: `python/batcher/_native.abi3.so` is there
+    after `just build` and gone after `just clean`, and the guidance that names it is equally
+    true either way. Both spellings `_resolves` accepts are tested, so a package-relative path
+    is classified the same way as a repo-relative one. If git is unavailable, nothing is
+    treated as ignored and the caller reports the path as it would have before.
+    """
+    if not paths:
+        return set()
+    candidates = {p for path in paths for p in (path, f"python/batcher/{path}")}
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "--stdin"],
+            cwd=ROOT,
+            input="\n".join(sorted(candidates)),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return set()
+    ignored = set(proc.stdout.split())
+    return {p for p in paths if p in ignored or f"python/batcher/{p}" in ignored}
+
+
 def _justfile_recipes() -> set[str]:
     """Recipe names from the justfile, including parameterized ones (`bench args="":`)."""
     text = (ROOT / "justfile").read_text()
@@ -106,7 +138,10 @@ def _justfile_recipes() -> set[str]:
 
 def main() -> int:
     recipes = _justfile_recipes()
-    failures: list[str] = []
+    #: (path, message) in document order. `path` is the repo path a message is about, or ""
+    #: for a recipe failure. Reporting waits until the whole tree is scanned so the
+    #: git-ignore classification is a single batched call.
+    pending: list[tuple[str, str]] = []
 
     for doc in GUARDRAILS:
         if not doc.exists():
@@ -120,13 +155,16 @@ def main() -> int:
                 if not path.startswith(PATH_ROOTS + PACKAGE_ROOTS) or PLACEHOLDER.search(path):
                     continue
                 if not _resolves(path):
-                    failures.append(f"{rel_doc}:{lineno}: path does not exist: {path}")
+                    pending.append((path, f"{rel_doc}:{lineno}: path does not exist: {path}"))
 
             for recipe in RECIPE_RE.findall(line):
                 if recipe not in recipes:
-                    failures.append(
-                        f"{rel_doc}:{lineno}: `just {recipe}` is not a recipe in the justfile"
+                    pending.append(
+                        ("", f"{rel_doc}:{lineno}: `just {recipe}` is not a recipe in the justfile")
                     )
+
+    generated = _git_ignored([path for path, _ in pending if path])
+    failures = [message for path, message in pending if path not in generated]
 
     for failure in failures:
         print(f"FAIL: {failure}")

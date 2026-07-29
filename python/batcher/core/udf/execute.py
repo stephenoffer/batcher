@@ -13,6 +13,7 @@ Arrow the whole way (zero-copy from the engine into the UDF and back).
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections.abc import Iterator
 
 import pyarrow as pa
@@ -20,17 +21,19 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.core.udf.apply import apply_udf
-from batcher.core.udf.lifecycle import build_udf_callable
+from batcher.core.udf.lifecycle import build_udf_callable, release_prebuilt
 from batcher.io.schema.evolution import reconcile_batches
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
+from batcher.plan.profile import StageRecorder, logical_op_ids, stage_kind
 from batcher.plan.schema import SchemaRef
-from batcher.plan.visitor import children, with_children
+from batcher.plan.visitor import children, scanned_source_ids, with_children
 
 __all__ = [
     "build_udf_callable",
     "execute_with_udfs",
     "has_map_batches",
     "prebuild_factories",
+    "release_prebuilt",
     "stream_with_udfs",
 ]
 
@@ -74,6 +77,7 @@ def execute_with_udfs(
     sources: list,
     source_projections: dict[int, list[str]] | None = None,
     engine_config: str | None = None,
+    recorder: StageRecorder | None = None,
 ) -> list[pa.RecordBatch]:
     """Execute a (possibly non-linear) pipeline that contains `map_batches`.
 
@@ -102,12 +106,17 @@ def execute_with_udfs(
     but the bounded-memory half of streaming is not available here. A caller that consumes
     batches incrementally (a distributed map task that writes from the worker) should use
     `stream_with_udfs` instead, which is the same execution with the materialization removed.
+
+    `recorder` is the optional per-stage measurement sink (`stats()` / `explain(analyze=True)`
+    for an ML pipeline). `None` — every caller but the profiling one — costs nothing: no
+    clock is read and no branch is taken inside a stage.
     """
     projections = source_projections or {}
     cfg = engine_config or active_config().engine_config_json()
     if not has_map_batches(plan):
         return _run_whole_plan(plan, sources, projections, cfg)
-    gen = _linear_stream(plan, sources, projections)
+    op_ids = logical_op_ids(plan) if recorder is not None else None
+    gen = _linear_stream(plan, sources, projections, recorder, op_ids)
     if gen is not None:
         # Reconcile the streamed output to one union schema, exactly as the materializing
         # path does per stage (`_execute_node`). A UDF whose output schema DRIFTS across
@@ -116,7 +125,7 @@ def execute_with_udfs(
         # first drift, so the streaming path would crash on inputs the staged path handles.
         # The chain's output is already fully listed here, so this adds no extra buffering.
         return reconcile_batches(list(gen))
-    batches, _schema = _execute_node(plan, sources, projections, cfg)
+    batches, _schema = _execute_node(plan, sources, projections, cfg, recorder, op_ids)
     return batches
 
 
@@ -152,7 +161,11 @@ def stream_with_udfs(
 
 
 def _linear_stream(
-    plan: LogicalPlan, sources: list, projections: dict[int, list[str]]
+    plan: LogicalPlan,
+    sources: list,
+    projections: dict[int, list[str]],
+    recorder: StageRecorder | None = None,
+    op_ids: dict[int, int] | None = None,
 ) -> Iterator[pa.RecordBatch] | None:
     """The stage-overlapped batch stream for `plan`, or `None` if it isn't eligible.
 
@@ -164,7 +177,7 @@ def _linear_stream(
     chain = linear_map_chain(plan)
     if chain is None or not stream_eligible(chain[1]):
         return None
-    return stream_linear_chain(chain[0], chain[1], sources, projections)
+    return stream_linear_chain(chain[0], chain[1], sources, projections, recorder, op_ids)
 
 
 def _run_whole_plan(
@@ -189,21 +202,11 @@ def _run_whole_plan(
     nat = engine()
     # `execute_plan` addresses sources positionally by `Scan.source_id`, so the list must keep
     # each source at its own index; only the ones the plan actually scans are read.
-    scanned = _scanned_source_ids(plan)
+    scanned = scanned_source_ids(plan)
     inputs = [
         list(src.read(projections.get(i))) if i in scanned else [] for i, src in enumerate(sources)
     ]
     return list(nat.execute_plan(_to_json(plan), inputs, cfg))
-
-
-def _scanned_source_ids(node: LogicalPlan) -> set[int]:
-    """The `source_id`s the plan actually reads."""
-    if isinstance(node, Scan):
-        return {node.source_id}
-    ids: set[int] = set()
-    for child in children(node):
-        ids |= _scanned_source_ids(child)
-    return ids
 
 
 def _execute_node(
@@ -211,12 +214,19 @@ def _execute_node(
     sources: list,
     projections: dict[int, list[str]] | None = None,
     cfg: str | None = None,
+    recorder: StageRecorder | None = None,
+    op_ids: dict[int, int] | None = None,
 ) -> tuple[list[pa.RecordBatch], pa.Schema]:
     """Materialize `node` to `(batches, schema)`.
 
     The schema is tracked alongside the batches so an *empty* sub-result (which
     carries no batch to read a schema from) can still be scanned by a parent
     operator — the case that makes joins/unions over filtered-to-empty inputs work.
+
+    With a `recorder`, each `map_batches` stage's rows, wall time, and output bytes are
+    reported against the stage's pre-order position, which is what gives an ML pipeline a
+    measured `stats()` tree. The timing brackets the UDF only, so the child's execution is
+    not charged to the parent stage.
     """
     projections = projections or {}
     cfg = cfg or active_config().engine_config_json()
@@ -224,21 +234,76 @@ def _execute_node(
         # Read only the columns the plan needs. Kyber computed them; a `map_batches` that
         # declared no `input_columns` yields None here, so the whole source is read (safe).
         batches = list(sources[node.source_id].read(projections.get(node.source_id)))
+        _record_stage(recorder, op_ids, node, "Scan", batches, batches, 0)
         return batches, (batches[0].schema if batches else node.schema.arrow)
     if isinstance(node, MapBatches):
-        inputs, in_schema = _execute_node(node.input, sources, projections, cfg)
+        inputs, in_schema = _execute_node(node.input, sources, projections, cfg, recorder, op_ids)
+        started = time.perf_counter_ns()
         # Reconcile a UDF whose output schema drifts across batches (e.g. LLM structured
         # outputs with varying fields) to one union schema, so the stage's batches concat
         # instead of failing — the schema-inference footgun Ray Data hits.
         out = reconcile_batches(apply_udf(inputs, node))
+        _record_stage(
+            recorder,
+            op_ids,
+            node,
+            stage_kind(node.fn),
+            inputs,
+            out,
+            time.perf_counter_ns() - started,
+        )
         # On empty input the UDF isn't called; assume a pass-through schema.
         return out, (out[0].schema if out else in_schema)
     # Any other relational operator: materialize each child, then run this single
     # operator on the engine with its children replaced by scans of those batches.
     # `projections` must reach those children: a Scan under a Filter/Join is still the
     # scan Kyber pruned columns for, and dropping the map here made it read every column.
-    child_results = [_execute_node(c, sources, projections, cfg) for c in children(node)]
-    return _run_engine_op(node, child_results, cfg)
+    child_results = [
+        _execute_node(c, sources, projections, cfg, recorder, op_ids) for c in children(node)
+    ]
+    started = time.perf_counter_ns()
+    out, schema = _run_engine_op(node, child_results, cfg)
+    if recorder is not None:
+        # Flattening every child's batches is only needed to count input rows, so it stays
+        # inside the profiling branch — this walk is also the distributed map task's
+        # executor, and an unprofiled run must not pay for a measurement nobody reads.
+        inputs = [b for batches, _ in child_results for b in batches]
+        kind = type(node).__name__
+        _record_stage(recorder, op_ids, node, kind, inputs, out, time.perf_counter_ns() - started)
+    return out, schema
+
+
+def _record_stage(
+    recorder: StageRecorder | None,
+    op_ids: dict[int, int] | None,
+    node: LogicalPlan,
+    kind: str,
+    inputs: list[pa.RecordBatch],
+    out: list[pa.RecordBatch],
+    elapsed_ns: int,
+) -> None:
+    """Report one node's measured execution, if this run is being profiled.
+
+    A node absent from `op_ids` is one the walk never numbered (it cannot happen for a plan
+    numbered from its own root, but a caller that hands in a sub-plan would hit it), and is
+    skipped rather than misattributed to op 0.
+    """
+    if recorder is None or op_ids is None:
+        return
+    op_id = op_ids.get(id(node))
+    if op_id is None:
+        return
+    recorder.record(
+        op_id,
+        kind=kind,
+        rows_in=sum(b.num_rows for b in inputs),
+        rows_out=sum(b.num_rows for b in out),
+        elapsed_ns=elapsed_ns,
+        result_bytes=sum(b.nbytes for b in out),
+        # Where the stage ran, so a reader of the profile can tell a GPU forward from the CPU
+        # decode feeding it — the distinction the whole CPU:GPU-ratio conversation turns on.
+        backend="gpu" if getattr(node, "num_gpus", 0) > 0 else "",
+    )
 
 
 def _run_engine_op(

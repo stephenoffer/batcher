@@ -32,6 +32,8 @@ from itertools import count
 from pathlib import Path
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
+from batcher._internal.paths import private_dir
 from batcher.plan.profile import ProfileCollector
 
 __all__ = [
@@ -88,7 +90,8 @@ def pipeline_signature(plan: object) -> str:
         from batcher.kyber.signature import plan_signature
 
         return plan_signature(plan)
-    except Exception:  # pragma: no cover - an unsignable plan must not fail the query
+    except Exception as exc:  # pragma: no cover - an unsignable plan must not fail the query
+        note_suppressed("api", "sign the plan for the event log", exc)
         return ""
 
 
@@ -138,26 +141,41 @@ def write_event_log(
     for a query that finished. The profile is assembled once and fed to both sinks.
     Best-effort: a filesystem or exporter error is swallowed so observability never fails a
     query.
+
+    Assembling the profile is not free — it walks every operator and renders the whole
+    document to a plain dict — so it happens only once something will actually read it: a
+    bus subscriber, the JSON event log, or an OTel exporter. With none attached (the
+    default) this closes the query out on the bus and stops, which is what keeps
+    observability off the critical path of a sub-second query.
     """
     if collector is None or collector.optimized_ir is None:
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
         return
+    from batcher._internal import events
     from batcher._internal.logging import get_logger
-    from batcher.api.terminal.otel import emit_query_spans
+    from batcher._internal.paths import open_private
+    from batcher.api.terminal.otel import emit_query_spans, otel_enabled
     from batcher.config import active_config
 
     cfg = active_config().observability
+    if not (cfg.event_log or events.listening() or otel_enabled()):
+        _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
+        return
     seq = next(_counter)
     # Reuse the id `start_query_report` already announced, so the live view and the archived
     # document name the same query; mint one only for a caller that never announced a start.
     query_id = query_id or _query_id(seq)
     profile = collector.to_profile(total_ms=total_ms, rows=rows, query_id=query_id)
+    # One render, both sinks: `to_dict` walks the whole operator tree, and the bus payload
+    # and the on-disk document are the same document.
+    document = profile.to_dict()
     _publish_stages(profile, query_id)
-    _publish_end(query_id, total_ms=total_ms, rows=rows, profile=profile.to_dict())
+    _publish_end(query_id, total_ms=total_ms, rows=rows, profile=document)
     if cfg.event_log:
         try:
             log_dir = _resolve_dir(cfg.event_log_dir)
-            (log_dir / f"{query_id}.json").write_text(json.dumps(profile.to_dict(), default=str))
+            with open_private(log_dir / f"{query_id}.json") as fh:
+                fh.write(json.dumps(document, default=str).encode("utf-8"))
             # Pruning scans the directory (O(files)); amortize it across writes so a small
             # query doesn't pay it every time.
             if seq % _PRUNE_EVERY == 0:
@@ -352,7 +370,11 @@ _CREATED_DIRS: set[str] = set()
 
 
 def _resolve_dir(configured: str) -> Path:
-    """The event-log directory, created if absent (``$BATCHER_HOME/logs`` by default)."""
+    """The event-log directory, created owner-only if absent (``$BATCHER_HOME/logs``).
+
+    Private because an event-log document is not metadata: it carries the whole plan,
+    including literal predicate constants, so a `WHERE ssn = '...'` ends up on disk in it.
+    """
     if configured:
         path = Path(configured)
     else:
@@ -360,7 +382,7 @@ def _resolve_dir(configured: str) -> Path:
         path = Path(base) / "logs"
     key = str(path)
     if key not in _CREATED_DIRS:
-        path.mkdir(parents=True, exist_ok=True)
+        private_dir(path)
         _CREATED_DIRS.add(key)
     return path
 

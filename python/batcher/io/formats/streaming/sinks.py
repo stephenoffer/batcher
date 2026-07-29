@@ -78,8 +78,16 @@ class ConsoleStreamSink:
 # Process-global store for in-memory sinks, read back by `bt.read_memory(name)`.
 _MEMORY: dict[str, list[pa.Table]] = {}
 
+#: The output schema each named sink was opened with, so an *empty* sink still reads back as
+#: the query's relation rather than as a table with no columns at all. A stream whose filter
+#: matched nothing, or a `complete`-mode query whose running result went to zero rows, is a
+#: perfectly ordinary outcome — and `bt.read_memory` answered it with a schema-less table,
+#: which then fails to concatenate against the same query's non-empty run and reads as "no
+#: such relation" rather than "no such rows".
+_MEMORY_SCHEMA: dict[str, pa.Schema] = {}
 
-def _check_memory_sink_size(name: str) -> None:
+
+def _check_memory_sink_size(name: str, held: int) -> None:
     """Raise a clear `ResourceError` if a named in-memory sink has outgrown the cap.
 
     In `append`/`update` mode this sink retains every micro-batch for the lifetime of
@@ -88,11 +96,22 @@ def _check_memory_sink_size(name: str) -> None:
     (the Spark `memory` sink is documented the same way), so the honest failure is an
     actionable error naming the sink, not a silent OOM. The cap is the same
     `memory.streaming_state_max_bytes` envelope that bounds watermark-held state.
+
+    `held` is passed in rather than recomputed. Summing `nbytes` across every retained
+    table on every micro-batch is O(batches) work per batch, so the guard against the sink
+    growing without bound was itself quadratic in the number of micro-batches — the check
+    got slower exactly as the thing it watches got bigger.
+
+    Args:
+        name: The in-memory sink's registered name, quoted back in the error.
+        held: Bytes the sink currently retains.
+
+    Raises:
+        ResourceError: If ``held`` exceeds the streaming-state budget.
     """
     from batcher.config import active_config
 
     cap = active_config().memory.streaming_state_budget_bytes()
-    held = sum(t.nbytes for t in _MEMORY.get(name, ()))
     if held > cap:
         from batcher._internal.errors import ResourceError
 
@@ -111,7 +130,10 @@ def memory_table(name: str) -> pa.Table:
     written to `name`.
     """
     parts = _MEMORY[name]
-    return pa.concat_tables(parts) if parts else pa.table({})
+    if parts:
+        return pa.concat_tables(parts)
+    schema = _MEMORY_SCHEMA.get(name)
+    return pa.Table.from_batches([], schema=schema) if schema is not None else pa.table({})
 
 
 @STREAM_SINKS.register("memory")
@@ -123,19 +145,39 @@ class MemoryStreamSink:
     by the engine so the sink keeps only what the semantics require.
     """
 
-    def __init__(self, name: str, *, output_mode: str = "append", **_: Any) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        output_mode: str = "append",
+        schema: pa.Schema | None = None,
+        **_: Any,
+    ) -> None:
         self._name = name
         self._replace = output_mode == "complete"
+        self._held = 0
+        # The query's output schema, when the conductor knew it. It is what lets an
+        # empty sink read back as the query's relation instead of as no relation.
+        self._schema = schema
 
     def open(self) -> None:
         _MEMORY[self._name] = []
+        self._held = 0
+        if self._schema is not None:
+            _MEMORY_SCHEMA[self._name] = self._schema
+        else:
+            _MEMORY_SCHEMA.pop(self._name, None)
 
     def write_batch(self, _batch_id: int, table: pa.Table) -> str | None:
+        # Learn the schema from the data when the conductor did not supply one, so a
+        # `complete`-mode sink whose running result later empties still reads back typed.
+        _MEMORY_SCHEMA.setdefault(self._name, table.schema)
         if self._replace:
             _MEMORY[self._name] = [table]
         else:
             _MEMORY[self._name].append(table)
-            _check_memory_sink_size(self._name)
+            self._held += table.nbytes
+            _check_memory_sink_size(self._name, self._held)
         return None
 
     def close(self) -> None:
@@ -170,8 +212,16 @@ class ForeachStreamSink:
     """Call ``fn(row)`` for each row of each micro-batch (Spark `foreach`).
 
     Convenience over `foreach_batch` for row-at-a-time external writes; the batch is
-    converted to row dicts in one vectorized `to_pylist` (no per-element Python in
-    the engine's hot path — the iteration is the user's chosen sink semantics).
+    converted to row dicts in one vectorized `to_pylist` per record batch (no per-element
+    Python in the engine's hot path — the iteration is the user's chosen sink semantics).
+
+    Converting a *chunk* at a time rather than the whole table is what keeps the sink
+    usable on a large micro-batch. `Table.to_pylist()` builds one Python list holding a dict
+    per row of the entire micro-batch before the first `fn(row)` runs, and a Python dict of
+    boxed scalars costs on the order of a hundred bytes per column — so a micro-batch that
+    fits comfortably in Arrow can be an order of magnitude larger as Python objects, and the
+    peak lands on top of the Arrow table it was built from. Per-record-batch conversion caps
+    that transient at one morsel and lets each chunk's dicts be collected as it goes.
     """
 
     def __init__(self, fn: Callable[[dict[str, Any]], Any], **_: Any) -> None:
@@ -181,8 +231,10 @@ class ForeachStreamSink:
         pass
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
-        for row in table.to_pylist():
-            self._fn(row)
+        fn = self._fn
+        for record_batch in table.to_batches():
+            for row in record_batch.to_pylist():
+                fn(row)
         return f"foreach:{batch_id}"
 
     def close(self) -> None:

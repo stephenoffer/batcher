@@ -63,6 +63,15 @@ def wired(monkeypatch):
     monkeypatch.setattr(
         "batcher.dist.shuffle_io.write_ipc", lambda batches, path: written.append((path, batches))
     )
+    # `_ensure_ray` rebinds `aggregate._reduce_task = ray.remote(aggregate._reduce_task)` on the
+    # *module*, permanently and process-wide. These tests call the task as a plain function, so
+    # once any earlier test in the session has started a distributed run they were calling a
+    # `RemoteFunction` instead and failed with "Remote functions cannot be called directly".
+    # That made them pass alone and fail in the full suite — the shape that gets rerun rather
+    # than fixed. Unwrap to the underlying function so a unit test of the *fold* does not depend
+    # on whether Ray has been wired up; monkeypatch restores the module attribute afterwards.
+    task = aggregate._reduce_task
+    monkeypatch.setattr(aggregate, "_reduce_task", getattr(task, "_function", task))
     return nat, written
 
 

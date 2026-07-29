@@ -15,22 +15,34 @@ lives in `core.udf.call`, and `execute_with_udfs` routes a linear chain here.
 
 from __future__ import annotations
 
-import contextlib
 import os
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 
-from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.core.udf import strategy as strat
 from batcher.core.udf.async_udf import is_async_udf
 from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
 from batcher.core.udf.lifecycle import build_udf_callable, teardown_udf
 from batcher.core.udf.resilience import wrap_resilient
+from batcher.core.udf.sizing import (
+    _GPU_BATCH_NS,
+    _GPU_STREAM_BATCH_ROWS,
+    _STREAM_PREFETCH_DEPTH,
+    cpu_batch_rows,
+    fold_ema,
+    gpu_batch_rows,
+    learned_gpu_cap,
+    learned_read_depth,
+    stage_sig,
+    timed_source,
+)
 from batcher.io.schema.evolution import normalize_batch, unify_schemas
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
+from batcher.plan.profile import StageRecorder, metered, stage_kind
 
 __all__ = [
     "linear_map_chain",
@@ -39,10 +51,6 @@ __all__ = [
     "stream_linear_chain",
 ]
 
-# Bounded look-ahead between pipelined map stages: a stage may run this many morsels
-# ahead of its consumer (so a CPU stage overlaps the GPU stage draining it) while keeping
-# resident memory to ~`depth` morsels per stage. Env-overridable.
-_STREAM_PREFETCH_DEPTH = max(0, int(os.environ.get("BATCHER_STREAM_PREFETCH_DEPTH", "2")))
 # GPU-stage in-flight forwards (see `_pipelined_emit`): >1 overlaps a batch's host-side
 # tensorize/copy with the previous batch's device forward, lifting a single-stage inference's
 # utilization. Default 1 (serial) — a chain with an upstream CPU stage already feeds the GPU,
@@ -54,170 +62,8 @@ _GPU_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_PIPELINE_DEPTH", "1
 # sizes its dispatch pool from it, so a solo GPU stage gets the same two in-flight forwards
 # whichever path the plan shape routes it to. One definition, not two that can drift.
 _GPU_SOLO_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_SOLO_PIPELINE_DEPTH", "2")))
-
-# Adaptive GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
-# zero-config `ds.map_batches(Model, num_gpus=1)` call). `_GPU_STREAM_BATCH_ROWS` is the
-# row cap (large enough to fill the device; the guides' image range is 32-128, 256 suits
-# most vision/embedding models); `_GPU_STREAM_BATCH_BYTES` is a per-batch input-byte budget
-# so the row count SHRINKS on wide rows (a decoded frame, a float embedding tensor) that
-# would otherwise OOM the GPU at the row cap, and stays at the cap for narrow rows. Floored
-# so the batch always fills the SMs. An explicit `batch_size` always wins; env-overridable.
-_GPU_STREAM_BATCH_ROWS = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_ROWS", "256")))
-_GPU_STREAM_BATCH_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_BYTES", str(64 << 20)))
-)
-_GPU_STREAM_BATCH_MIN = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_MIN", "8")))
-
-# Per-batch input-byte budget for a CPU (decode/preprocess) stage with no explicit `batch_size`:
-# like the GPU budget, this SHRINKS the chunk below the morsel when a stage's rows are huge
-# (a decoded frame, a raw tensor) so a transient per-thread output stays bounded, and keeps the
-# full morsel for narrow rows. Result-invariant — the chunk only shards. Env-overridable.
-_CPU_STREAM_BATCH_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_CPU_STREAM_BATCH_BYTES", str(128 << 20)))
-)
-# The deepest source-read look-ahead the learned readahead may request (a slow source hides more
-# of its latency behind compute); bounds resident memory to ~this many morsels for the read.
-_STREAM_MAX_PREFETCH_DEPTH = max(
-    _STREAM_PREFETCH_DEPTH, int(os.environ.get("BATCHER_STREAM_MAX_PREFETCH_DEPTH", "8"))
-)
-
-# Hub namespaces for the streaming path's learned sizing, keyed by a stable per-stage / per-source
-# signature. None of these can change a UDF's result — a batch/chunk size only shards rows, a
-# prefetch depth only reorders when a chunk is read — so a warm start is byte-identical to cold.
-_GPU_BATCH_NS = "udf_gpu_batch"  # learned VRAM-safe GPU batch rows per model signature
-_SCAN_TPUT_NS = "udf_scan_tput"  # learned source read throughput (rows/sec) per source identity
-
-
-def _stream_hub():
-    """The process-wide MetadataHub, or `None` if unreachable — learned reads are best-effort."""
-    try:
-        from batcher.core.runtime import default_hub
-
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning must never break a query
-        note_suppressed("core", "resolve metadata hub", exc)
-        return None
-
-
-def _stage_sig(op: MapBatches) -> str | None:
-    """A stable per-stage signature for `op` (its UDF's ``module.qualname``), or `None`."""
-    fn = op.fn
-    mod = getattr(fn, "__module__", None)
-    qual = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
-    return f"{mod}.{qual}" if mod and qual else None
-
-
-def _fold_ema(namespace: str, key: str | None, value: float) -> None:
-    """Fold one observation into a per-signature EMA bucket ``{ema, n}`` in the hub. Best-effort.
-
-    (A compact local copy of the dist learner's fold — `core` cannot import the `dist` layer.)"""
-    if key is None or value != value or value <= 0.0:
-        return
-    hub = _stream_hub()
-    if hub is None:
-        return
-    try:
-        from batcher.config import active_config
-
-        s = hub.get_keyed_param(namespace, key) or {}
-        a = float(active_config().optimizer.learning_smoothing_alpha)
-        prior = s.get("ema")
-        ema = value if prior is None else a * value + (1.0 - a) * float(prior)
-        hub.put_keyed_param(namespace, key, {"ema": ema, "n": int(s.get("n", 0)) + 1})
-    except Exception as exc:  # pragma: no cover - learning must never break a query
-        note_suppressed("core", "fold learned ema", exc)
-        return
-
-
-def _read_ema(namespace: str, key: str | None) -> float | None:
-    """The learned EMA for a signature (best-effort), or `None` when cold/unreachable."""
-    if key is None:
-        return None
-    hub = _stream_hub()
-    if hub is None:
-        return None
-    try:
-        s = hub.get_keyed_param(namespace, key) or {}
-    except Exception as exc:  # pragma: no cover
-        note_suppressed("core", "read learned ema", exc)
-        return None
-    return float(s["ema"]) if "ema" in s else None
-
-
-def _learned_gpu_cap(op: MapBatches) -> int:
-    """The GPU batch-row cap for a model, seeded from its learned VRAM-safe size when known.
-
-    A prior run's settled adaptive batch size (persisted per model signature) caps the byte-budget
-    sizing so the next run starts at the learned safe size instead of rediscovering it from the
-    default row cap — the automatic form of "we already found this model fits N rows". Never above
-    the config cap; a cold model keeps the cap. OOM-halving remains the in-run safety net."""
-    learned = _read_ema(_GPU_BATCH_NS, _stage_sig(op))
-    cap = _GPU_STREAM_BATCH_ROWS
-    if learned is not None and learned >= 1.0:
-        cap = min(cap, int(learned))
-    return max(_GPU_STREAM_BATCH_MIN, cap)
-
-
-def _cpu_batch_rows(batch: pa.RecordBatch, morsel: int) -> int:
-    """Byte-adaptive chunk row count for a CPU stage with no explicit `batch_size`.
-
-    ``min(morsel, byte_budget / per_row_bytes)`` floored at 1: narrow rows keep the full morsel;
-    wide (post-decode multimodal) rows chunk fewer so a per-thread output stays bounded. The chunk
-    only shards the morsel, so the concatenated output is identical to the plain morsel path."""
-    if batch.num_rows <= 0:
-        return morsel
-    per_row = max(1, batch.nbytes // batch.num_rows)
-    by_bytes = _CPU_STREAM_BATCH_BYTES // per_row
-    return max(1, min(morsel, by_bytes))
-
-
-def _learned_read_depth(source) -> int:
-    """The source-read prefetch depth, deepened for a source measured as slow to read.
-
-    Reads the source's learned throughput (rows/sec, persisted per identity): a slow source (remote
-    object storage, a throttled connector) gets a deeper look-ahead so more chunks overlap compute,
-    while a fast local source keeps the base depth (deeper prefetch would only add resident memory).
-    Clamped to ``[_STREAM_PREFETCH_DEPTH, _STREAM_MAX_PREFETCH_DEPTH]``. Prefetch only reorders when
-    a chunk is read, never which rows it holds, so the result is identical at any depth."""
-    try:
-        ident = source.identity()
-    except Exception as exc:  # pragma: no cover
-        note_suppressed("core", "read source identity", exc)
-        return _STREAM_PREFETCH_DEPTH
-    tput = _read_ema(_SCAN_TPUT_NS, ident)
-    if tput is None:
-        return _STREAM_PREFETCH_DEPTH
-    import math
-
-    fast = 5_000_000.0  # rows/sec: a fast local scan needs no extra readahead
-    if tput >= fast:
-        return _STREAM_PREFETCH_DEPTH
-    extra = int(math.log2(fast / max(tput, 1.0)))
-    deep = _STREAM_PREFETCH_DEPTH + extra
-    return max(_STREAM_PREFETCH_DEPTH, min(_STREAM_MAX_PREFETCH_DEPTH, deep))
-
-
-def _timed_source(source, gen: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-    """Yield the source's morsels, recording its measured read throughput (rows/sec) on exhaustion.
-
-    Times only the source iteration (rows / elapsed) and folds it into the learned readahead
-    signal, so the next run can deepen the prefetch for a slow source. Timing is a driver-side
-    counter — it touches no row and cannot change what is yielded."""
-    import time
-
-    ident = None
-    with contextlib.suppress(Exception):
-        ident = source.identity()
-    rows = 0
-    t0 = time.perf_counter()
-    try:
-        for batch in gen:
-            rows += batch.num_rows
-            yield batch
-    finally:
-        elapsed = time.perf_counter() - t0
-        if ident is not None and rows > 0 and elapsed > 0.0:
-            _fold_ema(_SCAN_TPUT_NS, ident, rows / elapsed)
+# The per-batch sizing constants and the learned refinements that narrow them live in
+# `core.udf.sizing`; this module owns the *scheduling* of the overlap, not the sizing.
 
 
 def linear_map_chain(plan: LogicalPlan) -> tuple[Scan, list[MapBatches]] | None:
@@ -232,22 +78,6 @@ def linear_map_chain(plan: LogicalPlan) -> tuple[Scan, list[MapBatches]] | None:
         return None
     stages.reverse()
     return node, stages
-
-
-def _gpu_batch_rows(batch: pa.RecordBatch, row_cap: int = _GPU_STREAM_BATCH_ROWS) -> int:
-    """Adaptive GPU sub-batch row count for a morsel, from its per-row byte width.
-
-    ``min(row_cap, byte_budget / per_row_bytes)`` floored at `_GPU_STREAM_BATCH_MIN`: narrow
-    rows batch up to the row cap (fill the device); wide rows (large images/tensors) batch
-    fewer rows to stay under the VRAM budget — data-width-adaptive, so the same zero-config
-    call is safe for a 150 KB image and a 3 MB frame alike (OOM-halving covers the rest). The
-    `row_cap` is the model's learned VRAM-safe size when known (see `_learned_gpu_cap`), else
-    the config default."""
-    if batch.num_rows <= 0:
-        return row_cap
-    per_row = max(1, batch.nbytes // batch.num_rows)
-    by_bytes = _GPU_STREAM_BATCH_BYTES // per_row
-    return max(_GPU_STREAM_BATCH_MIN, min(row_cap, by_bytes))
 
 
 def stream_eligible(stages: list[MapBatches]) -> bool:
@@ -291,6 +121,8 @@ def stream_linear_chain(
     stages: list[MapBatches],
     sources: list,
     projections: dict[int, list[str]] | None = None,
+    recorder: StageRecorder | None = None,
+    op_ids: dict[int, int] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Yield the chain's output morsels, each stage pipelined on its own thread.
 
@@ -304,6 +136,12 @@ def stream_linear_chain(
     is what lets reading chunk *k+1* from storage / the shuffle overlap the compute on chunk
     *k* — without it the whole partition materializes before the first stage runs and the GPU
     idles through the read.
+
+    With a `recorder`, each stage is metered around its own `fn` call — not around its output
+    generator, which would charge it for time spent waiting on a slower upstream (see
+    `_apply_udf_stream`). The read is metered at the generator, because there the wait *is*
+    the work. Together they give a streaming inference pipeline a measured `stats()` tree
+    without changing any scheduling.
     """
     from batcher._internal.prefetch import prefetch
 
@@ -313,24 +151,55 @@ def stream_linear_chain(
     # extra in-flight VRAM). A CPU stage's own `num_workers` threading is unchanged.
     solo_gpu = len(stages) == 1
     # A source measured as slow to read on a prior run gets a deeper look-ahead so more chunks
-    # overlap compute (`_learned_read_depth`); a fast source keeps the base depth. `_timed_source`
+    # overlap compute (`learned_read_depth`); a fast source keeps the base depth. `timed_source`
     # measures this run's read throughput to refine that next time. Both are pure scheduling —
     # prefetch order and result are unchanged at any depth.
     src = sources[scan.source_id]
-    read_depth = _learned_read_depth(src)
+    read_depth = learned_read_depth(src)
     # Stream only the columns the plan needs (None = every column, for an undeclared UDF).
     projection = (projections or {}).get(scan.source_id)
-    gen: Iterator[pa.RecordBatch] = prefetch(
-        _timed_source(src, iter(src.iter_batches(projection))), depth=read_depth
-    )
+    read: Iterator[pa.RecordBatch] = timed_source(src, iter(src.iter_batches(projection)))
+    if recorder is not None and op_ids is not None and id(scan) in op_ids:
+        # Meter the read too, not only the stages: the scan's row count is what the first
+        # stage's `rows_in` is read from, and without it that stage reports consuming nothing.
+        read = metered(read, recorder, op_ids[id(scan)], "Scan")
+    gen: Iterator[pa.RecordBatch] = prefetch(read, depth=read_depth)
     for op in stages:
         depth = _GPU_SOLO_PIPELINE_DEPTH if solo_gpu else _GPU_PIPELINE_DEPTH
-        gen = prefetch(_apply_udf_stream(gen, op, depth), depth=_STREAM_PREFETCH_DEPTH)
+        hook = _stage_recorder_hook(recorder, op_ids, op)
+        gen = prefetch(_apply_udf_stream(gen, op, depth, hook), depth=_STREAM_PREFETCH_DEPTH)
     yield from gen
 
 
+def _stage_recorder_hook(
+    recorder: StageRecorder | None, op_ids: dict[int, int] | None, op: MapBatches
+) -> Callable[[int, pa.RecordBatch, list], None] | None:
+    """The per-sub-batch profiling callback for `op`, or `None` when not profiling."""
+    if recorder is None or op_ids is None or id(op) not in op_ids:
+        return None
+    op_id = op_ids[id(op)]
+    backend = "gpu" if op.num_gpus > 0 else ""
+    kind = stage_kind(op.fn)
+
+    def _record(elapsed_ns: int, sub: pa.RecordBatch, out: list) -> None:
+        recorder.record(
+            op_id,
+            kind=kind,
+            rows_in=sub.num_rows,
+            rows_out=sum(b.num_rows for b in out),
+            elapsed_ns=elapsed_ns,
+            result_bytes=sum(b.nbytes for b in out),
+            backend=backend,
+        )
+
+    return _record
+
+
 def _apply_udf_stream(
-    gen: Iterator[pa.RecordBatch], op: MapBatches, gpu_depth: int = 1
+    gen: Iterator[pa.RecordBatch],
+    op: MapBatches,
+    gpu_depth: int = 1,
+    record: Callable[[int, pa.RecordBatch, list], None] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Apply one `map_batches` stage to a morsel stream, preserving order and semantics.
 
@@ -340,16 +209,27 @@ def _apply_udf_stream(
     persistent thread pool (`pool.map` keeps order — only helps a GIL-releasing `fn`, the
     intended Arrow/NumPy/torch case), else sequentially. Cross-stage overlap comes from
     the caller wrapping this generator in `prefetch`.
+
+    `record` is the profiling hook, called per sub-batch with the time **this stage's own
+    call** took and the rows it consumed and produced. It is placed around the `fn` call
+    rather than around the output generator deliberately. Timing the generator would
+    measure *residency* — a stage blocked on an empty input queue would be charged for its
+    upstream's slowness — and that distortion is unbounded: a stage fed by something 10x
+    slower reads 10x too high. It would also invert `gpu-starved`, whose whole job is
+    comparing a GPU stage against the CPU stages feeding it. Here the only overstatement is
+    the bounded one from `gpu_depth` concurrent in-flight forwards on a GPU stage.
     """
     fn = build_udf_callable(op.fn)
     call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
     morsel = max(1, active_config().execution.morsel_rows)
     is_gpu = op.num_gpus > 0
     if is_gpu:
-        # Run the forward under autocast (tensor-core half precision) — a no-op when disabled
-        # or unavailable. Brings the managed path's FP16 win to a raw `map_batches(model)`.
-        from batcher.ml.gpu import autocast_call
+        # Autograd off, then autocast (tensor-core half precision) — both no-ops when
+        # disabled or unavailable. Brings the managed path's FP16 win, and the activation
+        # memory autograd would otherwise pin, to a raw `map_batches(model)`.
+        from batcher.ml.gpu import autocast_call, inference_mode_call
 
+        call = inference_mode_call(call)
         call = autocast_call(call)
     # Retry a transient failure / bound a hung call around the raw `fn`, before the GPU
     # OOM-halving and error-budget bisection in `_emit` — so a flaky external stage streams
@@ -357,12 +237,12 @@ def _apply_udf_stream(
     call = wrap_resilient(call, op)
     # An explicit batch_size always wins. Without one, the chunk ADAPTS to the data's row width:
     # a GPU stage sizes from a VRAM byte budget capped at the model's learned safe size
-    # (`_learned_gpu_cap`), and a CPU stage sizes from a (larger) byte budget capped at the
-    # morsel (`_cpu_batch_rows`) so a post-decode multimodal stage shrinks its transient output
+    # (`learned_gpu_cap`), and a CPU stage sizes from a (larger) byte budget capped at the
+    # morsel (`cpu_batch_rows`) so a post-decode multimodal stage shrinks its transient output
     # on wide rows. A fixed row count would OOM the device / balloon memory on wide rows and
     # under-fill on narrow ones. OOM-halving remains the safety net if activations still overflow.
     explicit: int | None = op.batch_size or None
-    gpu_cap = _learned_gpu_cap(op) if is_gpu else _GPU_STREAM_BATCH_ROWS
+    gpu_cap = learned_gpu_cap(op) if is_gpu else _GPU_STREAM_BATCH_ROWS
     workers = op.num_workers if isinstance(op.num_workers, int) and op.num_workers > 1 else 1
     # What each morsel's *data width* permits, sized against the config cap rather than the
     # learned one. Folding the size actually applied would make the EMA its own input: the
@@ -377,10 +257,10 @@ def _apply_udf_stream(
         if explicit is not None:
             t = explicit
         elif is_gpu:
-            t = _gpu_batch_rows(batch, gpu_cap)
-            observed_gpu.append(_gpu_batch_rows(batch, _GPU_STREAM_BATCH_ROWS))
+            t = gpu_batch_rows(batch, gpu_cap)
+            observed_gpu.append(gpu_batch_rows(batch, _GPU_STREAM_BATCH_ROWS))
         else:
-            t = _cpu_batch_rows(batch, morsel)
+            t = cpu_batch_rows(batch, morsel)
         if batch.num_rows > t:
             return pa.Table.from_batches([batch]).to_batches(max_chunksize=t)
         return [batch]
@@ -412,11 +292,15 @@ def _apply_udf_stream(
     resilient = is_gpu or op.max_errored_rows > 0
 
     def _emit(sub: pa.RecordBatch):
-        return (
+        started = time.perf_counter_ns() if record is not None else 0
+        out = (
             _resilient_call(call, sub, budget, is_gpu)
             if resilient
             else _coerce_udf_result(call(sub))
         )
+        if record is not None:
+            record(time.perf_counter_ns() - started, sub, out)
+        return out
 
     # A GPU stage keeps `_GPU_PIPELINE_DEPTH` forwards in flight on a small thread pool: torch
     # releases the GIL during the device work, so batch k+1's CPU-side prep (the NumPy->torch
@@ -447,7 +331,7 @@ def _apply_udf_stream(
         # EMA becomes a ratchet that can only fall. Purely a starting-size hint; the size never
         # changes what the model computes, and OOM-halving stays the in-run safety net.
         if is_gpu and explicit is None and observed_gpu:
-            _fold_ema(_GPU_BATCH_NS, _stage_sig(op), float(min(observed_gpu)))
+            fold_ema(_GPU_BATCH_NS, stage_sig(op), float(min(observed_gpu)))
         # Release a class model this stage owns (a plain class `fn` built here, not a prebuilt
         # instance the streaming loop owns) — deterministic teardown at stage end.
         teardown_udf(fn, op)

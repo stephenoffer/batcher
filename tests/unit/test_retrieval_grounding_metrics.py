@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import retrieval as rt
+from batcher.plan.functions.metrics.text import retrieval as rt
 
 pytestmark = pytest.mark.unit
 

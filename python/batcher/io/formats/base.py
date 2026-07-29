@@ -72,7 +72,35 @@ class SinkFormat(Protocol):
         ...
 
 
+# Format families whose modules are imported the first time a format is looked up rather
+# than when `batcher.io.formats` is imported. Between them they reach every SQL warehouse,
+# NoSQL store, message broker, lakehouse table format, and ML shard layout Batcher can
+# read — the widest part of the IO surface and the least used, since a given process
+# names at most one or two of them. Importing them all up front was the single largest
+# component of `import batcher`, and it dragged `ssl`, `http`, `email`, and `asyncio` in
+# behind it for a process that may only ever read a Parquet file.
+#
+# The file formats a pipeline reaches for by default — Parquet, CSV, JSON, text, binary,
+# the multimodal blob readers, the robotics logs — stay eager in `formats/__init__`: they
+# are cheap, they are re-exported by name, and deferring them would only move the cost.
+_DEFERRED_FAMILIES = ("lakehouse", "ml", "nosql", "sql", "streaming")
+
+
+def _load_deferred_families() -> None:
+    """Import the deferred format families, so their modules register themselves.
+
+    Runs at most once, driven by `Registry.complete` from the first lookup that a
+    partially-populated registry could answer wrongly. Self-registration is untouched: a
+    new connector is still one new module in its category package that registers on
+    import, exactly as `add-an-io-format-or-connector` describes.
+    """
+    import importlib
+
+    for family in _DEFERRED_FAMILIES:
+        importlib.import_module(f"batcher.io.formats.{family}")
+
+
 # Registries of format readers/writers, keyed by format name ("parquet"/"csv"/…).
 # Concrete classes register into these from each `io/formats/<fmt>.py` module.
-SOURCES: Registry[type] = Registry("source")
-SINKS: Registry[type] = Registry("sink")
+SOURCES: Registry[type] = Registry("source", on_miss=_load_deferred_families)
+SINKS: Registry[type] = Registry("sink", on_miss=_load_deferred_families)

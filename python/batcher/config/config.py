@@ -78,6 +78,22 @@ def _engine_config_json(values: tuple[object, ...]) -> str:
     return json.dumps(dict(zip(_ENGINE_CONFIG_FIELDS, values, strict=True)))
 
 
+@functools.lru_cache(maxsize=128)
+def _engine_config_json_budgeted(
+    values: tuple[object, ...], budgets: tuple[tuple[int, int], ...]
+) -> str:
+    """`_engine_config_json` plus per-operator spill budgets, memoized on both parts.
+
+    The budgeted payload is rebuilt for the *same* plan on every run of a repeated query
+    and on every micro-batch of a streaming query — where the operator DAG, and so the
+    budget map, is fixed for the life of the stream. Keying the cache on the sorted budget
+    items collapses that to one `json.dumps` per distinct (config, budget) pair.
+    """
+    payload = dict(zip(_ENGINE_CONFIG_FIELDS, values, strict=True))
+    payload["op_budgets"] = {str(op_id): budget for op_id, budget in budgets}
+    return json.dumps(payload)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionConfig:
     """How work is sized and scheduled: thread count and morsel dimensions.
@@ -202,6 +218,56 @@ class ExecutionConfig:
     skew_min_bucket_rows: int = 4 * 16_384
     # Absolute byte floor below which a join bucket is never treated as skewed.
     skew_min_bucket_bytes: int = 4 * (1 << 20)
+
+    # --- UDF process isolation ----------------------------------------------------
+    # What a `map_batches` UDF child process inherits from the engine:
+    #
+    #   "none"   - the child inherits everything (pre-hardening behaviour). For an
+    #              embedder whose UDFs are as trusted as its own code, and who needs a
+    #              variable this engine has no way to know about.
+    #   "env"    - the child's environment is rebuilt from `udf_env_allowlist`, so it
+    #              cannot read `env:` secret material or `BATCHER_SECRET_COMMAND`.
+    #              The default: it closes a real exposure and costs one dict rebuild
+    #              per child, once, at pool startup.
+    #   "strict" - "env" plus the resource ceilings below and the UDF timeout.
+    #
+    # This is defense in depth, NOT a sandbox: a UDF is arbitrary Python in a process
+    # that can reach any syscall through `ctypes`. Untrusted code belongs in a
+    # container. See `core/udf/isolation.py` for why an import allowlist would be a
+    # false claim rather than a defence.
+    udf_isolation: str = "env"
+    # Extra environment variables a UDF child keeps, on top of the built-in allowlist
+    # (PATH/HOME/TMPDIR/locale/thread+device pinning). Name what your UDFs need.
+    udf_env_allowlist: tuple[str, ...] = ()
+    # Address-space ceiling per UDF child, 0 to inherit. Under "strict" this is what
+    # actually stops a runaway allocation: it raises `MemoryError` inside the guilty
+    # child instead of letting the kernel's OOM killer pick a victim, which on a
+    # shared box is frequently some other process.
+    udf_memory_limit_bytes: int = 0
+    # CPU-seconds per UDF child, 0 to inherit. Bounds an infinite loop without the
+    # driver having to be watching.
+    udf_cpu_limit_seconds: int = 0
+    # Wall-clock seconds a single UDF pool map may take, 0 for no limit. Without it a
+    # wedged child hangs the query forever with no error and no signal; with it the
+    # query raises and names the UDF.
+    udf_timeout_s: float = 0.0
+
+    # --- Concurrency admission --------------------------------------------------------
+    # How many queries may execute at once in this process. 0 (the default) is unbounded,
+    # which is today's behavior; a positive value bounds them and divides the cores among
+    # the ones running.
+    #
+    # This exists because of a measurement, not a theory: going from 1 concurrent client
+    # to 16 made throughput FALL (124 -> 88 QPS) while p50 rose 7.6 ms -> 178 ms. Each
+    # query asks the executor for a pool sized to every core, so sixteen of them put ~240
+    # runnable threads on 15 cores. See `carbonite/policies/concurrency.py`.
+    max_concurrent_queries: int = 0
+    # Queries allowed to wait for a slot before an arrival is refused. An unbounded queue
+    # is an outage that presents as slowness; the number matches the queue depth the
+    # Databricks comparator documents, so it is defensible rather than invented.
+    admission_queue_depth: int = 1000
+    # Seconds a query waits for a slot before raising `AdmissionTimeout`. 0 waits forever.
+    admission_timeout_s: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,6 +738,86 @@ class PIDConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantConfig:
+    """Which tenant this scope's work belongs to, and what it may consume.
+
+    Batcher is a library inside one process, so a tenant here is **a cooperating
+    workload, not an adversary**. Two tenants in one process share an address space; one
+    can read the other's memory directly and no Python-level control changes that. What
+    this section does is stop them sharing by *accident* — through the process-global
+    caches, pools, and learned-statistics store they would otherwise both land in — and
+    bound what each may consume.
+
+    That distinction is the whole design. Use it to keep a nightly ETL from evicting an
+    interactive team's cached results, or to keep one team's learned column statistics out
+    of another's optimizer. Do not use it to isolate mutually untrusting parties: run one
+    process per trust domain, as {doc}`../user-guide/hardening` says.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import TenantConfig
+            >>> TenantConfig().tenant_id
+            ''
+    """
+
+    #: Names the tenant. Empty (the default) means "no tenancy" — every process-global
+    #: structure behaves exactly as it did before this existed, which is what keeps this
+    #: from changing anything for a single-workload deployment.
+    tenant_id: str = ""
+    #: Share of the process result-cache budget this tenant may hold, 0.0-1.0. 0 means
+    #: unbounded (the historical behavior).
+    cache_share: float = 0.0
+    #: Maximum queries this tenant may run concurrently. 0 means unbounded.
+    max_concurrent_queries: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class GovernanceConfig:
+    """Whether row/column policy is advisory or mandatory, and where denials are recorded.
+
+    Governance is enforced as a plan rewrite inside a ``bt.security(...)`` block. That is
+    the right default for a library — a `Dataset` built outside one is exactly what it was
+    before a catalog existed — and the wrong one for a deployment, where "the developer
+    forgot the `with` block" must not be the difference between a masked column and a
+    plain one. This section is that switch.
+
+    ``mode`` is the one that matters:
+
+    - ``"off"`` (default) leaves every read exactly as it is today.
+    - ``"advisory"`` logs a warning for each read that a strict deployment would refuse,
+      and proceeds. This exists so an operator can find every ungoverned read in a real
+      workload *before* flipping the switch; without it, strict mode is unadoptable and
+      therefore shelfware.
+    - ``"strict"`` refuses a read that no `security()` block covers, and refuses a source
+      that cannot be governed at all — an in-memory table or a live stream has no durable
+      name to write a policy about, so it is rejected rather than silently exempted.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import GovernanceConfig
+            >>> GovernanceConfig().mode
+            'off'
+    """
+
+    #: ``off`` | ``advisory`` | ``strict`` — see the class docstring.
+    mode: str = "off"
+    #: Deny a table no grant mentions, instead of leaving it ungoverned. Turns the catalog
+    #: from a list of restrictions into a list of permissions.
+    default_deny: bool = False
+    #: Append every governance decision to this JSONL file. An audit trail a caller can
+    #: switch off by not passing a sink is not an audit trail.
+    audit_path: str | None = None
+    #: Refuse a `security()` block whose principal was *asserted* rather than established
+    #: by a `CredentialVerifier` (`bt.authenticate`). Closes the "anyone can claim to be
+    #: admin" gap for code paths a deployment controls; it cannot close it against code
+    #: running inside the engine's own process, which is why the trust boundary stays the
+    #: process. See `governance.authn`.
+    require_verified_principal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class MetadataConfig:
     """Where learned statistics live and how fast they age.
 
@@ -718,34 +864,34 @@ AUTOSCALE_WAIT_AUTO: float = -1.0
 class ShuffleTlsConfig:
     """TLS for the inter-node Arrow Flight shuffle — encrypt the wire, authenticate peers.
 
-        The shuffle moves query data (including already-decrypted or masked columns) directly
-        between worker processes. On any network the operator does not fully control, that
-        traffic must be encrypted and the peers mutually authenticated. These are **file
-        paths** to PEM material the platform mounts on every worker (a Kubernetes secret
-        volume, cert-manager, a cloud private-CA); Batcher reads them at worker start and
-        issues no certificates itself — minting and rotating them is a platform concern.
+    The shuffle moves query data (including already-decrypted or masked columns) directly
+    between worker processes. On any network the operator does not fully control, that
+    traffic must be encrypted and the peers mutually authenticated. These are **file
+    paths** to PEM material the platform mounts on every worker (a Kubernetes secret
+    volume, cert-manager, a cloud private-CA); Batcher reads them at worker start and
+    issues no certificates itself — minting and rotating them is a platform concern.
 
-        Off by default (`enabled=False`) for a plaintext shuffle on a trusted network. One
-        cluster CA typically signs both the server and the client certificates, so
-        `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
-        turn on mTLS (a connecting peer must present a certificate that CA signed).
-        Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
+    Off by default (`enabled=False`) for a plaintext shuffle on a trusted network. One
+    cluster CA typically signs both the server and the client certificates, so
+    `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
+    turn on mTLS (a connecting peer must present a certificate that CA signed).
+    Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
 
-        Examples:
-            .. doctest::
+    Examples:
+        .. doctest::
 
-                >>> from batcher.config import ShuffleTlsConfig
-                >>> ShuffleTlsConfig().enabled  # plaintext shuffle by default
-                False
-                >>> tls = ShuffleTlsConfig(
-    ...     enabled=True,
-    ...     ca_cert_path="/etc/batcher/ca.pem",
-    ...     server_cert_path="/etc/batcher/server.pem",
-    ...     server_key_path="/etc/batcher/server.key",
-    ...     require_client_auth=True,
-    ... )
-                >>> tls.server_name  # the SAN a peer's certificate must carry
-                'batcher-shuffle'
+            >>> from batcher.config import ShuffleTlsConfig
+            >>> ShuffleTlsConfig().enabled  # plaintext shuffle by default
+            False
+            >>> tls = ShuffleTlsConfig(
+            ...     enabled=True,
+            ...     ca_cert_path="/etc/batcher/ca.pem",
+            ...     server_cert_path="/etc/batcher/server.pem",
+            ...     server_key_path="/etc/batcher/server.key",
+            ...     require_client_auth=True,
+            ... )
+            >>> tls.server_name  # the SAN a peer's certificate must carry
+            'batcher-shuffle'
     """
 
     enabled: bool = False
@@ -1533,6 +1679,8 @@ class Config:
     metadata: MetadataConfig = MetadataConfig()
     distributed: DistributedConfig = DistributedConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
+    governance: GovernanceConfig = GovernanceConfig()
+    tenant: TenantConfig = TenantConfig()
 
     def replace(self, **section_overrides: object) -> Config:
         """Return a new Config with whole sections replaced.
@@ -1616,9 +1764,9 @@ class Config:
         """
         if not op_budgets:
             return self.engine_config_json()
-        cfg = self._engine_config_dict()
-        cfg["op_budgets"] = {str(op_id): budget for op_id, budget in op_budgets.items()}
-        return json.dumps(cfg)
+        return _engine_config_json_budgeted(
+            self._engine_config_values(), tuple(sorted(op_budgets.items()))
+        )
 
     def _engine_config_values(self) -> tuple[object, ...]:
         """The Rust-relevant execution knobs as a hashable tuple (the cache key)."""
@@ -1641,10 +1789,6 @@ class Config:
             self.execution.skew_min_bucket_rows,
             self.execution.skew_min_bucket_bytes,
         )
-
-    def _engine_config_dict(self) -> dict[str, object]:
-        """The Rust-relevant execution knobs as a plain dict (shared serialization)."""
-        return dict(zip(_ENGINE_CONFIG_FIELDS, self._engine_config_values(), strict=True))
 
     def validate(self) -> Config:
         """Validate the configuration, raising `ConfigError` on a bad value.
@@ -2122,28 +2266,66 @@ def set_config(config: Config) -> None:
 
 
 @contextlib.contextmanager
+def tenant(tenant_id: str, **overrides: object) -> Iterator[Config]:
+    """Run this block's work as `tenant_id`, isolated from other tenants' shared state.
+
+    Built on `config_context`, and that is the load-bearing design decision rather than an
+    implementation detail: the active config is a `ContextVar`, so a tenant scope is
+    correct under threads and asyncio, nests properly, and cannot leak past its `with`
+    block. A module-global "current tenant" would get all three wrong.
+
+    Inside the block, the process-global structures that would otherwise be shared are
+    keyed by tenant: the result cache, the plan cache, and the learned-statistics
+    namespace. Without it — the default — nothing is keyed and behavior is unchanged.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> with bt.tenant("analytics"):
+            ...     bt.active_config().tenant.tenant_id
+            'analytics'
+            >>> bt.active_config().tenant.tenant_id
+            ''
+
+    Args:
+        tenant_id: Names the tenant. Empty restores un-tenanted behavior.
+        **overrides: Other `TenantConfig` fields, e.g. ``max_concurrent_queries=4``.
+
+    Yields:
+        The `Config` in effect inside the block.
+    """
+    current = active_config()
+    scoped = current.replace(
+        tenant=dataclasses.replace(current.tenant, tenant_id=tenant_id, **overrides)
+    )
+    with config_context(scoped) as cfg:
+        yield cfg
+
+
+@contextlib.contextmanager
 def config_context(config: Config) -> Iterator[Config]:
     """Temporarily activate `config` for the duration of the `with` block.
 
-        Validates `config` on entry (raises `ConfigError` on a bad value).
+    Validates `config` on entry (raises `ConfigError` on a bad value).
 
-        Examples:
-            .. doctest::
+    Examples:
+        .. doctest::
 
-                >>> from batcher.config import Config, ExecutionConfig
-                >>> from batcher.config import active_config, config_context
-                >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
-                >>> with config_context(cfg):
-    ...     active_config().execution.morsel_rows
-                4096
-                >>> active_config().execution.morsel_rows
-                16384
+            >>> from batcher.config import Config, ExecutionConfig
+            >>> from batcher.config import active_config, config_context
+            >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+            >>> with config_context(cfg):
+            ...     active_config().execution.morsel_rows
+            4096
+            >>> active_config().execution.morsel_rows
+            16384
 
-        Args:
-            config: The Config to activate for the block. It is validated on entry.
+    Args:
+        config: The Config to activate for the block. It is validated on entry.
 
-        Yields:
-            The resolved Config that is active inside the block.
+    Yields:
+        The resolved Config that is active inside the block.
     """
     resolved = _resolved(config)
     token = _active.set(resolved)

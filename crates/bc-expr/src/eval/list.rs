@@ -58,6 +58,7 @@ pub(crate) fn eval_list_join(list: &ArrayRef, sep: &str) -> Result<ArrayRef, Exp
     use arrow::array::{Array, AsArray, StringArray};
 
     let lst = require_list(list, "list_join")?;
+    let lst = lst.as_list::<i32>();
     let elems = cast(lst.values(), &DataType::Utf8)?;
     let elems = elems.as_string::<i32>();
     let offsets = lst.value_offsets();
@@ -190,19 +191,20 @@ pub(crate) fn element_identity(child: &ArrayRef) -> Result<arrow::row::Rows, Exp
     Ok(converter.convert_columns(std::slice::from_ref(&key))?)
 }
 
-/// Downcast to a `List` array or raise a clear type error.
-pub(crate) fn require_list<'a>(
-    arr: &'a ArrayRef,
-    func: &str,
-) -> Result<&'a arrow::array::GenericListArray<i32>, ExprError> {
-    use arrow::array::AsArray;
-    if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedString {
-            func: func.into(),
-            got: arr.data_type().to_string(),
-        });
-    }
-    Ok(arr.as_list::<i32>())
+/// A `List` view of `arr`, accepting a `FixedSizeList` by widening it, or a clear
+/// type error.
+///
+/// Embeddings arrive as `FixedSizeList` — that is how Arrow and Parquet store a vector
+/// column, and what DuckDB's `ARRAY` type maps to. The vector kernels already coerced
+/// (see `list_ops::coerce::as_var_list`), but the *indexing* half of the namespace did
+/// not, so the same embedding column could be normalized and summed yet not subscripted,
+/// sliced, or searched. Coercing in one place is what makes `.list` mean the same thing
+/// for both list encodings.
+///
+/// Returns an owned array because widening allocates offsets; for an already-variable
+/// `List` it is a refcount bump, and next to an embedding payload the offsets are noise.
+pub(crate) fn require_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprError> {
+    crate::eval::list_ops::coerce::as_var_list(arr, func)
 }
 
 /// Rebuild a `List` column by choosing, for each row, which child indices (global)
@@ -246,6 +248,8 @@ pub(crate) fn eval_list_contains(arr: &ArrayRef, value: &Literal) -> Result<Arra
     use arrow::array::{Array, BooleanBuilder};
 
     let list = require_list(arr, "list.contains")?;
+    use arrow::array::AsArray;
+    let list = list.as_list::<i32>();
     let offsets = list.value_offsets();
     // Compare element-wise against the literal, both promoted to a common type so the
     // child is never narrowed onto the literal (that truncated `[2.5].contains(2)`).
@@ -271,6 +275,8 @@ pub(crate) fn eval_list_position(arr: &ArrayRef, value: &Literal) -> Result<Arra
     use arrow::array::{Array, Int64Builder};
 
     let list = require_list(arr, "list.position")?;
+    use arrow::array::AsArray;
+    let list = list.as_list::<i32>();
     let offsets = list.value_offsets();
     let eq = eq_against_literal(list.values(), value)?;
 
@@ -318,8 +324,9 @@ pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, 
     use arrow::array::{Array, AsArray};
 
     if !matches!(arr.data_type(), DataType::Struct(_)) {
-        return Err(ExprError::ExpectedString {
+        return Err(ExprError::ExpectedType {
             func: "struct.field".into(),
+            want: "a Struct argument",
             got: arr.data_type().to_string(),
         });
     }
@@ -345,12 +352,7 @@ pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, Expr
     use arrow::array::{Array, AsArray, UInt32Array};
     use arrow::compute::take;
 
-    if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedString {
-            func: "list.get".into(),
-            got: arr.data_type().to_string(),
-        });
-    }
+    let arr = require_list(arr, "list.get")?;
     let list = arr.as_list::<i32>();
     let offsets = list.value_offsets();
     let take_idx: UInt32Array = (0..list.len())
@@ -395,6 +397,18 @@ pub(crate) fn eval_list_binary(
     let left = as_var_list(left, &format!("list.{func:?} (left)"))?;
     let right = as_var_list(right, &format!("list.{func:?} (right)"))?;
     let (la, ra) = (left.as_list::<i32>(), right.as_list::<i32>());
+
+    // `Jaccard` is a positional *equality* rate, not a numeric reduction, so it is
+    // meaningful over strings — a token list, a list of ids. The shared path below casts
+    // every element array to Float64, and casting Utf8 to Float64 yields nulls rather than
+    // an error, so a string list scored 0.0 agreement even against an identical list. Route
+    // string elements through a native comparison instead of that lossy cast.
+    if matches!(func, ListBinaryFunc::Jaccard)
+        && crate::eval::list_ops::jaccard_str::is_string_list(la)
+        && crate::eval::list_ops::jaccard_str::is_string_list(ra)
+    {
+        return crate::eval::list_ops::jaccard_str::jaccard_utf8(la, ra);
+    }
 
     // Embeddings are overwhelmingly `f32`; keeping them at native width halves the bytes
     // the inner loop streams. Accumulation is `f64` either way, so the two paths agree
@@ -796,6 +810,44 @@ mod tests {
         (0..x.len())
             .map(|i| (!x.is_null(i)).then(|| x.value(i)))
             .collect()
+    }
+
+    /// `jaccard` over string lists compares elements, rather than casting them to Float64.
+    ///
+    /// The shared numeric path casts every element array to Float64, and Utf8 -> Float64 is a
+    /// *safe* cast that yields nulls instead of failing. Every position therefore disagreed
+    /// and a string list scored 0.0 against an identical copy of itself — a silently wrong
+    /// answer for anything using this as a near-duplicate score.
+    #[test]
+    fn jaccard_compares_strings_by_value() {
+        let left = str_lists(&[
+            Some(vec!["a", "b", "c"]),
+            Some(vec!["a", "b"]),
+            Some(vec!["x"]),
+            None,
+            Some(vec![]),
+        ]);
+        let right = str_lists(&[
+            Some(vec!["a", "b", "c"]), // identical -> 1.0
+            Some(vec!["a", "z"]),      // one of two agrees -> 0.5
+            Some(vec!["y"]),           // none agree -> 0.0
+            Some(vec!["a"]),           // null row -> null
+            Some(vec![]),              // no positions -> null
+        ]);
+        let out = eval_list_binary(ListBinaryFunc::Jaccard, &left, &right).unwrap();
+        assert_eq!(
+            f64s(&out),
+            vec![Some(1.0), Some(0.5), Some(0.0), None, None]
+        );
+    }
+
+    /// The numeric branch is unchanged by the string carve-out above.
+    #[test]
+    fn jaccard_still_compares_numbers_positionally() {
+        let left = lists(&[Some(vec![1.0, 2.0, 3.0]), Some(vec![5.0, 6.0])]);
+        let right = lists(&[Some(vec![1.0, 9.0, 3.0]), Some(vec![5.0, 6.0])]);
+        let out = eval_list_binary(ListBinaryFunc::Jaccard, &left, &right).unwrap();
+        assert_eq!(f64s(&out), vec![Some(2.0 / 3.0), Some(1.0)]);
     }
 
     #[test]

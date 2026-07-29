@@ -25,7 +25,6 @@ from batcher.plan.functions.aggregate import (
     var,
 )
 from batcher.plan.functions.collection import element, named_struct, sequence, struct
-from batcher.plan.functions.conditional import iff, nanvl
 from batcher.plan.functions.horizontal import (
     all_horizontal,
     any_horizontal,
@@ -38,11 +37,22 @@ from batcher.plan.functions.horizontal import (
     reduce_horizontal,
     sum_horizontal,
 )
-from batcher.plan.functions.math import arctan2, gcd, hypot, lcm, log, width_bucket
 from batcher.plan.functions.prompt import (
     render_template,
     truncate_to_token_budget,
     wrap_tag,
+)
+from batcher.plan.functions.scalar import (
+    arctan2,
+    gcd,
+    great_circle_distance,
+    hypot,
+    iff,
+    lcm,
+    log,
+    nanvl,
+    next_after,
+    width_bucket,
 )
 from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
 from batcher.plan.functions.string import (
@@ -67,6 +77,10 @@ from batcher.plan.functions.temporal import (
     date_add,
     date_part,
     date_sub,
+    from_epoch,
+    from_unix_date,
+    make_date,
+    make_timestamp,
     window,
 )
 
@@ -100,13 +114,18 @@ __all__ = [
     "extract_tag",
     "fold_horizontal",
     "format_string",
+    "from_epoch",
+    "from_unix_date",
     "gcd",
+    "great_circle_distance",
     "hmac_sha256",
     "hypot",
     "iff",
     "is_refusal",
     "lcm",
     "log",
+    "make_date",
+    "make_timestamp",
     "mask",
     "max",
     "max_horizontal",
@@ -118,6 +137,7 @@ __all__ = [
     "n_unique",
     "named_struct",
     "nanvl",
+    "next_after",
     "product_horizontal",
     "reduce_horizontal",
     "render_template",

@@ -109,11 +109,10 @@ this is what distributed.distribute_min_rows (1M) protects
 :::{tab-item} Distributed
 ```text
 TPC-H sf1 (6M rows), the udf-map workload:   92 ms   (batcher, 4 workers)
-                                          4,284 ms   (Ray Data, cluster)
 
 the result is bit-identical to the single-node one. at this size the shuffle
-plus actor startup costs more than the whole query.
-even distributed-versus-distributed, the gap is 46×.
+plus actor startup costs more than the whole query, and taking the distributed
+path anyway costs about 7%.
 ```
 :::
 ::::
@@ -141,8 +140,7 @@ The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists
 - [Carbonite](../internals/carbonite.md): the envelope each worker runs inside
 - [Ray integration](../integrations/ray.md): setting up the cluster this schedules onto
 - [Configuration options](../configuration/options.md): every `distributed.*` knob named here
-- [Scaling benchmarks](../benchmarks/scaling.md): the node-count curves
-- [vs Ray Data](../benchmarks/vs-ray-data.md): the 46× comparison above, in context
+- [Scaling benchmarks](../benchmarks/scaling.md): the node-count curves, and the cluster grid
 - [Mergeable algebra](mergeable-algebra.md): why a partitioned result equals a single-node one
 - [Shuffle over Arrow Flight](shuffle-flight.md): how the bytes actually move
 - [Credit-based flow control](credit-flow-control.md): what keeps a reducer from drowning

@@ -155,21 +155,28 @@ def hoist_windows(exprs: Sequence[Expr]) -> tuple[list[Expr], list[tuple[str, Wi
     hoisted: list[tuple[str, WindowExpr]] = []
     seen: dict[int, str] = {}  # id(WindowExpr) -> the column it was hoisted into
 
-    def lift(expr: Expr) -> Expr:
-        def rule(node: Expr) -> Expr:
-            if not isinstance(node, WindowExpr):
-                return node
-            shared = seen.get(id(node))
-            if shared is not None:
-                return Col(shared)
-            # Recurse into the argument first: an inner window must be materialized
-            # before the outer one can read it.
-            inner = node if node.input is None else node.with_input(lift(node.input))
-            name = f"{WINDOW_TEMP_PREFIX}{len(hoisted)}"
-            seen[id(node)] = name
-            hoisted.append((name, inner))
-            return Col(name)
+    def rule(node: Expr) -> Expr:
+        if not isinstance(node, WindowExpr):
+            return node
+        shared = seen.get(id(node))
+        if shared is not None:
+            return Col(shared)
+        # Recurse into the argument first: an inner window must be materialized
+        # before the outer one can read it.
+        inner = node if node.input is None else node.with_input(lift(node.input))
+        name = f"{WINDOW_TEMP_PREFIX}{len(hoisted)}"
+        seen[id(node)] = name
+        hoisted.append((name, inner))
+        return Col(name)
 
+    def lift(expr: Expr) -> Expr:
+        # A bare column reference cannot contain a window, and it is what almost every
+        # expression in a wide projection *is*: `with_columns` re-emits one pass-through
+        # `Col` per untouched column, so a 300-column relation reaches here 300 times with
+        # nothing to hoist. Answering that with a type check instead of a tree rewrite is
+        # what keeps the call proportional to the columns it actually changes.
+        if type(expr) is Col:
+            return expr
         return transform_expr_up(expr, rule)
 
     return [lift(e) for e in exprs], hoisted

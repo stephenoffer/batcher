@@ -359,3 +359,21 @@ consult the same statistics before executing. The `meta` namespace opens that la
 lets you ask it directly. Crucially, it also lets you ask things no SQL terminal has a
 spelling for, such as "would this join match anything?" or "how many files am I about to
 open?".
+
+Two deep dives explain the machinery underneath. {doc}`../deep-dives/learned-metadata`
+covers the sketches a finished query records for the next one, and
+{doc}`../deep-dives/cardinality-estimation` covers how the optimizer turns them into row
+estimates. The measured payoff is on {doc}`../benchmarks/analytics`, where a `count()`
+after a transform chain returns in 0.05 ms because nothing is scanned.
+
+## See also
+
+- {doc}`explain-plans`: confirm that a predicate reached the scan, and that pruning
+  actually happened.
+- {doc}`data-quality`: turn the `ds.meta.col(...).check` probes here into enforced
+  contracts with `ds.dq`.
+- {doc}`performance`: the other levers when a query is slower than its metadata suggests
+  it should be.
+- {doc}`reading-data`: where footer statistics come from, per format.
+- {doc}`lakehouse`: manifest-level statistics on Delta, Iceberg, and Hudi tables.
+- {doc}`../api/dataset`: the `ds.meta` reference, namespace by namespace.

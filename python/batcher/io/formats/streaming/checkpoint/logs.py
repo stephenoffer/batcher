@@ -19,6 +19,29 @@ from typing import Any
 __all__ = ["CommitLog", "OffsetLog"]
 
 
+def _tune(conn: sqlite3.Connection) -> None:
+    """Put a checkpoint log in write-ahead-log mode with relaxed sync.
+
+    Every micro-batch commits to both logs, so the default rollback journal charged a
+    stream two journal rewrites and fsyncs per epoch — at a 50ms trigger, forty fsyncs a
+    second spent on bookkeeping rather than on data. WAL appends instead.
+
+    ``synchronous=NORMAL`` is the right durability point rather than a shortcut, and the
+    reason is the direction in which this log is allowed to be wrong. Under WAL it survives
+    a *process* crash intact; an OS-level crash can lose the last few commits. Losing an
+    offset row means the epoch is re-read; losing a commit row means a published epoch is
+    replayed. Both land in the sink's idempotency check — which is precisely the mechanism
+    the whole two-phase design exists to lean on — so the worst case is repeated work. The
+    failure this log must never produce is the opposite one, recording a batch as committed
+    before its rows are durable, and that ordering is enforced by the caller, not by fsync.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:  # pragma: no cover - filesystem-dependent
+        pass
+
+
 class _LogTable:
     """A SQLite-backed log table with eager commit (the `SeenStore` pattern)."""
 
@@ -30,6 +53,7 @@ class _LogTable:
         # (recovery on the main thread before the loop starts, then only the loop
         # thread), so disabling the same-thread check is safe here.
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        _tune(self._conn)
         self._conn.execute(schema)
         self._conn.commit()
 
@@ -127,6 +151,24 @@ class CommitLog(_LogTable):
     def last_committed(self) -> int | None:
         """The highest committed batch id, or ``None`` if none committed yet."""
         row = self._conn.execute("SELECT MAX(batch_id) FROM commits").fetchone()
+        return row[0] if row is not None else None
+
+    def sink_token(self, batch_id: int) -> str | None:
+        """What the sink reported writing for `batch_id`, or `None`.
+
+        The read counterpart of the token `commit` records. Without it the column was
+        write-only, which is not a record: the log could be asked *whether* a batch
+        committed and never *what* the sink did for it — the difference between an audit
+        trail a `foreachBatch` sink can dedup against and a list of batch ids.
+
+        Args:
+            batch_id: The committed micro-batch to look up.
+
+        Returns:
+            The sink's token, or `None` when the batch is absent or wrote nothing.
+        """
+        cur = self._conn.execute("SELECT sink_token FROM commits WHERE batch_id = ?", (batch_id,))
+        row = cur.fetchone()
         return row[0] if row is not None else None
 
     def is_committed(self, batch_id: int) -> bool:

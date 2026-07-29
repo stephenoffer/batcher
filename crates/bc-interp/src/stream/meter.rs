@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use bc_ir::RelOp;
@@ -32,7 +33,6 @@ use crate::metrics::{ExecMetrics, OpMetric};
 
 /// One operator's running counters. Atomics because every rayon worker running a shard of the
 /// pipeline increments the *same* operator's counters.
-#[derive(Default)]
 struct Counters {
     rows_in: AtomicU64,
     rows_build: AtomicU64,
@@ -41,6 +41,29 @@ struct Counters {
     /// A high-water mark, not a sum: peak is the most this operator ever held at once.
     peak_bytes: AtomicU64,
     result_bytes: AtomicU64,
+    /// Nanoseconds after the meter's epoch at which this operator's *first* morsel began, across
+    /// every worker (a running `fetch_min`). Starts at `u64::MAX` so the first sample wins.
+    span_start_ns: AtomicU64,
+    /// Nanoseconds after the meter's epoch at which this operator's *last* morsel ended, across
+    /// every worker (a running `fetch_max`).
+    span_end_ns: AtomicU64,
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self {
+            rows_in: AtomicU64::new(0),
+            rows_build: AtomicU64::new(0),
+            rows_out: AtomicU64::new(0),
+            elapsed_ns: AtomicU64::new(0),
+            peak_bytes: AtomicU64::new(0),
+            result_bytes: AtomicU64::new(0),
+            // The identity for `fetch_min`: any real timestamp replaces it. `0` would make every
+            // operator appear to have started at the query's first instant.
+            span_start_ns: AtomicU64::new(u64::MAX),
+            span_end_ns: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Per-operator counters for one plan, indexed by the pre-order `op_id` the control plane uses.
@@ -51,6 +74,10 @@ pub(crate) struct Meter {
     /// so its nodes' addresses are stable identities.
     ids: HashMap<usize, u32>,
     threads: u32,
+    /// The instant the meter was created — the origin every operator's span is measured from.
+    /// Spans need a *shared* origin to be comparable across workers, and an `Instant` per
+    /// operator would give each its own.
+    epoch: Instant,
 }
 
 impl Meter {
@@ -68,7 +95,29 @@ impl Meter {
             counters,
             ids,
             threads,
+            epoch: Instant::now(),
         }
+    }
+
+    /// Widen an operator's wall span to cover a unit of work that just finished after
+    /// `elapsed_ns` of transform time.
+    ///
+    /// The span is what makes an occupancy figure possible on this tier. `elapsed_ns` alone is
+    /// *busy* time summed over every worker and every morsel; dividing it by itself yields
+    /// `1/threads` for every operator of every query, which is the constant this tier used to
+    /// report as CPU utilization. Dividing it by the wall interval the operator actually
+    /// occupied, times the worker count, yields the real figure.
+    ///
+    /// The end is read now and the start derived by subtraction, because the callers already
+    /// time their own transforms and threading a start instant through every one of them would
+    /// buy nothing: `Instant::now()` is a vDSO read, so the cost here is nanoseconds per
+    /// morsel against transforms measured in microseconds and up.
+    fn mark_span(&self, op: u32, elapsed_ns: u64) {
+        let c = &self.counters[op as usize];
+        let end = self.epoch.elapsed().as_nanos() as u64;
+        c.span_start_ns
+            .fetch_min(end.saturating_sub(elapsed_ns), Ordering::Relaxed);
+        c.span_end_ns.fetch_max(end, Ordering::Relaxed);
     }
 
     /// This node's `op_id`.
@@ -89,6 +138,7 @@ impl Meter {
         // A pipeline operator holds one morsel at a time, so its peak *is* the largest morsel it
         // ever produced — not the sum of them, which is the whole point of streaming.
         c.peak_bytes.fetch_max(bytes, Ordering::Relaxed);
+        self.mark_span(op, elapsed_ns);
     }
 
     /// A streamed join's build side is hashed **once**, no matter how many morsels probe it, so
@@ -122,6 +172,7 @@ impl Meter {
         c.result_bytes.fetch_add(bytes, Ordering::Relaxed);
         c.peak_bytes
             .fetch_max(peak_bytes.max(bytes), Ordering::Relaxed);
+        self.mark_span(op, elapsed_ns);
     }
 
     /// The metrics document, in pre-order — the order every other executor emits.
@@ -138,6 +189,16 @@ impl Meter {
             if elapsed_ns == 0 && rows_in == 0 && rows_out == 0 {
                 continue;
             }
+            // The interval from the first worker entering this operator to the last leaving it.
+            // `span_start_ns` still holding its `u64::MAX` sentinel means no unit of work was
+            // ever marked, so there is no interval and `0` (unmeasured) is the honest report.
+            let start = c.span_start_ns.load(Ordering::Relaxed);
+            let end = c.span_end_ns.load(Ordering::Relaxed);
+            let wall_span_ns = if start == u64::MAX {
+                0
+            } else {
+                end.saturating_sub(start)
+            };
             m.record(OpMetric {
                 op_id: id as u32,
                 kind: self.kinds[id],
@@ -145,28 +206,26 @@ impl Meter {
                 rows_build: c.rows_build.load(Ordering::Relaxed),
                 rows_out,
                 elapsed_ns,
-                // `0` means "not measured", and that is the truthful answer here rather than a
-                // defect. A CPU *utilization* needs two numbers — work summed across threads,
-                // and the wall interval it was spread over — and this tier only has the first:
-                // `elapsed_ns` is already the per-morsel transform time summed over every worker
-                // (see the module docs), and no wall span is recorded because operators interleave
-                // in a pipeline and none owns a clock interval outright.
+                wall_span_ns,
+                // The numerator of this tier's utilization: transform time summed over every
+                // morsel and every worker that ran the operator. It is *busy* time rather than
+                // CPU time from `getrusage` — a worker inside a transform is running, but for an
+                // I/O-bound transform some of that wall time is spent waiting rather than
+                // computing, so this reads slightly high on a scan and is exact on a compute
+                // kernel. That is an approximation with a known direction, which is a different
+                // thing from the constant it replaces.
                 //
-                // Reporting `elapsed_ns` here, as this did, was not a conservative approximation
-                // — it was a fabricated constant. The consumer divides `cpu_ns` by
-                // `elapsed_ns * threads` (`plan.feedback.cpu_utilization`), so handing it the same
-                // number twice yields exactly `1 / threads` for *every* operator of *every*
-                // query: a hardcoded 6.25% on a 16-core box. `explain(analyze=True)` printed that
-                // as "cpu utilization: 7% of cores — CPU idle, not CPU-limited" on queries
-                // measured at 8-10x parallelism, i.e. confidently backwards, and
-                // `kyber.cpu_shares.load_cpu_utilization` fed the same constant into the learned
-                // CPU-share model. Its loader ignores non-positive samples, so `0` stops the
-                // corruption rather than merely hiding it.
-                //
-                // Restoring a real number means carrying a wall span per operator (min start /
-                // max end across workers) as its own `OpMetric` field — a two-sided IR change,
-                // deliberately not bundled here.
-                cpu_ns: 0,
+                // What it replaces: this field was `0`, and before that it was `elapsed_ns`.
+                // Reporting `elapsed_ns` was not a conservative approximation but a fabricated
+                // constant — the consumer divides `cpu_ns` by `elapsed_ns * threads`
+                // (`plan.feedback.cpu_utilization`), so handing it the same number twice yields
+                // exactly `1 / threads` for *every* operator of *every* query: a hardcoded 6.25%
+                // on a 16-core box. `explain(analyze=True)` printed that as "CPU idle, not
+                // CPU-limited" on queries measured at 8-10x parallelism, confidently backwards,
+                // and the learned CPU-share model was fed the same constant. Zeroing it stopped
+                // the corruption; `wall_span_ns` is what makes a real figure possible, by giving
+                // the division an interval to divide by instead of the work itself.
+                cpu_ns: if wall_span_ns > 0 { elapsed_ns } else { 0 },
                 threads: self.threads,
                 peak_bytes: c.peak_bytes.load(Ordering::Relaxed),
                 result_bytes: c.result_bytes.load(Ordering::Relaxed),
@@ -174,6 +233,13 @@ impl Meter {
                 spill_bytes: 0,
                 peak_rss_bytes: 0,
                 backend: "interp",
+                // Unmeasured, for the same reason `cpu_ns` is: the OS counters are
+                // process-wide, and attributing them to one operator is only sound when that
+                // operator owns an exclusive wall interval. In this tier operators interleave
+                // across a pipeline and none does, so any per-operator split here would be a
+                // fabricated number rather than an approximate one. The control plane reads
+                // zeros as "unmeasured" and keeps its prior.
+                hw: Default::default(),
             });
         }
         m
@@ -192,6 +258,7 @@ fn kind_of(plan: &RelOp) -> &'static str {
         RelOp::Limit { .. } => "limit",
         RelOp::HashJoin { .. } => "hash_join",
         RelOp::AsofJoin { .. } => "asof_join",
+        RelOp::RangeJoin { .. } => "range_join",
         RelOp::Distinct { .. } => "distinct",
         RelOp::Window { .. } => "window",
         RelOp::Union { .. } => "union",

@@ -1,0 +1,470 @@
+//! The two spill stores and the codec that writes them.
+//!
+//! `SpillStore` is a partitioned, append-only staging area: the grace aggregate routes
+//! partials into it by a hash of the group key and reads each partition back once. Two
+//! implementations, and the difference is the whole point of the trait —
+//! [`MemSpillStore`] keeps partitions in memory so the grace algebra can be proven against
+//! the non-spilling oracle without touching a filesystem, and [`DiskSpillStore`] streams
+//! them to Arrow IPC files, which is the path that actually bounds resident memory.
+//!
+//! Split out of the merge algorithm because they answer different questions: this file is
+//! about *where the bytes live and who may read them*, `super` is about *how the mergeable
+//! algebra reproduces the global aggregate one partition at a time*.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow::ipc::CompressionType;
+
+use crate::error::RuntimeError;
+
+/// Compression codec for spilled Arrow-IPC streams.
+///
+/// Spill is **perf-only and result-invariant**: an IPC stream self-describes its
+/// compression, so the reader decompresses automatically and no codec choice can
+/// change the batches read back. This only trades CPU for spill-file (and
+/// disk-bandwidth) bytes. `None` is the historical, byte-for-byte-unchanged path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpillCodec {
+    /// Uncompressed — identical to the pre-compression spill path.
+    None,
+    /// LZ4 frame — fast, modest ratio.
+    Lz4,
+    /// Zstandard — slower, better ratio (best for large/blob-heavy spills).
+    Zstd,
+    /// Datatype-aware: pick the codec per spill from the spilled batch's schema
+    /// (see [`SpillCodec::classify`]). The default — a strictly better policy than a
+    /// fixed codec, and still result-invariant (IPC self-describes its compression).
+    #[default]
+    Auto,
+}
+
+impl SpillCodec {
+    /// Resolve the control-plane codec name (`EngineConfig.spill_compression`).
+    /// Unknown names fall back to `Auto` (the datatype-aware policy) rather than
+    /// erroring, so a newer control plane never breaks an older engine.
+    pub fn from_config_str(name: Option<&str>) -> Self {
+        match name.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("none") => Self::None,
+            Some("lz4") => Self::Lz4,
+            Some("zstd") => Self::Zstd,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Choose a concrete codec for a spilled batch by its dominant column type.
+    ///
+    /// Arrow IPC has a single stream-level codec (no per-field slot), so this picks
+    /// one codec for the whole stream by where the bytes are. The decisive fact
+    /// (measured): on fast local spill disk, general-purpose compression of numeric
+    /// or string state is a net *loss* — the CPU outweighs the I/O saved. Only
+    /// blob/large-binary payloads compress dramatically enough to win regardless of
+    /// disk speed. So `auto` compresses **only** a blob-bearing schema (ZSTD, best
+    /// ratio) and leaves everything else uncompressed — never a regression, a win
+    /// exactly where the payload dwarfs the CPU.
+    pub(super) fn classify(schema: &Schema) -> Self {
+        use arrow::datatypes::DataType::*;
+        let has_blob = schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), LargeBinary | Binary | LargeUtf8));
+        if has_blob {
+            Self::Zstd
+        } else {
+            Self::None
+        }
+    }
+
+    /// The IPC write options for this codec given the schema being spilled. `Auto`
+    /// classifies the schema first; if the chosen compression is not compiled into
+    /// this arrow build, it silently degrades to uncompressed (mirroring the Python
+    /// `TieredSpillStore`), so a write never fails on codec.
+    fn write_options(self, schema: &Schema) -> IpcWriteOptions {
+        let base = IpcWriteOptions::default();
+        let codec = match self {
+            Self::Auto => return Self::classify(schema).write_options(schema),
+            Self::None => return base,
+            Self::Lz4 => CompressionType::LZ4_FRAME,
+            Self::Zstd => CompressionType::ZSTD,
+        };
+        base.clone()
+            .try_with_compression(Some(codec))
+            .unwrap_or(base)
+    }
+}
+
+/// A partitioned, append-only store of partial-state batches.
+///
+/// The aggregator appends routed partials during the spill phase and reads each
+/// partition back (exactly once) during the merge phase. Implementations decide
+/// whether partitions live in memory or on disk; the algorithm is identical.
+pub trait SpillStore {
+    /// Number of hash partitions this store was created with (`P`).
+    fn num_partitions(&self) -> usize;
+    /// Append one partial-state batch to `partition`.
+    fn append(&mut self, partition: usize, batch: &RecordBatch) -> Result<(), RuntimeError>;
+    /// Drain every batch previously appended to `partition`. Called once per
+    /// partition; a store may free the partition's backing storage afterward.
+    fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError>;
+    /// Spawn a fresh, independent store of the same kind with `partitions` partitions —
+    /// used to recursively re-partition an over-large partition during the merge phase
+    /// (a disk store nests a subdirectory; a memory store makes another memory store).
+    fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError>;
+    /// Total logical bytes routed to this store's spill path (the sum of appended
+    /// batches' in-memory size). This is the measured *spill volume* Carbonite needs to
+    /// size spill scratch and disk bandwidth and to tell a 1 GB spill from a 100 GB one —
+    /// a `spilled: bool` cannot. `0` for a store that spilled nothing (or does not track).
+    fn spilled_bytes(&self) -> u64 {
+        0
+    }
+    /// Spill *skew*: the largest partition's bytes over the mean non-empty partition's — `1.0`
+    /// for a perfectly even spill, ≫ `1` when a hot key piles one partition. `1.0` for a store
+    /// that spilled nothing or does not track per-partition sizes.
+    fn spill_skew(&self) -> f32 {
+        1.0
+    }
+
+    /// Bytes appended to `partition`, or `0` when the store does not track them.
+    ///
+    /// Asked *before* the partition is read, which is the whole point: it is what lets the
+    /// merge decide to split a skewed partition without first pulling it into memory.
+    fn partition_bytes(&self, partition: usize) -> u64 {
+        let _ = partition;
+        0
+    }
+
+    /// Hand `partition`'s batches to `sink` one at a time, then release the partition.
+    ///
+    /// The bounded-memory counterpart of [`SpillStore::read`], which returns the partition
+    /// whole. The default reads it whole and feeds it through — correct for a store with no
+    /// streaming reader, and no worse than what the caller would have done anyway.
+    fn drain(
+        &mut self,
+        partition: usize,
+        sink: &mut dyn FnMut(&RecordBatch) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        for b in self.read(partition)? {
+            sink(&b)?;
+        }
+        Ok(())
+    }
+}
+
+/// Max-over-mean of the non-zero entries — the skew factor (`1.0` when even or fewer than
+/// two non-empty partitions).
+pub(super) fn skew_of(bytes_per_partition: &[u64]) -> f32 {
+    let nonzero: Vec<u64> = bytes_per_partition
+        .iter()
+        .copied()
+        .filter(|&b| b > 0)
+        .collect();
+    if nonzero.len() < 2 {
+        return 1.0;
+    }
+    let max = *nonzero.iter().max().unwrap() as f64;
+    let mean = nonzero.iter().sum::<u64>() as f64 / nonzero.len() as f64;
+    if mean <= 0.0 {
+        1.0
+    } else {
+        (max / mean) as f32
+    }
+}
+
+/// In-memory partitions. Does not reduce resident memory — it exists to test the
+/// grace algebra against the non-spilling oracle without touching the filesystem.
+pub struct MemSpillStore {
+    parts: Vec<Vec<RecordBatch>>,
+}
+
+impl MemSpillStore {
+    pub fn new(partitions: usize) -> Self {
+        let n = partitions.max(1);
+        Self {
+            parts: (0..n).map(|_| Vec::new()).collect(),
+        }
+    }
+}
+
+impl SpillStore for MemSpillStore {
+    fn num_partitions(&self) -> usize {
+        self.parts.len()
+    }
+    fn append(&mut self, partition: usize, batch: &RecordBatch) -> Result<(), RuntimeError> {
+        self.parts[partition].push(batch.clone());
+        Ok(())
+    }
+    fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError> {
+        Ok(std::mem::take(&mut self.parts[partition]))
+    }
+    fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError> {
+        Ok(Box::new(MemSpillStore::new(partitions)))
+    }
+    fn partition_bytes(&self, partition: usize) -> u64 {
+        self.parts
+            .get(partition)
+            .map(|batches| {
+                batches
+                    .iter()
+                    .map(|b| b.get_array_memory_size() as u64)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// Monotonic per-process counter that makes each spill store's scratch directory
+/// unique. Without it, every store names its files `part-{i}.arrow` under the same
+/// shared spill root, so concurrent stores — sibling spilling operators in one plan,
+/// or several distributed worker processes sharing one spill dir — would clobber
+/// each other's partitions (and one store's drop would `remove_dir_all` the shared
+/// root out from under the others). A process id + this counter isolates them.
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Disk-backed partitions: each partition streams to its own Arrow IPC file, so
+/// only the partition currently being merged is resident. Each store owns a private
+/// subdirectory under the given root, removed on drop (best-effort).
+pub struct DiskSpillStore {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+    writers: Vec<Option<StreamWriter<File>>>,
+    codec: SpillCodec,
+    /// Resolved on the first append (when the spilled schema is known, which `Auto`
+    /// needs to classify) and reused for every partition's writer.
+    write_options: Option<IpcWriteOptions>,
+    /// Running sum of appended batches' in-memory size — the logical spill volume this
+    /// store has written. The measured signal Carbonite sizes spill scratch from.
+    bytes_written: u64,
+    /// Bytes written to each partition, indexed by partition. The spread across these (max
+    /// vs mean) is the spill *skew*: an even hash gives ~equal partitions (skew ~1), a hot
+    /// key piles one partition many times its share (skew ≫ 1) — the signal that a family's
+    /// spill thrashes and should shard into more, salted partitions next run.
+    bytes_per_partition: Vec<u64>,
+}
+
+/// Restrict a spill directory to its owner (`0o700` on Unix); best-effort elsewhere.
+///
+/// Spilled data is the query's *actual rows* — the same bytes the caller may have taken
+/// care to encrypt in flight — written to a shared scratch path such as `/tmp`. Created
+/// with the default mode it is world-readable, so any other local user on the node can
+/// read a spilled join or aggregate. Restricting the directory is the primary choke point:
+/// without search permission on it, the `part-*.arrow` files inside are unreachable
+/// regardless of their own mode.
+///
+/// It is not the *only* one, which is why [`create_private`] restricts the files too. This
+/// function is best-effort and **silently ignores failure** — deliberately, so a filesystem
+/// that cannot represent Unix modes never fails a query over a hardening step — and that
+/// means the directory can legitimately end up 0755 with nothing said. Measured before the
+/// file mode was fixed: the directory came out 0700 and every `part-*.arrow` inside it
+/// 0644, so the entire protection rested on one call whose failure is by design invisible.
+///
+/// Best-effort by design — a filesystem that cannot represent Unix modes (or a Windows
+/// host) must not fail the query over a hardening step, and the spill path is otherwise
+/// platform-neutral.
+fn restrict_to_owner(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Create a spill file readable only by the running user.
+///
+/// The mode is set in the `open` rather than by a following `chmod`: a chmod leaves a
+/// window in which the file is world-readable, and these files hold the query's actual
+/// rows. Non-unix falls back to a plain create, matching [`restrict_to_owner`]'s stance
+/// that the spill path stays platform-neutral.
+fn create_private(path: &std::path::Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+    }
+}
+
+impl DiskSpillStore {
+    /// Create `partitions` empty, **uncompressed** spill files under a private
+    /// subdirectory of `root` — the historical path, byte-for-byte unchanged.
+    /// Use [`DiskSpillStore::with_codec`] to compress the streams.
+    pub fn new(root: PathBuf, partitions: usize) -> Result<Self, RuntimeError> {
+        Self::with_codec(root, partitions, SpillCodec::None)
+    }
+
+    /// Create `partitions` empty spill files whose IPC streams use `codec`.
+    ///
+    /// The store carves out its own `bc-spill-{pid}-{seq}` directory under `root`
+    /// (created if absent) so its `part-*.arrow` files never collide with — and its
+    /// drop never deletes — another concurrent store's files. This is what lets the
+    /// distributed reducers spill safely when many worker processes share one spill
+    /// root, and lets a single plan run two spilling breakers at once. The codec is
+    /// write-side only; the read path auto-detects compression from the IPC stream.
+    pub fn with_codec(
+        root: PathBuf,
+        partitions: usize,
+        codec: SpillCodec,
+    ) -> Result<Self, RuntimeError> {
+        let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!("bc-spill-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        restrict_to_owner(&dir);
+        let n = partitions.max(1);
+        let paths = (0..n)
+            .map(|i| dir.join(format!("part-{i}.arrow")))
+            .collect();
+        Ok(Self {
+            dir,
+            paths,
+            writers: (0..n).map(|_| None).collect(),
+            codec,
+            write_options: None,
+            bytes_written: 0,
+            bytes_per_partition: vec![0; n],
+        })
+    }
+
+    /// Finish `partition`'s writer (if still open) and return a *streaming* reader
+    /// over its batches — yielding one `RecordBatch` at a time, the bounded-memory
+    /// counterpart to [`SpillStore::read`] (which returns the whole partition). A
+    /// k-way merge uses this so only one batch per run is resident at a time.
+    /// `None` when the partition was never written.
+    pub fn open_reader(
+        &mut self,
+        partition: usize,
+    ) -> Result<Option<StreamReader<BufReader<File>>>, RuntimeError> {
+        if let Some(mut w) = self.writers[partition].take() {
+            w.finish()?;
+        }
+        if !self.paths[partition].exists() {
+            return Ok(None);
+        }
+        let file = File::open(&self.paths[partition])?;
+        Ok(Some(StreamReader::try_new(BufReader::new(file), None)?))
+    }
+}
+
+impl DiskSpillStore {
+    /// This store's private scratch directory — the one removed on drop.
+    ///
+    /// Named rather than left as a bare field so the merge module's tests can assert the
+    /// two properties that matter about it (concurrent stores get distinct directories,
+    /// and the directory is owner-only) without the field itself becoming reachable.
+    #[cfg(test)]
+    pub(super) fn scratch_dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+}
+
+impl SpillStore for DiskSpillStore {
+    fn num_partitions(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn append(&mut self, partition: usize, batch: &RecordBatch) -> Result<(), RuntimeError> {
+        if self.writers[partition].is_none() {
+            // Resolve write options on the first append, when the schema is known —
+            // `Auto` classifies it to pick a codec. Reused for every partition.
+            let opts = self
+                .write_options
+                .get_or_insert_with(|| self.codec.write_options(&batch.schema()))
+                .clone();
+            let file = create_private(&self.paths[partition])?;
+            self.writers[partition] = Some(StreamWriter::try_new_with_options(
+                file,
+                &batch.schema(),
+                opts,
+            )?);
+        }
+        self.writers[partition]
+            .as_mut()
+            .expect("writer just created")
+            .write(batch)?;
+        // Count the logical volume spilled (in-memory size, codec-independent) so the
+        // control plane can size spill scratch from a measured magnitude, not a bool.
+        let n = batch.get_array_memory_size() as u64;
+        self.bytes_written += n;
+        if let Some(slot) = self.bytes_per_partition.get_mut(partition) {
+            *slot += n;
+        }
+        Ok(())
+    }
+
+    fn spilled_bytes(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn spill_skew(&self) -> f32 {
+        skew_of(&self.bytes_per_partition)
+    }
+
+    fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError> {
+        // Finish (flush + close) the writer so the IPC stream is complete before
+        // we read it back. A partition with no appends yields nothing.
+        match self.writers[partition].take() {
+            Some(mut w) => w.finish()?,
+            None => return Ok(Vec::new()),
+        }
+        let file = File::open(&self.paths[partition])?;
+        let reader = StreamReader::try_new(BufReader::new(file), None)?;
+        reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RuntimeError::from)
+    }
+    fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError> {
+        // Nest the recursive re-partition under this store's private directory (itself
+        // removed on drop), inheriting the codec. `with_codec` adds its own unique
+        // `bc-spill-{pid}-{seq}` subdir, so siblings never collide.
+        Ok(Box::new(DiskSpillStore::with_codec(
+            self.dir.clone(),
+            partitions,
+            self.codec,
+        )?))
+    }
+
+    fn partition_bytes(&self, partition: usize) -> u64 {
+        self.bytes_per_partition
+            .get(partition)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Stream the partition off disk one IPC batch at a time — the reader
+    /// [`DiskSpillStore::open_reader`] already provided and the merge could not reach
+    /// through the trait.
+    fn drain(
+        &mut self,
+        partition: usize,
+        sink: &mut dyn FnMut(&RecordBatch) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let Some(reader) = self.open_reader(partition)? else {
+            return Ok(());
+        };
+        for batch in reader {
+            sink(&batch?)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DiskSpillStore {
+    fn drop(&mut self) {
+        // Best-effort cleanup of the temporary spill directory.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}

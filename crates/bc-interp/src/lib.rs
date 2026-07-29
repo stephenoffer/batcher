@@ -27,6 +27,7 @@ mod join_par;
 pub mod metrics;
 mod ops;
 pub mod par;
+mod rusage;
 pub mod stream;
 mod window_spill;
 
@@ -37,7 +38,8 @@ pub use par::{
 };
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,
-    execute_streaming_parallel_metered, streaming_parallelizes,
+    execute_streaming_parallel_metered, execute_streaming_parallel_metered_or_hand_off,
+    execute_streaming_parallel_or_hand_off, streaming_parallelizes,
 };
 
 use metrics::{IdGen, Stopwatch};
@@ -106,7 +108,7 @@ fn exec_seq(
                 })?;
             let rows = count_rows(&batches);
             let bytes = batch_bytes(&batches);
-            let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+            let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
             m.record(OpMetric {
                 op_id,
                 kind: "scan",
@@ -114,6 +116,7 @@ fn exec_seq(
                 rows_build: 0,
                 rows_out: rows,
                 elapsed_ns: t0.elapsed_ns(),
+                wall_span_ns: 0,
                 cpu_ns,
                 threads: 1,
                 peak_bytes: bytes,
@@ -122,6 +125,7 @@ fn exec_seq(
                 spill_bytes: 0,
                 peak_rss_bytes,
                 backend: "interp",
+                hw,
             });
             Ok(batches)
         }
@@ -374,6 +378,38 @@ fn exec_seq(
             Ok(out)
         }
 
+        RelOp::RangeJoin {
+            left,
+            right,
+            conditions,
+            join_type,
+            output,
+        } => {
+            let left_batches = exec_seq(left, sources, m, ids)?;
+            let right_batches = exec_seq(right, sources, m, ids)?;
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
+            let t0 = Stopwatch::start();
+            let left = ops::materialize(&left_batches)?;
+            let right = ops::materialize(&right_batches)?;
+            let out = vec![ops::range_join_batches(
+                &left, &right, conditions, *join_type, output,
+            )?];
+            record_breaker(
+                m,
+                op_id,
+                "range_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                false,
+            );
+            Ok(out)
+        }
+
         RelOp::AsofJoin {
             left,
             right,
@@ -471,7 +507,7 @@ fn record_op(
     spilled: bool,
 ) {
     let bytes = batch_bytes(out);
-    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
     m.record(OpMetric {
         op_id,
         kind,
@@ -479,6 +515,7 @@ fn record_op(
         rows_build: 0,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
+        wall_span_ns: 0,
         cpu_ns,
         threads: 1,
         peak_bytes: bytes,
@@ -487,6 +524,7 @@ fn record_op(
         spill_bytes: 0,
         peak_rss_bytes,
         backend: "interp",
+        hw,
     });
 }
 
@@ -507,7 +545,7 @@ fn record_breaker(
     spilled: bool,
 ) {
     let result_bytes = batch_bytes(out);
-    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
     m.record(OpMetric {
         op_id,
         kind,
@@ -515,6 +553,7 @@ fn record_breaker(
         rows_build,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
+        wall_span_ns: 0,
         cpu_ns,
         threads: 1,
         peak_bytes: in_bytes.saturating_add(result_bytes),
@@ -523,6 +562,7 @@ fn record_breaker(
         spill_bytes: 0,
         peak_rss_bytes,
         backend: "interp",
+        hw,
     });
 }
 

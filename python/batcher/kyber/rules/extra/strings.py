@@ -59,10 +59,6 @@ from batcher.plan.schema import SchemaRef
 __all__ = [
     "collapse_idempotent_str_func",
     "empty_pattern_match_to_not_null",
-    "fold_case_of_literal",
-    "fold_concat_of_literals",
-    "fold_len_of_literal",
-    "fold_substr_of_literal",
     "like_contains_to_contains",
     "like_only_wildcard_to_not_null",
     "like_prefix_to_starts_with",
@@ -135,6 +131,45 @@ def _cols_of(node: LogicalPlan) -> frozenset[str]:
     return cached
 
 
+#: `id(schema) -> (schema, utf8 column names)`. The fused chain hands each leaf the node's
+#: schema, but these leaves want the *Utf8 column set* derived from it, and deriving that is
+#: a scan of every field. Schemas are immutable and shared across a plan's nodes, so one
+#: entry per distinct schema serves every leaf and every expression. The schema is stored
+#: alongside to pin the id against reuse. (`_cols_of` memoizes the same answer on the input
+#: node, for the standalone path that still resolves the schema itself.)
+_STR_COLS_BY_SCHEMA: dict[int, tuple[object, frozenset[str]]] = {}
+_STR_COLS_MAX = 256
+
+
+def _str_cols_of(schema: SchemaRef | None) -> frozenset[str]:
+    if schema is None:
+        return frozenset()
+    cached = _STR_COLS_BY_SCHEMA.get(id(schema))
+    if cached is not None and cached[0] is schema:
+        return cached[1]
+    found = _str_cols(schema)
+    if len(_STR_COLS_BY_SCHEMA) >= _STR_COLS_MAX:
+        _STR_COLS_BY_SCHEMA.clear()
+    _STR_COLS_BY_SCHEMA[id(schema)] = (schema, found)
+    return found
+
+
+def _schema_leaf(leaf):
+    """Adapt a `leaf(expr, str_cols)` to the `(Expr, SchemaRef) -> Expr` shape the driver's
+    fused traversal runs, so these rules share its one walk instead of each making their own.
+
+    Only for the leaves applied to *every* expression a node carries. The two rules that go
+    through `_apply_conjuncts` must not be adapted: they are sound only at the top level of a
+    filter predicate, where a NULL result and a FALSE result are interchangeable, and the
+    fused chain would offer them every nested sub-expression as well.
+    """
+
+    def bound(expr: Expr, schema: SchemaRef | None) -> Expr:
+        return leaf(expr, _str_cols_of(schema))
+
+    return bound
+
+
 def _apply(node: LogicalPlan, leaf) -> LogicalPlan | None:
     """Run `leaf(expr, str_cols)` bottom-up over every expression `node` carries, returning the
     rebuilt node — or `None` when nothing changed, so the driver's fixpoint terminates."""
@@ -196,7 +231,14 @@ def _leaf_like_to_eq(expr: Expr, str_cols: frozenset[str]) -> Expr:
     return Binary("eq", expr.input, Lit(pattern))
 
 
-@rule(name="like_without_wildcards_to_eq", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="like_without_wildcards_to_eq",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("like",),
+    expr_schema=_schema_leaf(_leaf_like_to_eq),
+)
 def like_without_wildcards_to_eq(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a wildcard-free `x LIKE 'abc'` to the equality `x = 'abc'`.
 
@@ -223,7 +265,14 @@ def _leaf_like_prefix(expr: Expr, _str_cols: frozenset[str]) -> Expr:
     return StrFunc("starts_with", expr.input, pattern=prefix)
 
 
-@rule(name="like_prefix_to_starts_with", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="like_prefix_to_starts_with",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("like",),
+    expr_schema=_schema_leaf(_leaf_like_prefix),
+)
 def like_prefix_to_starts_with(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a pure-prefix `x LIKE 'abc%'` to `starts_with(x, 'abc')`.
 
@@ -245,7 +294,14 @@ def _leaf_like_suffix(expr: Expr, _str_cols: frozenset[str]) -> Expr:
     return StrFunc("ends_with", expr.input, pattern=suffix) if _is_literal_run(suffix) else expr
 
 
-@rule(name="like_suffix_to_ends_with", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="like_suffix_to_ends_with",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("like",),
+    expr_schema=_schema_leaf(_leaf_like_suffix),
+)
 def like_suffix_to_ends_with(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a pure-suffix `x LIKE '%abc'` to `ends_with(x, 'abc')`.
 
@@ -269,7 +325,14 @@ def _leaf_like_contains(expr: Expr, _str_cols: frozenset[str]) -> Expr:
     return StrFunc("contains", expr.input, pattern=middle)
 
 
-@rule(name="like_contains_to_contains", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="like_contains_to_contains",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("like",),
+    expr_schema=_schema_leaf(_leaf_like_contains),
+)
 def like_contains_to_contains(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite an infix `x LIKE '%abc%'` to `contains(x, 'abc')`.
 
@@ -288,7 +351,13 @@ def _leaf_all_wildcard(expr: Expr, str_cols: frozenset[str]) -> Expr:
     return IsNotNull(expr.input) if _is_utf8(expr.input, str_cols) else expr
 
 
-@rule(name="like_only_wildcard_to_not_null", phase=Phase.NORMALIZE, matches=(Filter,))
+@rule(
+    name="like_only_wildcard_to_not_null",
+    phase=Phase.NORMALIZE,
+    matches=(Filter,),
+    expr_matches=(StrFunc,),
+    expr_ops=("like",),
+)
 def like_only_wildcard_to_not_null(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a top-level `Filter` conjunct `x LIKE '%'` (or `'%%'`, …) to `x IS NOT NULL`.
 
@@ -309,7 +378,13 @@ def _leaf_empty_pattern(expr: Expr, str_cols: frozenset[str]) -> Expr:
     return IsNotNull(expr.input)
 
 
-@rule(name="empty_pattern_match_to_not_null", phase=Phase.NORMALIZE, matches=(Filter,))
+@rule(
+    name="empty_pattern_match_to_not_null",
+    phase=Phase.NORMALIZE,
+    matches=(Filter,),
+    expr_matches=(StrFunc,),
+    expr_ops=tuple(sorted(_SEARCH_FNS)),
+)
 def empty_pattern_match_to_not_null(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a top-level `Filter` conjunct `starts_with(x, '')` / `ends_with(x, '')` /
     `contains(x, '')` to `x IS NOT NULL`.
@@ -332,7 +407,14 @@ def _leaf_idempotent(expr: Expr, _str_cols: frozenset[str]) -> Expr:
     return expr
 
 
-@rule(name="collapse_idempotent_str_func", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="collapse_idempotent_str_func",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=tuple(sorted(_IDEMPOTENT_STR_FNS)),
+    expr_schema=_schema_leaf(_leaf_idempotent),
+)
 def collapse_idempotent_str_func(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Collapse a nested idempotent string function: `upper(upper(x))` → `upper(x)`, and the same
     for `lower`, `initcap`, `trim`, `l_trim` and `r_trim`.
@@ -357,7 +439,14 @@ def _leaf_trim_absorb(expr: Expr, _str_cols: frozenset[str]) -> Expr:
     return StrFunc("trim", inner.input, pattern=expr.pattern)
 
 
-@rule(name="trim_absorbs_inner_side_trim", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="trim_absorbs_inner_side_trim",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("trim",),
+    expr_schema=_schema_leaf(_leaf_trim_absorb),
+)
 def trim_absorbs_inner_side_trim(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Absorb a one-sided trim into an enclosing two-sided one: `trim(ltrim(x))` → `trim(x)`, and
     the `rtrim` twin — when both trim the same character set.
@@ -378,7 +467,14 @@ def _leaf_replace_identity(expr: Expr, str_cols: frozenset[str]) -> Expr:
     return expr.input if _is_utf8(expr.input, str_cols) else expr
 
 
-@rule(name="replace_identity_to_input", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="replace_identity_to_input",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("replace",),
+    expr_schema=_schema_leaf(_leaf_replace_identity),
+)
 def replace_identity_to_input(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a no-op replacement: `replace(x, s, s)` → `x`.
 
@@ -389,112 +485,3 @@ def replace_identity_to_input(node: LogicalPlan, _ctx: OptimizerContext) -> Logi
     value); NULL is preserved.
     """
     return _apply(node, _leaf_replace_identity)
-
-
-def _leaf_fold_case(expr: Expr, _str_cols: frozenset[str]) -> Expr:
-    if not (isinstance(expr, StrFunc) and expr.fn in ("upper", "lower")):
-        return expr
-    value = _str_lit(expr.input)
-    # ASCII only: Python's and Rust's *full* Unicode case mappings are not guaranteed to agree,
-    # and the engine — not Python — defines the result.
-    if value is None or not value.isascii():
-        return expr
-    return Lit(value.upper() if expr.fn == "upper" else value.lower())
-
-
-@rule(name="fold_case_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project))
-def fold_case_of_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """Fold `upper('abc')` → `'ABC'` and `lower('ABC')` → `'abc'` at plan time.
-
-    A case conversion of a constant is a constant. Restricted to an **ASCII** literal, where
-    Python's `str.upper`/`str.lower` and the engine's `to_uppercase`/`to_lowercase` are provably
-    the same function (a 1:1 map over `[A-Za-z]`); non-ASCII is left to the engine, since full
-    Unicode case mapping is where implementations diverge. The literal is non-null; type unchanged.
-    """
-    return _apply(node, _leaf_fold_case)
-
-
-def _leaf_fold_len(expr: Expr, _str_cols: frozenset[str]) -> Expr:
-    if not (isinstance(expr, StrFunc) and expr.fn in ("len", "octet_length", "bit_length")):
-        return expr
-    value = _str_lit(expr.input)
-    if value is None:
-        return expr
-    if expr.fn == "len":
-        return Lit(len(value))
-    octets = len(value.encode("utf-8"))
-    return Lit(octets if expr.fn == "octet_length" else octets * 8)
-
-
-@rule(name="fold_len_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project))
-def fold_len_of_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """Fold a string literal's length: `len('héllo')` → `5`, `octet_length('héllo')` → `6`.
-
-    The engine's `len` counts Unicode scalar values (`chars().count()`, matching DuckDB's `length`)
-    and Python's `len(s)` counts code points — the same number for every string that can cross the
-    UTF-8 FFI boundary. `octet_length` is the UTF-8 byte count and `bit_length` eight times that,
-    exactly as the engine computes them (`bit_length` too — eight times the byte count). The
-    literal is non-null; the fold keeps the Int64 type.
-    """
-    return _apply(node, _leaf_fold_len)
-
-
-def _leaf_fold_concat(expr: Expr, _str_cols: frozenset[str]) -> Expr:
-    if not (isinstance(expr, Binary) and expr.op == "concat"):
-        return expr
-    left, right = _str_lit(expr.left), _str_lit(expr.right)
-    return expr if left is None or right is None else Lit(left + right)
-
-
-@rule(name="fold_concat_of_literals", phase=Phase.NORMALIZE, matches=(Filter, Project))
-def fold_concat_of_literals(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """Fold a concatenation of string literals: `'a' || 'b'` → `'ab'`.
-
-    Arrow's `concat_elements_utf8` — what the engine's `concat` (SQL `||`) runs — is plain byte
-    concatenation on Utf8, which `+` on two Python `str`s reproduces exactly. Fires only when *both*
-    sides are string literals: the engine *casts* a non-Utf8 operand to Utf8 first and Arrow's
-    number→string formatting is not Python's. `ConstantFolding` declines `concat`, so nothing else
-    folds this; a NULL operand makes `||` null, and `Lit(None)` is not matched here.
-    """
-    return _apply(node, _leaf_fold_concat)
-
-
-def _substr(value: str, start: int, length: int | None) -> str:
-    """`substr` with the engine's (DuckDB's) semantics, mirroring `bc_expr`'s `substr_slice` step
-    for step: 1-based; a negative `start` counts from the end (`n + start + 1`); a positive `length`
-    spans the inclusive window `[start, start + length - 1]`, a negative one flips it to
-    `[start + length, start - 1]`; the window is *clipped* to `[1, n]` (out-of-range positions are
-    dropped, not shifted) and an empty intersection yields `''`. Indexed by code point — which
-    Python does natively, exactly as the engine's `chars()` does."""
-    n = len(value)
-    begin = n + start + 1 if start < 0 else start
-    if length is None:
-        lo, hi = begin, n
-    elif length >= 0:
-        lo, hi = begin, begin + length - 1
-    else:
-        lo, hi = begin + length, begin - 1
-    lo, hi = max(lo, 1), min(hi, n)
-    return "" if hi < lo else value[lo - 1 : hi]
-
-
-def _leaf_fold_substr(expr: Expr, _str_cols: frozenset[str]) -> Expr:
-    if not (isinstance(expr, StrFunc) and expr.fn == "substr"):
-        return expr
-    value = _str_lit(expr.input)
-    if value is None:
-        return expr
-    # `start` defaults to 1 in the engine when the IR omits it.
-    return Lit(_substr(value, expr.start if expr.start is not None else 1, expr.length))
-
-
-@rule(name="fold_substr_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project))
-def fold_substr_of_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """Fold a substring of a string literal: `substr('abcdef', 2, 3)` → `'bcd'`.
-
-    `_substr` reimplements the engine's `substr_slice` exactly (see its docstring), and the edge
-    cases are where that matters: `substr('abcdef', 0, 3)` is `'ab'` — the window `[0, 2]` clips to
-    `[1, 2]` rather than shifting — and `substr('abcdef', -2, 4)` is `'ef'`. The literal is
-    non-null; the fold keeps the Utf8 type.
-    """
-    return _apply(node, _leaf_fold_substr)

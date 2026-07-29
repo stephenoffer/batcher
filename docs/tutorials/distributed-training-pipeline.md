@@ -113,8 +113,8 @@ In real training, leave `device="auto"` (it picks CUDA, ROCm, XPU, or MPS and fa
 CPU) and set `pin_memory=True` so the copies are async. `local_shuffle_buffer_size=` gives a
 streaming approximation of a shuffle without materializing the dataset.
 
-On the benchmark this loader runs at 1.06 M rows/s against Ray Data's 281 K, a **3.0×**,
-because it is zero-copy through DLPack rather than a per-batch Arrow→tensor conversion.
+On the benchmark this loader streams **1.06 M rows/s**, because it is zero-copy through
+DLPack rather than a per-batch Arrow-to-tensor conversion.
 
 ## 5. The sample order, before you trust it
 

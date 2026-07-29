@@ -43,6 +43,52 @@ def _feature_list(ds: Dataset, features: Sequence[str] | None, target: str) -> l
     return [c for c in ds.columns if c != target]
 
 
+def _require_categorical(ds: Dataset, features: list[str], scorer: str) -> None:
+    """Reject a feature whose every value is distinct, where a categorical score says nothing.
+
+    A column with one level per row determines the target by construction, so a
+    contingency-table statistic sits at its structural maximum: `chi2_scores` returns exactly
+    the row count and `mutual_info_scores` exactly the target's entropy, *identically for every
+    such feature*. Nothing errors, so `select_k_best` then ranks features that all scored the
+    same and returns whichever the dict happened to order first -- a confident selection built
+    on no information.
+
+    That is easy to reach by accident, because `f_classif_scores` and `f_regression_scores` take
+    continuous features and share this signature, so the same numeric frame passed to all four
+    scorers silently degenerates in two of them. Floats are almost surely all-distinct.
+
+    Args:
+        ds: The dataset being scored.
+        features: The feature columns to check.
+        scorer: The calling scorer's name, for the message.
+
+    Raises:
+        PlanError: If a feature has one distinct value per row.
+    """
+    from batcher._internal.errors import PlanError
+    from batcher.plan.functions.aggregate import n_unique
+
+    if not features:
+        return
+    row = ds.agg(
+        __bt_rows=col(features[0]).count(),
+        **{f"u{i}": n_unique(col(f)) for i, f in enumerate(features)},
+    ).collect()
+    rows = row.column("__bt_rows")[0].as_py()
+    if not rows or rows < 3:
+        return
+    for i, feature in enumerate(features):
+        distinct = row.column(f"u{i}")[0].as_py()
+        if distinct is not None and distinct >= rows:
+            raise PlanError(
+                f"{scorer}() scores *categorical* features, and {feature!r} has one distinct "
+                f"value per row ({distinct} of {rows}), which pins the score at its maximum "
+                f"however unrelated the column is to the target. For a continuous feature use "
+                f"f_classif_scores() (categorical target) or f_regression_scores() (continuous "
+                f"target), or bucket it first with .qcut()/.cut()."
+            )
+
+
 def f_classif_scores(
     ds: Dataset, target: str, features: Sequence[str] | None = None
 ) -> dict[str, float]:
@@ -152,6 +198,7 @@ def chi2_scores(
             True
     """
     features = _feature_list(ds, features, target)
+    _require_categorical(ds, features, "chi2_scores")
     return {f: chi_square(ds, f, target) for f in features}
 
 
@@ -188,6 +235,7 @@ def mutual_info_scores(
             True
     """
     features = _feature_list(ds, features, target)
+    _require_categorical(ds, features, "mutual_info_scores")
     return {f: mutual_information(ds, f, target, base=base) for f in features}
 
 

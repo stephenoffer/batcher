@@ -10,6 +10,7 @@ surfaced to the api layer, which lowers grok extraction into Rust as
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import IO, Any
 
 import pyarrow as pa
@@ -70,23 +71,54 @@ class LogSource(FileSource):
         return LOG_SCHEMA
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
-        name = getattr(fh, "name", self._path)
+        """Every batch of one log file, materialized — the `read()` contract."""
+        return list(self._batches_from(fh, projection))
+
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream one log a morsel at a time rather than decoding it whole.
+
+        `_read_file` batches internally but *accumulates every batch* before returning, so
+        `iter_batches` was streaming in name only: a multi-GB log was fully resident as
+        Arrow before its first batch reached the consumer. A log file is the archetypal
+        larger-than-memory streaming input, and the neighbouring text source already fixed
+        exactly this shape for its line mode ("three copies of a multi-GB log"); the log
+        format, which exists for nothing else, kept the unbounded form.
+
+        Args:
+            path: The log file to stream.
+            projection: Columns the scan must produce. All columns when omitted.
+
+        Yields:
+            One `RecordBatch` per morsel of lines, in file order.
+        """
+        with self._open(path) as fh:
+            yield from self._batches_from(fh, projection, name=path)
+
+    def _batches_from(
+        self, fh: IO[Any], projection: list[str] | None, name: str | None = None
+    ) -> Iterator[pa.RecordBatch]:
+        """Yield morsel-sized batches of `fh`'s lines. The one decoding loop both paths use.
+
+        An *empty* file still yields one empty batch, because a reader that produced no
+        batch at all would leave the caller with no schema to build an empty result from.
+        """
+        name = name or getattr(fh, "name", self._path)
         batch_rows = active_config().execution.morsel_rows
-        out: list[pa.RecordBatch] = []
         paths: list[str] = []
         numbers: list[int] = []
         lines: list[str] = []
+        emitted = False
         for i, raw in enumerate(fh, start=1):
             text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
             paths.append(name)
             numbers.append(i)
             lines.append(text.rstrip("\n"))
             if len(lines) >= batch_rows:
-                out.append(self._batch(paths, numbers, lines, projection))
+                yield self._batch(paths, numbers, lines, projection)
+                emitted = True
                 paths, numbers, lines = [], [], []
-        if lines or not out:
-            out.append(self._batch(paths, numbers, lines, projection))
-        return out
+        if lines or not emitted:
+            yield self._batch(paths, numbers, lines, projection)
 
     @staticmethod
     def _batch(

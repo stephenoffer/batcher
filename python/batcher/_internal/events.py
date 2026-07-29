@@ -36,6 +36,8 @@ __all__ = [
     "PROGRESS",
     "QUERY_END",
     "QUERY_START",
+    "RECOVERY",
+    "RECOVERY_EVENTS",
     "SKIPPED",
     "STAGE_END",
     "STAGE_START",
@@ -94,6 +96,50 @@ SKIPPED = "skipped"
 #: Actor-pool size observation. Fields: ``size`` (live actors), ``pending`` (queued tasks).
 #: `name` is the stage label. Emit on a scale-up / scale-down or on the sampling interval.
 POOL = "pool"
+
+# --- Fault-tolerance observability -------------------------------------------
+# The distributed path has a lot of recovery machinery — lineage recompute with epoch
+# fencing, speculative backups, shuffle-output replication, proactive spot-preemption
+# migration — and until this kind existed it ran *entirely silently*. `ShuffleRecovery`
+# counted its recomputes into an attribute nobody read; the preemption migration sat inside
+# a bare `contextlib.suppress`. So a query that transparently survived losing two workers
+# and one that was simply four times too slow looked identical from outside, and the only
+# way to tell them apart was to already suspect the answer.
+#
+# One kind with an `event` discriminator rather than seven constants: the kind vocabulary
+# crosses to the web UI verbatim, and seven entries for one concern would swamp it.
+
+#: A fault-tolerance action happened on the distributed path. Every publisher runs on the
+#: driver, where the decision is made — nothing subscribes inside a Ray worker, so an event
+#: published there would be silently dropped.
+#:
+#: Fields: ``event`` (one of `RECOVERY_EVENTS`), ``shuffle`` (``aggregate``/``join``/
+#: ``sort``/``window``), and then per-event detail: ``worker``/``src`` (the lost or
+#: relocated source), ``epoch`` (the fence a recompute bumped), ``round`` and
+#: ``attempt_budget`` (which recovery round, of how many).
+RECOVERY = "recovery"
+
+#: The `event` values a `RECOVERY` event may carry.
+#:
+#: - ``worker_lost``: a worker was first observed dead, and its buckets are gone with it.
+#: - ``recompute``: a recovery round re-ran a lost source and bumped its epoch.
+#: - ``straggler_backup``: a speculative duplicate was launched for a slow task.
+#: - ``backup_won``: the speculative duplicate finished first; the original was cancelled.
+#: - ``replica_retired``: a stale replica was dropped before its source was reincarnated.
+#:   The one that most needs to be visible — reading a retired replica returns an *empty
+#:   bucket rather than an error*, so this is the last event before a silent row loss would
+#:   have happened.
+#: - ``preempt_migrate``: a draining (spot-preempted) worker's work moved before it died.
+#: - ``give_up``: the recovery budget was exhausted and the query is failing.
+RECOVERY_EVENTS = (
+    "worker_lost",
+    "recompute",
+    "straggler_backup",
+    "backup_won",
+    "replica_retired",
+    "preempt_migrate",
+    "give_up",
+)
 
 
 @dataclass(frozen=True, slots=True)

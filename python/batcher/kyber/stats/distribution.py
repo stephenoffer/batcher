@@ -173,7 +173,17 @@ def union_ndv(ndvs: Sequence[float], rows: float | None = None) -> float | None:
     combined = 0.0
     for d in known:
         combined = combined + d - (combined * d / domain)
-    if rows is not None and rows > 0.0:
+    if rows is not None:
+        # `rows == 0` is a *known* row count, not a missing one, and an empty union has no
+        # distinct values. The `rows > 0` guard skipped the cap there and the `max(1.0, ...)`
+        # floor then reported at least one, so `union_ndv([1e9], 0)` returned 1e9 while every
+        # positive `rows` capped correctly. No caller can reach it today -- `columns.py` passes
+        # `total_rows or None`, and `estimator.py` only sees `total == 0` when every branch is
+        # empty, which returns None above -- but the parameter is documented as capping whenever
+        # the count is known, and a floor of one distinct value is only right for a non-empty
+        # relation.
+        if rows <= 0.0:
+            return 0.0
         combined = min(combined, rows)
     return max(1.0, combined)
 

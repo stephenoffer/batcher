@@ -11,6 +11,7 @@
 //! bytes), which flows through `combine`'s generic state concatenation like any other
 //! state column; `merge` deserializes, unions per group, and re-serializes.
 
+use std::hash::BuildHasher;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, BinaryArray, Int64Array};
@@ -19,10 +20,14 @@ use bc_sketches::{HyperLogLog, Mergeable};
 
 use crate::error::RuntimeError;
 
-// Fixed seed so value hashing is deterministic within a process — partials built on
-// different morsels hash identically, which the HLL union relies on.
-const SEED: ahash::RandomState =
-    ahash::RandomState::with_seeds(0x9e37_79b9, 0x7f4a_7c15, 0xf39c_c060, 0x5ced_c834);
+// Deterministic value hashing, *across* processes and not merely within one. HLL partials
+// are serialized into a Binary column and merged by `combine_finalize` on another machine,
+// so a register set built with one hash and unioned with a register set built with another
+// does not error — it silently returns a wrong distinct count. `ahash` cannot promise that
+// (it selects an AES-NI backend at compile time); `PortableBuildHasher` can. See
+// `crate::keys::SHUFFLE_HASHER`.
+const SEED: bc_arrow::PortableBuildHasher =
+    bc_arrow::PortableBuildHasher::with_seed(0x484C_4C5F_5245_4753);
 
 /// Serialize one HLL per group into a `Binary` column (row `g` = group `g`).
 fn serialize(hlls: &[HyperLogLog]) -> ArrayRef {

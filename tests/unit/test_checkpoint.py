@@ -23,22 +23,31 @@ def test_offset_and_commit_logs_round_trip(tmp_path):
 
 def test_prune_logs_bounds_logs_but_preserves_recovery(tmp_path):
     # A long-running stream must not grow offsets/commits one row per micro-batch forever.
-    # Pruning after each commit drops everything before the last committed batch, yet
-    # recovery — which reads only that batch's offsets and the commit maximum — is intact.
+    # The sweep is *amortized* (`_PRUNE_EVERY` batches, not every commit): running two extra
+    # DELETEs and two extra fsyncs per epoch to remove a single row cost a low-latency trigger
+    # more than the growth it prevents, and the property that matters is that the logs stay
+    # bounded by a small constant — not that they hold exactly one row. Recovery, which reads
+    # only the last committed batch's offsets and the commit maximum, is intact either way.
+    from batcher.io.formats.streaming.checkpoint.store import _PRUNE_EVERY
+
+    total = _PRUNE_EVERY * 2 + 5
     store = CheckpointStore(str(tmp_path / "ckpt"))
-    for b in range(5):
+    for b in range(total):
         store.record_offsets(b, {0: {"value": (b + 1) * 5}})
         store.commit(b)
         store.prune_logs(b)  # keep_through = last committed batch
-    store.record_offsets(5, {0: {"value": 30}})  # an in-flight, uncommitted batch
+    store.record_offsets(total, {0: {"value": (total + 1) * 5}})  # in-flight, uncommitted
 
-    assert store.offsets.position_at(0) == {}  # pruned
-    assert store.offsets.position_at(4) == {0: {"value": 25}}  # the last commit's row survives
-    assert store.commits.last_committed() == 4
+    rows = store.offsets._conn.execute("SELECT COUNT(*) FROM offsets").fetchone()[0]
+    assert rows <= _PRUNE_EVERY + 2  # bounded by the stride, not by the stream's lifetime
+    assert store.offsets.position_at(0) == {}  # the earliest rows are long gone
+    last = total - 1
+    assert store.offsets.position_at(last) == {0: {"value": (last + 1) * 5}}
+    assert store.commits.last_committed() == last
 
     plan = recover(store)
-    assert plan.start_batch == 5  # first uncommitted
-    assert plan.seek == {0: {"value": 25}}  # seek to the last committed batch's position
+    assert plan.start_batch == total  # first uncommitted
+    assert plan.seek == {0: {"value": (last + 1) * 5}}  # the last committed batch's position
 
 
 def test_recover_fresh_query(tmp_path):

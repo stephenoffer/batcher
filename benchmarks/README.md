@@ -9,7 +9,7 @@ benchmark for unstructured multimodal ingest — against the engines Batcher cla
 | Tier            | Engines                                              |
 |-----------------|------------------------------------------------------|
 | **Single-node** | batcher, duckdb, `duckdb_arrow`, polars, pyarrow, **pyspark** (opt-in) |
-| **Multi-node**  | batcher (distributed), ray data, daft, **pyspark** (opt-in) |
+| **Multi-node**  | batcher (distributed), daft, **pyspark** (opt-in) |
 
 `duckdb` runs on its compressed *native* store (DuckDB at its best); `duckdb_arrow` runs the
 same query on the *same zero-copy Arrow* Batcher consumes — the like-for-like execution bar.
@@ -75,11 +75,10 @@ Each engine's reader is rebuilt **inside** the timed call, so listing and metada
 measured rather than amortized away — the opposite of the `--scan` mode used for TPC-H,
 where the scan is a fixed setup cost shared across 22 queries.
 
-Every SQL engine (Batcher, DuckDB, Polars, Daft, Spark) runs all nine shapes. PyArrow
-runs all nine through Acero; Ray Data covers `count`, `minmax`, `filter`, and
-`filter_agg` — the shapes its API expresses directly, and the ones that isolate the
-small-files tax — and reports `n/a` for the rest rather than a hand-rolled
-reimplementation that would benchmark the benchmark instead of the engine.
+Every SQL engine (Batcher, DuckDB, Polars, Daft, Spark) runs all nine shapes, and PyArrow
+runs all nine through Acero. An engine whose API does not express a shape directly reports
+`n/a` for it rather than a hand-rolled reimplementation that would benchmark the benchmark
+instead of the engine.
 
 ```bash
 python3 benchmarks/run.py --benchmark scan                        # all three layouts
@@ -139,14 +138,14 @@ For a fast offline read of the multimodal ingest story, `benchmarks/scenarios/` 
 single-file, correctness-gated head-to-heads that synthesize their own local corpus:
 
 ```bash
-python benchmarks/scenarios/image_decode.py       # JPEG decode+resize vs Ray Data + Daft
-python benchmarks/scenarios/point_cloud_load.py   # LiDAR .npy -> torch tensors vs Ray Data
+python benchmarks/scenarios/image_decode.py       # JPEG decode+resize vs Daft
+python benchmarks/scenarios/point_cloud_load.py   # LiDAR .npy -> torch tensors
 python benchmarks/scenarios/audio_decode.py       # native audio decode vs a soundfile loop
 ```
 
-On a 96-core node these show batcher **2.4× faster than Daft and 6× than Ray Data** on
-image decode+resize, and **2.4× than Ray Data** on point-cloud loading — the physical-AI
-(camera / LiDAR / audio) ingest path. Findings and the fix chain are in
+On a 96-core node these show batcher **2.4× faster than Daft** on image decode+resize,
+and they exercise the physical-AI (camera / LiDAR / audio) ingest path. Findings and the
+fix chain are in
 `BENCHMARK_RESULTS.md`; the mechanism is documented in `docs/user-guide/performance.md`
 ("Multimodal & physical-AI ingest").
 
@@ -172,8 +171,8 @@ Spark `AvailableNow` parity) fans the same work across the cluster; see
 
 ## `cluster/`: GPU multimodal compute (distributed)
 
-Beyond ingest, `benchmarks/cluster/` holds the distributed **GPU** multimodal benchmarks vs
-Ray Data (and Daft) — batch inference (`gpu_inference`, `gpu_pipeline`), LLM/embeddings
+Beyond ingest, `benchmarks/cluster/` holds the distributed **GPU** multimodal benchmarks
+— batch inference (`gpu_inference`, `gpu_pipeline`), LLM/embeddings
 (`gpu_llm`, `gpu_text_embed`), diffusion (`gpu_imagegen`), audio/video
 (`gpu_audio`, `gpu_video`), and training-data ingest (`gpu_train_ingest`). Those run on a
 live GPU cluster and measure images/sec **and GPU utilization**; they use fixed-seed
@@ -198,10 +197,10 @@ benchmarks/
     spark.py  daft.py  ray.py
   suites/
     standard/    SQL-first: tpch.py (22)  clickbench.py (43)  tpcds.py (subset)
-    operators/   dataframe-API operator-mix; where PyArrow + Ray Data also compete
+    operators/   dataframe-API operator-mix; where PyArrow also competes natively
     scan/        one table x three parquet file layouts; isolates scan planning
-    multimodal/  unstructured ingest: images.py (list/decode/resize) vs Ray Data + Daft
-  cluster/       distributed GPU multimodal benchmarks (inference/LLM/audio/video) vs Ray
+    multimodal/  unstructured ingest: images.py (list/decode/resize) vs Daft
+  cluster/       distributed GPU multimodal benchmarks (inference/LLM/audio/video)
   run.py         the CLI: select engines, load data, run, report
   internals/     benchmarks of Batcher's own subsystems, with their own reporting
     distributed.py             single-node == many-partition equivalence + timing
@@ -225,9 +224,9 @@ duckdb, polars `SQLContext`, spark, daft). Adding one is a single line:
 tpch.sql("tpch-q6", "SELECT sum(l_extendedprice * l_discount) ... FROM lineitem WHERE ...")
 ```
 
-PyArrow and Ray Data have no SQL surface, so they sit out the standard suites
-(shown `n/a`) and compete in the operator-mix, where a case is one SQL string for the
-SQL engines plus native callables for PyArrow (Acero) and Ray Data:
+PyArrow has no SQL surface, so it sits out the standard suites (shown `n/a`) and competes
+in the operator-mix, where a case is one SQL string for the SQL engines plus a native
+callable for PyArrow (Acero):
 
 ```python
 # suites/operators/aggregation.py
@@ -237,9 +236,7 @@ def groupby_sum(ctx):
     def pyarrow(t):  # native Acero
         a = t.group_by("l_returnflag").aggregate([("l_quantity", "sum")])
         return pa.table({"l_returnflag": a["l_returnflag"], "s": a["l_quantity_sum"]})
-    def ray(rd):     # native Ray Data
-        ...
-    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)
 ```
 
 ## Running
@@ -247,8 +244,16 @@ def groupby_sum(ctx):
 ```bash
 source .venv/bin/activate
 pip install -e '.[bench]'    # duckdb, polars, pyarrow, ray, daft, pyspark
-just build                   # or: maturin develop --release
+just build-release           # NOT `just build` — see below
 ```
+
+**Use `just build-release`.** `just build` installs the *dev* profile, which sets no
+`opt-level` and leaves `debug_assertions` on, so both Batcher and every third-party crate
+it links are unoptimized. Every comparator is an installed release wheel. Timing a dev
+build against them compares an unoptimized engine to optimized ones, and the resulting
+ratios are not a measurement of anything — in one direction they understate Batcher, and
+where a competitor still wins you cannot tell whether the gap is real. The harness cannot
+detect the profile from Python, so this is on you.
 
 ### Competitor engines (comparators)
 

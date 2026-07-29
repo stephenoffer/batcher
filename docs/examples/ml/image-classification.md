@@ -125,7 +125,7 @@ not in the call the engine makes on every batch.
 Leave `batch_size` unset if you do not have a number in mind. The pool starts from
 `model_memory_gb` and the free VRAM, then hill-climbs the batch size against measured
 throughput. Zero-config (`map_batches(Model, num_gpus=1)` with no `batch_size`) runs at
-2,451 img/s and 82% utilization; Ray Data rejects the same call outright.
+2,451 img/s and 82% utilization, within 2% of the hand-tuned batch size.
 :::
 
 ## One corrupt JPEG should cost you one JPEG
@@ -133,8 +133,9 @@ throughput. Zero-config (`map_batches(Model, num_gpus=1)` with no `batch_size`) 
 :::{important}
 Real corpora contain truncated files, HTML error pages saved with a `.jpg` extension, and
 CMYK JPEGs that decode to four channels. A six-hour job that dies at hour five on one of
-them is the default outcome in most engines. With ~1% corrupt rows injected across 200k
-rows, Ray Data retains 0% of the data; Batcher retains 99%.
+them is the default outcome in most engines. Batcher's error tolerance is per row rather
+than per block, so with about 1% corrupt rows injected across 200k rows it keeps 99% of the
+data and loses only the bad rows.
 :::
 
 Two knobs get you there. `on_error="null"` on the fetch turns a failed download into a

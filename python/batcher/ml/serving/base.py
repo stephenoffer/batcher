@@ -225,9 +225,57 @@ def _merge_results(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     # `atleast_1d` so a 0-d (scalar-per-sub-batch) output — e.g. a per-batch summary from
     # a split large batch — concatenates instead of raising "zero-dimensional arrays
     # cannot be concatenated".
-    return {
-        name: np.concatenate([np.atleast_1d(p[name]) for p in parts]) for name in parts[0]
-    }
+    return {name: np.concatenate([np.atleast_1d(p[name]) for p in parts]) for name in parts[0]}
+
+
+def _require_input_columns(batch: Any, inputs: list[str]) -> None:
+    """Reject an input column the batch does not have, naming what it does have.
+
+    `serving_udf` builds a callable rather than a plan node, so there is no dataset to check
+    against when it is constructed — the first batch is the earliest honest moment. Before
+    this, a mistyped `input_columns` reached Arrow and returned
+    ``KeyError: 'Field "nope" does not exist in schema'`` from inside a worker.
+    """
+    missing = [name for name in inputs if name not in batch.schema.names]
+    if not missing:
+        return
+    from batcher._internal.errors import ColumnNotFoundError
+
+    raise ColumnNotFoundError(
+        f"serving_udf input_columns={missing} are not in the batch; it has "
+        f"{list(batch.schema.names)}."
+    )
+
+
+def _check_response(result: Any, rows: int, outputs: list[str] | None) -> None:
+    """Reject a backend response that cannot be aligned with the batch it answered.
+
+    A serving backend that under-returns — a truncated response, a partially-failed batch —
+    is a real production failure, and the only signal was
+    ``ValueError: Arrays were not all the same length: 1 vs 3`` raised while assembling the
+    output. That names neither the backend nor which output was short, and it is the error
+    that stands between a caller and a **misaligned** result, so it is worth stating plainly.
+    """
+    from batcher._internal.errors import BackendError
+
+    if not isinstance(result, dict):
+        raise BackendError(
+            f"serving backend returned {type(result).__name__}, but predict() must return a "
+            f"{{name: array}} dict of output arrays."
+        )
+    for name in outputs if outputs is not None else list(result):
+        if name not in result:
+            raise BackendError(
+                f"serving backend response is missing output {name!r}; it returned "
+                f"{sorted(result)}."
+            )
+        length = getattr(result[name], "__len__", None)
+        if length is not None and len(result[name]) != rows:
+            raise BackendError(
+                f"serving backend returned {len(result[name])} rows for output {name!r} but "
+                f"was sent {rows}. A response that does not line up row-for-row would pair "
+                f"predictions with the wrong inputs."
+            )
 
 
 def serving_udf(
@@ -288,10 +336,12 @@ def serving_udf(
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
             import pyarrow as pa
 
+            _require_input_columns(batch, inputs)
             feed = {name: _column_to_numpy(batch.column(name)) for name in inputs}
             _reject_non_numeric_inputs(feed, batch)
             chunks = _split_feed(feed, batch.num_rows, max_batch_size)
             result = _merge_results(list(_pipelined(self._predict, chunks, depth)))
+            _check_response(result, batch.num_rows, outputs)
             keep = [batch.column(i) for i in range(batch.num_columns)]
             names = list(batch.schema.names)
             for name in outputs if outputs is not None else list(result):

@@ -357,8 +357,12 @@ def _surviving_row_groups(meta: Any, predicate: dict) -> list[int]:
 
 def _row_group_manifest(meta: Any, columns: list[str]) -> pa.Table | None:
     """Per-row-group bounds for `columns`, in the add-action layout `file_skipping` consumes."""
-    names = meta.schema.names
-    wanted = {c: names.index(c) for c in columns if c in names}
+    # One name -> position map, then one lookup per wanted column. The `in names` test and
+    # the `names.index(c)` that followed it were each a linear scan of the file's schema,
+    # so building this map cost O(columns x file width) — the quadratic term that shows up
+    # exactly on the wide Parquet files whose row-group pruning matters most.
+    position = {name: i for i, name in enumerate(meta.schema.names)}
+    wanted = {c: i for c in columns if (i := position.get(c)) is not None}
     if not wanted:
         return None
 

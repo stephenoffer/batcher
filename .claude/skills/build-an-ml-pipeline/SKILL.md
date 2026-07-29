@@ -222,7 +222,7 @@ The encoders hold the same line: the vocabulary is frozen at `fit`, so a categor
 seen in test maps to `unknown_value` (`-1`) under `OrdinalEncoder`/`LabelEncoder` and to an
 all-zero row under `OneHotEncoder` — the columns never change shape between train and
 serve.
-`examples/preprocessors.py` and `docs/ml/preprocessors.md` are the fuller treatment.
+`examples/preprocessors.py` and `docs/ml/preprocessors/index.md` are the fuller treatment.
 
 ## GPU and autobatching
 
@@ -290,4 +290,4 @@ output; `image_column=` handles VLM prompts.
 - `docs/tutorials/{batch-inference,distributed-training-pipeline,feature-engineering}.md`;
   `examples/ml_inference.py`, `examples/preprocessors.py`.
 - Skills: `run-a-distributed-job` (taking this to a cluster — GPU stages force distribution),
-  `write-a-batcher-pipeline`, `debug-a-batcher-query`, `migrate-from-ray-data`/`-daft`.
+  `write-a-batcher-pipeline`, `debug-a-batcher-query`, `migrate-from-daft`.

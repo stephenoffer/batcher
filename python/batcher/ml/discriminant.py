@@ -19,7 +19,8 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir.constructors import col, lit, when
+from batcher.ml._estimator import argmax_prediction, linear_score, require_fitted
+from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -124,6 +125,19 @@ class QuadraticDiscriminantAnalysis:
         for label in labels:
             subset = ds.filter(col(self.target) == label)
             count = subset.count()
+            if count < 2:
+                # A full per-class covariance divides by `count - 1`, so a class with a single
+                # example produces a NaN matrix and `pinv` then raised
+                # ``LinAlgError: SVD did not converge`` — a solver message for what is really a
+                # rare class. This is the ordinary shape of imbalanced data, so name the class.
+                from batcher._internal.errors import PlanError
+
+                raise PlanError(
+                    f"QuadraticDiscriminantAnalysis needs at least 2 examples per class to "
+                    f"estimate a covariance, but class {label!r} has {count}. Drop or merge the "
+                    f"rare class, or use LinearDiscriminantAnalysis, which pools one covariance "
+                    f"across all classes."
+                )
             means = subset.agg(**{name: mean_(col(name)) for name in self.features}).collect()
             covariance = covariance_matrix(subset, self.features).to_pydict()
             matrix = np.array([covariance[name] for name in self.features], dtype=float).T
@@ -168,15 +182,8 @@ class QuadraticDiscriminantAnalysis:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("QuadraticDiscriminantAnalysis must be fitted before predict.")
-        prediction = lit(self.classes_[0])
-        best = self._score(self.classes_[0])
-        for label in self.classes_[1:]:
-            score = self._score(label)
-            closer = score > best
-            prediction = when(closer).then(lit(label)).otherwise(prediction)
-            best = when(closer).then(score).otherwise(best)
+        require_fitted(self, self.classes_)
+        prediction = argmax_prediction(self.classes_, self._score)
         return ds.with_columns(**{self.output_column: prediction})
 
 
@@ -290,10 +297,7 @@ class LinearDiscriminantAnalysis:
 
     def _score(self, label: object):
         """The linear discriminant score expression for one class."""
-        expression = lit(self.bias_[label])
-        for name, weight in zip(self.features, self.weights_[label], strict=True):
-            expression = expression + lit(weight) * col(name)
-        return expression
+        return linear_score(self.features, self.weights_[label], self.bias_[label])
 
     def predict(self, ds: Dataset) -> Dataset:
         """Append the maximum-discriminant class label for each row.
@@ -315,13 +319,6 @@ class LinearDiscriminantAnalysis:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("LinearDiscriminantAnalysis must be fitted before predict.")
-        prediction = lit(self.classes_[0])
-        best = self._score(self.classes_[0])
-        for label in self.classes_[1:]:
-            score = self._score(label)
-            closer = score > best
-            prediction = when(closer).then(lit(label)).otherwise(prediction)
-            best = when(closer).then(score).otherwise(best)
+        require_fitted(self, self.classes_)
+        prediction = argmax_prediction(self.classes_, self._score)
         return ds.with_columns(**{self.output_column: prediction})

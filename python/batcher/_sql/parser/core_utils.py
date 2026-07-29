@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlglot import expressions as exp
+
 from batcher._internal.errors import PlanError
 
 
@@ -18,7 +20,6 @@ def _columns_selector(node) -> Any:
     ``COLUMNS('^sales')`` projects every matching column and ``func(COLUMNS(*))``
     applies ``func`` to each column. Reuses the DataFrame selector engine.
     """
-    from sqlglot import expressions as exp
 
     from batcher.plan.expr_ir.selectors import all as select_all
     from batcher.plan.expr_ir.selectors import matches
@@ -45,14 +46,10 @@ def _positional(projections, literal, clause: str):
 
 
 def _unwrap_alias(p):
-    from sqlglot import expressions as exp
-
     return p.this if isinstance(p, exp.Alias) else p
 
 
 def _alias_of(p) -> str:
-    from sqlglot import expressions as exp
-
     if isinstance(p, exp.Alias):
         return p.alias
     if isinstance(p, exp.Column):
@@ -68,8 +65,6 @@ def _alias_of(p) -> str:
 
 def _split_and(pred) -> list:
     """Flatten a conjunction (and parentheses) into its leaf predicates."""
-    from sqlglot import expressions as exp
-
     out: list = []
     stack = [pred]
     while stack:
@@ -85,8 +80,6 @@ def _split_and(pred) -> list:
 
 def _join_and(preds):
     """Re-combine leaf predicates into a single AND chain."""
-    from sqlglot import expressions as exp
-
     out = preds[0]
     for p in preds[1:]:
         out = exp.And(this=out, expression=p)
@@ -107,8 +100,6 @@ def _within_group_to_agg(node):
       (the two-argument quantile form).
     * ``mode() WITHIN GROUP (ORDER BY x)`` → ``Mode(x)``.
     """
-    from sqlglot import expressions as exp
-
     if not isinstance(node, exp.WithinGroup):
         return node
     agg = node.this
@@ -131,12 +122,18 @@ def _within_group_to_agg(node):
 
 
 def _has_aggregate(node) -> bool:
-    from sqlglot import expressions as exp
-
     # An aggregate inside a window (e.g. SUM(x) OVER (...)) is a window
     # function, not a GROUP-BY aggregate, so ignore those. An aggregate
     # inside a (scalar) subquery belongs to the inner query, not this one.
-    for a in node.find_all(exp.AggFunc):
+    #
+    # `iter_agg_nodes`, not `find_all(exp.AggFunc)`: the DuckDB aggregates sqlglot
+    # leaves anonymous (`product`, `sem`, `count_star`, …) are not `AggFunc` subclasses,
+    # so an ungrouped `SELECT product(x) FROM t` was not recognized as an aggregate
+    # query at all and fell through to the scalar translator.
+
+    from batcher._sql.parser.expressions.aggregates import iter_agg_nodes
+
+    for a in iter_agg_nodes(node):
         if a.find_ancestor(exp.Window) is not None:
             continue
         if a.find_ancestor(exp.Subquery) is not None:
@@ -166,8 +163,6 @@ def _disambiguate_columns(tr, node) -> None:
     name still resolves to the coalesced column, which is what USING/NATURAL specify and
     what the ``ON`` form is leniently allowed here (DuckDB calls that one ambiguous).
     """
-    from sqlglot import expressions as exp
-
     from_ = node.args.get("from") or node.args.get("from_")
     if from_ is None:
         return
@@ -270,8 +265,6 @@ def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
     Returns:
         The subset of `merged_keys` that a qualified reference outside the ON clause names.
     """
-    from sqlglot import expressions as exp
-
     if not merged_keys or any((j.kind or "").upper() in {"SEMI", "ANTI"} for j in joins):
         return set()
     if not any((j.side or "").upper() in {"LEFT", "RIGHT", "FULL"} for j in joins):

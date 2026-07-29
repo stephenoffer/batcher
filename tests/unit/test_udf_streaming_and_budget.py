@@ -26,6 +26,7 @@ import pytest
 
 from batcher.core.udf import apply as udf_apply
 from batcher.core.udf import execute as udf_execute
+from batcher.core.udf import sizing as udf_sizing
 from batcher.core.udf import strategy as udf_strategy
 from batcher.core.udf import stream as udf_stream
 from batcher.plan.logical import Limit, MapBatches, Scan
@@ -394,14 +395,14 @@ def test_autobatch_seeds_from_the_learned_gpu_batch_size(monkeypatch):
     import batcher.ml.inference as inference
 
     monkeypatch.setattr(inference, "InferencePool", _RecordingPool)
-    monkeypatch.setattr(udf_stream, "_read_ema", lambda ns, key: 64.0)
+    monkeypatch.setattr(udf_sizing, "_read_ema", lambda ns, key: 64.0)
 
     op = MapBatches(input=Scan(0, SchemaRef.from_arrow(_SCHEMA)), fn=_autobatch_fn, num_gpus=1)
     batch = pa.record_batch({"x": [1, 2, 3, 4]}, schema=_SCHEMA)
     out = udf_apply._apply_udf_autobatch(op, [batch])
 
     assert pa.Table.from_batches(out).column("x").to_pylist() == [1, 2, 3, 4]
-    assert _RecordingPool.last["target_batch_rows"] == udf_stream._learned_gpu_cap(op) == 64
+    assert _RecordingPool.last["target_batch_rows"] == udf_sizing.learned_gpu_cap(op) == 64
 
 
 def test_autobatch_gets_the_same_forward_overlap_as_the_streaming_path(monkeypatch):

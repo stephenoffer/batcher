@@ -184,23 +184,66 @@ def test_learned_signature_rows_reads_the_feedback_loop():
     assert lt.learned_signature_rows(hub, sig) == 4242.0
 
 
-# --- learned adaptive-would-help gate ---------------------------------------------------------
-def test_learned_adaptive_helps_cold_is_false():
-    assert lt.learned_adaptive_helps(_hub(), "q1") is False
+# --- learned adaptive routing (staged vs one-shot, a two-arm bandit) --------------------------
+def test_adaptive_route_is_unknown_cold():
+    """Nothing measured ⇒ no route, so the caller's structural heuristic decides."""
+    assert lt.learned_adaptive_route(_hub(), "q1") is None
 
 
-def test_learned_adaptive_helps_when_reopt_often_flipped():
+def test_adaptive_route_explores_the_untried_arm():
+    """One arm measured is not evidence; the bandit must try the other before ranking."""
     hub = _hub()
-    for flipped in (True, True, False, True):  # 3/4 flips > 0.25 threshold
-        lt.record_adaptive_flip(hub, "q1", flipped)
-    assert lt.learned_adaptive_helps(hub, "q1") is True
+    lt.record_adaptive_route(hub, "q1", "staged", 9999.0)  # cold sample, discarded
+    lt.record_adaptive_route(hub, "q1", "staged", 500.0)
+    assert lt.learned_adaptive_route(hub, "q1") == "one_shot"
 
 
-def test_learned_adaptive_helps_stays_false_when_reopt_rarely_flips():
+def test_the_first_observation_of_each_route_is_discarded():
+    """A shape's first run on a route pays one-time costs that recur for neither route.
+
+    q18 at sf10 is 8,000 ms on its first execution and ~300 ms thereafter; whichever arm ran
+    first would otherwise carry that 25x forever and the bandit would be ranking the order
+    the arms were tried in.
+    """
     hub = _hub()
-    for flipped in (False, False, False, False, True):  # 1/5 = 0.2 < 0.25 threshold
-        lt.record_adaptive_flip(hub, "q3", flipped)
-    assert lt.learned_adaptive_helps(hub, "q3") is False
+    lt.record_adaptive_route(hub, "q", "staged", 8000.0)
+    assert lt.learned_adaptive_route(hub, "q") is None, "the cold sample was recorded"
+
+    lt.record_adaptive_route(hub, "q", "staged", 300.0)
+    lt.record_adaptive_route(hub, "q", "one_shot", 8000.0)  # its own cold sample, discarded
+    lt.record_adaptive_route(hub, "q", "one_shot", 900.0)
+    assert lt.learned_adaptive_route(hub, "q") == "staged"
+
+
+def test_adaptive_route_converges_on_the_faster_arm():
+    """TPC-H q8 at sf10: 887 ms staged against 142 ms one-shot."""
+    hub = _hub()
+    for _ in range(5):
+        lt.record_adaptive_route(hub, "q8", "staged", 887.0)
+        lt.record_adaptive_route(hub, "q8", "one_shot", 142.0)
+    assert lt.learned_adaptive_route(hub, "q8") == "one_shot"
+
+
+def test_adaptive_route_keeps_staging_where_one_shot_is_worse():
+    """The other direction, which a "staging never pays" verdict would get wrong.
+
+    Which route wins is not a constant of the plan — staging is the only distributed route
+    for some shapes, and it is what earns the statistics a cold shape has not learned yet.
+    The router has to be able to say "staged" as readily as "one_shot".
+    """
+    hub = _hub()
+    for _ in range(5):
+        lt.record_adaptive_route(hub, "q_star", "staged", 169.0)
+        lt.record_adaptive_route(hub, "q_star", "one_shot", 2500.0)
+    assert lt.learned_adaptive_route(hub, "q_star") == "staged"
+
+
+def test_adaptive_route_is_per_signature():
+    hub = _hub()
+    for _ in range(5):
+        lt.record_adaptive_route(hub, "q8", "staged", 887.0)
+        lt.record_adaptive_route(hub, "q8", "one_shot", 142.0)
+    assert lt.learned_adaptive_route(hub, "q_other") is None
 
 
 # --- confidence-gated, smoothed CPU-share model (cpu_shares refinement) ------------------------
@@ -269,14 +312,112 @@ def test_learned_join_arm_overrides_the_cost_model_choice():
     cold_strategy = join.strategy
     assert cold_strategy != "sort_merge"
 
-    # Teach the bandit that sort_merge is fastest for this join signature.
+    # Teach the bandit that a *different admissible* arm is fastest for this signature.
+    # Sort-merge is deliberately not used here: this join's build fits memory many times
+    # over, so `selection._admissible_arms` withholds it from the bandit entirely (it
+    # cannot win where memory is not binding, and exploring it costs a measured 10x — see
+    # `test_sort_merge_is_not_offered_when_the_build_fits_memory`).
+    loser = "broadcast" if cold_strategy == "hash" else "hash"
     for _ in range(4):
-        lt.record_join_strategy(hub, sig, "hash", 100.0)
-        lt.record_join_strategy(hub, sig, "broadcast", 90.0)
-        lt.record_join_strategy(hub, sig, "sort_merge", 5.0)
+        lt.record_join_strategy(hub, sig, cold_strategy, 100.0)
+        lt.record_join_strategy(hub, sig, loser, 5.0)
 
     _p2, logical2, _d2 = optimize_full(q._plan, sources=q._sources, hub=hub)
-    assert _find_join(logical2).strategy == "sort_merge"  # learned arm overrode the cost guess
+    assert _find_join(logical2).strategy == loser  # learned arm overrode the cost guess
+
+
+def test_sort_merge_is_not_offered_when_the_build_fits_memory():
+    """Sort-merge exists to bound memory; where memory is not binding it cannot win.
+
+    The bandit gives every untried arm a turn and its evidence expires, so an inadmissible
+    arm is re-explored roughly every `1/(1-discount)` runs. On TPC-H sf10
+    `lineitem ⋈ orders` that experiment costs **12.8 s at 2.5x parallelism against 1.2 s at
+    21x** — regret UCB cannot recover, because the arm was never a candidate.
+    """
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    fits = BuildSideDecision(1e9, 1e9, False, "exact", build_bytes=1e9, build_measured=True)
+    assert "sort_merge" not in _admissible_arms(fits, sort_merge_min_bytes=30e9)
+
+    strains = BuildSideDecision(1e9, 1e9, False, "exact", build_bytes=90e9, build_measured=True)
+    assert "sort_merge" in _admissible_arms(strains, sort_merge_min_bytes=30e9)
+
+
+def test_an_unbounded_build_size_never_stands_down_the_memory_guard():
+    """TPC-H q5: relaxing the gate on a join-output build size OOM-killed it at 134 GB.
+
+    A join-free build is bounded by its scan's EXACT row count, whatever the intervening
+    selectivities do. A build that is itself a join output has no such ceiling — its size is a
+    product of guesses — so the byte test must not speak for it.
+    """
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    guessed = BuildSideDecision(1e9, 1e9, False, "default", build_bytes=1e9, build_measured=False)
+    assert "sort_merge" in _admissible_arms(guessed, sort_merge_min_bytes=30e9)
+
+
+def test_both_hashing_arms_are_always_offered():
+    """Narrowing the arm set must never leave the bandit with nothing to compare."""
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    arms = _admissible_arms(
+        BuildSideDecision(1e9, 1e9, False, "exact", build_bytes=1.0, build_measured=True),
+        sort_merge_min_bytes=30e9,
+    )
+    assert set(arms) == {"hash", "broadcast"}
+
+
+def test_a_memory_fitting_build_is_not_sort_merged_cold():
+    """The cost model's own cold choice, not just the bandit's exploration.
+
+    A row floor alone said nothing about the machine or the row width: on TPC-H sf10 the
+    build landed on the 57M-row `lineitem` side, cleared the 50M floor, and the resulting
+    sort-merge join ran 10.4 s at 2.3x parallelism where hash ran 1.5 s at 20x — on a host
+    where that build is under a gigabyte.
+    """
+    import batcher as bt
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.rules.selection import adaptive_build_side
+
+    left = bt.from_pydict({"k": list(range(64)), "v": list(range(64))})
+    right = bt.from_pydict({"k": list(range(32)), "w": list(range(32))})
+    q = left.join(right, on="k")
+    est = CardinalityEstimator(q._sources, {})
+
+    # A row floor of zero would sort-merge everything; the byte floor withholds it because
+    # this build is tiny next to the stated memory.
+    _plan, decisions = adaptive_build_side(
+        q._plan,
+        est,
+        sort_merge_min_rows=0.0,
+        sort_merge_min_bytes=1 << 30,
+        broadcast_max_bytes=0,
+    )
+    assert decisions
+    from batcher.plan.logical import Join
+    from batcher.plan.visitor import walk
+
+    assert all(n.strategy != "sort_merge" for n in walk(_plan) if isinstance(n, Join))
+
+
+def test_a_join_output_build_is_not_treated_as_bounded():
+    """The structural half of the q5 guard, on a real plan rather than a hand-made decision."""
+    import batcher as bt
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.rules.selection import adaptive_build_side
+
+    a = bt.from_pydict({"k": list(range(64)), "v": list(range(64))})
+    b = bt.from_pydict({"k": list(range(64)), "w": list(range(64))})
+    c = bt.from_pydict({"k": list(range(64)), "z": list(range(64))})
+    q = a.join(b.join(c, on="k"), on="k")  # the outer join's build side *is* a join output
+    est = CardinalityEstimator(q._sources, {})
+
+    _plan, decisions = adaptive_build_side(
+        q._plan, est, sort_merge_min_rows=0.0, sort_merge_min_bytes=1 << 30, broadcast_max_bytes=0
+    )
+    assert any(not d.build_measured for d in decisions), (
+        "no join reported an unbounded build, so the q5 guard could never engage"
+    )
 
 
 # --- all decisions are best-effort on a None hub ----------------------------------------------
@@ -288,7 +429,7 @@ def test_none_hub_is_safe_everywhere():
     assert lt.learned_partition_count(None, "x", 1) is None
     assert lt.learned_partial_agg(None, "x") is None
     assert lt.learned_signature_rows(None, "x") is None
-    assert lt.learned_adaptive_helps(None, "x") is False
+    assert lt.learned_adaptive_route(None, "x") is None
     # record_* on a None hub is a no-op, never raises.
     lt.record_join_strategy(None, "x", "hash", 1.0)
     lt.record_broadcast_timing(None, "broadcast", 1.0, 1.0)
@@ -296,4 +437,4 @@ def test_none_hub_is_safe_everywhere():
     lt.record_join_sides(None, "x", 1.0, 1.0)
     lt.record_partition_rows(None, "x", 1.0)
     lt.record_group_reduction(None, "x", 1.0, 1.0)
-    lt.record_adaptive_flip(None, "x", True)
+    lt.record_adaptive_route(None, "x", "staged", 1.0)

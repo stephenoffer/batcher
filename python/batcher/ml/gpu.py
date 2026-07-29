@@ -24,9 +24,11 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.errors import PlanError
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -39,6 +41,7 @@ __all__ = [
     "gpu_aware_pool_default",
     "gpu_feedback_key",
     "gpu_vram_gb",
+    "inference_mode_call",
     "inference_vram_multiplier",
     "load_gpu_peak_vram",
     "load_gpu_utilization",
@@ -69,10 +72,45 @@ def resolve_num_workers(num_workers: int | str, num_gpus: float) -> int:
     ``multiprocessing=True`` to use those cores across processes. An explicit int wins.
     """
     if num_workers != "auto":
-        return max(1, int(num_workers))  # type: ignore[arg-type]
+        return max(1, _as_worker_count(num_workers))
     if num_gpus > 0:
         return 1
     return available_cpu_count()  # usable local cores (cgroup/affinity aware), not host count
+
+
+def _as_worker_count(num_workers: object) -> int:
+    """Coerce an explicit `num_workers` to an int, or say what it should have been.
+
+    The only accepted values are ``"auto"`` and an integer, but anything `int()` could
+    parse got through and anything it could not raised `int()`'s own message —
+    ``invalid literal for int() with base 10: 'AUTO'`` — which names neither the parameter
+    nor the two things it takes. ``"AUTO"`` is the mistake worth catching by name: it is a
+    plausible spelling of the default, and it failed as a parse error rather than as an
+    unrecognized option.
+    """
+    # A float was never a documented value, but `int()` accepted one, so `num_workers=4.0`
+    # has always worked. Keep it working when it is integral and reject it only when
+    # truncating would silently change the answer — rejecting 4.0 outright would break
+    # callers for no benefit, and accepting 2.5 as 2 is the surprise worth stopping.
+    if isinstance(num_workers, float) and not isinstance(num_workers, bool):
+        if num_workers.is_integer():
+            return int(num_workers)
+        raise PlanError(
+            f"num_workers must be 'auto' or a whole number, got {num_workers!r}; it would "
+            f"otherwise be truncated to {int(num_workers)}."
+        )
+    if isinstance(num_workers, bool) or not isinstance(num_workers, (int, str)):
+        raise PlanError(
+            f"num_workers must be 'auto' or an integer, got {type(num_workers).__name__} "
+            f"{num_workers!r}."
+        )
+    try:
+        return int(num_workers)
+    except ValueError:
+        hint = " Did you mean 'auto'?" if str(num_workers).strip().lower() == "auto" else ""
+        raise PlanError(
+            f"num_workers must be 'auto' or an integer, got {num_workers!r}.{hint}"
+        ) from None
 
 
 def _accelerator_pool_size(resources: dict[str, float] | None, num_partitions: int) -> int | None:
@@ -811,8 +849,9 @@ def load_gpu_utilization(hub: MetadataHub | None, key: str) -> float | None:
     if hub is None:
         return None
     try:
-        return hub.load_params(_NAMESPACE).get(key)
-    except Exception:  # pragma: no cover - feedback must never break execution
+        return hub.load_params(scoped(_NAMESPACE)).get(key)
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("ml", "load GPU utilization feedback", exc)
         return None
 
 
@@ -821,7 +860,7 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
     if hub is None or util_fraction is None:
         return
     try:
-        stats = hub.load_params(_NAMESPACE)
+        stats = hub.load_params(scoped(_NAMESPACE))
         alpha = active_config().optimizer.learning_smoothing_alpha
         prior = stats.get(key)
         stats[key] = (
@@ -829,7 +868,7 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
             if prior is None
             else alpha * float(util_fraction) + (1.0 - alpha) * float(prior)
         )
-        hub.save_params(_NAMESPACE, stats)
+        hub.save_params(scoped(_NAMESPACE), stats)
     except Exception as exc:  # pragma: no cover - feedback must never break execution
         note_suppressed("ml", "persist learned GPU utilization", exc)
 
@@ -846,8 +885,9 @@ def load_gpu_peak_vram(hub: MetadataHub | None, key: str) -> float | None:
     if hub is None:
         return None
     try:
-        return hub.load_params(_VRAM_NAMESPACE).get(key)
-    except Exception:  # pragma: no cover - a learned read must never break execution
+        return hub.load_params(scoped(_VRAM_NAMESPACE)).get(key)
+    except Exception as exc:  # pragma: no cover - a learned read must never break execution
+        note_suppressed("ml", "load GPU peak-VRAM feedback", exc)
         return None
 
 
@@ -856,7 +896,7 @@ def record_gpu_peak_vram(hub: MetadataHub | None, key: str, vram_fraction: float
     if hub is None or vram_fraction is None:
         return
     try:
-        stats = hub.load_params(_VRAM_NAMESPACE)
+        stats = hub.load_params(scoped(_VRAM_NAMESPACE))
         alpha = active_config().optimizer.learning_smoothing_alpha
         prior = stats.get(key)
         stats[key] = (
@@ -864,7 +904,7 @@ def record_gpu_peak_vram(hub: MetadataHub | None, key: str, vram_fraction: float
             if prior is None
             else alpha * float(vram_fraction) + (1.0 - alpha) * float(prior)
         )
-        hub.save_params(_VRAM_NAMESPACE, stats)
+        hub.save_params(scoped(_VRAM_NAMESPACE), stats)
     except Exception as exc:  # pragma: no cover - feedback must never break execution
         note_suppressed("ml", "persist learned VRAM utilization", exc)
 
@@ -897,6 +937,74 @@ _AUTOCAST_MIN_SPEEDUP = 1.15
 # is not idempotent for one that writes anything. Neither is detectable from the callable,
 # so an author who knows their UDF has side effects opts out here.
 _AUTOCAST_OPT_OUT_ATTR = "batcher_autocast"
+# The same escape hatch for the autograd-off wrap. A UDF whose *output* is a gradient — a
+# saliency map, an adversarial perturbation, an influence score — needs the backward graph
+# the wrap removes, and nothing about the callable says so from outside.
+_INFERENCE_MODE_OPT_OUT_ATTR = "batcher_inference_mode"
+
+
+def inference_mode_call(call: Callable) -> Callable:
+    """Wrap a per-batch model `call` so its forward runs under `torch.inference_mode()`.
+
+    Autograd is on by default in PyTorch, so every forward inside a `map_batches` inference
+    stage builds a backward graph nobody will ever use: version counters on each tensor, an
+    autograd node per op, and the activations kept alive to feed a backward pass that never
+    comes. `inference_mode` switches all of that off — strictly more than `no_grad`, which
+    still tracks version counters and view metadata — which cuts host overhead per op and,
+    more importantly, frees the activation memory that would otherwise cap the batch size.
+
+    This is a pure resource win with no numerical effect: the forward computes the identical
+    values either way. That is what makes it safe to apply unconditionally, unlike
+    `autocast_call` — which changes precision and therefore has to prove it pays first.
+
+    Ray Data users apply this by hand in every `__call__`, and forgetting it is common enough
+    that the pattern catalog has an entry for it. Here it is applied by the engine, so an
+    opaque `map_batches(model, num_gpus=1)` gets it whether or not the model's author
+    remembered.
+
+    A UDF that genuinely needs autograd (computing gradients as its *output* — a saliency map,
+    an adversarial perturbation, an influence score) sets ``batcher_inference_mode = False`` on
+    itself or its class to decline. The wrap is skipped entirely when torch is absent, so a
+    non-torch UDF pays nothing.
+
+    Returns `call` unchanged when it cannot apply. Wrapping is by exception, not by probe: no
+    extra execution of `call`, so it is safe for a UDF that bills a request or writes.
+    """
+    if getattr(call, _INFERENCE_MODE_OPT_OUT_ATTR, None) is False:
+        return call
+    obj = getattr(call, "__self__", call)  # bound method -> its instance; else the callable
+    for target in (obj, type(obj)):
+        if getattr(target, _INFERENCE_MODE_OPT_OUT_ATTR, True) is False:
+            return call
+
+    @functools.wraps(call)
+    def _no_autograd(batch):
+        torch = _torch()
+        if torch is None:
+            return call(batch)
+        # `inference_mode` landed in torch 1.9; `no_grad` is the equivalent-intent fallback
+        # for anything older, and still removes the backward graph.
+        guard = getattr(torch, "inference_mode", None) or torch.no_grad
+        with guard():
+            return call(batch)
+
+    return _no_autograd
+
+
+def _torch() -> Any | None:
+    """The **already-imported** `torch` module, or `None`.
+
+    Deliberately a `sys.modules` lookup rather than an import. A UDF that calls torch has
+    imported it in this process by definition, so looking is sufficient — while importing
+    would make a `num_gpus=1` stage that never touches torch pay a multi-second import on
+    its first batch, charged to that stage in the profile, for a guard it cannot use.
+
+    Checked per call rather than once, so a model that imports torch lazily inside its first
+    `__call__` is still wrapped from the next batch onward.
+    """
+    import sys
+
+    return sys.modules.get("torch")
 
 
 def autocast_call(call: Callable) -> Callable:

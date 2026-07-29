@@ -28,7 +28,7 @@ Deliberately **not** rewritten — each omission is a decision, with the reason:
   ``millennium`` extension noted below) are range-sargable.
 * ``century`` / ``millennium`` — these *are* monotone and contiguous
   (``century = (Y-1)//100 + 1``, ``millennium = (Y-1)//1000 + 1``; see
-  ``bc-expr/src/eval/date.rs``), but their home is the ``_BUCKETS`` table in
+  ``bc-expr/src/eval/temporal/date.rs``), but their home is the ``_BUCKETS`` table in
   `temporal_sargable` — two entries, no new code. Left there deliberately rather than
   re-implemented here.
 * ``convert_timezone`` elimination — **not** an identity, even from a zone to *itself*:
@@ -60,6 +60,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, node_rule, plan_rule
 from batcher.kyber.rules.extra.temporal_sargable import _MIRROR, _OPS, _column_kind, _range_expr
+from batcher.kyber.rules.leaf_rewrite import whole_plan_expr_rule
 from batcher.kyber.rules.normalize.ranges import (
     _TRUNC_SUBDAY,
     _match_trunc_and_lit,
@@ -67,10 +68,9 @@ from batcher.kyber.rules.normalize.ranges import (
     _trunc_aligned,
 )
 from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit
-from batcher.plan.expr_ir.func_nodes import DateFunc, DateOffset, DateTrunc, Strftime
-from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.expr_ir.func_nodes import DateTrunc, Strftime
+from batcher.plan.expr_rewrite import transform_expr_up
 from batcher.plan.logical import Filter, LogicalPlan
-from batcher.plan.visitor import transform_up
 
 __all__ = [
     "DATE_TRUNC_RANGE_RULES",
@@ -103,7 +103,7 @@ def rewrite_date_trunc_filter(node: Filter, op: str) -> Filter | None:
 
     Args:
         node: The `Filter` whose predicate is scanned.
-        op: The effective comparison operator to match (`lt`/`le`/`gt`/`ge`).
+        op: The effective comparison operator to match (`lt`/`le`/`gt`/`ge`/`ne`).
 
     Returns:
         A new `Filter` when at least one comparison was rewritten, else None.
@@ -157,16 +157,45 @@ def _trunc_bounds(value: object, unit: str) -> tuple[_dt.date, _dt.date] | None:
 # (one calendar unit wide). chrono zero-pads `%Y` to four digits, `%m`/`%d` to two, so a
 # literal outside the strict shape below is not producible and is left alone.
 _STRFTIME_UNITS: dict[str, tuple[re.Pattern[str], str]] = {
-    "%Y": (re.compile(r"^\d{4}$"), "year"),
-    "%Y-%m": (re.compile(r"^\d{4}-\d{2}$"), "month"),
-    "%Y-%m-%d": (re.compile(r"^\d{4}-\d{2}-\d{2}$"), "day"),
+    "%Y": (re.compile(r"^(\d{4})$"), "year"),
+    "%Y-%m": (re.compile(r"^(\d{4})-(\d{2})$"), "month"),
+    "%Y-%m-%d": (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), "day"),
+    # The sub-day formats are the same isomorphism carried one, two and three fields
+    # further: chrono zero-pads `%H`/`%M`/`%S` to two digits and the separators are
+    # constant, so the rendering stays fixed-width and most-significant-field-first. They
+    # apply to a *timestamp* column only — a date has no sub-day component to bound, which
+    # `_strftime_bounds` checks before building the range.
+    "%Y-%m-%d %H": (re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2})$"), "hour"),
+    "%Y-%m-%d %H:%M": (re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$"), "minute"),
+    "%Y-%m-%d %H:%M:%S": (
+        re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$"),
+        "second",
+    ),
+    # The separator is not what makes the encoding an isomorphism — the fixed width and
+    # the field order are — so the separator-free partition-key spellings and the ISO-8601
+    # `T` form belong here on exactly the same argument. These are the shapes a Hive-style
+    # `dt=20240105` path and a machine-generated ISO timestamp actually take.
+    "%Y%m": (re.compile(r"^(\d{4})(\d{2})$"), "month"),
+    "%Y%m%d": (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "day"),
+    "%Y/%m/%d": (re.compile(r"^(\d{4})/(\d{2})/(\d{2})$"), "day"),
+    "%Y-%m-%dT%H": (re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2})$"), "hour"),
+    "%Y-%m-%dT%H:%M": (
+        re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$"),
+        "minute",
+    ),
+    "%Y-%m-%dT%H:%M:%S": (
+        re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$"),
+        "second",
+    ),
 }
 
 
 def rewrite_strftime_filter(node: Filter, op: str) -> Filter | None:
     """Rewrite ``strftime(col, fmt) <op> '<text>'`` conjuncts to a range on the column.
 
-    Only for the fixed-width formats ``%Y`` / ``%Y-%m`` / ``%Y-%m-%d``, whose output is
+    Only for the fixed-width formats in `_STRFTIME_UNITS` — the dash-separated calendar
+    prefixes, their sub-day extensions, the separator-free partition-key spellings and the
+    ISO-8601 ``T`` form — whose output is
     an order isomorphism (zero-padded, most-significant-field-first): the rows whose text
     equals ``'2021-03'`` are exactly ``[2021-03-01, 2021-04-01)``, and because the string
     order matches the chronological one, ``<``/``<=``/``>``/``>=`` map to the same
@@ -174,7 +203,8 @@ def rewrite_strftime_filter(node: Filter, op: str) -> Filter | None:
     (a `date` literal for a date column, `datetime` for a naive timestamp), so the
     emitted comparison is the one the engine already knows how to prune on.
 
-    Skipped when the format is not one of the three, the literal does not match the
+    Skipped when the format is not one of the twelve, a sub-day format is applied to a date
+    column, the literal does not match the
     format's exact shape (e.g. ``'2021-3'``), the date it names does not exist
     (``'2021-02-30'``), the column's type is unknown/tz-aware, or the bound would run off
     the representable calendar.
@@ -219,12 +249,19 @@ def _strftime_bounds(
 ) -> tuple[_dt.date, _dt.date] | None:
     """The half-open instant range whose `fmt` rendering is exactly `text`, else None."""
     spec = _STRFTIME_UNITS.get(fmt)
-    if spec is None or not spec[0].match(text):
+    matched = spec[0].match(text) if spec is not None else None
+    if spec is None or matched is None:
         return None
-    fields = [int(part) for part in text.split("-")]
-    year, month, day = [*fields, 1, 1][:3]
+    if spec[1] in _TRUNC_SUBDAY and not is_timestamp:
+        return None  # a date column carries no sub-day component to bound
+    fields = [int(group) for group in matched.groups()]
+    year, month, day, hour, minute, second = (*fields, *(1, 1, 0, 0, 0)[len(fields) - 1 :])
     try:
-        lower = _dt.datetime(year, month, day) if is_timestamp else _dt.date(year, month, day)
+        lower = (
+            _dt.datetime(year, month, day, hour, minute, second)
+            if is_timestamp
+            else _dt.date(year, month, day)
+        )
         upper = _next_unit(lower, spec[1])
     except (ValueError, OverflowError):
         return None  # a month/day the calendar has no room for, or year 9999 + 1
@@ -350,94 +387,6 @@ def rewrite_date_cast_filter(node: Filter) -> Filter | None:
     return Filter(node.input, new_pred) if changed else None
 
 
-# --- constant folding the engine's `ConstantFolding` leaves alone -----------------
-
-# `DateFunc`s whose value Python computes *identically* to the engine. Each mirrors an
-# arrow `DatePart` (`date_part` is 1-based for quarter/day_of_year, as Python is) or the
-# engine's explicit year formula (`bc-expr/src/eval/date.rs`). Everything else is left to
-# the engine on purpose: `dayname`/`monthname` are locale-sensitive in Python but chrono
-# `%A`/`%B` in the engine; `week`/`iso_year`/`isodow` follow ISO rules Python spells
-# differently; `epoch`/`last_day`/`is_leap_year`/`days_in_month` have engine-specific
-# output types or paths. A fold that is not bit-identical is a wrong answer.
-_FOLDABLE_DATE_FNS: dict[str, Callable[[_dt.date], int]] = {
-    "year": lambda v: v.year,
-    "month": lambda v: v.month,
-    "day": lambda v: v.day,
-    "hour": lambda v: v.hour,  # datetime only (see `_fold_date_func`)
-    "minute": lambda v: v.minute,
-    "second": lambda v: v.second,
-    "quarter": lambda v: (v.month - 1) // 3 + 1,
-    "day_of_year": lambda v: v.timetuple().tm_yday,
-    "decade": lambda v: v.year // 10,
-    "century": lambda v: (v.year - 1) // 100 + 1,
-    "millennium": lambda v: (v.year - 1) // 1000 + 1,
-}
-# Fields a `date` literal does not carry. The engine reads them off a Date32 array
-# through arrow's `date_part`; rather than assume that yields 0, only fold them when the
-# literal is a `datetime` and the answer is on the literal itself.
-_TIME_FIELDS = frozenset({"hour", "minute", "second"})
-
-
-def _naive_temporal(value: object) -> bool:
-    """Whether `value` is a naive `date`/`datetime` literal (never a bool)."""
-    if not isinstance(value, _dt.date) or isinstance(value, bool):
-        return False
-    return not (isinstance(value, _dt.datetime) and value.tzinfo is not None)
-
-
-def _fold_date_func(expr: Expr) -> Expr:
-    if not (isinstance(expr, DateFunc) and isinstance(expr.input, Lit)):
-        return expr
-    value = expr.input.value
-    if not _naive_temporal(value):
-        return expr
-    if expr.fn in _TIME_FIELDS and not isinstance(value, _dt.datetime):
-        return expr
-    fold = _FOLDABLE_DATE_FNS.get(expr.fn)
-    return expr if fold is None else Lit(fold(value))
-
-
-def _fold_date_offset(expr: Expr) -> Expr:
-    if not (isinstance(expr, DateOffset) and isinstance(expr.input, Lit)):
-        return expr
-    value = expr.input.value
-    if not _naive_temporal(value) or expr.months:
-        return expr  # calendar months clamp to the month end — the engine's rule, not ours
-    if expr.micros and not isinstance(value, _dt.datetime):
-        return expr  # the engine *errors* on a sub-day offset of a Date — preserve that
-    try:
-        return Lit(value + _dt.timedelta(days=expr.days, microseconds=expr.micros))
-    except (OverflowError, ValueError):
-        return expr  # off the end of the calendar — let the engine decide
-
-
-def _fold_temporal_comparison(expr: Expr) -> Expr:
-    if not (isinstance(expr, Binary) and expr.op in _COMPARISONS):
-        return expr
-    left, right = expr.left, expr.right
-    if not (isinstance(left, Lit) and isinstance(right, Lit)):
-        return expr
-    a, b = left.value, right.value
-    if not (_naive_temporal(a) and _naive_temporal(b)):
-        return expr
-    if isinstance(a, _dt.datetime) != isinstance(b, _dt.datetime):
-        return expr  # date vs datetime: the engine coerces; don't guess its rebasing
-    return Lit(_COMPARISONS[expr.op](a, b))
-
-
-def _expr_rule(
-    fn: Callable[[Expr], Expr],
-) -> Callable[[LogicalPlan, OptimizerContext], LogicalPlan]:
-    """A whole-plan rule applying the leaf expression rewrite `fn` everywhere."""
-
-    def apply(plan: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan:
-        return transform_up(
-            plan, lambda node: map_node_expressions(node, lambda e: transform_expr_up(e, fn))
-        )
-
-    return apply
-
-
 # --- registration ----------------------------------------------------------------
 
 
@@ -455,18 +404,35 @@ def _strftime_rule(op: str) -> Callable[[Filter, OptimizerContext], LogicalPlan 
     return apply
 
 
-#: One rule per (`date_trunc`, inequality) pair — the four the equality rule leaves.
+#: One rule per (`date_trunc`, comparison) pair — the four inequalities the equality rule
+#: leaves, plus `<>`. The inequality is the complement of the same `[L, L+1u)` band the
+#: equality rule builds, so it needs no new bound arithmetic: `trunc(col) <> L` is
+#: `col < L OR col >= L+1u`.
 DATE_TRUNC_RANGE_RULES = [
     DEFAULT_REGISTRY.add(
-        node_rule(f"date_trunc_{op}_to_range", Phase.NORMALIZE, _trunc_rule(op), matches=(Filter,))
+        node_rule(
+            f"date_trunc_{op}_to_range",
+            Phase.NORMALIZE,
+            _trunc_rule(op),
+            matches=(Filter,),
+            # The rewrite lands on a `Binary`, but it cannot fire without a `DateTrunc`
+            # to lift the comparison off -- a far sharper gate than the comparison itself.
+            expr_matches=(DateTrunc,),
+        )
     )
-    for op in _INEQUALITIES
+    for op in (*_INEQUALITIES, "ne")
 ]
 
 #: One rule per (`strftime`, comparison) pair, over the three order-isomorphic formats.
 STRFTIME_RANGE_RULES = [
     DEFAULT_REGISTRY.add(
-        node_rule(f"strftime_{op}_to_range", Phase.NORMALIZE, _strftime_rule(op), matches=(Filter,))
+        node_rule(
+            f"strftime_{op}_to_range",
+            Phase.NORMALIZE,
+            _strftime_rule(op),
+            matches=(Filter,),
+            expr_matches=(Strftime,),
+        )
     )
     for op in _OPS
 ]
@@ -477,14 +443,13 @@ DEFAULT_REGISTRY.add(
         Phase.NORMALIZE,
         lambda node, _ctx: rewrite_date_cast_filter(node),
         matches=(Filter,),
+        # Needs a timestamp `Cast` to drop; a plan without one can never match.
+        expr_matches=(Cast,),
     )
 )
 
 for _name, _fn in (
     ("date_trunc_idempotent", _collapse_same_unit),
     ("date_trunc_nested_to_coarser", _collapse_to_coarser),
-    ("fold_date_func_of_literal", _fold_date_func),
-    ("fold_date_offset_of_literal", _fold_date_offset),
-    ("fold_temporal_literal_comparison", _fold_temporal_comparison),
 ):
-    DEFAULT_REGISTRY.add(plan_rule(_name, Phase.NORMALIZE, _expr_rule(_fn)))
+    DEFAULT_REGISTRY.add(plan_rule(_name, Phase.NORMALIZE, whole_plan_expr_rule(_fn)))

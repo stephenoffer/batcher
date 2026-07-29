@@ -28,10 +28,13 @@ def _nonnull() -> pa.Table:
 
 
 def test_dedupe_sort_keys(duck):
+    # Ordered on purpose: this rule rewrites a *sort*, so an order-independent comparison
+    # would pass just as happily if deduping the keys had destroyed the ordering entirely.
+    # (x, y) is a total order over this data, so there is no tie ambiguity to make it flaky.
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x", "y", "x").collect()
-    assert_same(out, duck.sql("SELECT * FROM t"))
+    assert_same_ordered(out, duck.sql("SELECT * FROM t ORDER BY x, y"))
 
 
 def test_sort_before_full_sample(duck):
@@ -121,7 +124,10 @@ def test_drop_self_cast_in_filter(duck):
 
 
 def test_drop_self_cast_in_sort_key(duck):
+    # Ordered on purpose, for the same reason as `test_dedupe_sort_keys`: dropping the
+    # no-op cast must leave the sort key intact, and only an ordered comparison can see that.
+    # x is distinct here, so the order is total.
     t = pa.table({"x": [5, 3, 1, 4, 2], "y": [50, 30, 10, 40, 20]})
     duck.register("t", t)
     out = bt.from_arrow(t).sort(col("x").cast("int64")).select("x", "y").collect()
-    assert_same(out, duck.sql("SELECT x, y FROM t"))
+    assert_same_ordered(out, duck.sql("SELECT x, y FROM t ORDER BY x"))

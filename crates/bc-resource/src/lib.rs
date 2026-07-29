@@ -16,6 +16,10 @@
 //! (soft 85% / hard 90% of the budget) and drives the pool through `bc-py`; the
 //! pool itself is policy-free — it only accounts and admits.
 
+pub mod cancel;
+
+pub use cancel::CancelToken;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -27,11 +31,27 @@ use thiserror::Error;
 /// from its memory envelope via [`MemoryPool::set_soft_fraction`].
 const DEFAULT_SOFT_BPS: usize = 8000;
 
+/// Hard cap on cooperative-spill rounds inside one reservation attempt.
+///
+/// The loop's termination argument is "every round must free something", which holds only
+/// if a consumer's reported freed bytes actually come back to *this* pool. A consumer that
+/// frees memory it never charged here — a bug, or an operator whose spill releases an
+/// off-pool buffer — reports progress forever while `available()` never moves, and the
+/// reserving thread spins inside the pool with no timeout and no way out. Bounding the
+/// rounds turns that from a hang into a failed reservation, which every caller already
+/// handles (it is the signal to spill itself).
+const MAX_SPILL_ROUNDS: usize = 32;
+
 /// Coarse memory-pressure level derived from `used / limit`. The one signal the
 /// executor's backpressure mechanisms (proactive spill, the morsel-admission gate,
 /// the distributed credit window) all read, so single-node and distributed throttle
 /// off the same envelope rather than each inventing a threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered, so a caller can write `pressure >= Pressure::Elevated` the way the control
+/// plane's `PressureLevel` is compared. Without it every consumer of this enum had to
+/// spell out a match over all three variants to ask "is it at least this bad", which is
+/// the kind of thing that is written correctly the first time and wrongly the fourth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Pressure {
     /// Below the soft line — the fast path, no throttling.
     Nominal,
@@ -52,6 +72,24 @@ pub enum Pressure {
 /// failing the requester — so a small operator no longer dies while a large
 /// neighbour (or a concurrent query) sits on the budget. A consumer that cannot
 /// spill simply does not register and is never asked.
+///
+/// **One occupant so far, and it frees a different currency than it is asked for.** The
+/// published shuffle store registers (`bc-py`'s `ShuffleSpiller`, over
+/// `bc-transport`'s `PartitionStore`), which makes the cooperative path do real work: it
+/// writes idle finished buckets to disk and hands their memory back to the process.
+///
+/// What it does *not* do is make the pending reservation fit. Those buckets were never
+/// reserved here — a mapper hands one over and it stays resident until a reducer collects
+/// it, which is precisely why they are the memory a reservation is most often losing to —
+/// so spilling them does not move `available()`. The progress check below sees that, stops
+/// after one round, and returns the failure. The caller is then refused, as it would have
+/// been, but into a process with room for its own spill path to run. Treat that as the
+/// honest reading of what the cooperative path buys today; the reservation only starts to
+/// *succeed* once a consumer's memory is charged to this pool in the first place.
+///
+/// The operators that would close that gap are the ones already owning spillable state
+/// they reserve for: the aggregate's hash table (`bc-runtime::agg::spill`) and the external
+/// sort's runs. Both are mid-`par_iter` state, which is why neither is here yet.
 pub trait Spillable: Send + Sync {
     /// Spill at least `target` bytes of in-memory state to disk if possible,
     /// returning the bytes actually freed (`0` if it cannot spill right now).
@@ -86,6 +124,46 @@ pub enum ResourceError {
 /// Result alias for fallible reservations.
 pub type ResourceResult<T> = Result<T, ResourceError>;
 
+/// A snapshot of a [`MemoryPool`]'s accounting and its lifetime counters.
+///
+/// The four figures are only useful together. `peak_used / limit` says how close the
+/// workload ran to its envelope; `denied` says whether it went over; `spill_requests`
+/// says whether other operators had to give memory back to keep it running. A query that
+/// spilled with a low peak was starved by something outside this pool, and one that
+/// spilled with `peak == limit` and no spill requests was simply too big for the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStats {
+    /// The admission cap in bytes.
+    pub limit: usize,
+    /// Bytes reserved right now.
+    pub used: usize,
+    /// High-water mark of `used` over the pool's life.
+    pub peak_used: usize,
+    /// Reservations refused for lack of headroom.
+    pub denied: usize,
+    /// Times a registered consumer was asked to spill.
+    pub spill_requests: usize,
+}
+
+impl PoolStats {
+    /// `used / limit` in `[0, 1]`; `1.0` for a zero-limit (unconfigured) pool, which is
+    /// full by definition rather than empty.
+    pub fn utilization(&self) -> f64 {
+        if self.limit == 0 {
+            return 1.0;
+        }
+        (self.used as f64 / self.limit as f64).min(1.0)
+    }
+
+    /// `peak_used / limit` in `[0, 1]` — the pressure the workload actually reached.
+    pub fn peak_utilization(&self) -> f64 {
+        if self.limit == 0 {
+            return 1.0;
+        }
+        (self.peak_used as f64 / self.limit as f64).min(1.0)
+    }
+}
+
 /// A greedy, thread-safe memory accounting pool.
 ///
 /// Tracks `used` bytes against a fixed `limit`. Growth is admitted only when it
@@ -101,6 +179,16 @@ pub struct MemoryPool {
     used: AtomicUsize,
     /// Soft-pressure line as basis points of `limit` (see [`Pressure`]).
     soft_bps: AtomicUsize,
+    /// High-water mark of `used` over the pool's life. `peak / limit` is the memory
+    /// pressure a workload *actually* reached, which a spot reading of `used` cannot
+    /// recover after the fact — and after the fact is when anyone asks.
+    peak: AtomicUsize,
+    /// Reservations refused for lack of headroom. The direct evidence that the envelope
+    /// is the binding constraint, where a high `peak` is only circumstantial.
+    denied: AtomicUsize,
+    /// Times the cooperative path had to ask a consumer to spill. Distinguishes "the
+    /// budget was tight" from "the budget was tight and operators paid for it".
+    spill_requests: AtomicUsize,
     /// Registered [`Spillable`] consumers (held by `Weak` so a finished operator's
     /// entry is harmless dead weight, swept lazily on the next slow-path entry). The
     /// `Mutex` is taken only on the cooperative slow path / registration — never per
@@ -126,8 +214,39 @@ impl MemoryPool {
             limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
             soft_bps: AtomicUsize::new(DEFAULT_SOFT_BPS),
+            peak: AtomicUsize::new(0),
+            denied: AtomicUsize::new(0),
+            spill_requests: AtomicUsize::new(0),
             consumers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// High-water mark of concurrently-reserved bytes over this pool's life.
+    pub fn peak_used(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
+    }
+
+    /// Reservations this pool has refused for lack of headroom.
+    pub fn denied(&self) -> usize {
+        self.denied.load(Ordering::Acquire)
+    }
+
+    /// Times the cooperative path asked a registered consumer to spill.
+    pub fn spill_requests(&self) -> usize {
+        self.spill_requests.load(Ordering::Acquire)
+    }
+
+    /// A snapshot of everything this pool measured. Read together, the four figures say
+    /// *why* a query spilled: a high `peak` with no `denied` means it ran close and made
+    /// it, and `denied` with `spill_requests` means operators had to give memory back.
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            limit: self.limit(),
+            used: self.used(),
+            peak_used: self.peak_used(),
+            denied: self.denied(),
+            spill_requests: self.spill_requests(),
+        }
     }
 
     /// The pool's current limit in bytes.
@@ -164,6 +283,7 @@ impl MemoryPool {
             // Saturating add guards the (pathological) overflow case as an exhaustion.
             let new = cur.saturating_add(bytes);
             if new > limit {
+                self.denied.fetch_add(1, Ordering::Relaxed);
                 return Err(ResourceError::Exhausted {
                     requested: bytes,
                     available: limit.saturating_sub(cur),
@@ -174,10 +294,23 @@ impl MemoryPool {
                 .used
                 .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.observe_peak(new);
+                    return Ok(());
+                }
                 Err(actual) => cur = actual, // raced with another reserver; retry
             }
         }
+    }
+
+    /// Raise the lifetime high-water mark to `used` if it is a new maximum.
+    ///
+    /// `fetch_max` rather than a load-compare-store: the reservation path is lock-free and
+    /// concurrent, so a read-then-write would let two reservers racing past the previous
+    /// peak each see the old value and record the smaller of their two — losing exactly
+    /// the sample that mattered.
+    fn observe_peak(&self, used: usize) {
+        self.peak.fetch_max(used, Ordering::Relaxed);
     }
 
     /// Release `bytes` back to the pool. Clamped to the current `used` so a
@@ -231,27 +364,30 @@ impl MemoryPool {
         if let Ok(r) = self.try_reserve(bytes) {
             return Ok(r);
         }
-        // Spill registered consumers, largest first, until it fits or a full pass
-        // frees nothing (guarantees termination — each round needs real progress).
-        loop {
-            let needed = bytes.saturating_sub(self.available());
-            if needed == 0 {
+        // Spill registered consumers, largest first, until it fits, a full pass frees
+        // nothing, or the round budget runs out. Two independent termination conditions,
+        // because "each round must free something" is only sound if the freed bytes come
+        // back to *this* pool — see `MAX_SPILL_ROUNDS`.
+        for _ in 0..MAX_SPILL_ROUNDS {
+            let before = self.available();
+            if bytes <= before {
                 break;
             }
             let mut victims = self.live_consumers();
             victims.sort_by_key(|c| std::cmp::Reverse(c.spillable_bytes()));
-            let mut freed_any = false;
             for v in victims {
                 let need = bytes.saturating_sub(self.available());
                 if need == 0 {
                     break;
                 }
+                self.spill_requests.fetch_add(1, Ordering::Relaxed);
                 // spill() runs outside the registry lock and only releases memory.
-                if v.spill(need) > 0 {
-                    freed_any = true;
-                }
+                v.spill(need);
             }
-            if !freed_any {
+            // Progress is measured on the pool, not on what the consumers *claimed* to
+            // free. A consumer that reports bytes it never charged here would otherwise
+            // keep the loop alive forever while the reservation never becomes satisfiable.
+            if self.available() <= before {
                 break;
             }
         }
@@ -326,8 +462,33 @@ impl MemoryReservation {
     /// the pool cannot admit the growth.
     pub fn try_grow(&mut self, extra: usize) -> ResourceResult<()> {
         self.pool.try_reserve_bytes(extra)?;
-        self.size += extra;
+        // Saturating, matching the pool's own accounting. The pool refuses a growth that
+        // would overflow `used`, so this cannot be reached in practice — but a plain `+=`
+        // makes the reservation the one place in the crate where the arithmetic could
+        // wrap, and a wrapped size releases the wrong number of bytes on drop.
+        self.size = self.size.saturating_add(extra);
         Ok(())
+    }
+
+    /// Resize this reservation to exactly `bytes`, growing or shrinking as needed.
+    ///
+    /// The primitive an operator wants when it *recomputes* its footprint rather than
+    /// accumulating it — a hash table that rehashed, a sort run that compacted. Expressing
+    /// that as a grow/shrink pair at the call site means every such site re-derives the
+    /// delta and its sign, which is how a shrink gets released twice.
+    ///
+    /// A failed growth leaves the reservation exactly as it was, so a caller that cannot
+    /// get the larger size still holds (and still owes) the smaller one.
+    ///
+    /// # Errors
+    /// [`ResourceError::Exhausted`] if growing to `bytes` does not fit the pool.
+    pub fn try_resize(&mut self, bytes: usize) -> ResourceResult<()> {
+        if bytes > self.size {
+            self.try_grow(bytes - self.size)
+        } else {
+            self.shrink(self.size - bytes);
+            Ok(())
+        }
     }
 
     /// Shrink this reservation by `bytes` (clamped to its current size),
@@ -464,6 +625,62 @@ mod tests {
         }
     }
 
+    /// A consumer whose memory was never charged here — the real first occupant's shape.
+    ///
+    /// The published shuffle store frees genuine process memory on `spill`, but those bytes
+    /// were never reserved against this pool, so `available()` does not move. Two things
+    /// must hold, and they pull in opposite directions: the consumer must actually be
+    /// *asked* (that is the whole benefit — real RAM comes back for the caller's own spill
+    /// path), and the loop must still terminate and return the failure rather than asking
+    /// forever for bytes that will never arrive.
+    ///
+    /// The progress check reads the pool, not the consumer's claim, which is exactly what
+    /// makes both true. This test exists so that check is never "simplified" into trusting
+    /// the returned figure.
+    struct OffPoolConsumer {
+        spill_calls: AtomicUsize,
+        held: AtomicUsize,
+    }
+
+    impl Spillable for OffPoolConsumer {
+        fn spill(&self, target: usize) -> usize {
+            self.spill_calls.fetch_add(1, Ordering::AcqRel);
+            // Frees memory somewhere else in the process; the pool's `used` is untouched.
+            let freed = target.min(self.held.load(Ordering::Acquire));
+            self.held.fetch_sub(freed, Ordering::AcqRel);
+            freed
+        }
+        fn spillable_bytes(&self) -> usize {
+            self.held.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn a_consumer_that_frees_untracked_memory_is_asked_once_and_then_gives_up() {
+        let pool = MemoryPool::new(1000);
+        let _hog = pool.try_reserve(900).unwrap();
+        let off_pool = Arc::new(OffPoolConsumer {
+            spill_calls: AtomicUsize::new(0),
+            held: AtomicUsize::new(1 << 30), // "holding" a gigabyte the pool cannot see
+        });
+        pool.register_consumer(&(Arc::clone(&off_pool) as Arc<dyn Spillable>));
+
+        assert!(
+            pool.try_reserve_cooperative(500).is_err(),
+            "the reservation cannot fit: freeing untracked memory does not free pool credit"
+        );
+        assert_eq!(
+            off_pool.spill_calls.load(Ordering::Acquire),
+            1,
+            "it must be asked exactly once — never zero (no benefit) and never repeatedly \
+             (an unterminating loop over bytes that never reach this pool)"
+        );
+        assert!(
+            off_pool.held.load(Ordering::Acquire) < 1 << 30,
+            "the ask did not reach the consumer"
+        );
+    }
+
     #[test]
     fn cooperative_reserve_spills_the_largest_other_consumer_first() {
         let pool = MemoryPool::new(1000);
@@ -534,6 +751,97 @@ mod tests {
         assert_eq!(pool.pressure(), Pressure::Elevated);
         pool.try_reserve_bytes(150).unwrap(); // 1000 → at hard cap
         assert_eq!(pool.pressure(), Pressure::Critical);
+    }
+
+    /// A consumer that reports freed bytes it never charged to this pool. Its `spill`
+    /// always claims progress, so a termination rule based on what consumers *say* spins
+    /// forever with the pool's `available()` never moving.
+    struct LyingConsumer;
+
+    impl Spillable for LyingConsumer {
+        fn spill(&self, target: usize) -> usize {
+            target // claims to have freed it; releases nothing to the pool
+        }
+        fn spillable_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    #[test]
+    fn cooperative_reserve_terminates_against_a_consumer_that_frees_nothing() {
+        let pool = MemoryPool::new(1000);
+        let liar: Arc<dyn Spillable> = Arc::new(LyingConsumer);
+        pool.register_consumer(&liar);
+        let _held = pool.try_reserve(900).unwrap();
+
+        // Must return rather than spin: progress is measured on the pool, not on the claim.
+        assert!(pool.try_reserve_cooperative(500).is_err());
+        assert!(pool.spill_requests() > 0);
+        assert!(pool.spill_requests() <= MAX_SPILL_ROUNDS * 8);
+    }
+
+    #[test]
+    fn peak_and_denied_record_what_the_workload_actually_did() {
+        let pool = MemoryPool::new(1000);
+        {
+            let _a = pool.try_reserve(400).unwrap();
+            let _b = pool.try_reserve(300).unwrap();
+            assert_eq!(pool.peak_used(), 700);
+        }
+        assert_eq!(pool.used(), 0);
+        assert_eq!(
+            pool.peak_used(),
+            700,
+            "the peak is a lifetime mark, not a live read"
+        );
+
+        assert!(pool.try_reserve(2000).is_err());
+        assert_eq!(pool.denied(), 1);
+
+        let stats = pool.stats();
+        assert_eq!(stats.limit, 1000);
+        assert_eq!(stats.peak_used, 700);
+        assert_eq!(stats.denied, 1);
+        assert!((stats.peak_utilization() - 0.7).abs() < 1e-9);
+        assert_eq!(stats.utilization(), 0.0);
+    }
+
+    #[test]
+    fn zero_limit_pool_stats_read_as_full_not_empty() {
+        let stats = MemoryPool::new(0).stats();
+        assert_eq!(stats.utilization(), 1.0);
+        assert_eq!(stats.peak_utilization(), 1.0);
+    }
+
+    #[test]
+    fn try_resize_grows_and_shrinks_in_one_step() {
+        let pool = MemoryPool::new(1000);
+        let mut r = pool.try_reserve(100).unwrap();
+
+        r.try_resize(600).unwrap();
+        assert_eq!(r.size(), 600);
+        assert_eq!(pool.used(), 600);
+
+        r.try_resize(200).unwrap();
+        assert_eq!(r.size(), 200);
+        assert_eq!(pool.used(), 200);
+
+        // A refused growth leaves the reservation exactly as it was.
+        assert!(r.try_resize(5000).is_err());
+        assert_eq!(r.size(), 200);
+        assert_eq!(pool.used(), 200);
+
+        r.try_resize(0).unwrap();
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn pressure_levels_are_ordered() {
+        assert!(Pressure::Critical > Pressure::Elevated);
+        assert!(Pressure::Elevated > Pressure::Nominal);
+        let pool = MemoryPool::new(1000);
+        let _held = pool.try_reserve(850).unwrap();
+        assert!(pool.pressure() >= Pressure::Elevated);
     }
 
     #[test]

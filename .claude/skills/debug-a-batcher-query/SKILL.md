@@ -16,7 +16,8 @@ First, three facts that save an hour:
 - `ds.profile()` is a **data-quality column profiler** (null counts, approx distinct) —
   it is *not* a performance profiler. The measurement tools are `ds.explain(analyze=True)`
   and `ds.stats()`.
-- Confirm you are on a release build. A debug build is ~10x slower and can look like a hang.
+- Confirm you are on a release build: `bt.versions()["engine_profile"]`. A debug build is
+  ~10x slower and can look like a hang. Rebuild with `just build-release`.
 
 ## A. It raises
 

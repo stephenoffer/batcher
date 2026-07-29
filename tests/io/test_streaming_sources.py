@@ -246,9 +246,49 @@ def test_broker_backs_off_on_empty_polls(monkeypatch):
     out = list(_EmptyThenData().iter_batches())
     assert len(out) == 2  # the two non-empty polls yielded a batch each
     # First idle streak grows geometrically; after real data the back-off resets to the floor.
-    assert sleeps[:3] == [0.01, 0.02, 0.04]
-    assert sleeps[3] == 0.01  # reset after the batch at poll 4
+    # Each nap is the back-off *minus how long the poll itself already blocked*, so an
+    # instant-return poll like this one sleeps just under the nominal step.
+    assert [round(s, 3) for s in sleeps[:3]] == [0.01, 0.02, 0.04]
+    assert round(sleeps[3], 3) == 0.01  # reset after the batch at poll 4
     assert max(sleeps) <= 0.25  # capped
+
+
+def test_broker_back_off_is_discounted_by_a_poll_that_already_blocked(monkeypatch):
+    """A broker whose `_poll` blocks longer than the back-off must not sleep on top of it.
+
+    The back-off exists to stop a fast-returning `_poll` spinning a core. A blocking `_poll`
+    (Kafka waits up to `poll_timeout` for its first record) already rests, and charging it the
+    nap as well added up to 250ms of pure latency to the first record after an idle stretch.
+    """
+    import time
+
+    from batcher.io.formats.streaming.broker import BrokerSource
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    class _SlowIdleBroker(BrokerSource):
+        format_name = "slow_idle"
+        __slots__ = ("_calls",)
+
+        def __init__(self):
+            super().__init__("t", poll_size=5)
+            self._calls = 0
+
+        def _discover_partitions(self):
+            return [0]
+
+        def _poll(self):
+            self._calls += 1
+            if self._calls > 4:
+                return None
+            clock["now"] += 1.0  # each poll blocks a full second before coming back empty
+            return []
+
+    assert list(_SlowIdleBroker().iter_batches()) == []
+    assert sleeps == []  # every nap was fully covered by the poll's own wait
 
 
 class _BoundedTestBroker(BrokerSource):

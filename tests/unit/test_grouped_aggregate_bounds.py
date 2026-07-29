@@ -68,3 +68,31 @@ def test_the_group_key_still_carries_its_exact_bounds():
     cols = grouped_aggregate_columns(_agg("max"), _child())
     assert (cols["k"].min, cols["k"].max) == (1, 9)
     assert cols["k"].provenance is Provenance.EXACT
+
+
+def test_a_counting_bound_is_published_only_when_the_input_count_is_exact():
+    """An estimated `|child|` is not an upper bound on a group's size, so it must not be one.
+
+    `min`/`max` survive a downgraded provenance as valid *bounds* — a filtered column may no
+    longer attain its extremes, but they still enclose it. The counting upper bound is the
+    exception: it is `|child|` itself, and an *estimate* of `|child|` can be smaller than the
+    truth. A too-small upper bound is not conservative, it is wrong.
+
+    It reaches results because `zonemap_prune_filter` folds a `HAVING count(*) > n` whose
+    bound cannot reach `n` into the empty relation. Publishing an estimate therefore turned a
+    learned row count into missing rows: once a selective query taught the metadata hub that a
+    scan yields ~1 row, an unrelated `GROUP BY ... HAVING count(*) > 6` over the same source
+    with a *different* predicate returned nothing at all — and a later, less selective query
+    silently restored the right answer.
+    """
+    estimated_child = RelStats(
+        1000.0,
+        Provenance.LEARNED,
+        {"k": ColumnStat(min=1, max=9, provenance=Provenance.EXACT)},
+    )
+    cols = grouped_aggregate_columns(_agg("count_star"), estimated_child)
+    assert cols["out"].max is None, "an estimated row count must not become an upper bound"
+    assert cols["out"].min == 1, "the lower bound holds regardless — a group has a row"
+
+    # ...while an exactly-known input still yields the bound the rule is there to use.
+    assert grouped_aggregate_columns(_agg("count_star"), _child())["out"].max == 1000

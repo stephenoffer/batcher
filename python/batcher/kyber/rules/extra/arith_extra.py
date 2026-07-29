@@ -59,6 +59,7 @@ from batcher.kyber.pass_base import OptimizerContext
 # wrong way to share between rule families.
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.arith_algebra import _is_int_lit
 from batcher.kyber.rules.extra.boolean_algebra import _key, _rewrite_node, _safe
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit
@@ -91,9 +92,15 @@ _INT64_MIN = -(2**63)
 # Unary math functions that are their own fixpoint: `f(f(x)) == f(x)` for every input,
 # NaN and ±inf included. `abs`/`sign` by definition; the four rounding functions because
 # their output is integral and each is the identity on an integral value.
-_IDEMPOTENT_MATH = frozenset({"abs", "sign", "floor", "ceil", "trunc", "round"})
+# `rint` (round-half-to-even) belongs with the other rounding functions in all three of the
+# roles these sets play: it is its own fixpoint on an integral value, it is the identity on
+# the integral result of any of its siblings, and over an *integer* literal it is the
+# engine's int→f64 promotion and nothing more. `even` is deliberately absent — it rounds
+# away from zero to the next *even* integer (`even(5)` is 6), so it is idempotent but is not
+# the identity on an integral value and does not fold to a plain promotion.
+_IDEMPOTENT_MATH = frozenset({"abs", "sign", "floor", "ceil", "trunc", "round", "rint"})
 # The rounding family — each maps any float to an integral float (or NaN/±inf).
-_ROUNDING = frozenset({"floor", "ceil", "trunc", "round"})
+_ROUNDING = frozenset({"floor", "ceil", "trunc", "round", "rint"})
 # Unary math functions whose value over an *integer* literal is exactly computable here.
 _FOLDABLE_MATH = _IDEMPOTENT_MATH | {"sqrt"}
 # The bitwise logic ops (associative/commutative, and closed over i64). Each is also
@@ -109,9 +116,8 @@ _SHIFTS = frozenset({"shift_left", "shift_right"})
 _NUMERIC = (pa.int64(), pa.float64())
 
 
-def _schema(node: LogicalPlan) -> SchemaRef | None:
-    """The input schema that types `node`'s expressions (`None` when unknown)."""
-    return node.input.available_schema()
+#: What `schema_rule` pre-checks a node for before threading its schema through.
+_CARRIES = (Binary, MathExpr)
 
 
 def _is_int64(expr: Expr, schema: SchemaRef | None) -> bool:
@@ -149,7 +155,14 @@ def _abs_of_negation(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="abs_of_negation", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="abs_of_negation",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(MathExpr,),
+    expr_ops=("abs",),
+    expr_schema=_abs_of_negation,
+)
 def abs_of_negation(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`abs(-x) → abs(x)` (the negation lowers to `0 - x`), for an Int64/Float64 `x`.
 
@@ -161,8 +174,7 @@ def abs_of_negation(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | 
     would promote to Float64 through the subtraction, so dropping it would *narrow* the
     result. NULL propagates identically on both sides; one kernel pass instead of two.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _abs_of_negation(e, schema))
+    return schema_rule(node, _abs_of_negation, carries=_CARRIES)
 
 
 def _collapse_idempotent(expr: Expr) -> Expr:
@@ -181,6 +193,7 @@ def _collapse_idempotent(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=_NODES,
     expr=_collapse_idempotent,
+    expr_matches=(MathExpr,),
 )
 def collapse_idempotent_math_fn(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`f(f(x)) → f(x)` for the idempotent unary math functions — `abs`, `sign`, `floor`,
@@ -214,6 +227,7 @@ def _collapse_nested_rounding(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=_NODES,
     expr=_collapse_nested_rounding,
+    expr_matches=(MathExpr,),
 )
 def collapse_nested_rounding(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop the outer of two *different* nested rounding functions: `floor(round(x))` →
@@ -236,7 +250,14 @@ def _rounding_of_int(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="rounding_of_int_is_cast", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="rounding_of_int_is_cast",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(MathExpr,),
+    expr_ops=tuple(sorted(_ROUNDING)),
+    expr_schema=_rounding_of_int,
+)
 def rounding_of_int_is_cast(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`floor(i) / ceil(i) / trunc(i) / round(i)` over an **Int64** expression → `cast(i,
     float64)` — the cast the engine was going to do anyway, with the now-pointless math
@@ -250,8 +271,7 @@ def rounding_of_int_is_cast(node: LogicalPlan, _ctx: OptimizerContext) -> Logica
     produce it), and nulls propagate through the cast exactly as through the kernel. Fires
     only on a provably Int64 operand — over a float, rounding is real work.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _rounding_of_int(e, schema))
+    return schema_rule(node, _rounding_of_int, carries=_CARRIES)
 
 
 # --- literal folding (the engine's kernels, evaluated at plan time) ----------
@@ -290,6 +310,7 @@ def _fold_math_lit(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=_NODES,
     expr=_fold_math_lit,
+    expr_matches=(MathExpr,),
 )
 def fold_math_of_int_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Evaluate a unary math function over an **integer literal** at plan time: `abs(-5)` →
@@ -327,6 +348,8 @@ def _fold_bitwise(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=_NODES,
     expr=_fold_bitwise,
+    expr_matches=(Binary,),
+    expr_ops=tuple(sorted(_BITWISE_LOGIC)),
 )
 def fold_bitwise_literals(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold `bit_and` / `bit_or` / `bit_xor` over two integer literals: `6 & 3` → `2`.
@@ -362,7 +385,36 @@ def _drop_neutral(
     return expr
 
 
-@rule(name="bit_or_zero", phase=Phase.NORMALIZE, matches=_NODES)
+# --- the schema leaves, named so the registrations below can declare them ----------------
+# Declaring the leaf lets the driver run these inside the single expression traversal it
+# already makes per node, instead of each rule walking every expression itself.
+
+
+def _bit_or_zero_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
+    return _drop_neutral(expr, schema, _BIT_OR, 0, commutes=True)
+
+
+def _bit_xor_zero_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
+    return _drop_neutral(expr, schema, _BIT_XOR, 0, commutes=True)
+
+
+def _bit_and_minus_one_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
+    return _drop_neutral(expr, schema, _BIT_AND, -1, commutes=True)
+
+
+def _shift_by_zero_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
+    return _drop_neutral(expr, schema, _SHIFTS, 0, commutes=False)
+
+
+def _bit_and_self_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
+    return _self_bitwise(expr, schema, "bit_and")
+
+
+def _bit_or_self_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
+    return _self_bitwise(expr, schema, "bit_or")
+
+
+@rule(name="bit_or_zero", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_or_zero_leaf)
 def bit_or_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x | 0 → x` (and `0 | x → x`) for an Int64 `x`. Zero is OR's identity element in
     every bit position, and the kernel propagates nulls, so a null `x` is null on both
@@ -371,11 +423,10 @@ def bit_or_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None
     Float64 column, `f | 0` is an Int64 expression, and dropping the `| 0` would hand back
     a Float64 one.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_neutral(e, schema, _BIT_OR, 0, commutes=True))
+    return schema_rule(node, _bit_or_zero_leaf, carries=_CARRIES)
 
 
-@rule(name="bit_xor_zero", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(name="bit_xor_zero", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_xor_zero_leaf)
 def bit_xor_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x ^ 0 → x` (and `0 ^ x → x`) for an Int64 `x`. XOR with an all-zero pattern flips
     no bit, and nulls propagate through the kernel, so the operand survives unchanged in
@@ -383,30 +434,32 @@ def bit_xor_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | Non
     sibling `x ^ x → 0` is *not* implemented: it is false for a null `x` (`NULL ^ NULL` is
     NULL, not 0).
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_neutral(e, schema, _BIT_XOR, 0, commutes=True))
+    return schema_rule(node, _bit_xor_zero_leaf, carries=_CARRIES)
 
 
-@rule(name="bit_and_minus_one", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="bit_and_minus_one",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_schema=_bit_and_minus_one_leaf,
+)
 def bit_and_minus_one(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x & -1 → x` (and `-1 & x → x`) for an Int64 `x`. In two's complement `-1` is the
     all-ones mask — AND's identity element — so every bit of `x` survives, and a null `x`
     stays null through the kernel. Gated on a provably Int64 `x` (the kernels cast to
     Int64). The companion `x & 0 → 0` is refused: it would turn a NULL into a zero.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_neutral(e, schema, _BIT_AND, -1, commutes=True))
+    return schema_rule(node, _bit_and_minus_one_leaf, carries=_CARRIES)
 
 
-@rule(name="shift_by_zero", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(name="shift_by_zero", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_shift_by_zero_leaf)
 def shift_by_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x << 0 → x` and `x >> 0 → x` for an Int64 `x`. A zero-bit shift moves nothing, in
     either direction and at either sign, and the kernel propagates nulls. Not commutative
     (only a zero *shift count* qualifies — `0 << x` is a real computation), and gated on a
     provably Int64 `x`, since the shift kernels cast their operands to Int64.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_neutral(e, schema, _SHIFTS, 0, commutes=False))
+    return schema_rule(node, _shift_by_zero_leaf, carries=_CARRIES)
 
 
 def _self_bitwise(expr: Expr, schema: SchemaRef | None, op: str) -> Expr:
@@ -421,7 +474,7 @@ def _self_bitwise(expr: Expr, schema: SchemaRef | None, op: str) -> Expr:
     return expr
 
 
-@rule(name="bit_and_self", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(name="bit_and_self", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_and_self_leaf)
 def bit_and_self(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x & x → x` for an Int64 `x`. Bitwise AND is idempotent in every bit position, and
     the kernel's null propagation agrees (`NULL & NULL` is NULL, which is what a lone
@@ -430,15 +483,13 @@ def bit_and_self(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | Non
     into one changes neither the value nor whether the query errors; and `x` must be
     provably Int64, since the kernel casts its operands there.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _self_bitwise(e, schema, "bit_and"))
+    return schema_rule(node, _bit_and_self_leaf, carries=_CARRIES)
 
 
-@rule(name="bit_or_self", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(name="bit_or_self", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_or_self_leaf)
 def bit_or_self(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x | x → x` for an Int64 `x` — the dual of `bit_and_self`, with the same proof:
     bitwise OR is idempotent bit by bit, `NULL | NULL` is NULL, the dropped copy must be
     `_safe`, and the operand must be provably Int64 (the kernel casts to Int64).
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _self_bitwise(e, schema, "bit_or"))
+    return schema_rule(node, _bit_or_self_leaf, carries=_CARRIES)

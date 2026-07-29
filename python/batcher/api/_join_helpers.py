@@ -6,12 +6,16 @@ here to keep `dataset.py` focused on the public `Dataset` surface.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir import Col, Expr, Lit
+from batcher.plan.expr_ir import Col, Expr
+from batcher.plan.expr_ir.core import _wrap
 from batcher.plan.logical import JoinOutputCol, empty_result_schema
 from batcher.plan.schema import placeholder_schema
+
+if TYPE_CHECKING:
+    from batcher.api.dataset.frame import Dataset
 
 __all__ = [
     "_as_expr",
@@ -25,7 +29,16 @@ __all__ = [
 
 
 def _as_expr(value: Any) -> Expr:
-    return value if isinstance(value, Expr) else Lit(value)
+    """Coerce a `select`/`with_columns` value to an `Expr`, lifting a scalar to `Lit`.
+
+    Delegates to `plan.expr_ir`'s `_wrap` rather than re-deciding, because the two
+    disagreed: `_wrap` passes an `AggExpr` through (it is not an `Expr`, but it is a
+    legal leaf of one), while this lifted it into ``Lit(AggExpr)``. A bare
+    ``select(s=col("x").sum())`` therefore skipped both aggregate-misuse guards and
+    failed much later inside the optimizer with ``TypeError: unsupported literal type:
+    AggExpr``. Passing it through reaches `AggExpr.to_ir`, which names the real mistake.
+    """
+    return _wrap(value)
 
 
 def _as_key_expr(value: str | Expr) -> Expr:
@@ -71,6 +84,11 @@ def _join_output(
 
     out: list[JoinOutputCol] = []
     used: set[str] = set()
+    # The two "is this column a join key?" tests below run once per column of each side,
+    # against key lists — a linear scan each, so a multi-key join over a wide relation
+    # paid columns x keys comparisons to build a column list.
+    left_key_set = set(left_keys)
+    right_key_set = set(right_keys)
 
     if how == "full":
         # In a full outer join a key is null on whichever side didn't match, so
@@ -89,13 +107,13 @@ def _join_output(
             used.add(out_name)
 
     for c in left_cols:
-        if c in left_keys:
+        if c in left_key_set:
             continue
         out.append(JoinOutputCol("left", c, c))
         used.add(c)
 
     for c in right_cols:
-        if c in right_keys:
+        if c in right_key_set:
             continue
         alias = c if c not in used else f"{c}{suffix}"
         out.append(JoinOutputCol("right", c, alias))
@@ -145,3 +163,50 @@ def _broadcast(flag: bool | list[bool], n: int, name: str) -> list[bool]:
 # here under their original private names to keep this module's callers unchanged.
 _empty_schema = placeholder_schema
 _empty_result_schema = empty_result_schema
+
+
+def range_semi_join(
+    left: Dataset,
+    right: Dataset,
+    conditions: list[tuple[str, str, str]],
+    *,
+    negate: bool,
+) -> Dataset:
+    """Semi (or anti) join two datasets on a single **inequality**.
+
+    `SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE a.x < b.y)` is exactly
+    ``a SEMI JOIN b ON a.x < b.y``, and `NOT EXISTS` is the anti join. Before this the SQL
+    front-end raised `NotImplementedError: correlated subqueries not supported` for the
+    shape — only *equality*-correlated `EXISTS` decorrelated — so a query DuckDB answers had
+    no plan at all here.
+
+    It is a thin wrapper because the work was already done elsewhere: `RangeJoin` carries a
+    `join_type`, and `bc_runtime::join::range_join_indices` implements `Semi` and `Anti` and
+    is fuzzed against a brute-force cross-product oracle for both. This is the first caller
+    to emit a `RangeJoin` that is not an inner join.
+
+    Args:
+        left: The outer relation, whose rows are kept or dropped.
+        right: The subquery relation, used only as a membership test.
+        conditions: One or two `(left_key, right_key, op)` inequalities, each oriented
+            ``left_key OP right_key``. Two is the engine's ceiling (IEJoin sorts on two
+            axes) and covers the interval shape, ``a.lo < b.y AND b.y < a.hi``.
+        negate: `True` for `NOT EXISTS` (an anti join), `False` for `EXISTS`.
+
+    Returns:
+        A new `Dataset` carrying only `left`'s columns.
+    """
+    from batcher.api.dataset.frame import Dataset
+    from batcher.plan.logical import RangeCondition, RangeJoin, remap_sources
+
+    offset = len(left._sources)
+    right_plan = remap_sources(right._plan, offset)
+    output = tuple(JoinOutputCol("left", c, c) for c in left.columns)
+    node = RangeJoin(
+        left._plan,
+        right_plan,
+        tuple(RangeCondition(lk, rk, op) for lk, rk, op in conditions),
+        "anti" if negate else "semi",
+        output,
+    )
+    return Dataset(node, left._sources + right._sources)

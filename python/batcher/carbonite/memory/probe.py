@@ -6,8 +6,10 @@ is lower. `memory.current` is not usage, because it counts reclaimable page cach
 free figure `psutil` reports is the *machine's*, not the container's.
 
 Each answer is cached at the lifetime it is stable for: host RAM and the cgroup cap cannot
-change for the process, so both are memoized; the live available reading is re-sampled on a
-short TTL; the current charge is read fresh every time.
+change for the process, so both are memoized; the live available reading and the reclaimable
+page-cache term are re-sampled on a short (50 ms) TTL; the cgroup's raw charge — the figure
+the OOM-killer acts on — is re-read on a 1 ms window, wide enough only to let the components
+deciding about one query share a read and far too narrow to hide a real change.
 
 Separated from `pressure` so the classification ladder there reads as policy, with the OS
 archaeology it rests on in one place beneath it.
@@ -23,6 +25,7 @@ from batcher._internal.hardware import cgroup_v2_dirs, read_cgroup_bytes
 from batcher.config import active_config
 
 __all__ = [
+    "ROUND_COALESCE_SECONDS",
     "SAMPLE_TTL_SECONDS",
     "available_bytes",
     "cap_to_cgroup_headroom",
@@ -55,13 +58,35 @@ _host_ram_bytes: int | None = None
 # Single-slot TTL cache for the live available-bytes reading: `(monotonic_deadline, value)`.
 _available_cache: tuple[float, int] | None = None
 
+# Single-slot TTL cache for the cgroup page-cache term, on the same window and for the same
+# reason: `(monotonic_deadline, value)`. See `_cgroup_file_cache_bytes`.
+_file_cache_cache: tuple[float, int] | None = None
+
+# How long the *raw* cgroup charge is reused. Two orders of magnitude below
+# `SAMPLE_TTL_SECONDS`, because this is not a sampling window: it is only wide enough to
+# let the components deciding about one query share a single read. See `_cgroup_total_bytes`.
+ROUND_COALESCE_SECONDS = 0.001
+
+# Single-slot coalescing cache for the raw charge: `(monotonic_deadline, value)`.
+_total_cache: tuple[float, int | None] | None = None
+
 
 def reset_memory_sampling() -> None:
-    """Drop the memoized host RAM and the live-reading TTL cache. For tests that
-    patch the underlying OS readers and need the next sample to re-read them."""
-    global _host_ram_bytes, _available_cache
+    """Drop every memoized memory reading, so the next sample re-reads the OS.
+
+    For tests that patch the underlying OS readers. This must clear the **cgroup cap**
+    too: it is the one figure memoized with `functools.lru_cache`, so a reset that only
+    cleared the module globals left `cgroup_limit_bytes` pinned to whatever the first
+    test in the process observed. Since `total_memory_bytes` takes the min of host RAM
+    and that cap, a stale cap silently overrode every later patch — the reset appeared to
+    work while the number it was supposed to refresh never moved.
+    """
+    global _host_ram_bytes, _available_cache, _file_cache_cache, _total_cache
     _host_ram_bytes = None
     _available_cache = None
+    _file_cache_cache = None
+    _total_cache = None
+    cgroup_limit_bytes.cache_clear()
 
 
 @functools.lru_cache(maxsize=1)
@@ -91,7 +116,29 @@ def cgroup_limit_bytes() -> int | None:
 
 
 def _cgroup_file_cache_bytes() -> int:
-    """Page cache charged to this cgroup — `file` (v2) or `total_cache` (v1); 0 if unknown."""
+    """Page cache charged to this cgroup — `file` (v2) or `total_cache` (v1); 0 if unknown.
+
+    Re-sampled on `SAMPLE_TTL_SECONDS`, the same window `available_bytes` uses, because
+    reading it means opening and line-scanning `memory.stat` (~50 fields) and the two
+    readers that want a pressure level — morsel sizing and the spill gate — ask on every
+    terminal op. Only the *subtracted* term is windowed: `memory.current` itself, the
+    number the OOM-killer acts on, is still read fresh on every call, so the safety-critical
+    signal keeps full resolution. A stale cache figure can only shift the reported usage by
+    however much reclaimable cache moved inside one 50 ms window, and cache is by
+    definition the part the kernel gives back before anything is killed.
+    """
+    global _file_cache_cache
+
+    now = time.monotonic()
+    if _file_cache_cache is not None and now < _file_cache_cache[0]:
+        return _file_cache_cache[1]
+    value = _read_cgroup_file_cache_bytes()
+    _file_cache_cache = (now + SAMPLE_TTL_SECONDS, value)
+    return value
+
+
+def _read_cgroup_file_cache_bytes() -> int:
+    """The uncached `memory.stat` read behind `_cgroup_file_cache_bytes`."""
     for path, key in (
         ("/sys/fs/cgroup/memory.stat", "file"),
         ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
@@ -140,12 +187,26 @@ def _cgroup_total_bytes() -> int | None:
     """The raw cgroup charge, anonymous **and** cached — `memory.current` / `usage_in_bytes`.
 
     Not a pressure signal on its own; see `cgroup_current_bytes`.
+
+    Coalesced over `ROUND_COALESCE_SECONDS`. This is deliberately *not* the 50 ms sampling
+    window the available-bytes reading uses: it exists only so the several components that
+    each ask for the pressure level while making decisions about the *same* query — morsel
+    sizing and the spill gate, microseconds apart — read the file once between them instead
+    of once each. At a millisecond the reading is still fresh by every timescale a memory
+    decision reacts on, and nothing can allocate enough to change the verdict inside it.
     """
+    global _total_cache
+
+    now = time.monotonic()
+    if _total_cache is not None and now < _total_cache[0]:
+        return _total_cache[1]
+    value: int | None = None
     for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
         value = read_cgroup_bytes(path)
         if value is not None:
-            return value
-    return None
+            break
+    _total_cache = (now + ROUND_COALESCE_SECONDS, value)
+    return value
 
 
 def cap_to_cgroup_headroom(host_available: int) -> int:
@@ -172,14 +233,35 @@ def process_rss_bytes() -> int | None:
     """This process's resident set size (RSS) via `psutil`, or `None` without it.
 
     RSS captures the engine's true footprint — the Flight `PartitionStore`, pyarrow
-    buffers, everything — not just the buffer pool's accounted reservations."""
+    buffers, everything — not just the buffer pool's accounted reservations. Falls back
+    to `/proc/self/statm` on Linux, so a container without the optional dependency still
+    gets a real footprint reading rather than losing the safety-critical half of
+    `_engine_used_fraction` (which then cannot see anything the pool does not account).
+
+    Returns:
+        Resident bytes, or `None` when no reader is available.
+    """
     try:
         import psutil
     except ImportError:
-        return None
+        return _proc_statm_rss_bytes()
     try:
         return int(psutil.Process().memory_info().rss)
-    except Exception:
+    except (OSError, ValueError, AttributeError):
+        return _proc_statm_rss_bytes()
+
+
+def _proc_statm_rss_bytes() -> int | None:
+    """RSS from `/proc/self/statm` (Linux), in bytes, or `None` if unreadable.
+
+    Field two of `statm` is the resident set in pages. It costs one small read and needs
+    no dependency, which is exactly the situation the psutil-less container is in.
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
 
 

@@ -1,0 +1,411 @@
+% Bibliography for the Batcher paper.
+%
+% Every entry below is a work the authors have read or used directly. Entries
+% carrying a "% VERIFY" comment have a field (usually page numbers, a volume, or
+% an exact venue name) that was written from memory and MUST be checked against
+% the publisher record before submission. No entry here is a placeholder for a
+% work that does not exist.
+
+% ---------------------------------------------------------------------------
+% Vectorized and compiled execution
+% ---------------------------------------------------------------------------
+
+@inproceedings{boncz2005monetdb,
+  author    = {Boncz, Peter A. and Zukowski, Marcin and Nes, Niels},
+  title     = {{MonetDB/X100}: Hyper-Pipelining Query Execution},
+  booktitle = {Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2005}
+}
+
+@article{neumann2011compiling,
+  author  = {Neumann, Thomas},
+  title   = {Efficiently Compiling Efficient Query Plans for Modern Hardware},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {4},
+  number  = {9},
+  pages   = {539--550},
+  year    = {2011}
+}
+
+@inproceedings{leis2014morsel,
+  author    = {Leis, Viktor and Boncz, Peter and Kemper, Alfons and Neumann, Thomas},
+  title     = {Morsel-Driven Parallelism: A {NUMA}-Aware Query Evaluation Framework
+               for the Many-Core Age},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2014}
+}
+
+@article{graefe1994volcano,
+  author  = {Graefe, Goetz},
+  title   = {Volcano---An Extensible and Parallel Query Evaluation System},
+  journal = {IEEE Transactions on Knowledge and Data Engineering},
+  volume  = {6},
+  number  = {1},
+  pages   = {120--135},
+  year    = {1994}
+}
+
+@inproceedings{neumann2020umbra,
+  author    = {Neumann, Thomas and Freitag, Michael},
+  title     = {{Umbra}: A Disk-Based System with In-Memory Performance},
+  booktitle = {Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2020}
+}
+
+@inproceedings{raasveldt2019duckdb,
+  author    = {Raasveldt, Mark and M{\"u}hleisen, Hannes},
+  title     = {{DuckDB}: An Embeddable Analytical Database},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  note      = {Demonstration},
+  year      = {2019}
+}
+
+@inproceedings{balkesen2013mainmemory,
+  author    = {Balkesen, Cagri and Teubner, Jens and Alonso, Gustavo and
+               {\"O}zsu, M. Tamer},
+  title     = {Main-Memory Hash Joins on Multi-Core {CPUs}: Tuning to the Underlying
+               Hardware},
+  booktitle = {IEEE International Conference on Data Engineering (ICDE)},
+  year      = {2013}
+}
+
+% ---------------------------------------------------------------------------
+% Distributed dataflow and streaming
+% ---------------------------------------------------------------------------
+
+@inproceedings{zaharia2012rdd,
+  author    = {Zaharia, Matei and Chowdhury, Mosharaf and Das, Tathagata and
+               Dave, Ankur and Ma, Justin and McCauley, Murphy and
+               Franklin, Michael J. and Shenker, Scott and Stoica, Ion},
+  title     = {Resilient Distributed Datasets: A Fault-Tolerant Abstraction for
+               In-Memory Cluster Computing},
+  booktitle = {USENIX Symposium on Networked Systems Design and Implementation (NSDI)},
+  year      = {2012}
+}
+
+@inproceedings{armbrust2015sparksql,
+  author    = {Armbrust, Michael and Xin, Reynold S. and Lian, Cheng and
+               Huai, Yin and Liu, Davies and Bradley, Joseph K. and
+               Meng, Xiangrui and Kaftan, Tomer and Franklin, Michael J. and
+               Ghodsi, Ali and Zaharia, Matei},
+  title     = {{Spark SQL}: Relational Data Processing in {Spark}},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2015}
+}
+
+@inproceedings{zaharia2013dstreams,
+  author    = {Zaharia, Matei and Das, Tathagata and Li, Haoyuan and
+               Hunter, Timothy and Shenker, Scott and Stoica, Ion},
+  title     = {Discretized Streams: Fault-Tolerant Streaming Computation at Scale},
+  booktitle = {ACM Symposium on Operating Systems Principles (SOSP)},
+  year      = {2013}
+}
+
+@article{carbone2015flink,
+  author  = {Carbone, Paris and Katsifodimos, Asterios and Ewen, Stephan and
+             Markl, Volker and Haridi, Seif and Tzoumas, Kostas},
+  title   = {Apache {Flink}: Stream and Batch Processing in a Single Engine},
+  journal = {IEEE Data Engineering Bulletin},
+  volume  = {38},
+  number  = {4},
+  year    = {2015}
+}
+
+@inproceedings{moritz2018ray,
+  author    = {Moritz, Philipp and Nishihara, Robert and Wang, Stephanie and
+               Tumanov, Alexey and Liaw, Richard and Liang, Eric and
+               Elibol, Melih and Yang, Zongheng and Paul, William and
+               Jordan, Michael I. and Stoica, Ion},
+  title     = {{Ray}: A Distributed Framework for Emerging {AI} Applications},
+  booktitle = {USENIX Symposium on Operating Systems Design and Implementation (OSDI)},
+  year      = {2018}
+}
+
+% ---------------------------------------------------------------------------
+% Query optimization: classical, adaptive, learned
+% ---------------------------------------------------------------------------
+
+@inproceedings{selinger1979access,
+  author    = {Selinger, P. Griffiths and Astrahan, M. M. and Chamberlin, D. D. and
+               Lorie, R. A. and Price, T. G.},
+  title     = {Access Path Selection in a Relational Database Management System},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {1979}
+}
+
+@inproceedings{kabra1998midquery,
+  author    = {Kabra, Navin and DeWitt, David J.},
+  title     = {Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {1998}
+}
+
+@inproceedings{avnur2000eddies,
+  author    = {Avnur, Ron and Hellerstein, Joseph M.},
+  title     = {Eddies: Continuously Adaptive Query Processing},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2000}
+}
+
+@inproceedings{markl2004progressive,
+  author    = {Markl, Volker and Raman, Vijayshankar and Simmen, David and
+               Lohman, Guy and Pirahesh, Hamid and Cilimdzic, Miso},
+  title     = {Robust Query Processing through Progressive Optimization},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2004}
+}
+
+@article{deshpande2007adaptive,
+  author  = {Deshpande, Amol and Ives, Zachary and Raman, Vijayshankar},
+  title   = {Adaptive Query Processing},
+  journal = {Foundations and Trends in Databases},
+  volume  = {1},
+  number  = {1},
+  pages   = {1--140},
+  year    = {2007}
+}
+
+@article{marcus2019neo,
+  author  = {Marcus, Ryan and Negi, Parimarjan and Mao, Hongzi and Zhang, Chi and
+             Alizadeh, Mohammad and Kraska, Tim and Papaemmanouil, Olga and
+             Tatbul, Nesime},
+  title   = {{Neo}: A Learned Query Optimizer},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {12},
+  number  = {11},
+  year    = {2019}
+}
+
+@inproceedings{marcus2021bao,
+  author    = {Marcus, Ryan and Negi, Parimarjan and Mao, Hongzi and
+               Tatbul, Nesime and Alizadeh, Mohammad and Kraska, Tim},
+  title     = {{Bao}: Making Learned Query Optimization Practical},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2021}
+}
+
+@inproceedings{kipf2019learned,
+  author    = {Kipf, Andreas and Kipf, Thomas and Radke, Bernhard and
+               Leis, Viktor and Boncz, Peter and Kemper, Alfons},
+  title     = {Learned Cardinalities: Estimating Correlated Joins with Deep Learning},
+  booktitle = {Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2019}
+}
+
+@article{leis2015goodjoin,
+  author  = {Leis, Viktor and Gubichev, Andrey and Mirchev, Atanas and
+             Boncz, Peter and Kemper, Alfons and Neumann, Thomas},
+  title   = {How Good Are Query Optimizers, Really?},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {9},
+  number  = {3},
+  pages   = {204--215},
+  year    = {2015}
+}
+
+% ---------------------------------------------------------------------------
+% Operators, sketches, and primitives
+% ---------------------------------------------------------------------------
+
+@article{khayyat2015iejoin,
+  author  = {Khayyat, Zuhair and Lucia, William and Singh, Meghna and
+             Ouzzani, Mourad and Papotti, Paolo and Quian{\'e}-Ruiz, Jorge-Arnulfo and
+             Tang, Nan and Kalnis, Panos},
+  title   = {Lightning Fast and Space Efficient Inequality Joins},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {8},
+  number  = {13},
+  year    = {2015}
+}
+
+@inproceedings{flajolet2007hyperloglog,
+  author    = {Flajolet, Philippe and Fusy, {\'E}ric and Gandouet, Olivier and
+               Meunier, Fr{\'e}d{\'e}ric},
+  title     = {{HyperLogLog}: The Analysis of a Near-Optimal Cardinality Estimation
+               Algorithm},
+  booktitle = {Conference on Analysis of Algorithms (AofA)},
+  year      = {2007}
+}
+
+@inproceedings{karnin2016kll,
+  author    = {Karnin, Zohar and Lang, Kevin and Liberty, Edo},
+  title     = {Optimal Quantile Approximation in Streams},
+  booktitle = {IEEE Symposium on Foundations of Computer Science (FOCS)},
+  year      = {2016}
+}
+
+@article{cormode2005countmin,
+  author  = {Cormode, Graham and Muthukrishnan, S.},
+  title   = {An Improved Data Stream Summary: The Count-Min Sketch and Its Applications},
+  journal = {Journal of Algorithms},
+  volume  = {55},
+  number  = {1},
+  pages   = {58--75},
+  year    = {2005}
+}
+
+@article{bloom1970,
+  author  = {Bloom, Burton H.},
+  title   = {Space/Time Trade-offs in Hash Coding with Allowable Errors},
+  journal = {Communications of the ACM},
+  volume  = {13},
+  number  = {7},
+  pages   = {422--426},
+  year    = {1970}
+}
+
+@article{auer2002ucb,
+  author  = {Auer, Peter and Cesa-Bianchi, Nicol{\`o} and Fischer, Paul},
+  title   = {Finite-Time Analysis of the Multiarmed Bandit Problem},
+  journal = {Machine Learning},
+  volume  = {47},
+  number  = {2--3},
+  pages   = {235--256},
+  year    = {2002}
+}
+
+@article{luby1988feistel,
+  author  = {Luby, Michael and Rackoff, Charles},
+  title   = {How to Construct Pseudorandom Permutations from Pseudorandom Functions},
+  journal = {SIAM Journal on Computing},
+  volume  = {17},
+  number  = {2},
+  pages   = {373--386},
+  year    = {1988}
+}
+
+@inproceedings{black2002ciphers,
+  author    = {Black, John and Rogaway, Phillip},
+  title     = {Ciphers with Arbitrary Finite Domains},
+  booktitle = {Topics in Cryptology --- CT-RSA},
+  year      = {2002}
+}
+
+% ---------------------------------------------------------------------------
+% Software, benchmarks, and specifications
+% ---------------------------------------------------------------------------
+
+@misc{arrow,
+  author       = {{The Apache Software Foundation}},
+  title        = {Apache {Arrow}: A Cross-Language Development Platform for
+                  In-Memory Analytics},
+  url          = {https://arrow.apache.org},
+  year         = {2024}
+}
+
+@misc{cranelift,
+  author       = {{Bytecode Alliance}},
+  title        = {Cranelift Code Generator},
+  url          = {https://cranelift.dev},
+  year         = {2024}
+}
+
+@misc{polars,
+  author       = {Vink, Ritchie and {Polars contributors}},
+  title        = {Polars: {DataFrames} for the New Era},
+  url          = {https://pola.rs},
+  year         = {2024}
+}
+
+@misc{daft,
+  author       = {{Eventual Computing}},
+  title        = {Daft: A Distributed Query Engine for Large-Scale Multimodal Data},
+  url          = {https://getdaft.io},
+  year         = {2024}
+}
+
+@misc{raydata,
+  author       = {{The Ray Team}},
+  title        = {Ray Data: Scalable Datasets for {ML}},
+  url          = {https://docs.ray.io/en/latest/data/data.html},
+  year         = {2024}
+}
+
+@misc{tpch,
+  author       = {{Transaction Processing Performance Council}},
+  title        = {{TPC Benchmark H} Standard Specification},
+  url          = {https://www.tpc.org/tpch/},
+  year         = {2022}
+}
+
+@misc{clickbench,
+  author       = {{ClickHouse, Inc.}},
+  title        = {{ClickBench}: A Benchmark for Analytical Databases},
+  url          = {https://benchmark.clickhouse.com},
+  year         = {2024}
+}
+
+@misc{sparkaqe,
+  author       = {{The Apache Software Foundation}},
+  title        = {Adaptive Query Execution --- {Spark SQL} Performance Tuning Guide},
+  url          = {https://spark.apache.org/docs/latest/sql-performance-tuning.html},
+  year         = {2024}
+}
+
+@misc{arrowflight,
+  author       = {{The Apache Software Foundation}},
+  title        = {Arrow {Flight RPC}},
+  url          = {https://arrow.apache.org/docs/format/Flight.html},
+  year         = {2024}
+}
+
+% VERIFY: this is cited for the "shuffled order as a computed bijection" idea in
+% training-data loaders. Confirm the current canonical reference (project docs vs.
+% a technical report) and its year before submission.
+@misc{mosaicstreaming,
+  author       = {{MosaicML / Databricks}},
+  title        = {{StreamingDataset}: Fast, Accurate Streaming of Training Data
+                  from Cloud Storage},
+  url          = {https://github.com/mosaicml/streaming},
+  year         = {2023}
+}
+
+@article{gray1997datacube,
+  author  = {Gray, Jim and Chaudhuri, Surajit and Bosworth, Adam and
+             Layman, Andrew and Reichart, Don and Venkatrao, Murali and
+             Pellow, Frank and Pirahesh, Hamid},
+  title   = {Data Cube: A Relational Aggregation Operator Generalizing
+             Group-By, Cross-Tab, and Sub-Totals},
+  journal = {Data Mining and Knowledge Discovery},
+  volume  = {1},
+  number  = {1},
+  pages   = {29--53},
+  year    = {1997}
+}
+
+@inproceedings{dean2004mapreduce,
+  author    = {Dean, Jeffrey and Ghemawat, Sanjay},
+  title     = {{MapReduce}: Simplified Data Processing on Large Clusters},
+  booktitle = {USENIX Symposium on Operating Systems Design and Implementation (OSDI)},
+  year      = {2004}
+}
+
+% VERIFIED 2026-07-28: PDF downloaded and text-extracted. Contains the
+% 33 ZB (2018) -> 175 ZB (2025) Global DataSphere forecast on p.3 and p.6.
+% NOTE: this report does NOT contain the word "unstructured" anywhere. Do not
+% cite it for the structured/unstructured split -- that is a common miscitation.
+@techreport{idc2018datasphere,
+  author      = {Reinsel, David and Gantz, John and Rydning, John},
+  title       = {The Digitization of the World: From Edge to Core},
+  institution = {International Data Corporation},
+  type        = {IDC White Paper},
+  number      = {US44413318},
+  year        = {2018},
+  month       = {November},
+  url         = {https://www.seagate.com/files/www-content/our-story/trends/files/idc-seagate-dataage-whitepaper.pdf},
+  urldate     = {2026-07-28}
+}
+
+% VERIFY BEFORE SUBMISSION: this is the IDC report series that actually forecasts
+% the structured/unstructured split. It is paywalled; we cite it by title and
+% document number and do NOT quote a figure from it, because we have not read it.
+@techreport{idc2025structured,
+  author      = {{International Data Corporation}},
+  title       = {Worldwide Global {DataSphere} Structured and Unstructured Data
+                 Forecast, 2025--2029},
+  institution = {International Data Corporation},
+  number      = {US52800025},
+  year        = {2025},
+  url         = {https://my.idc.com/getdoc.jsp?containerId=US52800025},
+  urldate     = {2026-07-28}
+}

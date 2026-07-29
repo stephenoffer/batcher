@@ -125,7 +125,15 @@ def start_distributed_stream(
     try:
         engine.start()
     except BaseException:
+        # `start()` opens the checkpoint and recovers before the loop thread exists, so a
+        # failure here leaves a query that never ran in the registry and a store nothing will
+        # ever close. The single-node launcher already handled both; this one did not.
         _deregister(query_name)
+        if store is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                store.close()
         raise
     return query
 
@@ -238,11 +246,23 @@ def _drain_workers(source) -> int:
     drain scales with the backlog's real parallelism instead of a fixed handful. On a Ray
     cluster the resulting task demand is what the autoscaler reacts to; the per-task
     placement then clamps this to the live cluster (`dist.executors...clamp_workers`).
+
+    **A source whose `splits()` hands out work is never probed.** The rest of the engine
+    treats `splits()` as a question, but the incremental file source answers it by *claiming*
+    the files it returns — they become pending, withheld from every later pass until the epoch
+    that read them is published. Counting partitions with it therefore consumed a whole
+    discovery pass whose files no epoch ever read: the query's first batch of new files was
+    silently stranded, and on a continuous stream they stayed stranded for the life of the
+    run. Such a source is recognized by the `confirm` half of that protocol (the same marker
+    `LocalRunner` uses) and sized from the CPU count instead.
     """
     from batcher._internal.hardware import available_cpu_count
 
+    cpus = available_cpu_count()
+    if getattr(source, "confirm", None) is not None:
+        return max(1, cpus)
     try:
         n_splits = len(source.splits())
     except Exception:
         n_splits = 1
-    return max(1, min(n_splits, available_cpu_count()))
+    return max(1, min(n_splits, cpus))

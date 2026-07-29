@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from batcher.config import active_config
 from batcher.kyber import plan_cache
 from batcher.kyber.ols import fit_ols, ols_update
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -38,8 +39,15 @@ _BAND = 8.0
 
 # Reusable primitive 2 — an OLS two-line crossover (generalizing gpu/adaptive.py).
 def _fold_ols(hub: MetadataHub, namespace: str, bucket: str, x: float, y: float) -> None:
-    s = hub.get_keyed_param(namespace, bucket) or {}
-    plan_cache.record_write(hub, namespace, bucket, ols_update(s, x, y))
+    """Fold one `(x, y)` observation into a bucket's fitted line. Best-effort.
+
+    Scoped to the machine class. A crossover is the row count at which one strategy overtakes
+    another, and that point is a ratio of two per-row costs — so it moves with the hardware
+    even when the ranking does not. Learn "the GPU wins above 200k rows" on an A100 beside a
+    slow host CPU, and the same fit is badly wrong on a fast CPU beside a T4.
+    """
+    s = hub.get_keyed_param(scoped(namespace), bucket) or {}
+    plan_cache.record_write(hub, scoped(namespace), bucket, ols_update(s, x, y))
 
 
 _fit = fit_ols
@@ -61,8 +69,8 @@ def _solve_crossover(
     if hub is None:
         return None
     try:
-        below = _fit(hub.get_keyed_param(namespace, cheap_below) or {})
-        above = _fit(hub.get_keyed_param(namespace, cheap_above) or {})
+        below = _fit(hub.get_keyed_param(scoped(namespace), cheap_below) or {})
+        above = _fit(hub.get_keyed_param(scoped(namespace), cheap_above) or {})
     except Exception:  # pragma: no cover
         return None
     if below is None or above is None:

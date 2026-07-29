@@ -1,10 +1,10 @@
 """Differential tests for `.dt.last_day()` (and `.dt.millennium()`) vs DuckDB.
 
-`last_day(ts)` in DuckDB returns a DATE at the last day of the instant's month.
-Batcher returns that day at 00:00:00 as a Timestamp(Microsecond) (mirroring how
-`date_trunc` builds its result). To compare exactly, the DuckDB expression casts
-its DATE result to TIMESTAMP (`last_day(ts)::TIMESTAMP`), so both sides surface a
-midnight ``datetime.datetime`` through ``to_pylist()``.
+`last_day(ts)` returns a DATE at the last day of the instant's month, in DuckDB and
+(since the type was corrected) in Batcher too.
+Batcher used to return that day at 00:00:00 as a Timestamp(Microsecond), and these
+tests cast DuckDB's DATE to TIMESTAMP to compare at all. Both sides are dates now, so
+the cast is gone — its absence is part of what these tests assert.
 """
 
 from __future__ import annotations
@@ -44,9 +44,8 @@ def t(duck):
 
 def test_last_day_vs_duckdb(duck, t):
     out = bt.from_arrow(t).select(l=col("ts").dt.last_day()).collect()
-    # Cast DuckDB's DATE result to TIMESTAMP so it aligns with Batcher's
-    # Timestamp(us) at midnight.
-    expected = duck.sql("SELECT last_day(ts)::TIMESTAMP AS l FROM t")
+    # No cast: both engines return a DATE.
+    expected = duck.sql("SELECT last_day(ts) AS l FROM t")
     assert_same(out, expected)
 
 
@@ -59,5 +58,5 @@ def test_last_day_and_millennium_vs_duckdb(duck, t):
         )
         .collect()
     )
-    expected = duck.sql("SELECT last_day(ts)::TIMESTAMP AS l, millennium(ts) AS mil FROM t")
+    expected = duck.sql("SELECT last_day(ts) AS l, millennium(ts) AS mil FROM t")
     assert_same(out, expected)

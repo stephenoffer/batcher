@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.core import Expr, _wrap
+from batcher.plan.expr_ir.core import Expr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import (
     ListBinary,
     ListContains,
@@ -74,6 +74,49 @@ class _StructNamespace:
                 {'x': [1, 2]}
         """
         return StructField(self._e, name)
+
+    def keys(self) -> MapFunc:
+        """Return the struct's field names as a ``List`` column (DuckDB ``struct_keys``).
+
+        A struct's keys come from its *type*, so every row carries the same list. A null
+        struct row still answers null rather than the names, which is what distinguishes
+        this from a constant.
+
+        Returns:
+            A new List<Utf8> expression of the struct's field names.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]})
+                >>> ds.select(bt.col("s").struct.keys().alias("k")).to_pydict()
+                {'k': [['x', 'y'], ['x', 'y']]}
+        """
+        return MapFunc("map_keys", self._e)
+
+    def get(self, name: str) -> MapFunc:
+        """Return the named field, the subscript spelling of :meth:`field`.
+
+        This is what ``s['x']`` lowers to, and what DuckDB's ``struct_extract`` and
+        Spark's ``element_at(s, 'x')`` reach. Naming a field the struct does not have is
+        an error rather than a null, because a struct's fields are fixed by its type.
+
+        Args:
+            name: The struct field to project out.
+
+        Returns:
+            A new expression: the named field, under the struct's own row nulls.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]})
+                >>> ds.select(bt.col("s").struct.get("x").alias("x")).to_pydict()
+                {'x': [1, 2]}
+        """
+        return MapFunc("element_at", self._e, key=name)
 
 
 class _JsonNamespace:
@@ -177,6 +220,209 @@ class _JsonNamespace:
         """
         return StrFunc("json_extract_bool", self._e, pattern=path)
 
+    def array_length(self, path: str = "$") -> StrFunc:
+        """Count the elements of the JSON array at `path` (→ Int64).
+
+        The count is taken by skipping over each element structurally, so a long array
+        of large objects costs one pass over its bytes and parses none of them.
+
+        Args:
+            path: A JSONPath to the array; the document root by default.
+
+        Returns:
+            A new Int64 expression, or null if the path is absent or the value there is
+            not an array.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"xs": [1, 2, 3]}', '{"xs": 4}']})
+                >>> ds.select(r=bt.col("j").json.array_length("$.xs")).to_pydict()
+                {'r': [3, None]}
+        """
+        return StrFunc("json_array_length", self._e, pattern=path)
+
+    def keys(self, path: str = "$") -> StrFunc:
+        """List the keys of the JSON object at `path`, in source order (→ List<Utf8>).
+
+        Source order, not sorted order, so the keys line up with the document as written.
+
+        Args:
+            path: A JSONPath to the object; the document root by default.
+
+        Returns:
+            A new List<Utf8> expression, or a null list if the path is absent or the
+            value there is not an object.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"z": 1, "a": 2}', "[]"]})
+                >>> ds.select(r=bt.col("j").json.keys()).to_pydict()
+                {'r': [['z', 'a'], None]}
+        """
+        return StrFunc("json_object_keys", self._e, pattern=path)
+
+    def values(self, path: str = "$") -> StrFunc:
+        """Read the JSON array at `path` as a list of texts (→ List<Utf8>).
+
+        Each element is rendered the way :meth:`extract_string` renders a value: a string
+        element verbatim, an object or array as its compact JSON, a JSON ``null`` as a
+        null element. This is the bridge from a JSON array column to a Batcher list
+        column, so :meth:`~batcher.Dataset.explode` and the ``.list`` namespace apply.
+
+        Args:
+            path: A JSONPath to the array; the document root by default.
+
+        Returns:
+            A new List<Utf8> expression, or a null list if the path is absent or the
+            value there is not an array.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"xs": ["a", 1, {"b": 2}]}']})
+                >>> ds.select(r=bt.col("j").json.values("$.xs")).to_pydict()
+                {'r': [['a', '1', '{"b":2}']]}
+        """
+        return StrFunc("json_array_values", self._e, pattern=path)
+
+    def type_of(self, path: str = "$") -> StrFunc:
+        """Name the JSON type at `path` (→ Utf8).
+
+        One of ``object``, ``array``, ``string``, ``number``, ``boolean``, or ``null``.
+        Use it to route a heterogeneous field before extracting it, rather than
+        extracting into every type and coalescing.
+
+        Args:
+            path: A JSONPath; the document root by default.
+
+        Returns:
+            A new Utf8 expression, or null if the path is absent.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"v": [1]}', '{"v": "x"}', "{}"]})
+                >>> ds.select(r=bt.col("j").json.type_of("$.v")).to_pydict()
+                {'r': ['array', 'string', None]}
+        """
+        return StrFunc("json_type", self._e, pattern=path)
+
+    def value(self, path: str) -> StrFunc:
+        """The **scalar** at `path` as its JSON token, null for a container (→ Utf8).
+
+        DuckDB ``json_value``. The difference from :meth:`extract_string` is deliberate
+        and is DuckDB's: this one answers only for a scalar and keeps a string's quotes
+        (it returns the JSON token), where ``extract_string`` unquotes a string and
+        renders an object or array as compact JSON.
+
+        Args:
+            path: A JSONPath, e.g. ``"$.user.age"``.
+
+        Returns:
+            A new Utf8 expression; null at a container, an absent path, or a JSON null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a": 1, "b": "x", "c": [1]}']})
+                >>> ds.select(r=bt.col("j").json.value("$.b")).to_pydict()
+                {'r': ['"x"']}
+        """
+        return StrFunc("json_value", self._e, pattern=path)
+
+    def contains(self, value: str) -> StrFunc:
+        """Whether the document contains `value` as an element or field value (→ Boolean).
+
+        DuckDB ``json_contains``. `value` is itself JSON, so a string needs its quotes.
+        Comparison is on the parsed values, so whitespace and key order cannot change
+        the answer.
+
+        Args:
+            value: The JSON text to look for, e.g. ``"1"`` or ``'"needle"'``.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ["[1, 2, 3]", '{"a": 5}']})
+                >>> ds.select(r=bt.col("j").json.contains("5")).to_pydict()
+                {'r': [False, True]}
+        """
+        return StrFunc("json_contains", self._e, pattern=value)
+
+    def pretty(self) -> StrFunc:
+        """Re-render the document with two-space indentation (→ Utf8).
+
+        DuckDB ``json_pretty``. Text that is not valid JSON is null rather than an error.
+
+        Returns:
+            A new Utf8 expression: the indented document.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a":1}']})
+                >>> print(ds.select(r=bt.col("j").json.pretty()).to_pydict()["r"][0])
+                {
+                  "a": 1
+                }
+        """
+        return StrFunc("json_pretty", self._e)
+
+    def structure(self) -> StrFunc:
+        """The document's shape with each leaf replaced by its type name (→ Utf8).
+
+        DuckDB ``json_structure``: the schema-on-read summary to group by when you are
+        finding out what shapes a JSON column actually holds. An array is described by
+        its first element, as in DuckDB.
+
+        Returns:
+            A new Utf8 expression: the structure document.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a": 1, "b": "x"}']})
+                >>> ds.select(r=bt.col("j").json.structure()).to_pydict()
+                {'r': ['{"a":"UBIGINT","b":"VARCHAR"}']}
+        """
+        return StrFunc("json_structure", self._e)
+
+    def exists(self, path: str) -> StrFunc:
+        """Test whether a value exists at `path` (→ Boolean).
+
+        A JSON ``null`` counts as present. That is the distinction the ``extract_*``
+        methods cannot express, since an absent path and a JSON ``null`` both extract to
+        SQL null, and the two mean different things in a schema-on-read pipeline.
+
+        Args:
+            path: A JSONPath, e.g. ``"$.user.email"``.
+
+        Returns:
+            A new Boolean expression; null only where the input itself is null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"v": null}', "{}"]})
+                >>> ds.select(r=bt.col("j").json.exists("$.v")).to_pydict()
+                {'r': [True, False]}
+        """
+        return StrFunc("json_exists", self._e, pattern=path)
+
 
 class _MapNamespace:
     """Map-column accessors: ``col("m").map.keys()``, ``.values()``, ``.get(key)``.
@@ -245,6 +491,54 @@ class _MapNamespace:
         """
         return MapFunc("map_values", self._e)
 
+    def len(self) -> Expr:
+        """Count each row's entries (DuckDB ``cardinality``; → Int64).
+
+        Composed from :meth:`keys` rather than given its own kernel: the key list has one
+        element per entry by construction, so its length *is* the cardinality, and a null
+        map stays null through both steps.
+
+        Returns:
+            A new Int64 expression: the number of entries, or null for a null map.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> col = pa.array([[("a", 1), ("b", 2)], [("c", 3)]],
+                ...                type=pa.map_(pa.string(), pa.int64()))
+                >>> ds = bt.from_arrow(pa.table({"m": col}))
+                >>> ds.select(bt.col("m").map.len().alias("n")).to_pydict()
+                {'n': [2, 1]}
+        """
+        return self.keys().list.len()
+
+    def contains(self, key: object) -> Expr:
+        """Whether each row's map holds ``key`` (DuckDB ``map_contains``; → Boolean).
+
+        Composed from :meth:`keys`, so it answers null for a null map and ``False`` for an
+        empty one — matching DuckDB, and distinguishing "no such key" from "no map".
+
+        Args:
+            key: The map key to look for in every row; a plan-time literal.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> col = pa.array([[("a", 1), ("b", 2)], [("c", 3)]],
+                ...                type=pa.map_(pa.string(), pa.int64()))
+                >>> ds = bt.from_arrow(pa.table({"m": col}))
+                >>> ds.select(bt.col("m").map.contains("a").alias("has")).to_pydict()
+                {'has': [True, False]}
+        """
+        return self.keys().list.contains(key)
+
     def get(self, key: object) -> MapFunc:
         """Look up the value for a literal ``key`` in each row's map; null if absent.
 
@@ -282,7 +576,7 @@ class _ListNamespace:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"a": [[3, 1, 2]]})
             >>> ds.select(bt.col("a").list.sum().alias("s")).to_pydict()
-            {'s': [6.0]}
+            {'s': [6]}
     """
 
     __slots__ = ("_e",)
@@ -333,7 +627,7 @@ class _ListNamespace:
                 >>> ds.select(bt.col("a").list.get(-1).alias("r")).to_pydict()
                 {'r': [2, None, None]}
         """
-        return ListGet(self._e, index)
+        return ListGet(self._e, require_int(index, func="list.get", arg="index"))
 
     def first(self) -> ListGet:
         """Return the first element of each list; null if the list is null or empty.
@@ -433,6 +727,89 @@ class _ListNamespace:
                 {'r': [[2, 3]]}
         """
         return ListSet("array_intersect", self._e, _wrap(other))
+
+    def concat(self, other: Any) -> ListSet:
+        """This list's elements followed by ``other``'s, keeping duplicates (→ List).
+
+        DuckDB ``list_concat``. Unlike :meth:`union` this does not deduplicate or reorder,
+        and a null list counts as **empty** rather than making the row null — so
+        ``concat`` of a null and ``[1]`` is ``[1]``, where ``union`` of the two is null.
+        The result is null only when both sides are.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the two lists appended.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [[2, 3]]})
+                >>> ds.select(bt.col("a").list.concat(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[1, 2, 2, 3]]}
+        """
+        return ListSet("array_concat", self._e, _wrap(other))
+
+    def has_all(self, other: Any) -> Expr:
+        """Whether every element of ``other`` is present in this list (→ Boolean).
+
+        DuckDB ``list_has_all``. An empty ``other`` is trivially contained, so the result
+        is true; a null list on either side gives null.
+
+        Composed as "the intersection holds as many distinct elements as ``other`` does"
+        rather than the more obvious "``other`` minus this list is empty". Both are
+        correct on non-null input, but the difference form reads `other` first and so
+        stays non-null when *this* list is null, answering `False` where DuckDB answers
+        null. Going through the intersection makes both operands load-bearing, so
+        nullness propagates from either side on its own.
+
+        Args:
+            other: The list of elements to look for.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3], [1, 2]], "b": [[1, 2], [1, 5]]})
+                >>> ds.select(bt.col("a").list.has_all(bt.col("b")).alias("r")).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.intersect(_wrap(other)).list.len() == _wrap(other).list.n_unique()
+
+    def has_any(self, other: Any) -> Expr:
+        """Whether this list shares any element with ``other`` (→ Boolean).
+
+        DuckDB ``list_has_any``. The two share an element exactly when their intersection
+        is non-empty, so an empty list on either side is false and a null list on either
+        side is null.
+
+        The trailing ``* 0`` is what carries `other`'s nullness. `intersect` treats a null
+        right operand as an *empty* list (DuckDB does the same:
+        ``list_intersect([1,2], NULL)`` is ``[]``), so the intersection alone would answer
+        `False` where ``list_has_any`` answers null. Multiplying `other`'s length by zero
+        contributes nothing for a real list and null for a null one.
+
+        Args:
+            other: The list of elements to look for.
+
+        Returns:
+            A new Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2], [1, 2]], "b": [[2, 5], [5, 6]]})
+                >>> ds.select(bt.col("a").list.has_any(bt.col("b")).alias("r")).to_pydict()
+                {'r': [True, False]}
+        """
+        other_expr = _wrap(other)
+        return (self.intersect(other_expr).list.len() + other_expr.list.len() * 0) > 0
 
     def difference(self, other: Any) -> ListSet:
         """The distinct elements in this list but not in ``other`` (→ List).
@@ -583,7 +960,6 @@ class _ListNamespace:
                 >>> ds.select(r=bt.col("v").list.is_unit_norm()).to_pydict()
                 {'r': [True, False]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         return (self.l2_norm() - Lit(1.0)).abs() < Lit(tolerance)
 
@@ -629,8 +1005,6 @@ class _ListNamespace:
         """
         import math
 
-        from batcher.plan.expr_ir.core import Lit
-
         return self.cosine_similarity(other).acos() / Lit(math.pi)
 
     def dim(self) -> ListFunc:
@@ -669,7 +1043,6 @@ class _ListNamespace:
                 >>> ds.select(r=bt.col("v").list.is_zero_vector()).to_pydict()
                 {'r': [False, True]}
         """
-        from batcher.plan.expr_ir.core import Lit
 
         return self.l2_norm() == Lit(0.0)
 
@@ -803,6 +1176,25 @@ class _ListNamespace:
         """
         return ListTransform(self._e, _wrap(func))
 
+    def drop_nulls(self) -> ListFilter:
+        """Drop the null elements of each list (Polars ``list.drop_nulls``, → List).
+
+        Returns:
+            A new List expression with the nulls removed; list lengths change, and a
+            null *list* stays null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, None, 3], [None]]})
+                >>> ds.select(r=bt.col("a").list.drop_nulls()).to_pydict()
+                {'r': [[1, 3], []]}
+        """
+        from batcher.plan.functions.collection import element
+
+        return self.filter(element().is_not_null())
+
     def filter(self, predicate: Any) -> ListFilter:
         """Keep the elements where ``predicate`` is true (→ List).
 
@@ -906,6 +1298,9 @@ class _ListNamespace:
                 >>> ds.select(bt.col("a").list.slice(1, 2).alias("r")).to_pydict()
                 {'r': [[20, 30]]}
         """
+        offset = require_int(offset, func="list.slice", arg="offset")
+        if length is not None:
+            length = require_int(length, func="list.slice", arg="length")
         return ListSlice(self._e, offset, length)
 
     def head(self, n: int = 5) -> ListSlice:

@@ -95,17 +95,17 @@ Aggregates and windows over an event log, without the future in them.
 
 ## What the engine buys you here
 
-Measured on 8×T4 against Ray Data, with a prediction-agreement gate on every run. These are
-the workloads the recipes above are built on; the [full table and the honest exceptions live
-in the benchmarks](../../benchmarks/ai-and-gpu.md).
+Measured on 8xT4 with a prediction-agreement gate on every run. These are the workloads the
+recipes above are built on, and the [full table lives in the
+benchmarks](../../benchmarks/ai-and-gpu.md).
 
-| Workload | Model | vs Ray Data |
+| Workload | Model | Throughput |
 | --- | --- | ---: |
-| Text embeddings | sentence-transformers MiniLM | **47×** |
-| Audio feature extraction | torchaudio mel + ResNet-18 | **12.5×** |
-| LLM batch inference | HF gpt2 | **11.1×** |
-| Batch inference | ResNet-50 | **2.05×** |
-| Fractional-GPU packing | EfficientNet-B0, 2 per GPU | **1.96×** |
+| Audio feature extraction | torchaudio mel + ResNet-18 | **38,546 clip/s** |
+| Text embeddings | sentence-transformers MiniLM | **33,611 text/s** |
+| Fractional-GPU packing | EfficientNet-B0, 2 per GPU | **6,764 img/s** at 89% GPU |
+| Batch inference | ResNet-50 | **2,504 img/s** at 81% GPU |
+| LLM batch inference | HF gpt2 | **814.8 prompt/s** |
 
 None of that comes from per-workload tuning. It comes from the model loading once, the CPU
 stage overlapping the GPU stage, and the decode running in the data plane.

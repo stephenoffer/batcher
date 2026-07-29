@@ -48,6 +48,24 @@ DEAD_ALLOW: dict[str, str] = {
         "documented in CLAUDE.md as not wired into bc-py — the UDF/inference plane is not "
         "on a live path, so its public surface is unreferenced on purpose"
     ),
+    "crates/bc-secrets/src/lib.rs": (
+        "`clear_cache` is reached only by this crate's own tests, and its docstring says why "
+        "it is still `pub`: the resolution cache is process-global with a TTL, so a host that "
+        "rotates a credential needs the same escape hatch the tests use to make the new value "
+        "visible before the TTL expires. Cache invalidation is the API, not an unused seam"
+    ),
+}
+
+#: The handful of handlers that are silent on purpose and cannot be made otherwise, keyed by
+#: ``file:line-of-except``. Keep this list at approximately zero entries: the fix for a silent
+#: best-effort path is `note_suppressed`, and an exemption is only right when *calling* it is
+#: the thing that would fail. Re-check the line numbers when the file moves.
+SILENT_ALLOW: dict[str, str] = {
+    "python/batcher/dist/executors/scan_read.py:171": (
+        "this handler *is* the logging path for a skipped split, so anything it could report "
+        "would take the same route that just failed — the one place where staying silent is "
+        "the only option, and it is documented in the handler body"
+    ),
 }
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -69,6 +87,9 @@ class Context:
     """Everything the detectors share: parsed sources and a global name index."""
 
     modules: dict[Path, ast.Module]
+    #: The raw text of each parsed module, for the checks that need what `ast` throws away —
+    #: comments, chiefly, which are how this codebase marks a silence as deliberate.
+    sources: dict[Path, str]
     #: name -> {file: how many times the token appears}. A definition is dead when no other
     #: file mentions it *and* its own file mentions it exactly once (the definition itself).
     name_files: dict[str, dict[str, int]]
@@ -103,11 +124,14 @@ _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 def build_context() -> Context:
     """Parse the package, and index every identifier token in the searchable tree."""
     modules: dict[Path, ast.Module] = {}
+    sources: dict[Path, str] = {}
     for path in sorted(PKG.rglob("*.py")):
         try:
-            modules[path] = ast.parse(path.read_text())
+            text = path.read_text()
+            modules[path] = ast.parse(text)
         except (SyntaxError, UnicodeDecodeError):
             continue
+        sources[path] = text
 
     name_files: dict[str, dict[str, int]] = defaultdict(dict)
     rust_text: dict[Path, str] = {}
@@ -126,7 +150,7 @@ def build_context() -> Context:
                 rust_text[path] = text
             for token, count in Counter(_WORD.findall(text)).items():
                 name_files[token][rel] = count
-    return Context(modules=modules, name_files=name_files, rust_text=rust_text)
+    return Context(modules=modules, sources=sources, name_files=name_files, rust_text=rust_text)
 
 
 def _decorator_names(node: ast.AST) -> list[str]:

@@ -23,12 +23,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.nodes import cume_dist, rank, row_number
 from batcher.plan.functions.aggregate import count_if
 from batcher.plan.functions.aggregate import sum as sum_
-from batcher.plan.functions.metrics.classification import positive_mask
+from batcher.plan.functions.metrics.model.classification import positive_mask
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -291,8 +290,13 @@ def ks_statistic(
 def _require_columns(ds: Dataset, *names: str) -> None:
     """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
     available = ds.columns
+    # Membership against a set: the check runs per requested name, and `available` is the
+    # relation's full width — a wide feature table turned a handful of name checks into a
+    # scan of thousands of columns each. The list is kept for the error message, which
+    # needs the original order to suggest a close match.
+    present = set(available)
     for name in names:
-        if name not in available:
+        if name not in present:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
 
             raise ColumnNotFoundError(
@@ -305,33 +309,3 @@ def _aggregate(ds: Dataset, groups: list[str], metrics: dict[str, Any]) -> Datas
     if groups:
         return ds.group_by(*groups).agg(**metrics)
     return ds.agg(**metrics)
-
-
-def check_positive_rate(ds: Dataset, y_true: str, *, positive: Any = 1) -> None:
-    """Raise when a ranking metric is undefined because one class is absent.
-
-    ROC AUC, average precision, and KS all divide by the positive or the negative count, so
-    a dataset with only one class returns NaN rather than failing. Silent NaN in an
-    evaluation report is worse than an error, because it reads as "the model scored nothing"
-    rather than "this split has no negatives".
-
-    Args:
-        ds: The scored dataset.
-        y_true: The label column.
-        positive: The label value that counts as the positive class.
-
-    Raises:
-        PlanError: If every row is positive, or none is.
-    """
-    counts = ds.agg(
-        n_pos=count_if(positive_mask(col(y_true), positive)),
-        n=col(y_true).count(),
-    ).collect()
-    n_positive = counts.column("n_pos")[0].as_py()
-    total = counts.column("n")[0].as_py()
-    if n_positive == 0 or n_positive == total:
-        present = "only positives" if n_positive else "no positives"
-        raise PlanError(
-            f"a ranking metric needs both classes present, but {y_true!r} has {present} "
-            f"({n_positive} of {total} rows). Check the label column and the positive= value."
-        )

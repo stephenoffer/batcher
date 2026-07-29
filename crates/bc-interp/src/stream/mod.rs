@@ -45,30 +45,35 @@
 //! is associative by construction, so folding per morsel finalizes to what one big `partial`
 //! would. `stream_matches_the_sequential_oracle` pins it over every operator.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use bc_ir::{JoinType, RelOp};
 use bc_runtime::agg;
-use bc_runtime::join::{streaming_supported, BroadcastProbe};
 
 use crate::ops;
 use crate::InterpError;
 
 mod breaker;
+mod builds;
 mod meter;
 mod parallel;
 mod pipeline;
+mod probe_chunks;
+mod runtime_filter;
 
 pub use parallel::{
-    execute_streaming_parallel, execute_streaming_parallel_metered, streaming_parallelizes,
+    execute_streaming_parallel, execute_streaming_parallel_metered,
+    execute_streaming_parallel_metered_or_hand_off, execute_streaming_parallel_or_hand_off,
+    streaming_parallelizes,
 };
 
 use breaker::{drain, exec_breaker};
+pub(crate) use builds::{node_key, prebuild_joins, BuildCache, MatCache};
 pub(crate) use meter::Meter;
 pub(crate) use pipeline::limit_stream;
 use pipeline::scan_stream;
+use probe_chunks::{PendingProbe, ProbeSlicer};
 
 /// Everything a stream stage needs, in one `Copy` handle so an iterator closure can capture it
 /// by value rather than borrowing a struct that has to outlive the stream.
@@ -166,145 +171,6 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// A hash join's build side, prepared once and shared by every worker that probes it.
-///
-/// Rebuilding this per worker would be `workers x` the build cost, and on a chain of joins that
-/// is the dominant term — the thing that would make a "parallel" streaming executor slower than
-/// the materializing one it replaces.
-pub(crate) struct JoinBuild {
-    /// The materialized build relation (small by construction — it is the broadcast side).
-    side: RecordBatch,
-    /// The hash table over it, or `None` when this join's shape cannot be probed per morsel and
-    /// the materialized fallback must be used.
-    probe: Option<BroadcastProbe>,
-}
-
-impl JoinBuild {
-    /// Whether this join can be probed one morsel at a time. `false` means every worker that
-    /// probes it would re-join the whole build side, so the driver must not shard through it.
-    pub(crate) fn has_morsel_probe(&self) -> bool {
-        self.probe.is_some()
-    }
-}
-
-/// Prepared build sides, keyed by the identity of their `HashJoin` node.
-///
-/// The key is the node's address. The plan is borrowed for the whole execution and never moves,
-/// so the address is a stable identity — and it distinguishes two structurally identical joins in
-/// the same plan, which a structural key would conflate.
-pub(crate) type BuildCache = HashMap<usize, Arc<JoinBuild>>;
-
-/// Spine breakers that have already been evaluated, keyed the same way (`node_key`).
-///
-/// A breaker sitting between the plan root and the driving scan used to force the *whole* query
-/// onto the sequential path: sharding cannot cross it (a breaker handed one shard answers for one
-/// shard), and `spine_is_shardable` refuses the plan rather than risk that. But its own subtree is
-/// usually the expensive half and is very often perfectly shardable on its own — TPC-H q17's
-/// decorrelated aggregate over 6M rows of `lineitem` is exactly that, and it ran on one core.
-///
-/// So the breaker is evaluated **up front, in parallel, over the unsharded sources** — the same
-/// treatment [`prebuild_joins`] already gives a join's build side — and its result is stored here.
-/// From then on it is a materialized *leaf*: [`build_with`] yields the stored batches instead of
-/// executing the subtree, and the spine above it becomes shardable because nothing on that spine
-/// is a breaker any more.
-///
-/// The soundness argument is the one that matters, because this is a wrong-answer-shaped change:
-/// sharding is never extended *through* a breaker. The breaker is fully evaluated first, over
-/// every row of its input, and what the workers then share is a finished relation — identical in
-/// every worker, and never itself sharded.
-pub(crate) type MatCache = HashMap<usize, Arc<Vec<RecordBatch>>>;
-
-/// Execute (and hash) every hash-join build side in `plan`, once, across `workers`.
-///
-/// Each build side is run on the streaming path too, so preparing it never materializes its
-/// subtree either — and it is *sharded* like any other streamed relation, because a build side is
-/// not always the small one (see `collect_builds`).
-pub(crate) fn prebuild_joins(
-    plan: &RelOp,
-    sources: &[Vec<RecordBatch>],
-    meter: Option<&Meter>,
-    budget: usize,
-    workers: usize,
-) -> Result<Arc<BuildCache>, InterpError> {
-    let mut cache = BuildCache::new();
-    collect_builds(plan, sources, &mut cache, meter, budget, workers)?;
-    Ok(Arc::new(cache))
-}
-
-fn collect_builds(
-    plan: &RelOp,
-    sources: &[Vec<RecordBatch>],
-    cache: &mut BuildCache,
-    meter: Option<&Meter>,
-    budget: usize,
-    workers: usize,
-) -> Result<(), InterpError> {
-    if let RelOp::HashJoin {
-        left,
-        right,
-        right_keys,
-        join_type,
-        ..
-    } = plan
-    {
-        // Only the probe spine draws on *this* cache. The build side is executed below as one
-        // self-contained unit, which prepares whatever joins it holds itself, so descending into
-        // it here would build them twice.
-        collect_builds(left, sources, cache, meter, budget, workers)?;
-        // Shard the build side across the workers, exactly as the probe side is sharded. This
-        // was the streaming executor's worst asymmetry: the probe ran on every core while the
-        // build — the *whole* other relation — ran on one. It is hashed into a table either way,
-        // so single-threading it bought no memory and cost the entire build serially. TPC-H q4
-        // (`orders SEMI lineitem`) is the shape that exposes it: a semi join's build is always
-        // the right input (it is not commutative, so Kyber cannot swap it), so the 3.8M-row side
-        // is built and probed by 57k rows — 279 ms streaming vs 45 ms materializing. Recursion
-        // terminates because each build subtree is strictly smaller than the plan.
-        let batches = parallel::run(right, sources, workers, meter, budget)?;
-        if let Ok(side) = ops::materialize(&batches) {
-            let probe = make_probe(&side, right_keys, *join_type)?;
-            cache.insert(node_key(plan), Arc::new(JoinBuild { side, probe }));
-        }
-        return Ok(());
-    }
-    for child in plan.children() {
-        collect_builds(child, sources, cache, meter, budget, workers)?;
-    }
-    Ok(())
-}
-
-/// Identity of a plan node — its address in the (borrowed, immobile) plan tree.
-pub(crate) fn node_key(plan: &RelOp) -> usize {
-    plan as *const RelOp as usize
-}
-
-/// The per-morsel probe table over `side`, or `None` when this join's shape cannot be served
-/// per morsel (`Right`/`Full`, or a non-integer key) and the materialized path must take over.
-fn make_probe(
-    side: &RecordBatch,
-    right_keys: &[String],
-    join_type: JoinType,
-) -> Result<Option<BroadcastProbe>, InterpError> {
-    let build_keys = ops::columns_by_name(side, right_keys)?;
-    let key_types: Vec<&arrow::datatypes::DataType> =
-        build_keys.iter().map(|k| k.data_type()).collect();
-    let rt = ops::map_join_type(join_type);
-    if !streaming_supported(rt, &key_types, side.num_rows()) {
-        return Ok(None);
-    }
-    let tuning = bc_arrow::RuntimeTuning::default();
-    // `probe_rows` only decides whether the probe-side bloom pays for itself, and the bloom is a
-    // pure short-circuit with no false negatives — the emitted rows are identical either way. A
-    // streamed probe is by definition the large side, and its exact row count is not knowable
-    // without materializing it, which is the thing this executor exists to avoid.
-    Ok(BroadcastProbe::new(
-        &build_keys,
-        rt,
-        usize::MAX,
-        tuning.bloom_fp_rate,
-        tuning.bloom_min_build_rows,
-    ))
-}
-
 /// A lazily-produced stream of morsels. `Box<dyn Iterator>` rather than a bespoke trait: a
 /// pipeline operator *is* an iterator adapter, and Rust's iterators already give the pull-based
 /// composition (`map`, `chain`, short-circuit) this executor is made of — for free, and lazily.
@@ -358,8 +224,23 @@ pub(crate) fn strip_empties(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
     batches.into_iter().take(1).collect()
 }
 
-/// Compose the stream for `plan`. Pipeline operators wrap their child lazily; breakers drain it.
+/// Compose the stream for `plan`, then apply any runtime join filter placed on its output.
+///
+/// The filter is attached *outside* [`build_node`] so it lands on the node's finished morsels,
+/// after that node's own metrics are recorded — the operator did the work the meter says it
+/// did, and what the filter removes is charged to the consumer, not hidden from the producer.
 pub(crate) fn build_with<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpError> {
+    let stream = build_node(plan, ctx)?;
+    match ctx.cache.filters_for(node_key(plan)) {
+        None => Ok(stream),
+        Some(filters) => Ok(Box::new(
+            stream.map(move |b| runtime_filter::apply(filters, b?)),
+        )),
+    }
+}
+
+/// Compose the stream for `plan`. Pipeline operators wrap their child lazily; breakers drain it.
+fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpError> {
     // An already-materialized spine breaker is a leaf: yield what it produced. Checked before the
     // match, so it wins over every arm below — including the breaker arm that would otherwise
     // re-execute this subtree once per worker, and (crucially) over any arm that would execute it
@@ -401,11 +282,16 @@ pub(crate) fn build_with<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a
         // `par.rs` still compiles, which is where the fused-pipeline shapes make it pay.
         RelOp::Filter { input, predicate } => {
             let child = build_with(input, ctx)?;
+            // Per-operator conjunct order, built once and captured by the per-morsel
+            // closure. This path is the engine default and never carries a JIT (see the
+            // note above), so it is the one that most wants a measured order rather than a
+            // static-cost guess. Result-invariant: the conjuncts of an `AND` commute.
+            let order = bc_expr::ConjunctOrder::new(predicate);
             Ok(Box::new(child.map(move |b| {
                 let b = b?;
                 let rows_in = b.num_rows() as u64;
                 let t = std::time::Instant::now();
-                let out = ops::filter_batch(&b, predicate)?;
+                let out = ops::filter_batch_jit(&b, predicate, &None, order.as_ref())?;
                 ctx.morsel(id, rows_in, &out, t);
                 Ok(out)
             })))
@@ -597,6 +483,7 @@ fn build_join<'a>(
                 ctx.budget,
                 Some(ctx.cache),
                 ctx.mats,
+                None,
             )?;
             return materialized_join_from(
                 Box::new(batches.into_iter().map(Ok)),
@@ -657,27 +544,83 @@ fn build_join<'a>(
     let stream = std::iter::once(Ok(first)).chain(probe);
     let side = &prepared.side;
 
-    Ok(Box::new(stream.map(move |morsel| {
-        let morsel = morsel?;
-        let rows_in = morsel.num_rows() as u64;
-        let t = std::time::Instant::now();
-        let probe_keys = ops::columns_by_name(&morsel, left_keys)?;
-        // `accepts` vetted this relation's key shape above, so the probe is infallible from
-        // here — the `expect` documents an invariant, not a hope.
-        let idx = table
-            .probe(&probe_keys)
-            .expect("accepts() vetted this relation's key shape");
-        let out =
-            ops::gather_join_output_with(&morsel, side, &idx, output, Arc::clone(&out_schema))?;
-        if let (Some(m), Some(id)) = (ctx.meter, id) {
-            // `rows_in` is the *probe* side only, and `rows_build` the build side — the split the
-            // metric contract requires, so a join's fan-out (`rows_out / rows_in`) means what
-            // Kyber thinks it means. The build rows are recorded once, on the first morsel, not
-            // once per morsel: the table was built once.
-            m.morsel(id, rows_in, &out, t.elapsed().as_nanos() as u64);
-            m.record_build_rows_once(id, build_rows);
+    // One probe morsel does NOT imply one output morsel: a join *multiplies* rows, and a
+    // high-fan-out one multiplies them a lot. Against a build side holding `f` rows per key, a
+    // 16,384-row probe morsel yields `16,384 x f` output rows, and emitting that as a single
+    // `RecordBatch` is what broke the streaming executor's constant-memory property — measured at
+    // 13.1 GB for a cartesian join over two 20,000-row tables. It is not a cartesian-only
+    // problem: an ordinary equi-join on a skewed key with 100,000 build-side duplicates does the
+    // same. So the *output* is morselized, not the input, and the probe emits as many morsels as
+    // its fan-out requires. `ops::remorselize`'s doc comment names this exact hazard for
+    // unnest/unpivot; a join is the operator that multiplies rows most.
+    let mut pending: Option<PendingProbe> = None;
+    // The probe morsel currently being consumed, and how far into it we have got. A morsel is
+    // probed in slices, not whole, so the *index* buffers stay morsel-scale too — output
+    // morselization alone bounds the gathered batch but not the two `u32` arrays behind it.
+    let mut current: Option<(RecordBatch, usize)> = None;
+    let mut slicer = ProbeSlicer::new();
+    let mut source = stream;
+    Ok(Box::new(std::iter::from_fn(move || {
+        loop {
+            // Drain the morsel being emitted before pulling another from the probe side.
+            if let Some(p) = pending.as_mut() {
+                match p.next_chunk(side, output, &out_schema) {
+                    Some(Ok((out, rows_in))) => {
+                        if let (Some(m), Some(id)) = (ctx.meter, id) {
+                            // `rows_in` is the *probe* side only, and `rows_build` the build side
+                            // — the split the metric contract requires, so a join's fan-out
+                            // (`rows_out / rows_in`) means what Kyber thinks it means. It is
+                            // carried by the FIRST chunk of a morsel and zero thereafter, so
+                            // chunking cannot inflate the input count; `rows_out` accumulates
+                            // across chunks, which is what it should do. The build rows are
+                            // recorded once, not once per morsel: the table was built once.
+                            m.morsel(id, rows_in, &out, p.take_elapsed());
+                            m.record_build_rows_once(id, build_rows);
+                        }
+                        return Some(Ok(out));
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => pending = None,
+                }
+                continue;
+            }
+
+            // Pull a fresh morsel only once the previous one has been probed to its end.
+            let (morsel, offset) = match current.take() {
+                Some(pair) => pair,
+                None => match source.next()? {
+                    Ok(m) => (m, 0),
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            let remaining = morsel.num_rows() - offset;
+            let take = slicer.slice_rows().min(remaining);
+            // Slicing costs a `RecordBatch` rebuild (cheap, `Arc`-shared buffers), so skip it
+            // when the slice *is* the whole morsel — the steady state for any join whose fan-out
+            // is 1, which is most of them.
+            let slice = if offset == 0 && take == morsel.num_rows() {
+                morsel.clone()
+            } else {
+                morsel.slice(offset, take)
+            };
+            if offset + take < morsel.num_rows() {
+                current = Some((morsel, offset + take));
+            }
+
+            let t = std::time::Instant::now();
+            let probe_keys = match ops::columns_by_name(&slice, left_keys) {
+                Ok(k) => k,
+                Err(e) => return Some(Err(e)),
+            };
+            // `accepts` vetted this relation's key shape above, so the probe is infallible from
+            // here — the `expect` documents an invariant, not a hope.
+            let idx = table
+                .probe(&probe_keys)
+                .expect("accepts() vetted this relation's key shape");
+            // What this slice actually fanned out to sizes the next one.
+            slicer.observe(take, idx.left.len());
+            pending = Some(PendingProbe::new(slice, idx, t.elapsed().as_nanos() as u64));
         }
-        Ok(out)
     })))
 }
 
@@ -719,6 +662,17 @@ fn materialized_join_from<'a>(
         output,
         strategy,
     )?;
+    // Emitted whole, deliberately, even though it can be relation-sized.
+    //
+    // Splitting it into morsels here looks like the tidy thing to do — everything downstream is
+    // written against morsels — and it is a trap. The consumer of this stream is very often
+    // *another* join's fallback, or a sort, and both begin by `ops::materialize`-ing what they are
+    // given: handed one batch that is a no-op, handed N slices of it that is a full concatenating
+    // copy of the whole relation. On a chain of joins each link pays that copy, which is how a
+    // TPC-H q5 that streams in a few GB was measured at 99 GB and OOM-killed.
+    //
+    // The one consumer that genuinely wants morsels — the aggregate, which folds them across the
+    // pool — slices this itself, at zero copy, in `fold_partial_parallel`.
     Ok(Box::new(std::iter::once(Ok(out))))
 }
 

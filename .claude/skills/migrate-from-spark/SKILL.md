@@ -7,7 +7,7 @@ description: Port a PySpark job to Batcher's public Python API — the DataFrame
 
 Use this when you have working PySpark and want it running on Batcher. The DataFrame
 vocabulary carries over almost verbatim; what changes is the *runtime model*, and that
-is where ports go wrong. Read `docs/migration/index.md` (the canonical mapping tables)
+is where ports go wrong. Read `docs/migration/transforming.md` (the canonical mapping tables)
 before extending anything here — this skill is the porting procedure, that page is the
 reference.
 
@@ -141,10 +141,35 @@ reference.
   adapt batch size and `num_gpus` from measurements; set them only when a measurement
   says to.
 
+## `bt.sql(dialect="spark")` gives you Spark's *syntax*, not Spark's semantics
+
+`bt.sql` reads Spark SQL when you ask it to, so a `spark.sql("...")` string usually ports
+by changing the call. The dialect selects a **parser**. Where Spark and DuckDB genuinely
+disagree on what a function *means*, the engine follows DuckDB, because DuckDB is the
+oracle every differential test in the repo is written against. These are the differences
+a port actually hits, each found by running Spark's own documented examples through
+`bt.sql` (`docs/internals/competitor_parity_census.md`):
+
+| Expression | Spark | Batcher (= DuckDB) |
+|---|---|---|
+| `regexp_replace(s, p, r)` | replaces **every** match | replaces the **first**; use `regexp_replace_all` |
+| `sort_array(a)` | nulls **first** | nulls **last** |
+| `array_distinct(a)` | keeps a null element | drops nulls |
+| `dayname(d)` / `monthname(d)` | abbreviated (`Wed`, `Feb`) | full (`Wednesday`, `February`) |
+| `round(x)` | half **up** | half **away from zero** |
+| `split(s, p)` | `p` is a **regex** | `p` is a **literal**; use `regexp_split_to_array` |
+| `weekday(d)` | `0` is **Monday** | `0` is **Sunday** (DuckDB's `dayofweek`) |
+| `to_binary(s, charset)` | the encoded **bytes** | refused — DuckDB's `to_binary(s)` is a `0`/`1` bit string, a different function under the same name |
+| `element_at(a, i)` | 1-based | 1-based (`a[i]` is 0-based in Spark, 1-based in DuckDB — the parser handles it) |
+
+Rewrite the first seven explicitly during the port; none of them raises, so each is a
+result that quietly differs. `to_binary` is the exception and is deliberately so: it is
+refused rather than answered, because the two functions share a name and nothing else. Verify the port the way the recipe above says: compare row
+counts and a checksum against the original job's output, not the eyeball.
+
 ## See also
 
-- `docs/migration/index.md` — the full pandas/Polars/PySpark mapping tables.
+- `docs/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
 - `docs/user-guide/{sql,udfs,window-functions,writing-data,explain-plans}.md`.
 - `docs/integrations/ray.md` — how distribution actually works (scheduling only).
-- Skills: `migrate-from-ray-data` (the Ray Data port), `run-quality-gate` (if the port
-  changes repo code).
+- Skills: `run-quality-gate` (if the port changes repo code).

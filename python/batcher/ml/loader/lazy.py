@@ -26,6 +26,16 @@ if TYPE_CHECKING:
 __all__ = ["iter_torch_batches", "streaming_split"]
 
 DEFAULT_BATCH_ROWS = 1024
+# Ceiling on the *bytes* a local-shuffle block may hold, independent of the row count the
+# caller asked for. `local_shuffle_buffer_size` is a row count, and a row count says nothing
+# about memory: 50,000 narrow tabular rows is a few MB, while 50,000 decoded 224x224 images
+# is ~30 GB. Ray Data users hit exactly this — the pattern catalog records a 2-5x slowdown
+# and OOMs on large rows, with "use 512-2048 for wide rows" as the manual fix. Bounding the
+# block by bytes as well as rows makes the knob mean "decorrelate as much as fits", so a
+# request that is too large for the row width degrades to a smaller window instead of an
+# OOM. Cutting a block early only *narrows* the shuffle window; it never drops or repeats a
+# row, so the stream's contents are unchanged.
+_SHUFFLE_BLOCK_MAX_BYTES = 256 << 20
 
 
 def iter_torch_batches(
@@ -81,13 +91,14 @@ def iter_torch_batches(
             (one fewer CPU copy before the device move). Do not mutate the tensors; leave
             False for training, which mutates batches in place.
         local_shuffle_buffer_size: if set, shuffle within blocks of this many rows before
-            batching (a streaming approximation of a global shuffle). The buffer is heap RAM
-            holding whole rows, so the right size depends on row width: 100-500 costs
-            nothing for narrow tabular rows, while the same buffer over decoded images or
-            long sequences is a well-known 5-10x training slowdown. A larger buffer decorrelates
-            neighbouring samples better; if the corpus is already written in random order, a
-            small buffer (or none) is enough. Past that trade, shuffle globally with
-            `stream_loader` instead of buying decorrelation with RAM.
+            batching (a streaming approximation of a global shuffle). A larger buffer
+            decorrelates neighbouring samples better; if the corpus is already written in
+            random order, a small buffer (or none) is enough. Past that trade, shuffle
+            globally with `stream_loader` instead of buying decorrelation with RAM. The row
+            count is a **request, not a reservation**: the block is also **bounded by bytes**,
+            so the same number that costs nothing over narrow tabular rows cannot become an
+            unbounded allocation over decoded images or long sequences. A request too large
+            for the row width silently gets the widest window that fits.
         seed: seed for the local shuffle, combined with `epoch`.
         epoch: reshuffles the local-shuffle order; pass the epoch number so successive passes
             over the same dataset differ. Without it every epoch sees an identical order,
@@ -351,6 +362,10 @@ def _shuffle_to_numpy(
     once, emit it in `out_rows` chunks, repeat. The shuffle happens in **NumPy space** (one
     conversion, then a gather per chunk), avoiding the ~3-4 copies of a wide column a
     `take`-then-reconvert Arrow shuffle pays — which made this loader lose to Ray Data.
+
+    The block is bounded by `_SHUFFLE_BLOCK_MAX_BYTES` as well as by `buffer_rows`, so the
+    caller's row count cannot turn into an unbounded allocation when the rows turn out to be
+    decoded images or long sequences. Whichever bound binds first cuts the block.
     """
     import numpy as np
     import pyarrow as pa
@@ -370,11 +385,13 @@ def _shuffle_to_numpy(
 
     block: list = []
     rows = 0
+    nbytes = 0
     for b in batches:
         block.append(b)
         rows += b.num_rows
-        if rows >= buffer_rows:
+        nbytes += b.nbytes
+        if rows >= buffer_rows or nbytes >= _SHUFFLE_BLOCK_MAX_BYTES:
             yield from _emit(block)
-            block, rows = [], 0
+            block, rows, nbytes = [], 0, 0
     if block:
         yield from _emit(block)

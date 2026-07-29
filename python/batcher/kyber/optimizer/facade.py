@@ -249,8 +249,18 @@ def optimize(
     hub: MetadataHub | None = None,
     source_stats: list | None = None,
 ) -> PhysicalPlan:
-    """Convenience wrapper around `Optimizer.optimize`."""
-    return Optimizer(config, sources, hub, source_stats=source_stats).optimize(logical)
+    """The optimized physical plan, reusing a cached plan when one exists.
+
+    The physical-plan-only projection of `optimize_full`, and for the same reason
+    `optimize_traced` is: this is what the streaming terminals reach for
+    (`iter_batches`, the micro-batch dispatcher, the watermark rewrites), and it used to
+    build a fresh `Optimizer` and re-run every phase on every call. A `for batch in
+    ds.iter_batches()` loop therefore re-planned the identical query on each pass while
+    `collect()` on the same `Dataset` answered from the memo — the streaming path, the one
+    that exists to be incremental, was the one paying full planning cost repeatedly.
+    """
+    phys, _plan, _decisions = optimize_full(logical, config, sources, hub, source_stats)
+    return phys
 
 
 def optimize_traced(
@@ -260,8 +270,18 @@ def optimize_traced(
     hub: MetadataHub | None = None,
     source_stats: list | None = None,
 ) -> tuple[PhysicalPlan, list[BuildSideDecision]]:
-    """Convenience wrapper around `Optimizer.optimize_traced`."""
-    return Optimizer(config, sources, hub, source_stats=source_stats).optimize_traced(logical)
+    """The physical plan and its build-side decisions, reusing a cached plan when one exists.
+
+    A thin projection of `optimize_full`, and deliberately so: this is the entry point
+    `explain()` uses, and it used to construct a fresh `Optimizer` and re-run every phase
+    on every call. That made explaining a query cost a full optimization even though
+    `collect()` on the same `Dataset` had already planned it and put the result in the
+    memo — so the diagnostic tool was the slowest way to look at a plan, and an
+    `explain()` / `collect()` pair planned the same query twice. Sharing one memo also
+    means what `explain()` shows is the plan `collect()` will actually run.
+    """
+    phys, _plan, decisions = optimize_full(logical, config, sources, hub, source_stats)
+    return phys, decisions
 
 
 def optimize_full(

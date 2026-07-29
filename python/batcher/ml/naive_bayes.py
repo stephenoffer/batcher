@@ -17,6 +17,7 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import argmax_prediction, require_fitted
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -25,18 +26,6 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["BernoulliNB", "GaussianNB", "MultinomialNB"]
-
-
-def _argmax_prediction(labels, score_of):
-    """The label whose score expression is largest per row, as a nested-conditional expression."""
-    prediction = lit(labels[0])
-    best = score_of(labels[0])
-    for label in labels[1:]:
-        score = score_of(label)
-        closer = score > best
-        prediction = when(closer).then(lit(label)).otherwise(prediction)
-        best = when(closer).then(score).otherwise(best)
-    return prediction
 
 
 class GaussianNB:
@@ -133,10 +122,23 @@ class GaussianNB:
         global_variance = ds.agg(
             **{f"v{i}": var_pop(col(name)) for i, name in enumerate(self.features)}
         ).collect()
-        smoothing = self.var_smoothing * max(
+        widest = max(
             float(global_variance.column(f"v{i}")[0].as_py() or 0.0)
             for i in range(len(self.features))
         )
+        if widest <= 0.0:
+            # `var_smoothing` is a *fraction of the widest feature variance* (as in sklearn),
+            # so when every feature is constant across the whole dataset the floor is zero,
+            # every class variance is zero, and the Gaussian log-likelihood divides by it —
+            # surfacing as `ValueError: math domain error` from inside `predict`. A single
+            # training row reaches the same place. Neither message says the features carry no
+            # information, which is the actual problem.
+            raise PlanError(
+                f"GaussianNB cannot fit: every feature in {list(self.features)} has zero "
+                f"variance across the {total} training row(s), so there is no distribution to "
+                f"learn. Drop the constant features, or fit on more rows."
+            )
+        smoothing = self.var_smoothing * widest
         aggregates: dict[str, object] = {"__bt_n": col(self.target).count()}
         for i, name in enumerate(self.features):
             aggregates[f"m{i}"] = mean_(col(name))
@@ -189,9 +191,8 @@ class GaussianNB:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("GaussianNB must be fitted before predict.")
-        prediction = _argmax_prediction(self.classes_, self._log_likelihood)
+        require_fitted(self, self.classes_)
+        prediction = argmax_prediction(self.classes_, self._log_likelihood)
         return ds.with_columns(**{self.output_column: prediction})
 
 
@@ -318,10 +319,9 @@ class MultinomialNB:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("MultinomialNB must be fitted before predict.")
+        require_fitted(self, self.classes_)
         return ds.with_columns(
-            **{self.output_column: _argmax_prediction(self.classes_, self._score)}
+            **{self.output_column: argmax_prediction(self.classes_, self._score)}
         )
 
 
@@ -388,7 +388,15 @@ class BernoulliNB:
         self.log_neg_prob_: dict[object, list[float]] = {}
 
     def _present(self, name: str):
-        """The 0/1 indicator that feature `name` is present (above the threshold)."""
+        """The 0/1 indicator that feature `name` is present (above the threshold).
+
+        A null counts as **absent**, because a null compares false against the threshold.
+        That is a modeling decision rather than an accident, and the one that keeps the model
+        coherent: "absent" is a state Bernoulli NB explicitly models, and the same indicator
+        builds both the fitted presence probabilities and the prediction, so a missing value
+        means the same thing on both sides. Impute first if missingness should mean something
+        else for your data.
+        """
         return when(col(name) > lit(self.threshold)).then(lit(1.0)).otherwise(lit(0.0))
 
     def fit(self, ds: Dataset) -> BernoulliNB:
@@ -465,10 +473,9 @@ class BernoulliNB:
         Returns:
             A new lazy `Dataset` with the predicted-class column appended.
         """
-        if not self.classes_:
-            raise PlanError("BernoulliNB must be fitted before predict.")
+        require_fitted(self, self.classes_)
         return ds.with_columns(
-            **{self.output_column: _argmax_prediction(self.classes_, self._score)}
+            **{self.output_column: argmax_prediction(self.classes_, self._score)}
         )
 
 

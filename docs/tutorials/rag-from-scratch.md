@@ -89,8 +89,8 @@ vectors.write.parquet("s3://index/chunks/")
 
 That warm pool is worth stating plainly, because it is the difference between a benchmark and
 a bill: MiniLM loads in about 2 seconds and embeds nearly instantly, so an engine that reloads
-the model per execution spends its entire runtime loading. Measured on 8×T4 over 8,192 texts,
-Batcher runs at 33,611 text/s against Ray Data's 717, a **47×**, with identical vectors.
+the model per execution spends its entire runtime loading. Measured on 8xT4 over 8,192 texts,
+Batcher embeds at **33,611 text/s** with the model loaded once for the session.
 
 For the tutorial, a deterministic bag-of-words stub stands in. It is a `map_batches` that
 appends a vector column, which is exactly the shape the real encoder has.
@@ -239,10 +239,10 @@ Both halves of RAG are on the benchmark, and both are warm-pool workloads: the m
 once per session rather than once per job. Distributed over 8×T4, correctness-gated on
 output agreement:
 
-| Half of RAG | Batcher | Ray Data | Ratio |
-|---|---:|---:|---:|
-| Text embeddings (MiniLM, 8,192 texts) | 33,611 text/s | 717 text/s | **47×** |
-| LLM generation (gpt2, 2,048 prompts) | 814.8 prompt/s | 73.2 prompt/s | **11.1×** |
+| Half of RAG | Batcher |
+|---|---:|
+| Text embeddings (MiniLM, 8,192 texts) | **33,611 text/s** |
+| LLM generation (gpt2, 2,048 prompts) | **814.8 prompt/s** |
 
 Neither number comes from a RAG-specific code path. They come from the same mechanisms every
 `map_batches` inference pipeline gets: session-warm pools, stage-overlapped streaming, and an
@@ -272,7 +272,7 @@ The ANN index, for when the brute-force scan stops being enough.
 :::{grid-item-card} {octicon}`graph;1.1em` AI and GPU benchmarks
 :link: ../benchmarks/ai-and-gpu
 :link-type: doc
-Where the 47× and the 11.1× come from.
+Where the embedding and generation throughput comes from.
 :::
 ::::
 
@@ -285,5 +285,5 @@ Where the 47× and the 11.1× come from.
   [text embeddings recipe](../examples/ml/text-embeddings.md): the short versions.
 - [Expressions](../user-guide/expressions.md): `.str.chunk`, `.list.cosine_similarity`, and
   the rest of the column language this page leans on.
-- [vs Ray Data](../benchmarks/vs-ray-data.md): why a warm pool is worth 47× on the embedding
-  half.
+- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): the warm pool and the stage overlap
+  behind both halves.

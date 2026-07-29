@@ -23,10 +23,11 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.bloom_index import BloomIndex
-from batcher.plan.expr_ir import Binary, Expr, IsNotNull, IsNull, Not
+from batcher.plan.expr_ir import Binary, Expr, IsNotNull, IsNull, Lit, Not
 from batcher.plan.logical import (
     Distinct,
     Filter,
+    Join,
     Limit,
     LogicalPlan,
     Sample,
@@ -67,7 +68,7 @@ _SCHEMA_PRESERVING = (Filter, Sort, Distinct, Sample)
 @rule(
     name="propagate_empty_relation",
     phase=Phase.SELECTION,
-    matches=(Filter, Sort, Distinct, Sample, Union),
+    matches=(Filter, Sort, Distinct, Sample, Union, Join),
 )
 def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold a provably-empty subtree upward through operators that preserve it.
@@ -80,7 +81,10 @@ def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
       empty input is itself empty — replace it with the empty input;
     - a `Union` drops its empty branches (an empty contributes no rows); if all are
       empty the union is empty, and a single surviving branch makes the union a
-      pass-through (still deduplicated for a DISTINCT union).
+      pass-through (still deduplicated for a DISTINCT union);
+    - a `Join` folds when a side being empty decides the result — see
+      `_join_over_empty_side`, where the *output schema* is what limits how far it
+      can go.
 
     Registered after `zonemap_prune_filter` in the SELECTION phase so it folds the
     empties that pruning produces in the same pass; bottom-up traversal collapses a
@@ -89,8 +93,61 @@ def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
     """
     if isinstance(node, Union):
         return _prune_empty_union_branches(node)
+    if isinstance(node, Join):
+        return _join_over_empty_side(node)
     if isinstance(node, _SCHEMA_PRESERVING) and _is_empty(node.input):
         return node.input  # empty in, empty out, identical schema
+    return None
+
+
+# Join types an empty *left* side makes empty. `right` and `full` are deliberately
+# absent: they keep the right side's rows padded with nulls on the left, so an empty
+# left leaves them non-empty. Only the types whose row count is bounded by the left are
+# here — `inner` (nothing to match), `left` (every output row is a left row), and
+# `semi`/`anti` (whose output is the left side's columns and rows).
+# An empty *right* side is not the mirror image, so it is handled case by case below.
+_EMPTY_LEFT_IS_EMPTY = frozenset({"inner", "left", "semi", "anti"})
+
+
+def _join_over_empty_side(node: Join) -> LogicalPlan | None:
+    """Fold a join whose result an empty side already decides.
+
+    Three cases, and the difference between them is entirely about **output schema**,
+    which is what stops this being one rule:
+
+    * **An empty left is empty for every join type.** A `full` or `right` join would
+      normally pad, but Batcher's `Join.output` names the surviving columns, so the
+      empty relation has to keep the join's own schema — `Limit(node, 0)`, not the
+      empty side, which has only half the columns.
+    * **A semi or anti join outputs the left side's columns alone**, so an empty right
+      collapses to something built from `node.left`: no rows for `semi` (nothing can
+      match), and *all* of the left for `anti` (nothing to exclude). Both drop the
+      right subtree outright, which is the case here that saves real work today.
+    * **An empty right in an `inner` join** is empty, but the schema is left+right, so
+      it can only be spelled `Limit(node, 0)`.
+
+    `Limit(x, 0)` is the canonical empty marker, and it is currently a *plan-level*
+    marker: `bc-interp`'s `Limit` arm executes its input and then discards every row,
+    because `ops::limit` recovers the output schema from the first input batch and
+    there is no Rust-side plan schema inference. So the `Limit(node, 0)` results below
+    shrink the plan and let row counts propagate exactly, but do not yet skip the scan.
+    A first-class `Empty { schema }` relation — which DataFusion, DuckDB and Spark all
+    have — is what makes them pay off, and is tracked separately. The `anti` and `semi`
+    rewrites do not wait on it: they remove a subtree rather than mark it empty.
+    """
+    left_empty, right_empty = _is_empty(node.left), _is_empty(node.right)
+    if left_empty and node.join_type in _EMPTY_LEFT_IS_EMPTY:
+        return Limit(node, 0)
+    if not right_empty:
+        return None
+    if node.join_type == "anti":
+        # Nothing on the right to exclude, so every left row survives — and an anti
+        # join already outputs exactly the left side's columns, so the join goes away.
+        return node.left
+    if node.join_type == "semi":
+        return Limit(node.left, 0)  # nothing can match; semi outputs left columns only
+    if node.join_type == "inner":
+        return Limit(node, 0)
     return None
 
 
@@ -114,6 +171,15 @@ def _prune_empty_union_branches(node: Union) -> LogicalPlan | None:
 
 def _predicate_status(expr: Expr, stats: RelStats) -> bool | None:
     """Tri-state evaluation of `expr` against `stats`' column bounds."""
+    if isinstance(expr, Lit) and type(expr.value) is bool:
+        # A boolean literal decides itself, with no bounds needed. This is not a
+        # theoretical case: constant folding runs in NORMALIZE, but `filter_null_join_keys`
+        # runs later, in SELECTION, and rewrites a `false` predicate under a join into
+        # `false AND k IS NOT NULL`. Nothing folds after that, so without this clause the
+        # conjunction reads as undecidable and a provably-empty join side ships to the
+        # engine to be evaluated per row. `type(...) is bool` because `Lit(0)` is not a
+        # boolean predicate and `0 == False` in Python.
+        return _TRUE if expr.value else _FALSE
     if isinstance(expr, Binary):
         if expr.op == "and":
             return _and(_predicate_status(expr.left, stats), _predicate_status(expr.right, stats))

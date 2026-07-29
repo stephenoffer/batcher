@@ -38,6 +38,21 @@ A glob reads many files as one Dataset. Reading stays lazy: no bytes are fetched
 ds = bt.read.parquet("s3://bucket/year=2024/month=06/*.parquet")
 ```
 
+Only the scheme changes between a bucket and a local disk, so the same read is runnable here against local files:
+
+```python
+import batcher as bt
+
+bt.from_pydict({"user_id": [1, 2], "status": ["active", "closed"]}).write.parquet("events/a.parquet")
+bt.from_pydict({"user_id": [3], "status": ["active"]}).write.parquet("events/b.parquet")
+
+ds = bt.read.parquet("events/*.parquet")
+print(ds.filter(bt.col("status") == "active").sort("user_id").to_pydict())
+# {'user_id': [1, 3], 'status': ['active', 'active']}
+```
+
+Swap `events/*.parquet` for `s3://bucket/events/*.parquet` and nothing else changes.
+
 ## Credentials
 
 Credentials are read from the environment, following the conventions of each provider's SDK. They are the same variables the AWS, Google Cloud, and Azure tooling already uses. Set them before starting your process.

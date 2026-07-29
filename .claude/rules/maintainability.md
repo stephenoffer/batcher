@@ -87,10 +87,10 @@ each other; `api` wires them.
 - New optimizer rule → `kyber/rules/<family>.py`, registered via `@rule`.
 - New scalar/agg/window function → `plan/functions/<family>.py`, surfaced through the
   `api/functions.py` façade; or a `.str`/`.dt`/… accessor in `plan/expr_ir/namespaces/`.
-- New IO format → `io/formats/<category>/<fmt>.py` (the nine category packages:
+- New IO format → `io/formats/<category>/<fmt>.py` (the ten category packages:
   `structured`, `semistructured`, `unstructured`, `multimodal`, `lakehouse`, `sql`,
-  `nosql`, `streaming`, `ml`), registered as a `SourceFormat`/`SinkFormat`. See the
-  `add-an-io-format-or-connector` skill.
+  `nosql`, `streaming`, `ml`, `robotics`), registered as a `SourceFormat`/`SinkFormat`.
+  See the `add-an-io-format-or-connector` skill.
 - New relational operator → Rust `bc-runtime` (mergeable) + `plan/logical/` + the IR tag.
 - New execution tier (morsel/JIT/LLVM/GPU) → a `core` `Executor` strategy, not new
   call-site branching.

@@ -145,6 +145,13 @@ class FeasibilityVerdict:
     feasible: bool
     binding_constraint: str | None = None  # "memory" | "credits" | "parallelism" | None
     suggested_bounds: ResourceBounds | None = None
+    # The operator whose demand binds the constraint, as a plain ``"kind#id"`` string (e.g.
+    # ``"Aggregate#3"``), or `None` when nothing was sizable. `binding_constraint` says
+    # *which resource* ran out; this says *who ran it out*, which is the actionable half —
+    # a user told "this query will spill" can do nothing, while one told the plan's third
+    # aggregate is the breaker knows which step to reshape. A string, not an op reference,
+    # so the verdict stays a plain data contract that can cross the Ray boundary.
+    binding_op: str | None = None
     # Whether this verdict rests on a *guess* rather than a measurement or a proof — set
     # when the operator that binds the constraint carries `Provenance.DEFAULT`. An
     # advisory infeasibility should still steer the plan toward its out-of-core path, but

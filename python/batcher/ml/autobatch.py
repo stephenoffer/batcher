@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -44,8 +45,9 @@ def learned_batch_size(hub: MetadataHub | None, signature: str | None) -> int | 
     if hub is None or signature is None:
         return None
     try:
-        s = hub.get_keyed_param(_LEARN_NS, signature) or {}
-    except Exception:  # pragma: no cover - learning must never break a query
+        s = hub.get_keyed_param(scoped(_LEARN_NS), signature) or {}
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("ml", "read learned batch size", exc)
         return None
     v = s.get("size")
     return int(v) if isinstance(v, (int, float)) and v >= 1 else None
@@ -60,12 +62,12 @@ def record_batch_size(hub: MetadataHub | None, signature: str | None, size: int)
     try:
         from batcher.config import active_config
 
-        s = hub.get_keyed_param(_LEARN_NS, signature) or {}
+        s = hub.get_keyed_param(scoped(_LEARN_NS), signature) or {}
         alpha = float(active_config().optimizer.learning_smoothing_alpha)
         prior = s.get("size")
         new = float(size)
         smoothed = new if prior is None else alpha * new + (1.0 - alpha) * float(prior)
-        hub.put_keyed_param(_LEARN_NS, signature, {"size": smoothed})
+        hub.put_keyed_param(scoped(_LEARN_NS), signature, {"size": smoothed})
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("ml", "record autobatch size", exc)
         return
@@ -101,10 +103,21 @@ class ThroughputController:
         hub: MetadataHub | None = None,
         signature: str | None = None,
     ) -> None:
+        # Typed, and naming the values: these are user-supplied autobatch bounds, and a
+        # message that restates the rule without saying which number broke it makes the
+        # caller re-read their own call to find out.
+        from batcher._internal.errors import PlanError
+
         if min_rows < 1 or max_rows < min_rows:
-            raise ValueError("require 1 <= min_rows <= max_rows")
+            raise PlanError(
+                f"autobatch needs 1 <= min_rows <= max_rows, got min_rows={min_rows}, "
+                f"max_rows={max_rows}"
+            )
         if grow <= 1.0 or not (0.0 < shrink < 1.0):
-            raise ValueError("require grow > 1 and 0 < shrink < 1")
+            raise PlanError(
+                f"autobatch needs grow > 1 and 0 < shrink < 1 (it grows on success and "
+                f"shrinks on OOM), got grow={grow}, shrink={shrink}"
+            )
         self._min = min_rows
         self._max = max_rows
         self._vram_cap = vram_cap

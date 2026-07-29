@@ -67,6 +67,21 @@ pub enum WindowFn {
     ForwardFill,
     /// Nearest non-null value at or after the current row of the ordered partition.
     BackwardFill,
+    /// Sample / population variance and standard deviation over the window
+    /// (`var`/`var_pop`/`stddev`/`stddev_pop`). → Float64.
+    Var,
+    Stddev,
+    /// Running product of the non-null values. → Float64.
+    Product,
+    /// Logical AND / OR of the non-null booleans. → Boolean.
+    BoolAnd,
+    BoolOr,
+    /// Bitwise fold of the non-null Int64 values. → Int64.
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// Number of distinct non-null values. → Int64.
+    CountDistinct,
 }
 
 impl WindowFn {
@@ -90,6 +105,15 @@ impl WindowFn {
             WindowFn::NthValue => "nth_value",
             WindowFn::ForwardFill => "forward_fill",
             WindowFn::BackwardFill => "backward_fill",
+            WindowFn::Var => "var",
+            WindowFn::Stddev => "stddev",
+            WindowFn::Product => "product",
+            WindowFn::BoolAnd => "bool_and",
+            WindowFn::BoolOr => "bool_or",
+            WindowFn::BitAnd => "bit_and",
+            WindowFn::BitOr => "bit_or",
+            WindowFn::BitXor => "bit_xor",
+            WindowFn::CountDistinct => "count_distinct",
         }
     }
 
@@ -100,7 +124,7 @@ impl WindowFn {
         matches!(
             self,
             WindowFn::Sum | WindowFn::Avg | WindowFn::Min | WindowFn::Max | WindowFn::Count
-        )
+        ) || crate::window_agg::is_extended_aggregate(self)
     }
 
     /// Positional "value" functions select a row's value by offset rather than
@@ -831,6 +855,9 @@ fn running_aggregate(
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
     let values = require(values, func)?;
+    if crate::window_agg::is_extended_aggregate(func) {
+        return crate::window_agg::running(func, ordered, order_rows, values, num_rows);
+    }
     if func == WindowFn::Count {
         let mut out = vec![0i64; num_rows];
         for part in ordered {

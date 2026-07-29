@@ -98,6 +98,46 @@ it stable across restarts, and make your sink idempotent.
 The `subscription` name doubles as the isolation boundary. Two pipelines sharing a name share
 the message stream, and each sees roughly half the messages.
 
+## Decoding the payload
+
+The payload arrives as opaque bytes, so decoding is your first transformation. Expressed as
+expressions rather than a Python loop, it runs in the engine. The block below stands a local
+batch in for the topic, using the same six columns the reader delivers:
+
+```python
+import batcher as bt
+import pyarrow as pa
+from batcher import col
+
+schema = pa.schema([
+    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
+    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
+])
+batch = pa.record_batch({
+    "key": [b"acct-1", b"acct-2", b"acct-1"],
+    "value": [b'{"account":"acct-1","delta":50}', b'{"account":"acct-2","delta":-20}',
+              b'{"account":"acct-1","delta":15}'],
+    "partition": [0, 1, 0],
+    "offset": [881, 12, 882],
+    "timestamp": [1700000000000, 1700000001000, 1700000002000],
+    "topic": ["persistent://public/default/ledger"] * 3,
+}, schema=schema)
+
+# Stand in for the topic; the pipeline below is what you run against the real one.
+ledger = bt.from_batches(lambda: iter([batch]), schema)
+
+moves = ledger.select(
+    col("value").cast("string").json.extract_string("$.account").alias("account"),
+    col("value").cast("string").json.extract_int("$.delta").alias("delta"),
+)
+print(moves.group_by("account").agg(balance=col("delta").sum()).sort("account").to_pydict())
+# {'account': ['acct-1', 'acct-2'], 'balance': [65, -20]}
+```
+
+Because a shared subscription gives no per-key ordering, an aggregate like the one above is
+safe (addition commutes) while a last-write-wins or state-machine transition is not. That is
+the practical shape of the warning above.
+
 ## Writing the stream out
 
 ```python

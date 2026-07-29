@@ -17,14 +17,128 @@ use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use bc_ir::RelOp;
+use bc_runtime::agg;
+use rayon::prelude::*;
 
 use super::{build_with, finalize_partial, fold_partial, Ctx, Morsels};
 use crate::ops;
 use crate::InterpError;
 
+/// Morsels each worker gets per parallel fold round.
+///
+/// The round is the unit of buffering, so this is what the "streaming" aggregate holds of its
+/// input at once: `workers x` this many morsels. Two keeps every worker fed across a round
+/// boundary (one to fold, one queued) while leaving the buffer a small multiple of a morsel —
+/// at the 16,384-row default and 96 workers, a few hundred MB at the very widest, and
+/// proportional to the machine rather than to the relation.
+const PAR_FOLD_MORSELS_PER_WORKER: usize = 2;
+
 /// Pull a stream to exhaustion.
 pub(super) fn drain(stream: Morsels<'_>) -> Result<Vec<RecordBatch>, InterpError> {
     stream.collect()
+}
+
+/// [`fold_partial`], with the per-morsel `partial` step spread across `workers`.
+///
+/// The sequential fold is the right shape when this breaker is *inside* a sharded worker (there
+/// the parallelism is the shard, and `Ctx::workers` is 1 to say so). On the **un-sharded**
+/// fallback path it is not: that path is taken precisely when the plan could not be split — a
+/// self-join, or a hash join whose build side is past the per-morsel probe's ceiling — and the
+/// aggregate then folds the *whole* relation on one core while every other core idles. It is the
+/// dominant term when it happens: a 60M-row `lineitem` join-then-group-by measured 2.7 s, of
+/// which ~1.9 s was this loop.
+///
+/// Rounds are the only difference. Morsels are taken from the stream **in order** into a bounded
+/// buffer, `partial`-ed in parallel, and combined in that same order — so this is the mergeable
+/// algebra (invariant #7) with a wider `partial` step, exactly as the sharded aggregate in
+/// `stream::parallel` already runs it, and the accumulated partial folds in last on each round
+/// just as the sequential loop does.
+///
+/// Only the `partial` step fans out; the stream is still pulled one morsel at a time by this
+/// thread. That is deliberate — the pull is where the *upstream* pipeline runs, and on this path
+/// the upstream has either already materialized (the join fallback) or is un-shardable by
+/// construction, so pulling it from several threads would be unsound rather than merely
+/// unhelpful.
+///
+/// An oversized batch is **sliced here** rather than upstream. The un-shardable join emits its
+/// output as one relation-sized batch on purpose (splitting it there makes the next join's
+/// `materialize` copy the whole relation — see `materialized_join_from`), so without this the
+/// round would hold exactly one unit of work and fold on one core. Slicing is zero-copy and
+/// local to this fold, so it costs the pipeline nothing and buys the fan-out.
+fn fold_partial_parallel(
+    input: Morsels<'_>,
+    group_keys: &[bc_ir::ProjectionItem],
+    aggregates: &[bc_ir::AggregateItem],
+    jit: &std::sync::OnceLock<ops::AggJit>,
+    workers: usize,
+) -> Result<(Option<agg::Partial>, u64), InterpError> {
+    let funcs = ops::agg_funcs(aggregates);
+    let per_round = workers.saturating_mul(PAR_FOLD_MORSELS_PER_WORKER).max(2);
+    let mut buf: Vec<RecordBatch> = Vec::with_capacity(per_round);
+    let mut folded: Option<agg::Partial> = None;
+    let mut rows_in: u64 = 0;
+
+    for morsel in input {
+        let morsel = morsel?;
+        if morsel.num_rows() == 0 {
+            continue;
+        }
+        rows_in += morsel.num_rows() as u64;
+        for piece in slice_to_morsels(morsel) {
+            buf.push(piece);
+            if buf.len() >= per_round {
+                folded = Some(fold_round(
+                    &mut buf, group_keys, aggregates, jit, &funcs, folded,
+                )?);
+            }
+        }
+    }
+    if !buf.is_empty() {
+        folded = Some(fold_round(
+            &mut buf, group_keys, aggregates, jit, &funcs, folded,
+        )?);
+    }
+    Ok((folded, rows_in))
+}
+
+/// One batch as morsel-sized, in-order, **zero-copy** slices — itself when it already fits.
+///
+/// `RecordBatch::slice` shares the parent's buffers, so this changes only where the fold's units
+/// of work begin and end. Order is the slice order, which is the batch's own row order.
+fn slice_to_morsels(batch: RecordBatch) -> Vec<RecordBatch> {
+    let rows = batch.num_rows();
+    if rows <= bc_arrow::DEFAULT_MORSEL_ROWS {
+        return vec![batch];
+    }
+    (0..rows)
+        .step_by(bc_arrow::DEFAULT_MORSEL_ROWS)
+        .map(|start| batch.slice(start, bc_arrow::DEFAULT_MORSEL_ROWS.min(rows - start)))
+        .collect()
+}
+
+/// One round of [`fold_partial_parallel`]: `partial` every buffered morsel in parallel, then
+/// combine them (and the partial carried in from earlier rounds) into one.
+fn fold_round(
+    buf: &mut Vec<RecordBatch>,
+    group_keys: &[bc_ir::ProjectionItem],
+    aggregates: &[bc_ir::AggregateItem],
+    jit: &std::sync::OnceLock<ops::AggJit>,
+    funcs: &[agg::AggFunc],
+    carried: Option<agg::Partial>,
+) -> Result<agg::Partial, InterpError> {
+    // Compiled once per query, before the fan-out, and shared by every worker — the same
+    // `OnceLock` contract `fold_partial` documents. Compiling inside the `par_iter` would pay
+    // Cranelift's per-expression cost once per core.
+    let compiled = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &buf[0]));
+    let mut partials: Vec<agg::Partial> = buf
+        .par_iter()
+        .map(|m| ops::eval_partial_jit(m, group_keys, aggregates, compiled))
+        .collect::<Result<Vec<_>, _>>()?;
+    buf.clear();
+    if let Some(prev) = carried {
+        partials.push(prev);
+    }
+    agg::combine(&partials, funcs).map_err(Into::into)
 }
 
 /// Run a breaker over its (streamed) input and return its materialized output.
@@ -41,9 +155,18 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // which is O(groups). The fold reports the rows it consumed, which is this operator's
             // `rows_in`: Kyber's selectivity model reads `rows_out / rows_in`, so a zero here
             // would not be a missing number, it would be a *wrong* one.
-            // Sequential breaker: a fresh cell, compiled once on the first morsel.
+            // A fresh cell, compiled once on the first morsel that carries rows.
             let jit = std::sync::OnceLock::new();
-            match fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)? {
+            // `ctx.workers` is 1 inside a sharded worker (the shard *is* the parallelism, and
+            // fanning out again would nest rayon) and the real width on the un-sharded fallback
+            // path — where nothing else is spreading this fold across the machine.
+            let stream = build_with(input, ctx)?;
+            let folded = if ctx.workers > 1 {
+                fold_partial_parallel(stream, group_keys, aggregates, &jit, ctx.workers)?
+            } else {
+                fold_partial(stream, group_keys, aggregates, &jit)?
+            };
+            match folded {
                 (Some(merged), rows_in) => {
                     // Both halves of the state, not just the keys. The accumulator columns
                     // are the half that can actually be unbounded: a holistic aggregate

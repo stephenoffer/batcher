@@ -41,9 +41,10 @@ from batcher.api import session as _session
 from batcher.api.dataset import Dataset, GroupBy
 from batcher.api.functions import *  # noqa: F403  (governed by functions.__all__)
 from batcher.api.io_namespace import read as _read_namespace
-from batcher.api.security import security
+from batcher.api.security import authenticate, current_verifier, security, set_verifier
 from batcher.api.session import *  # noqa: F403  (governed by session.__all__)
 from batcher.api.sql_session import Session
+from batcher.core.runtime import cancel_query, running_queries
 from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
 from batcher.observe import start_ui, stop_ui, ui_url
 from batcher.plan.streaming import OutputMode, Trigger
@@ -84,7 +85,12 @@ __all__ = [
     "SecurityCatalog",
     "Session",
     "Trigger",
+    "authenticate",
+    "cancel_query",
+    "current_verifier",
     "security",
+    "running_queries",
+    "set_verifier",
     "start_ui",
     "stop_ui",
     "ui_url",

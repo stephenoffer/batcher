@@ -12,6 +12,7 @@ Functions take the translator instance (`tr`) as their first argument.
 from __future__ import annotations
 
 import pyarrow as pa
+from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
 from batcher._sql.parser import udf
@@ -25,8 +26,6 @@ from batcher.plan.schema import suggest_columns
 
 
 def _from(tr, node) -> Dataset:
-    from sqlglot import expressions as exp
-
     from_ = node.args.get("from_") or node.args.get("from")
     if from_ is None:
         # `SELECT <exprs>` with no FROM → one row of constants (e.g.
@@ -228,8 +227,6 @@ def _outer_join_residual(tr, left: Dataset, right: Dataset, extra, how: str):
     sides preserved), cannot be expressed this way and is rejected rather than
     silently mis-answered. Returns ``(left, right, remaining_residual_or_None)``.
     """
-    from sqlglot import expressions as exp
-
     refs = {c.name for c in extra.find_all(exp.Column)}
     left_cols, right_cols = set(left.columns), set(right.columns)
     if how == "left" and refs <= right_cols and not (refs & left_cols):
@@ -250,8 +247,6 @@ def _reject_ambiguous_residual(extra, left: Dataset, right: Dataset, keys: set[s
     (``a.v`` and ``b.v`` both resolve to ``v``), so a collision would be evaluated
     against the wrong column. Surface it instead of returning a wrong answer.
     """
-    from sqlglot import expressions as exp
-
     collisions = (set(left.columns) & set(right.columns)) - keys
     referenced = {c.name for c in extra.find_all(exp.Column)}
     ambiguous = sorted(referenced & collisions)
@@ -264,8 +259,6 @@ def _reject_ambiguous_residual(extra, left: Dataset, right: Dataset, keys: set[s
 
 def _split_join_on(on):
     """Split an ``ON`` predicate into ``(equi key pairs, residual predicate)``."""
-    from sqlglot import expressions as exp
-
     eq_pairs: list[tuple[str, str]] = []
     residual: list = []
     for conj in _and_conjuncts(on):
@@ -284,8 +277,6 @@ def _split_join_on(on):
 
 
 def _table(tr, node) -> Dataset:
-    from sqlglot import expressions as exp
-
     # A PIVOT / UNPIVOT modifier reshapes the table. sqlglot attaches it as `pivots`;
     # it maps onto the relational `Dataset.pivot` / `unpivot` the engine already has, so
     # it is applied rather than rejected. Deferred until after the base relation is
@@ -339,8 +330,6 @@ def _apply_pivots(ds: Dataset, pivots) -> Dataset:
     Returns:
         The reshaped dataset.
     """
-    from sqlglot import expressions as exp
-
     if len(pivots) != 1:
         raise NotImplementedError("only a single PIVOT / UNPIVOT modifier is supported")
     piv = pivots[0]
@@ -380,8 +369,6 @@ def _apply_pivots(ds: Dataset, pivots) -> Dataset:
 
 def _values_literal(node):
     """The Python value a VALUES cell denotes (constant literals only)."""
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.Null):
         return None
     if isinstance(node, exp.Boolean):

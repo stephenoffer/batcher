@@ -48,6 +48,7 @@ def _drop_unreachable(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_drop_unreachable,
+    expr_matches=(Case,),
 )
 def case_drop_unreachable_branches(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Delete a `WHEN` whose condition is the literal FALSE: a branch fires only where its condition
@@ -77,6 +78,7 @@ def _first_true(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_first_true,
+    expr_matches=(Case,),
 )
 def case_first_true_branch_wins(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """A `WHEN` whose condition is the literal TRUE becomes the `ELSE`, and every branch after it
@@ -101,6 +103,7 @@ def _all_same_result(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_all_same_result,
+    expr_matches=(Case,),
 )
 def case_all_branches_same_result(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Every arm (each `then` *and* the `otherwise`) is the same expression → that expression.
@@ -121,6 +124,7 @@ def _no_branches(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_no_branches,
+    expr_matches=(Case,),
 )
 def case_no_branches_to_else(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """A `CASE` with no `WHEN` branches left is its `ELSE`: with nothing to select, every row falls
@@ -151,6 +155,7 @@ def _dedup_conditions(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_dedup_conditions,
+    expr_matches=(Case,),
 )
 def case_drop_duplicate_conditions(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Delete a `WHEN` whose condition repeats an earlier branch's. Wherever the later condition is
@@ -176,6 +181,7 @@ def _case_to_coalesce(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_case_to_coalesce,
+    expr_matches=(Case, IsNotNull, IsNull),
 )
 def case_to_coalesce(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`CASE WHEN x IS NOT NULL THEN x ELSE y END` → `coalesce(x, y)`, and the mirrored
@@ -205,6 +211,7 @@ def _nullif_distinct_literals(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_nullif_distinct_literals,
+    expr_matches=(Lit, NullIf),
 )
 def nullif_distinct_literals(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NULLIF(a, b)` over two *distinct* literals of one type → `a`. NULLIF nulls its left operand
@@ -230,6 +237,7 @@ def _coalesce_flatten(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_coalesce_flatten,
+    expr_matches=(Coalesce,),
 )
 def coalesce_flatten_nested(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, coalesce(b, c))` → `coalesce(a, b, c)`. "First non-null" is associative: the
@@ -261,6 +269,7 @@ def _coalesce_drop_unreachable(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_coalesce_drop_unreachable,
+    expr_matches=(Coalesce, Lit),
 )
 def coalesce_drop_nulls_after_first_non_null(
     node: _Node, _ctx: OptimizerContext
@@ -284,6 +293,7 @@ def _coalesce_single(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_coalesce_single,
+    expr_matches=(Coalesce,),
 )
 def coalesce_single_arg(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(x)` → `x`. The first non-null of one argument is that argument (a null `x` yields
@@ -309,6 +319,7 @@ def _coalesce_dedup(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_coalesce_dedup,
+    expr_matches=(Coalesce,),
 )
 def coalesce_dedup_args(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, a, b)` → `coalesce(a, b)` — drop an argument identical to the one before it.

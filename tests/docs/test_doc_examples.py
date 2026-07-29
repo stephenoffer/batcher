@@ -19,6 +19,11 @@ Contract for doc authors:
   ``# docs: run``.
 - Examples should be self-contained within a page and use in-memory data
   (``bt.from_pydict``), so the suite needs no fixtures on disk.
+- A page is executed in its own empty temporary directory, so a block that *does*
+  write a relative path (``write.parquet("events/a.parquet")``, a key file for a
+  ``file:`` secret reference) leaves the repository clean. Running the suite used to
+  drop those artifacts in the repo root, where an untracked ``aes.key`` sat waiting
+  for the next ``git add -A``.
 """
 
 from __future__ import annotations
@@ -61,13 +66,18 @@ def _runnable_blocks(text: str, *, opt_in: bool) -> list[str]:
 @pytest.mark.docs
 @pytest.mark.integration
 @pytest.mark.parametrize("path", _doc_files(), ids=lambda p: str(p.relative_to(DOCS_ROOT)))
-def test_doc_examples(path: Path) -> None:
+def test_doc_examples(path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run every non-skipped python block in one doc page, in order."""
     rel = path.relative_to(DOCS_ROOT)
     opt_in = bool(rel.parts) and rel.parts[0] in _DESIGN_SECTIONS
     blocks = _runnable_blocks(path.read_text(), opt_in=opt_in)
     if not blocks:
         pytest.skip("no runnable python blocks")
+    # Each page gets its own empty directory as cwd. Examples are documented as
+    # self-contained and in-memory, so nothing here reads a repo-relative path — but the
+    # ones that *write* one (a parquet glob, a `file:` secret key) would otherwise land in
+    # the repository root and be swept up by the next `git add -A`.
+    monkeypatch.chdir(tmp_path)
     namespace: dict[str, object] = {}
     for index, block in enumerate(blocks):
         try:

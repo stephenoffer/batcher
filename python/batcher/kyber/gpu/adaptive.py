@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber.ols import fit_ols, ols_update
+from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -68,8 +69,8 @@ def record_backend_timing(
         return
     try:
         key = _bucket(backend, accelerator_type)
-        s = hub.get_keyed_param(_NS, key) or {}
-        hub.put_keyed_param(_NS, key, ols_update(s, float(rows), float(wall_ms)))
+        s = hub.get_keyed_param(scoped(_NS), key) or {}
+        hub.put_keyed_param(scoped(_NS), key, ols_update(s, float(rows), float(wall_ms)))
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "record backend timing", exc)
         return
@@ -97,10 +98,10 @@ def learned_gpu_min_rows(
     if hub is None:
         return None
     try:
-        gpu = _fit(hub.get_keyed_param(_NS, _bucket("gpu", accelerator_type)) or {})
+        gpu = _fit(hub.get_keyed_param(scoped(_NS), _bucket("gpu", accelerator_type)) or {})
         if gpu is None and accelerator_type:
-            gpu = _fit(hub.get_keyed_param(_NS, "gpu") or {})
-        cpu = _fit(hub.get_keyed_param(_NS, "cpu") or {})
+            gpu = _fit(hub.get_keyed_param(scoped(_NS), "gpu") or {})
+        cpu = _fit(hub.get_keyed_param(scoped(_NS), "cpu") or {})
     except Exception as exc:  # pragma: no cover
         note_suppressed("kyber", "fit gpu crossover", exc)
         return None

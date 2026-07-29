@@ -23,7 +23,12 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.expr_ir import Binary, Col, Expr, referenced_columns, remap_columns
-from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts, substitute_columns
+from batcher.plan.expr_rewrite import (
+    combine_conjuncts,
+    expr_key,
+    split_conjuncts,
+    substitute_columns,
+)
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -387,11 +392,13 @@ def _add_inferred(
     """Add each `constraints` conjunct, rephrased onto `target_key`, to `target` —
     unless an identical conjunct is already present. Returns `(plan, changed)`."""
     current = split_conjuncts(target.predicate) if isinstance(target, Filter) else []
-    existing = [c.to_ir() for c in current]
+    # A set of canonical (memoized) keys, not a list of IR dicts: dicts are unhashable, so
+    # the "already present?" test was a linear scan with a full dict comparison per step.
+    existing = {expr_key(c) for c in current}
     fresh = [
         remapped
         for c in constraints
-        if (remapped := remap_columns(c, {source_key: target_key})).to_ir() not in existing
+        if expr_key(remapped := remap_columns(c, {source_key: target_key})) not in existing
     ]
     if not fresh:
         return target, False

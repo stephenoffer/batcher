@@ -107,13 +107,29 @@ mod tls;
 mod tls_test_certs;
 
 pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
-pub use shared::{clear_shared, fetch_shared, publish_shared, shm_available};
+pub use shared::{clear_plan_shared, clear_shared, fetch_shared, publish_shared, shm_available};
 pub use ticket::ShuffleTicket;
 pub use tls::{TlsClientConfig, TlsIdentity, TlsServerConfig};
 
 /// Default number of in-flight `RecordBatch` credits for a credit-bounded
 /// exchange when the caller does not specify one.
-pub const DEFAULT_CREDITS: u32 = 4;
+///
+/// **Kept equal to `FlowControlConfig.default_credits` on the control-plane side.** This
+/// is the value in force whenever Carbonite does not hand one down: a `ShuffleSession`
+/// built without an explicit grant passes `credits=None`, and a producer that receives a
+/// missing or malformed seed falls back here too. It was 4 while the control plane's
+/// authority said 16, so exactly the paths where Carbonite had *not* spoken ran at the
+/// throttled window — measured on a 50 ms-RTT link, one 18 MiB partition moves at
+/// 2.4 MiB/s at 4 credits and 7.7 MiB/s at 16 (3.2x), because a cross-node fetch's
+/// throughput ceiling is `window x batch / RTT` and 4 batches do not fill the
+/// bandwidth-delay product.
+///
+/// This is a *starting* window, not a ceiling: the AIMD controller and the byte-budgeted
+/// `credit_ceiling` still govern what a channel may grow to, so raising the floor changes
+/// how fast a short fetch reaches its operating point, not how much memory it may hold.
+/// At the default 1 MiB morsel it is ~16 MiB per channel, well inside the 256 MiB
+/// per-channel budget.
+pub const DEFAULT_CREDITS: u32 = 16;
 
 /// HTTP/2 per-stream receive window for a bulk Arrow transfer.
 ///
@@ -224,6 +240,22 @@ mod tunables {
     /// link and gives up fast on incompressible data (near-free there).
     static COMPRESSION: AtomicU64 = AtomicU64::new(1);
 
+    /// Byte cap on the in-memory shuffle-output store, `0` = unbounded (the default, and
+    /// the historical behaviour). Above it the store spills its largest published buckets
+    /// to local disk and reads them back on fetch — result-preserving, so this trades a
+    /// re-read for a memory bound. Set per worker from Carbonite, which knows the envelope.
+    static SHUFFLE_STORE_CAP: AtomicU64 = AtomicU64::new(0);
+
+    /// Set the in-memory shuffle-store cap in bytes (`0` disables spilling).
+    pub fn set_shuffle_store_cap(bytes: u64) {
+        SHUFFLE_STORE_CAP.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The current in-memory shuffle-store cap in bytes (`0` = unbounded).
+    pub fn shuffle_store_cap() -> usize {
+        SHUFFLE_STORE_CAP.load(Ordering::Relaxed) as usize
+    }
+
     /// Set the shuffle wire-compression codec (0 none / 1 lz4 / 2 zstd). Values outside
     /// that range are ignored (keep current). Settable per worker from Carbonite.
     pub fn set_compression(code: u64) {
@@ -274,7 +306,8 @@ mod tunables {
 
 pub use tunables::{
     client_tls, compression, connections_per_peer, fetch_idle_timeout, keepalive, set_client_tls,
-    set_compression, set_connections_per_peer, set_transport_timeouts,
+    set_compression, set_connections_per_peer, set_shuffle_store_cap, set_transport_timeouts,
+    shuffle_store_cap,
 };
 
 impl From<tonic::Status> for TransportError {
@@ -843,6 +876,226 @@ mod tests {
             max_inflight >= 1 && max_inflight <= WINDOW as i64,
             "in-flight high-water mark {max_inflight} must be within (0, {WINDOW}]",
         );
+    }
+
+    /// A consumer that over-grants must not be able to make the producer buffer past the
+    /// window it seeded.
+    ///
+    /// The credit bound used to be the *consumer's* arithmetic: the producer added
+    /// whatever permits arrived. A reducer with a buggy top-up — or one that simply
+    /// claimed more — made a healthy mapper encode and hold its whole partition, and a
+    /// large enough claim panicked the serve task outright on `add_permits`. This drives
+    /// the exchange by hand so it can grant dishonestly, then checks the producer's own
+    /// in-flight gauge.
+    #[tokio::test]
+    async fn an_over_granting_consumer_cannot_widen_the_producers_window() {
+        const N: i64 = 60;
+        const WINDOW: u32 = 4;
+
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(9, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, N)).await;
+
+        let mut client = FlightClient::connect(&addr).await.unwrap();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
+        let ticket_str = ticket.to_string();
+        let first = FlightData {
+            flight_descriptor: Some(arrow_flight::FlightDescriptor {
+                r#type: arrow_flight::flight_descriptor::DescriptorType::Path as i32,
+                path: vec![ticket_str, String::new()],
+                ..Default::default()
+            }),
+            app_metadata: handler::encode_credits(WINDOW).into(),
+            ..Default::default()
+        };
+        grant_tx.send(first).await.unwrap();
+
+        let request = futures::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(grant_rx),
+            Ok::<_, arrow_flight::error::FlightError>,
+        );
+        let mut response = client.do_exchange(request).await.unwrap();
+
+        // Drain, granting back a wildly inflated top-up after every batch.
+        let mut seen = 0i64;
+        while let Ok(Some(_batch)) = response.try_next().await {
+            seen += 1;
+            let _ = grant_tx
+                .send(FlightData {
+                    app_metadata: handler::encode_credits(100_000).into(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        drop(grant_tx);
+
+        assert_eq!(seen, N, "the transfer must still complete");
+        let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+        // `WINDOW + 1`, and the `+ 1` is real rather than slack. The clamp reads
+        // `available_permits()` to decide how much room a grant may fill, while the
+        // producer decrements that same count at `acquire()` and only marks the batch
+        // in-flight at `on_send()`. A grant landing between those two points sees one more
+        // slot free than the gauge will shortly show, so in-flight can transiently reach
+        // one past the window. Closing it would need the permit count and the gauge to move
+        // under one lock, on the per-batch path, to buy back a single batch slot.
+        //
+        // What matters is that the bound is *a* bound: without the clamp this same test
+        // observes 56 in flight against a seeded window of 4 — the producer encoding its
+        // whole partition because the consumer said it could.
+        assert!(
+            max_inflight <= WINDOW as i64 + 1,
+            "a dishonest consumer widened the producer's window to {max_inflight} (seeded {WINDOW})",
+        );
+    }
+
+    /// A `ClientPool` is process-lifetime and keyed by advertised address, and a worker
+    /// advertises an *ephemeral* port — so every peer restart, autoscaling replacement, and
+    /// actor recycle mints a new key. Nothing ever removed one, so each dead peer kept its
+    /// entry and up to `connections_per_peer` live HTTP/2 connections: an unbounded leak of
+    /// memory and file descriptors in the one process that outlives every query.
+    #[tokio::test]
+    async fn a_peer_that_proves_unreachable_is_dropped_from_the_pool() {
+        let pool = ClientPool::new();
+        let ticket = ShuffleTicket::new(3, 0, 0, 0, 0);
+
+        // A port nothing is listening on: connect fails, the redial fails, the peer goes.
+        let dead = "127.0.0.1:1";
+        assert!(pool.fetch_with_credits(dead, &ticket, 4).await.is_err());
+        assert_eq!(
+            pool.connection_count(),
+            0,
+            "an unreachable peer kept its pool entry and its connections",
+        );
+    }
+
+    /// The eviction must be tied to proven unreachability, not to idleness: a live peer
+    /// that is merely quiet between queries should keep its warm connections, since
+    /// re-establishing them is exactly the cost this pool exists to avoid.
+    #[tokio::test]
+    async fn a_live_but_idle_peer_keeps_its_pooled_connections() {
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(4, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, 3)).await;
+
+        let pool = ClientPool::new();
+        assert_eq!(
+            pool.fetch_with_credits(&addr, &ticket, 4)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(pool.connection_count(), 1);
+
+        // A second fetch after the first finished must reuse the entry, not rebuild it.
+        assert_eq!(
+            pool.fetch_with_credits(&addr, &ticket, 4)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            pool.connection_count(),
+            1,
+            "a live peer's pool entry was dropped"
+        );
+    }
+
+    /// A **slow** consumer, which is the case every other flow-control test misses.
+    ///
+    /// The existing tests drain as fast as the producer can send, so the semaphore is
+    /// almost never empty when the producer reaches it — the blocking path that *is* the
+    /// flow control is barely exercised. Pausing between reads forces the producer to park
+    /// at zero credits repeatedly, which is the condition the bound exists for: without it
+    /// a fast mapper encodes its whole partition into the transport while a busy reducer
+    /// works through the first few batches.
+    #[tokio::test]
+    async fn a_slow_consumer_parks_the_producer_at_its_window() {
+        const N: i64 = 40;
+        const WINDOW: u32 = 3;
+
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(11, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, N)).await;
+
+        let mut client = FlightClient::connect(&addr).await.unwrap();
+        let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
+        grant_tx
+            .send(FlightData {
+                flight_descriptor: Some(arrow_flight::FlightDescriptor {
+                    r#type: arrow_flight::flight_descriptor::DescriptorType::Path as i32,
+                    path: vec![ticket.to_string(), String::new()],
+                    ..Default::default()
+                }),
+                app_metadata: handler::encode_credits(WINDOW).into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = futures::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(grant_rx),
+            Ok::<_, arrow_flight::error::FlightError>,
+        );
+        let mut response = client.do_exchange(request).await.unwrap();
+
+        let mut seen = 0i64;
+        while let Ok(Some(_)) = response.try_next().await {
+            seen += 1;
+            // Work between reads: the producer must wait rather than run ahead.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let _ = grant_tx
+                .send(FlightData {
+                    app_metadata: handler::encode_credits(1).into(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        drop(grant_tx);
+
+        assert_eq!(seen, N, "a slow consumer must still receive every batch");
+        let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+        assert!(
+            max_inflight <= WINDOW as i64 + 1,
+            "the producer ran {max_inflight} ahead of a slow consumer (window {WINDOW})",
+        );
+        assert!(
+            max_inflight >= WINDOW as i64,
+            "the producer filled only {max_inflight} of {WINDOW} credits, so it never \
+             parked — this test is not exercising the blocking path it exists for"
+        );
+    }
+
+    /// The bound must hold across window sizes, not just the two the other tests pick.
+    #[tokio::test]
+    async fn the_credit_bound_holds_across_window_sizes() {
+        for (n, window) in [(1i64, 1u32), (7, 1), (25, 2), (25, 8), (60, 5), (13, 64)] {
+            let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+            let addr = producer.addr().to_string();
+            let ticket = ShuffleTicket::new(12, 0, 0, 0, 0);
+            producer.publish(&ticket, seq_batches(0, n)).await;
+
+            let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, window)
+                .await
+                .unwrap();
+            assert_eq!(got.len() as i64, n, "n={n} window={window}: lost batches");
+            for (i, b) in got.iter().enumerate() {
+                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(
+                    col.value(0),
+                    i as i64,
+                    "n={n} window={window}: out of order"
+                );
+            }
+            let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+            assert!(
+                max_inflight >= 1 && max_inflight <= window as i64,
+                "n={n} window={window}: in-flight high-water {max_inflight} outside (0, {window}]",
+            );
+        }
     }
 
     #[tokio::test]

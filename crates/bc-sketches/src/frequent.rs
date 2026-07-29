@@ -23,14 +23,28 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use crate::{Mergeable, SEED};
+use crate::Mergeable;
 
-/// The counter table. Hashed with the crate's **fixed-seed** ahash rather than std's
-/// randomly-seeded SipHash: the update runs once per row of every sketched column, where
-/// SipHash's per-key cost is a material share of the sketch, and a fixed seed keeps the
-/// summary reproducible across processes (the `Mergeable` contract — partition-built
-/// sketches must merge identically). Iteration order does not reach a result: `heavy_hitters`
-/// sorts its output, and the decrement step touches every counter uniformly.
+/// The counter table's hasher — **process-local**, and separate from the crate's
+/// cross-process [`crate::SEED`] on purpose.
+///
+/// This one only picks buckets inside one `HashMap`; the value never leaves the process
+/// and no merged result depends on it. `merge` accumulates counts (commutative) and
+/// `reduce_to_capacity` sorts the counts and applies a value threshold, so neither is
+/// sensitive to iteration order — which is what makes `ahash`, the faster choice, also the
+/// correct one here.
+const TABLE_HASHER: ahash::RandomState =
+    ahash::RandomState::with_seeds(0xC0FF_EE01, 0xDEAD_BEEF, 0x1234_5678, 0xABCD_EF01);
+
+/// The counter table. Hashed with [`TABLE_HASHER`] rather than std's randomly-seeded
+/// SipHash: the update runs once per row of every sketched column, where SipHash's per-key
+/// cost is a material share of the sketch.
+///
+/// What makes this safe is **not** the fixed seed — a fixed `ahash` seed is not reproducible
+/// across builds, only within one — but that no result depends on the hash at all. Iteration
+/// order never reaches an answer: `heavy_hitters` sorts its output, `merge` sums counts, and
+/// `reduce_to_capacity` thresholds on a sorted count. The `Mergeable` contract holds because
+/// the *algorithm* is order-independent, which is a stronger guarantee than a seed.
 type Counters<K> = HashMap<K, u64, ahash::RandomState>;
 
 /// A Misra-Gries summary tracking up to `capacity` candidate heavy-hitter keys.
@@ -49,7 +63,7 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
         assert!(capacity >= 1, "capacity must be >= 1");
         Self {
             capacity,
-            counters: HashMap::with_capacity_and_hasher(capacity + 1, SEED),
+            counters: HashMap::with_capacity_and_hasher(capacity + 1, TABLE_HASHER),
             total: 0,
         }
     }

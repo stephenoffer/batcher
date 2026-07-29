@@ -21,6 +21,7 @@ from batcher.dist.fleet._fleet import (
     session_fleet_lease,
     set_fleet,
 )
+from batcher.dist.fleet.eviction import evict_plan, fleet_actors_for_eviction
 from batcher.dist.fleet.source import FlightFetchSplit, FlightMaterializedSource
 
 __all__ = [
@@ -29,6 +30,8 @@ __all__ = [
     "ShuffleFleet",
     "acquire_fleet",
     "current_fleet",
+    "evict_plan",
+    "fleet_actors_for_eviction",
     "maybe_spawn_query_fleet",
     "release_fleet",
     "release_session_fleet",

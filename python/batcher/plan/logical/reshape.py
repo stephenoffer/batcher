@@ -10,6 +10,7 @@ from `plan.ir_tags`.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -163,7 +164,11 @@ class Unpivot(LogicalPlan):
 
     def __post_init__(self) -> None:
         available = self.input.available_columns()
-        missing = [c for c in (*self.index, *self.on) if c not in available]
+        # `index` carries every column the unpivot keeps, so this checks O(width) names
+        # against O(width) columns — quadratic against a list, linear against a set. The
+        # list itself is kept for the error message, which reports the columns in order.
+        present = set(available)
+        missing = [c for c in (*self.index, *self.on) if c not in present]
         if missing:
             raise PlanError(f"unpivot columns {missing} not found in input columns: {available}")
         if not self.on:
@@ -172,7 +177,10 @@ class Unpivot(LogicalPlan):
         # them (e.g. value_name == an index column) would produce two columns of the same
         # name and silently drop one on the way out. Reject it, like Polars does.
         out = [*self.index, self.variable_name, self.value_name]
-        dups = sorted({c for c in out if out.count(c) > 1})
+        # Counted in one pass: `index` is every column the unpivot carries through, so a
+        # `list.count()` per element made validating a wide unpivot quadratic in its width.
+        seen = Counter(out)
+        dups = sorted(c for c, n in seen.items() if n > 1)
         if dups:
             raise PlanError(
                 f"unpivot output columns collide: {dups} — variable_name/value_name must "

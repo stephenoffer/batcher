@@ -6,15 +6,25 @@
 //! equals any literal, and `NULL OR NULL = NULL`). This is also the kernel a runtime
 //! join filter uses to prune a probe side by the build side's key set.
 
-use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
+use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type};
 use arrow::error::ArrowError;
 
-use crate::{ExprError, Literal};
+use crate::{BinaryOp, ExprError, Literal};
+
+/// The set type for the hashed path.
+///
+/// `std::collections::HashSet` defaults to SipHash, which is ~20–30 cycles per probe and was
+/// the whole cost of a large `IN` over a wide column: a 204-member `l_partkey IN (…)` over
+/// TPC-H `lineitem` measured 13.2 ms against 4.4 ms for an 8-member (linear-scan) list on the
+/// same 6M rows, and set size cannot explain that for an O(1) probe — the hash can. `ahash` is
+/// already the workspace's hasher for exactly this reason (`bc-runtime`'s join tables use it),
+/// and membership is hasher-independent, so the mask is unchanged.
+type FastSet<T> = std::collections::HashSet<T, ahash::RandomState>;
 
 /// At/below this many members, a linear scan of the set beats hashing every input row.
 ///
@@ -35,7 +45,7 @@ const LINEAR_SCAN_MAX: usize = 8;
 /// membership is method-independent), so the produced mask is bit-for-bit unchanged.
 enum Members<T> {
     Linear(Vec<T>),
-    Hashed(HashSet<T>),
+    Hashed(FastSet<T>),
 }
 
 impl<T: Hash + Eq> Members<T> {
@@ -56,26 +66,54 @@ impl<T: Hash + Eq> Members<T> {
     }
 }
 
+/// A membership test over an *ordered* domain, guarded by the set's `[min, max]`.
+///
+/// A value outside the members' range cannot be a member, so two predictable compares reject
+/// it without hashing. That costs an in-range row two compares it did not pay before, and
+/// saves an out-of-range row the whole hash — which is the shape that matters here, because
+/// the sets this kernel is handed by a pushed-down join filter are a narrow key range probed
+/// by a whole fact table. Bit-identical either way: the bounds only ever short-circuit a
+/// `false` the set lookup would have returned anyway.
+///
+/// Only for types with a total order matching equality — integers and dates. Floats are
+/// keyed by their raw bit pattern (see the `Float64` arm), which is not ordered like the
+/// values, and strings would pay a `memcmp` against each bound to save one hash.
+struct Ranged<T> {
+    members: Members<T>,
+    /// `None` for an empty set: nothing is a member.
+    bounds: Option<(T, T)>,
+}
+
+impl<T: Hash + Eq + Ord + Copy> Ranged<T> {
+    fn new(items: Vec<T>) -> Self {
+        let bounds = items.iter().copied().min().zip(items.iter().copied().max());
+        Self {
+            members: Members::new(items),
+            bounds,
+        }
+    }
+
+    #[inline]
+    fn contains(&self, value: T) -> bool {
+        match self.bounds {
+            Some((lo, hi)) => value >= lo && value <= hi && self.members.contains(&value),
+            None => false,
+        }
+    }
+}
+
 /// Evaluate `array IN set` to a `BooleanArray` (null where `array` is null).
 pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef, ExprError> {
     let out: BooleanArray = match array.data_type() {
         DataType::Int64 => {
             let a = array.as_primitive::<Int64Type>();
-            let members = Members::new(set.iter().filter_map(literal_i64).collect());
-            membership(
-                a.len(),
-                |i| a.is_valid(i),
-                |i| members.contains(&a.value(i)),
-            )
+            let members = Ranged::new(set.iter().filter_map(literal_i64).collect());
+            membership(a.nulls(), a.len(), |i| members.contains(a.value(i)))
         }
         DataType::Date32 => {
             let a = array.as_primitive::<Date32Type>();
-            let members = Members::new(set.iter().filter_map(literal_date).collect());
-            membership(
-                a.len(),
-                |i| a.is_valid(i),
-                |i| members.contains(&a.value(i)),
-            )
+            let members = Ranged::new(set.iter().filter_map(literal_date).collect());
+            membership(a.nulls(), a.len(), |i| members.contains(a.value(i)))
         }
         // A float column can reach `InList`: the fold rule collapses a chain of
         // `float_col = <int literal>` disjuncts (integers are foldable literals) into an
@@ -93,20 +131,14 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
                     .map(f64::to_bits)
                     .collect(),
             );
-            membership(
-                a.len(),
-                |i| a.is_valid(i),
-                |i| members.contains(&a.value(i).to_bits()),
-            )
+            membership(a.nulls(), a.len(), |i| {
+                members.contains(&a.value(i).to_bits())
+            })
         }
         DataType::Utf8 => {
             let a = array.as_string::<i32>();
             let members = Members::new(set.iter().filter_map(literal_str).collect());
-            membership(
-                a.len(),
-                |i| a.is_valid(i),
-                |i| members.contains(&a.value(i)),
-            )
+            membership(a.nulls(), a.len(), |i| members.contains(&a.value(i)))
         }
         // A dictionary-encoded column: evaluate membership on the *dictionary values* (a
         // handful of distinct entries) once, then gather one bit per row through the keys.
@@ -120,25 +152,68 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
             let out = arrow::compute::take(&member_over_values, dict.keys(), None)?;
             return Ok(out);
         }
-        other => {
-            // `InList` is only emitted (by the fold rule) for these column types, so an
-            // other dtype is a planner bug rather than user data.
-            return Err(
-                ArrowError::ComputeError(format!("in_list unsupported for {other:?}")).into(),
-            );
-        }
+        // Any other column type — a timestamp against date literals, a decimal price against
+        // integer literals, a boolean. The fold rule that emits `InList` is a
+        // predicate-*shape* rewrite: it sees literals, not the column's dtype (which it
+        // cannot know without the schema), so it can hand this kernel a type the typed arms
+        // above do not accelerate. Delegating to the very form it folded from is what keeps
+        // the rewrite unconditionally safe — the answer here is `eval_binary`'s, including
+        // its coercions, so `IN` can neither refuse a pair `=` accepts nor invent one it
+        // rejects. Before that arm existed this returned "in_list unsupported for {dtype}",
+        // which failed queries the unfolded chain ran happily.
+        _ => return membership_generic(array, set),
     };
     Ok(Arc::new(out))
 }
 
-/// One bool per row: `null` where invalid, else whether the value is a member.
-/// `contains` is only called on valid rows, so it never reads a null slot.
+/// Membership over a column type the typed arms do not cover, by the OR-of-equality the
+/// fold collapsed from.
+///
+/// Compares the column against each literal with the *same* `eval_binary` the `col = lit`
+/// path uses — so coercion, float canonicalization, and type promotion are whatever that
+/// path does — then ORs the result bits and re-applies the input's null mask. That mask is
+/// the whole of the null story: every member is a non-null literal, so a row is null
+/// exactly when its input is, which is `NULL IN set = NULL`. A literal of a kind the
+/// column cannot be compared to surfaces `eval_binary`'s own error rather than a bespoke
+/// one, and a member the typed arms would have skipped (a `Literal` of the wrong kind)
+/// simply never matches, matching their `filter_map`.
+fn membership_generic(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef, ExprError> {
+    let n = array.len();
+    let mut hit = BooleanBuffer::new_unset(n);
+    for member in set {
+        let eq = crate::eval::binary::eval_binary(BinaryOp::Eq, array, &member.to_array(n))?;
+        let eq = eq.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+            ArrowError::ComputeError(format!(
+                "in_list: `=` on {:?} is not boolean",
+                array.data_type()
+            ))
+        })?;
+        // `values()` ignores `eq`'s nulls, i.e. treats "null = literal" as "no match".
+        // Correct here because the null rows are re-masked below.
+        hit = &hit | eq.values();
+    }
+    Ok(Arc::new(BooleanArray::new(hit, array.nulls().cloned())))
+}
+
+/// One bool per row: `null` where the input is null, else whether the value is a member.
+///
+/// `contains` is called for **every** slot, including null ones, and the result is masked
+/// afterwards. That is deliberate: testing validity per row makes the loop unpredictably
+/// branchy, while `collect_bool` fills the mask 64 bits at a time with no per-row branch, and
+/// the arrow accessors are in-bounds at a null slot (a primitive reads its buffer; a string's
+/// offsets are valid for every slot), so reading one is defined — its answer is simply thrown
+/// away. ANDing the values with the validity bitmap keeps the *value* bits zero under a null,
+/// so the output is bit-for-bit what the per-row `valid(i).then(…)` build produced.
 fn membership(
+    nulls: Option<&arrow::buffer::NullBuffer>,
     n: usize,
-    valid: impl Fn(usize) -> bool,
     contains: impl Fn(usize) -> bool,
 ) -> BooleanArray {
-    (0..n).map(|i| valid(i).then(|| contains(i))).collect()
+    let values = BooleanBuffer::collect_bool(n, contains);
+    match nulls {
+        None => BooleanArray::new(values, None),
+        Some(nb) => BooleanArray::new(&values & nb.inner(), Some(nb.clone())),
+    }
 }
 
 fn literal_i64(lit: &Literal) -> Option<i64> {
@@ -174,6 +249,8 @@ fn literal_str(lit: &Literal) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{Int64Array, StringArray};
+
     use super::*;
 
     fn run(arr: ArrayRef, set: &[Literal]) -> Vec<Option<bool>> {
@@ -200,6 +277,75 @@ mod tests {
         let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("13"), Some("99"), None]));
         let set = [Literal::Str("13".into()), Literal::Str("31".into())];
         assert_eq!(run(arr, &set), vec![Some(true), Some(false), None]);
+    }
+
+    /// A decimal column against integer literals — the shape the fold rule emits without
+    /// knowing the dtype (it sees foldable `int` literals; the column they are compared to
+    /// is whatever the file said). It has no typed arm, so it takes `membership_generic`,
+    /// which must answer what the `col = lit` chain it folded from would have — including
+    /// the null, and including `eval_binary`'s scale alignment, which is the whole reason
+    /// this cannot be a bespoke comparison.
+    #[test]
+    fn decimal_column_against_int_literals_matches_the_or_chain() {
+        use arrow::array::Decimal128Array;
+        // Scale 2: 1.00, 2.00, null, 5.00 — against the integer literals 1 and 5.
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(100), Some(200), None, Some(500)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let set = [Literal::Int(1), Literal::Int(5)];
+        assert_eq!(
+            run(arr, &set),
+            vec![Some(true), Some(false), None, Some(true)]
+        );
+    }
+
+    /// A timestamp column against date literals — the shape the fold rule emits without
+    /// knowing the dtype (a `date` literal is foldable; the column it is compared to may well
+    /// be a Timestamp). It has no typed arm, so it takes `membership_generic`, which must
+    /// answer what the `col = lit` chain it folded from would have.
+    ///
+    /// This is the case that pushed the DATE-to-TIMESTAMP widening into `eval_binary`: arrow
+    /// rejects `Timestamp == Date32` outright, so before that both the chain and the folded
+    /// form raised, while DuckDB answers the query. `tests/differential/test_diff_in_list.py`
+    /// pins the end-to-end result against DuckDB; this pins the kernel.
+    #[test]
+    fn timestamp_column_against_date_literals_matches_the_or_chain() {
+        use arrow::array::TimestampMicrosecondArray;
+        // 1970-01-02 and 1970-01-03 as microseconds; day 1 is in the set, day 2 is not.
+        let day = 86_400_000_000i64;
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(day),
+            Some(2 * day),
+            None,
+        ]));
+        let set = [Literal::Date(1), Literal::Date(5)];
+        assert_eq!(run(arr, &set), vec![Some(true), Some(false), None]);
+    }
+
+    /// The widening is to midnight, not a truncation of the timestamp to its date: a stamp
+    /// *within* the matching day is not a member. That is DuckDB's answer and SQL's, and it
+    /// is the direction that cannot lose information.
+    #[test]
+    fn a_timestamp_inside_the_day_is_not_a_member_of_that_date() {
+        use arrow::array::TimestampMicrosecondArray;
+        let day = 86_400_000_000i64;
+        let noon = day + day / 2;
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(noon), Some(day)]));
+        let set = [Literal::Date(1), Literal::Date(5)];
+        assert_eq!(run(arr, &set), vec![Some(false), Some(true)]);
+    }
+
+    /// The generic arm must be bit-identical to the typed one where both apply, so the
+    /// fallback can never become a second, subtly different membership semantics.
+    #[test]
+    fn generic_arm_agrees_with_the_typed_arm() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(5)]));
+        let set = [Literal::Int(1), Literal::Int(5)];
+        let typed = eval_in_list(&arr, &set).unwrap();
+        let generic = membership_generic(&arr, &set).unwrap();
+        assert_eq!(&typed, &generic);
     }
 
     #[test]

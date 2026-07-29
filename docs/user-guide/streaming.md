@@ -182,6 +182,27 @@ With several queries running, `bt.await_any_termination(timeout=None)` blocks un
 the first of them stops, re-raising its exception if it failed. This is the Spark
 `awaitAnyTermination` pattern, for a driver that supervises multiple streams.
 
+### Is the query keeping up?
+
+Throughput tells you how fast a micro-batch ran. It cannot tell you whether that was fast
+enough, because "enough" is the trigger interval. Each `StreamingQueryProgress` carries
+`behind_by_ms`, the milliseconds the batch overran its cadence, and `is_behind` for the
+common check:
+
+```python
+# docs: skip
+late = [p for p in q.recent_progress() if p.is_behind]
+if late:
+    print(f"{len(late)} of the last {len(q.recent_progress())} batches ran long")
+    print(max(p.behind_by_ms for p in late), "ms worst case")
+```
+
+A batch that occasionally runs long is normal. A `behind_by_ms` that grows batch over batch
+means the query is falling behind its source, and the fix is upstream of the metric: a
+larger trigger interval, more workers, or less work per row. Both fields are `0` for a
+trigger with no interval (`once`, `available_now`, `continuous`), where there is no cadence
+to be late for.
+
 ## Event-time windows and watermarks
 
 `bt.window(time_col, duration)` assigns each row to one event-time window. Group by it like

@@ -7,7 +7,6 @@
 
 pub(crate) mod binary;
 pub(crate) mod cast;
-pub(crate) mod date;
 mod dispatch;
 pub(crate) mod generate;
 pub(crate) mod hash;
@@ -19,4 +18,4 @@ pub(crate) mod math;
 pub(crate) mod media;
 pub(crate) mod security;
 pub(crate) mod str;
-pub(crate) mod timezone;
+pub(crate) mod temporal;

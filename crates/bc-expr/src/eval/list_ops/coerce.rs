@@ -25,14 +25,32 @@ use crate::ExprError;
 
 /// Normalize a list-like array into a `List<i32>`.
 ///
-/// `List` passes through untouched (a cheap `Arc` clone). `FixedSizeList` is cast,
-/// which materializes an `n+1` offset buffer but shares the values buffer — the offsets
-/// are negligible next to the embedding payload. Anything else is a type error naming
-/// the function and the offending side, so the message stays actionable.
+/// This is the single place the three list encodings become one, so every `.list` method
+/// means the same thing whichever one a column arrives in:
+///
+/// * **`List`** passes through untouched (a cheap `Arc` clone).
+/// * **`FixedSizeList`** is cast, materializing an `n+1` offset buffer but sharing the
+///   values buffer — the offsets are negligible next to the embedding payload. This is
+///   how Arrow and Parquet store a vector column, and what DuckDB's `ARRAY` maps to.
+/// * **`LargeList`** is cast down to 32-bit offsets. This is the encoding Arrow reaches
+///   for once a list column passes `i32::MAX` offsets, and it is what an Arrow reader
+///   hands back for a `large_list` Parquet column regardless of the actual size — so
+///   rejecting it made the whole `.list` namespace unusable on data that is not
+///   necessarily large at all.
+///
+/// The `LargeList` narrowing is safe *per morsel*, not in general: execution is batched
+/// at 16,384 rows, so a single batch would need over 131,000 child elements per row on
+/// average to exceed a 32-bit offset. Beyond that the Arrow cast **errors** rather than
+/// truncating, so the failure is loud. Making the kernels generic over the offset type is
+/// the fix that removes the bound entirely; it touches every kernel and is not this
+/// change.
+///
+/// Anything else is a type error naming the function and the offending side, so the
+/// message stays actionable.
 pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprError> {
     match arr.data_type() {
         DataType::List(_) => Ok(Arc::clone(arr)),
-        DataType::FixedSizeList(field, _) => {
+        DataType::FixedSizeList(field, _) | DataType::LargeList(field) => {
             let target = DataType::List(Arc::new(Field::new(
                 field.name(),
                 field.data_type().clone(),
@@ -40,8 +58,9 @@ pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprEr
             )));
             cast(arr, &target).map_err(ExprError::from)
         }
-        other => Err(ExprError::ExpectedString {
+        other => Err(ExprError::ExpectedType {
             func: func.to_string(),
+            want: "a List argument",
             got: other.to_string(),
         }),
     }

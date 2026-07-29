@@ -51,6 +51,8 @@ from batcher.plan.logical import (
     LogicalPlan,
     MapBatches,
     Project,
+    RangeJoin,
+    RowId,
     Sample,
     Scan,
     Sort,
@@ -65,6 +67,37 @@ from batcher.plan.stats import ColumnStat, Provenance, RelStats, weakest
 from batcher.plan.types import column_bytes
 
 __all__ = ["StatsEstimator", "combine_ndv"]
+
+# Selectivity of an inequality whose operand ranges are unknown. System R's constant, and
+# the one DuckDB, Postgres and Spark all still use.
+_UNKNOWN_INEQUALITY_SELECTIVITY = 1.0 / 3.0
+
+# Floor for a computed inequality selectivity. Zero would assert the join is *empty*, which
+# a distribution assumption may not do — only a proof may.
+_MIN_INEQUALITY_SELECTIVITY = 1e-6
+
+
+def _uniform_p_less(a1: float, b1: float, a2: float, b2: float) -> float:
+    """`P(X < Y)` for independent `X ~ U[a1, b1]` and `Y ~ U[a2, b2]`.
+
+    Integrating `X`'s CDF over `Y`'s support: the part of `Y`'s range above `b1` contributes
+    1, the part below `a1` contributes 0, and the overlap contributes the area under the
+    ramp between them. Degenerate (zero-width) ranges are the point-mass limits of the same
+    expression and are handled explicitly rather than by dividing by zero.
+    """
+    if b1 <= a2:
+        return 1.0
+    if a1 >= b2:
+        return 0.0
+    if b1 == a1:  # X is a point
+        return 0.0 if b2 == a2 else min(1.0, max(0.0, (b2 - a1) / (b2 - a2)))
+    if b2 == a2:  # Y is a point
+        return min(1.0, max(0.0, (a2 - a1) / (b1 - a1)))
+    above = max(0.0, b2 - max(a2, b1))
+    lo, hi = max(a2, a1), min(b2, b1)
+    ramp = ((hi - a1) ** 2 - (lo - a1) ** 2) / (2.0 * (b1 - a1)) if hi > lo else 0.0
+    return min(1.0, max(0.0, (above + ramp) / (b2 - a2)))
+
 
 # Operators whose estimates carry a learned correction. Joins, aggregates, and distincts
 # are where structural cardinality estimation is worst (containment assumptions, ndv
@@ -324,6 +357,23 @@ class StatsEstimator:
             else:
                 rows = child.rows * node.fraction
             return RelStats(rows, Provenance.DEFAULT, col_prop.sample_columns(child, rows))
+        if isinstance(node, RowId):
+            # `with_row_index` is strictly 1:1 — it appends a counter and changes nothing
+            # else — so rows, provenance, column stats and the delivered ordering all carry
+            # through. Falling to the `unknown_rows` default (which is what a missing branch
+            # here does) turned an EXACT 1,000-row relation into a 1e12-row guess for every
+            # operator above it: a join above a `with_row_index` picked the wrong build side
+            # and admission sized the query against a fiction.
+            child = self.estimate(node.input)
+            return RelStats(
+                child.rows,
+                child.provenance,
+                col_prop.row_id_columns(node, child),
+                # The counter is ascending and never null, so it is a valid ordering in its
+                # own right — recorded only when the child delivers none, since a data-column
+                # ordering is what a downstream `Sort` is far more likely to be elided by.
+                child.sorted_by or (node.alias,),
+            )
         if isinstance(node, Aggregate):
             return self._estimate_aggregate(node)
         if isinstance(node, Sort):
@@ -338,6 +388,8 @@ class StatsEstimator:
             return self._estimate_union(node)
         if isinstance(node, Join):
             return self._estimate_join(node)
+        if isinstance(node, RangeJoin):
+            return self._estimate_range_join(node)
         if isinstance(node, AsofJoin):
             # ASOF is left-style: exactly one output row per left row, so the count
             # (and its provenance) is the left input's — EXACT when the left is, so
@@ -625,6 +677,55 @@ class StatsEstimator:
         if measured:
             estimate = max(estimate, combine_ndv(measured, child.rows))
         return RelStats(estimate, Provenance.DEFAULT, columns)
+
+    def _estimate_range_join(self, node: RangeJoin) -> RelStats:
+        """`|L| x |R| x prod(selectivity_i)` — the product a cartesian join would produce,
+        cut by each inequality's estimated selectivity.
+
+        The alternative (falling through to the unknown-rows default) reported a fixed
+        `1e12` for every range join, which is worse than useless: it is not merely
+        imprecise, it is the same number regardless of input size, so join ordering and
+        memory sizing above the operator could not tell a ten-row range join from a
+        ten-million-row one.
+
+        Conditions are combined by independence. That is optimistic for the shape the
+        operator exists for — interval containment, where `lo` and `hi` are strongly
+        correlated — so the estimate runs high there. It is the standard assumption and
+        the direction that errs toward over-provisioning rather than under.
+        """
+        left = self.estimate(node.left)
+        right = self.estimate(node.right)
+        selectivity = 1.0
+        for cond in node.conditions:
+            selectivity *= self._inequality_selectivity(left, right, cond)
+        rows = max(0.0, left.rows * right.rows * selectivity)
+        columns = col_prop.range_join_columns(node, left, right, rows)
+        return RelStats(rows, Provenance.DEFAULT, columns)
+
+    def _inequality_selectivity(self, left: RelStats, right: RelStats, cond) -> float:
+        """`P(left_key OP right_key)` for two independent uniform columns.
+
+        With both `[min, max]` ranges known this is a closed form rather than a constant,
+        which is what lets the estimator see that a join whose ranges barely overlap
+        produces few rows and one whose ranges nest produces nearly the full product.
+        Falls back to System R's 1/3 — the same constant DuckDB, Postgres and Spark use
+        — when either range is missing or is not linearly ordered.
+        """
+        ls = left.columns.get(cond.left_key)
+        rs = right.columns.get(cond.right_key)
+        if ls is None or rs is None:
+            return _UNKNOWN_INEQUALITY_SELECTIVITY
+        bounds = [_ordinal(v) for v in (ls.min, ls.max, rs.min, rs.max)]
+        if any(b is None for b in bounds):
+            return _UNKNOWN_INEQUALITY_SELECTIVITY
+        a1, b1, a2, b2 = bounds  # type: ignore[misc]
+        if b1 < a1 or b2 < a2:
+            return _UNKNOWN_INEQUALITY_SELECTIVITY
+        p_less = _uniform_p_less(a1, b1, a2, b2)
+        p = p_less if cond.op in ("lt", "le") else 1.0 - p_less
+        # Never return exactly 0: a zero estimate is a *proof* of emptiness and this is an
+        # assumption, so it must not let a downstream rule delete the join.
+        return min(1.0, max(_MIN_INEQUALITY_SELECTIVITY, p))
 
     def _estimate_join(self, node: Join) -> RelStats:
         left = self.estimate(node.left)

@@ -25,6 +25,7 @@ These read one file, a directory, or a glob from local disk or object storage:
 | `bt.read.xml(path)` | XML file(s) | `xml` |
 | `bt.read.text(path, mode="line")` | text file(s) as rows (`mode="line"` or `"file"`) | |
 | `bt.read.binary(path)` | whole files as `{uri, bytes, size, mime}` rows | |
+| `bt.read.warc(path)` | web-archive (WARC) file(s), one row per record; `.warc.gz` read transparently | |
 | `bt.read.numpy(path)` | NumPy `.npy` / `.npz` file(s) | |
 | `bt.read.hdf5(path)` | HDF5 file(s) | `hdf5` |
 | `bt.read.zarr(path)` | a Zarr store | `zarr` |

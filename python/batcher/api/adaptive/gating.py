@@ -10,12 +10,13 @@ means the gate stays pure and unit-testable without executing a query.
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
 from batcher.api.adaptive.plan_surgery import joins, walk
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Scan, is_streamable
 from batcher.plan.stats import Provenance
 
-__all__ = ["resolve_adaptive"]
+__all__ = ["record_adaptive_route", "resolve_adaptive"]
 
 
 def resolve_adaptive(
@@ -49,38 +50,85 @@ def resolve_adaptive(
 
         if requires_staging(plan):
             return True
-    # The cold heuristic (a join over a breaker-produced, guessed-size operand) fires on
-    # the first run. Once history exists, ALSO enable for any signature whose measured
-    # re-optimization actually *flipped* a plan often enough — a shape whose estimates the
-    # loop keeps correcting is worth the per-stage cost even if the structural gate misses
-    # it. Gating adaptivity only trades planning overhead, never the result.
-    return _adaptive_would_help(plan, sources, hub) or _learned_adaptive_helps(plan, hub)
-
-
-def _learned_adaptive_helps(plan: LogicalPlan, hub) -> bool:
-    """Whether the hub has learned that stage-by-stage re-opt historically helps `plan`."""
-    if hub is None:
+    # The size floor is a precondition, not one vote among several, and it is checked before
+    # anything learned. `plan_signature` deliberately normalizes literals so statistics
+    # generalize across runs — which also makes it **scale-blind**: the same query over sf1
+    # and sf10 shares a signature. A route measured where staging pays would then be replayed
+    # at interactive scale, where it cannot: measured on TPC-H sf1, replaying sf10's routes
+    # took q8 from 18.8 ms to 181.9 ms and q2 from 11.2 ms to 123.2 ms. Nothing keyed by
+    # signature may decide a question about size.
+    if not _large_enough(plan, sources, hub):
         return False
+    # Above the floor, measured cost decides once both routes have been tried, because this is
+    # a cost question and the structural heuristic below cannot answer it. That heuristic fires
+    # on nearly every multi-join query at scale, and staging is not the ~20-40 ms of control
+    # plane it was priced against: the loop runs one breaker per stage, so it materializes every
+    # join separately and gives up both operator fusion and the streaming executor's width.
+    # Measured at sf10, that cost q8 4.1x, q17 6.3x, q9 3.3x and q3 3.1x against the one-shot
+    # plan for the identical result.
+    #
+    # The heuristic is not simply inverted, because which route wins is not a constant of the
+    # plan: staging is the only distributed route for some shapes, and it is what earns the
+    # statistics a cold shape has not learned yet. `learned_adaptive_route` measures both and
+    # minimizes regret. Staging only re-plans equivalent algebra, so the arms return the
+    # identical relation and the choice is result-invariant.
+    #
+    # But an arm is only worth exploring if it could win, and `staged` cannot win a plan whose
+    # join operands are ALREADY confidently sized: measuring a cardinality the optimizer
+    # already knows exactly changes no decision, so staging can only add its own cost. UCB1
+    # gives every offered arm a turn and its evidence expires, so offering it anyway means
+    # re-paying that cost forever — the same regret `sort_merge` was withheld from the
+    # build-side bandit for, and for the same reason. Measured on `lineitem ⋈ orders` at sf10
+    # (both scans EXACT-sized): the converged one-shot route runs 132 ms, and the periodic
+    # staged exploration 283-470 ms, on a query where the two arms cannot differ in what they
+    # learn. So the structural question is asked FIRST and gates the bandit, rather than being
+    # the cold-start fallback the bandit overrides once it has a verdict.
+    if not _adaptive_would_help(plan, sources, hub):
+        return False
+    route = _learned_adaptive_route(plan, hub)
+    if route is not None:
+        return route == "staged"
+    return True
+
+
+def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
+    """Whether the query is big enough for stage-by-stage re-optimization to pay at all.
+
+    A join, and total scan rows clearing `_ADAPTIVE_MIN_INPUT_ROWS`. Both read EXACT source
+    row counts, so this separates scales without depending on the guessed operand size the
+    rest of the gate is about.
+    """
+    if not joins(plan):
+        return False
+    estimator = _build_estimator(sources, hub)
+    return _total_input_rows(plan, estimator) >= _ADAPTIVE_MIN_INPUT_ROWS
+
+
+def _learned_adaptive_route(plan: LogicalPlan, hub) -> str | None:
+    """The measured-cheaper route for `plan` (`staged`/`one_shot`), or `None` cold."""
+    if hub is None:
+        return None
     try:
-        from batcher.kyber.learned_tuning import learned_adaptive_helps
+        from batcher.kyber.learned_tuning import learned_adaptive_route
         from batcher.kyber.signature import plan_signature
 
-        return learned_adaptive_helps(hub, plan_signature(plan))
-    except Exception:  # pragma: no cover - a learned read must never break routing
-        return False
+        return learned_adaptive_route(hub, plan_signature(plan))
+    except Exception as exc:  # pragma: no cover - a learned read must never break routing
+        note_suppressed("api", "read learned adaptive-routing verdict", exc)
+        return None
 
 
-def _record_adaptive_flip(hub, plan: LogicalPlan, flipped: bool) -> None:
-    """Fold this adaptive run's flip outcome into the learned adaptive gate. Best-effort."""
-    if hub is None:
+def record_adaptive_route(hub, plan: LogicalPlan, staged: bool, wall_ms: float) -> None:
+    """Fold one query's measured wall time into the staged-vs-one-shot bandit. Best-effort."""
+    if hub is None or wall_ms <= 0.0:
         return
     try:
-        from batcher.kyber.learned_tuning import record_adaptive_flip
+        from batcher.kyber.learned_tuning import record_adaptive_route as _record
         from batcher.kyber.signature import plan_signature
 
-        record_adaptive_flip(hub, plan_signature(plan), flipped)
-    except Exception:  # pragma: no cover - recording must never break a query
-        return
+        _record(hub, plan_signature(plan), "staged" if staged else "one_shot", wall_ms)
+    except Exception as exc:  # pragma: no cover - recording must never break a query
+        note_suppressed("api", "record adaptive-routing outcome", exc)
 
 
 # Below this total input-row count, stage-by-stage re-optimization is not worth its
@@ -109,19 +157,56 @@ def _total_input_rows(plan: LogicalPlan, estimator) -> float:
 
 
 def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
-    """Whether any join has a breaker-produced operand whose size is only guessed —
-    *and* the total input is large enough for re-optimization to pay for itself."""
+    """Whether any join has a breaker-produced operand whose size is not yet trustworthy.
+
+    The size floor this used to check itself now sits in `_large_enough`, ahead of the
+    learned router, because it has to bind that too — see `resolve_adaptive`.
+
+    Two conditions have to hold for an operand to justify staging, and the second one is
+    the correction. It must be breaker-produced, so the loop can actually materialize it
+    and measure something. And its size must be genuinely unknown.
+
+    Provenance alone answers the second badly, because it describes where a number came
+    from and not whether that number was right. `Provenance.DEFAULT` is sticky: the
+    one-shot path never records an intermediate operator's measured cardinality against
+    the operand's signature, so a shape can be estimated to within a percent of actual
+    forever and still read as a guess. Measured at sf10, TPC-H q5's operands land within
+    1.0x of actual and carried the default label anyway, which fired this gate on every
+    run and put the query on a route that costs it. The label was standing in for evidence
+    the hub already had.
+
+    So the label now only opens the question, and the measured q-error history closes it.
+    An operand whose signature has a run of observations that never crossed the
+    re-optimization threshold (`kyber.estimate_is_reliable`) is treated as confidently
+    sized whatever its provenance says, because a stage boundary placed there would have
+    had nothing to correct. A cold hub knows nothing, returns `False` from that check, and
+    the gate behaves exactly as it did before any history existed.
+    """
     plan_joins = joins(plan)
     if not plan_joins:
         return False
     estimator = _build_estimator(sources, hub)
-    if _total_input_rows(plan, estimator) < _ADAPTIVE_MIN_INPUT_ROWS:
-        return False  # small inputs: the one-shot plan is already fast (see threshold note)
     return any(
-        not is_streamable(operand) and estimator.estimate(operand).provenance >= Provenance.DEFAULT
+        not is_streamable(operand)
+        and estimator.estimate(operand).provenance >= Provenance.DEFAULT
+        and not _estimate_has_held_up(operand, hub)
         for join in plan_joins
         for operand in (join.left, join.right)
     )
+
+
+def _estimate_has_held_up(operand: LogicalPlan, hub) -> bool:
+    """Whether `operand`'s shape has a measured history of accurate size estimates."""
+    if hub is None:
+        return False
+    try:
+        from batcher.kyber import estimate_is_reliable
+        from batcher.kyber.signature import plan_signature
+
+        return estimate_is_reliable(hub, plan_signature(operand))
+    except Exception as exc:  # pragma: no cover - a learned read must never break routing
+        note_suppressed("api", "read operand q-error reliability", exc)
+        return False
 
 
 def _build_estimator(sources: list[Source], hub):

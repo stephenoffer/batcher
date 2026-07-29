@@ -15,7 +15,13 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import Op
-from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases, _validate_refs
+from batcher.plan.logical.base import (
+    LogicalPlan,
+    _reject_duplicate_aliases,
+    _validate_projection_refs,
+    _validate_refs,
+    available_column_set,
+)
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, promote, widen
 
@@ -43,6 +49,18 @@ class Scan(LogicalPlan):
     def to_ir(self) -> dict[str, Any]:
         return {"op": Op.SCAN, "source_id": self.source_id}
 
+    def identity_suffix(self) -> str:
+        """This scan's schema — the part of its identity `to_ir()` deliberately omits.
+
+        The engine reads types off the Arrow batches it is handed, so the schema is not on
+        the wire and must not be: a second copy of the types would be a second, driftable
+        source of truth. But that leaves every scan of source *n* with identical IR
+        regardless of what source *n* actually is, which is a collision in
+        `content_key` — and `content_key` is what `kyber.plan_cache` memoizes optimized
+        plans on. See `LogicalPlan.content_key`.
+        """
+        return str(self.schema.arrow)
+
     def available_columns(self) -> list[str]:
         return self.schema.names
 
@@ -62,7 +80,7 @@ class Filter(LogicalPlan):
 
     def __post_init__(self) -> None:
         # Validate against the INPUT's columns (predicate runs before projection).
-        _validate_refs(self.predicate, set(self.input.available_columns()), what="filter")
+        _validate_refs(self.predicate, available_column_set(self.input), what="filter")
 
     def to_ir(self) -> dict[str, Any]:
         return {
@@ -94,10 +112,12 @@ class Project(LogicalPlan):
     items: tuple[Projection, ...]
 
     def __post_init__(self) -> None:
-        available = set(self.input.available_columns())
+        available = available_column_set(self.input)
+        aliases = []
         for item in self.items:
-            _validate_refs(item.expr, available, what=f"projection {item.alias!r}")
-        _reject_duplicate_aliases([item.alias for item in self.items], what="select/with_columns")
+            _validate_projection_refs(item.expr, available, item.alias)
+            aliases.append(item.alias)
+        _reject_duplicate_aliases(aliases, what="select/with_columns")
 
     def to_ir(self) -> dict[str, Any]:
         return {

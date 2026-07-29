@@ -14,12 +14,16 @@ from collections.abc import Iterable
 
 import pyarrow as pa
 
+from batcher._internal.errors import IOError
+from batcher._internal.paths import open_private, private_dir
+
 __all__ = [
     "distributed_work_dir",
     "read_ipc",
     "shared_scratch_root",
     "write_ipc",
     "write_ipc_round_robin",
+    "write_shuffle_buckets",
 ]
 
 # Cluster-shared mounts, in scope order (narrowest first). On managed Ray clusters these are
@@ -72,7 +76,10 @@ def distributed_work_dir(prefix: str) -> str:
     """
     root = shared_scratch_root()
     if root:
-        os.makedirs(root, exist_ok=True)
+        # The root is a *shared cluster mount*, so creating it 0755 publishes every
+        # query's scratch listing to the whole node. `mkdtemp` already gives the inner
+        # directory 0700; this closes the parent, which nothing else does.
+        private_dir(root)
         return tempfile.mkdtemp(prefix=prefix, dir=root)
     return tempfile.mkdtemp(prefix=prefix)
 
@@ -80,11 +87,45 @@ def distributed_work_dir(prefix: str) -> str:
 def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
     """Write record batches to an Arrow IPC stream file. Returns `path`."""
     if not batches:
-        raise ValueError("write_ipc requires at least one batch (for the schema)")
-    with pa.OSFile(path, "wb") as sink, pa.ipc.new_stream(sink, batches[0].schema) as writer:
+        raise IOError(
+            f"cannot write an Arrow IPC shuffle file to {path!r} with no batches: the "
+            "stream needs at least one to take its schema from"
+        )
+    with (
+        pa.PythonFile(open_private(path), mode="w") as sink,
+        pa.ipc.new_stream(sink, batches[0].schema) as writer,
+    ):
         for b in batches:
             writer.write_batch(b)
     return path
+
+
+def write_shuffle_buckets(
+    buckets: list[list[pa.RecordBatch]], work_dir: str, prefix: str, mapper_id: int
+) -> list[str]:
+    """Write one IPC file per reducer bucket and return their paths, in reducer order.
+
+    The map half of every disk shuffle ends the same way: `partition_batches` hands back one
+    batch list per reducer, and each is written to a file the reducer will later collect by
+    name. The naming is the contract between the two halves — `<prefix><mapper>_r<reducer>` —
+    so it belongs in one place rather than being spelled out in each operator's map task.
+
+    Args:
+        buckets: One batch list per reducer, in reducer order.
+        work_dir: The shuffle scratch directory, shared across the cluster.
+        prefix: Distinguishes concurrent shuffles in the same directory — `"m"` for the
+            aggregate, `"wm"` for the window, `"<side>_m"` for each side of a join.
+        mapper_id: This mapper's index, which makes the filename unique across mappers.
+
+    Returns:
+        The written paths, one per reducer, in reducer order.
+    """
+    paths = []
+    for reducer, bucket in enumerate(buckets):
+        path = os.path.join(work_dir, f"{prefix}{mapper_id}_r{reducer}.arrow")
+        write_ipc(bucket, path)
+        paths.append(path)
+    return paths
 
 
 def write_ipc_round_robin(
@@ -106,12 +147,14 @@ def write_ipc_round_robin(
     reads which batch differs.
     """
     n = len(paths)
-    sinks: list[pa.OSFile | None] = [None] * n
+    sinks: list[object | None] = [None] * n
     writers: list[object | None] = [None] * n
     schema: pa.Schema | None = None
 
     def _open(j: int, sch: pa.Schema) -> None:
-        sinks[j] = pa.OSFile(paths[j], "wb")
+        # Owner-only, like every other shuffle artifact: these files hold the query's rows
+        # on a scratch path that may be a shared cluster mount.
+        sinks[j] = pa.PythonFile(open_private(paths[j]), mode="w")
         writers[j] = pa.ipc.new_stream(sinks[j], sch)
 
     try:

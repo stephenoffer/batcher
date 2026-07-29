@@ -1,0 +1,103 @@
+% ---------------------------------------------------------------------------
+% Shared TikZ styles for paper figures.
+%
+% Drop this in the preamble, then draw every diagram with these styles. One edit
+% here restyles every figure in the paper, which is the whole point: consistency
+% across figures is what makes a paper look professionally produced.
+%
+% Colors are the Okabe-Ito colorblind-safe palette. Meaning is never carried by
+% color alone: use `pfig/box` for context and `pfig/new` for what the paper
+% contributes, and the contrast survives a grayscale print.
+%
+% Requires: \usepackage{tikz} and the libraries loaded below. Builds with stock
+% TeX Live, no external binaries.
+% ---------------------------------------------------------------------------
+
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc,shapes.geometric}
+
+% Okabe-Ito palette ---------------------------------------------------------
+\definecolor{okBlue}{HTML}{0072B2}
+\definecolor{okSky}{HTML}{56B4E9}
+\definecolor{okGreen}{HTML}{009E73}
+\definecolor{okOrange}{HTML}{E69F00}
+\definecolor{okVermillion}{HTML}{D55E00}
+\definecolor{okPurple}{HTML}{CC79A7}
+\definecolor{okYellow}{HTML}{F0E442}
+\definecolor{pfigGray}{HTML}{6E6E6E}
+\definecolor{pfigLight}{HTML}{EDEDED}
+
+\tikzset{
+  % Base node: context components. Deliberately quiet.
+  pfig/box/.style={
+    draw=pfigGray, fill=white, line width=0.6pt,
+    rounded corners=2pt, inner sep=4pt, align=center,
+    font=\footnotesize, minimum height=7mm, text=black
+  },
+  % The contribution. One accent, used sparingly: if everything is emphasized,
+  % nothing is.
+  pfig/new/.style={
+    pfig/box, draw=okBlue, fill=okSky!18, line width=1pt, font=\footnotesize\bfseries
+  },
+  % Secondary emphasis, when a second component genuinely needs to stand out.
+  pfig/alt/.style={
+    pfig/box, draw=okOrange, fill=okOrange!12, line width=0.9pt
+  },
+  % External input or user.
+  pfig/io/.style={
+    pfig/box, rounded corners=6pt, fill=pfigLight, draw=pfigGray
+  },
+  % Data store.
+  pfig/store/.style={
+    pfig/box, cylinder, shape border rotate=90, aspect=0.25,
+    inner sep=3pt, minimum width=16mm
+  },
+  % Decision or gate.
+  pfig/gate/.style={
+    pfig/box, diamond, aspect=1.8, inner sep=1pt, minimum height=6mm
+  },
+  % Swimlane or grouping background.
+  pfig/lane/.style={
+    draw=pfigGray!50, dashed, line width=0.5pt, rounded corners=3pt,
+    fill=pfigLight!45, inner sep=5pt
+  },
+  % Arrows. Solid for the main path, dashed for feedback or optional flow.
+  pfig/arrow/.style={
+    -{Stealth[length=2.4mm,width=1.6mm]}, line width=0.7pt, draw=black
+  },
+  pfig/arrowD/.style={
+    pfig/arrow, dashed, draw=pfigGray
+  },
+  pfig/arrowNew/.style={
+    pfig/arrow, draw=okBlue, line width=0.9pt
+  },
+  % Edge labels: small, never smaller than 7pt at final size.
+  pfig/label/.style={
+    font=\scriptsize, text=black, inner sep=1.5pt, fill=white, fill opacity=0.85,
+    text opacity=1
+  },
+  % Section caption inside a figure.
+  pfig/title/.style={
+    font=\footnotesize\bfseries, text=black
+  },
+}
+
+% ---------------------------------------------------------------------------
+% Example. Delete once you have your own figures.
+%
+% \begin{figure}[t]
+%   \centering
+%   \begin{tikzpicture}[node distance=6mm and 9mm]
+%     \node[pfig/io]  (in)   {Workload};
+%     \node[pfig/box, right=of in]  (enc) {Encoder};
+%     \node[pfig/new, right=of enc] (ours){Verifier-guided\\memory};
+%     \node[pfig/box, right=of ours](dec) {Decoder};
+%     \node[pfig/io,  right=of dec] (out) {Answer};
+%     \draw[pfig/arrow]    (in)  -- (enc);
+%     \draw[pfig/arrowNew] (enc) -- node[pfig/label]{states} (ours);
+%     \draw[pfig/arrowNew] (ours)-- (dec);
+%     \draw[pfig/arrow]    (dec) -- (out);
+%     \draw[pfig/arrowD]   (dec.south) to[out=-90,in=-90] node[pfig/label]{retry} (ours.south);
+%   \end{tikzpicture}
+%   \caption{...}
+% \end{figure}
+% ---------------------------------------------------------------------------

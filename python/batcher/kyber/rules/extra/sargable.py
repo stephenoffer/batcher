@@ -39,11 +39,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, plan_rule
+from batcher.kyber.rule import Phase, node_rule
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
-from batcher.plan.logical import LogicalPlan
+from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
 from batcher.plan.visitor import transform_up
 
 __all__ = [
@@ -302,14 +303,49 @@ def _reduce_bitxor(expr: Expr) -> Binary | None:
 
 # --- registration -----------------------------------------------------------
 
-for _name, _fn in (
-    ("sarg_flip_comparison", flip_comparison_literal),
-    ("sarg_add_const", sarg_add_const),
-    ("sarg_sub_const", sarg_sub_const),
-    ("sarg_rsub_const", sarg_rsub_const),
-    ("sarg_mul_const", sarg_mul_const),
-    ("sarg_xor_const", sarg_xor_const),
+# Each of these walks the whole plan itself, and as a `plan_rule` it has no node type to be
+# indexed on -- so without an expression declaration it runs against every plan there is.
+# Every leaf gates on a `Binary` first: the five strength reductions need an `=`/`<>` (the
+# only comparisons whose bijection survives the arithmetic), and the flip needs any
+# comparison with the literal on the left.
+#: The node types that carry expressions. `map_node_expressions` -- which `_expr_pass` and
+#: the driver's fused chain both go through -- rewrites expressions on exactly these, and
+#: returns `Scan`, `Join`, `Distinct`, `Union`, `Limit`, and `MapBatches` untouched. So
+#: naming them here is not a narrowing: it is the same set the whole-plan pass already
+#: reached, stated explicitly.
+_EXPR_NODES = (Filter, Project, Aggregate, Sort, Window)
+
+
+def _node_pass(leaf: ExprRule):
+    """The node-local `f(node, ctx)` form of one leaf, for the driver's fused traversal."""
+
+    def apply(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
+        rebuilt = map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
+        return None if rebuilt is node else rebuilt
+
+    return apply
+
+
+# Registered as node rules rather than whole-plan ones so the driver runs all six inside the
+# single expression traversal it already makes per node, instead of each walking the entire
+# plan itself. The whole-plan `flip_comparison_literal`/`sarg_*_const` functions above stay
+# as they are: they are the standalone form the unit tests drive directly.
+for _name, _leaf, _ops in (
+    ("sarg_flip_comparison", _flip_leaf, tuple(sorted(_FLIP))),
+    ("sarg_add_const", _add_leaf, tuple(sorted(_EQ_NE))),
+    ("sarg_sub_const", _sub_leaf, tuple(sorted(_EQ_NE))),
+    ("sarg_rsub_const", _rsub_leaf, tuple(sorted(_EQ_NE))),
+    ("sarg_mul_const", _mul_leaf, tuple(sorted(_EQ_NE))),
+    ("sarg_xor_const", _xor_leaf, tuple(sorted(_EQ_NE))),
 ):
     DEFAULT_REGISTRY.add(
-        plan_rule(_name, Phase.NORMALIZE, (lambda fn: lambda plan, _ctx: fn(plan))(_fn))
+        node_rule(
+            _name,
+            Phase.NORMALIZE,
+            _node_pass(_leaf),
+            matches=_EXPR_NODES,
+            expr_fn=_leaf,
+            expr_matches=(Binary,),
+            expr_ops=_ops,
+        )
     )

@@ -141,11 +141,20 @@ def test_aggregate_expression_is_partition_independent():
             assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
 
 
-def test_nested_and_scalar_only_aggregates_are_rejected():
+def test_a_scalar_only_aggregate_is_still_rejected():
     ds = bt.from_pydict({"g": ["a"], "x": [1.0]})
     # A scalar expression with no aggregate is not an aggregation.
     with pytest.raises(PlanError, match="aggregate"):
         ds.group_by("g").agg(bad=col("x") + 1)
-    # An aggregate used outside agg() cannot be lowered.
-    with pytest.raises(PlanError, match="group_by"):
-        ds.select(r=col("x").sum() / col("x").sum()).to_pydict()
+
+
+def test_an_aggregate_expression_in_a_select_is_the_whole_frame_aggregation():
+    """This used to be the other half of the rejection test above.
+
+    An expression over aggregates in a `select` no longer fails to lower: every item is
+    an aggregate, so the projection *is* a whole-frame aggregation and returns one row —
+    what `SELECT sum(x) / sum(x) FROM t` means, and what Polars and pandas answer.
+    """
+    ds = bt.from_pydict({"g": ["a", "b"], "x": [1.0, 3.0]})
+    assert ds.select(r=col("x").sum() / col("x").sum()).to_pydict() == {"r": [1.0]}
+    assert ds.select(r=col("x").sum()).to_pydict() == {"r": [4.0]}

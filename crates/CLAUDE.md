@@ -90,6 +90,10 @@ state and a SIMD/NUMA/spill rewrite lands without touching callers.
 - **`keys.rs`** is the ONE canonical grouping/partitioning key form; every hash path (assign /
   combine / shuffle / join / window) derives key identity from it so they cannot disagree.
   `bc-arrow/float_ident.rs` is the matching NaN/±0 contract.
+- **Cancellation** is `bc-resource/src/cancel.rs`: an `AtomicBool` per query id, polled at
+  points where unwinding is safe (`ExecOptions::check_cancelled` between operators,
+  `stream::parallel::with_cancellation` per morsel, the external sort between merge passes).
+  Never poll mid-operator — returning there leaks a half-built table's pool reservation.
 - **`bc-transport`** is the Flight shuffle with credit-based flow control (1 credit = 1 batch
   slot; producer blocks at 0). The data plane bypasses the Ray object store — never route
   bulk batches through Ray.

@@ -82,14 +82,24 @@ class DatasetSCD:
         """Bind the SCD accessor to its `Dataset`; reached as `ds.scd`, not constructed directly."""
         self._ds = ds
 
-    def type1(self, target: str, *, keys: str | list[str], **opts) -> WriteManifest:
+    def type1(
+        self, target: str, *, keys: str | list[str], format: str | None = None, **opts
+    ) -> WriteManifest:
         """SCD type 1 — overwrite changed attributes in place (no history).
 
-        A keyed upsert into `target` (delegates to `ds.write.merge`).
+        A keyed upsert into `target` (delegates to `ds.write.merge`). An absent target is the
+        dimension's **first load**: every incoming row is new, so the snapshot is written as
+        the table. `type2`, `type3` and `apply_changes` all handle that case; this did not, so
+        the first run of a type-1 load into a Delta table raised
+        ``IOError: path '...' does not exist`` instead of creating it. A file target (Parquet,
+        CSV) happened to work, because writing a MERGE to a missing file just writes the file,
+        so only the transactional formats broke.
 
         Args:
             target: Path of the dimension table to upsert into.
             keys: The natural key column(s) identifying a row.
+            format: Target format; inferred from the path when omitted. Accepted here for
+                parity with `type2`/`type3`, which have always taken it.
             **opts: Forwarded to `ds.write.merge`.
 
         Returns:
@@ -108,9 +118,22 @@ class DatasetSCD:
                 >>> _ = bt.from_pydict({"id": [2], "city": ["SF"]}).scd.type1(target, keys="id")
                 >>> bt.read.parquet(target).sort("id").to_pydict()
                 {'id': [1, 2], 'city': ['NYC', 'SF']}
+
+                The first load needs no existing table:
+
+                >>> fresh = os.path.join(tempfile.mkdtemp(), "new.parquet")
+                >>> _ = bt.from_pydict({"id": [1], "city": ["NYC"]}).scd.type1(fresh, keys="id")
+                >>> bt.read.parquet(fresh).to_pydict()
+                {'id': [1], 'city': ['NYC']}
         """
+        from batcher.io.detect import detect_format
+        from batcher.io.filesystem import resolve_filesystem
+
         key_list = _require_keys("type1", keys)
-        return self._ds.write.merge(target, on=key_list, when_matched="update", **opts)
+        fmt = detect_format(target, format)
+        if not resolve_filesystem(target).exists(target):
+            return self._ds.write(target, fmt, mode="overwrite", **opts)
+        return self._ds.write.merge(target, on=key_list, when_matched="update", format=fmt, **opts)
 
     def type2(
         self,

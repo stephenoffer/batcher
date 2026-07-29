@@ -71,11 +71,23 @@ def has_selector(expr: Any) -> bool:
             >>> has_selector(bt.numeric() + 1), has_selector(bt.col("x") + 1)
             (True, False)
     """
+    kind = type(expr)
+    # A bare column or literal is a leaf and can never *contain* anything. `select`
+    # asks this of every positional argument, so on a wide projection built from
+    # `col(...)` references this is the difference between a type check and a
+    # `dataclasses.fields` walk per column.
+    if kind is Col or kind is Lit:
+        return False
     if not isinstance(expr, Expr):
         return False
-    found: list[Selector] = []
-    _walk(expr, found.append)
-    return bool(found)
+    found = False
+
+    def mark(_selector: Selector) -> None:
+        nonlocal found
+        found = True
+
+    _walk(expr, mark)
+    return found
 
 
 def _substitute(expr: Expr, target: Selector, replacement: Expr) -> Expr:

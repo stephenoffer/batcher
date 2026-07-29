@@ -694,7 +694,8 @@ def _learning_hub(hub=None):
         from batcher.core import default_hub
 
         return default_hub()
-    except Exception:  # pragma: no cover - learning is best-effort
+    except Exception as exc:  # pragma: no cover - learning is best-effort
+        note_suppressed("dist", "resolve the learning hub", exc)
         return None
 
 
@@ -717,7 +718,8 @@ def _learned_weight_factor(plan: LogicalPlan, hub=None) -> float:
 
     try:
         factor = learned_cpu_weight_factor(_learning_hub(hub), _plan_family(plan))
-    except Exception:  # pragma: no cover - learning is best-effort
+    except Exception as exc:  # pragma: no cover - learning is best-effort
+        note_suppressed("dist", "read learned task-weight factor", exc)
         factor = None
     return factor if factor is not None else 1.0
 
@@ -822,7 +824,8 @@ def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
             )
             total_bytes = total_rows * width
         return max(1, math.ceil(total_bytes / max(1, opt.target_bytes_per_task)))
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "size the byte-based partition count", exc)
         return 1
 
 
@@ -1146,7 +1149,8 @@ def _drain_gpu_stat(actor) -> float | None:
 
     try:
         return ray.get(actor.gpu_stats.remote())
-    except Exception:  # pragma: no cover - feedback must never break execution
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("dist", "drain a GPU utilization sample", exc)
         return None
 
 
@@ -1160,7 +1164,8 @@ def _drain_gpu_vram(actor) -> float | None:
         return None
     try:
         return ray.get(stat.remote())
-    except Exception:  # pragma: no cover - feedback must never break execution
+    except Exception as exc:  # pragma: no cover - feedback must never break execution
+        note_suppressed("dist", "drain a GPU VRAM sample", exc)
         return None
 
 
@@ -1257,11 +1262,17 @@ class _MapActor:
         bucket reads via shared memory / direct memory — no driver round-trip) instead
         of waiting for the driver to hand it a materialized partition."""
         from batcher import core
-        from batcher.carbonite.transfer.server import fetch
+        from batcher.carbonite.transfer.lifecycle import process_client
         from batcher.io.source import InMemorySource
         from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
 
-        rows = fetch(addr, ticket)
+        # The *pooled* client, not the one-shot `server.fetch`. This runs once per morsel
+        # on the GPU consumer of the streaming pipeline — the hottest fetch in the engine —
+        # and the one-shot form opens a fresh gRPC channel every time, so the stage paid a
+        # full connection handshake ahead of each morsel it was supposed to be overlapping
+        # with the previous one's forward pass. `server.fetch`'s own docstring names the
+        # pooled client as the form for repeated fetches; this was the repeated fetch.
+        rows = process_client().fetch(addr, str(ticket))
         if not rows:
             return None
         out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])

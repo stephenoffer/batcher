@@ -18,14 +18,62 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import ClassVar
 
 import pyarrow as pa
 
 from batcher._internal.mathx import safe_div
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import active_config
+from batcher.plan.types import retained_bytes as _retained_bytes
 
-__all__ = ["CacheStore", "current_result_cache", "result_cache"]
+__all__ = ["CacheStore", "current_result_cache", "reset_result_cache", "result_cache"]
+
+
+# `_retained_bytes` is `plan.types.retained_bytes`: what the table keeps resident, not the
+# size of the rows it addresses. Measured on this engine, `limit(10)` over 2M rows reports
+# 160 bytes from `nbytes` and retains 262,144 — morselization bounds the per-entry ratio at
+# one morsel, and a table from a source that does not morselize carries no bound at all.
+
+
+#: How many times a table's retained footprint may exceed its logical size before the
+#: store compacts it on insert. Any slice retains its parent's buffers, so some excess is
+#: normal and copying for it would cost more than it saves; a 4x gap means most of what the
+#: entry pins is not what the entry *is*.
+_COMPACT_RATIO = 4.0
+#: Below this, the excess is not worth a copy whatever the ratio says — a 200-byte entry
+#: pinning 4 KiB is not a memory problem, and the copy is pure overhead.
+_COMPACT_FLOOR_BYTES = 1 << 20
+
+
+def _compacted(table: pa.Table, retained: int) -> tuple[pa.Table, int]:
+    """`table` copied free of any parent buffers it merely windows, and its new footprint.
+
+    Caching a slice is the common shape here: `head`, `limit`, and a selective filter all
+    produce one, and all three are exactly the cheap results a user caches. Refusing to
+    cache them (the alternative) throws away the useful case to avoid the footprint; taking
+    a compacting copy keeps the entry *and* makes its accounted size true.
+
+    `take` rather than `combine_chunks`, which does not compact a single already-contiguous
+    chunk and so leaves the parent pinned. The copy runs in Arrow's C++ kernels over whole
+    columns, not per row.
+
+    Args:
+        table: The result to compact.
+        retained: Its footprint before compaction, returned unchanged if the copy is
+            skipped or fails.
+
+    Returns:
+        The table to store and the bytes to account for it.
+    """
+    if retained < _COMPACT_FLOOR_BYTES or retained < table.nbytes * _COMPACT_RATIO:
+        return table, retained
+    try:
+        compact = table.take(pa.array(range(table.num_rows), type=pa.int64()))
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowMemoryError):
+        return table, retained  # an exotic column type; account it honestly instead
+    after = _retained_bytes(compact)
+    return (compact, after) if after < retained else (table, retained)
 
 
 @dataclass(slots=True)
@@ -36,6 +84,11 @@ class _Entry:
     keepalive: object
     cost: float  # wall-clock seconds the result took to compute (recompute cost)
     hits: int  # times served since insertion (access frequency)
+    # The retained footprint measured at insertion, and the single number the budget is
+    # kept against. Stored rather than re-derived at eviction: a store that measures one
+    # way on the way in and another on the way out leaks its accounting a little on every
+    # entry, and the leak is invisible until the budget stops meaning anything.
+    size: int
 
     def value(self) -> float:
         """Greedy-Dual-Size-Frequency keep-value: recompute-cost x frequency / size.
@@ -45,8 +98,11 @@ class _Entry:
         better than plain LRU when cached results vary by orders of magnitude in both
         recompute cost and size. The `+`-ones keep a zero-cost or never-hit entry
         comparable (ordered by size), and the size floor avoids divide-by-zero.
+
+        Size is the *retained* footprint, so an entry that pins a large parent buffer
+        ranks as the large entry it is rather than as the small window it addresses.
         """
-        size = max(1, self.table.nbytes)
+        size = max(1, self.size)
         return (self.cost + 1e-9) * (self.hits + 1) / size
 
 
@@ -59,10 +115,18 @@ class CacheStore:
     rule). A `get` hit refreshes recency. All operations are guarded by one lock; the
     store is shared process-wide, so concurrent queries see one consistent budget.
 
-    The bytes counted are `Table.nbytes` (the Arrow buffers). Shared/dictionary
-    buffers can make that an under-count, so keep the budget conservative relative to
-    real RAM.
+    The bytes counted are what an entry keeps *resident* (`_retained_bytes`), not the
+    size of the rows it addresses, so a slice cannot enter the cache reporting a fraction
+    of what it pins. Where the two differ enough to matter the store takes a compacting
+    copy on insert, making the entry as small as it claims to be.
     """
+
+    # Fractions of the budget the cache is trimmed to at each pressure level. Storage always
+    # yields to execution, never the reverse, so these only ever shrink the cache.
+    _PRESSURE_RETAIN: ClassVar[dict[PressureLevel, float]] = {
+        PressureLevel.ELEVATED: 0.75,
+        PressureLevel.SPILL: 0.5,
+    }
 
     def __init__(self, max_bytes: int) -> None:
         self._max_bytes = max(0, max_bytes)
@@ -77,12 +141,33 @@ class CacheStore:
         # value): the aggregate hit-rate tells whether the result cache is *earning its RAM*.
         self._hits = 0
         self._misses = 0
+        # Entries dropped to stay within budget over this store's life. A hit rate alone
+        # cannot distinguish "nobody asked for it again" from "it was evicted before they
+        # could" — the first says the cache is not useful here, the second says it is too
+        # small — and those call for opposite responses.
+        self._evictions = 0
         self._lock = threading.Lock()
 
     @property
     def max_bytes(self) -> int:
         """The cache's byte budget."""
         return self._max_bytes
+
+    def set_budget(self, max_bytes: int) -> None:
+        """Resize the storage envelope, evicting down at once if it shrank.
+
+        The reconcile `result_cache()` performs. It is a method rather than the module
+        function reaching in through `_lock` and `_max_bytes`, because reaching in put the
+        store's two invariants — the budget and the accounted bytes — outside the class
+        that maintains them, which is exactly where a later edit stops keeping them
+        together.
+
+        Args:
+            max_bytes: The new byte budget. Negative is treated as zero.
+        """
+        with self._lock:
+            self._max_bytes = max(0, max_bytes)
+            self._evict_to(self._max_bytes)
 
     @property
     def used_bytes(self) -> int:
@@ -101,15 +186,25 @@ class CacheStore:
             return None
 
     def stats(self) -> dict[str, int | float]:
-        """Result-cache effectiveness: hits, misses, aggregate hit-rate, and bytes held —
-        the signal for whether the cache is earning its RAM. Hit-rate is `0.0` before any get."""
+        """Result-cache effectiveness: hits, misses, evictions, and how full it is.
+
+        Returns:
+            The hit/miss counts and aggregate hit-rate (`0.0` before any get), the byte
+            budget and what is held against it, the entry count, and how many entries were
+            evicted. Evictions are what disambiguate a poor hit rate: many of them means
+            the budget is too small, none of them means the cache is not useful here.
+        """
         with self._lock:
             total = self._hits + self._misses
             return {
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": safe_div(self._hits, total),
+                "evictions": self._evictions,
+                "entries": len(self._entries),
                 "used_bytes": self._used,
+                "max_bytes": self._max_bytes,
+                "fill": safe_div(self._used, self._max_bytes),
             }
 
     def put(self, key: str, table: pa.Table, keepalive: object = None, cost: float = 0.0) -> None:
@@ -122,15 +217,24 @@ class CacheStore:
         expensive result outlives a cheap one. A no-op when the budget is zero or the
         table alone exceeds it (an entry too big to cache is skipped rather than
         thrashing out everything else).
+
+        The table is charged its *retained* footprint, and compacted first when that
+        greatly exceeds what it addresses — so what the store holds is a copy the entry
+        owns outright, rather than a window pinning a parent it will never serve.
         """
-        size = table.nbytes
+        # Measured and compacted outside the lock: both are pure functions of `table`, and
+        # the copy is the one genuinely slow step here. Holding the store's lock across it
+        # would stall every concurrent `get` behind one insert's memcpy.
+        table, size = _compacted(table, _retained_bytes(table))
         with self._lock:
             if self._max_bytes == 0 or size > self._max_bytes:
                 return
             existing = self._entries.pop(key, None)
             if existing is not None:
-                self._used -= existing.table.nbytes
-            self._entries[key] = _Entry(table=table, keepalive=keepalive, cost=cost, hits=0)
+                self._used -= existing.size
+            self._entries[key] = _Entry(
+                table=table, keepalive=keepalive, cost=cost, hits=0, size=size
+            )
             self._used += size
             self._evict_to(self._max_bytes)
 
@@ -139,7 +243,20 @@ class CacheStore:
         with self._lock:
             entry = self._entries.pop(key, None)
             if entry is not None:
-                self._used -= entry.table.nbytes
+                self._used -= entry.size
+
+    def __len__(self) -> int:
+        """How many results are cached right now."""
+        return len(self._entries)
+
+    def __contains__(self, key: str) -> bool:
+        """Whether `key` is cached, **without** counting a hit or refreshing its value.
+
+        A membership test is not an access, so it must not move the eviction ranking. The
+        alternative — probing with `get` — silently promotes an entry every time anything
+        merely asks whether it exists.
+        """
+        return key in self._entries
 
     def clear(self) -> None:
         """Evict everything, returning all storage memory."""
@@ -172,12 +289,14 @@ class CacheStore:
         """
         if level >= PressureLevel.CRITICAL:
             self.clear()
-        elif level >= PressureLevel.SPILL:
-            with self._lock:
-                self._evict_to(self._max_bytes // 2)
-        elif level >= PressureLevel.ELEVATED:
-            with self._lock:
-                self._evict_to(self._max_bytes * 3 // 4)
+            return
+        retain = self._PRESSURE_RETAIN.get(
+            PressureLevel.SPILL if level >= PressureLevel.SPILL else PressureLevel.ELEVATED
+        )
+        if level < PressureLevel.ELEVATED or retain is None:
+            return
+        with self._lock:
+            self._evict_to(int(self._max_bytes * retain))
 
     def _evict_to(self, target_bytes: int) -> None:
         """Evict the lowest-value entries until `used <= target_bytes`.
@@ -188,20 +307,28 @@ class CacheStore:
 
         An entry's keep-value is independent of which *other* entries remain, so the
         eviction order is a single stable sort — not a fresh O(n) min-scan per victim.
-        That makes a bulk eviction (`on_pressure` halving the cache, a large insert
-        pushing out many small entries) O(n log n) instead of O(n²), and computes each
-        `value()` once instead of once per comparison per round.
+        That makes a bulk eviction (`on_pressure` halving the cache, a large insert pushing
+        out many small entries) O(n log n) instead of O(n²), and computes each `value()`
+        once instead of once per comparison per round. Stable sort keeps insertion order
+        among equal values, so a never-hit zero-cost set degrades to size-then-FIFO.
+
+        A heap was tried here for the common single-victim case, on the reasoning that
+        `heapify` is O(n) where the sort is O(n log n). Measured over 2k / 10k / 40k
+        entries it was 1.10x / 0.86x / 1.00x — a wash, because what dominates is computing
+        `value()` once per entry and materializing the key sequence, which both approaches
+        pay identically, while Timsort's extra comparisons run in C over precomputed keys.
+        The sort stays: same cost, less machinery. Recorded so the next reader does not
+        re-derive the same idea and re-measure it.
         """
         if self._used <= target_bytes or not self._entries:
             return
-        # Stable sort keeps insertion order among equal values → oldest evicted first,
-        # matching the previous per-round `min` tie-break exactly.
         victims = sorted(self._entries.items(), key=lambda kv: kv[1].value())
         for key, entry in victims:
             if self._used <= target_bytes:
                 break
             del self._entries[key]
-            self._used -= entry.table.nbytes
+            self._used -= entry.size
+            self._evictions += 1
 
 
 _result_cache: CacheStore | None = None
@@ -217,18 +344,29 @@ def result_cache() -> CacheStore:
     """
     global _result_cache
     budget = active_config().memory.result_cache_max_bytes
-    if _result_cache is None:
+    cache = _result_cache
+    if cache is None:
         with _result_cache_lock:
             if _result_cache is None:
                 _result_cache = CacheStore(budget)
                 return _result_cache
-    if _result_cache.max_bytes != budget:
-        with _result_cache._lock:
-            _result_cache._max_bytes = max(0, budget)
-            _result_cache._evict_to(_result_cache._max_bytes)
-    return _result_cache
+            cache = _result_cache
+    if cache.max_bytes != budget:
+        cache.set_budget(budget)
+    return cache
 
 
 def current_result_cache() -> CacheStore | None:
     """The process-wide result cache if one has been created, else `None`."""
     return _result_cache
+
+
+def reset_result_cache() -> None:
+    """Drop the process-wide result cache so the next call builds a fresh one.
+
+    For tests, which otherwise inherit whatever entries and hit/miss counters an earlier
+    test left behind — the same reason `reset_process_pool` exists for the buffer pool.
+    """
+    global _result_cache
+    with _result_cache_lock:
+        _result_cache = None

@@ -147,6 +147,18 @@ def evaluate(
     For a binary task, giving `y_score` alone is enough: the hard predictions are derived
     at `threshold`, so precision, recall, and AUC all come from one scored column.
 
+    **Nulls are excluded, not counted as wrong.** Every metric is an Arrow aggregate, and
+    those skip nulls, so a row whose label or prediction is missing contributes to nothing:
+    the denominator is the rows where both are present. That is the usual convention, but it
+    is worth knowing which way it cuts — a model that predicts null on the half of the data
+    it finds hard scores on the easy half alone, and reports a clean number for it. Nothing
+    here says how many rows survived, so check that yourself when nulls are possible:
+    ``ds.filter(bt.col(y_pred).is_null()).count()``.
+
+    A metric that is undefined for the data returns ``nan`` rather than raising — `roc_auc`
+    and `balanced_accuracy` when only one class is present, `precision`/`recall`/`f1` when
+    there are no positives. A `nan` in the report means "not defined here", not "zero".
+
     Args:
         ds: The dataset holding labels and predictions.
         y_true: The label column.

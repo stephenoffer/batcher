@@ -189,6 +189,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.count()` | COUNT(*) aggregate |
 | `bt.iff(condition, if_true, if_false)` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
 | `bt.nanvl(value, fallback)` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
+| `bt.next_after(value, toward)` | the adjacent representable float, one ULP toward `toward` (DuckDB `nextafter`) |
 | `bt.concat(*exprs)` | concatenate values into one string |
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
 | `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
@@ -198,6 +199,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
 | `bt.gcd(a, b)` / `bt.lcm(a, b)` | greatest common divisor / least common multiple |
 | `bt.hypot(a, b)` | Euclidean norm `sqrt(a² + b²)` |
+| `bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km")` | haversine distance between two lat/lon points, in `km`/`m`/`mi`/`nm` |
 | `bt.width_bucket(value, low, high, count)` | histogram bucket index over `[low, high]` |
 | `bt.struct(**fields)` / `bt.named_struct(name, value, ...)` | build a struct column |
 | `bt.sequence(start, stop, step=1)` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
@@ -231,6 +233,10 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.date_part(part, expr)` | extract a calendar field (`year`/`month`/`dow`/…) |
 | `bt.date_add(expr, days)` | add a whole number of `days` to a date/time column (Spark `date_add`) |
 | `bt.date_sub(expr, days)` | subtract a whole number of `days` from a date/time column (Spark `date_sub`) |
+| `bt.make_date(year, month, day)` | build a Date from integer components; an impossible date is null |
+| `bt.make_timestamp(year, month, day, hour=0, minute=0, second=0)` | build a Timestamp from components |
+| `bt.from_epoch(expr, unit="s")` | read an integer epoch column as a Timestamp at a stated unit (`s`/`ms`/`us`/`ns`) |
+| `bt.from_unix_date(expr)` | read an integer column of days since 1970-01-01 as a Date |
 
 ## Top-level helpers
 
@@ -341,7 +347,7 @@ model once per worker.
 | `Tokenizer` / `Concatenator` | stateless text split / feature-vector assembly |
 | `Chain` | each step, fit on the previous step's output |
 
-See the [preprocessors guide](../ml/preprocessors.md) for the workflow and the
+See the [preprocessors guide](../ml/preprocessors/index.md) for the workflow and the
 [ML API page](ml.md) for the per-class reference.
 
 ## Configuration
@@ -355,3 +361,13 @@ from batcher import Config, set_config, config_context
 with `set_config(...)` or temporarily with `config_context(...)`. `Config.from_env`
 and `Config.from_file` overlay `BATCHER_*` environment variables and a JSON file.
 See the configuration page for the full pattern.
+
+## See also
+
+- {doc}`dataset`: every `Dataset` method, with its arguments and its return type.
+- {doc}`expressions` and {doc}`expression-accessors`: the column language and the
+  `.str` / `.dt` / `.list` / `.struct` / `.json` namespaces.
+- {doc}`functions`: the free functions, grouped by family.
+- {doc}`io`: readers, writers, save modes, and the format-specific options.
+- {doc}`../user-guide/index`: the task-oriented guides behind these signatures.
+- {doc}`../getting-started/quickstart`: the same surface as a five-minute walkthrough.

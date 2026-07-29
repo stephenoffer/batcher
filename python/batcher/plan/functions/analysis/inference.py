@@ -18,9 +18,11 @@ which is a scalar operation on two numbers, not a pass over the data.
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
+from batcher.plan.functions.analysis._normal import normal_ppf
 
 __all__ = [
     "cohens_d",
@@ -33,9 +35,41 @@ __all__ = [
     "welch_t_statistic",
 ]
 
-# The multiplier for a 95% interval under a normal approximation. Kept as a named constant
-# because a hard-coded 1.96 in three formulas is exactly the kind of duplication that drifts.
-_Z95 = 1.959963984540054
+
+def _two_sided_z(confidence: float, *, func: str) -> float:
+    """The two-sided normal multiplier for a `confidence` level, exactly.
+
+    This used to be ``1.959963984540054 if confidence < 0.97 else 2.5758293035489004``, which
+    served *every* level below 0.97 with the 95% multiplier. A 90% interval came back 15% too
+    wide and a 50% interval nearly three times too wide, both reported as if they were the level
+    asked for:
+
+        confidence   reported half-width   correct
+        0.50         0.0673                0.0234
+        0.90         0.0673                0.0570
+        0.95         0.0673                0.0673
+
+    The driver already has an accurate inverse normal CDF, so there is no reason to approximate:
+    `confidence` is a Python float known at plan-build time, so this is one scalar evaluation
+    per plan, not per row.
+
+    Args:
+        confidence: The two-sided confidence level, strictly between 0 and 1.
+        func: The calling function's name, for the error message.
+
+    Returns:
+        The multiplier ``z`` such that a standard normal lies within ``+/- z`` with probability
+        `confidence`.
+
+    Raises:
+        PlanError: If `confidence` is not strictly between 0 and 1.
+    """
+    if not 0.0 < confidence < 1.0:
+        raise PlanError(
+            f"{func}() needs a confidence strictly between 0 and 1, got {confidence!r}. "
+            "Pass 0.95 for a 95% interval."
+        )
+    return normal_ppf(1.0 - (1.0 - confidence) / 2.0)
 
 
 def group_mean(value: IntoExpr, group: Expr) -> Expr:
@@ -68,9 +102,21 @@ def _group_var(value: IntoExpr, group: Expr) -> Expr:
     """The sample variance of `value` over the rows where `group` is true.
 
     ``E[x^2] - E[x]^2`` scaled to the ``n - 1`` denominator. The naive form is used here
-    (rather than the engine's Welford aggregate) because a *conditional* variance cannot be
-    expressed with the aggregate directly; the trade is documented on the callers, which
-    center their inputs implicitly by taking a difference of means.
+    rather than the engine's Welford aggregate because a *conditional* variance cannot be
+    expressed with the aggregate directly, and a window expression -- which is how
+    `Expr.zscore` and `Expr.expanding_var` center their inputs -- is rejected inside an
+    aggregate.
+
+    .. warning::
+
+       The difference of two nearly equal large numbers loses a digit of precision for
+       every digit by which the mean exceeds the spread, and taking a difference of means
+       downstream does **not** recover it: the cancellation has already happened here. On
+       ``[k+1, ..., k+6]`` split into two groups, `welch_t_statistic` returns ``-inf`` at
+       ``k=1e9`` (both variances cancelled to 0) and ``NaN`` at ``k=1e12`` (they cancelled
+       negative). An epoch-second timestamp is ~1.7e9, so subtract a reference point from
+       such a column before testing it. Fixing this properly needs a weighted/conditional
+       Welford aggregate in `bc-runtime`.
     """
     column = _as_column(value)
     kept = group & column.is_not_null()
@@ -271,8 +317,9 @@ def mean_ci_half_width(column: str | Expr, *, confidence: float = 0.95) -> Expr:
 
     Args:
         column: The measured column.
-        confidence: The confidence level; only 0.95 and 0.99 are supported exactly, and
-            anything else is served by the closer of the two.
+        confidence: The two-sided confidence level, strictly between 0 and 1. Any level is
+            exact; the multiplier is the normal quantile, evaluated once when the plan is
+            built.
 
     Returns:
         The interval half-width.
@@ -286,7 +333,7 @@ def mean_ci_half_width(column: str | Expr, *, confidence: float = 0.95) -> Expr:
             5.6861
     """
     value = _as_column(column)
-    multiplier = _Z95 if confidence < 0.97 else 2.5758293035489004
+    multiplier = _two_sided_z(confidence, func="mean_ci_half_width")
     return lit(multiplier) * value.std() / value.count().cast("float64").sqrt()
 
 
@@ -299,7 +346,7 @@ def proportion_ci_half_width(outcome: Expr, *, confidence: float = 0.95) -> Expr
 
     Args:
         outcome: A boolean expression that is true on a success.
-        confidence: The confidence level; 0.95 or 0.99.
+        confidence: The two-sided confidence level, strictly between 0 and 1.
 
     Returns:
         The interval half-width.
@@ -315,5 +362,5 @@ def proportion_ci_half_width(outcome: Expr, *, confidence: float = 0.95) -> Expr
     """
     total = count_if(outcome | ~outcome)
     rate = count_if(outcome) / total
-    multiplier = _Z95 if confidence < 0.97 else 2.5758293035489004
+    multiplier = _two_sided_z(confidence, func="proportion_ci_half_width")
     return lit(multiplier) * (rate * (lit(1.0) - rate) / total).sqrt()

@@ -372,5 +372,5 @@ Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed
 ## See also
 
 - {doc}`evaluation` — score a model once you have a trustworthy split.
-- {doc}`preprocessors` — the transforms these statistics tell you a column needs.
+- {doc}`preprocessors/index` — the transforms these statistics tell you a column needs.
 - {doc}`../user-guide/data-quality` — assert contracts rather than measure them.

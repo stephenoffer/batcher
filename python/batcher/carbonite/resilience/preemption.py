@@ -30,6 +30,50 @@ __all__ = ["PreemptionMonitor", "cloud_preemption_probe", "preemption_monitor"]
 # probe from ever stalling the poll loop (and reads a partition as "not draining").
 _PROBE_TIMEOUT_S = 0.3
 
+# EC2 IMDSv2: a session token is minted by PUT and then presented on the metadata GET.
+#
+# **Without it the AWS spot probe cannot fire at all on a modern instance.** IMDSv2 is
+# enforced whenever the instance is launched with `HttpTokens=required`, which is the
+# default for recent launch templates and is commonly mandated org-wide by policy. An
+# unauthenticated GET there returns 401, the probe treats any error as "not draining"
+# (correctly — being off EC2 must not false-positive), and the two cases are
+# indistinguishable from inside. The result is a spot fleet that never sees a termination
+# notice and never proactively drains, failing exactly as an on-prem cluster would, with
+# nothing to say the feature is off.
+#
+# The TTL is short because the token is used once, immediately.
+_IMDS_TOKEN_URL = "http://169.254.169.254/latest/api/token"
+_IMDS_TOKEN_TTL_S = 60
+
+
+def _imds_v2_headers() -> dict[str, str]:
+    """An IMDSv2 session-token header, or `{}` when one cannot be minted.
+
+    Empty is the right fallback rather than an error: it is what an IMDSv1-only instance
+    and a non-EC2 host both produce, and the GET that follows still works on IMDSv1. So
+    this only ever adds reach, and costs one link-local round trip on a spot worker's poll.
+
+    Returns:
+        `{"X-aws-ec2-metadata-token": ...}`, or `{}`.
+    """
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            _IMDS_TOKEN_URL,
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": str(_IMDS_TOKEN_TTL_S)},
+        )
+        with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
+            if resp.status == 200:
+                token = resp.read().decode("utf-8", "replace").strip()
+                if token:
+                    return {"X-aws-ec2-metadata-token": token}
+    except Exception as exc:
+        # Off EC2, or IMDSv1-only, or IMDS hop-limited. All normal, none fatal.
+        note_suppressed("carbonite", "mint an IMDSv2 session token", exc)
+    return {}
+
 
 def _azure_is_draining(body: str) -> bool:
     """Whether Azure's Scheduled Events payload announces reclamation of *this* node.
@@ -58,13 +102,18 @@ def cloud_preemption_probe() -> bool:
     false-positives a drain. Cheap link-local HTTP with a tight timeout, called from the
     poll thread — and only ever from a spot-profile worker, so a fixed on-prem cluster
     never pays for probes its infrastructure would not answer.
+
+    The AWS probe presents an IMDSv2 session token when one can be minted. Without it the
+    probe is silently dead on any instance launched with `HttpTokens=required`, which is
+    both the modern default and a common org-wide policy — the GET returns 401, that reads
+    as "not draining" like every other error, and the fleet simply never drains.
     """
     import urllib.request
 
     probes: tuple[tuple[str, dict[str, str], Callable[[str], bool]], ...] = (
         (
             "http://169.254.169.254/latest/meta-data/spot/instance-action",
-            {},
+            _imds_v2_headers(),
             bool,
         ),
         (
@@ -159,7 +208,9 @@ class PreemptionMonitor:
         """Stop polling and restore the prior SIGTERM handler. Idempotent."""
         self._stop.set()
         thread = self._thread
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
+            # Never join from inside the poll thread itself (a drain callback that calls
+            # `stop()` would otherwise deadlock waiting for its own thread to finish).
             thread.join(timeout=1.0)
         with self._lock:
             self._thread = None
@@ -176,14 +227,23 @@ class PreemptionMonitor:
             self._safe_call(callback)
 
     def _poll_loop(self) -> None:
-        while not self._stop.is_set():
-            draining = False
-            with contextlib.suppress(Exception):
-                draining = self._probe()
-            if draining:
-                self.trigger()
-                return  # sticky — nothing more to watch
-            self._stop.wait(self._poll_interval_s)
+        try:
+            while not self._stop.is_set():
+                draining = False
+                with contextlib.suppress(Exception):
+                    draining = self._probe()
+                if draining:
+                    self.trigger()
+                    return  # sticky — nothing more to watch
+                self._stop.wait(self._poll_interval_s)
+        finally:
+            # Release the thread slot on the way out, whichever way we left. `start()` is
+            # a no-op while `_thread` is set, so a loop that exited on its own (a drain
+            # was observed, or the probe raised out) left the monitor permanently
+            # un-startable — with a dead thread standing in for a live one.
+            with self._lock:
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _install_sigterm(self) -> None:
         try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -21,6 +23,7 @@ from batcher.api.orchestration.sizing import (
 from batcher.api.orchestration.stages import execute_distributed, resolve_sources, spill_to_disk
 from batcher.api.source_stats import collect_source_stats, column_bounds_needed
 from batcher.config import active_config, config_context
+from batcher.core.runtime import query_scope
 
 if TYPE_CHECKING:
     from batcher.core import ExecutionContext
@@ -59,6 +62,7 @@ def _log_decisions(opt, decisions, verdict, *, distributed: bool) -> None:
         ops=len(opt.ops),
         feasible=verdict.feasible,
         binding=verdict.binding_constraint or "none",
+        binding_op=verdict.binding_op or "none",
         distributed=distributed,
     )
     for i, decision in enumerate(decisions):
@@ -126,8 +130,45 @@ def run_relational(
         adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config(families)
         if adapted is not None:
             scope = config_context(adapted)
-    with scope:
+    # Hold an execution slot for the whole run, and narrow this query's pool to its share
+    # of the machine. Both are no-ops when `execution.max_concurrent_queries` is 0, which
+    # is the default — so an unconfigured deployment executes exactly as before.
+    #
+    # The grant is threaded through the SAME `config_context` the adaptive morsel sizing
+    # already uses rather than a second mechanism: one scoped-config path means one place
+    # where "what does this query think the machine looks like" is answered.
+    #
+    # `query_scope` wraps the whole thing so the execution has a cancellable id and Ctrl-C
+    # reaches it. It is outermost of the three because a query queued for an admission slot
+    # should be interruptible too — a user waiting on a full queue is exactly who reaches
+    # for Ctrl-C, and a scope inside `admit()` would not have been entered yet.
+    with (
+        query_scope(),
+        carbonite.ResourceManager(hub=ctx.hub).admit() as grant,
+        _with_grant(scope, grant),
+    ):
         return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
+
+
+@contextlib.contextmanager
+def _with_grant(scope, grant):
+    """Apply `grant.workers` to the active config for the block, inside `scope`.
+
+    Nested inside the adaptive-sizing scope rather than replacing it: that scope may have
+    adjusted the morsel target from learned statistics, and narrowing the pool must not
+    discard it.
+    """
+    with scope:
+        workers = getattr(grant, "workers", 0)
+        if not workers:
+            yield  # unbounded: the single-query case and the unconfigured default
+            return
+        current = active_config()
+        narrowed = current.replace(
+            execution=dataclasses.replace(current.execution, parallelism=workers)
+        )
+        with config_context(narrowed):
+            yield
 
 
 def _optimize(plan, sources, ctx, *, distributed: bool):
@@ -196,7 +237,11 @@ def _admit(opt, decisions, ctx, *, distributed: bool):
 
     must_spill = not verdict.feasible and verdict.binding_constraint == "memory"
     if not verdict.feasible and not must_spill:
-        raise PlanError(f"plan is infeasible (binding constraint: {verdict.binding_constraint})")
+        raise PlanError(
+            f"plan is infeasible (binding constraint: {verdict.binding_constraint}"
+            + (f" at {verdict.binding_op}" if verdict.binding_op else "")
+            + ")"
+        )
     return rm, verdict, must_spill
 
 
@@ -240,20 +285,72 @@ def _close_learning_loops(
     Output size, per-column distinct counts and quantiles, the filter's measured
     selectivity, the conductor's tuning loops, and the memory-pressure flap rate. Every one
     of these only steers a later *performance* choice, so recording is result-invariant.
+
+    Only `learn_column_stats` needs the *resident* input batches, which is why the
+    out-of-core paths call `_close_resident_free_loops` instead of this — they never
+    materialize the input, but everything else they measured is just as real.
+    """
+    from batcher.api.terminal._metadata import learn_column_stats
+
+    learn_column_stats(ctx.hub, resolved.batches, sources, plan, resolved.complete)
+    _close_resident_free_loops(
+        plan, logical_opt, ctx, rm, sources, table.num_rows, decisions, started=started
+    )
+
+
+def record_cardinality_outcome(hub, plan, sources, out_rows: int) -> None:
+    """Record the two loops every completed run can close, whatever route it took.
+
+    The measured output count (which corrects this plan signature's cardinality next run)
+    and the filter's measured selectivity ratio. Neither needs the input resident, a
+    resource manager, or the optimizer's per-join decisions — only the plan, its sources and
+    how many rows came out — which is what lets the in-memory, out-of-core and explicit
+    ``spill=True`` routes all close them from the one definition instead of each recording
+    a different subset (the explicit spill route recorded nothing at all).
+
+    Args:
+        hub: The metadata hub to record into; a `None` hub is a no-op.
+        plan: The pre-optimization plan — the identity the learner keys on.
+        sources: The plan's bound sources, for the selectivity denominator.
+        out_rows: Rows the run actually produced.
     """
     from batcher import kyber
-    from batcher.api.terminal._metadata import learn_column_stats
+
+    kyber.record_execution(hub, plan, out_rows)
+    kyber.record_selectivity(hub, plan, sources, out_rows)
+
+
+def _close_resident_free_loops(
+    plan, logical_opt, ctx, rm, sources, out_rows: int, decisions, *, started: float
+):
+    """The learning loops that need no resident input batches.
+
+    Split out because the spill paths used to record the output row count and nothing else,
+    which left the optimizer learning least from exactly the queries that most needed it:
+    a query big enough to go out-of-core taught it no filter selectivity, no shuffle volume,
+    no group-reduction ratio, no join outcome, and no memory-pressure flap rate. That is
+    self-reinforcing — those are the very inputs whose absence keeps the next run's estimate
+    poor enough to spill again.
+
+    None of these reads a batch. `record_selectivity` divides the output count by the
+    source's footer row count, `record_run_feedback` takes counts and a wall time, and the
+    flap rate comes off the resource manager — all available whether the input was resident
+    or streamed from disk. (`learn_column_stats` genuinely cannot run here: it measures
+    ndv/quantiles from the scanned batches, and an out-of-core run never holds them.)
+
+    The flap rate is the sharpest of them: it exists to stiffen de-escalation for a workload
+    that oscillates under memory pressure, and it was being recorded only on the path that
+    did *not* hit pressure.
+    """
     from batcher.api.tuning import record_run_feedback, total_source_rows
 
-    kyber.record_execution(ctx.hub, plan, table.num_rows)
-    learn_column_stats(ctx.hub, resolved.batches, sources, plan, resolved.complete)
-    kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
+    record_cardinality_outcome(ctx.hub, plan, sources, out_rows)
     record_run_feedback(
         ctx.hub,
         plan,
         logical_opt,
         decisions,
-        out_rows=table.num_rows,
+        out_rows=out_rows,
         input_rows=total_source_rows(sources),
         wall_ms=(time.perf_counter() - started) * 1000.0,
     )
@@ -319,7 +416,9 @@ def _run_relational(
     if must_spill or rm.should_spill(opt) or rm.input_exceeds_budget(input_bytes):
         spilled = spill_to_disk(logical_opt, sources, ctx, rm, opt, verdict)
         if spilled is not None:
-            kyber.record_execution(ctx.hub, plan, spilled.num_rows)
+            _close_resident_free_loops(
+                plan, logical_opt, ctx, rm, sources, spilled.num_rows, decisions, started=started
+            )
             return spilled, decisions
         # An *advisory* infeasibility rests on a `Provenance.DEFAULT` guess: worth routing
         # out-of-core, but a guess must never fail a legitimate query (the admission
@@ -327,7 +426,9 @@ def _run_relational(
         if must_spill and not verdict.advisory:
             raise PlanError(
                 "plan does not fit the memory envelope and has no out-of-core path "
-                f"(binding constraint: {verdict.binding_constraint})"
+                f"(binding constraint: {verdict.binding_constraint}"
+                + (f" at {verdict.binding_op}" if verdict.binding_op else "")
+                + ")"
             )
 
     resolved = resolve_sources(sources, opt, ctx)
@@ -343,13 +444,31 @@ def _run_relational(
             parts = partitions_from_physical(opt) or DEFAULT_PARTITIONS
             spilled = spill_collect(logical_opt, sources, parts)
             if spilled is not None:
-                kyber.record_execution(ctx.hub, plan, spilled.num_rows)
+                _close_resident_free_loops(
+                    plan,
+                    logical_opt,
+                    ctx,
+                    rm,
+                    sources,
+                    spilled.num_rows,
+                    decisions,
+                    started=started,
+                )
                 return spilled, decisions
         table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
 
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started
     )
+    if ctx.profile is not None:
+        # Recorded *after* execution, not at admission: the interesting figures are the
+        # envelope's high-water mark and the cache's hit rate, and at admission neither has
+        # happened yet. Without it a profile shows the plan and the timings but not the
+        # memory conditions, and the same plan reads as fast with headroom and slow at the
+        # edge of the budget.
+        from batcher.api.terminal.profile import resource_decision
+
+        ctx.profile.decisions.append(resource_decision(rm))
     return table, decisions
 
 

@@ -66,18 +66,56 @@ def assign_replica_hosts(
         return out
 
     live = [w for w in range(len(nodes)) if w not in dead]
+    # Seed the load with the primaries each worker already holds, not zero.
+    #
+    # A primary copy and a replica copy are the same bucket and cost the same memory, so a
+    # worker hosting many primaries is genuinely the most loaded host on the cluster — and
+    # counting only replicas made it look like the emptiest one, so it attracted them.
+    # Measured on four workers where one held three of four primaries: that worker was
+    # handed a replica too and ended up with 4 of the 8 copies, against 1 each for two idle
+    # workers. Seeding drops its share to 3 and lifts the idle workers to 2.
     load = dict.fromkeys(live, 0)
+    for primary in primaries.values():
+        if primary in load:
+            load[primary] += 1
     for src in sorted(primaries):
         primary = primaries[src]
         primary_node = nodes[primary] if primary < len(nodes) else None
-        # Off-node first (an independent failure domain), then least-loaded, then stable
-        # by index so the assignment is deterministic — a replay picks the same hosts.
-        candidates = sorted(
-            (w for w in live if w != primary),
-            key=lambda w: (nodes[w] == primary_node, load[w], w),
-        )
-        chosen = candidates[:wanted]
-        out[src] = chosen
-        for w in chosen:
+        out[src] = _pick_replicas(primary, primary_node, live, nodes, load, wanted)
+        for w in out[src]:
             load[w] += 1
     return out
+
+
+def _pick_replicas(
+    primary: int,
+    primary_node: str | None,
+    live: list[int],
+    nodes: Sequence[str],
+    load: dict[int, int],
+    wanted: int,
+) -> list[int]:
+    """The workers holding one source's replicas: each in a fresh failure domain if possible.
+
+    The replicas of one source must be independent of the primary **and of each other**.
+    Choosing them all at once from a single ranking got the first part right and the second
+    wrong: with `factor=3` on a three-node cluster, both replicas could land on the same
+    second node, so one node loss took out both and the source fell back to a full lineage
+    recompute — precisely the outcome paying for two copies was meant to buy off.
+
+    Picking them one at a time, each excluding the nodes already holding a copy, gives
+    `min(factor, nodes)` distinct failure domains, which is the most the topology allows.
+    Once every node holds a copy the constraint relaxes to least-loaded, so a small cluster
+    still gets as many replicas as it was asked for rather than silently fewer.
+    """
+    chosen: list[int] = []
+    used_nodes = {primary_node} if primary_node is not None else set()
+    for _ in range(wanted):
+        candidates = [w for w in live if w != primary and w not in chosen]
+        if not candidates:
+            break
+        # Rank: a node no copy is on yet, then the least-loaded worker, then the lowest
+        # index so a replay assigns the same hosts.
+        chosen.append(min(candidates, key=lambda w: (nodes[w] in used_nodes, load[w], w)))
+        used_nodes.add(nodes[chosen[-1]])
+    return chosen

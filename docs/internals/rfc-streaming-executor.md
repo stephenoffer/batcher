@@ -144,6 +144,32 @@ ever).
 **What it buys.** Kills the ~22% gather tax on high-selectivity filter→aggregate queries — the
 exact sf10 shapes where Batcher trails DuckDB-on-Arrow (q1 1.19×, q19 1.27×).
 
+**Corroboration (2026-07-24, sf1, 96 cores, release).** Re-measuring the DuckDB gap found it is
+*this* proposal and not twelve separate ones: Batcher trails on 12 of 22 TPC-H queries, and
+profiling the three worst put the time in materialization every time — q21's bottleneck is a
+filter taking 90 ms to pass 3.79 M of 6 M rows and copy 87 MB; q5's is a hash join taking 204 ms
+on a 6 M-row probe emitting 1.2 M rows.
+
+One comparison isolates the cost from the probe itself, which the `perf` profile above cannot
+do on its own. The **same** 6 M-row `lineitem` probe costs:
+
+| Query | rows emitted | probe cost |
+|---|---|---|
+| q17 (first join) | 6,088 | 103 ms |
+| q5 | 1,201,113 | 204 ms |
+
+Same input, same operator, same key type — the cost tracks the *output* row count, so it is the
+gather and not the hash probe. That is the proposal's premise measured directly rather than
+inferred from a profile, and it is the strongest argument available for the morsel-type
+extension this section asks a maintainer to decide on.
+
+Also worth recording for whoever takes that decision: two adjacent leads were checked and are
+dead. The `interp` backend label on these filters is **not** a JIT fallback — `bc-codegen`
+accepts both `int > int` and `date > date` when asked directly, and `stream/mod.rs` records
+that wiring Tier-1 into this path measured 1.01× over TPC-H with five queries slower. And
+Kyber's join orders on q5/q17/q21 estimate within 2× of actual, so this is not a planning
+problem.
+
 ## Proposal 3 — Arrow-native encodings (recover the "storage" win without a bespoke format)
 
 **Problem.** DuckDB's native store dictionary-encodes low-cardinality columns and hashes

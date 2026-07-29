@@ -1,13 +1,17 @@
 """The Carbonite resource manager entry point.
 
 Validates plans for feasibility, hands out credit windows and memory reservations,
-and decides when a query must spill. It is a thin orchestrator: it composes one
-policy of each kind (admission, spill, flow control, memory estimation — see
-`carbonite.base`) plus the memory subsystem (buffer pool + pressure monitor) and
-delegates to them. `validate` returns real counter-offers Kyber re-plans around;
-`reserve` accounts against the process-wide buffer pool; `should_spill` compares a
-plan's estimated envelope to live memory so a large query goes out-of-core instead
-of OOMing. An alternate policy plugs in by being passed to the constructor.
+and decides when a query must spill. It is a thin orchestrator: it composes one policy
+of each of the four kinds `carbonite.base` declares (admission, flow control, memory
+estimation, scheduling), the `SpillAdvisor` that owns every out-of-core decision, and
+the memory subsystem (buffer pool + pressure monitor), and delegates to them.
+
+`validate` returns real counter-offers Kyber re-plans around; `reserve` accounts against
+the process-wide buffer pool; `should_spill` — and `spill_reason`, which says *why* —
+compare a plan's estimated envelope and live memory so a large query goes out-of-core
+instead of OOMing; `stats` reads all of it back in one snapshot. An alternate policy plugs
+in by being passed to the constructor, and every delegation goes through it, including the
+learned-warm-start paths.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import dataclasses
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.base import (
     AdmissionPolicy,
     FlowControlPolicy,
@@ -26,7 +31,6 @@ from batcher.carbonite.base import (
 from batcher.carbonite.memory import OperatorMemoryEstimator, PressureMonitor, process_pool
 from batcher.carbonite.memory.learned import LearnedMemoryModel, learned_memory_model
 from batcher.carbonite.memory.pressure import (
-    PressureLevel,
     hysteresis_alpha_from_flap,
     load_flap_rate,
 )
@@ -39,6 +43,20 @@ from batcher.carbonite.policies import (
     learned_channel_morsel_bytes,
     load_shuffle_window,
 )
+from batcher.carbonite.policies.cpu_budget import effective_core_budget
+from batcher.carbonite.policies.morsel import (
+    MIN_MORSEL_BYTES,
+    MIN_MORSEL_ROWS,
+    PRESSURE_FACTORS,
+    morsel_target,
+)
+from batcher.carbonite.policies.spill_advice import SpillAdvisor
+from batcher.carbonite.policies.spill_shape import (
+    MAX_SPILL_PARTITIONS,
+    MIN_SPILL_PARTITIONS,
+    SPILL_BYTES_PER_PARTITION,
+    SPILL_COMPRESS_ABOVE,
+)
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 from batcher.plan.physical import PhysicalPlan
@@ -46,28 +64,18 @@ from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, Scheduling
 
 __all__ = ["ResourceManager"]
 
-# How far to shrink the morsel target at each pressure level (adaptive morsel sizing).
-# NORMAL keeps the configured target (no entry ⇒ factor 1.0); ELEVATED halves it;
-# SPILL/CRITICAL quarter it so the streaming working set stays tight while the engine
-# is already under pressure.
-_MORSEL_PRESSURE_FACTORS = {
-    PressureLevel.ELEVATED: 0.5,
-    PressureLevel.SPILL: 0.25,
-    PressureLevel.CRITICAL: 0.25,
-}
-_MIN_MORSEL_ROWS = 1024  # floor: a morsel never shrinks below a cache-efficient batch
-_MIN_MORSEL_BYTES = 64 * 1024  # 64 KiB floor (companion byte bound)
+# Re-exported under their historical private names: the morsel-sizing rules moved to
+# `policies.morsel`, but tests and callers name them from here.
+_MORSEL_PRESSURE_FACTORS = PRESSURE_FACTORS
+_MIN_MORSEL_ROWS = MIN_MORSEL_ROWS
+_MIN_MORSEL_BYTES = MIN_MORSEL_BYTES
 
-# Learned spill-partition sizing: aim each out-of-core bucket at roughly this many bytes
-# of the LEARNED peak, so a bigger measured working set shards into more, smaller buckets
-# (bounded memory per bucket) and a small one stays coarse. Only *shards* — the shuffle
-# is result-invariant in the number of partitions.
-_SPILL_BYTES_PER_PARTITION = 128 * 1024 * 1024  # 128 MiB target per spill bucket
-_MIN_SPILL_PARTITIONS = 2
-_MAX_SPILL_PARTITIONS = 4096
-# Above this learned peak a spill bucket compresses well enough to be worth the CPU:
-# a large out-of-core state is IO-bound, so trading CPU for less disk/network wins.
-_SPILL_COMPRESS_ABOVE = 512 * 1024 * 1024  # 512 MiB
+# Re-exported under their historical private names: the sizing rules moved to
+# `policies.spill_shape`, but callers and tests name them from here.
+_SPILL_BYTES_PER_PARTITION = SPILL_BYTES_PER_PARTITION
+_MIN_SPILL_PARTITIONS = MIN_SPILL_PARTITIONS
+_MAX_SPILL_PARTITIONS = MAX_SPILL_PARTITIONS
+_SPILL_COMPRESS_ABOVE = SPILL_COMPRESS_ABOVE
 
 
 class ResourceManager:
@@ -107,14 +115,14 @@ class ResourceManager:
         self._ctx = ResourceContext(
             config=self._config, envelope_bytes=self._envelope, memory_model=self._mem_model
         )
-        # Single-entry envelope cache keyed by plan *identity* (a held reference, so
-        # `is` is stable and the object can't be GC'd into an id collision).
-        self._peak_plan: object = None
-        self._peak_value = 0
         self._admission = admission or BudgetingAdmission()
         self._flow_control = flow_control or StaticCreditFlowControl()
         self._memory = memory or OperatorMemoryEstimator()
         self._scheduling = scheduling or DefaultSchedulingPolicy()
+        # Every out-of-core decision, sized off one peak (cached per plan) and one budget.
+        self._spill = SpillAdvisor(
+            self._config, self._ctx, self._memory, self._mem_model, self._pressure, self._envelope
+        )
 
     def validate(self, plan: PhysicalPlan) -> FeasibilityVerdict:
         """Check whether `plan` can run within available resources.
@@ -127,7 +135,9 @@ class ResourceManager:
         """
         return self._admission.validate(plan, self._ctx)
 
-    def grant_credits(self, requested: int, *, signature: str | None = None) -> int:
+    def grant_credits(
+        self, requested: int, *, signature: str | None = None, channels: int | None = None
+    ) -> int:
         """Grant a credit window (in-flight `RecordBatch` slots) for a data channel.
 
         One credit = one buffered batch, so the returned window bounds a shuffle
@@ -146,13 +156,24 @@ class ResourceManager:
         if signature is not None:
             learned = load_shuffle_window(self._hub, signature)
             if learned is not None and learned > 0:
-                # Honor the byte bound (`credit_byte_budget`) via the learned wide-row width,
-                # exactly as the static grant does — otherwise a wide-row shuffle's learned
-                # window would be clamped only by the un-corrected count ceiling and buffer far
-                # past the byte budget. Cold/narrow model → the plain count ceiling.
-                ceiling = credit_ceiling(self._config, learned_channel_morsel_bytes(self._ctx))
-                return max(1, min(learned, ceiling))
-        return self._flow_control.grant(requested, self._ctx)
+                requested = learned
+        # Always through the policy, including the learned path. Clamping the learned window
+        # here instead — which is what this did — reproduced `StaticCreditFlowControl`'s band
+        # inline and so silently bypassed whichever policy the manager was actually
+        # constructed with: a deployment that supplied its own flow control got it for every
+        # cold channel and lost it for exactly the recurring ones it had tuned for. The
+        # static policy applies the identical clamp, so the default path is unchanged.
+        #
+        # `channels` is how many channels will actually fetch at once. The per-channel byte
+        # budget is divided by it rather than by the configured `shuffle_fetch_fan_in`,
+        # which caps concurrency without measuring it — a reducer with three upstreams was
+        # being handed a budget sized for eight, so its three channels could together
+        # buffer nearly three times the intended share. `None` keeps the configured fan-in,
+        # which is what a caller that cannot know its width gets.
+        ctx = self._ctx
+        if channels is not None and channels > 0:
+            ctx = dataclasses.replace(ctx, shuffle_channels=channels)
+        return self._flow_control.grant(requested, ctx)
 
     def scheduling_envelope(
         self, plan: PhysicalPlan, requested_workers: int | None = None
@@ -172,8 +193,30 @@ class ResourceManager:
             requested_workers=requested_workers,
             available_bytes=self._hard_budget(),
         )
-        max_credits = max((op.bounds.c_max_credits for op in plan.ops), default=0)
+        # The plan's widest credit request, taken from the memory estimator's envelope so
+        # this and every other consumer of "what does this plan want" read one derivation
+        # rather than each re-scanning `plan.ops` with its own default.
+        max_credits = self._memory.envelope(plan, self._ctx).c_max_credits
         return dataclasses.replace(env, credits=self.grant_credits(max_credits))
+
+    def credit_window_ceiling(self, *, channels: int | None = None) -> int:
+        """The maximum credit window a shuffle channel may hold, in batch slots.
+
+        The bound `grant_credits` clamps into, exposed because it has to travel. An AIMD
+        controller running in a Ray worker cannot derive it: the worker sees neither the
+        driver's `config_context` nor the metadata hub the learned row width comes from, so
+        every input to the calculation is wrong or absent there. The driver computes it once
+        and ships the integer.
+
+        Args:
+            channels: Channels actually fetching at once, or `None` for the configured cap.
+
+        Returns:
+            The ceiling in credits, at least 1.
+        """
+        return credit_ceiling(
+            self._config, learned_channel_morsel_bytes(self._ctx), channels=channels
+        )
 
     def adaptive_flow_control(self, *, signature: str | None = None) -> AIMDFlowControl:
         """Vend an AIMD credit controller for an adaptive shuffle channel.
@@ -219,149 +262,121 @@ class ResourceManager:
         morsel only batches data, so this never changes the result; a cold store learns
         nothing and leaves the count at the pressure-only value (``None`` when unpressured).
         """
-        cfg = self._config.execution
-        # A pure read: the AIMD round is the one component that *samples* the monitor
-        # (advancing its de-escalation average). Sizing a morsel must not.
-        factor = _MORSEL_PRESSURE_FACTORS.get(self._pressure.classify(), 1.0)
-        rows = int(cfg.morsel_rows * factor)
-        nbytes = int(cfg.morsel_bytes * factor)
-        learned_rows = self._learned_morsel_rows(families)
-        if learned_rows is not None:
-            rows = min(rows, learned_rows)
-        # Keep the configured target (fast path) only when neither lever moved anything.
-        if factor >= 1.0 and rows >= cfg.morsel_rows:
-            return None
-        return max(_MIN_MORSEL_ROWS, rows), max(_MIN_MORSEL_BYTES, nbytes)
+        # `classify()`, a pure read: the AIMD round is the one component that *samples* the
+        # monitor (advancing its de-escalation average). Sizing a morsel must not.
+        return morsel_target(self._config, self._pressure.classify(), self._mem_model, families)
 
-    def _learned_morsel_rows(self, families: Iterable[str] | None = None) -> int | None:
-        """Row cap that keeps a morsel's *measured* byte working set within the budget.
+    def recommend_parallelism(self) -> int | None:
+        """Cores to fan out across when the machine is measurably oversubscribed, else `None`.
 
-        Uses the widest learned per-row footprint (``rows = morsel_bytes /
-        max_bytes_per_row``), restricted to `families` — *this plan's* operator kinds — when
-        given, so a narrow plan is sized by its own data rather than throttled by an
-        unrelated wide family measured in an earlier query. `None` when nothing is learned
-        yet or the learned width is no wider than the configured target already implies (so
-        the common case adds no overhead and no change)."""
-        widths = self._mem_model.max_bytes_per_row(families)
-        if widths is None or widths <= 0:
-            return None
-        cap = int(self._config.execution.morsel_bytes / widths)
-        if cap >= self._config.execution.morsel_rows:
-            return None  # learned width is no wider than assumed — nothing to tighten
-        return max(_MIN_MORSEL_ROWS, cap)
+        The CPU counterpart to `recommend_morsel_target`. Memory has a pressure monitor, a
+        budget, and a spill path; CPU had only the permitted core count, which says what the
+        cgroup allows and nothing about what the scheduler delivers. When two workers share a
+        node, a quota is binding, or a co-tenant has half the box, fanning out to the permitted
+        count adds context switches and cache pressure without adding throughput — the query
+        gets slower the harder the engine tries.
+
+        `None` on a quiet machine (the common case), so the engine keeps its own default and
+        nothing changes. See `policies.cpu_budget` for the deadband and the floor.
+
+        Returns:
+            The reduced core budget, or `None` to leave parallelism alone.
+        """
+        configured = self._config.execution.parallelism
+        if configured > 0:
+            return None  # an explicit setting is an instruction, not an estimate
+        budget = effective_core_budget()
+        return budget if budget < available_cpu_count() else None
 
     def recommended_config(self, families: Iterable[str] | None = None) -> Config | None:
-        """A `Config` with the pressure-scaled morsel target, or ``None`` to keep the
-        current one. The conductor activates it for the execution scope so the adapted
-        morsel reaches both the in-process engine and the shipped worker config. `families`
-        (the plan's operator kinds) narrows the learned width to this plan's own data."""
+        """A `Config` with the pressure-scaled morsel target and contention-scaled fan-out,
+        or ``None`` to keep the current one. The conductor activates it for the execution
+        scope so the adaptation reaches both the in-process engine and the shipped worker
+        config. `families` (the plan's operator kinds) narrows the learned width to this
+        plan's own data."""
         target = self.recommend_morsel_target(families)
-        if target is None:
+        parallelism = self.recommend_parallelism()
+        if target is None and parallelism is None:
             return None
-        rows, nbytes = target
-        execution = dataclasses.replace(
-            self._config.execution, morsel_rows=rows, morsel_bytes=nbytes
-        )
+        changes: dict[str, object] = {}
+        if target is not None:
+            changes["morsel_rows"], changes["morsel_bytes"] = target
+        if parallelism is not None:
+            changes["parallelism"] = parallelism
+        execution = dataclasses.replace(self._config.execution, **changes)
         return dataclasses.replace(self._config, execution=execution)
 
-    def _peak_bytes(self, plan: PhysicalPlan) -> int:
-        """The plan's peak in-memory bytes (learned-blended), computed once per plan.
-
-        `estimated_bytes`, `should_spill`, and `reserve` all consult this, so the
-        per-plan envelope is built once rather than three times. The estimator
-        blends each operator's plan estimate toward its *measured* peak (learned from
-        `m_peak_bytes`) when the hub has one, so all three decisions size against reality;
-        on a cold store it is exactly the plan's dominant breaker.
-        """
-        if plan is not self._peak_plan:
-            self._peak_value = self._memory.envelope(plan, self._ctx).m_max_bytes
-            self._peak_plan = plan
-        return self._peak_value
-
     def estimated_bytes(self, plan: PhysicalPlan) -> int:
-        """Estimated peak in-memory bytes for `plan` (its dominant breaker).
+        """Estimated peak in-memory bytes for `plan` — its learned-blended dominant breaker.
 
-        The figure `reserve` accounts and `should_spill` compares against the
-        budget. 0 when Kyber emitted no sizes (an un-estimable plan).
+        The figure `reserve` accounts and the spill gate compares against the budget.
+        `0` when Kyber emitted no sizes. See `policies.spill_advice.SpillAdvisor`.
         """
-        return self._peak_bytes(plan)
+        return self._spill.peak_bytes(plan)
 
     def should_spill(self, plan: PhysicalPlan) -> bool:
-        """Decide whether `plan` should run out-of-core rather than in memory.
+        """Whether `plan` should run out-of-core rather than in memory.
 
-        Compares the plan's estimated peak memory (the dominant breaker, via the
-        `MemoryEstimator`) against the unified hard budget. When the estimate won't
-        fit, the conductor routes the query through the spilling executor so it
-        completes under bounded memory instead of OOMing.
-
-        The estimate is not trusted as the *only* signal, because it systematically
-        under-predicts in exactly the cases that OOM. Kyber emits `0` for any operator
-        whose cardinality is unknown (`kyber.annotate`), so an un-sized plan used to
-        take the `return False` fast path and run fully in memory no matter how much
-        of the box was already gone. So the estimate can only ever *add* a spill: when
-        it does not force one, the live **measured** footprint decides. That reading
-        (`PressureMonitor`, cgroup-current else RSS) is the one number here that cannot
-        be wrong the way an estimate can, and it was already computed for the morsel/
-        cache ladder — it simply never gated this decision.
-
-        Spilling is result-invariant — it only trades time for bounded memory — so a
-        false positive costs latency while a false negative costs the process. That
-        asymmetry is why the measured signal is allowed to overrule "no estimate".
-        `classify()` (not `level()`) reads the level so this does not consume the AIMD
-        round's sample.
+        The boolean form of `spill_reason`, which documents the two signals behind it.
         """
-        estimated = self._peak_bytes(plan)
-        if estimated > 0 and estimated > self._hard_budget():
-            return True
-        return self._pressure.classify() >= PressureLevel.SPILL
+        return self._spill.spill_reason(plan) is not None
+
+    def spill_reason(self, plan: PhysicalPlan) -> str | None:
+        """*Why* `plan` must go out-of-core, or `None` when it need not.
+
+        An estimate over budget is fixed by reshaping the plan; live pressure is fixed by
+        finding what else holds memory. See `policies.spill_advice.SpillAdvisor`.
+        """
+        return self._spill.spill_reason(plan)
+
+    def stats(self) -> dict[str, object]:
+        """One reading of every resource Carbonite governs, for telemetry and `explain`.
+
+        The buffer pool, the result cache, the concurrency limiter, and the pressure
+        monitor each measure their own corner, and each was readable only by reaching for
+        the object that owns it. Reading them together is what makes them a diagnosis: a
+        query that spilled with an empty pool and a full cache was starved by *storage*,
+        and one that spilled with a full pool and no cache was simply too big.
+
+        Returns:
+            A nested dict keyed by subsystem. Corners that were never created (no pool, no
+            cache) are omitted rather than reported as zero, which would be a lie about a
+            thing that does not exist.
+        """
+        from batcher.carbonite.cache import current_result_cache
+        from batcher.carbonite.memory.pool import current_process_pool
+
+        level = self._pressure.classify()
+        out: dict[str, object] = {
+            "pressure_level": level.name,
+            "envelope_bytes": self._envelope,
+            "soft_budget_bytes": self._spill.soft_budget(),
+            "hard_budget_bytes": self._spill.hard_budget(),
+            "headroom_bytes": self._pressure.headroom_bytes(),
+        }
+        pool = current_process_pool()
+        if pool is not None:
+            out["pool"] = pool.stats()
+        cache = current_result_cache()
+        if cache is not None:
+            out["result_cache"] = cache.stats()
+        flap = self._pressure.flap_rate()
+        if flap is not None:
+            out["pressure_flap_rate"] = flap
+        return out
 
     def input_exceeds_budget(self, input_bytes: int) -> bool:
         """Whether reading the sources whole would not fit the memory envelope.
 
-        The in-memory path resolves every source to a list of Arrow batches *before* the
-        engine runs, so the input is resident in full no matter how small the result is —
-        a `GROUP BY` returning four rows still materializes every projected column of
-        every row. That makes the input, not the operator state, the dominant term for a
-        scan-heavy query, and it is the one term the plan estimate never covered:
-        `m_max_bytes` sizes an operator's *working set*, so a plan whose breakers are all
-        small reads as "fits" while the scan feeding them does not.
-
-        This is metadata-only — a declared `row_count()` times the projected schema width
-        — so it costs no I/O and is available *before* the decision it informs. `0` means
-        the sources could not size themselves, which is not evidence of fitting, so the
-        caller falls back to the other signals rather than treating it as a `False`.
-
-        Returning `True` routes the query to the out-of-core executor, which reads through
-        a bounded streaming tap instead of resolving the sources — the same relation,
-        bounded memory.
+        The dominant term for a scan-heavy query, and the one the plan estimate never
+        covered. See `policies.spill_advice.SpillAdvisor.input_exceeds_budget`.
         """
-        return input_bytes > 0 and input_bytes > self._hard_budget()
+        return self._spill.input_exceeds_budget(input_bytes)
 
     def recommend_spill_partitions(self, plan: PhysicalPlan) -> int | None:
-        """Number of out-of-core buckets to shard `plan`'s spilled state into, or ``None``.
-
-        Sizes the bucket count so each bucket holds ~`_SPILL_BYTES_PER_PARTITION` of the
-        LEARNED peak (`m_peak_bytes`-blended, not the plan guess): a larger measured
-        working set shards into more, smaller buckets so per-bucket memory stays bounded,
-        a small one stays coarse. Returns ``None`` when the plan is un-sized (nothing
-        learned or estimated) so the caller keeps its default partition count. The number
-        of partitions only *shards* the shuffle — the result is identical for any count
-        (the mergeable algebra), so this is a pure performance lever.
-
-        NOTE for the orchestrator: consume this in place of the blind
-        `partitions_from_physical` fallback to right-size out-of-core sharding.
-        """
-        peak = self._peak_bytes(plan)
-        if peak <= 0:
-            return None
-        # Prefer the *measured* spill volume when a family has a spill history: buckets shard
-        # only the bytes that actually go to disk, which is smaller than the total working-set
-        # peak (which includes the in-memory budget that never spills). Fall back to peak when
-        # nothing has spilled yet. Result-invariant either way — this only sets bucket count.
-        volume = self._mem_model.predicted_spill_bytes(plan.ops)
-        basis = volume if volume > 0 else peak
-        parts = max(_MIN_SPILL_PARTITIONS, -(-basis // _SPILL_BYTES_PER_PARTITION))  # ceil-div
-        return min(_MAX_SPILL_PARTITIONS, int(parts))
+        """Out-of-core buckets to shard `plan`'s spilled state into, or `None` to keep the
+        caller's default. See `policies.spill_advice.SpillAdvisor.partitions`."""
+        return self._spill.partitions(plan)
 
     def flap_rate(self) -> float | None:
         """This run's measured pressure-level flap rate, or `None` if too few samples.
@@ -378,68 +393,54 @@ class ResourceManager:
         return self._pressure.flap_rate()
 
     def partitions_for_bounds(self, plan: PhysicalPlan, bounds: ResourceBounds | None) -> int:
-        """Fewest spill buckets that make each bucket fit `bounds`, or ``0`` if unconstrained.
+        """Fewest spill buckets that make each bucket fit admission's counter-offer.
 
-        This is the **return leg** of the Kyber↔Carbonite contract. When admission refuses a
-        plan it does not merely say "no": `BudgetingAdmission.validate` attaches a
-        `suggested_bounds` counter-offer naming the per-operator byte envelope the plan *would*
-        fit in. Nothing consumed it, so the conductor degraded an infeasible verdict to a bare
-        `must_spill` boolean and then sharded the out-of-core phase by
-        `_SPILL_BYTES_PER_PARTITION` — a fixed constant that knows nothing about the machine's
-        actual budget. On a memory-tight host that produces buckets which individually still do
-        not fit, which is the exact failure admission had just diagnosed.
-
-        Sharding by the offered envelope instead makes the counter-offer binding: with a peak
-        (or measured spill volume) of `B` and an envelope of `E`, `ceil(B / E)` buckets each
-        hold about `E`. Clamped to `_MAX_SPILL_PARTITIONS` like every other recommendation.
-
-        Result-invariant: partition count only *shards* the shuffle, and the mergeable algebra
-        gives an identical merged result for any count. This is a memory-safety lever only.
-
-        Args:
-            plan: The physical plan about to be routed out-of-core.
-            bounds: Carbonite's counter-offer, or `None` when admission raised no objection.
-
-        Returns:
-            The minimum bucket count, or `0` when there is no bound or the plan is un-sized
-            (the caller then keeps whatever count it already chose).
+        The return leg of the Kyber-Carbonite contract; `0` when unconstrained. See
+        `policies.spill_advice.SpillAdvisor.partitions_for_bounds`.
         """
-        if bounds is None or bounds.m_max_bytes <= 0:
-            return 0
-        # Same basis as `recommend_spill_partitions`: the measured spill volume when a family
-        # has a spill history, else the learned-blended peak.
-        volume = self._mem_model.predicted_spill_bytes(plan.ops)
-        basis = volume if volume > 0 else self._peak_bytes(plan)
-        if basis <= 0:
-            return 0
-        parts = -(-basis // bounds.m_max_bytes)  # ceil-div
-        return min(_MAX_SPILL_PARTITIONS, int(max(1, parts)))
+        return self._spill.partitions_for_bounds(plan, bounds)
 
     def recommend_spill_compression(self, plan: PhysicalPlan) -> bool | None:
         """Whether spilling `plan` should compress its buckets, from the learned peak.
 
-        A large out-of-core state is IO-bound (disk / object-store), so above
-        `_SPILL_COMPRESS_ABOVE` of measured peak, trading CPU for less bytes on the wire
-        pays; below it the CPU isn't worth it. Compression is lossless — the un-spilled
-        result is byte-identical either way — so this is a pure throughput lever. Returns
-        ``None`` for an un-sized plan (keep the configured default).
-
-        NOTE for the orchestrator: map this onto `memory.spill_compression` when spilling.
+        `None` for an un-sized plan (keep the configured default). Lossless either way.
+        See `policies.spill_advice.SpillAdvisor.compression`.
         """
-        peak = self._peak_bytes(plan)
-        if peak <= 0:
-            return None
-        return peak >= _SPILL_COMPRESS_ABOVE
-
-    def _soft_budget(self) -> int:
-        """Bytes a query aims to stay under (the admission/throttle threshold)."""
-        return int(self._envelope * self._config.memory.soft_limit)
+        return self._spill.compression(plan)
 
     def _hard_budget(self) -> int:
-        """Bytes a query may hold in memory before it must spill (the spill/reserve
-        cap). Both `should_spill` and `reserve` use this one figure, derived from the
-        once-sampled envelope, so the two decisions never disagree."""
-        return int(self._envelope * self._config.memory.hard_limit)
+        """Bytes a query may hold before it must spill — the one figure the spill gate and
+        the reservation share, so the two can never disagree."""
+        return self._spill.hard_budget()
+
+    @contextmanager
+    def admit(self) -> Iterator[object]:
+        """Hold an execution slot for the block, sized to what else is running.
+
+        A context manager rather than a `validate`-style call because the slot must be
+        held for the *duration* of execution, and a function that returns a verdict cannot
+        bracket that — the query would be counted as running for as long as it took to
+        decide, which is not the thing being bounded.
+
+        Yields an `ExecutionGrant` whose `workers` is the rayon pool width this query
+        should request. `workers=0` means unbounded, which is what a single query gets and
+        what every query gets when `execution.max_concurrent_queries` is 0 (the default) —
+        so an unconfigured deployment executes exactly as it did before this existed.
+
+        Yields:
+            The `ExecutionGrant` for this query.
+
+        Raises:
+            AdmissionTimeout: If the queue is full or the wait deadline passes.
+        """
+        from batcher.carbonite.policies.concurrency import process_limiter
+
+        limiter = process_limiter(self._config)
+        grant = limiter.acquire(timeout=max(0.0, self._config.execution.admission_timeout_s))
+        try:
+            yield grant
+        finally:
+            limiter.release()
 
     @contextmanager
     def reserve(self, m_bytes: int) -> Iterator[bool]:

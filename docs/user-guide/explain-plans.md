@@ -201,16 +201,74 @@ import json
 profile = json.loads(query.explain(analyze=True, format="json"))
 print(sorted(profile["ops"][0]))
 # ['algorithm', 'backend', 'cpu_util', 'depth', 'elapsed_ms', 'est_error', 'est_rows',
-#  'kind', 'measured', 'op_id', 'peak_rss_bytes', 'provenance', 'result_bytes',
-#  'rows_in', 'rows_out', 'selectivity', 'spill_bytes', 'spilled', 'threads']
+#  'invol_ctx_switches', 'io_read_bytes', 'io_write_bytes', 'kind', 'major_faults',
+#  'measured', 'minor_faults', 'op_id', 'peak_rss_bytes', 'preemption_rate',
+#  'provenance', 'result_bytes', 'rows_in', 'rows_out', 'selectivity', 'spill_bytes',
+#  'spilled', 'threads', 'vol_ctx_switches']
 
 print(profile["rows"], profile["spilled"], profile["carbonite_summary"])
 # 2 False feasible
 ```
 
 The document also carries `logical_ir` and `optimized_ir` (the plan before and after
-Kyber), `decisions`, `adaptive_stages`, and the memory budget. Asserting on
+Kyber), `decisions`, `adaptive_stages`, the memory budget, and `machine`. Asserting on
 `optimized_ir` is how you write a regression test that a predicate stays pushed down.
+
+`machine` names the hardware the run was measured on, as a readable label and a fingerprint:
+
+```text
+machine: GenuineIntel/16c/64GiB/l3=32MiB/nvme [a2f5aeb968ef]
+```
+
+Every timing above it is relative to that machine, so it's what makes two profiles from
+different nodes comparable. The fingerprint is also the key the engine stores its learned
+costs under, which makes it the answer to "why did this node plan worse than that one?" — a
+different fingerprint means the two learned separately and neither inherited the other's
+measurements. {doc}`performance` covers what that changes.
+
+## What the operator cost the machine
+
+Rows and milliseconds say what an operator did. They don't say what it cost the machine, and
+that's where most unexplained slowness lives. Alongside the timings, each operator reports
+what the operating system charged it.
+
+Two of those readings change what you should do, so `explain(analyze=True)` prints them on
+the operator's line, and only when they're present:
+
+```text
+aggregate    est≈1,000 actual=1,000  842.1ms (91%) cpu=11%  out=64KB  interp  PAGING(31,204 major faults)
+```
+
+`PAGING` means the kernel was fetching back memory the process already believed it held. It
+comes first because it invalidates every other number on the line: the operator's time is
+storage latency, and its low CPU number is threads blocked rather than work not done. Adding
+parallelism here makes things strictly worse, because each extra worker faults in its own
+working set and evicts the others. Lower `memory.max_memory_bytes` so the engine spills
+deliberately instead, or give the process more memory.
+
+`contended` means the scheduler repeatedly took cores away from the operator while it ran, so
+something else on the machine wanted them. Batcher measures this per operator rather than from
+the machine's load average, which is a one-minute average over the whole box and misses a short
+query that lands inside someone else's burst. Treat the run's timing as a lower bound on the
+plan's real speed.
+
+The rest are in the JSON document rather than on the line, because they're inputs to a
+diagnosis rather than verdicts:
+
+| Field | What it tells you |
+|---|---|
+| `major_faults` | Pages fetched from disk. Any material count means the box is paging. |
+| `minor_faults` | Pages committed without disk I/O — the *measured* working set, against which `peak_rss_bytes` is a high-water mark and the planner's estimate is a model. |
+| `invol_ctx_switches` | Times the scheduler evicted the operator from a core. |
+| `preemption_rate` | The same, per core-second, so it compares across operators of different widths and durations. |
+| `vol_ctx_switches` | Times the operator blocked and yielded. High against low `cpu_util` means genuinely I/O- or lock-bound, rather than under-parallelized. |
+| `io_read_bytes` | Bytes that actually reached the block device. A warm and a cold scan of the same file are identical in every other field and differ by two orders of magnitude in cost. |
+| `io_write_bytes` | Bytes written to the device, spill included. |
+
+Every one of these is `0` when the platform can't report it, and `0` means *not measured*
+rather than *none*. On the streaming executor the per-operator counters are unmeasured by
+design: its operators interleave, so no one of them owns a wall interval that
+process-wide counters could honestly be attributed to.
 
 ## A checklist for a slow query
 
@@ -232,6 +290,8 @@ Then, and only then, start changing the query.
 - [Troubleshooting](troubleshooting.md): what to do about what you found.
 - [Query lifecycle](../deep-dives/query-lifecycle.md): the stages the plan passes
   through, which is what the tree is a picture of.
+- [The plan IR](../deep-dives/plan-ir.md): the JSON document the tree is printed from, and
+  the contract the Rust engine reads it under.
 - [Cost model](../deep-dives/cost-model.md): how an `est≈N` becomes a join order.
 - [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): why the same
   `explain()` says something different after a run.

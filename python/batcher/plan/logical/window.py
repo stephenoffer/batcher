@@ -23,7 +23,7 @@ from batcher.plan.ir_tags import (
     Op,
 )
 from batcher.plan.logical.aggregate import SortKeySpec
-from batcher.plan.logical.base import LogicalPlan, _validate_refs
+from batcher.plan.logical.base import LogicalPlan, _validate_refs, available_column_set
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, widen
 
@@ -194,7 +194,7 @@ class Window(LogicalPlan):
                 )
             if self.rank_limit < 0:
                 raise PlanError(f"window rank_limit must be non-negative, got {self.rank_limit}")
-        available = set(self.input.available_columns())
+        available = available_column_set(self.input)
         for expr in self.partition_keys:
             _validate_refs(expr, available, what="window partition key")
         for key in self.order_keys:

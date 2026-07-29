@@ -67,11 +67,11 @@ def test_clamp_to_free_disk_stats_nearest_existing_ancestor(tmp_path):
     # A spill dir that does not exist yet (created lazily on first spill) must still be
     # clamped — by stat'ing its nearest existing ancestor (the same filesystem), not by
     # silently dropping the disk-aware bound and keeping the too-large configured budget.
-    from batcher.carbonite.spill import _clamp_to_free_disk
+    from batcher.carbonite.spill.disk import clamp_to_free_disk
 
     free = shutil.disk_usage(str(tmp_path)).free
     missing = str(tmp_path / "does" / "not" / "exist" / "yet")
-    clamped = _clamp_to_free_disk(missing, free * 1000)
+    clamped = clamp_to_free_disk(missing, free * 1000)
     assert clamped is not None
     assert clamped <= free  # bounded by the ancestor's real free space, not the raw budget
 
@@ -86,7 +86,8 @@ def test_local_budget_derived_from_free_disk_when_unset(tmp_path):
 def test_remote_tier_always_compresses_even_when_local_is_raw():
     # C13: the remote tier is slow object storage priced by bytes transferred, so it
     # compresses even when the local NVMe tier is left uncompressed.
-    from batcher.carbonite.spill import _ipc_options, _remote_ipc_options
+    from batcher.carbonite.spill.disk import ipc_options as _ipc_options
+    from batcher.carbonite.spill.disk import remote_ipc_options as _remote_ipc_options
 
     if _ipc_options("lz4") is None:
         pytest.skip("lz4 codec not built into this pyarrow")

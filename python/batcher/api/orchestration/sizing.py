@@ -90,21 +90,38 @@ def projected_input_bytes(sources: list[Source], projections: dict[int, list[str
     """Bytes the sources would occupy if resolved whole, from metadata alone.
 
     The in-memory path materializes every source before the engine starts, so this is the
-    resident cost of *reading*, independent of what the query then computes. It is a
-    declared `row_count()` times the projected schema's per-row width: no I/O, no scan.
+    resident cost of *reading*, independent of what the query then computes. It is a row
+    count times the projected schema's per-row width: no I/O, no scan.
+
+    **An estimated row count counts here, and an exact one is not required.** That is the
+    difference between this and `declared_row_count`, whose caller asks "did this read see
+    the source whole?" — a question an estimate genuinely cannot answer, so it insists on
+    exactness. This caller asks "will reading this fit in memory?", where the two failure
+    modes are not symmetric: over-estimating routes a query out of core and costs latency,
+    while having no estimate at all leaves it on the in-memory path and costs the process.
+
+    Demanding exactness here made the guard depend on file format rather than on data size.
+    Parquet carries a row count in its footer and was protected; CSV and JSON do not, so the
+    identical query over the identical rows read `0` and ran unbounded — measured on a 64 MiB
+    envelope, the Parquet copy routed to the out-of-core executor and the CSV copy did not.
+    A source's own estimate (`statistics().row_count`, from a sampled scan) is the number it
+    already computed for the optimizer; refusing it bought nothing.
 
     Args:
         sources: The plan's bound sources.
         projections: Pushed column projections, keyed by source index.
 
     Returns:
-        The total byte estimate, or `0` when any source cannot declare its size.
+        The total byte estimate, or `0` when any source can offer no row count at all —
+        which is not evidence of fitting, so the caller must fall back to its other signals.
     """
     from batcher.plan.types import schema_row_bytes
 
     total = 0.0
     for i, src in enumerate(sources):
         rows = declared_row_count(src)
+        if rows is None:
+            rows = _estimated_row_count(src)
         if rows is None or rows < 0:
             return 0
         try:
@@ -116,6 +133,30 @@ def projected_input_bytes(sources: list[Source], projections: dict[int, list[str
             return 0
         total += rows * schema_row_bytes(schema)
     return int(total)
+
+
+def _estimated_row_count(src: Source) -> int | None:
+    """A source's *estimated* row count from its own statistics, or `None`.
+
+    The number a format without a footer still knows — a CSV reader samples to estimate it
+    for the optimizer, so it costs nothing extra here. Best-effort by construction: a source
+    that cannot describe itself returns `None` and the caller falls back to its other
+    signals, exactly as before.
+
+    Args:
+        src: The source to ask.
+
+    Returns:
+        The estimated rows, or `None`.
+    """
+    try:
+        stats = src.statistics()
+    except Exception:  # pragma: no cover - a source with no statistics at all
+        return None
+    rows = getattr(stats, "row_count", None) if stats is not None else None
+    if rows is None or rows < 0:
+        return None
+    return int(rows)
 
 
 def declared_row_count(src: Source) -> int | None:

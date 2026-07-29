@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 import pyarrow as pa
+from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
 from batcher._sql import translate_ast
@@ -53,8 +54,6 @@ def _typed_null(cast_name: str | None) -> Expr:
 
 def _target_name(table_node: Any) -> str:
     """The table name a DML statement targets (unwrapping a column-list schema)."""
-    from sqlglot import expressions as exp
-
     if isinstance(table_node, exp.Schema):
         table_node = table_node.this
     return table_node.name
@@ -67,8 +66,6 @@ def apply_dml(node: Any, registry: _Registry, functions: dict[str, Any]) -> tupl
     catalog plus per-call overrides). The returned dataset is the target table's
     new state; the caller rebinds `target_name` to it.
     """
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.Insert):
         return _insert(node, registry, functions)
     if isinstance(node, exp.Delete):
@@ -85,8 +82,6 @@ def _require_target(name: str, registry: _Registry) -> Dataset:
 
 
 def _insert(node: Any, registry: _Registry, functions: dict[str, Any]) -> tuple[str, Dataset]:
-    from sqlglot import expressions as exp
-
     for unsupported in ("conflict", "returning"):
         if node.args.get(unsupported):
             raise NotImplementedError(f"INSERT ... {unsupported.upper()} is not supported")

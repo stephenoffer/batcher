@@ -113,8 +113,8 @@ The same accessor also offers `ds.ml.infer(model, ...)` and
 Leave `batch_size` unset unless you have measured a reason to set it. Adaptive batch sizing
 picks a VRAM-safe default and halves the batch on a CUDA OOM, which is why
 `ds.map_batches(Model, num_gpus=1)` with no knobs runs at 2,451 img/s and 82% GPU
-utilization on the [AI and GPU benchmark](../benchmarks/ai-and-gpu.md). Ray Data rejects that
-same call outright.
+utilization on the [AI and GPU benchmark](../benchmarks/ai-and-gpu.md), within 2% of the
+hand-tuned batch size.
 :::
 
 ## What you learned

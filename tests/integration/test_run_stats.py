@@ -38,10 +38,16 @@ def test_stats_reports_per_operator_metrics():
     assert "aggregate" in text
 
 
-def test_stats_rejects_map_batches():
-    from batcher._internal.errors import BackendError
-
-    tbl = pa.table({"x": [1, 2, 3]})
+def test_stats_measures_a_map_batches_pipeline():
+    """`stats()` used to refuse a `map_batches` plan outright, because the engine emits no
+    metrics for a Python UDF. That left the batch-inference shape — the one the ML surface
+    exists for — with no answer to "which stage is the bottleneck", which is step one of
+    every performance guide. The orchestrator measures the stages itself now.
+    """
+    tbl = pa.table({"x": list(range(512))})
     ds = bt.from_arrow(tbl).ml.map_batches(lambda b: b, output_columns=["x"])
-    with pytest.raises(BackendError, match="map_batches"):
-        ds.stats()
+    st = ds.stats()
+    stages = [op for op in st.ops if op.kind == "MapBatches"]
+    assert len(stages) == 1
+    assert stages[0].rows_in == stages[0].rows_out == 512
+    assert "MapBatches" in str(st)

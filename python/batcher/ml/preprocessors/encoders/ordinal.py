@@ -20,6 +20,7 @@ from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import (
     MAX_CATEGORIES,
     Preprocessor,
+    column_arg,
     columns_arg,
     distinct_values,
 )
@@ -169,7 +170,7 @@ class LabelEncoder(Preprocessor):
         unknown_value: int = -1,
         max_categories: int = MAX_CATEGORIES,
     ) -> None:
-        self.column = column
+        self.column = column_arg(column, what="LabelEncoder")
         self.unknown_value = unknown_value
         self.max_categories = max_categories
         self.classes_: list[Any] = []

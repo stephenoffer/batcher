@@ -12,12 +12,31 @@ arrow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 regex = "1"
+# The pure-Rust port of the FDLIBM special functions, for `gamma`/`lgamma`. Rust's own
+# `f64::gamma` is still unstable, and a series approximation would agree with DuckDB only
+# to a tolerance — DuckDB reaches the same FDLIBM routines through its libc, so this
+# agrees to the last bit. Already in the lock file as a transitive dependency, so the
+# direct edge costs nothing.
+libm = "0.2"
+# Fast non-cryptographic hashing for the `IN` membership set (see `eval/in_list.rs`):
+# `std`'s SipHash was the whole cost of a large `IN` over a wide column.
+ahash.workspace = true
 # Prebuilt SIMD substring search (Two-Way + memchr prefilter). SQL `LIKE`/`contains`
 # search the SAME needle across every row of a column; `str::contains` rebuilds its
 # searcher per call, so a prebuilt `memmem::Finder` reused across the whole column is
 # the difference between ~80 ns/row and DuckDB-class ~7 ns/row.
 memchr = "2"
 base64 = "0.22"
+# Byte-stream compression for `.str.compress`/`.str.decompress`. Payloads arrive *inside*
+# columns (a gzipped JSON body in a Kafka record, a zstd blob in a warehouse table), so
+# reading one has to be expressible without leaving the data plane for a Python UDF. All
+# four crates are already in the build via Arrow's `ipc_compression` and the object-store
+# stack, so these edges add no new third-party code — which is why six codecs cost what
+# three would.
+flate2 = "1"
+zstd = "0.13"
+brotli = "8"
+lz4_flex = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # IANA timezone database for `convert_timezone` (DST-aware tz conversion).
 chrono-tz = { version = "0.10", default-features = false }

@@ -29,6 +29,11 @@ pub(crate) fn eval_list_set(
 ) -> Result<ArrayRef, ExprError> {
     let l = require_list(left, "list set op")?;
     let r = require_list(right, "list set op")?;
+    use arrow::array::AsArray;
+    let (l, r) = (l.as_list::<i32>(), r.as_list::<i32>());
+    if matches!(op, ListSetOp::Concat) {
+        return eval_list_concat(l, r);
+    }
     // Promote both children to a common numeric type when they differ (e.g.
     // `List<Int64>` ∩ `List<Float64>`) so `concat` and the comparison see one type.
     // Without this, mismatched-width numeric lists errored in `concat` where DuckDB
@@ -78,6 +83,9 @@ pub(crate) fn eval_list_set(
                 ListSetOp::Intersect => rset.contains(&owned),
                 ListSetOp::Except => !rset.contains(&owned),
                 ListSetOp::Union => true,
+                // Handled by `eval_list_concat` above; this arm is unreachable and is
+                // spelled out rather than wildcarded so a new op cannot slip through.
+                ListSetOp::Concat => unreachable!("concat takes its own path"),
             };
             if keep_it && seen.insert(owned) {
                 keep.push(k as u32);
@@ -103,6 +111,50 @@ pub(crate) fn eval_list_set(
         OffsetBuffer::new(offsets.into()),
         values,
         Some(NullBuffer::from(valid)),
+    )))
+}
+
+/// `list_concat(a, b)` — append, without the dedup and membership machinery above.
+///
+/// Two rules separate it from the set ops and both are DuckDB's: duplicates are kept
+/// (`list_concat([1,2],[2,3])` is `[1,2,2,3]`, not `[1,2,3]`), and a NULL list behaves as
+/// **empty** rather than nulling the row. That second rule holds all the way down —
+/// `list_concat(NULL, NULL)` is `[]`, not NULL — so this kernel never produces a null row
+/// at all. Nulling the both-null case was the first implementation's guess, and the
+/// differential test's both-null row is what caught it.
+fn eval_list_concat(
+    l: &arrow::array::ListArray,
+    r: &arrow::array::ListArray,
+) -> Result<ArrayRef, ExprError> {
+    let (lc, rc) = coerce_children(l.values(), r.values())?;
+    let combined = concat(&[lc.as_ref(), rc.as_ref()])?;
+    let roffset = lc.len();
+    let (lo, ro) = (l.value_offsets(), r.value_offsets());
+
+    let mut keep: Vec<u32> = Vec::new();
+    let mut offsets: Vec<i32> = Vec::with_capacity(l.len() + 1);
+    offsets.push(0);
+
+    for row in 0..l.len() {
+        let left_null = l.is_null(row);
+        let right_null = row >= r.len() || r.is_null(row);
+        if !left_null {
+            keep.extend((lo[row] as usize..lo[row + 1] as usize).map(|k| k as u32));
+        }
+        if !right_null {
+            keep.extend((ro[row] as usize..ro[row + 1] as usize).map(|k| (roffset + k) as u32));
+        }
+        offsets.push(keep.len() as i32);
+    }
+
+    let values = take(combined.as_ref(), &UInt32Array::from(keep), None)?;
+    let field = Arc::new(Field::new_list_field(combined.data_type().clone(), true));
+    // No null buffer: every row is a real (possibly empty) list.
+    Ok(Arc::new(ListArray::new(
+        field,
+        OffsetBuffer::new(offsets.into()),
+        values,
+        None,
     )))
 }
 
@@ -144,6 +196,7 @@ mod tests {
     }
 
     fn row(out: &ArrayRef, i: usize) -> Vec<i64> {
+        use arrow::array::AsArray;
         let l = out.as_list::<i32>();
         let v = l.value(i);
         v.as_primitive::<Int64Type>().values().to_vec()
@@ -183,6 +236,7 @@ mod tests {
         let a = flist(&[&[0.0]]);
         let b = flist(&[&[-0.0]]);
         let out = eval_list_set(ListSetOp::Intersect, &a, &b).unwrap();
+        use arrow::array::AsArray;
         let l = out.as_list::<i32>();
         let v = l.value(0);
         let f = v.as_primitive::<Float64Type>();
@@ -209,6 +263,7 @@ mod tests {
         let ints = list(&[Some(&[1, 2, 3])]);
         let floats = flist(&[&[2.0, 3.0, 4.0]]);
         let out = eval_list_set(ListSetOp::Intersect, &ints, &floats).unwrap();
+        use arrow::array::AsArray;
         let l = out.as_list::<i32>();
         let v = l.value(0);
         let f = v.as_primitive::<Float64Type>();

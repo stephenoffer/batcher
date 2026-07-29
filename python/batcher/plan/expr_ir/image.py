@@ -9,18 +9,31 @@ from __future__ import annotations
 
 import base64
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
 __all__ = ["ImageFunc", "_ImageNamespace"]
 
+# Container formats `.image.encode` can write; mirrors `bc-expr`'s `ENCODE_FORMATS`.
+# WebP is readable but not writable by the underlying decoder, so it is deliberately
+# absent: accepting the name at plan build and failing at run time would be worse than
+# rejecting it here.
+_IMAGE_FORMATS = frozenset({"png", "jpeg", "bmp", "gif"})
+
+# Color modes `.image.convert` can produce; mirrors `bc-expr`'s `COLOR_MODES`, and the
+# same vocabulary `.image.decode()` reports — so a mode read off `decode` can be handed
+# straight back to `convert`.
+_IMAGE_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
+
 
 @expr_node
 class ImageFunc(IRNode):
     """An image decode op over a binary (image-bytes) sub-expression (via `.image`).
 
-    `decode` reads each image's dimensions; `to_tensor` decodes, resizes to
+    `decode` reads each image's header facts (dimensions, channel count, color mode);
+    `to_tensor` decodes, resizes to
     ``(width, height)``, and flattens to a fixed-size RGB8 pixel list; `to_tensor_f32`
     additionally scales/normalizes to a model-ready ``float32`` tensor; `center_crop`
     crops the centered region; `to_grayscale` converts to a single luma channel.
@@ -36,6 +49,12 @@ class ImageFunc(IRNode):
     mean: list[float] | None = scalar(omit_none=True, default=None)
     std: list[float] | None = scalar(omit_none=True, default=None)
     channels_first: bool = scalar(omit_falsy=True, default=False)
+    # `crop` only: the window's top-left corner. `encode` only: the target container.
+    # All three are omitted from the IR unless set, so every other image op's wire shape
+    # is byte-identical to what it was.
+    x: int | None = scalar(omit_none=True, default=None)
+    y: int | None = scalar(omit_none=True, default=None)
+    format: str | None = scalar(omit_none=True, default=None)
 
 
 # A 1x1 red PNG. Exported so the doctests here (and the docs) have a real image to
@@ -58,7 +77,7 @@ class _ImageNamespace:
             >>> from batcher.plan.expr_ir.image import _PNG_1X1
             >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
             >>> ds.select(dims=bt.col("img").image.decode()).to_pydict()
-            {'dims': [{'width': 1, 'height': 1}]}
+            {'dims': [{'width': 1, 'height': 1, 'channels': 4, 'mode': 'RGBA'}]}
     """
 
     __slots__ = ("_e",)
@@ -72,15 +91,22 @@ class _ImageNamespace:
         return f"<.image accessor of {self._e!r}>"
 
     def decode(self) -> ImageFunc:
-        """Read each image's dimensions without materializing its pixels.
+        """Read each image's header facts without materializing its pixels.
 
         Only the image header is parsed, so this succeeds — and is cheap — even for a
         file whose pixel data is truncated or corrupt. Use `to_tensor` when the pixels
         themselves must be valid.
 
+        All four facts come from one header read, so asking for the mode costs nothing
+        beyond asking for the width. Project the one you want with
+        ``.struct.field("width")``. ``mode`` uses Pillow's vocabulary — ``L``, ``LA``,
+        ``RGB``, ``RGBA`` — because that is what the other half of a multimodal pipeline
+        speaks; bit depth is not part of the name, so a 16-bit RGB image is ``RGB`` with
+        3 channels.
+
         Returns:
-            An expression evaluating to a struct ``{width, height}`` of Int32
-            dimensions; null for null or undecodable input.
+            An expression evaluating to a struct ``{width, height, channels, mode}``,
+            the first three Int32 and ``mode`` Utf8; null for null or undecodable input.
 
         Examples:
             .. doctest::
@@ -89,9 +115,123 @@ class _ImageNamespace:
                 >>> from batcher.plan.expr_ir.image import _PNG_1X1
                 >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
                 >>> ds.select(d=bt.col("img").image.decode()).to_pydict()
-                {'d': [{'width': 1, 'height': 1}]}
+                {'d': [{'width': 1, 'height': 1, 'channels': 4, 'mode': 'RGBA'}]}
+
+                >>> ds.select(w=bt.col("img").image.decode().struct.field("width")).to_pydict()
+                {'w': [1]}
         """
         return ImageFunc("decode", self._e)
+
+    def crop(self, x: int, y: int, width: int, height: int) -> ImageFunc:
+        """Cut the window at ``(x, y)`` out of each image, as PNG bytes.
+
+        The arbitrary-offset counterpart of :meth:`center_crop`, and the shape a detection
+        pipeline needs: pull a bounding box out of a frame and keep it as an *image* rather
+        than as a tensor.
+
+        A window that runs past an edge is **clipped**, so the result can be smaller than
+        requested. That is the opposite of :meth:`center_crop`, which zero-pads, and the
+        difference is deliberate: `center_crop` feeds a model that needs a fixed input
+        size, while a cropped image is something a person or another tool will look at,
+        and inventing black pixels there would be inventing data. A window that starts
+        past the image entirely is null.
+
+        Args:
+            x: Left edge of the window, in pixels from the left of the image.
+            y: Top edge of the window, in pixels from the top of the image.
+            width: Window width in pixels.
+            height: Window height in pixels.
+
+        Returns:
+            An expression evaluating to PNG bytes of the cropped region; null for null,
+            undecodable, or entirely-out-of-bounds input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> region = bt.col("img").image.crop(0, 0, 1, 1)
+                >>> ds.select(d=region.image.decode().struct.field("width")).to_pydict()
+                {'d': [1]}
+        """
+        return ImageFunc("crop", self._e, width=width, height=height, x=x, y=y)
+
+    def encode(self, format: str) -> ImageFunc:
+        """Re-encode each image in `format`, pixels unchanged.
+
+        Normalizes a mixed-format corpus onto one codec, or trades a PNG for a smaller
+        JPEG. Because JPEG has no alpha channel, an RGBA source is flattened to RGB rather
+        than failing the row, which would otherwise drop every transparent image.
+
+        Args:
+            format: One of ``"png"``, ``"jpeg"``, ``"bmp"``, or ``"gif"``. WebP is
+                readable but not writable, so it is not offered.
+
+        Returns:
+            An expression evaluating to the re-encoded bytes; null for null or
+            undecodable input.
+
+        Raises:
+            PlanError: If `format` is not a writable format.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> jpeg = bt.col("img").image.encode("jpeg")
+                >>> ds.select(m=jpeg.image.decode().struct.field("mode")).to_pydict()
+                {'m': ['RGB']}
+        """
+        if format not in _IMAGE_FORMATS:
+            raise PlanError(
+                f"image.encode(): format must be one of {sorted(_IMAGE_FORMATS)}, got {format!r}"
+            )
+        return ImageFunc("encode", self._e, format=format)
+
+    def convert(self, mode: str) -> ImageFunc:
+        """Convert each image to color `mode`, re-encoded as PNG.
+
+        The general form of :meth:`to_grayscale`, which is ``"L"`` plus a resize. This
+        changes only the channels, which is what normalizing a corpus that mixes RGB and
+        RGBA needs before a model that wants one of them.
+
+        The mode names are the ones :meth:`decode` reports, so a mode read off one can be
+        handed straight back to the other. Grayscale uses Rec. 601 luma — the same
+        weighting :meth:`to_grayscale` and :meth:`dhash` use, so the three cannot disagree
+        about what grey means.
+
+        Args:
+            mode: One of ``"L"`` (grayscale), ``"LA"`` (grayscale + alpha), ``"RGB"``, or
+                ``"RGBA"``.
+
+        Returns:
+            An expression evaluating to PNG bytes in `mode`; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `mode` is not one of the four.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> grey = bt.col("img").image.convert("L")
+                >>> ds.select(m=grey.image.decode().struct.field("mode")).to_pydict()
+                {'m': ['L']}
+        """
+        if mode not in _IMAGE_MODES:
+            raise PlanError(
+                f"image.convert(): mode must be one of {sorted(_IMAGE_MODES)}, got {mode!r}"
+            )
+        # `format` carries the target mode here and the target container for `encode`;
+        # neither function uses the other's meaning, so they share the one string slot.
+        return ImageFunc("convert", self._e, format=mode)
 
     def to_tensor(self, width: int, height: int) -> ImageFunc:
         """Decode and resize to ``(width, height)``, flattened to RGB8 pixels.
@@ -286,6 +426,6 @@ class _ImageNamespace:
                 >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
                 >>> small = bt.col("img").image.resize(2, 2)
                 >>> ds.select(d=small.image.decode()).to_pydict()
-                {'d': [{'width': 2, 'height': 2}]}
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
         """
         return ImageFunc("resize", self._e, width=width, height=height)

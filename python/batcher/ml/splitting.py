@@ -44,8 +44,13 @@ def _check_folds(k: int) -> None:
 def _check_columns(ds: Dataset, *names: str) -> None:
     """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
     available = ds.columns
+    # Membership against a set: the check runs per requested name, and `available` is the
+    # relation's full width — a wide feature table turned a handful of name checks into a
+    # scan of thousands of columns each. The list is kept for the error message, which
+    # needs the original order to suggest a close match.
+    present = set(available)
     for name in names:
-        if name not in available:
+        if name not in present:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
 
             raise ColumnNotFoundError(
@@ -289,7 +294,12 @@ def time_series_split(
             >>> ds = bt.from_pydict({"t": list(range(100)), "x": list(range(100))})
             >>> splits = time_series_split(ds, "t", 4)
             >>> [(tr.count(), va.count()) for tr, va in splits]
-            [(19, 20), (39, 20), (59, 20), (79, 19)]
+            [(20, 20), (40, 20), (60, 20), (80, 19)]
+
+    Note:
+        Each validation window is half-open, ``[cut_i, cut_i+1)``, and the last cut is the
+        maximum of `time_column`, so the single latest row falls outside every validation
+        fold. That is why the final pair above validates on 19 rows rather than 20.
     """
     _check_columns(ds, time_column)
     if n_splits < 1:

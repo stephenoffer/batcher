@@ -10,6 +10,7 @@ so they add no new IR — the sugar lowers to existing `select`/`with_columns`/`
 from __future__ import annotations
 
 import random
+from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -401,7 +402,10 @@ def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
     for c in ds.columns:
         final.extend(fields_of[c]) if c in fields_of else final.append(c)
     if len(final) != len(set(final)):
-        dup = sorted({n for n in final if final.count(n) > 1})
+        # One counting pass rather than a `list.count()` per column: a struct-heavy
+        # relation can expand to thousands of output names, and the error message is
+        # not the place to spend quadratic time.
+        dup = sorted(n for n, k in Counter(final).items() if k > 1)
         raise PlanError(f"unnest(): output columns collide: {dup} (rename before unnesting)")
 
     derived = {

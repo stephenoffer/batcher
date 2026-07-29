@@ -7,6 +7,8 @@ that forward their state (`self._plan`, `self._sources`, `self.columns`) here.
 
 from __future__ import annotations
 
+import time
+import uuid
 from typing import Any
 
 import pyarrow as pa
@@ -149,19 +151,21 @@ def _collect(
             and not core.has_map_batches(plan.input)
         ):
             from batcher.api._join_helpers import _empty_result_schema
+            from batcher.api.terminal.stream.dispatch import _pushdown
             from batcher.core.streaming import stream_limit
 
-            batches = list(stream_limit(plan, sources[0]))
+            batches = list(stream_limit(plan, sources[0], projection=_pushdown(plan)))
             schema = batches[0].schema if batches else _empty_result_schema(plan, columns)
             return pa.Table.from_batches(batches, schema=schema)
 
     if adaptive:
         from batcher import core
-        from batcher.api.adaptive import execute_adaptive
+        from batcher.api.adaptive import execute_adaptive, record_adaptive_route
 
         # Adaptive re-optimization now works distributed too: each breaker stage
         # fans out across workers and its measured cardinality re-plans the rest.
-        return execute_adaptive(
+        _t0 = time.perf_counter()
+        table = execute_adaptive(
             plan,
             sources,
             core.default_hub(),
@@ -169,10 +173,18 @@ def _collect(
             num_workers=num_workers,
             transport=transport,
         ).table
+        # Feed the staged arm of the route bandit. This is the *only* place either arm is
+        # measured, and it has to be the whole query rather than a per-stage total, because
+        # what the two routes differ in is precisely the work that is not inside a stage:
+        # the per-stage materialize, re-plan, and the fusion and parallel width the pipeline
+        # gives up by being cut at every breaker.
+        record_adaptive_route(core.default_hub(), plan, True, (time.perf_counter() - _t0) * 1000.0)
+        return table
 
     if spill and not distributed:
         from batcher import core, kyber
         from batcher.api.orchestration import auto_num_partitions
+        from batcher.api.orchestration.run import record_cardinality_outcome
         from batcher.dist.spill import spill_collect
 
         hub = core.default_hub()
@@ -181,13 +193,19 @@ def _collect(
         opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
         spilled = spill_collect(opt_lp, sources, partitions)
         if spilled is not None:
+            # This route bypasses `run_relational`, so it must close its own loops — it
+            # recorded nothing at all, which made an explicit `spill=True` the one way to run
+            # a query that taught the optimizer literally nothing. The whole-input measures
+            # (`learn_column_stats`) still cannot run: an out-of-core scan never holds the
+            # batches to measure.
+            record_cardinality_outcome(hub, plan, sources, spilled.num_rows)
             return spilled
         # Other plan shapes have no spilling path → fall through to in-memory.
 
     # Imported here (not at module load) to keep the layer-import contract
-    # simple and avoid importing the engine for pure-Python tooling.
-    import time
-
+    # simple and avoid importing the engine for pure-Python tooling. `time` is not one of
+    # those: it is stdlib, already loaded, and re-importing it on every terminal op bought
+    # nothing.
     from batcher import core
     from batcher.api import executors
     from batcher.api.terminal.event_log import (
@@ -223,9 +241,11 @@ def _collect(
         raise
     total_ms = (time.perf_counter() - t0) * 1000.0
     write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows, query_id=query_id)
+    from batcher.api.adaptive import record_adaptive_route
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
+    record_adaptive_route(ctx.hub, plan, False, total_ms)  # the one-shot arm of the route bandit
     return table
 
 
@@ -371,14 +391,42 @@ def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.
 def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
     """Execute through the real path (single-node/spill/distributed) and return `RunStats`.
 
-    Raises `PlanError` for an unbounded source and `BackendError` for a `map_batches`/ML
-    pipeline (the opaque UDF path emits no per-operator metrics).
+    Raises `PlanError` for an unbounded source. A `map_batches`/ML pipeline is measured per
+    stage against its logical tree (see `run_profiled`), so it reports rows and time per
+    stage rather than refusing.
     """
     from batcher.api.stats import RunStats
     from batcher.api.terminal.profile import run_profiled
 
     profile = run_profiled(plan, sources, columns)
     return RunStats.from_profile(profile)
+
+
+def _sink_owns_its_layout(sink: object, path: str) -> bool:
+    """Whether this sink's file layout is a property of the *target*, not of this write.
+
+    `partitions_itself` is the flat form: a sink whose layout never comes from the call site
+    (a partitioned Iceberg table declares its spec in the catalog). `requires_partitioned_write`
+    is the form that has to look: a Delta table is partitioned or not depending on how it was
+    created, so only the table can answer, and the answer decides whether this write may take
+    the single-file path.
+
+    It matters because Delta keeps a partition value in the file's *directory name*. A write
+    that takes the single-file path into a partitioned table does not merely lay the file out
+    differently — the value is nowhere, and the rows read back null in the column the table is
+    organised by.
+
+    Args:
+        sink: The format sink about to be written through.
+        path: The write's destination root.
+
+    Returns:
+        True when this write must go through the partitioned path.
+    """
+    ask = getattr(sink, "requires_partitioned_write", None)
+    if ask is not None:
+        return bool(ask(path))
+    return bool(getattr(sink, "partitions_itself", False))
 
 
 def _streaming_write_eligible(
@@ -389,6 +437,8 @@ def _streaming_write_eligible(
     max_rows_per_file: int | None,
     num_files: int | None,
     target_bytes_per_file: int | None,
+    sink: object = None,
+    path: str = "",
 ) -> bool:
     """Whether `_write` can stream the result to one file instead of collecting it.
 
@@ -405,6 +455,8 @@ def _streaming_write_eligible(
 
     if distributed or partition_by:
         return False
+    if sink is not None and _sink_owns_its_layout(sink, path):
+        return False  # a partitioned target needs the whole table to fan out by key
     if max_rows_per_file is not None or num_files is not None or target_bytes_per_file is not None:
         return False
     if not is_streamable(plan):
@@ -511,8 +563,6 @@ def _write(
         # One write token shared by every worker's sink so all shards of this write name
         # their staged files under the same token (and a later write uses a different one,
         # so `add_files` never lets it clobber a file a prior snapshot still references).
-        import uuid
-
         sink_kwargs.setdefault("write_token", uuid.uuid4().hex[:12])
     # `sink` lets a caller supply the writer instead of taking the registry's default. The
     # copy-on-write MERGE needs it: its output files land *beside* files it deliberately did
@@ -581,6 +631,8 @@ def _write(
         max_rows_per_file,
         num_files,
         target_bytes_per_file,
+        sink,
+        path,
     ):
         from batcher._internal.prefetch import prefetch
         from batcher.api.terminal.map_stream import peek_stream
@@ -617,7 +669,7 @@ def _write(
         directory
         or partition_by
         or max_rows_per_file is not None
-        or getattr(sink, "partitions_itself", False)
+        or _sink_owns_its_layout(sink, path)
     ):
         # A row cap (or partitioning) writes a directory of `part-*` files; the cap
         # bounds each file's size (no single giant file; tiny files coalesce upstream).

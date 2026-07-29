@@ -143,7 +143,11 @@ class FeatureSpec:
         present = list(ds.columns)
         feature_set = set(self.features)
         actual_features = [c for c in present if c in feature_set]
-        missing = [f for f in self.features if f not in present]
+        # Against a set, not the `present` list: both sides scale with the model's feature
+        # count, so a wide tabular spec (thousands of features is normal) was validating in
+        # time quadratic in its own width — on a check that exists to be cheap.
+        present_set = set(present)
+        missing = [f for f in self.features if f not in present_set]
         if missing:
             raise PlanError(
                 f"the frame is missing pinned feature(s) {missing}. A tabular model scores by "

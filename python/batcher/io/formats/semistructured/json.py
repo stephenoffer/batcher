@@ -411,27 +411,16 @@ class JSONSink(FileSink):
         """
         from itertools import chain
 
-        from batcher.io.base import _safe_size
-        from batcher.io.filesystem import resolve_filesystem
-        from batcher.io.manifest import WrittenFile
+        def encode(first, rest, fh) -> int:
+            rows = 0
+            for batch in chain([first], rest):
+                if not batch.num_rows:
+                    continue
+                fh.write(_ndjson_bytes(pa.Table.from_batches([batch])))
+                rows += batch.num_rows
+            return rows
 
-        fs = resolve_filesystem(path)
-        if resume and fs.exists(path):
-            return WrittenFile(path=path, rows=0, bytes=_safe_size(fs, path))
-        it = iter(batches)
-        first = next(it, None)
-        rows = 0
-        with fs.atomic_writer(path) as fh:
-            if first is None:
-                empty = schema.empty_table() if schema is not None else pa.table({})
-                self._write_serial(empty, fh)
-            else:
-                for batch in chain([first], it):
-                    if not batch.num_rows:
-                        continue
-                    fh.write(_ndjson_bytes(pa.Table.from_batches([batch])))
-                    rows += batch.num_rows
-        return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
+        return self._stream_to_file(batches, path, schema=schema, resume=resume, encode=encode)
 
     def _write_serial(self, table: pa.Table, fh: IO[Any]) -> None:
         fh.write(_ndjson_bytes(table))

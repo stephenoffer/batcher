@@ -33,6 +33,7 @@ from batcher.plan.expr_ir import Cast, Col, Expr, IsNotNull, IsNull, Not
 from batcher.plan.expr_ir.walk import column_occurrence_counts
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
+    expr_key,
     split_conjuncts,
     substitute_columns,
     transform_expr_up,
@@ -84,8 +85,13 @@ def eliminate_sort_before_sample(node: Sample, _ctx: OptimizerContext) -> Logica
 
 
 def _sort_key_sig(key: object) -> tuple:
-    """A structural signature for a sort key (lowered IR + direction + null placement)."""
-    return (key.expr.to_ir(), key.descending, key.nulls_first)
+    """A structural signature for a sort key (lowered IR + direction + null placement).
+
+    Uses `expr_key`'s canonical *string* rather than the raw IR dict, which makes the
+    signature hashable — so `dedupe_sort_keys` can hold the seen set in a `set` instead of
+    scanning a list and comparing whole dicts, one full comparison per key already kept.
+    """
+    return (expr_key(key.expr), key.descending, key.nulls_first)
 
 
 @rule(name="dedupe_sort_keys", phase=Phase.NORMALIZE, matches=(Sort,))
@@ -95,13 +101,13 @@ def dedupe_sort_keys(node: Sort, _ctx: OptimizerContext) -> LogicalPlan | None:
     ties on that key — where it is, by construction, also equal — so it never
     discriminates. Removing exact-duplicate keys leaves the ordering (and the result)
     unchanged. Returns None when every key is unique, keeping the rule idempotent."""
-    seen: list[tuple] = []
+    seen: set[tuple] = set()
     kept = []
     for key in node.keys:
         sig = _sort_key_sig(key)
         if sig in seen:
             continue
-        seen.append(sig)
+        seen.add(sig)
         kept.append(key)
     if len(kept) == len(node.keys):
         return None
@@ -266,7 +272,12 @@ def _strip_self_cast(expr: Expr, schema: SchemaRef) -> Expr:
     return expr
 
 
-@rule(name="drop_self_cast_in_projection", phase=Phase.NORMALIZE, matches=(Project,))
+@rule(
+    name="drop_self_cast_in_projection",
+    phase=Phase.NORMALIZE,
+    matches=(Project,),
+    expr_matches=(Cast,),
+)
 def drop_self_cast_in_projection(node: Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a cast of a column to the type it already has, inside a projection.
 
@@ -290,7 +301,9 @@ def drop_self_cast_in_projection(node: Project, _ctx: OptimizerContext) -> Logic
     return dataclasses.replace(node, items=tuple(new_items))
 
 
-@rule(name="drop_self_cast_in_filter", phase=Phase.NORMALIZE, matches=(Filter,))
+@rule(
+    name="drop_self_cast_in_filter", phase=Phase.NORMALIZE, matches=(Filter,), expr_matches=(Cast,)
+)
 def drop_self_cast_in_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a cast of a column to the type it already has, inside a filter predicate.
 
@@ -308,7 +321,9 @@ def drop_self_cast_in_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPla
     return Filter(node.input, new_pred)
 
 
-@rule(name="drop_self_cast_in_sort_key", phase=Phase.NORMALIZE, matches=(Sort,))
+@rule(
+    name="drop_self_cast_in_sort_key", phase=Phase.NORMALIZE, matches=(Sort,), expr_matches=(Cast,)
+)
 def drop_self_cast_in_sort_key(node: Sort, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a cast of a column to the type it already has, inside a sort key.
 

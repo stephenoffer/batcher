@@ -13,8 +13,10 @@ Why a per-row ratio, not an absolute peak. A family's absolute peak depends on t
 query's size (a 1M-row aggregate peaks far above a 10-row one), so replaying a stored
 absolute byte figure onto a differently-sized plan would be wrong — exactly the
 mistake `kyber.learning` avoids by learning filter *selectivity* (a ratio) rather
-than an absolute row count. `bytes_per_row = median(m_peak_bytes / n_input)` is
-size-general: multiply by *this* plan's estimated input rows to get a learned peak.
+than an absolute row count. `bytes_per_row = quantile(m_peak_bytes / n_input)` is
+size-general: multiply by *this* plan's estimated input rows to get a learned peak. The
+quantile is deliberately an *upper* one rather than the median — see `_FOOTPRINT_QUANTILE`
+for why a median is the wrong statistic for a one-sided safety quantity.
 
 Everything here is pure and best-effort: it reads the hub, returns numbers, decides
 nothing, and any failure or a cold store falls back to the caller's plan estimate so
@@ -25,17 +27,68 @@ performance and scheduling, never correctness.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import weakref
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from statistics import median
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import blend, clamp_factor
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 
 __all__ = ["LearnedMemoryModel", "learned_memory_model"]
+
+# Which quantile of the measured per-row footprints becomes the family's figure.
+#
+# The median was the obvious first choice and is the wrong statistic for this quantity.
+# Memory sizing is one-sided: over-provisioning costs a little headroom, under-provisioning
+# costs the process. A median is by construction exceeded by half the runs, so fitting the
+# median means every second execution of a family reserves less than it turned out to need
+# — and the ones that exceed it are exactly the large, skewed, or wide-row runs that OOM.
+# A high quantile keeps the same size-generality (it is still a per-row ratio) while
+# landing above the bulk of the distribution.
+#
+# 0.8 rather than 0.95: the samples are few (a family may have ten), the tail of a memory
+# distribution is fat and noisy, and `blend_peak` already clamps the result to within
+# `cost_calibration_clamp`x of the plan estimate. Chasing a far tail on ten samples fits
+# noise; P80 moves the fit off the coin-flip without doing that. Spill volume uses the same
+# quantile, where over-estimating shards into more, smaller buckets — also the safe side.
+_FOOTPRINT_QUANTILE = 0.8
+
+
+def _upper_quantile(values: Sequence[float], q: float = _FOOTPRINT_QUANTILE) -> float:
+    """The `q`-quantile of `values` by linear interpolation between order statistics.
+
+    The R type-7 / `numpy.percentile` definition, written out because this module is on the
+    per-query path and must not pull numpy in for one number. For a single sample it is
+    that sample; for two it interpolates, so a family with the minimum sample count still
+    gets a figure that moves smoothly as evidence arrives rather than jumping between
+    order statistics.
+
+    Args:
+        values: The measurements, in any order. Must be non-empty.
+        q: The quantile in ``[0, 1]``.
+
+    Returns:
+        The interpolated quantile.
+    """
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = q * (len(ordered) - 1)
+    low = math.floor(pos)
+    high = min(low + 1, len(ordered) - 1)
+    frac = pos - low
+    mixed = ordered[low] * (1.0 - frac) + ordered[high] * frac
+    # Clamped to the two order statistics it interpolates between. `a*(1-f) + b*f` is not
+    # exactly bounded by `[a, b]` in floating point — for a == b it can land one ulp
+    # outside — so without this the "quantile" of a constant sample can exceed every value
+    # in it. A per-row memory figure above every measurement is a small error that feeds
+    # straight into a byte budget, and it makes the function's own contract untrue.
+    return min(max(mixed, ordered[low]), ordered[high])
+
 
 # LogicalPlan node-class names (`PhysicalOp.kind`, e.g. "Aggregate", "Join") vs the
 # native `ExecMetrics` tags feedback is recorded under (e.g. "aggregate", "hash_join").
@@ -93,6 +146,19 @@ class LearnedMemoryModel:
     # built without it fall back to the caller's peak-based sizing, per this module's
     # contract that anything unlearned defers to the plan estimate.
     _unknown_rows: float = 0.0
+    # The widest learned per-row footprint across every family. Derived in `__post_init__`
+    # rather than passed in, so it cannot disagree with `_bytes_per_row`: it is a *fact
+    # about* that dict, and a constructor argument would be one more thing every builder
+    # (and every test double) has to remember to keep consistent.
+    #
+    # It is precomputed at all because `max_bytes_per_row(None)` is asked once per credit
+    # grant and once per adaptive flow-control round — the shuffle's per-fetch path — where
+    # rescanning the dict is a linear pass to recover a constant of the fit.
+    _widest_bytes_per_row: float | None = dataclasses.field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        positive = [w for w in self._bytes_per_row.values() if w > 0]
+        object.__setattr__(self, "_widest_bytes_per_row", max(positive) if positive else None)
 
     def bytes_per_row(self, kind: str) -> float | None:
         """Measured peak bytes per input row for `kind`'s family, or `None` if unlearned."""
@@ -160,10 +226,9 @@ class LearnedMemoryModel:
         scan-only plan is not throttled by an unrelated wide aggregate measured in an earlier
         query; `None` (the default) keeps the global widest, unchanged."""
         if kinds is None:
-            widths = [w for w in self._bytes_per_row.values() if w > 0]
-        else:
-            wanted = {_canonical_kind(k) for k in kinds}
-            widths = [w for k, w in self._bytes_per_row.items() if k in wanted and w > 0]
+            return self._widest_bytes_per_row
+        wanted = {_canonical_kind(k) for k in kinds}
+        widths = [w for k, w in self._bytes_per_row.items() if k in wanted and w > 0]
         return max(widths) if widths else None
 
     def blend_peak(self, kind: str, plan_estimate: int) -> int:
@@ -248,9 +313,9 @@ def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
                 spill_samples.append(spill / basis)
         canon = _canonical_kind(kind)
         if len(samples) >= min_samples:
-            bpr[canon] = median(samples)
+            bpr[canon] = _upper_quantile(samples)
         if len(spill_samples) >= min_samples:
-            spr[canon] = median(spill_samples)
+            spr[canon] = _upper_quantile(spill_samples)
     return LearnedMemoryModel(
         _bytes_per_row=bpr,
         _alpha=opt.learning_smoothing_alpha,
@@ -289,7 +354,8 @@ def learned_memory_model(
         return cached[2]
     try:
         model = _fit(hub, cfg)
-    except Exception:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("carbonite", "load the learned memory model", exc)
         model = _empty_model(cfg)
     _MODEL_CACHE[hub] = (version, fingerprint, model)
     return model

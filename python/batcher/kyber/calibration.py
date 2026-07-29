@@ -31,10 +31,11 @@ import math
 import weakref
 from statistics import median
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import Config, CostCoefficients, active_config
 from batcher.metadata import MetadataHub
 
-__all__ = ["calibrate"]
+__all__ = ["calibrate", "refit_version"]
 
 # Per-hub memo of the calibrated coefficients, keyed weakly by the hub so a dropped
 # hub (e.g. a test's process-wide reset) evicts its entry automatically. The value is
@@ -52,6 +53,23 @@ _CALIB_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, CostCoeff
 # this refits roughly every few-to-ten queries — fresh enough for a cost heuristic while
 # keeping per-query planning overhead flat instead of growing with session history.
 _RECALIBRATE_AFTER = 64
+
+
+def refit_version(hub: MetadataHub | None) -> int:
+    """The hub version at which the coefficients now in force were fitted (`0` if never).
+
+    This is the *identity of the live fit*, and it is what a memoized plan has to be keyed by:
+    it advances exactly when `calibrate` re-scans, and not once per recorded operator. Keying
+    on a bucket of the raw version instead (`version // _RECALIBRATE_AFTER`) looks equivalent
+    and is not — the two are different clocks. The refit throttle counts rows *since the last
+    refit*, while the bucket counts from zero, so on a query recording ~35 operators the bucket
+    rolled over every second execution whether or not anything had been re-fit. Measured on
+    TPC-H q8 at sf10: the plan cache alternated hit/miss forever on a completely stable set of
+    coefficients, and a miss costs 350 ms against a hit's 160 ms.
+    """
+    cached = _CALIB_CACHE.get(hub) if hub is not None else None
+    return int(cached[0]) if cached is not None else 0
+
 
 # Each calibratable operator `kind` (the native `ExecMetrics` tag) maps to the cost
 # coefficient its dominant per-row term scales, plus the `basis(rows_in, rows_out)`
@@ -159,7 +177,8 @@ def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoef
         return cached[2]
     try:
         coeffs = _calibrate(hub.op_stats_by_kind(), defaults, cfg)
-    except Exception:  # pragma: no cover - calibration must never break planning
+    except Exception as exc:  # pragma: no cover - calibration must never break planning
+        note_suppressed("kyber", "load calibrated cost coefficients", exc)
         coeffs = defaults
     _CALIB_CACHE[hub] = (version, fingerprint, coeffs)
     return coeffs

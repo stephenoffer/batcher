@@ -166,6 +166,64 @@ def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | N
     return (x - lo) / (hi - lo)
 
 
+def fraction_left_below_right(
+    left: tuple[Any, Any] | None, right: tuple[Any, Any] | None
+) -> float | None:
+    """`P(a < b)` for two columns from their `[min, max]` bounds, or None if unusable.
+
+    The two-column analogue of [`_fraction_below_bounds`]: that one interpolates a column
+    against a *literal*, this one against another column's span. Both values spread
+    uniformly over their own range and are assumed independent, which is the same
+    assumption the literal path already makes, applied twice.
+
+    Exact rather than sampled. With `a` uniform on `[a0, a1]` and `b` uniform on
+    `[b0, b1]`, `P(a < b)` integrates the length of `b`'s range above `a`::
+
+        P(a < b) = (1 / (La * Lb)) * integral over a of clip(b1 - max(b0, a), 0, Lb)
+
+    and that integrand is piecewise linear: flat at `Lb` while `a <= b0`, falling as
+    `b1 - a` across the overlap, zero once `a >= b1`. So the integral is one rectangle
+    plus one triangle, both in closed form below.
+
+    Disjoint ranges give a certainty for free — `a1 <= b0` returns 1.0 and `a0 >= b1`
+    returns 0.0 — which is the case a flat constant gets most wrong.
+
+    A degenerate range (`min == max`, one distinct value) reduces to the one-sided
+    interpolation, and two degenerate ranges to a plain comparison.
+
+    Strict and non-strict are not distinguished: separating them needs `P(a == b)`, which
+    needs both columns' distinct counts rather than just their bounds. The difference is
+    one distinct value's mass, so callers treat `lt`/`le` alike here — unlike the literal
+    path, which does subtract that point mass because it knows the single value involved.
+    """
+    if left is None or right is None:
+        return None
+    a0, a1 = _ordinal(left[0]), _ordinal(left[1])
+    b0, b1 = _ordinal(right[0]), _ordinal(right[1])
+    if a0 is None or a1 is None or b0 is None or b1 is None:
+        return None
+    if a1 < a0 or b1 < b0:  # a nonsense bound pair; defer rather than invent a number
+        return None
+    # Certainties first: they are exact, and they need no uniformity assumption at all.
+    if a1 <= b0:
+        return 1.0
+    if a0 >= b1:
+        return 0.0
+    la, lb = a1 - a0, b1 - b0
+    if la == 0.0 and lb == 0.0:
+        return 1.0 if a0 < b0 else 0.0
+    if la == 0.0:  # `a` is a single value: the fraction of `b` strictly above it
+        return min(1.0, max(0.0, (b1 - a0) / lb))
+    if lb == 0.0:  # `b` is a single value: the fraction of `a` strictly below it
+        return min(1.0, max(0.0, (b0 - a0) / la))
+    # Rectangle: the part of `a`'s range wholly below `b`'s, where every `b` is greater.
+    below = max(0.0, min(a1, b0) - a0) * lb
+    # Triangle: across the overlap, `b1 - a` shrinks linearly as `a` rises.
+    lo, hi = max(a0, b0), min(a1, b1)
+    overlap = ((b1 - lo) ** 2 - (b1 - hi) ** 2) / 2.0 if hi > lo else 0.0
+    return min(1.0, max(0.0, (below + overlap) / (la * lb)))
+
+
 def _fraction_below(x: float, probs: list[float], values: list[float]) -> float | None:
     """Interpolate the fraction of values ≤ `x` from quantile boundaries (`values` at
     `probs`, both ascending). None if the boundaries are unusable.

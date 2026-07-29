@@ -46,6 +46,52 @@ The envelope is derived from system RAM by default. In a container, the OS often
 reports the host's memory rather than the cgroup limit, so set `max_memory_bytes`
 to the real ceiling.
 
+### Why a query went out of core
+
+Two independent signals route a query to the spilling executor, and they call for
+opposite responses. An estimate over budget is about the plan and is answered by
+reshaping it; live memory pressure is about the box and is answered by finding what else
+holds memory. `explain(analyze=True)` names which one fired:
+
+```python
+# docs: run
+import batcher as bt
+
+ds = bt.from_pydict({"k": [1, 2, 1, 2], "v": [10, 20, 30, 40]})
+report = ds.group_by("k").agg(total=bt.col("v").sum()).explain(analyze=True)
+print("[carbonite/resources]" in report)
+```
+
+```text
+True
+```
+
+The report carries two Carbonite decisions. The admission decision names the operator
+that binds the constraint, not just which resource ran out, so an infeasible plan points
+at the join or aggregate to reshape. The resource decision, recorded after execution,
+carries the envelope's peak utilization, the result cache's hit rate, and the pressure
+level the query actually ran under, because the same plan is fast with headroom and slow
+at the edge of the budget.
+
+### Disk is governed too
+
+Spilling trades memory pressure for disk pressure, and a full scratch volume is a hard
+failure rather than a slow one: an out-of-space write cannot be retried or degraded. The
+local tier is therefore classified on its own three-level ladder, measured rather than
+accounted, so a volume filled by a co-tenant is seen as readily as one this query filled:
+
+| Level | Meaning |
+|-------|---------|
+| `NORMAL` | Ample room; buckets stay on the fast local tier. |
+| `ELEVATED` | Under a quarter free; new buckets route to `spill_remote_uri` if one is set. |
+| `FULL` | Under the reserve floor; the local tier is exhausted. |
+
+New buckets route away at `ELEVATED` rather than waiting for `FULL`, because a bucket's
+tier is fixed when it opens: by the time the floor is crossed, several buckets can already
+be streaming to a volume that cannot hold them. Set `memory.spill_remote_uri` to give them
+somewhere to go. Without it the local tier is all there is, and a full disk fails the
+query with a message naming the volume and the fix.
+
 ## Flow control
 
 The shuffle uses credit-based backpressure: one credit is one in-flight
@@ -81,6 +127,23 @@ Ray object store. Which transport runs is one knob:
 
 The disk shuffle's working directory is driver-local, so `"auto"` will not pick it
 across nodes unless you also set `config.distributed.shared_filesystem`.
+
+### Published shuffle output is memory too
+
+A shuffle bucket is the one large footprint the buffer pool used to miss. Nobody reserves
+it. A mapper produces the bucket, hands it to the node's Flight store, and it stays
+resident until a reducer collects it, so with as many mappers as reducers a node holds its
+whole share of the shuffle in memory no reservation covers.
+
+The store now takes a reservation equal to what it holds, against the same envelope every
+operator draws on. When the pool cannot cover a growth, the store writes its largest
+buckets to local disk and reads them back on fetch. The rows are unchanged, so the cost is
+a re-read and nothing else, and a shuffle that fits the envelope never touches the disk.
+
+That reservation also makes published output the first thing the pool asks to spill when
+another operator cannot get memory. It is the right first victim: a published bucket is
+finished work waiting to be collected, so spilling it stalls nobody, where spilling a
+half-built hash table interrupts an operator that is still using it.
 
 ### Same-node zero-copy fast path (automatic)
 

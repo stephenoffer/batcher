@@ -209,7 +209,6 @@ properties a distributed run depends on.
 | `DistributedSampler` | in-RAM index list, O(n) per rank | no | yes, by padding | no |
 | WebDataset | approximate: shard order plus a local buffer | no | heuristic | no |
 | MosaicML Streaming | shard and block shuffle, bounded | yes | yes | yes |
-| Ray Data `streaming_split` | local buffer only | no | not guaranteed | n/a |
 | Batcher | exact, O(1) memory | yes | yes, by dropping or padding | yes |
 
 One distinction is worth being precise about. WebDataset and MosaicML shuffle
@@ -256,7 +255,7 @@ improves, and the improvement is not real.
 
 - [Data loaders](data-loaders.md): the loader map and the framework converters.
 - [PyTorch](pytorch.md): DDP and FSDP wiring on the training side.
-- [Preprocessors](preprocessors.md): the fit and transform contract.
+- [Preprocessors](preprocessors/index.md): the fit and transform contract.
 - [Streaming for training](streaming.md): the bounded-memory ingest path in depth.
 - [Distributed training pipeline](../tutorials/distributed-training-pipeline.md): the
   tutorial, from raw files to a multi-rank loop.

@@ -141,19 +141,26 @@ def test_launcher_leaves_a_map_batches_pipeline_unpushed():
 
 
 def test_distinct_as_aggregate_matches_the_stream_distinct_derivation(monkeypatch):
-    """`_distinct_as_aggregate` builds the same `Aggregate` `stream_distinct` folds."""
+    """`_distinct_as_aggregate` builds the same `Aggregate` `stream_distinct` folds.
+
+    Patched at `core.streaming.drivers`, where `stream_aggregate` is *defined and called*,
+    not at the `core.streaming` façade that re-exports it: `stream_distinct` resolves the
+    name in its own module, so a patch on the façade would silently apply to nothing and
+    this test would pass while testing the unpatched code.
+    """
     from batcher.core import streaming
+    from batcher.core.streaming import drivers
 
     ds = bt.from_arrow(pa.Table.from_batches(_batches())).select("a", "b").distinct()
     distinct = ds._plan
 
     seen: list[object] = []
 
-    def _capture(agg, source, batch_size=None):
+    def _capture(agg, source, batch_size=None, **_kwargs):
         seen.append(agg)
         return iter(())
 
-    monkeypatch.setattr(streaming, "stream_aggregate", _capture)
+    monkeypatch.setattr(drivers, "stream_aggregate", _capture)
     list(streaming.stream_distinct(distinct, _SpySource(_batches())))
 
     assert len(seen) == 1

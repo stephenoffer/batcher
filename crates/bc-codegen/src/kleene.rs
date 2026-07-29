@@ -38,9 +38,16 @@ fn kleene_supported(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } | Expr::Math2 { left, right, .. } => {
             kleene_supported(left) && kleene_supported(right)
         }
-        Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
-            kleene_supported(input)
-        }
+        Expr::Not { input }
+        | Expr::Cast { input, .. }
+        | Expr::Math { input, .. }
+        | Expr::IsNan { input }
+        | Expr::IsInf { input }
+        | Expr::InList { input, .. }
+        // Total predicates: their value comes from the operand's validity and their own
+        // result is always valid, which the Kleene ABI expresses directly.
+        | Expr::IsNull { input }
+        | Expr::IsNotNull { input } => kleene_supported(input),
         _ => false, // Case/Coalesce/etc. — value depends on validity; not supported.
     }
 }
@@ -89,7 +96,15 @@ pub(crate) fn is_null_propagating(expr: &Expr) -> bool {
         // trap, so logical NOT over a propagating operand still propagates.
         Expr::Not { input } => is_null_propagating(input),
         // Value-only math and exact numeric casts propagate nulls and never trap.
-        Expr::Math { input, .. } | Expr::Cast { input, .. } => is_null_propagating(input),
+        // `is_nan`/`is_inf` join them: both read only the values buffer and carry the
+        // input's validity through unchanged, and a float compare cannot trap on the
+        // garbage value sitting at a masked-out null slot.
+        Expr::Math { input, .. }
+        | Expr::Cast { input, .. }
+        | Expr::IsNan { input }
+        | Expr::IsInf { input }
+        // `x IN (...)` is null iff `x` is, and an equality compare cannot trap.
+        | Expr::InList { input, .. } => is_null_propagating(input),
         Expr::Math2 { left, right, .. } => is_null_propagating(left) && is_null_propagating(right),
         _ => false,
     }

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, Expr, WindowExpr
+from batcher.plan.expr_ir.walk import broadcast_aggregate_leaves, contains_aggregate
 from batcher.plan.expr_rewrite import hoist_windows
 from batcher.plan.logical import (
     Filter,
@@ -77,12 +78,36 @@ def _materialize(plan: LogicalPlan, hoisted: list[tuple[str, WindowExpr]]) -> Lo
     return plan
 
 
-def windowed_project(ds: Dataset, items: list[Projection]) -> Dataset:
+def windowed_project(ds: Dataset, items: list[Projection], *, collapse: bool = False) -> Dataset:
     """Project `items`, first materializing any window expression they compose.
 
     The synthetic window columns exist only between the `Window` nodes and this
     `Project`, so they never reach the output schema.
+
+    An `AggExpr` among the items is not a scalar and has no scalar IR, so it is resolved
+    first, in one of the two ways an aggregate can be meant in a row-shaped context:
+
+    * **Every** item is an aggregate and `collapse` is set (a `select`): the projection
+      *is* a whole-frame aggregation, so it lowers to `group_by().agg(...)` and returns
+      one row. That is what ``ds.select(total=col("x").sum())`` means in Polars and
+      pandas, and it used to raise here.
+    * Otherwise: each aggregate leaf becomes ``agg.over()`` — the aggregate over the
+      whole frame, broadcast to every row — which is the only reading under which
+      ``with_columns(share=col("x") / col("x").sum())`` has a row per input row.
+
+    Args:
+        ds: The dataset being projected.
+        items: The output projections, in order.
+        collapse: Whether an all-aggregate projection may collapse to a single row
+            (true for `select`, false for `with_columns`, which keeps its input's rows).
+
+    Returns:
+        A new `Dataset` with the projection applied.
     """
+    if any(contains_aggregate(p.expr) for p in items):
+        if collapse and all(contains_aggregate(p.expr) for p in items):
+            return ds.group_by().agg(**{p.alias: p.expr for p in items})
+        items = [Projection(p.alias, broadcast_aggregate_leaves(p.expr)) for p in items]
     exprs, hoisted = hoist_windows([p.expr for p in items])
     if not hoisted:
         return ds._derive(Project(ds._plan, tuple(items)))
@@ -98,6 +123,11 @@ def windowed_filter(ds: Dataset, predicate: Expr) -> Dataset:
     sees every input row, exactly as in the SQL subquery this desugars to. A trailing
     `Project` restores the input schema by dropping the synthetic columns.
     """
+    # An aggregate in a predicate is the whole-frame one, broadcast to every row:
+    # ``filter(col("x") > col("x").mean())`` keeps the rows above the overall mean, the
+    # reading Polars and pandas both give it. Without this it raised.
+    if contains_aggregate(predicate):
+        predicate = broadcast_aggregate_leaves(predicate)
     (rewritten,), hoisted = hoist_windows([predicate])
     if not hoisted:
         return ds._derive(Filter(ds._plan, predicate))

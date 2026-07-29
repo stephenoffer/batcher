@@ -21,6 +21,8 @@ import os
 import sys
 import time
 
+from _ray_env import with_timeout
+
 # Unbuffered, line-flushed prints so a long distributed run streams progress.
 print = functools.partial(print, flush=True)
 
@@ -230,38 +232,6 @@ def _time_run(run, monitor=None) -> tuple[float, dict]:
     return dt, {"sig": sig, "util": util}
 
 
-def _with_timeout(fn, timeout_s: float):
-    """Wrap `fn` so each call raises `TimeoutError` if it runs past `timeout_s`.
-
-    Runs the call on a **daemon** thread and waits up to `timeout_s`. A timed-out
-    call's thread is abandoned but, being a daemon, never keeps the process alive — so
-    a pathological engine (e.g. Ray Data's distributed join) cannot leave a zombie
-    driver holding cluster actors after the sweep ends. (A plain ThreadPoolExecutor
-    uses non-daemon threads, which did exactly that.)
-    """
-    import threading
-
-    def wrapped():
-        box: dict = {}
-
-        def run():
-            try:
-                box["v"] = fn()
-            except BaseException as e:
-                box["e"] = e
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        t.join(timeout_s)
-        if t.is_alive():
-            raise TimeoutError
-        if "e" in box:
-            raise box["e"]
-        return box.get("v")
-
-    return wrapped
-
-
 def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int) -> dict:
     """Time one engine across every pipeline, with the cluster to itself.
 
@@ -296,7 +266,7 @@ def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int)
         if thunk is None:
             continue
         try:
-            run = _with_timeout(thunk, timeout_s)
+            run = with_timeout(thunk, timeout_s)
             print(f"  [{eng}/{name}] warmup ...")
             # warmup (untimed): pays cold scheduling / shipping / planning.
             warm_sig = run()

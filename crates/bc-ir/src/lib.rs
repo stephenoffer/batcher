@@ -17,8 +17,10 @@
 use bc_expr::Expr;
 use serde::Deserialize;
 
+mod depth;
 mod engine_config;
 mod error;
+pub use depth::{json_max_depth, MAX_PLAN_DEPTH};
 pub use engine_config::EngineConfig;
 pub use error::IrError;
 
@@ -100,6 +102,29 @@ pub enum RelOp {
         right_by: Vec<String>,
         /// `true` = backward (largest right.on ≤ left.on); `false` = forward.
         backward: bool,
+        output: Vec<JoinOutputCol>,
+    },
+
+    /// Join two relations on one or two **inequalities** (`l.x < r.y`, interval
+    /// containment, a band join). A pipeline breaker.
+    ///
+    /// Without this node every such join lowers to a cartesian `HashJoin` with the
+    /// predicate as a `Filter` above it, so the intermediate is `|left| x |right|` rows
+    /// however few survive — quadratic time *and* memory. This node is executed by an
+    /// output-sensitive algorithm instead: a sorted-suffix scan for one inequality, and
+    /// IEJoin (Khayyat et al., the algorithm DuckDB's `PhysicalIEJoin` implements) for
+    /// two.
+    ///
+    /// `conditions` holds one or two inequalities, each oriented `left_key OP right_key`.
+    /// The planner is responsible for their key columns sharing a data type; anything
+    /// further in the original predicate stays as a `Filter` above this node, which is
+    /// what keeps the rewrite a *restriction* of the cartesian plan rather than a
+    /// reinterpretation of it.
+    RangeJoin {
+        left: Box<RelOp>,
+        right: Box<RelOp>,
+        conditions: Vec<RangeCondition>,
+        join_type: JoinType,
         output: Vec<JoinOutputCol>,
     },
 
@@ -255,6 +280,27 @@ pub enum JoinStrategy {
     SortMerge,
 }
 
+/// One inequality in a [`RelOp::RangeJoin`] condition, oriented `left_key OP right_key`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RangeCondition {
+    pub left_key: String,
+    pub right_key: String,
+    pub op: RangeOp,
+}
+
+/// The comparison in a [`RangeCondition`]. Wire names are the contract with the planner.
+///
+/// Only the four ordering comparisons appear: `=` is a hash join and `<>` admits no
+/// ordering structure at all, so both are left to the paths that already handle them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
 /// One output column of a join: which side it comes from, its source name there,
 /// and the output name.
 #[derive(Debug, Clone, Deserialize)]
@@ -357,6 +403,32 @@ pub enum AggFunc {
     /// `histogram` — a `Map<value, count>` per group (same value-list state as
     /// `Median`; finalize counts).
     Histogram,
+    /// `any_value`/`arbitrary` — *an* element of the group, unspecified which.
+    /// Resolved to the minimum, because a mergeable combine has to be commutative:
+    /// "the first row" is not a property a partition-order-independent fold can have.
+    /// DuckDB leaves the choice unspecified, so the minimum is a conforming answer
+    /// and, unlike scan order, it is the same on one node and on a hundred.
+    AnyValue,
+    /// `entropy` — the base-2 Shannon entropy of the group's value distribution
+    /// (same value-list state as `Median`; finalize counts frequencies).
+    Entropy,
+    /// `mad` — the median absolute deviation, `median(|x - median(x)|)` (same
+    /// value-list state as `Median`).
+    Mad,
+    /// `quantile_disc` — the *discrete* quantile at `param`: an element that is
+    /// actually present, rather than the interpolation `Quantile` computes.
+    QuantileDisc,
+    /// `approx_top_k` — the `param` most frequent values as a `List`. Exact here (the
+    /// value-list state carries every value), which is a stronger answer than the
+    /// sketch DuckDB's name promises; the name is kept for portability.
+    ApproxTopK,
+    /// `kurtosis_pop` — *population* excess kurtosis (`m4/m2² - 3`), where `Kurtosis`
+    /// is the sample-corrected one. Same 5-column moment state.
+    KurtosisPop,
+    /// `kahan_sum`/`fsum` — Neumaier-compensated summation. Same answer as `Sum` for a
+    /// short or well-conditioned column, and a materially better one for a long float
+    /// column whose addends differ wildly in magnitude.
+    KahanSum,
 }
 
 /// One window function in a `Window`: a function over an optional input
@@ -449,6 +521,20 @@ pub enum WindowFn {
     ForwardFill,
     /// The mirror of `ForwardFill`: carry the next non-null value backward.
     BackwardFill,
+    /// The aggregates beyond `sum`/`avg`/`min`/`max`/`count`. Every reference engine
+    /// (DuckDB, Spark, Polars) allows any aggregate over a window; these are the ones
+    /// whose running form is O(1) per row, which is what lets them share the same
+    /// whole-partition and running machinery as the five above. Order statistics
+    /// (`median`/`quantile`/`mode`) are deliberately absent — see `bc_runtime::window_agg`.
+    Var,
+    Stddev,
+    Product,
+    BoolAnd,
+    BoolOr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    CountDistinct,
 }
 
 /// One output column of a `Project`: an expression and the name it is bound to.
@@ -478,7 +564,9 @@ impl RelOp {
             | RelOp::RowId { input, .. }
             | RelOp::Unpivot { input, .. }
             | RelOp::Sample { input, .. } => vec![input],
-            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+            RelOp::HashJoin { left, right, .. }
+            | RelOp::AsofJoin { left, right, .. }
+            | RelOp::RangeJoin { left, right, .. } => {
                 vec![left, right]
             }
             RelOp::Union { inputs, .. } => inputs.iter().collect(),
@@ -491,8 +579,64 @@ impl RelOp {
     /// children of a node out of order and still hand each the ids a plain recursive walk
     /// would. The fused join pipeline uses this to test its (cheap) build sides for
     /// streamability before committing to its (expensive) probe side.
+    /// Walks an explicit worklist rather than recursing. [`Self::from_json`] bounds the
+    /// depth of a plan that arrives over the wire, but a plan built in Rust — or one
+    /// deserialized before this guard existed — has no such bound, and this used to be a
+    /// second way to overflow the stack on a deep chain. A `Vec` grows on the heap.
     pub fn node_count(&self) -> u32 {
-        1 + self.children().iter().map(|c| c.node_count()).sum::<u32>()
+        let mut count = 0u32;
+        let mut stack: Vec<&RelOp> = vec![self];
+        while let Some(node) = stack.pop() {
+            count += 1;
+            stack.extend(node.children());
+        }
+        count
+    }
+
+    /// The expressions this node evaluates itself, ignoring its inputs.
+    ///
+    /// Split out of [`Self::contains_media_decode`] so that walk can be a flat worklist
+    /// while this stays an exhaustive `match` — which is what keeps the guarantee that a
+    /// new `RelOp` variant is a compile error until someone classifies its expressions.
+    fn own_exprs(&self) -> Vec<&Expr> {
+        match self {
+            RelOp::Scan { .. } | RelOp::Distinct { .. } => Vec::new(),
+            RelOp::Limit { .. }
+            | RelOp::Unnest { .. }
+            | RelOp::RowId { .. }
+            | RelOp::Unpivot { .. }
+            | RelOp::Sample { .. }
+            | RelOp::HashJoin { .. }
+            | RelOp::AsofJoin { .. }
+            | RelOp::RangeJoin { .. }
+            | RelOp::Union { .. } => Vec::new(),
+            RelOp::Filter { predicate, .. } => vec![predicate],
+            RelOp::Project { exprs, .. } => exprs.iter().map(|p| &p.expr).collect(),
+            RelOp::Aggregate {
+                group_keys,
+                aggregates,
+                ..
+            } => group_keys
+                .iter()
+                .map(|p| &p.expr)
+                .chain(
+                    aggregates
+                        .iter()
+                        .flat_map(|a| a.input.iter().chain(a.input2.iter())),
+                )
+                .collect(),
+            RelOp::Sort { keys, .. } => keys.iter().map(|k| &k.expr).collect(),
+            RelOp::Window {
+                partition_keys,
+                order_keys,
+                functions,
+                ..
+            } => partition_keys
+                .iter()
+                .chain(order_keys.iter().map(|k| &k.expr))
+                .chain(functions.iter().filter_map(|f| f.input.as_ref()))
+                .collect(),
+        }
     }
 
     /// True if any expression anywhere in this plan is a library-backed media decode
@@ -503,57 +647,25 @@ impl RelOp {
     /// [`Expr::contains_media_decode`]), so a plan carrying one can saturate every core
     /// even when its input is a single morsel. The parallel executor uses this to lift
     /// its morsel-count cap on pool width for such plans. Exhaustive by construction: a
-    /// new `RelOp` variant is a compile error here until it is classified.
+    /// new `RelOp` variant is a compile error in [`Self::own_exprs`] until it is
+    /// classified.
+    ///
+    /// Walks a worklist rather than recursing, for the reason given on
+    /// [`Self::node_count`]. Short-circuits on the first hit, so the common answer
+    /// (`false`, after a full walk) is the only one that pays for the whole plan.
     pub fn contains_media_decode(&self) -> bool {
-        match self {
-            RelOp::Scan { .. } => false,
-            RelOp::Filter { input, predicate } => {
-                predicate.contains_media_decode() || input.contains_media_decode()
+        let mut stack: Vec<&RelOp> = vec![self];
+        while let Some(node) = stack.pop() {
+            if node
+                .own_exprs()
+                .into_iter()
+                .any(Expr::contains_media_decode)
+            {
+                return true;
             }
-            RelOp::Project { input, exprs } => {
-                exprs.iter().any(|p| p.expr.contains_media_decode())
-                    || input.contains_media_decode()
-            }
-            RelOp::Aggregate {
-                input,
-                group_keys,
-                aggregates,
-            } => {
-                group_keys.iter().any(|p| p.expr.contains_media_decode())
-                    || aggregates.iter().any(|a| {
-                        a.input.as_ref().is_some_and(Expr::contains_media_decode)
-                            || a.input2.as_ref().is_some_and(Expr::contains_media_decode)
-                    })
-                    || input.contains_media_decode()
-            }
-            RelOp::Sort { input, keys, .. } => {
-                keys.iter().any(|k| k.expr.contains_media_decode()) || input.contains_media_decode()
-            }
-            RelOp::Limit { input, .. }
-            | RelOp::Distinct { input }
-            | RelOp::Unnest { input, .. }
-            | RelOp::RowId { input, .. }
-            | RelOp::Unpivot { input, .. }
-            | RelOp::Sample { input, .. } => input.contains_media_decode(),
-            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
-                left.contains_media_decode() || right.contains_media_decode()
-            }
-            RelOp::Window {
-                input,
-                partition_keys,
-                order_keys,
-                functions,
-                ..
-            } => {
-                partition_keys.iter().any(Expr::contains_media_decode)
-                    || order_keys.iter().any(|k| k.expr.contains_media_decode())
-                    || functions
-                        .iter()
-                        .any(|f| f.input.as_ref().is_some_and(Expr::contains_media_decode))
-                    || input.contains_media_decode()
-            }
-            RelOp::Union { inputs, .. } => inputs.iter().any(RelOp::contains_media_decode),
+            stack.extend(node.children());
         }
+        false
     }
 
     /// Parse a plan from the JSON IR document emitted by the Python control plane.
@@ -561,11 +673,28 @@ impl RelOp {
     /// serde_json guards against stack overflow with a default 128-deep recursion limit,
     /// but a legitimately deep generated pipeline — a long `.filter(...)` chain, hundreds
     /// of interleaved operators — nests past it and would fail with "recursion limit
-    /// exceeded". The Python control plane already caps plan depth at its own recursion
-    /// limit (~1000), which the native stack comfortably handles, so we lift serde_json's
-    /// guard here and rely on that bound — deep plans deserialize out of the box. `end()`
-    /// still rejects trailing garbage, matching `serde_json::from_str`'s contract.
+    /// exceeded". So serde's guard stays lifted, and [`MAX_PLAN_DEPTH`] replaces it with a
+    /// *measured* bound checked by a non-recursive scan before any frame is pushed.
+    ///
+    /// The distinction matters more than the number does. Lifting serde's limit without
+    /// replacing it turned a catchable `Err` into a stack overflow, which Rust reports as
+    /// an **uncatchable `SIGABRT`** — no Python exception, no message, and on a shuffle
+    /// actor just an `ActorDiedError`. Checking first restores the `Err`.
+    ///
+    /// `end()` still rejects trailing garbage, matching `serde_json::from_str`'s contract.
+    ///
+    /// # Errors
+    ///
+    /// [`IrError::PlanTooDeep`] if the document nests past [`MAX_PLAN_DEPTH`], and
+    /// [`IrError::Parse`] for malformed or contract-violating JSON.
     pub fn from_json(s: &str) -> Result<Self, IrError> {
+        let found = depth::json_max_depth(s);
+        if found > depth::MAX_PLAN_DEPTH {
+            return Err(IrError::PlanTooDeep {
+                depth: found,
+                limit: depth::MAX_PLAN_DEPTH,
+            });
+        }
         let mut de = serde_json::Deserializer::from_str(s);
         de.disable_recursion_limit();
         let op = Self::deserialize(&mut de)?;

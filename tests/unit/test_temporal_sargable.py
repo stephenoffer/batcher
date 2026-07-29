@@ -41,13 +41,16 @@ def _pred(node):
 # --- registration --------------------------------------------------------------
 
 
-def test_ten_rules_registered():
+def test_one_rule_per_bucket_and_operator_is_registered():
+    # Four contiguous calendar-year buckets against six comparisons. `century` and
+    # `millennium` are 1-based (century 20 is 1901-2000); `iso_year` is absent because its
+    # boundaries are Mondays rather than 1 January, so it is not calendar-year aligned.
     names = {r.name for r in DEFAULT_REGISTRY.rules()}
-    expected = {
-        f"{fn}_{op}_to_range" for fn in ("year", "decade") for op in ("eq", "lt", "le", "gt", "ge")
-    }
+    buckets = ("year", "decade", "century", "millennium")
+    operators = ("eq", "ne", "lt", "le", "gt", "ge")
+    expected = {f"{fn}_{op}_to_range" for fn in buckets for op in operators}
     assert expected <= names
-    assert len(TEMPORAL_SARGABLE_RULES) == 10
+    assert len(TEMPORAL_SARGABLE_RULES) == len(buckets) * len(operators)
 
 
 # --- year: one shape assertion per operator ------------------------------------

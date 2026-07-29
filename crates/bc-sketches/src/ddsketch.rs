@@ -131,7 +131,7 @@ impl DDSketch {
 
     /// Approximate value at quantile `q ∈ [0, 1]` (`None` if empty). `q=0`/`q=1`
     /// return the exact min/max; otherwise the result is within relative error
-    /// `α` of the true quantile.
+    /// `α` of the true quantile, and always inside the observed `[min, max]`.
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.n == 0 {
             return None;
@@ -153,22 +153,44 @@ impl DDSketch {
         for (&i, &c) in self.negative.iter().rev() {
             cum += c;
             if cum as f64 > target {
-                return Some(-self.value_of(i));
+                return Some(self.bounded(-self.value_of(i)));
             }
         }
         // Then exact zeros.
         cum += self.zeros;
         if self.zeros > 0 && cum as f64 > target {
-            return Some(0.0);
+            return Some(self.bounded(0.0));
         }
         // Then positive buckets, ascending.
         for (&i, &c) in self.positive.iter() {
             cum += c;
             if cum as f64 > target {
-                return Some(self.value_of(i));
+                return Some(self.bounded(self.value_of(i)));
             }
         }
         Some(self.max)
+    }
+
+    /// Hold an interior estimate inside the exactly-tracked `[min, max]`.
+    ///
+    /// A quantile is an order statistic, so every one of them lies between the smallest and
+    /// largest value observed. The bucket walk above does not honour that on its own: it
+    /// returns `value_of(i)`, the bucket's geometric *centre* `2γ^i/(γ+1)`, which is within a
+    /// factor `1±α` of every magnitude in the bucket but need not be a value any row took.
+    /// When the data occupies only part of its bucket the centre falls outside the data
+    /// entirely. A column of one repeated value is the extreme case: 50,000 rows of `7.0` sit
+    /// near the floor of bucket 98, whose centre is `7.0288`, so every interior quantile —
+    /// the median included — came back *above the maximum*. On a low-cardinality column the
+    /// same effect pushed `q=0.9` past the largest value, so "rows above the 90th percentile"
+    /// selected nothing.
+    ///
+    /// `rank` already clamps for the same reason (see its note on `rank(max) == 1.0`); this is
+    /// the missing other half. Clamping cannot lose accuracy, because the true quantile is in
+    /// range by definition, so moving an out-of-range estimate to the boundary moves it
+    /// toward the answer. `min`/`max` merge exactly, so the clamp is order-independent and
+    /// the single-node == distributed guarantee is unaffected.
+    fn bounded(&self, v: f64) -> f64 {
+        v.clamp(self.min, self.max)
     }
 
     /// Convenience: the median.
@@ -416,6 +438,58 @@ mod tests {
             v.swap(i, j);
         }
         v
+    }
+
+    /// Every quantile is an order statistic, so none may fall outside `[min, max]`.
+    ///
+    /// The bucket walk returns `value_of(i)`, the bucket's geometric centre, which need not be
+    /// a value any row took. A column of one repeated value put *every* interior quantile off
+    /// the data (50k rows of `7.0` reported a median of `7.0288`, above the maximum), and a
+    /// low-cardinality column pushed `q=0.9` above the largest value, so a "top decile" filter
+    /// selected nothing.
+    #[test]
+    fn every_quantile_lies_inside_the_observed_range() {
+        let cases: Vec<Vec<f64>> = vec![
+            vec![7.0; 5_000], // one repeated value
+            vec![1.0; 5_000], // and one below a bucket edge
+            (0..5_000)
+                .map(|i| if i % 2 == 0 { 2.0 } else { 8.0 })
+                .collect(),
+            (0..5_000).map(|i| (i % 5 + 1) as f64).collect(), // five distinct values
+            (0..5_000).map(|i| -((i % 5 + 1) as f64)).collect(), // all negative
+            (0..5_000).map(|i| (i % 11) as f64 - 5.0).collect(), // spanning zero
+        ];
+        for values in cases {
+            let mut sketch = DDSketch::new(0.01);
+            for &v in &values {
+                sketch.add(v);
+            }
+            let lo = values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            for step in 0..=100 {
+                let q = step as f64 / 100.0;
+                let got = sketch.quantile(q).expect("non-empty");
+                assert!(
+                    got >= lo && got <= hi,
+                    "quantile({q}) = {got} outside [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    /// A constant column's quantiles are all exactly that constant, not merely near it.
+    #[test]
+    fn a_constant_column_reports_the_constant_at_every_quantile() {
+        for &c in &[7.0f64, 1.0, -3.5, 1e9, 1e-9] {
+            let mut sketch = DDSketch::new(0.01);
+            for _ in 0..1_000 {
+                sketch.add(c);
+            }
+            for step in 0..=20 {
+                let q = step as f64 / 20.0;
+                assert_eq!(sketch.quantile(q), Some(c), "q={q} on constant {c}");
+            }
+        }
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub(crate) fn bounded_group_histogram(
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
         codec,
+        None,
     )?
     else {
         let empty = histogram_map(

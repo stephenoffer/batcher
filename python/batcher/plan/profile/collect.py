@@ -14,6 +14,7 @@ from typing import Any
 
 from batcher.plan.feedback import cpu_utilization
 from batcher.plan.physical import PhysicalOp
+from batcher.plan.profile.stages import StageRecorder
 from batcher.plan.profile.types import Decision, OpProfile, QueryProfile
 
 __all__ = ["ProfileCollector", "build_op_profiles", "merge_metric_ops", "worker_op_profiles"]
@@ -41,6 +42,11 @@ class ProfileCollector:
     # Raw `ExecMetrics` op-lists shipped back by distributed workers (the map sub-plan),
     # one list per worker. Merged into `QueryProfile.worker_ops` by `to_profile`.
     worker_metrics: list[list[dict[str, Any]]] = field(default_factory=list)
+    # Measurements for the Python-UDF stages the engine never sees (`map_batches`). Kept
+    # apart from `metric_ops` — which the engine fills — because the two are numbered against
+    # different trees: engine ops against the optimized IR, stages against the logical plan.
+    # `api` picks whichever tree the plan actually has.
+    stage_recorder: StageRecorder = field(default_factory=StageRecorder)
 
     def to_profile(
         self, *, total_ms: float, rows: int, query_id: str = "", memory_budget_bytes: int = 0
@@ -122,9 +128,18 @@ def build_op_profiles(
                 peak_rss_bytes=int(m.get("peak_rss_bytes", 0)),
                 backend=str(m.get("backend", "")),
                 cpu_util=cpu_utilization(
-                    m.get("cpu_ns", 0), m.get("elapsed_ns", 0), m.get("threads", 1)
+                    m.get("cpu_ns", 0),
+                    m.get("elapsed_ns", 0),
+                    m.get("threads", 1),
+                    m.get("wall_span_ns", 0),
                 ),
                 threads=int(m.get("threads", 0)),
+                minor_faults=int(m.get("minor_faults", 0)),
+                major_faults=int(m.get("major_faults", 0)),
+                vol_ctx_switches=int(m.get("vol_ctx_switches", 0)),
+                invol_ctx_switches=int(m.get("invol_ctx_switches", 0)),
+                io_read_bytes=int(m.get("io_read_bytes", 0)),
+                io_write_bytes=int(m.get("io_write_bytes", 0)),
             )
         )
     return tuple(out)
@@ -166,6 +181,12 @@ def merge_metric_ops(per_worker: Sequence[Sequence[Mapping[str, Any]]]) -> list[
                     "spill_bytes": int(m.get("spill_bytes", 0)),
                     "peak_rss_bytes": int(m.get("peak_rss_bytes", 0)),
                     "backend": m.get("backend", ""),
+                    "minor_faults": int(m.get("minor_faults", 0)),
+                    "major_faults": int(m.get("major_faults", 0)),
+                    "vol_ctx_switches": int(m.get("vol_ctx_switches", 0)),
+                    "invol_ctx_switches": int(m.get("invol_ctx_switches", 0)),
+                    "io_read_bytes": int(m.get("io_read_bytes", 0)),
+                    "io_write_bytes": int(m.get("io_write_bytes", 0)),
                 }
                 continue
             # Rows and CPU-time are additive across workers: each processed its own share.
@@ -192,6 +213,19 @@ def merge_metric_ops(per_worker: Sequence[Sequence[Mapping[str, Any]]]) -> list[
             # Peak RSS is a high-water, not additive — take the worst single worker (a lower
             # bound on cluster-wide RSS, same convention as peak_bytes).
             cur["peak_rss_bytes"] = max(cur["peak_rss_bytes"], int(m.get("peak_rss_bytes", 0)))
+            # Every hardware counter is a *count of events*, so all of them sum across workers
+            # — unlike peak bytes and RSS, which are concurrent high-water marks. The cluster
+            # faulted the sum of the pages its workers faulted and read the sum of the bytes
+            # they read, and those totals are what a cluster-wide diagnosis needs.
+            for key in (
+                "minor_faults",
+                "major_faults",
+                "vol_ctx_switches",
+                "invol_ctx_switches",
+                "io_read_bytes",
+                "io_write_bytes",
+            ):
+                cur[key] += int(m.get(key, 0))
     return [acc[k] for k in sorted(acc)]
 
 
@@ -219,9 +253,18 @@ def worker_op_profiles(merged: Sequence[Mapping[str, Any]]) -> tuple[OpProfile, 
                 peak_rss_bytes=int(m.get("peak_rss_bytes", 0)),
                 backend=str(m.get("backend", "")),
                 cpu_util=cpu_utilization(
-                    m.get("cpu_ns", 0), m.get("elapsed_ns", 0), m.get("threads", 1)
+                    m.get("cpu_ns", 0),
+                    m.get("elapsed_ns", 0),
+                    m.get("threads", 1),
+                    m.get("wall_span_ns", 0),
                 ),
                 threads=int(m.get("threads", 0)),
+                minor_faults=int(m.get("minor_faults", 0)),
+                major_faults=int(m.get("major_faults", 0)),
+                vol_ctx_switches=int(m.get("vol_ctx_switches", 0)),
+                invol_ctx_switches=int(m.get("invol_ctx_switches", 0)),
+                io_read_bytes=int(m.get("io_read_bytes", 0)),
+                io_write_bytes=int(m.get("io_write_bytes", 0)),
             )
         )
     return tuple(out)
@@ -249,6 +292,12 @@ def walk_ir(ir: Mapping[str, Any], depth: int = 0) -> Iterator[tuple[int, Mappin
     engine's id generator, and the dashboard's DAG builder must all number operators
     identically or they silently describe different operators. One walk, imported — never
     a second copy that can drift.
+
+    Recursive for the reason `plan.visitor.walk` documents: an IR tree is a handful of
+    nodes deep, and at that size an explicit stack's `(depth, node)` bookkeeping costs
+    more than the `yield from` re-entry it removes (measured on a real plan: 4.60 us
+    recursive against 5.46 us iterative). Rewriting this is also the riskiest kind of
+    change, because the walk order *is* the `op_id` contract.
 
     Args:
         ir: A relational IR node (the ``to_ir()`` shape).

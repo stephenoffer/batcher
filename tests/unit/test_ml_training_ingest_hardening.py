@@ -407,9 +407,16 @@ def test_prefetch_default_overlaps_the_device_copy():
 
 
 def test_local_shuffle_buffer_documents_its_cost():
+    """The buffer's memory behavior must stay documented at the call site.
+
+    It used to be documented as a hazard the caller manages ("this many rows costs a 5-10x
+    slowdown over images"). The engine now bounds the block by bytes, so what has to be
+    documented changed: the row count is a *request*, and a request too large for the row
+    width silently gets a narrower window instead of an OOM. Someone reading only the
+    signature must still learn that."""
     doc = iter_torch_batches.__doc__ or ""
-    assert "5-10x" in doc, "the local-shuffle buffer/correlation trade is undocumented"
-    assert "100-500" in doc
+    assert "request, not a reservation" in doc, "the row-count-is-not-a-bound contract is gone"
+    assert "bounded by bytes" in doc, "the byte bound that makes the knob safe is undocumented"
 
 
 # --------------------------------------------------------------------------------------
@@ -424,7 +431,8 @@ def test_resumable_sampler_partitions_across_dataloader_workers(monkeypatch, num
     per_worker = []
     for worker in range(num_workers):
         monkeypatch.setattr(
-            "batcher.ml.streaming_sampler._worker_stride", lambda w=worker: (w, num_workers)
+            "batcher.ml.streaming_sampler.resumable._worker_stride",
+            lambda w=worker: (w, num_workers),
         )
         per_worker.append(list(ResumableSampler(64, world_size=2, rank=0, seed=7)))
 
@@ -436,10 +444,57 @@ def test_resumable_sampler_partitions_across_dataloader_workers(monkeypatch, num
 
 
 def test_worker_striding_does_not_disturb_the_resume_position(monkeypatch):
-    monkeypatch.setattr("batcher.ml.streaming_sampler._worker_stride", lambda: (1, 2))
+    monkeypatch.setattr("batcher.ml.streaming_sampler.resumable._worker_stride", lambda: (1, 2))
     sampler = ResumableSampler(16, world_size=2, rank=0, seed=7)
     list(sampler)
     # The global position counts skipped samples too, so a checkpoint means the same thing
     # in every worker: 16 usable positions, 8 of them this rank's, at world_size each.
     assert sampler.global_consumed == 16
     assert len(sampler) == 0
+
+
+# --------------------------------------------------------------------------------------
+# 9. `local_shuffle_buffer_size` is a ROW count, so it said nothing about memory.
+# --------------------------------------------------------------------------------------
+
+
+def test_wide_rows_cannot_blow_the_shuffle_buffer_past_its_byte_bound():
+    """A row count is not a memory bound. 50k narrow rows is a few MB; 50k decoded images is
+    tens of GB, and the request looks identical from here. The block must cut on whichever
+    bound binds first, so a too-large request degrades to a smaller window, not an OOM."""
+    from batcher.ml.loader import lazy
+
+    wide = pa.table({"id": list(range(64)), "px": [b"\0" * 4096] * 64})
+    batches = wide.to_batches(max_chunksize=8)
+    per_batch_bytes = batches[0].nbytes
+
+    # Ask for a window far wider than the byte ceiling allows.
+    blocks = []
+    original = lazy._SHUFFLE_BLOCK_MAX_BYTES
+    try:
+        # A ceiling of two batches' worth: the row bound (10_000) can never bind.
+        lazy._SHUFFLE_BLOCK_MAX_BYTES = per_batch_bytes * 2
+        for chunk in lazy._shuffle_to_numpy(iter(batches), 10_000, 8, seed=1, columns=["id"]):
+            blocks.append(chunk)
+    finally:
+        lazy._SHUFFLE_BLOCK_MAX_BYTES = original
+
+    # Every row still arrives exactly once — a narrower window reorders, it never drops.
+    seen = [int(v) for chunk in blocks for v in chunk["id"]]
+    assert sorted(seen) == list(range(64))
+
+
+def test_narrow_rows_still_get_the_window_they_asked_for():
+    """The byte bound must not quietly shrink a window that genuinely fits — otherwise it
+    would cost decorrelation on exactly the tabular case the knob was added for."""
+    from batcher.ml.loader import lazy
+
+    narrow = _table(64)
+    emitted = list(
+        lazy._shuffle_to_numpy(
+            iter(narrow.to_batches(max_chunksize=8)), 64, 64, seed=1, columns=["id"]
+        )
+    )
+    # 64 narrow rows are nowhere near 256 MiB, so the row bound binds: one full-width block.
+    assert len(emitted) == 1
+    assert sorted(int(v) for v in emitted[0]["id"]) == list(range(64))

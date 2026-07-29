@@ -25,7 +25,26 @@ mod bloom;
 mod footer_stats;
 mod page_index;
 mod predicate;
+mod row_filter;
 mod store;
+
+/// Below this many candidate rows a read is short enough that the row-filter probe would cost
+/// a larger share of it than the filter could save, so neither runs.
+const ROW_FILTER_MIN_ROWS: usize = 200_000;
+
+/// How many rows the row-filter selectivity probe reads before deciding. Enough for a stable
+/// selected-fraction, small enough that a decision *not* to filter costs ~1 ms.
+const ROW_FILTER_PROBE_ROWS: usize = 8_192;
+
+/// Whether row-level filter pushdown is enabled (`BATCHER_PARQUET_ROW_FILTER=0` disables).
+///
+/// An escape hatch in the shape the rest of this module already uses, and the A/B switch the
+/// feature was measured with: comparing two *builds* on a shared machine could not separate
+/// the effect from the noise, whereas one binary run both ways can.
+fn row_filter_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("BATCHER_PARQUET_ROW_FILTER").as_deref() != Ok("0"))
+}
 
 pub use avro::read_avro_bytes;
 pub use footer_stats::{
@@ -104,9 +123,18 @@ pub fn read_parquet(
 /// Read one Parquet object with a pushed predicate applied as row-group pruning.
 ///
 /// Identical to [`read_parquet`] except `predicate` (the compact JSON `to_native_predicate`
-/// emits; see [`predicate`]) prunes the requested row-groups by their footer statistics
-/// before decode. Pruning is superset-safe (the engine keeps the `Filter`), so an
-/// unparseable or non-pushable predicate simply reads every requested row-group.
+/// emits; see [`predicate`]) is used to skip work before and during decode: row-group pruning
+/// by footer statistics, page pruning by the column index, bloom pruning, and — when the
+/// predicate's types allow it and a probe measures it worth doing — a [`row_filter`] applied
+/// *during* the decode.
+///
+/// The first three are superset-safe: they only skip provably-empty blocks. The row filter is
+/// not — it removes individual rows — which is sound because `to_native_predicate` is
+/// all-or-nothing, so a predicate that arrives here is a *complete* translation of the
+/// `Filter` above the scan rather than a weakening of it. The result is therefore anywhere
+/// between the exact matching rows and every requested row-group, and the engine keeps its
+/// `Filter` either way (`core/scan_only.py` refuses its shortcut whenever a predicate was
+/// pushed). An unparseable or non-pushable predicate simply reads every requested row-group.
 pub fn read_parquet_filtered(
     uri: &str,
     row_groups: &[usize],
@@ -318,6 +346,104 @@ async fn read_parquet_async(
         ProjectionMask::columns(arrow_meta.parquet_schema(), cols.iter().map(|s| s.as_str()))
     });
 
+    // Decide, by measurement, whether a row-level filter pays on this read.
+    //
+    // A `RowFilter` is the only pruning step here that can *lose*: below `MAX_SELECTIVITY` it
+    // saves decoding the non-predicate columns of every rejected row, and above it the
+    // fragmented row selection costs more than the decode it skips (measured 1.45x faster at
+    // ~2 % selected, 1.57x *slower* at ~95 %). Nothing in the footer can distinguish the two —
+    // a scattered predicate leaves every row group's [min, max] spanning the domain whether it
+    // selects 2 % or 95 % — so the only honest input is a measurement.
+    //
+    // The probe decodes just the predicate columns of the first surviving row group, which is
+    // a single narrow column chunk, and applies the verdict to the whole read. Selectivity can
+    // of course vary between row groups; getting that wrong costs only speed, never rows.
+    //
+    // Indexing is deliberately non-panicking. `ParquetMetaData::row_group(i)` panics on an
+    // out-of-bounds index, and an out-of-range split index reaches here as a plain candidate:
+    // probing one would turn a bad index into a process-aborting panic across the FFI, where
+    // the un-probed path reports it as a clean `row group N out of bounds` error. So the row
+    // counts come from `.get()`, and an out-of-range first target skips the probe entirely and
+    // leaves the index for the decoder to report exactly as it does today.
+    let row_groups = arrow_meta.metadata().row_groups();
+    let probe_rows: usize = targets
+        .iter()
+        .filter_map(|&rg| row_groups.get(rg))
+        .map(|rg| rg.num_rows() as usize)
+        .sum();
+    let mut row_filter_cols: Option<Vec<String>> = None;
+    if let Some(pred) = parsed.as_ref() {
+        // Under this size the whole read is already short and the probe would be a larger
+        // share of it than anything the filter could save.
+        if row_filter_enabled()
+            && probe_rows >= ROW_FILTER_MIN_ROWS
+            && row_groups.get(targets[0]).is_some()
+        {
+            // Free pre-check before the probe: if the zone maps already say the predicate keeps
+            // most rows, there is nothing for the filter to save and the probe itself would be
+            // the only cost anyone measured. The estimate is only ever allowed to *decline*
+            // (see `row_filter::estimate`) — installing stays a measured decision, because the
+            // interpolation behind it is wrong on skewed data and a wrong install is a
+            // slowdown while a wrong decline is only a missed speed-up.
+            let permissive = {
+                let (mut weighted, mut rows) = (0.0f64, 0.0f64);
+                let mut usable = true;
+                for &rg in &targets {
+                    let Some(meta) = row_groups.get(rg) else {
+                        continue;
+                    };
+                    match row_filter::estimate(pred, meta) {
+                        Some(f) => {
+                            weighted += f * meta.num_rows() as f64;
+                            rows += meta.num_rows() as f64;
+                        }
+                        None => {
+                            usable = false;
+                            break;
+                        }
+                    }
+                }
+                usable && rows > 0.0 && !row_filter::worth_it_frac(weighted / rows)
+            };
+            if !permissive {
+                if let Some(cols) = row_filter::plan(pred, arrow_meta.schema()) {
+                    let reader =
+                        ParquetObjectReader::new(resolved.store.clone(), resolved.path.clone())
+                            .with_file_size(size);
+                    let mask = ProjectionMask::columns(
+                        arrow_meta.parquet_schema(),
+                        cols.iter().map(String::as_str),
+                    );
+                    let mut probe = ParquetRecordBatchStreamBuilder::new_with_metadata(
+                        reader,
+                        arrow_meta.clone(),
+                    )
+                    .with_batch_size(batch_size.max(1))
+                    .with_row_groups(vec![targets[0]])
+                    .with_projection(mask)
+                    .build()?;
+                    // Stop as soon as the estimate is good enough. Decoding the *whole* first row
+                    // group to measure it cost more than the filter saved on a permissive
+                    // predicate (~18 ms, turning a 179 ms read into 198 ms); a few thousand rows
+                    // answer "is this selective?" just as well and cost ~1 ms. The estimate is a
+                    // sample, so a clustered column can mislead it — which changes only speed.
+                    let (mut selected, mut total) = (0usize, 0usize);
+                    while total < ROW_FILTER_PROBE_ROWS {
+                        let Some(batch) = probe.try_next().await? else {
+                            break;
+                        };
+                        let m = row_filter::mask_of(pred, &batch);
+                        total += m.len();
+                        selected += m.true_count();
+                    }
+                    if row_filter::worth_it(selected, total) {
+                        row_filter_cols = Some(cols);
+                    }
+                }
+            }
+        }
+    }
+
     // Read row-groups CONCURRENTLY: each as its own short stream over a cloned reader
     // (which shares the Arc'd store + connection pool and the already-parsed metadata).
     // Each row-group future is `tokio::spawn`ed onto the runtime's worker pool — NOT merely
@@ -343,6 +469,7 @@ async fn read_parquet_async(
             .and_then(|pred| page_index::row_selection(arrow_meta.metadata(), pred, rg));
         let bloom_pred = parsed.clone();
         let bloom_meta = arrow_meta.clone();
+        let rf_cols = row_filter_cols.clone();
         tokio::spawn(async move {
             let mut b = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, amd)
                 .with_batch_size(batch_size)
@@ -361,6 +488,18 @@ async fn read_parquet_async(
                 if bloom::provably_absent(&mut b, bloom_meta.metadata(), pred, rg).await {
                     return Ok(Vec::new());
                 }
+            }
+            // Last: row-level pushdown *into* the decode. Every step above prunes whole
+            // blocks — row group, page, bloom — and none of them can help a predicate whose
+            // matches are scattered, which leaves every block alive and every column fully
+            // decoded before the engine's `Filter` discards most of it. A `RowFilter` decodes
+            // the predicate columns first and decodes the rest for surviving rows only, so
+            // the saving is the width of the table times the rows rejected. Installed only
+            // when the probe above measured it worth doing, and only for a predicate proved to
+            // carry the engine's own comparison semantics — unlike the pruning above, this
+            // step *removes rows* rather than skipping provably-empty work.
+            if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
+                b = b.with_row_filter(row_filter::build(pred, cols, bloom_meta.parquet_schema()));
             }
             let stream = b.build()?;
             stream.try_collect::<Vec<RecordBatch>>().await
@@ -634,8 +773,26 @@ mod tests {
         write_parquet(&p32, &[u32b], 1000);
         let ge = r#"{"node":"cmp","col":"u","op":"ge","lit":2000000000}"#;
         let out = read_parquet_filtered(p32.to_str().unwrap(), &[], None, 4096, ge).unwrap();
-        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, 2, "unsigned UInt32 group must be kept (3e9 >= 2e9)");
+        // The invariant is the one this test is named for: the *matching* row survives. It is
+        // asserted by value rather than by row count because `row_filter` now also evaluates
+        // the predicate per row, so the non-matching `10` is legitimately gone. The hazard
+        // being guarded is unchanged and still caught: if the unsigned max were read as a
+        // signed `-1_294_967_296`, the group would be pruned whole and `3e9` would vanish.
+        let vals: Vec<u32> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(
+            vals.contains(&3_000_000_000u32),
+            "unsigned UInt32 group must be kept (3e9 >= 2e9), got {vals:?}"
+        );
         // A predicate the unsigned range truly excludes still prunes.
         let gt = r#"{"node":"cmp","col":"u","op":"gt","lit":4000000000}"#;
         let none = read_parquet_filtered(p32.to_str().unwrap(), &[], None, 4096, gt).unwrap();
@@ -652,11 +809,153 @@ mod tests {
         // `u >= 9e18` (< i64::MAX) must keep the group — `big` matches.
         let ge64 = r#"{"node":"cmp","col":"u","op":"ge","lit":9000000000000000000}"#;
         let out64 = read_parquet_filtered(p64.to_str().unwrap(), &[], None, 4096, ge64).unwrap();
-        assert_eq!(
-            out64.iter().map(|b| b.num_rows()).sum::<usize>(),
-            2,
-            "unsigned UInt64 group must be kept"
+        // As above: assert the matching value survives, not the unfiltered row count.
+        let vals64: Vec<u64> = out64
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(
+            vals64.contains(&big),
+            "unsigned UInt64 group must be kept, got {vals64:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn row_filter_returns_exactly_the_matching_rows() {
+        // The row filter is the one pruning step here that *removes rows*, so its output must
+        // equal the predicate applied by hand — not merely a superset of it. Sized past
+        // `ROW_FILTER_MIN_ROWS` so the filter actually engages, and shaped so the predicate is
+        // selective enough to survive the selectivity gate.
+        let dir = std::env::temp_dir().join(format!("bcio_rowfilter_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        let n: i64 = 300_000;
+        // Deliberately **scattered**, not sorted. On sorted data the footer zone maps prune
+        // every non-matching row group first, the survivors fall under `ROW_FILTER_MIN_ROWS`,
+        // and the row filter never engages — so a sorted fixture would silently test nothing.
+        // A stride co-prime with `n` permutes 0..n and leaves every row group's [min, max]
+        // spanning the domain, which is exactly the shape only a row filter can prune.
+        let scattered: Vec<i64> = (0..n).map(|i| (i * 7919) % n).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(scattered)),
+                Arc::new(Float64Array::from(
+                    (0..n).map(|x| x as f64 * 0.5).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        write_parquet(&p, &[batch], 25_000);
+        let path = p.to_str().unwrap();
+
+        // `a < 10000` over 0..300000 selects 10,000 rows — 3.3 %, comfortably selective.
+        let pred = r#"{"node":"cmp","col":"a","op":"lt","lit":10000}"#;
+        let out = read_parquet_filtered(path, &[], None, 8192, pred).unwrap();
+        let mut got: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        got.sort_unstable(); // the file order is a permutation; compare as a set
+        let want: Vec<i64> = (0..10_000).collect();
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "row count must be exact, not a superset"
+        );
+        assert_eq!(got, want, "values must be exactly the matching rows");
+
+        // An AND of two ranges, to exercise the Kleene combination path.
+        let both = r#"{"node":"and","left":{"node":"cmp","col":"a","op":"ge","lit":100},"right":{"node":"cmp","col":"a","op":"lt","lit":5000}}"#;
+        let out2 = read_parquet_filtered(path, &[], None, 8192, both).unwrap();
+        let mut got2: Vec<i64> = out2
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        got2.sort_unstable();
+        assert_eq!(got2, (100..5000).collect::<Vec<i64>>());
+
+        // A permissive predicate is declined by the selectivity gate, so it returns the
+        // un-filtered superset — still correct, because the engine keeps its own `Filter`.
+        // Asserting the *matching* rows are all present is what matters either way.
+        let wide = r#"{"node":"cmp","col":"a","op":"lt","lit":299000}"#;
+        let out3 = read_parquet_filtered(path, &[], None, 8192, wide).unwrap();
+        let rows3: usize = out3.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            rows3 >= 299_000,
+            "a declined filter must not drop matching rows, got {rows3}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn selectivity_estimate_tracks_the_zone_map() {
+        // The estimator is what lets a permissive predicate decline the row filter for free,
+        // without paying for a probe. It only has to be right about *which side of the
+        // threshold* it is on, so that is what this asserts.
+        let dir = std::env::temp_dir().join(format!("bcio_est_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        write_parquet(&p, &[sample(10_000)], 10_000); // one row group, a = 0..10000
+        let file = std::fs::File::open(&p).unwrap();
+        let md = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).unwrap();
+        let rg = md.metadata().row_group(0);
+
+        let est = |json: &str| {
+            let pred = predicate::parse(json).unwrap();
+            row_filter::estimate(&pred, rg).unwrap()
+        };
+
+        // 2 % of the [0, 9999] span sits below 200.
+        let selective = est(r#"{"node":"cmp","col":"a","op":"lt","lit":200}"#);
+        assert!(selective < 0.05, "expected ~0.02, got {selective}");
+        assert!(row_filter::worth_it_frac(selective));
+
+        // 95 % sits below 9500 — the case that must decline.
+        let permissive = est(r#"{"node":"cmp","col":"a","op":"lt","lit":9500}"#);
+        assert!(permissive > 0.9, "expected ~0.95, got {permissive}");
+        assert!(!row_filter::worth_it_frac(permissive));
+
+        // `>` is the complement of `<` over the same bound.
+        let gt = est(r#"{"node":"cmp","col":"a","op":"gt","lit":9500}"#);
+        assert!((gt + permissive - 1.0).abs() < 1e-9);
+
+        // AND multiplies, so two selective terms stay selective.
+        let both = est(
+            r#"{"node":"and","left":{"node":"cmp","col":"a","op":"lt","lit":200},"right":{"node":"cmp","col":"a","op":"lt","lit":200}}"#,
+        );
+        assert!(both < selective);
+
+        // A non-numeric literal has no meaningful span, so the estimator abstains and the
+        // caller falls through to the measured probe rather than inventing a number.
+        let s = predicate::parse(r#"{"node":"cmp","col":"a","op":"eq","lit":"x"}"#).unwrap();
+        assert!(row_filter::estimate(&s, rg).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

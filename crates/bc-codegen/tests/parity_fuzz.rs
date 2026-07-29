@@ -211,7 +211,7 @@ fn gen_num(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
     if depth == 0 || rng.chance(3) {
         return gen_leaf(rng, nulls);
     }
-    match rng.below(9) {
+    match rng.below(10) {
         0 => bin(
             *rng.pick(&[BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul]),
             gen_num(rng, depth - 1, nulls),
@@ -247,6 +247,31 @@ fn gen_num(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
             dtype: (*rng.pick(&["int64", "float64", "double", "long"])).to_string(),
             try_cast: false,
         },
+        // `greatest`/`least`: same-typed operands (the JIT declines a mixed call), 2..4
+        // of them, so the accumulator chain runs more than one step.
+        9 => {
+            let n = 2 + rng.below(3);
+            let float_side = rng.chance(2);
+            let inputs = (0..n)
+                .map(|_| {
+                    if float_side {
+                        gen_float(rng, depth - 1, nulls)
+                    } else {
+                        let cols = if nulls == Nulls::Yes && rng.chance(2) {
+                            I64_NULL_COLS
+                        } else {
+                            I64_COLS
+                        };
+                        col(rng.pick(cols))
+                    }
+                })
+                .collect::<Vec<_>>();
+            if rng.chance(2) {
+                Expr::Greatest { inputs }
+            } else {
+                Expr::Least { inputs }
+            }
+        }
         5 => {
             let nbranches = 1 + rng.below(2);
             Expr::Case {
@@ -279,7 +304,58 @@ fn gen_leaf(rng: &mut Rng, nulls: Nulls) -> Expr {
     }
 }
 
-/// A boolean sub-expression (comparison / AND / OR / NOT).
+/// A float-typed sub-expression -- the operand shape `is_nan`/`is_inf` compile over.
+///
+/// Half the time a bare float column (so the null-carrying `cn` is exercised), half a
+/// numeric sub-expression cast to `float64`. The cast is always the exact, JIT-supported
+/// direction, so the operand never itself forces a fallback and the new lowering is
+/// genuinely reached rather than skipped.
+fn gen_float(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
+    if rng.chance(2) {
+        let cols = if nulls == Nulls::Yes && rng.chance(2) {
+            F64_NULL_COLS
+        } else {
+            F64_COLS
+        };
+        col(rng.pick(cols))
+    } else {
+        Expr::Cast {
+            input: Box::new(gen_num(rng, depth, nulls)),
+            dtype: "float64".to_string(),
+            try_cast: false,
+        }
+    }
+}
+
+/// `x IN (lit, ...)` over an int or float operand.
+///
+/// The set is drawn from the same nasty pools the columns are seeded from, so a float
+/// set regularly contains `-0.0`, a NaN, and an infinity -- which is the only way to
+/// catch a lowering that used `fcmp Equal` instead of the interpreter's raw-bit match.
+/// Sizes straddle the JIT's arity cap so both the compiled chain and the fallback run.
+fn gen_in_list(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
+    let n = 1 + rng.below(10); // 1..=10, i.e. either side of IN_LIST_JIT_MAX (8)
+    if rng.chance(2) {
+        let set = (0..n)
+            .map(|_| Literal::Int(*rng.pick(NASTY_I64)))
+            .collect::<Vec<_>>();
+        Expr::InList {
+            input: Box::new(gen_num(rng, depth, nulls)),
+            set,
+        }
+    } else {
+        let fs = nasty_f64();
+        let set = (0..n)
+            .map(|_| Literal::Float(fs[rng.below(fs.len())]))
+            .collect::<Vec<_>>();
+        Expr::InList {
+            input: Box::new(gen_float(rng, depth, nulls)),
+            set,
+        }
+    }
+}
+
+/// A boolean sub-expression (comparison / AND / OR / NOT / is_nan / is_inf / IN).
 fn gen_bool(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
     if depth == 0 {
         return bin(
@@ -288,7 +364,7 @@ fn gen_bool(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
             gen_leaf(rng, nulls),
         );
     }
-    match rng.below(6) {
+    match rng.below(11) {
         0..=2 => bin(
             *rng.pick(CMP_OPS),
             gen_num(rng, depth - 1, nulls),
@@ -304,6 +380,23 @@ fn gen_bool(rng: &mut Rng, depth: usize, nulls: Nulls) -> Expr {
             gen_bool(rng, depth - 1, nulls),
             gen_bool(rng, depth - 1, nulls),
         ),
+        // `is_nan` / `is_inf`: the JIT lowers these to a raw IEEE `fcmp`, while the
+        // interpreter walks the values buffer with `f64::is_nan`/`is_infinite`. The
+        // nasty-value seeding (NaN of several payloads, both infinities, denormals,
+        // -0.0) is what makes this comparison worth anything.
+        5 => Expr::IsNan {
+            input: Box::new(gen_float(rng, depth - 1, nulls)),
+        },
+        6 => Expr::IsInf {
+            input: Box::new(gen_float(rng, depth - 1, nulls)),
+        },
+        7 => gen_in_list(rng, depth - 1, nulls),
+        8 => Expr::IsNull {
+            input: Box::new(gen_num(rng, depth - 1, nulls)),
+        },
+        9 => Expr::IsNotNull {
+            input: Box::new(gen_num(rng, depth - 1, nulls)),
+        },
         _ => Expr::Not {
             input: Box::new(gen_bool(rng, depth - 1, nulls)),
         },
@@ -539,4 +632,251 @@ fn compiled_expr_carries_no_state_across_batches() {
             }
         }
     }
+}
+
+/// `is_nan` / `is_inf` must actually **compile**, not merely agree by falling back.
+///
+/// `run_case` treats a fallback as success, which is right for a fuzzer but makes a
+/// pass vacuous if the JIT silently refuses every one of these. This pins the lowering
+/// itself: compilation succeeds over a float column, and the compiled result is
+/// bit-identical to the interpreter on the nasty values -- NaN of several payloads,
+/// both infinities, denormals, and `-0.0`.
+///
+/// The float-compare choice is the subtle part. The engine's `!=` uses *total* ordering,
+/// under which `NaN == NaN`, so lowering `is_nan` to `x != x` would flag nothing. The JIT
+/// emits a raw IEEE `Unordered` compare instead, and this test is what would catch a
+/// regression back to the total-order operator.
+#[test]
+fn is_nan_and_is_inf_compile_and_match_the_interpreter() {
+    let mut rng = Rng(0x5eed_1234);
+    let mut compiled_any = false;
+    for &nulls in &[Nulls::No, Nulls::Yes] {
+        let cols: &[&str] = if nulls == Nulls::Yes {
+            F64_NULL_COLS
+        } else {
+            F64_COLS
+        };
+        for name in cols {
+            for expr in [
+                Expr::IsNan {
+                    input: Box::new(col(name)),
+                },
+                Expr::IsInf {
+                    input: Box::new(col(name)),
+                },
+            ] {
+                for &n in LENGTHS {
+                    let batch = make_batch(n, &mut rng);
+                    // Compilation must succeed -- that is the property under test.
+                    let compiled = bc_codegen::compile_expr(&expr, &batch)
+                        .unwrap_or_else(|e| panic!("{expr:?} failed to compile: {e:?}"));
+                    compiled_any = true;
+                    let jit = compiled.eval(&batch).expect("compiled eval");
+                    let oracle = expr.eval(&batch).expect("interpreter eval");
+                    if let Some(why) = diff(&jit, &oracle) {
+                        panic!("JIT != interpreter\n  expr: {expr:?}\n  rows: {n}\n  diff: {why}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        compiled_any,
+        "no expression was compiled -- the test proved nothing"
+    );
+}
+
+/// A non-float operand must fall back rather than compile a wrong answer.
+///
+/// The interpreter reaches `is_nan(int)` by casting to Float64 first, which is always
+/// false. The JIT declines instead of reproducing that, so the guard is that
+/// `compile_expr` returns `Err` -- not that it returns the right constant.
+#[test]
+fn is_nan_over_an_integer_column_falls_back() {
+    let mut rng = Rng(0x5eed_9876);
+    let batch = make_batch(17, &mut rng);
+    let expr = Expr::IsNan {
+        input: Box::new(col("a")),
+    };
+    assert!(
+        bc_codegen::compile_expr(&expr, &batch).is_err(),
+        "is_nan over an Int64 column should fall back to the interpreter"
+    );
+}
+
+/// `x IN (...)` must compile for a small set, and must match the interpreter's raw-bit
+/// float membership rather than an IEEE float compare.
+///
+/// The float case is the one that matters. The interpreter keys membership on
+/// `f64::to_bits`, because the `col = lit` chain this folds from compares by *total*
+/// order and total-order equality is bit equality. So `-0.0` must NOT match a `0.0`
+/// literal, and a NaN column value must match only a bit-identical NaN literal -- both
+/// of which an `fcmp Equal` lowering would get wrong in the opposite direction.
+#[test]
+fn in_list_compiles_and_matches_raw_bit_float_membership() {
+    let mut rng = Rng(0xfeed_4321);
+    let batch = make_batch(65, &mut rng);
+    let cases = vec![
+        Expr::InList {
+            input: Box::new(col("a")),
+            set: vec![Literal::Int(0), Literal::Int(1), Literal::Int(i64::MIN)],
+        },
+        Expr::InList {
+            input: Box::new(col("c")),
+            set: vec![Literal::Float(0.0), Literal::Float(1.0)],
+        },
+        // `-0.0` and a NaN as members: bit equality, not numeric equality.
+        Expr::InList {
+            input: Box::new(col("c")),
+            set: vec![Literal::Float(-0.0), Literal::Float(f64::NAN)],
+        },
+        Expr::InList {
+            input: Box::new(col("cn")),
+            set: vec![Literal::Float(f64::INFINITY), Literal::Float(-0.0)],
+        },
+    ];
+    for expr in &cases {
+        let compiled = bc_codegen::compile_expr(expr, &batch)
+            .unwrap_or_else(|e| panic!("{expr:?} failed to compile: {e:?}"));
+        let jit = compiled.eval(&batch).expect("compiled eval");
+        let oracle = expr.eval(&batch).expect("interpreter eval");
+        if let Some(why) = diff(&jit, &oracle) {
+            panic!("JIT != interpreter\n  expr: {expr:?}\n  diff: {why}");
+        }
+    }
+}
+
+/// A set past the arity cap falls back -- the interpreter's hash probe beats a chain there.
+#[test]
+fn in_list_past_the_arity_cap_falls_back() {
+    let mut rng = Rng(0xfeed_8765);
+    let batch = make_batch(9, &mut rng);
+    let expr = Expr::InList {
+        input: Box::new(col("a")),
+        set: (0..20).map(Literal::Int).collect(),
+    };
+    assert!(
+        bc_codegen::compile_expr(&expr, &batch).is_err(),
+        "a 20-member IN should fall back to the interpreter's hashed membership"
+    );
+}
+
+/// `greatest`/`least` rank by the engine's float identity, and ties keep the accumulator.
+///
+/// Both properties are observable and neither is IEEE: `greatest(NaN, 5)` is NaN (a NaN
+/// ranks *above* `+inf`, so an IEEE `fcmp` lowering -- where every NaN compare is false --
+/// would return 5), and `greatest(-0.0, 0.0)` is `-0.0` (the keys tie and the accumulator
+/// survives, so a strict `>` instead of `>=` would return `0.0`). These cases were read
+/// off the interpreter first and are pinned here against both mistakes.
+#[test]
+fn greatest_and_least_match_the_engine_float_identity() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Float64, false),
+        Field::new("b", DataType::Float64, false),
+    ]));
+    let nan = f64::NAN;
+    let inf = f64::INFINITY;
+    let a = Float64Array::from(vec![nan, 5.0, -0.0, -inf, 5.0]);
+    let b = Float64Array::from(vec![5.0, nan, 0.0, nan, -inf]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(a) as ArrayRef, Arc::new(b) as ArrayRef],
+    )
+    .expect("batch");
+
+    for expr in [
+        Expr::Greatest {
+            inputs: vec![col("a"), col("b")],
+        },
+        Expr::Least {
+            inputs: vec![col("a"), col("b")],
+        },
+    ] {
+        let compiled = bc_codegen::compile_expr(&expr, &batch)
+            .unwrap_or_else(|e| panic!("{expr:?} failed to compile: {e:?}"));
+        let jit = compiled.eval(&batch).expect("compiled eval");
+        let oracle = expr.eval(&batch).expect("interpreter eval");
+        if let Some(why) = diff(&jit, &oracle) {
+            panic!("JIT != interpreter\n  expr: {expr:?}\n  diff: {why}");
+        }
+    }
+}
+
+/// A mixed int/float `greatest` falls back rather than duplicating `coerce_numeric`.
+#[test]
+fn mixed_type_greatest_falls_back() {
+    let mut rng = Rng(0xabc_1234);
+    let batch = make_batch(9, &mut rng);
+    let expr = Expr::Greatest {
+        inputs: vec![col("a"), col("c")],
+    };
+    assert!(
+        bc_codegen::compile_expr(&expr, &batch).is_err(),
+        "greatest(int, float) should fall back to the interpreter's coercion"
+    );
+}
+
+/// `is_null` / `is_not_null` are total: they answer for a null row rather than
+/// propagating it, which is the opposite of every other unary op the JIT compiles.
+///
+/// Both compile paths are exercised. Under the Kleene ABI (reached via the enclosing
+/// `AND`) the answer is the operand's validity bit, and the *result* must itself be
+/// non-null on every row -- a validity slip there would surface as nulls in the output.
+/// On the null-free path the answer is a constant, which is only sound because
+/// `CompiledExpr::eval` refuses a batch carrying nulls for a non-`null_safe` expression;
+/// the nullable case below is what would catch that guard being lost.
+#[test]
+fn is_null_predicates_match_the_interpreter_on_both_paths() {
+    let mut rng = Rng(0x1501_1111);
+    let mut compiled_any = false;
+    let cases = vec![
+        // Null-free operand: constant answer on the plain path.
+        Expr::IsNull {
+            input: Box::new(col("a")),
+        },
+        Expr::IsNotNull {
+            input: Box::new(col("c")),
+        },
+        // Nullable operand inside an AND: the Kleene ABI path.
+        bin(
+            BinaryOp::And,
+            Expr::IsNotNull {
+                input: Box::new(col("an")),
+            },
+            bin(
+                BinaryOp::Gt,
+                col("a"),
+                Expr::Lit {
+                    value: Literal::Int(0),
+                },
+            ),
+        ),
+        bin(
+            BinaryOp::Or,
+            Expr::IsNull {
+                input: Box::new(col("cn")),
+            },
+            bin(BinaryOp::Lt, col("c"), col("d")),
+        ),
+    ];
+    for expr in &cases {
+        for &n in LENGTHS {
+            let batch = make_batch(n, &mut rng);
+            let Ok(compiled) = bc_codegen::compile_expr(expr, &batch) else {
+                continue; // a refusal is always allowed
+            };
+            let Ok(jit) = compiled.eval(&batch) else {
+                continue; // a per-batch refusal is always allowed
+            };
+            compiled_any = true;
+            let oracle = expr.eval(&batch).expect("interpreter eval");
+            if let Some(why) = diff(&jit, &oracle) {
+                panic!("JIT != interpreter\n  expr: {expr:?}\n  rows: {n}\n  diff: {why}");
+            }
+        }
+    }
+    assert!(
+        compiled_any,
+        "no is_null expression compiled -- the test proved nothing"
+    );
 }

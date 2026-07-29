@@ -26,11 +26,16 @@ use crate::error::RuntimeError;
 
 mod asof;
 mod build;
+mod dense;
+mod key_filter;
 mod radix;
+mod range;
 mod sort_merge;
 mod stream;
 
 pub use asof::asof_join_indices;
+pub use key_filter::KeyFilter;
+pub use range::{range_join_indices, RangeOp};
 pub use sort_merge::sort_merge_join_indices;
 pub use stream::{streaming_supported, BroadcastProbe};
 
@@ -130,14 +135,14 @@ impl IndexBuf {
 
     /// Append a real row index.
     #[inline]
-    fn push(&mut self, row: u32) {
+    pub(crate) fn push(&mut self, row: u32) {
         debug_assert_ne!(row, NULL_INDEX, "row index collides with the NULL sentinel");
         self.idx.push(row);
     }
 
     /// Append a NULL (an unmatched outer row, or the unused side of a semi/anti join).
     #[inline]
-    fn push_null(&mut self) {
+    pub(crate) fn push_null(&mut self) {
         self.idx.push(NULL_INDEX);
         self.any_null = true;
     }
@@ -150,7 +155,7 @@ impl IndexBuf {
     ///
     /// Used to concatenate per-partition pieces **in partition order**, which is what makes
     /// the parallel radix join emit byte-identical rows to the sequential one.
-    fn extend(&mut self, other: IndexBuf) {
+    pub(crate) fn extend(&mut self, other: IndexBuf) {
         self.idx.extend_from_slice(&other.idx);
         self.any_null |= other.any_null;
     }
@@ -357,6 +362,15 @@ trait JoinKeys {
     fn right_eq_right(&self, a: usize, b: usize) -> bool;
     /// Whether build row `r` and probe row `l` carry the same key (probe comparison).
     fn right_eq_left(&self, r: usize, l: usize) -> bool;
+
+    /// The raw `(build, probe)` key slices, when the key is exactly one `Int64` column.
+    ///
+    /// `None` for every other shape, which is what confines the dense direct-map path
+    /// ([`dense::DenseHeads`]) to the one key type whose values can index an array. A
+    /// multi-column or row-encoded key has no such value, so it keeps the hash table.
+    fn dense_keys(&self) -> Option<(&[i64], &[i64])> {
+        None
+    }
 }
 
 /// Row-encoded keys (the general path): equal keys produce equal byte rows, so they
@@ -426,6 +440,9 @@ impl JoinKeys for I64Keys<'_> {
     fn right_eq_left(&self, r: usize, l: usize) -> bool {
         self.right[r] == self.left[l]
     }
+    fn dense_keys(&self) -> Option<(&[i64], &[i64])> {
+        Some((self.right, self.left))
+    }
 }
 
 /// Two-`Int64`-key fast path: the raw value slices of both key columns per side.
@@ -491,6 +508,14 @@ struct JoinTable {
     /// its hash alone, so a chain never spans shards and the build parallelizes with no
     /// synchronization; `next` stays a single absolute-indexed chain either way.
     heads: Vec<HashTable<u32>>,
+    /// A perfect hash over a small-range single-`Int64` build key, replacing `heads`.
+    ///
+    /// When present, `heads` is empty and every lookup is one indexed load with no hashing
+    /// on either side — see [`dense::DenseHeads`] for why a dimension table's surrogate key
+    /// makes this the common case, and for the memory bound that lets it be enabled on the
+    /// key's range alone. `next` and `unique` mean exactly what they mean for the hash path,
+    /// so the probe loop below is shared.
+    dense: Option<dense::DenseHeads>,
     next: Vec<u32>,
     /// Whether no build key repeats — so every chain has length exactly 1.
     ///
@@ -582,6 +607,25 @@ impl JoinTable {
         bloom_fp_rate: f64,
     ) -> Self {
         let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+
+        // A single small-range `Int64` build key is direct-mapped instead of hashed. This is
+        // checked first because it subsumes the hash build entirely: no build-side hashing,
+        // no probe-side hashing, and no bloom (the "is this key present" question the bloom
+        // approximates is answered exactly, by the same indexed load that finds the head).
+        if let Some((right, _)) = keys.dense_keys() {
+            if let Some(d) = dense::DenseHeads::build(right, right_rows, right_null) {
+                return Self {
+                    heads: Vec::new(),
+                    dense: Some(d.heads),
+                    next: build::stitch_chain(d.links, right_rows, d.unique),
+                    unique: d.unique,
+                    state,
+                    bloom: None,
+                    bloom_trial: BloomTrial::default(),
+                };
+            }
+        }
+
         let bloom = use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
         let shards = build::shard_count(right_rows);
         if shards > 1 {
@@ -589,6 +633,7 @@ impl JoinTable {
                 build::build_sharded(keys, &state, right_rows, right_null, shards, bloom);
             return Self {
                 heads,
+                dense: None,
                 next,
                 unique,
                 state,
@@ -629,6 +674,7 @@ impl JoinTable {
         }
         Self {
             heads: vec![heads],
+            dense: None,
             next,
             unique,
             state,
@@ -653,6 +699,14 @@ impl JoinTable {
     ) -> Option<u32> {
         if is_null {
             return None;
+        }
+        // The dense direct map answers without hashing either side. The `Option` test is
+        // loop-invariant over a probe range, so this is a predicted branch, not a per-row cost.
+        if let Some(d) = self.dense.as_ref() {
+            // `dense` is only ever set from a key set that reported `dense_keys`, so the
+            // probe side reports it too — both come from the same `JoinKeys`.
+            let (_, left) = keys.dense_keys().expect("dense table implies i64 keys");
+            return d.head(left[l]);
         }
         let hash = keys.hash_left(&self.state, l);
         // A bloom miss is definitive (no false negatives): the key is not on the build
@@ -1325,15 +1379,32 @@ mod tests {
         (pairs, table)
     }
 
+    /// Spacing between the bloom tests' build keys, wide enough that
+    /// [`dense::DenseHeads`] refuses the key set.
+    ///
+    /// This is load-bearing, not arbitrary. The dense direct map accepts any key whose value
+    /// range is within a small multiple of its row count — which a contiguous `0..n` is — and
+    /// a dense table needs **no bloom at all** (an out-of-range key is rejected by the index
+    /// bound itself). Generating these keys contiguously therefore routes them past the hash
+    /// build entirely, leaves `bloom_trial` untouched at its default, and makes both
+    /// assertions below vacuously true. Keep the keys spread.
+    const BLOOM_TEST_KEY_SPREAD: i64 = 1 << 12;
+
+    /// `n` build keys spread past the dense map's range budget — see
+    /// [`BLOOM_TEST_KEY_SPREAD`].
+    fn spread_keys(n: i64) -> Vec<i64> {
+        (0..n).map(|i| i * BLOOM_TEST_KEY_SPREAD).collect()
+    }
+
     /// The bloom is a pure short-circuit, so latching it off mid-probe must not change a single
     /// emitted row. Probed in chunks well past [`BLOOM_TRIAL_ROWS`] so the verdict actually flips
     /// part-way through — exactly the window a wrong implementation would corrupt.
     #[test]
     fn latching_the_bloom_off_midway_emits_the_same_rows() {
         // Every probe key matches — the shape that makes the bloom useless (TPC-H lineitem⋈orders).
-        let build: Vec<i64> = (0..40_000).collect();
+        let build: Vec<i64> = spread_keys(40_000);
         let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
-            .map(|i| i % 40_000)
+            .map(|i| (i % 40_000) * BLOOM_TEST_KEY_SPREAD)
             .collect();
 
         let (chunked, table) = probe_in_chunks(&build, &probe, 8_192);
@@ -1360,14 +1431,15 @@ mod tests {
     /// silently cost every selective probe its short-circuit.
     #[test]
     fn a_selective_bloom_is_kept() {
-        let build: Vec<i64> = (0..40_000).collect();
-        // 1 probe row in 50 can match; the rest fall far outside the build's key range.
+        let build: Vec<i64> = spread_keys(40_000);
+        // 1 probe row in 50 can match; the rest fall far outside the build's key range (whose
+        // maximum is `40_000 * BLOOM_TEST_KEY_SPREAD`, so a billion is clear of every key).
         let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
             .map(|i| {
                 if i % 50 == 0 {
-                    i % 40_000
+                    (i % 40_000) * BLOOM_TEST_KEY_SPREAD
                 } else {
-                    10_000_000 + i
+                    1_000_000_000 + i
                 }
             })
             .collect();
@@ -1377,6 +1449,52 @@ mod tests {
             table.bloom_trial.worth_consulting(),
             "a bloom rejecting ~98% of probe rows must stay engaged",
         );
+    }
+
+    /// The dense direct map must emit exactly what the hash table emits.
+    ///
+    /// Scaling every key by a constant is a bijection, so it leaves the join's *structure*
+    /// untouched — the same probe rows pair with the same build rows — while moving the key
+    /// set from inside the dense map's range budget to outside it. So the same logical join
+    /// runs down both paths and the index pairs must match element for element, including
+    /// the chain order for duplicated keys and the placement of unmatched rows.
+    ///
+    /// Without this, the dense path could disagree with the hash path on duplicate-key chain
+    /// order and every existing test would still pass, because they all use one path or the
+    /// other, never both on the same relation.
+    #[test]
+    fn the_dense_map_and_the_hash_table_emit_identical_pairs() {
+        // Duplicated build keys (so chains exist), gaps, and probe keys that miss.
+        let build_raw: Vec<i64> = vec![3, 7, 3, 0, 12, 7, 7, 5, 3];
+        let probe_raw: Vec<i64> = vec![7, 3, 99, 0, 12, 5, 7, 100, 3, 0];
+
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+            JoinType::Right,
+            JoinType::Full,
+        ] {
+            let dense = hash_join_indices(&keys(&probe_raw), &keys(&build_raw), join_type).unwrap();
+            // The same relation, keys spread past the dense range budget ⇒ the hash path.
+            let scale =
+                |v: &[i64]| -> Vec<i64> { v.iter().map(|k| k * BLOOM_TEST_KEY_SPREAD).collect() };
+            let hashed = hash_join_indices(
+                &keys(&scale(&probe_raw)),
+                &keys(&scale(&build_raw)),
+                join_type,
+            )
+            .unwrap();
+            assert_eq!(
+                dense.left, hashed.left,
+                "left indices diverged for {join_type:?}"
+            );
+            assert_eq!(
+                dense.right, hashed.right,
+                "right indices diverged for {join_type:?}"
+            );
+        }
     }
 
     /// An inner join emits no NULL index, so `finish` must build no null buffer — that is

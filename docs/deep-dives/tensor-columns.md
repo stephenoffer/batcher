@@ -131,7 +131,7 @@ is a downstream Rust *expression*, never a read-time side effect:
 
 ```text
 col("bytes").image.to_tensor(width, height)   -> FixedSizeList<UInt8> + tensor metadata
-col("bytes").image.decode()                   -> struct {width, height}  (header only)
+col("bytes").image.decode()                   -> struct {width, height, channels, mode}  (header only)
 col("bytes").audio.to_waveform()              -> list<float32>  (variable length: NOT a tensor)
 ```
 
@@ -167,9 +167,8 @@ read-only and handing one to torch is undefined behavior the moment anything wri
 `zero_copy=True` opts into `torch.from_dlpack`, with a copy as fallback.
 
 That default is a real cost, and it is the honest kind: correctness first. The
-zero-copy DLPack path is what `iter_torch_batches` uses for training ingest, where it is
-measured at 3.0× Ray Data's `iter_torch_batches` (1.76 vs 0.58 Mrows/s on 10M rows × 32
-features).
+zero-copy DLPack path is what `iter_torch_batches` uses for training ingest, where it streams
+1.76 M rows/s on 10M rows by 32 features, well above what most training loops consume.
 
 ```python
 import numpy as np

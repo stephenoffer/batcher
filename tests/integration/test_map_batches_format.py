@@ -13,6 +13,7 @@ import pytest
 
 import batcher as bt
 from batcher._internal.errors import PlanError
+from batcher.ml.batch_format import FORMATS
 
 
 def _table() -> pa.Table:
@@ -80,7 +81,17 @@ def test_formats_agree():
 
 def test_unknown_format_rejected():
     with pytest.raises(PlanError, match="batch_format"):
-        bt.from_arrow(_table()).map_batches(lambda b: b, batch_format="polars")
+        bt.from_arrow(_table()).map_batches(lambda b: b, batch_format="dataframe")
+
+
+def test_every_supported_format_is_accepted():
+    """Pins the guard to `FORMATS`, so adding a format can't leave the check stale.
+
+    This test previously named a supported format as the unknown one, which made the
+    rejection test vacuous. Asserting both directions keeps the two lists together.
+    """
+    for fmt in FORMATS:
+        bt.from_arrow(_table()).map_batches(lambda b: b, batch_format=fmt)
 
 
 # --------------------------------------------------------------------------- #

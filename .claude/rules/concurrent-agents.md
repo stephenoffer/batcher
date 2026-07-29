@@ -28,6 +28,70 @@ agent's work here:
   other agents' half-finished files. **Scope every fix and format command to the paths
   you own** (`ruff format path/to/your/file.py`).
 - **`git commit -a`** — commits everyone's work under your message.
+- **The index is shared too, so `git add` your paths is not enough.** `git commit` writes
+  whatever is staged, including files *another agent staged*, and a blocked commit of yours
+  leaves your own files staged for the next one to sweep up. Both have happened here: one
+  commit landed carrying 52 lines of another session's docs page, and an earlier one swallowed
+  an unrelated test fix left over from a commit the pre-commit hook had rejected. Use
+  **`git commit --only <paths>`** (or `git commit <paths>`), which commits exactly those paths
+  and ignores the rest of the index. If you use plain `git commit`, read
+  `git diff --cached --stat` immediately before it and confirm every line is yours.
+
+  To back a path out of a commit you already made, without touching the working tree:
+  `git restore --source=HEAD~1 --staged <path>` then `git commit --amend --no-edit`. Their
+  content stays in the tree and goes back to being unstaged. Guard any `--amend` with
+  `git rev-parse HEAD` against the hash you meant to amend — if another agent committed on
+  top, you would be rewriting *their* commit.
+
+## `just build` crashes every other session's running tests
+
+`maturin develop` overwrites `python/batcher/_native.abi3.so` **in place**. Every Python
+process that has already imported the engine holds that file memory-mapped, so replacing it
+pulls the pages out from under running code. The result is not a test failure — it is a
+`Fatal Python error: Bus error` (exit 135) or a segfault, with a 300-line dump of loaded
+extension modules and no indication of the cause.
+
+This happened three times in one session here, twice killing a full-suite run partway
+(64 tests in, and 18 tests in) and once corrupting a benchmark. Each time the tell was the
+same: compare the `.so`'s mtime against the run's start.
+
+```
+ls -la python/batcher/_native.abi3.so   # mtime inside your run window?  that is why
+```
+
+What to do about it:
+
+- **Don't diagnose a Bus error / exit 135 / 139 as your bug** until you have checked that
+  mtime. It almost never is.
+- **Prefer targeted suites over the full run** while others are active — a two-minute run
+  has a small window, a twenty-minute one is nearly certain to be hit.
+- **Re-run before reporting.** A crashed run has no result, not a bad one.
+- If you must run the whole suite, do it right after your own build, and expect to repeat.
+
+The same swap is why a benchmark can silently measure the *other* agent's build: check
+`bt.versions()["engine_profile"]`, which the suite now does for you.
+
+## The pre-commit hook is repo-wide, so someone else's half-done refactor blocks you
+
+`lint-structure` runs over the whole tree, not your staged paths. An agent mid-way through
+shrinking an oversized file — say `stream/mod.rs` at 804 code lines against a limit of 800,
+on its way down from 826 — fails the hook for *every* session trying to commit, including
+ones that touched nothing near it.
+
+Diagnose it before assuming your change is at fault: the FAIL line names the file, and
+`git status <that file>` plus `git show HEAD:<that file> | wc -l` tells you whether someone
+is actively working it down.
+
+Then **wait and retry** — a loop around `git commit` is the whole fix, and their next save
+usually clears it. Do not:
+
+- **`--no-verify`.** The gate is the point, and skipping it is how an oversized file or a
+  broken layer contract lands.
+- **"Just fix" their file.** It is four lines; it is also the middle of someone's refactor,
+  and your trim will collide with theirs.
+
+The same applies to `MAP.md`: it goes stale the moment any session adds a module, so
+regenerate it *inside* the retry loop rather than before it.
 
 ## Prove "pre-existing", never assume it
 

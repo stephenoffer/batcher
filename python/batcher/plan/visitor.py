@@ -16,10 +16,11 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 
-from batcher.plan.logical import LogicalPlan
+from batcher.plan.logical import LogicalPlan, Scan
 
 __all__ = [
     "children",
+    "scanned_source_ids",
     "transform_down",
     "transform_up",
     "walk",
@@ -100,6 +101,29 @@ def children(node: LogicalPlan) -> list[LogicalPlan]:
     return out
 
 
+def scanned_source_ids(node: LogicalPlan) -> set[int]:
+    """The `source_id`s that `node`'s subtree actually reads.
+
+    Sources are addressed positionally across the FFI boundary, so a caller has to keep
+    every source at its own index while reading only the ones the plan reaches. Both the
+    single-node UDF path and the distributed stage splitter need exactly that set, and
+    they live in `core` and `dist`, which cannot import each other — so it belongs here,
+    in the neutral layer both already depend on, rather than being written twice.
+
+    Args:
+        node: The root of the subtree to inspect.
+
+    Returns:
+        The set of `Scan.source_id` values reachable from `node`.
+    """
+    if isinstance(node, Scan):
+        return {node.source_id}
+    ids: set[int] = set()
+    for child in children(node):
+        ids |= scanned_source_ids(child)
+    return ids
+
+
 def with_children(node: LogicalPlan, new_children: list[LogicalPlan]) -> LogicalPlan:
     """Rebuild `node` with its child plans replaced, in the order `children` yields.
 
@@ -177,7 +201,15 @@ def transform_down(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) 
 
 def walk(node: LogicalPlan):
     """Yield every node in the tree, pre-order (parents before children). For
-    read-only analyses (counting ops, collecting scans, validation)."""
+    read-only analyses (counting ops, collecting scans, validation).
+
+    Recursive on purpose, and measured. `yield from` re-enters one generator per nesting
+    level for each value it forwards, which argues for an explicit stack — but a plan is
+    a handful of nodes deep, and at that size the `children()` list plus the stack
+    bookkeeping costs more than the re-entry it removes (3-node plan: 1.14 us recursive
+    against 1.45 us iterative; an 11-node plan, 4.24 against 4.90). Don't "fix" this
+    without re-measuring on a real plan.
+    """
     yield node
     for child in children(node):
         yield from walk(child)

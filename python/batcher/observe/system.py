@@ -23,7 +23,7 @@ import platform
 import sys
 from typing import Any
 
-from batcher._internal.hardware import available_cpu_count, gpu_inventory
+from batcher._internal.hardware import available_cpu_count, gpu_inventory, hardware_profile
 from batcher._internal.native import engine_or_none
 
 __all__ = ["system_snapshot"]
@@ -32,11 +32,20 @@ __all__ = ["system_snapshot"]
 def system_snapshot() -> dict[str, Any]:
     """Host, runtime, engine, and configuration facts, as one JSON-encodable dict.
 
+    The ``hardware`` section is the full measured profile — NUMA nodes, SMT siblings, the
+    cache hierarchy, vector width, page size, the scratch device's class — plus the
+    ``fingerprint`` that names this machine class. That fingerprint is worth surfacing rather
+    than hiding: it is the key every learned parameter is stored under, so it is the answer to
+    "why did the optimizer start cold on this node?" (a different machine class) and to "will
+    what this node learns help the next one?" (only if the fingerprints match).
+
     Returns:
-        A dict with ``host``, ``runtime``, ``engine``, ``config``, and ``cluster`` sections.
+        A dict with ``host``, ``hardware``, ``runtime``, ``engine``, ``config``, and
+        ``cluster`` sections.
     """
     return {
         "host": _host(),
+        "hardware": hardware_profile().to_dict(),
         "runtime": _runtime(),
         "engine": _engine(),
         "config": _config(),

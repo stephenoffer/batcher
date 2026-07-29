@@ -11,17 +11,22 @@ from __future__ import annotations
 
 import datetime as _dt
 
-from batcher._internal.mathx import is_nan
-from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.registry import DEFAULT_REGISTRY, rule
+from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, plan_rule
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_ir.namespaces import DateTrunc, StrFunc
-from batcher.plan.expr_rewrite import combine_conjuncts, map_node_expressions, split_conjuncts
-from batcher.plan.logical import Filter, LogicalPlan
+from batcher.plan.expr_rewrite import (
+    map_node_expressions,
+)
+from batcher.plan.logical import LogicalPlan
 from batcher.plan.visitor import transform_up
 
-__all__ = ["date_trunc_to_range", "like_prefix_to_range", "or_to_in_and_range"]
+__all__ = [
+    "date_trunc_to_range",
+    "len_zero_to_empty_string",
+    "like_prefix_to_range",
+    "prefix_predicates_to_range",
+]
 
 
 # --- LIKE-prefix → range ----------------------------------------------------
@@ -93,8 +98,22 @@ _TRUNC_FIXED_STEP = {
     "minute": _dt.timedelta(minutes=1),
     "hour": _dt.timedelta(hours=1),
     "day": _dt.timedelta(days=1),
+    # A week is a genuinely fixed seven-day step: the engine truncates to Monday, and no
+    # calendar irregularity moves the next Monday. `quarter` is *not* here — three calendar
+    # months is not a fixed number of days — and is handled in `_next_unit`.
+    "week": _dt.timedelta(days=7),
 }
 _TRUNC_SUBDAY = frozenset({"second", "minute", "hour"})
+
+# Multi-year truncation units, and how many calendar years each bucket spans. The
+# boundaries are **0-based** — the engine truncates 2024 to 2000 for `century` (measured) —
+# which is the opposite convention from the `century()`/`millennium()` *extractions*, where
+# century 21 starts in 2001. The two are genuinely different functions and this asymmetry is
+# the reason each carries its own table rather than sharing one.
+_TRUNC_YEAR_SPAN = {"decade": 10, "century": 100, "millennium": 1000}
+# Units whose bucket starts at a midnight but not at a month or year boundary, so alignment
+# is checked on the day/weekday rather than by a modulus.
+_TRUNC_COARSE_DAY = frozenset({"week", "quarter", *_TRUNC_YEAR_SPAN})
 
 
 def date_trunc_to_range(plan: LogicalPlan) -> LogicalPlan:
@@ -167,6 +186,21 @@ def _trunc_aligned(value, unit: str, is_datetime: bool) -> bool:
             value.hour or value.minute or value.second or value.microsecond
         ):
             return False
+    if (
+        is_datetime
+        and unit in _TRUNC_COARSE_DAY
+        and (value.hour or value.minute or value.second or value.microsecond)
+    ):
+        return False
+    span = _TRUNC_YEAR_SPAN.get(unit)
+    if span is not None:
+        # 0-based buckets: a `century`-aligned literal is 1900/2000/2100, not 1901/2001.
+        return value.month == 1 and value.day == 1 and value.year % span == 0
+    if unit == "week":
+        # The engine truncates to Monday, so a week-aligned literal is a Monday midnight.
+        return value.weekday() == 0
+    if unit == "quarter":
+        return value.day == 1 and value.month in (1, 4, 7, 10)
     if unit == "month" and value.day != 1:
         return False
     return not (unit == "year" and (value.month != 1 or value.day != 1))
@@ -177,6 +211,18 @@ def _next_unit(value, unit: str):
     is assumed unit-aligned, so the calendar cases never hit a missing day."""
     if unit in _TRUNC_FIXED_STEP:
         return value + _TRUNC_FIXED_STEP[unit]
+    span = _TRUNC_YEAR_SPAN.get(unit)
+    if span is not None:
+        return value.replace(year=value.year + span)
+    if unit == "quarter":
+        # A quarter is three calendar months, and its start is always the 1st of January,
+        # April, July or October — so the step never lands on a day the month lacks.
+        month = value.month + 3
+        return (
+            value.replace(year=value.year + 1, month=month - 12)
+            if month > 12
+            else (value.replace(month=month))
+        )
     if unit == "month":
         year, month = (value.year + 1, 1) if value.month == 12 else (value.year, value.month + 1)
         return value.replace(year=year, month=month)
@@ -194,79 +240,125 @@ DEFAULT_REGISTRY.add(
 )
 
 
-def _flat_or_equalities(expr: Expr) -> tuple[str, list] | None:
-    """If `expr` is `c == v1 OR c == v2 OR …` (≥2 disjuncts, one column, literal
-    values), return `(column, [values])`; else None. The shape SQL `IN (...)` and
-    chained `OR` equalities lower to."""
-    if not (isinstance(expr, Binary) and expr.op == "or"):
-        return None
-    leaves: list[tuple[str, object]] = []
-
-    def collect(e: Expr) -> bool:
-        if isinstance(e, Binary) and e.op == "or":
-            return collect(e.left) and collect(e.right)
-        if isinstance(e, Binary) and e.op == "eq":
-            left, right = e.left, e.right
-            if isinstance(left, Col) and isinstance(right, Lit):
-                leaves.append((left.name, right.value))
-                return True
-            if isinstance(right, Col) and isinstance(left, Lit):
-                leaves.append((right.name, left.value))
-                return True
-        return False
-
-    if not collect(expr) or len(leaves) < 2:
-        return None
-    cols = {name for name, _ in leaves}
-    values = [v for _, v in leaves]
-    if len(cols) != 1 or any(_bad_range_literal(v) for v in values):
-        return None
-    return cols.pop(), values
+# --- starts_with / substr prefix → range ------------------------------------
 
 
-def _bad_range_literal(value: object) -> bool:
-    """Whether a literal cannot participate in a min/max range bound.
+def prefix_predicates_to_range(plan: LogicalPlan) -> LogicalPlan:
+    """Rewrite `starts_with(col, 'abc')` and `substr(col, 1, 3) = 'abc'` to the same
+    exact range `col >= 'abc' AND col < 'abd'` that `LIKE 'abc%'` already gets.
 
-    ``NULL`` and booleans are excluded (a range over them is meaningless), and so is
-    **NaN**: the engine's ``=`` matches a NaN row (``col = NaN`` is TRUE where ``col`` is
-    NaN), but ``NaN >= lo`` / ``NaN <= hi`` are both FALSE — so a range bound derived from a
-    disjunction containing ``col = NaN`` would drop the very NaN rows that disjunct keeps,
-    and Python's ``min``/``max`` over a list containing NaN is order-dependent garbage (a
-    leading NaN yields ``col >= NaN``, which rejects every row). Such a disjunction gets no
-    range bound at all — the original ``OR`` still selects exactly the right rows.
+    `like_prefix_to_range` has handled the SQL spelling for a while; these are the two
+    *DataFrame* spellings of the identical predicate, and neither was rewritten. So
+    `ds.filter(col("s").str.starts_with("abc"))` — the idiom a Batcher user actually
+    writes — scanned every row group while the SQL form skipped them. The asymmetry was
+    invisible because both return the right rows.
+
+    Both equivalences are exact:
+
+    * a string starts with `p` iff it lies in `[p, next(p))`, which is the same argument
+      `like_prefix_to_range` rests on;
+    * `substr(s, 1, n) = lit` (with `len(lit) == n`) is the same statement — a shorter `s`
+      yields a shorter substring that cannot equal `lit`, and is also below `lit` in the
+      range, so both forms exclude it.
+
+    NULL is preserved: `starts_with`/`substr`/`=` are all null-propagating, and so is the
+    conjunction of two comparisons. Same conservative guard as the `LIKE` rule — the
+    prefix must be non-empty and end in a safely incrementable ASCII character, since the
+    upper bound is built by incrementing that character.
     """
-    if value is None or isinstance(value, bool):
-        return True
-    return is_nan(value)
+    return transform_up(plan, lambda node: map_node_expressions(node, _rewrite_prefix))
 
 
-@rule(name="or_to_in_and_range", phase=Phase.NORMALIZE, matches=(Filter,))
-def or_to_in_and_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """Add `c >= min AND c <= max` alongside a `c = v1 OR c = v2 OR …` conjunct.
+def _rewrite_prefix(expr: Expr) -> Expr:
+    prefix, column = _prefix_and_column(expr)
+    if prefix is None or column is None:
+        return expr
+    upper = _increment_prefix(prefix)
+    if upper is None:
+        return expr
+    return Binary("and", Binary("ge", column, Lit(prefix)), Binary("lt", column, Lit(upper)))
 
-    A disjunction of equalities (what `IN (...)` lowers to) is opaque to range-based
-    zone-map pruning. Its values imply the bound `min(vs) ≤ c ≤ max(vs)`, a superset
-    that — ANDed with the original disjunction — leaves the result unchanged but gives
-    `zonemap_prune_filter` a range it can use to skip whole row groups (and each
-    equality is still a bloom-index probe). Idempotent: the bounds are added only if
-    not already present. Skipped when the literals aren't mutually comparable.
+
+def _prefix_and_column(expr: Expr) -> tuple[str | None, Expr | None]:
+    """`(prefix, column)` for the two prefix spellings, else `(None, None)`."""
+    if isinstance(expr, StrFunc) and expr.fn == "starts_with" and isinstance(expr.pattern, str):
+        return expr.pattern, expr.input
+    # `substr(col, 1, n) = lit` — only from the first character, and only when the
+    # literal is exactly `n` characters. A shorter literal makes the predicate
+    # unsatisfiable and a longer one makes it constant-false; neither is a prefix test,
+    # and folding them here would hide a user's mistake behind a range.
+    if not (isinstance(expr, Binary) and expr.op == "eq"):
+        return None, None
+    for value, other in ((expr.left, expr.right), (expr.right, expr.left)):
+        if (
+            isinstance(value, StrFunc)
+            and value.fn == "substr"
+            and value.start == 1
+            and isinstance(other, Lit)
+            and isinstance(other.value, str)
+            and value.length == len(other.value)
+        ):
+            return other.value, value.input
+    return None, None
+
+
+def _increment_prefix(prefix: str) -> str | None:
+    """The exclusive upper bound for a literal prefix, or None if it is not safe.
+
+    Shares `_MAX_INCREMENTABLE` with the `LIKE` rule so the two cannot disagree about
+    which prefixes are incrementable.
     """
-    conjuncts = split_conjuncts(node.predicate)
-    existing = [c.to_ir() for c in conjuncts]  # IR dicts are unhashable → list + `in`
-    added: list[Expr] = []
-    for conj in conjuncts:
-        info = _flat_or_equalities(conj)
-        if info is None:
-            continue
-        col_name, values = info
-        try:
-            lo, hi = min(values), max(values)
-        except TypeError:
-            continue  # values not mutually comparable (mixed types)
-        for bound in (Binary("ge", Col(col_name), Lit(lo)), Binary("le", Col(col_name), Lit(hi))):
-            if bound.to_ir() not in existing:
-                added.append(bound)
-                existing.append(bound.to_ir())
-    if not added:
+    if not prefix or ord(prefix[-1]) > _MAX_INCREMENTABLE:
         return None
-    return Filter(node.input, combine_conjuncts([*conjuncts, *added]))
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
+DEFAULT_REGISTRY.add(
+    plan_rule(
+        "prefix_predicates_to_range",
+        Phase.NORMALIZE,
+        lambda plan, _ctx: prefix_predicates_to_range(plan),
+    )
+)
+
+
+# --- len(col) = 0 → col = '' ------------------------------------------------
+
+
+def len_zero_to_empty_string(plan: LogicalPlan) -> LogicalPlan:
+    """Rewrite `len(col) = 0` to `col = ''` (and `len(col) <> 0` to `col <> ''`).
+
+    A length test wraps the column in a function, which makes it opaque to zone-map
+    pruning, bloom probing and source pushdown — every one of which needs a bare `Col` on
+    one side. The equality is the same predicate in a form all three can use.
+
+    Exact: a string has zero characters iff it is the empty string, and both spellings
+    are null-propagating, so a null row is null either way.
+    """
+    return transform_up(plan, lambda node: map_node_expressions(node, _rewrite_len_zero))
+
+
+def _rewrite_len_zero(expr: Expr) -> Expr:
+    if not (isinstance(expr, Binary) and expr.op in ("eq", "ne")):
+        return expr
+    for value, other in ((expr.left, expr.right), (expr.right, expr.left)):
+        if (
+            isinstance(value, StrFunc)
+            and value.fn == "len"
+            and isinstance(other, Lit)
+            # `type(...) is int` because `True` is an `int` subclass and `len(s) = True`
+            # is not this predicate.
+            and type(other.value) is int
+            and other.value == 0
+        ):
+            return Binary(expr.op, value.input, Lit(""))
+    return expr
+
+
+DEFAULT_REGISTRY.add(
+    plan_rule(
+        "len_zero_to_empty_string",
+        Phase.NORMALIZE,
+        lambda plan, _ctx: len_zero_to_empty_string(plan),
+    )
+)

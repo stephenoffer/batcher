@@ -50,6 +50,41 @@ def test_tumbling_window_matches_duckdb(duck, width):
     assert_same(got, rel)
 
 
+@pytest.mark.parametrize("width", ["1h", "30m", "15m"])
+def test_tumbling_window_before_the_epoch_matches_duckdb(duck, width):
+    """Pre-epoch instants need a *floor* division, not a truncating one.
+
+    Bucketing negative microseconds-since-epoch by truncation rounds toward zero, which
+    puts the window start *after* the row it contains. Every other case here is in 2024,
+    so nothing exercised the sign.
+    """
+    mins = [-1, -7, -30, -59, -60, -61, -120, -1440, 0, 5]
+    ts = [_BASE.replace(year=1970) + dt.timedelta(minutes=m) for m in mins]
+    tbl = pa.table(
+        {
+            "ts": pa.array(ts, type=pa.timestamp("us")),
+            "v": pa.array(list(range(1, len(ts) + 1)), pa.int64()),
+        }
+    )
+    got = (
+        bt.from_arrow(tbl)
+        .group_by(w=bt.window(col("ts"), width))
+        .agg(total=col("v").sum(), n=col("v").count())
+        .collect()
+    )
+    duck.register("t", tbl)
+    rel = duck.sql(
+        f"SELECT time_bucket(INTERVAL '{_DUCK_INTERVAL[width]}', ts, TIMESTAMP '1970-01-01') AS w, "
+        "sum(v) AS total, count(v) AS n FROM t GROUP BY w"
+    )
+    assert_same(got, rel)
+    # ...and the start must actually contain its rows, which an order-independent
+    # multiset comparison cannot see.
+    rows = bt.from_arrow(tbl).select(ts=col("ts"), w=bt.window(col("ts"), width)).to_pydict()
+    for row_ts, start in zip(rows["ts"], rows["w"], strict=True):
+        assert start <= row_ts, f"window start {start} is after the row {row_ts} it holds"
+
+
 @pytest.mark.parametrize(("width", "slide"), [("1h", "30m"), ("1h", "20m")])
 def test_sliding_window_matches_duckdb(duck, width, slide):
     tbl = _data()

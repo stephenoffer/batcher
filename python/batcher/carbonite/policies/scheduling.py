@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import available_cpu_count
-from batcher.carbonite.memory.estimator import peak_operator_bytes
+from batcher.carbonite.memory.estimator import learned_plan_peak
 from batcher.plan.resource import SchedulingEnvelope
 
 if TYPE_CHECKING:
@@ -18,6 +18,20 @@ if TYPE_CHECKING:
     from batcher.plan.physical import PhysicalPlan
 
 __all__ = ["DefaultSchedulingPolicy"]
+
+# Absolute ceiling on the worker fan-out this policy will *ask* for.
+#
+# `n_max_parallelism` is Kyber's `rows / target_rows_per_task`, and Kyber stamps an
+# `unknown_rows` placeholder (~1e12) on any operator it could not size — which turns into
+# a request for millions of Ray tasks. `dist.clamp_workers` reduces the figure to live
+# cluster capacity and so hides the consequence on a real cluster, but the number still
+# travels through the envelope: it is logged, it is compared, and it divides the per-task
+# memory grant (`peak // n_tasks`) down to the morsel floor, which is how an un-sized plan
+# ends up asking Ray for a million tasks of one morsel each.
+#
+# 100k is far above any real fan-out (a 10k-core cluster at ten tasks per core) and far
+# below the placeholder, so it can only ever catch the pathological case.
+_MAX_TASK_FANOUT = 100_000
 
 
 class DefaultSchedulingPolicy:
@@ -96,17 +110,19 @@ class DefaultSchedulingPolicy:
             n_tasks = desired
         else:
             n_tasks = cpu_budget
-        n_tasks = max(1, n_tasks)
+        # An explicit user request is honored as given; a *derived* fan-out is held under
+        # the sanity ceiling, because the derivation multiplies through Kyber's
+        # unknown-cardinality placeholder when a plan could not be sized.
+        n_tasks = max(1, n_tasks if requested_workers else min(n_tasks, _MAX_TASK_FANOUT))
 
         # Per-task memory: the dominant breaker split across tasks, never below one
         # morsel and never above a fair share of the live budget. 0 (no hint) when
         # Kyber could not size the plan. Blended toward the measured peak (learned from
         # `m_peak_bytes`) when available, so each distributed worker gets a right-sized
         # grant instead of one sized from the plan guess; cold families pass through.
-        model = ctx.memory_model
-        peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
+        peak = learned_plan_peak(plan, ctx.memory_model)
         # The configured value, not `morsel_rows * row_bytes`. The two agree only at the
-        # defaults (16,384 x 64 == 1 MiB); `ResourceManager.adapted_config` rewrites
+        # defaults (16,384 x 64 == 1 MiB); `ResourceManager.recommended_config` rewrites
         # `morsel_rows` (from the learned per-row width) and `morsel_bytes` (from the
         # pressure factor) *independently*, so after any adaptive resize the derivation
         # drifts from the real morsel — and this value is the per-task memory floor below.
@@ -154,10 +170,18 @@ class DefaultSchedulingPolicy:
         # partition, so its heaviest op sets the core need). A pure scan→filter→write
         # plan asks <1 CPU and packs tighter; any breaker pulls it back to a full core.
         # Falls back to the configured default for an unsized plan (no bounds).
+        #
+        # Floored at `cpu_share_min` for the same reason that floor exists on the learned
+        # path: a plan whose operators all declare `c_cpu_shares = 0` (an annotator that
+        # abstained, a hand-built plan) would otherwise request `num_cpus=0`, which Ray
+        # treats as "needs no CPU" and will pack without limit onto one node — the exact
+        # oversubscription the concurrency limiter exists to prevent, arriving through
+        # the scheduler instead.
         num_cpus = max(
             (op.bounds.c_cpu_shares for op in plan.ops),
             default=cfg.execution.cpus_per_task,
         )
+        num_cpus = max(num_cpus, cfg.execution.cpu_share_min)
 
         # Placement-strategy preference (resolved against the live cluster in `dist`).
         # A small-shuffle breaker prefers PACK — co-locate the workers, no cross-node

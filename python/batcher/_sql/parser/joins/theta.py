@@ -9,6 +9,8 @@ correctness argument, and that module is at its size limit.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher.api.dataset import Dataset
 
 __all__ = ["and_conjuncts", "outer_theta_join", "swap_on_sides"]
@@ -16,8 +18,6 @@ __all__ = ["and_conjuncts", "outer_theta_join", "swap_on_sides"]
 
 def and_conjuncts(node) -> list:
     """Flatten an ``AND`` tree (and parentheses) into its conjunct list."""
-    from sqlglot import expressions as exp
-
     if isinstance(node, exp.And):
         return and_conjuncts(node.this) + and_conjuncts(node.expression)
     if isinstance(node, exp.Paren):
@@ -111,8 +111,6 @@ def swap_on_sides(on):
     Returns:
         The predicate with each column-to-column equality's operands exchanged.
     """
-    from sqlglot import expressions as exp
-
     swapped = []
     for conj in and_conjuncts(on):
         if (

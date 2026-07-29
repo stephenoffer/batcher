@@ -15,6 +15,7 @@ registered via the `@rule` decorator (auto-discovered on import from
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
@@ -152,7 +153,8 @@ def _measured_as_non_reducing(ctx: OptimizerContext, node: Aggregate) -> bool:
         from batcher.kyber.signature import plan_signature
 
         return learned_partial_agg(ctx.hub, plan_signature(node)) is False
-    except Exception:  # pragma: no cover - a learned read must never break planning
+    except Exception as exc:  # pragma: no cover - a learned read must never break planning
+        note_suppressed("kyber", "read measured non-reducing evidence", exc)
         return False
 
 

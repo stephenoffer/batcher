@@ -83,9 +83,9 @@ def _fold(expr: Expr) -> Expr:
         # Fold it here so the bound still collapses to a single date/timestamp `Lit` for
         # zone-map pruning / predicate pushdown / range selectivity (TPC-H date filters).
         # Reuse the temporal rule's folder (naive-only, no month clamping) — one definition.
-        from batcher.kyber.rules.extra.temporal_extra import _fold_date_offset
+        from batcher.kyber.rules.extra.temporal_folds import fold_date_offset
 
-        return _fold_date_offset(expr)
+        return fold_date_offset(expr)
     return expr
 
 

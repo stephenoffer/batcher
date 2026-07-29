@@ -59,19 +59,16 @@ def max_map_workers(plan: LogicalPlan) -> int:
     Sizes the streaming window so a `map_batches` UDF is handed enough batches per
     round to fill its worker pool — the difference between serial and all-cores.
     """
-    import dataclasses
-
     from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import children
 
     best = 1
     if isinstance(plan, MapBatches):
         best = max(best, int(plan.num_workers or 1))
-    for f in dataclasses.fields(plan):
-        v = getattr(plan, f.name)
-        if isinstance(v, LogicalPlan):
-            best = max(best, max_map_workers(v))
-        elif isinstance(v, tuple):
-            best = max((max_map_workers(x) for x in v if isinstance(x, LogicalPlan)), default=best)
+    # Children come from `plan.visitor`, which caches each node class's child-bearing
+    # fields — rather than re-deriving them per node with `dataclasses.fields`.
+    for child in children(plan):
+        best = max(best, max_map_workers(child))
     return best
 
 

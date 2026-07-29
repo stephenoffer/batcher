@@ -17,12 +17,13 @@ avoid an import-time cycle.
 
 from __future__ import annotations
 
+import datetime as _dt
 import itertools
 import math
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float, require_int
 from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import ExprTag
@@ -52,7 +53,23 @@ def _wrap(value: IntoExpr) -> Expr:
     # leaves back out; any that reach `to_ir()` elsewhere raise a clear error there.
     if isinstance(value, (Expr, AggExpr)):
         return value  # type: ignore[return-value]
+    # An unterminated CASE builder is the one non-`Expr` that users hand us on purpose, by
+    # forgetting `.otherwise(...)`. Lifting it to a literal produced `unsupported literal
+    # type: CaseBuilder`, which names an internal class and no remedy. Catch it by name to
+    # avoid importing `nodes` (which imports this module).
+    if type(value).__name__ == "CaseBuilder":
+        raise PlanError(
+            "when(...).then(...) is an unfinished CASE builder, not an expression: it needs "
+            "a terminating .otherwise(...). SQL's bare `CASE WHEN ... END` yields NULL, which "
+            "has no literal spelling here — give .otherwise() an explicit sentinel and turn "
+            "it into a null with bt.nullif(expr, sentinel) if that is what you want."
+        )
     return Lit(value)
+
+
+# `constructors` imports this module, so `col` is resolved on first use rather than at
+# module level — and remembered, instead of re-imported per coerced ordering argument.
+_COL = None
 
 
 def _col_or_expr(value: IntoExpr) -> Expr:
@@ -61,9 +78,14 @@ def _col_or_expr(value: IntoExpr) -> Expr:
     ``_wrap`` would turn ``arg_max(v, "k")`` into an ordering by the constant ``'k'``;
     an ``Expr`` passes through unchanged. Mirrors SQL ``arg_max(v, k)`` / DuckDB.
     """
-    from batcher.plan.expr_ir.constructors import col
+    if isinstance(value, str):
+        global _COL
+        if _COL is None:
+            from batcher.plan.expr_ir.constructors import col
 
-    return col(value) if isinstance(value, str) else _wrap(value)
+            _COL = col
+        return _COL(value)
+    return _wrap(value)
 
 
 def _cut_labels(edges: list[float], left_closed: bool) -> list[str]:
@@ -82,6 +104,41 @@ def _cut_edge(value: float) -> str:
     if value == float("inf"):
         return "inf"
     return str(int(value)) if value.is_integer() else str(value)
+
+
+# Accessor-namespace classes, resolved on first use and remembered. The namespace modules
+# import `Expr` from here, so this module cannot import them at module level — but the
+# deferred `from ... import ...` each accessor carried then ran on *every* `.str` / `.dt` /
+# `.list` / ... access, and a repeat `from X import Y` still costs ~400 ns against ~70 ns
+# for a cached lookup. Resolving once keeps the import cycle broken and takes the import
+# machinery off the accessor path, which is the widest part of the expression API.
+_ACCESSORS: dict[str, type] = {}
+
+# `render` imports this module, so `render_expr` is another name that cannot be imported at
+# module level and was therefore re-imported on every `repr()` — which the aggregate-leaf
+# registry uses as its dedup key, so it is not only a debugging path.
+_RENDER = None
+
+
+def _render():
+    """The `render_expr` function, imported at most once."""
+    global _RENDER
+    if _RENDER is None:
+        from batcher.plan.expr_ir.render import render_expr
+
+        _RENDER = render_expr
+    return _RENDER
+
+
+def _accessor(module: str, name: str) -> type:
+    """The accessor-namespace class `name` from `module`, imported at most once."""
+    cls = _ACCESSORS.get(name)
+    if cls is None:
+        import importlib
+
+        cls = getattr(importlib.import_module(module), name)
+        _ACCESSORS[name] = cls
+    return cls
 
 
 class Expr:
@@ -182,9 +239,7 @@ class Expr:
 
     def __repr__(self) -> str:
         """A source-like rendering of the expression, e.g. ``(col('x') + lit(1))``."""
-        from batcher.plan.expr_ir.render import render_expr
-
-        return render_expr(self)
+        return _render()(self)
 
     # --- arithmetic operators ---------------------------------------------
     def __add__(self, other: IntoExpr) -> Expr:
@@ -904,9 +959,7 @@ class Expr:
                 >>> ds.select(r=bt.col("s").str.upper()).to_pydict()
                 {'r': ['AB', 'CD']}
         """
-        from batcher.plan.expr_ir.namespaces import _StrNamespace
-
-        return _StrNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_StrNamespace")(self)
 
     @property
     def dt(self) -> _DtNamespace:
@@ -927,9 +980,7 @@ class Expr:
                 >>> ds.select(r=bt.col("d").dt.year()).to_pydict()
                 {'r': [2021]}
         """
-        from batcher.plan.expr_ir.namespaces import _DtNamespace
-
-        return _DtNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_DtNamespace")(self)
 
     # --- math functions ----------------------------------------------------
     def abs(self) -> MathExpr:
@@ -947,6 +998,88 @@ class Expr:
                 {'r': [1, 2, 3]}
         """
         return MathExpr("abs", self)
+
+    def chr(self) -> Expr:
+        """The character at this Unicode code point (DuckDB/Spark ``chr``, → Utf8).
+
+        Returns:
+            A new Utf8 expression; null where the value is not a code point.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"n": [65, 233]})
+                >>> ds.select(r=bt.col("n").chr()).to_pydict()
+                {'r': ['A', 'é']}
+        """
+        from batcher.plan.expr_ir.func_nodes import StrFunc
+
+        return StrFunc("chr", self)
+
+    def to_base(self, radix: int) -> Expr:
+        """This integer written in `radix` (DuckDB ``to_base``; ``bin`` is radix 2, → Utf8).
+
+        Args:
+            radix: The base, from 2 to 36.
+
+        Returns:
+            A new Utf8 expression: the digits, with a leading ``-`` when negative.
+
+        Raises:
+            PlanError: If `radix` is outside 2..36.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"n": [15, 255]})
+                >>> ds.select(b=bt.col("n").to_base(2), h=bt.col("n").to_base(16)).to_pydict()
+                {'b': ['1111', '11111111'], 'h': ['f', 'ff']}
+        """
+        from batcher.plan.expr_ir.func_nodes import StrFunc
+
+        if not 2 <= radix <= 36:
+            raise PlanError(f"to_base(): radix must be between 2 and 36, got {radix}")
+        return StrFunc("to_base", self, start=radix)
+
+    def format_bytes(self, *, si: bool = False) -> Expr:
+        """This byte count as human-readable text (DuckDB ``format_bytes``, → Utf8).
+
+        Args:
+            si: Use decimal units (``kB``, ``MB``; powers of 1000) instead of the
+                default binary ones (``KiB``, ``MiB``; powers of 1024).
+
+        Returns:
+            A new Utf8 expression, e.g. ``"1.5 KiB"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"n": [512, 1536]})
+                >>> ds.select(r=bt.col("n").format_bytes()).to_pydict()
+                {'r': ['512 B', '1.5 KiB']}
+        """
+        from batcher.plan.expr_ir.func_nodes import StrFunc
+
+        return StrFunc("format_bytes_si" if si else "format_bytes", self)
+
+    def neg(self) -> Expr:
+        """Arithmetic negation — the Polars ``neg`` spelling of the unary minus.
+
+        Returns:
+            A new expression of the negated values (nulls propagate).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, -2, 3]})
+                >>> ds.select(r=bt.col("x").neg()).to_pydict()
+                {'r': [-1, 2, -3]}
+        """
+        return Lit(0) - self
 
     def round(self, digits: int | None = None) -> Expr:
         """Round half-away-from-zero to the nearest integer, or to `digits` decimal places.
@@ -1481,13 +1614,23 @@ class Expr:
         """The broadcast ``(mean, sample stddev)`` of this column over its window.
 
         The window engine offers `sum`/`avg`/`min`/`max`/`count` but no `stddev`, so the
-        deviation comes from the moments — ``Var = E[x^2] - E[x]^2`` with the Bessel
-        correction ``n / (n - 1)``, exactly as `rolling_var` does over a trailing frame."""
+        deviation is built from window aggregates. It uses the **two-pass** form —
+        ``E[(x - mean)^2]`` against the already-broadcast window mean — rather than
+        ``E[x^2] - E[x]^2``, because the latter subtracts two nearly equal large numbers
+        and loses a digit for every digit by which the mean exceeds the spread. On
+        ``[k+1, ..., k+6]`` it drove `zscore` to `inf` at ``k=1e9`` (the standard deviation
+        cancelled to exactly 0) and to `NaN` at ``k=1e12`` (it cancelled negative, and the
+        square root of a negative is not a number). An epoch-second timestamp is ~1.7e9.
+
+        The mean is a window aggregate broadcast to every row, so ``x - mean`` is an
+        ordinary scalar expression and the second pass costs one more window aggregate over
+        the same partition — which `hoist_windows` shares with the first."""
         keys = list(partition_by)
         n = self.count().over(partition_by=keys).cast("float64")
         mean = self.mean().over(partition_by=keys)
-        mean_sq = (self * self).mean().over(partition_by=keys)
-        std = ((mean_sq - mean * mean) * (n / (n - Lit(1)))).sqrt()
+        deviation = self - mean
+        var_pop = (deviation * deviation).mean().over(partition_by=keys)
+        std = (var_pop * (n / (n - Lit(1)))).sqrt()
         return mean, std
 
     def zscore(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
@@ -2011,11 +2154,24 @@ class Expr:
                 >>> ds.with_columns(v=bt.col("x").expanding_var().round(4)).to_pydict()["v"]
                 [nan, 0.5, 1.0, 1.6667]
         """
+        from batcher.plan.expr_ir.constructors import when
+
         keys, order = list(partition_by), list(order_by)
+        # Centered on the partition mean before the running moments are taken. The identity
+        # `Var(x) = Var(x - k)` makes this exact for any constant `k`, and without it the
+        # `E[x^2] - E[x]^2` difference cancels: on `[k+1, ..., k+6]` the running variance
+        # came back as 0.0 at `k=1e9` and as -161061273 -- a negative variance -- at
+        # `k=1e12`. The partition mean is the constant nearest the data that a window
+        # expression can name; see `_rolling_var`, which carries the same correction.
+        centre = AggExpr("avg", self).over(partition_by=keys)
+        centered = self - centre
         n = self.cum_count(partition_by=keys, order_by=order).cast("float64")
-        mean = self.cum_sum(partition_by=keys, order_by=order) / n
-        mean_sq = (self * self).cum_sum(partition_by=keys, order_by=order) / n
-        var_pop = mean_sq - mean * mean
+        mean = centered.cum_sum(partition_by=keys, order_by=order) / n
+        mean_sq = (centered * centered).cum_sum(partition_by=keys, order_by=order) / n
+        raw = mean_sq - mean * mean
+        # Clamped through a comparison rather than a max(), so a NaN from a non-finite
+        # value still propagates instead of being reported as a confident zero variance.
+        var_pop = when(raw < Lit(0.0)).then(Lit(0.0)).otherwise(raw)
         if ddof == 0:
             return var_pop
         return var_pop * (n / (n - Lit(ddof)))
@@ -2071,8 +2227,8 @@ class Expr:
                 >>> ds.select(b=bt.col("k").hash_bucket(4)).to_pydict()
                 {'b': [1, 3, 3, 1]}
         """
-        if buckets < 1:
-            raise PlanError(f"hash_bucket(): buckets must be >= 1, got {buckets}")
+        buckets = require_int(buckets, func="hash_bucket", arg="buckets", minimum=1)
+        seed = require_int(seed, func="hash_bucket", arg="seed")
         return self.hash(seed=seed).abs() % Lit(buckets)
 
     def pct_of_total(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
@@ -2468,6 +2624,119 @@ class Expr:
         """
         return MathExpr("cot", self)
 
+    def sec(self) -> MathExpr:
+        """Secant (``1 / cos``) of an angle in radians (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the secants.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0]})
+                >>> ds.select(r=bt.col("x").sec()).to_pydict()
+                {'r': [1.0]}
+        """
+        return MathExpr("sec", self)
+
+    def csc(self) -> MathExpr:
+        """Cosecant (``1 / sin``) of an angle in radians (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the cosecants.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import math
+                >>> ds = bt.from_pydict({"x": [math.pi / 2]})
+                >>> ds.select(r=bt.col("x").csc()).to_pydict()
+                {'r': [1.0]}
+        """
+        return MathExpr("csc", self)
+
+    def rint(self) -> MathExpr:
+        """Round half to **even** — IEEE-754 ``roundTiesToEven`` (→ Float64).
+
+        The tie rule is the difference from :meth:`round`, which rounds half *away from
+        zero* here and in DuckDB: ``rint(2.5)`` is ``2.0`` where ``round(2.5)`` is
+        ``3.0``. Ties-to-even is what floating-point arithmetic itself uses, so summing
+        rounded values does not drift upward the way half-up rounding does.
+
+        Returns:
+            A new Float64 expression of the rounded values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.5, 1.5, 2.5, 3.5, -2.5]})
+                >>> ds.select(r=bt.col("x").rint()).to_pydict()
+                {'r': [0.0, 2.0, 2.0, 4.0, -2.0]}
+        """
+        return MathExpr("rint", self)
+
+    def even(self) -> MathExpr:
+        """Round away from zero to the nearest even integer (DuckDB ``even``; → Float64).
+
+        The rounding direction is *outward*, not to-nearest: ``3.0`` becomes ``4.0`` and
+        ``-2.1`` becomes ``-4.0``. A value that is already an even integer is unchanged.
+
+        Returns:
+            A new Float64 expression of the rounded values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [2.1, -2.1, 2.0, 3.0]})
+                >>> ds.select(r=bt.col("x").even()).to_pydict()
+                {'r': [4.0, -4.0, 2.0, 4.0]}
+        """
+        return MathExpr("even", self)
+
+    def gamma(self) -> MathExpr:
+        """The gamma function ``Γ(x)`` (DuckDB ``gamma``; → Float64).
+
+        The continuous extension of the factorial: ``Γ(n) == (n - 1)!`` for a positive
+        integer. Use :meth:`lgamma` instead above ~171, where ``Γ`` overflows to infinity.
+
+        Returns:
+            A new Float64 expression of the gamma values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5.0, 1.0]})
+                >>> ds.select(r=bt.col("x").gamma()).to_pydict()
+                {'r': [24.0, 1.0]}
+        """
+        return MathExpr("gamma", self)
+
+    def lgamma(self) -> MathExpr:
+        """The natural log of ``|Γ(x)|`` (DuckDB ``lgamma``; → Float64).
+
+        Computed directly rather than as ``gamma().ln()``, which overflows to infinity
+        above ~171 and loses the answer entirely. This is the form log-likelihoods and
+        combinatorial ratios are written in.
+
+        Returns:
+            A new Float64 expression of the log-gamma values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5.0]})
+                >>> r = ds.select(r=bt.col("x").lgamma()).to_pydict()
+                >>> round(r["r"][0], 6)
+                3.178054
+        """
+        return MathExpr("lgamma", self)
+
     def factorial(self) -> MathExpr:
         """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``; → Float64).
 
@@ -2480,7 +2749,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [5]})
                 >>> ds.select(f=bt.col("x").factorial()).to_pydict()
-                {'f': [120.0]}
+                {'f': [120]}
         """
         return MathExpr("factorial", self)
 
@@ -2496,7 +2765,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [7]})
                 >>> ds.select(r=bt.col("x").bit_count()).to_pydict()
-                {'r': [3.0]}
+                {'r': [3]}
         """
         return MathExpr("bit_count", self)
 
@@ -2518,9 +2787,7 @@ class Expr:
                 >>> ds.select(r=bt.col("a").list.len()).to_pydict()
                 {'r': [2, 1]}
         """
-        from batcher.plan.expr_ir.namespaces import _ListNamespace
-
-        return _ListNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_ListNamespace")(self)
 
     @property
     def struct(self) -> _StructNamespace:
@@ -2539,9 +2806,7 @@ class Expr:
                 >>> ds.select(r=bt.col("s").struct.field("a")).to_pydict()
                 {'r': [1, 2]}
         """
-        from batcher.plan.expr_ir.namespaces import _StructNamespace
-
-        return _StructNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_StructNamespace")(self)
 
     @property
     def map(self) -> _MapNamespace:
@@ -2560,9 +2825,7 @@ class Expr:
                 >>> bt.col("m").map.get("k").to_ir()["e"]
                 'map'
         """
-        from batcher.plan.expr_ir.namespaces import _MapNamespace
-
-        return _MapNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_MapNamespace")(self)
 
     @property
     def json(self) -> _JsonNamespace:
@@ -2582,9 +2845,7 @@ class Expr:
                 >>> ds.select(r=bt.col("j").json.extract_string("$.a")).to_pydict()
                 {'r': ['x']}
         """
-        from batcher.plan.expr_ir.namespaces import _JsonNamespace
-
-        return _JsonNamespace(self)
+        return _accessor("batcher.plan.expr_ir.namespaces", "_JsonNamespace")(self)
 
     @property
     def image(self) -> _ImageNamespace:
@@ -2604,9 +2865,7 @@ class Expr:
                 >>> isinstance(bt.col("img").image.decode(), Expr)
                 True
         """
-        from batcher.plan.expr_ir.image import _ImageNamespace
-
-        return _ImageNamespace(self)
+        return _accessor("batcher.plan.expr_ir.image", "_ImageNamespace")(self)
 
     @property
     def audio(self) -> _AudioNamespace:
@@ -2625,9 +2884,7 @@ class Expr:
                 >>> bt.col("a").audio.decode().to_ir()["e"]
                 'audio'
         """
-        from batcher.plan.expr_ir.audio import _AudioNamespace
-
-        return _AudioNamespace(self)
+        return _accessor("batcher.plan.expr_ir.audio", "_AudioNamespace")(self)
 
     @property
     def video(self) -> _VideoNamespace:
@@ -2646,9 +2903,7 @@ class Expr:
                 >>> bt.col("v").video.decode().to_ir()["e"]
                 'video'
         """
-        from batcher.plan.expr_ir.video import _VideoNamespace
-
-        return _VideoNamespace(self)
+        return _accessor("batcher.plan.expr_ir.video", "_VideoNamespace")(self)
 
     def hash(self, seed: int = 0) -> Expr:
         """A deterministic 64-bit hash of this expression's value, per row → Int64.
@@ -2958,6 +3213,154 @@ class Expr:
         """
         return AggExpr("kurtosis", self)
 
+    def kurtosis_pop(self) -> AggExpr:
+        """Population excess kurtosis per group (→ Float64).
+
+        The uncorrected ``m4/m2² - 3``, where :meth:`kurtosis` applies the sample
+        correction. DuckDB has both, and on a small group they differ by a lot, so
+        pick the one your statistics call for rather than treating them as rounding.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
+                >>> ds.group_by("g").agg(r=bt.col("x").kurtosis_pop()).to_pydict()
+                {'g': ['a'], 'r': [0.5049148147577234]}
+        """
+        return AggExpr("kurtosis_pop", self)
+
+    def entropy(self) -> AggExpr:
+        """Base-2 Shannon entropy of a group's value distribution (→ Float64).
+
+        ``-Σ pᵢ·log₂(pᵢ)`` over the distinct values' frequencies: 0 when a group holds
+        one distinct value, ``log₂(n)`` when all n are distinct. The measure to reach
+        for when the question is how *concentrated* a column is, rather than how large.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 1, 2, 2]})
+                >>> ds.group_by("g").agg(r=bt.col("x").entropy()).to_pydict()
+                {'g': ['a'], 'r': [1.0]}
+        """
+        return AggExpr("entropy", self)
+
+    def mad(self) -> AggExpr:
+        """Median absolute deviation per group (→ Float64).
+
+        ``median(|x - median(x)|)`` — a spread measure that, unlike the standard
+        deviation, a single extreme value cannot move.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 100]})
+                >>> ds.group_by("g").agg(r=bt.col("x").mad()).to_pydict()
+                {'g': ['a'], 'r': [1.0]}
+        """
+        return AggExpr("mad", self)
+
+    def quantile_disc(self, q: float) -> AggExpr:
+        """Discrete quantile `q ∈ [0, 1]` — a value that is actually present (→ Float64).
+
+        Where :meth:`quantile` interpolates between the two bracketing values, this
+        returns the element at rank ``ceil(q·n) - 1``. That matters for an ordinal
+        column, where the interpolated value may not be a legal value at all.
+
+        Args:
+            q: The quantile in ``[0, 1]``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 2, 3, 4]})
+                >>> ds.group_by("g").agg(r=bt.col("x").quantile_disc(0.5)).to_pydict()
+                {'g': ['a'], 'r': [2.0]}
+        """
+        return AggExpr("quantile_disc", self, param=q)
+
+    def top_k(self, k: int) -> AggExpr:
+        """The `k` most frequent values per group, most frequent first (→ List).
+
+        DuckDB's ``approx_top_k``, computed **exactly**: the aggregate already holds
+        every value of the group, so a sketch could only lose accuracy. Ties break to
+        the smaller value, so the result does not depend on partition order.
+
+        Args:
+            k: How many values to return.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 6, "x": [1, 2, 2, 3, 3, 3]})
+                >>> ds.group_by("g").agg(r=bt.col("x").top_k(2)).to_pydict()
+                {'g': ['a'], 'r': [[3, 2]]}
+        """
+        return AggExpr("approx_top_k", self, param=float(k))
+
+    def kahan_sum(self) -> AggExpr:
+        """Compensated sum of a group's values (DuckDB ``fsum``/``kahan_sum``, → Float64).
+
+        A plain float sum loses the low bits of every addend far smaller than the running
+        total, so a long column of small values added to a large one drifts. This one
+        carries that lost part along and adds it back, which is exact where it matters and
+        never worse than :meth:`sum`. Mergeable, so a distributed run agrees.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1e16, 1.0, 1.0, -1e16]})
+                >>> ds.select(exact=bt.col("x").kahan_sum(), naive=bt.col("x").sum()).to_pydict()
+                {'exact': [2.0], 'naive': [0.0]}
+        """
+        return AggExpr("kahan_sum", self)
+
+    def any_value(self) -> AggExpr:
+        """One value from each group, unspecified which (→ the input type).
+
+        DuckDB's ``any_value``/``arbitrary``, for the common case of carrying a column
+        that is constant within the group through a ``group_by`` without naming a
+        reduction for it. The engine resolves "unspecified" to the group's **minimum**,
+        because a mergeable aggregate has to combine commutatively — so the answer is
+        the same on one node as on a hundred, which "the first row" would not be.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a"], "dept": ["eng", "eng"]})
+                >>> ds.group_by("g").agg(r=bt.col("dept").any_value()).to_pydict()
+                {'g': ['a'], 'r': ['eng']}
+        """
+        return AggExpr("any_value", self)
+
     def median(self) -> AggExpr:
         """Exact median per group — the 0.5 quantile (→ Float64).
 
@@ -3003,9 +3406,10 @@ class Expr:
         """
         from batcher._internal.errors import PlanError
 
+        q = require_float(q, func="quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"quantile q must be in [0, 1], got {q}")
-        return AggExpr("quantile", self, param=float(q))
+        return AggExpr("quantile", self, param=q)
 
     def count(self) -> AggExpr:
         """Number of non-null values per group (SQL ``COUNT(expr)``; nulls are skipped).
@@ -3095,9 +3499,10 @@ class Expr:
                 >>> r.with_columns(q=bt.col("q").round()).to_pydict()
                 {'g': ['a', 'b'], 'q': [10.0, 20.0]}
         """
+        q = require_float(q, func="approx_quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"approx_quantile(q) requires q in [0, 1], got {q}")
-        return AggExpr("approx_quantile", self, param=float(q))
+        return AggExpr("approx_quantile", self, param=q)
 
     def approx_median(self) -> AggExpr:
         """Approximate median (the 0.5 quantile) via a KLL sketch — see :meth:`approx_quantile`.
@@ -3583,8 +3988,9 @@ class Expr:
         of existing nodes, so rolling adds no IR."""
         from batcher.plan.expr_ir.constructors import nullif, when
 
-        if window_size < 1:
-            raise PlanError(f"rolling_{agg}(): window_size must be >= 1, got {window_size}")
+        window_size = require_int(window_size, func=f"rolling_{agg}", arg="window_size", minimum=1)
+        if min_periods is not None:
+            min_periods = require_int(min_periods, func=f"rolling_{agg}", arg="min_periods")
         if min_periods is not None and not 1 <= min_periods <= window_size:
             raise PlanError(
                 f"rolling_{agg}(): min_periods must be in [1, {window_size}], got {min_periods}"
@@ -3773,13 +4179,46 @@ class Expr:
         """Sample/population variance over the trailing frame, composed from moments.
 
         ``Var = E[x^2] - E[x]^2`` gives the population variance over the frame; the
-        Bessel correction ``n / (n - ddof)`` lifts it to the sample statistic. All three
+        Bessel correction ``n / (n - ddof)`` lifts it to the sample statistic. All the
         terms reuse the tested `_rolling` machinery over the *same* frame, so rolling
         variance adds no new IR and inherits the leading-partial-frame / `min_periods`
-        semantics of :meth:`rolling_sum`."""
-        mean = self._rolling("avg", window_size, min_periods, partition_by, order_by)
-        mean_sq = (self * self)._rolling("avg", window_size, min_periods, partition_by, order_by)
-        var_pop = mean_sq - mean * mean
+        semantics of :meth:`rolling_sum`.
+
+        The values are **centered on the partition mean first**, which the identity
+        ``Var(x) = Var(x - k)`` makes exact for any constant `k`. Without it this is the
+        sum-of-powers formula that `bc-runtime`'s `var_state` was rewritten to escape: it
+        subtracts two nearly equal large numbers, so it loses a digit of precision for
+        every digit by which the mean exceeds the spread. Measured on
+        ``[k+1, k+2, ..., k+6]`` with a 3-wide frame, where the true variance is 1.0:
+
+        ==============  ==================================
+        offset ``k``    ``E[x^2] - E[x]^2`` returned
+        ==============  ==================================
+        ``0``           1.0
+        ``1e6``         0.999939
+        ``1e9``         0.0        (reads as "constant")
+        ``1e12``        -201326592 (a negative variance)
+        ==============  ==================================
+
+        An epoch-second timestamp is ~1.7e9 and a monetary column in cents reaches 1e12,
+        so this is the ordinary case rather than an adversarial one. Centering removes the
+        offset before it can cancel; the partition mean is used because it is the constant
+        nearest the data that a window expression can name.
+
+        The residual is clamped at zero for the rounding that can still put a
+        mathematically non-negative quantity a few ulps below it — via a comparison, so a
+        genuine NaN (a non-finite value in the frame) propagates instead of being clipped
+        to a confident zero."""
+        from batcher.plan.expr_ir.constructors import when
+
+        centre = AggExpr("avg", self).over(partition_by=partition_by)
+        centered = self - centre
+        mean = centered._rolling("avg", window_size, min_periods, partition_by, order_by)
+        mean_sq = (centered * centered)._rolling(
+            "avg", window_size, min_periods, partition_by, order_by
+        )
+        raw = mean_sq - mean * mean
+        var_pop = when(raw < Lit(0.0)).then(Lit(0.0)).otherwise(raw)
         if ddof == 0:
             return var_pop
         count = self._rolling("count", window_size, min_periods, partition_by, order_by).cast(
@@ -4113,20 +4552,38 @@ from batcher.plan.expr_ir.node_base import (  # noqa: E402
 class Lit(Expr):
     """A constant literal. The wire kind is inferred from the Python type."""
 
-    __slots__ = ("value",)
+    # `_ir_cache` mirrors the memo `IRNode` keeps in its instance `__dict__`. `Lit` is
+    # `__slots__`-based (there are more literals in a plan than any other node kind, and
+    # a per-instance dict on each is real memory), so it needs the slot declared to get
+    # the same one-lowering-per-node behavior every other node already has.
+    __slots__ = ("_ir_cache", "value")
 
     def __init__(self, value: int | float | bool | str) -> None:
         """Wrap a Python scalar (or date/datetime) as a literal expression node."""
         self.value = value
+        self._ir_cache: dict[str, Any] | None = None
 
     def to_ir(self) -> dict[str, Any]:
         """Lower this literal to its JSON IR dict (the Rust wire contract)."""
-        import datetime as _dt
-
+        cached = self._ir_cache
+        if cached is not None:
+            return cached
         v = self.value
-        # bool must be checked before int (bool is a subclass of int); likewise
-        # datetime before date (datetime subclasses date).
-        if isinstance(v, bool):
+        kind = type(v)
+        # Exact-type dispatch for the four scalar kinds that make up almost every literal
+        # in a plan, before the `isinstance` ladder the subclass relationships require
+        # (bool before int, datetime before date). A subclass of one of these — a
+        # `numpy.bool_`, an `IntEnum` — still falls through to the ladder below and is
+        # tagged exactly as it was.
+        if kind is int:
+            tagged: dict[str, Any] = {"int": v}
+        elif kind is str:
+            tagged = {"str": v}
+        elif kind is bool:
+            tagged = {"bool": v}
+        elif kind is float and -math.inf < v < math.inf:
+            tagged = {"float": v}  # finite: the numeric wire form
+        elif isinstance(v, bool):
             tagged = {"bool": v}
         elif isinstance(v, int):
             tagged = {"int": v}
@@ -4139,9 +4596,9 @@ class Lit(Expr):
             # numeric (unchanged wire, fast path).
             if v != v:
                 tagged = {"float": "NaN"}
-            elif v == float("inf"):
+            elif v == math.inf:
                 tagged = {"float": "inf"}
-            elif v == float("-inf"):
+            elif v == -math.inf:
                 tagged = {"float": "-inf"}
             else:
                 tagged = {"float": v}
@@ -4166,7 +4623,9 @@ class Lit(Expr):
             tagged = {"date": (v - _dt.date(1970, 1, 1)).days}
         else:  # pragma: no cover - guarded by typing
             raise TypeError(f"unsupported literal type: {type(v).__name__}")
-        return {"e": ExprTag.LIT, "value": tagged}
+        out = {"e": ExprTag.LIT, "value": tagged}
+        self._ir_cache = out
+        return out
 
 
 @expr_node
@@ -4511,6 +4970,70 @@ class AggExpr:
     def __abs__(self) -> Expr:
         """Absolute value ``abs(agg)``."""
         return Expr.__abs__(self)
+
+    # --- comparison and boolean composition over aggregates ---------------
+    # These forward to `Expr` for the same reason the arithmetic ones do, and their
+    # absence was not merely a missing feature. Without `__eq__`, Python fell back to
+    # identity comparison, so ``col("x").sum() == 6`` evaluated to the *bool* `False`
+    # rather than building a predicate — and `with_columns` then wrote that constant
+    # into a column, silently reporting `False` for a sum that really was 6. Every
+    # comparison is defined here so no such fallback remains.
+
+    def __eq__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Equality predicate over this aggregate (``agg == other``)."""
+        return Expr.__eq__(self, other)
+
+    def __ne__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Inequality predicate over this aggregate (``agg != other``)."""
+        return Expr.__ne__(self, other)
+
+    def __lt__(self, other: IntoExpr) -> Expr:
+        """Less-than predicate over this aggregate (``agg < other``)."""
+        return Expr.__lt__(self, other)
+
+    def __le__(self, other: IntoExpr) -> Expr:
+        """Less-or-equal predicate over this aggregate (``agg <= other``)."""
+        return Expr.__le__(self, other)
+
+    def __gt__(self, other: IntoExpr) -> Expr:
+        """Greater-than predicate over this aggregate (``agg > other``)."""
+        return Expr.__gt__(self, other)
+
+    def __ge__(self, other: IntoExpr) -> Expr:
+        """Greater-or-equal predicate over this aggregate (``agg >= other``)."""
+        return Expr.__ge__(self, other)
+
+    def __and__(self, other: IntoExpr) -> Expr:
+        """Boolean conjunction over aggregate predicates (``agg & other``)."""
+        return Expr.__and__(self, other)
+
+    def __rand__(self, other: IntoExpr) -> Expr:
+        """Reflected conjunction so ``other & agg`` works."""
+        return Expr.__rand__(self, other)
+
+    def __or__(self, other: IntoExpr) -> Expr:
+        """Boolean disjunction over aggregate predicates (``agg | other``)."""
+        return Expr.__or__(self, other)
+
+    def __ror__(self, other: IntoExpr) -> Expr:
+        """Reflected disjunction so ``other | agg`` works."""
+        return Expr.__ror__(self, other)
+
+    def __invert__(self) -> Expr:
+        """Boolean negation of an aggregate predicate (``~agg``)."""
+        return Expr.__invert__(self)
+
+    def __hash__(self) -> NoReturn:
+        """Refuse hashing, exactly as `Expr` does — ``==`` now builds a predicate.
+
+        Defining `__eq__` above would otherwise leave `AggExpr` with an inherited
+        `__hash__` whose contract it no longer honors, so a set or dict keyed on
+        aggregates would compare with a predicate and misbehave silently.
+
+        Raises:
+            TypeError: Always — naming the two workable keys.
+        """
+        return Expr.__hash__(self)
 
 
 # Expose `Expr`'s unary/parametric math methods on `AggExpr` so an aggregate result can

@@ -25,7 +25,19 @@ Predicates, null handling, sampling.
 :::{grid-item-card} {octicon}`code;1.1em` Expressions
 :link: expressions
 :link-type: doc
-The composable column language and its accessors.
+The composable column language: operators, conditionals, nulls, math.
+:::
+
+:::{grid-item-card} {octicon}`list-unordered;1.1em` Expression accessors
+:link: expression-accessors
+:link-type: doc
+`.str`, `.dt`, `.list`, `.struct`, and `.json`.
+:::
+
+:::{grid-item-card} {octicon}`beaker;1.1em` Expression recipes
+:link: expression-recipes
+:link-type: doc
+Porting, feature engineering, and text-corpus curation.
 :::
 
 :::{grid-item-card} {octicon}`sort-desc;1.1em` Sorting
@@ -165,6 +177,18 @@ Expectations, and the fail/drop/quarantine choice.
 :link-type: doc
 Column masks, row-level security, lineage, audit.
 :::
+
+:::{grid-item-card} {octicon}`key;1.1em` Secrets and keys
+:link: secrets
+:link-type: doc
+Encryption keys and connector credentials, passed by reference.
+:::
+
+:::{grid-item-card} {octicon}`lock;1.1em` Hardening a deployment
+:link: hardening
+:link-type: doc
+The settings to change before production, and the boundaries Batcher does not enforce.
+:::
 ::::
 
 ## Operate
@@ -223,6 +247,8 @@ Diagnose and fix common issues.
 transformations
 filtering
 expressions
+expression-accessors
+expression-recipes
 sorting
 distinct-and-dedup
 sampling
@@ -260,6 +286,8 @@ streaming
 
 data-quality
 governance
+secrets
+hardening
 ```
 
 ```{toctree}

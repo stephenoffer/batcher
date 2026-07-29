@@ -109,8 +109,8 @@ triaged = tickets.ml.classify(
 ::::
 
 Warm pools matter most on the local path: the model loads once per session and is reused
-across calls, which is the single biggest contributor to Batcher's 11× over Ray Data on LLM
-batch inference.
+across calls, which is what keeps gpt2 batch generation at 814.8 prompt/s on 8xT4 rather than
+paying a 7-second load on every execution.
 
 ## Typed columns, not JSON blobs
 
@@ -264,8 +264,8 @@ summaries = tickets.ml.generate(
 - [RAG index](rag-index.md): generation over retrieved context.
 - [ML API reference](../../api/ml.md): `classify`, `extract`, `generate`, `vllm_engine`,
   `http_engine`, `json_schema`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the 11.1× on LLM batch inference,
-  and the case where it is parity.
+- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the LLM batch-inference
+  throughput, and the hardware ceiling behind it.
 - [HuggingFace integration](../../integrations/huggingface.md): model ids, tokenizers, and
   datasets.
 - [GPU execution](../../deep-dives/gpu-execution.md): why the pool is warm and the stages

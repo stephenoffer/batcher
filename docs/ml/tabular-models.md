@@ -157,7 +157,7 @@ When the groups *are* the labels, `batcher.ml.cluster.NearestCentroid` is the su
 
 Each framework is an optional extra: `pip install 'batcher-engine[xgboost]'`, `[lightgbm]`, `[catboost]`, `[onnx]`, or `[sklearn]`. `[tabular]` installs all of them.
 
-Feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with `OrdinalEncoder`, `TargetEncoder`, or one of the cardinality-tolerant encoders on {doc}`preprocessors`. A string column raises an error naming the column rather than failing deep inside the model.
+Feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with `OrdinalEncoder`, `TargetEncoder`, or one of the cardinality-tolerant encoders on {doc}`preprocessors/index`. A string column raises an error naming the column rather than failing deep inside the model.
 
 The feature-name guard only fires where the model recorded its training feature names. A booster fitted from a bare NumPy matrix records generic `f0…fN`, which match no real column, so nothing can be checked. Fit from a DataFrame, or keep the feature list beside the model.
 
@@ -166,6 +166,6 @@ Under `distributed=True` a preempted worker's partition is recomputed, so scorin
 ## See also
 
 - {doc}`evaluation` — score the predictions you just produced, per segment, in one pass.
-- {doc}`preprocessors` — the fit/transform steps that produce the feature columns.
+- {doc}`preprocessors/index` — the fit/transform steps that produce the feature columns.
 - {doc}`statistics-and-drift` — check that today's features still look like the training ones.
 - {doc}`inference` — the deep-learning and HuggingFace path.

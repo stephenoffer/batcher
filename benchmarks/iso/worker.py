@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
 import pyarrow as pa
 import pyarrow.feather as feather
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from signature import result_signature
 
 
 def _load(scale: int, names: list[str]) -> dict[str, pa.Table]:
@@ -33,32 +37,6 @@ _TPCH_TABLES = (
 )
 
 
-def _signature(tbl: pa.Table) -> list:
-    """A small order-independent fingerprint of a result for cross-engine equality."""
-    import math
-    from decimal import Decimal
-
-    cols = sorted(tbl.column_names)
-    tbl = tbl.select(cols)
-    n = tbl.num_rows
-    pd = tbl.to_pydict()
-    rows = []
-    for i in range(n):
-        r = []
-        for c in cols:
-            v = pd[c][i]
-            if isinstance(v, Decimal):
-                v = float(v)
-            if hasattr(v, "isoformat"):
-                v = v.isoformat()
-            if isinstance(v, float):
-                v = "nan" if math.isnan(v) else round(v, 4)
-            r.append(v)
-        rows.append(tuple(r))
-    rows.sort(key=lambda r: tuple(repr(x) for x in r))
-    return [n, rows[:5], rows[-5:] if n > 5 else []]
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--engine", required=True)
@@ -75,7 +53,7 @@ def main() -> None:
         res = runner(args.sql)
         tbl = res if isinstance(res, pa.Table) else pa.table(res)
         out["rows"] = tbl.num_rows
-        out["sig"] = _signature(tbl)
+        out["sig"] = result_signature(tbl)
         runner(args.sql)  # warm up
         best = float("inf")
         for _ in range(args.runs):

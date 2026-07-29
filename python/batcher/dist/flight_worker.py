@@ -189,6 +189,7 @@ try:
             preemption: bool = False,
             tls_config: ShuffleTlsConfig | None = None,
             port_range: tuple[int, int] | None = None,
+            credit_ceiling: int = 0,
         ) -> None:
             nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
@@ -212,8 +213,21 @@ try:
             # a dead peer is detected, and set keepalive to catch a dropped connection
             # promptly. A long GC pause under a generous idle window is not misread as
             # death. 0 keeps the process default.
+            # The cap on this worker's *published* shuffle output — the one large
+            # footprint Carbonite's buffer pool cannot see, since a bucket is held for a
+            # reducer rather than reserved by anyone. Above it the store spills its
+            # largest buckets to local disk and reads them back on fetch, which is
+            # result-preserving. Set before the server is created: each store captures the
+            # cap at construction so its bound cannot shift mid-query.
+            from batcher.carbonite.policies import shuffle_store_cap
+            from batcher.config import active_config
+
             nat.set_flight_transport_config(
-                idle_timeout_ms, keepalive_ms, connections_per_peer, compression
+                idle_timeout_ms,
+                keepalive_ms,
+                connections_per_peer,
+                compression,
+                shuffle_store_cap(active_config()),
             )
 
             # Shuffle TLS (off unless the operator mounted certs and enabled it). Read
@@ -268,7 +282,18 @@ try:
                     # adaptive credits `_window()` reads the controller, never the session's
                     # static `credits`, so a bare controller silently discarded all of it and
                     # every channel re-climbed from `default_credits` (4) on every query.
-                    flow_control=AIMDFlowControl(initial_window=credits),
+                    # The ceiling comes from the driver, not from this process. A Ray
+                    # actor sees neither the driver's `config_context` nor the metadata hub
+                    # the learned row width is fit from, so every input `credit_ceiling`
+                    # needs is wrong or missing here — and AIMD *grows toward* its ceiling,
+                    # so re-deriving a wrong one is not an approximation, it is the window
+                    # the controller settles at and the memory it buffers there. A
+                    # wide-row shuffle (embeddings, blobs) was the case that mattered: its
+                    # learned per-batch width is what holds the window under
+                    # `credit_byte_budget`, and it is invisible from inside the worker.
+                    flow_control=AIMDFlowControl(
+                        initial_window=credits, ceiling=credit_ceiling or None
+                    ),
                     pressure=PressureMonitor(),
                     advertise_host=advertise_host,
                     token=shuffle_token,
@@ -337,6 +362,39 @@ try:
 
             return ray.get_runtime_context().get_node_id()
 
+        def clear_plan(self, plan_id: int) -> None:
+            """Evict every bucket this worker published for `plan_id`.
+
+            The shuffle store is append-only until something evicts it, and until this was
+            wired the *batch* path evicted nothing: `ShuffleSession.clear_plan` existed and
+            was bound all the way through to Rust, with exactly one caller — a test. So a
+            session-scoped fleet (`reuse_session_fleet`, on by default) accumulated every
+            bucket of every stage of every query it ever served, until the node ran out of
+            memory. Only the streaming pipeline released anything.
+            """
+            self.session.clear_plan(plan_id)
+
+        def release_ticket(self, ticket: str) -> None:
+            """Evict one published bucket, once the stage that reads it has finished.
+
+            The finer-grained half of `clear_plan`: an adaptive query's stage `k` holds its
+            buckets resident through stages `k+1..n` otherwise, which is the leak that
+            exhausts memory *inside a single query* rather than across a session.
+            """
+            from batcher.carbonite.transfer.server import ShuffleTicket
+
+            parts = [int(p) for p in str(ticket).split("/")]
+            self.session.release(ShuffleTicket(*parts))
+
+        def partition_count(self) -> int:
+            """How many buckets this worker still holds.
+
+            The leak oracle, and the reason this is a permanent method rather than a test
+            helper: a bucket leak has no symptom until the node dies, so the only way to
+            test for it is to ask a live worker what it is still holding.
+            """
+            return self.session.partition_count
+
         def map_publish(
             self, map_ir, gk, aj, partition, n_keys, n_reducers, src=None, epoch=0, plan_id=None
         ) -> str:
@@ -372,6 +430,11 @@ try:
             for r in range(n_reducers):
                 bucket = buckets[r] if r < len(buckets) else []
                 self.session.publish(_ticket(0, src, r, epoch), bucket)
+                # `nbytes`, deliberately, where the memory guards nearby use
+                # `plan.types.retained_bytes`: this figure predicts what a reducer will
+                # *pull over the wire*, and Arrow IPC writes only the rows a batch
+                # addresses. A window's pinned parent costs this worker memory (which the
+                # store's own cap governs) but costs the transfer nothing.
                 self._bucket_bytes[r] = sum(b.nbytes for b in bucket)
             return self.session.addr
 
@@ -531,15 +594,30 @@ try:
             )
             if not rows:
                 buckets = []
+            elif n_buckets == 1:
+                buckets = [rows]
             else:
                 key_idx = [rows[0].schema.get_field_index(k) for k in key_names]
-                buckets = (
-                    [rows] if n_buckets == 1 else nat.partition_batches(rows, key_idx, n_buckets)
-                )
+                buckets = nat.partition_batches(rows, key_idx, n_buckets)
+                # `partition_batches` gathers each row into a *new* buffer — the buckets do
+                # not alias the input — so from here `rows` is a second, complete copy of
+                # this mapper's output with no remaining reader. Holding it across the
+                # publish loop doubled the map side's peak footprint, and this is the path
+                # the memory envelope does not cover: `memory_budget_bytes` bounds
+                # allocations inside `execute_plan`, not what the worker keeps afterwards
+                # or what the Flight store holds until a reducer fetches it. That gap is
+                # what OOM-kills a shuffle worker (BENCHMARK_RESULTS.md, sf10 q5).
+                del rows
             for r in range(n_buckets):
                 self.session.publish(
                     _ticket(stage, src, r, epoch), buckets[r] if r < len(buckets) else []
                 )
+                # `publish` is synchronous and moves the batches into the store's own
+                # `Vec<RecordBatch>`, so the mapper's reference is redundant the moment it
+                # returns. Dropping it here means the peak is one bucket past what the
+                # store already holds, instead of every bucket until the last is sent.
+                if r < len(buckets):
+                    buckets[r] = []
             return self.session.addr
 
         def map_publish_join(self, left, right, n_buckets, src=None, epoch=0, plan_id=None) -> str:
@@ -995,6 +1073,16 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     port_range = _shuffle_port_range(os.environ.get("BATCHER_SHUFFLE_PORT_RANGE")) or (
         tuple(dc.shuffle_port_range) if dc.shuffle_port_range else None
     )
+    # The AIMD ceiling, computed once here where the driver's config and the metadata hub
+    # are both visible, and shipped to every actor as a plain int. `workers` is the channel
+    # width: in a hash shuffle every reducer fetches from every mapper. Only the adaptive
+    # path reads it, so a static-credit fleet pays one cheap call and ignores the result.
+    ceiling = 0
+    if adaptive:
+        from batcher.carbonite import ResourceManager
+
+        ceiling = ResourceManager().credit_window_ceiling(channels=max(1, workers))
+
     pg = create_worker_placement(workers, current_envelope())
     # Resolve the fleet-uniform actor options once (they read the live topology), then vary
     # only the per-bundle index — so spawning W workers is O(W), not O(W x nodes).
@@ -1015,6 +1103,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             preemption,
             dc.tls,
             port_range,
+            ceiling,
         )
         for i in range(workers)
     ]

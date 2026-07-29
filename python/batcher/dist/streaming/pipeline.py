@@ -166,9 +166,10 @@ def stream_distributed_pipeline(
     """
     from batcher.dist.executors.map import _gpu_options
     from batcher.dist.executors.partition_io import partition_descriptors
-    from batcher.dist.executors.plan_analysis import _source_ids, split_at_first_pool_boundary
+    from batcher.dist.executors.plan_analysis import split_at_first_pool_boundary
     from batcher.dist.executors.ray_runtime import _ensure_ray
     from batcher.dist.flight_worker import new_plan_id
+    from batcher.plan.visitor import scanned_source_ids
 
     _ensure_ray(workers)
     # Imported AFTER `_ensure_ray` so it is the Ray-remote-wrapped class (the rebind in
@@ -176,11 +177,11 @@ def stream_distributed_pipeline(
     from batcher.dist.executors.map import _MapActor
 
     cpu_stage, gpu_stage = split_at_first_pool_boundary(plan)
-    sid = next(iter(_source_ids(plan)))
+    sid = next(iter(scanned_source_ids(plan)))
     partitions = partition_descriptors(sources[sid], workers)
     n = len(partitions)
     if n == 0:
-        return pa.table({})
+        return _empty(plan)
 
     credits = max(1, active_config().flow_control.default_credits)
     n_producers = clamp(n, 1, workers)
@@ -225,7 +226,21 @@ def stream_distributed_pipeline(
     for _key, out in sorted(results.items()):
         if out:
             batches.extend(out)
-    return pa.Table.from_batches(batches) if batches else pa.table({})
+    return pa.Table.from_batches(batches) if batches else _empty(plan)
+
+
+def _empty(plan: LogicalPlan) -> pa.Table:
+    """A typed empty result for this plan.
+
+    `pa.table({})` returns a table with *no columns at all*, so an empty distributed
+    pipeline disagreed with the single-node run it is supposed to be identical to on the
+    result schema — no names, no types. A caller that concatenates it against a non-empty
+    run then fails on a schema mismatch, and one that inspects `.schema` silently sees an
+    empty relation where it should see a typed one.
+    """
+    from batcher.dist.executors.plan_analysis import empty_result_table
+
+    return empty_result_table(plan, plan.available_columns())
 
 
 def _record_consumer_feedback(consumers, plan: LogicalPlan, hub) -> None:
@@ -298,7 +313,7 @@ def _run_streamed(
     dead_producers: set = set()  # producers lost to preemption (their morsels are void)
     open_inflight: dict = {}  # ref -> producer
     publish_inflight: dict = {}  # ref -> (producer, partition_idx, seq, ticket)
-    consume_inflight: dict = {}  # ref -> (consumer, producer, key, addr, ticket)
+    consume_inflight: dict = {}  # ref -> (consumer, producer, key, addr, ticket, attempts)
     free_consumers = deque(consumers)
     ready: deque = deque()  # (addr, ticket, producer, key, attempts) awaiting a consumer
     results: dict = {}
@@ -389,6 +404,19 @@ def _run_streamed(
 
         waitset = list(open_inflight) + list(publish_inflight) + list(consume_inflight)
         if not waitset:
+            if ready:
+                # Nothing is in flight and nothing can be issued, yet morsels are still
+                # waiting for a consumer — which means the consumer pool emptied and could
+                # not be replenished. Returning here would hand back a *partial* result that
+                # looks complete: the rows of every unconsumed morsel would be missing from
+                # the answer with no error anywhere. Say so instead.
+                from batcher._internal.errors import ResourceError
+
+                raise ResourceError(
+                    f"distributed streaming pipeline stalled with {len(ready)} morsels "
+                    "unconsumed and no consumer left to run them (every consumer was lost "
+                    "and none could be replaced)"
+                )
             break  # nothing in flight and no headroom to issue ⇒ all partitions drained
         done, _ = ray.wait(waitset, num_returns=1)
         ref = done[0]

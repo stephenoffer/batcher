@@ -26,6 +26,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import Lit, referenced_columns
+from batcher.plan.expr_rewrite import expr_key
 from batcher.plan.logical import LogicalPlan, Project, Window
 
 __all__ = [
@@ -77,13 +78,16 @@ def dedupe_window_partition_keys(node: Window, _ctx: OptimizerContext) -> Logica
     NULLs included). Keys are compared by lowered IR (never ``==``, which builds a
     comparison expression). Returns None when the keys are already distinct.
     """
-    seen: list[object] = []
+    # `expr_key` gives a hashable, memoized canonical form, so the "seen this key?" test
+    # is a set lookup rather than a linear scan comparing whole IR dicts — the difference
+    # between linear and quadratic in the number of partition keys.
+    seen: set[str] = set()
     kept = []
     for pk in node.partition_keys:
-        sig = pk.to_ir()
+        sig = expr_key(pk)
         if sig in seen:
             continue
-        seen.append(sig)
+        seen.add(sig)
         kept.append(pk)
     if len(kept) == len(node.partition_keys):
         return None
@@ -101,13 +105,13 @@ def dedupe_window_order_keys(node: Window, _ctx: OptimizerContext) -> LogicalPla
     dropped (compared by lowered IR). Returns None when the order expressions are
     already distinct.
     """
-    seen: list[object] = []
+    seen: set[str] = set()
     kept = []
     for key in node.order_keys:
-        sig = key.expr.to_ir()
+        sig = expr_key(key.expr)
         if sig in seen:
             continue
-        seen.append(sig)
+        seen.add(sig)
         kept.append(key)
     if len(kept) == len(node.order_keys):
         return None

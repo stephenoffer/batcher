@@ -14,10 +14,6 @@ use crate::eval::binary::{
     as_bool, coerce_numeric, eval_binary, try_dict_compare, try_scalar_binary,
 };
 use crate::eval::cast::cast_expr;
-use crate::eval::date::{
-    eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
-    eval_window_buckets, eval_window_start, parse_dtype,
-};
 use crate::eval::generate::eval_sequence;
 use crate::eval::in_list::eval_in_list;
 use crate::eval::list::{
@@ -29,9 +25,15 @@ use crate::eval::map::eval_map;
 use crate::eval::math::{
     eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
 };
+use crate::eval::media::image::ImageArgs;
 use crate::eval::media::{eval_audio, eval_image, eval_video};
 use crate::eval::str::{eval_str, try_dict_str};
-use crate::eval::timezone::eval_convert_timezone;
+use crate::eval::temporal::date::{
+    eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
+    eval_window_buckets, eval_window_start, parse_dtype,
+};
+use crate::eval::temporal::make::eval_make_temporal;
+use crate::eval::temporal::timezone::eval_convert_timezone;
 use crate::{BinaryOp, Expr, ExprError};
 
 /// Decode a dictionary-encoded array to its value type; identity for any other array.
@@ -176,16 +178,24 @@ impl Expr {
                 mean,
                 std,
                 channels_first,
+                x,
+                y,
+                format,
             } => {
                 let arr = input.eval(batch)?;
                 eval_image(
                     *func,
                     &arr,
-                    *width,
-                    *height,
-                    mean.as_deref(),
-                    std.as_deref(),
-                    *channels_first,
+                    ImageArgs {
+                        width: *width,
+                        height: *height,
+                        mean: mean.as_deref(),
+                        std: std.as_deref(),
+                        channels_first: *channels_first,
+                        x: *x,
+                        y: *y,
+                        format: format.as_deref(),
+                    },
                 )
             }
             Expr::Audio {
@@ -219,6 +229,13 @@ impl Expr {
                 eval_in_list(&arr, set)
             }
             Expr::Array { elements } => eval_array(elements, batch),
+            Expr::MakeTemporal { func, args } => {
+                let evaluated: Vec<_> = args
+                    .iter()
+                    .map(|a| a.eval(batch))
+                    .collect::<Result<_, _>>()?;
+                eval_make_temporal(*func, &evaluated)
+            }
             Expr::Hash { inputs, seed } => {
                 let args: Vec<_> = inputs
                     .iter()
@@ -349,6 +366,8 @@ impl Expr {
             } => {
                 let arr = input.eval(batch)?;
                 let list = require_list(&arr, "list.slice")?;
+                use arrow::array::AsArray;
+                let list = list.as_list::<i32>();
                 rebuild_list(list, |s, e| {
                     // Saturating throughout: a huge `offset`/`length` (up to i64::MAX)
                     // otherwise overflows the `+` before the `.min(e)` clamp — panicking

@@ -185,6 +185,10 @@ def test_metrics_snapshot_shape(clean_metrics):
         "operators",
         "partitions",
         "queries",
+        # Fault-tolerance actions by kind (recompute, worker_lost, backup_won, ...).
+        # Recovery used to be entirely unobservable, so a query that transparently
+        # survived losing two workers looked identical to one that was merely slow.
+        "recovery",
         "rows",
         "skipped",
         "spills",
@@ -298,3 +302,142 @@ def test_observability_sinks_do_not_attach_a_metrics_bus_sink():
     finally:
         m._detach = detach
         assert events.listening() or not events.listening()
+
+
+# --- findings surface in stats(), not only in the dashboard ---------------------------
+# The engine already derived what was wrong with a run, and showed it only to someone who
+# had started the web UI. A user reading `stats()` in a terminal — the surface every
+# performance guide sends them to — was told nothing.
+
+
+def _profile(ops, total_ms=700.0):
+    from batcher.plan.profile import OpProfile, QueryProfile
+
+    return QueryProfile(
+        ops=tuple(OpProfile(measured=True, **{"depth": 0, **op}) for op in ops),
+        total_ms=total_ms,
+        rows=1000,
+        measured=True,
+    )
+
+
+def test_a_starved_gpu_is_reported_by_stats_itself():
+    profile = _profile(
+        [
+            {
+                "op_id": 0,
+                "kind": "MapBatches",
+                "rows_in": 1000,
+                "rows_out": 1000,
+                "elapsed_ms": 100.0,
+                "backend": "gpu",
+            },
+            {
+                "op_id": 1,
+                "kind": "MapBatches",
+                "rows_in": 1000,
+                "rows_out": 1000,
+                "elapsed_ms": 500.0,
+            },
+        ]
+    )
+    stats = RunStats.from_profile(profile)
+    assert any(f["rule"] == "gpu-starved" for f in stats.findings)
+    rendered = str(stats)
+    assert "findings" in rendered
+    # The finding is useless without what to do about it, so the action prints too.
+    assert "more CPU per GPU" in rendered
+
+
+def test_a_healthy_run_prints_no_findings_section():
+    """An empty section under every clean run is how a reader learns to skip the one that
+    mattered."""
+    profile = _profile(
+        [
+            {
+                "op_id": 0,
+                "kind": "scan",
+                "rows_in": 1000,
+                "rows_out": 1000,
+                "elapsed_ms": 40.0,
+                "cpu_util": 0.95,
+            },
+            {
+                "op_id": 1,
+                "kind": "aggregate",
+                "rows_in": 1000,
+                "rows_out": 10,
+                "elapsed_ms": 45.0,
+                "cpu_util": 0.95,
+            },
+        ],
+        total_ms=90.0,
+    )
+    stats = RunStats.from_profile(profile)
+    assert "findings" not in str(stats)
+
+
+def test_info_findings_are_carried_but_not_printed():
+    """`findings` is the full list for a program to read; the printed table shows only what
+    needs acting on."""
+    profile = _profile(
+        [
+            {
+                "op_id": 0,
+                "kind": "MapBatches",
+                "rows_in": 2000,
+                "rows_out": 20000,
+                "elapsed_ms": 300.0,
+            },
+        ]
+    )
+    stats = RunStats.from_profile(profile)
+    assert any(f["rule"] == "row-exploding-stage" for f in stats.findings)
+    assert "findings" not in str(stats)
+
+
+def test_deriving_findings_never_breaks_a_measurement(monkeypatch):
+    """Findings are commentary on a measurement that already succeeded."""
+    import batcher.observe.insights as insights
+
+    def boom(_profile):
+        raise RuntimeError("rule exploded")
+
+    monkeypatch.setattr(insights, "derive_insights", boom)
+    stats = RunStats.from_profile(
+        _profile([{"op_id": 0, "kind": "scan", "rows_in": 1, "rows_out": 1, "elapsed_ms": 1.0}])
+    )
+    assert stats.findings == ()
+    assert stats.total_ms == 700.0
+
+
+def test_overlapping_stages_do_not_report_a_share_above_100_percent():
+    """A pipelined chain runs its stages concurrently, so their times legitimately sum past
+    the wall clock. Dividing by wall time produced shares like "325%", which reads as a bug
+    rather than as concurrency — so the denominator switches and says which one it used."""
+    stats = RunStats(
+        ops=(
+            OpStat(0, "MapBatches", 100, 100, 30.0, 0, False, "gpu"),
+            OpStat(1, "MapBatches", 100, 100, 70.0, 0, False, ""),
+        ),
+        total_ms=40.0,  # less than 30 + 70: the stages overlapped
+        rows=100,
+    )
+    line = stats.bottleneck_summary()
+    assert "70%" in line, line
+    assert "operator time (stages overlap)" in line
+
+
+def test_a_sequential_run_still_reports_against_wall_time():
+    """The wall-clock reading is the right one when nothing overlapped, and must not be
+    silently replaced by the operator-time one."""
+    stats = RunStats(
+        ops=(
+            OpStat(0, "scan", 100, 100, 20.0, 0, False, ""),
+            OpStat(1, "filter", 100, 50, 30.0, 0, False, ""),
+        ),
+        total_ms=100.0,
+        rows=50,
+    )
+    line = stats.bottleneck_summary()
+    assert "30% of wall time" in line, line

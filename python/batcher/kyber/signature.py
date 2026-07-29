@@ -51,7 +51,11 @@ def plan_signature(node: LogicalPlan) -> str:
     if cached is not None:
         return cached
     payload = json.dumps(_struct(node), sort_keys=True, default=str)
-    sig = hashlib.sha1(payload.encode()).hexdigest()[:16]
+    # `usedforsecurity=False`: this is a plan-identity cache key, and a FIPS-enforcing host
+    # rejects a bare `sha1()` outright — which would fail *every* query, since the signature
+    # is taken several times per plan. Declaring the non-security use is what makes OpenSSL
+    # allow it, and the digest is unchanged.
+    sig = hashlib.sha1(payload.encode(), usedforsecurity=False).hexdigest()[:16]
     node.__dict__[_SIG_SLOT] = sig
     return sig
 

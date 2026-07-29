@@ -21,7 +21,12 @@ from contextlib import contextmanager
 
 from batcher._internal.native import engine_or_none
 
-__all__ = ["BufferPool", "current_process_pool", "process_pool"]
+__all__ = [
+    "BufferPool",
+    "current_process_pool",
+    "process_pool",
+    "reset_process_pool",
+]
 
 
 class _FallbackPool:
@@ -34,13 +39,17 @@ class _FallbackPool:
     def __init__(self, limit_bytes: int) -> None:
         self._limit = limit_bytes
         self._used = 0
+        self._peak_used = 0
+        self._denied = 0
         self._lock = threading.Lock()
 
     def try_reserve(self, n_bytes: int) -> bool:
         with self._lock:
             if self._used + n_bytes > self._limit:
+                self._denied += 1
                 return False
             self._used += n_bytes
+            self._peak_used = max(self._peak_used, self._used)
             return True
 
     def release(self, n_bytes: int) -> None:
@@ -62,6 +71,14 @@ class _FallbackPool:
     @property
     def limit(self) -> int:
         return self._limit
+
+    @property
+    def peak_used(self) -> int:
+        return self._peak_used
+
+    @property
+    def denied(self) -> int:
+        return self._denied
 
 
 def _make_native_pool(limit_bytes: int):
@@ -92,13 +109,39 @@ class BufferPool:
         # memory pressure a workload hit: near 1 means it ran at the edge (spill/OOM risk),
         # low means the budget was oversized. Measurement only; never gates a reservation.
         self._peak_used = 0
+        # How many reservations were refused for lack of headroom. A non-zero count is the
+        # direct evidence that the envelope is the binding constraint on this workload —
+        # the thing `peak_used` near `limit` only *suggests*.
+        self._denied = 0
+        # Guards the two measurement counters. The accounting itself is atomic inside the
+        # Rust pool; these are Python-side read-modify-writes, and several queries reserve
+        # against the one process pool concurrently.
+        self._stats_lock = threading.Lock()
 
     @contextmanager
     def reserve(self, n_bytes: int) -> Iterator[bool]:
-        """Account `n_bytes` for the block; release on exit. Yields whether it fit."""
+        """Account `n_bytes` for the block; release on exit. Yields whether it fit.
+
+        A non-positive request is granted without touching the accounting. Passing a
+        *negative* count would otherwise **reduce** `used` on reserve and grow it again on
+        release, which silently hands the caller memory the envelope never had — the pool
+        admits growth, so nothing else in it checks the sign.
+
+        Args:
+            n_bytes: Bytes to hold for the duration of the block.
+
+        Yields:
+            Whether the reservation fit inside the envelope.
+        """
+        if n_bytes <= 0:
+            yield True
+            return
         granted = self._pool.try_reserve(n_bytes)
-        if granted and self._pool.used > self._peak_used:
-            self._peak_used = self._pool.used
+        with self._stats_lock:
+            if granted:
+                self._peak_used = max(self._peak_used, self._pool.used)
+            else:
+                self._denied += 1
         try:
             yield granted
         finally:
@@ -108,8 +151,66 @@ class BufferPool:
     @property
     def peak_used(self) -> int:
         """The high-water mark of concurrently-reserved bytes over this pool's life — the
-        measured memory pressure (`peak_used / limit`) the workload actually hit."""
-        return self._peak_used
+        measured memory pressure (`peak_used / limit`) the workload actually hit.
+
+        Prefers the **engine's own** high-water mark when the compiled pool reports one.
+        The control plane only sees the reservations it makes itself; the data plane also
+        reserves for operator state and the Flight transit buffers, and those are most of
+        the footprint on exactly the queries whose peak anyone wants to know.
+        """
+        return max(self._peak_used, int(getattr(self._pool, "peak_used", 0) or 0))
+
+    @property
+    def denied(self) -> int:
+        """Reservations refused for lack of headroom.
+
+        The **max** of the control plane's own count and the engine's, not their sum: the
+        engine's counter already includes every denial the control plane caused, so adding
+        them would double-count each one and report twice the refusals that happened.
+        Taking the max keeps the figure right whichever side saw more — the engine denies
+        reservations the control plane never makes (operator state, transit buffers), and
+        it reports nothing at all when the extension is not built.
+        """
+        return max(self._denied, int(getattr(self._pool, "denied", 0) or 0))
+
+    @property
+    def spill_requests(self) -> int:
+        """Times the engine's cooperative path made an operator spill to grant a
+        reservation — how often other operators paid for this query's memory. `0` without
+        the compiled engine, which has no cooperative path to count."""
+        return int(getattr(self._pool, "spill_requests", 0) or 0)
+
+    @property
+    def utilization(self) -> float:
+        """`used / limit` right now, in ``[0, 1]``; `1.0` for a zero-limit pool.
+
+        The one place this ratio is computed, so the pressure monitor and any telemetry
+        reader agree on what "how full is the engine's envelope" means.
+        """
+        limit = self._pool.limit
+        if limit <= 0:
+            return 1.0
+        return min(1.0, self._pool.used / limit)
+
+    def stats(self) -> dict[str, int | float]:
+        """A snapshot of this envelope: limit, live usage, lifetime peak, denials.
+
+        Returns:
+            The accounting figures, with `utilization` and `peak_utilization` as the two
+            ratios a reader actually acts on.
+        """
+        limit = self._pool.limit
+        peak = self.peak_used
+        return {
+            "limit_bytes": limit,
+            "used_bytes": self._pool.used,
+            "available_bytes": self._pool.available,
+            "peak_used_bytes": peak,
+            "denied": self.denied,
+            "spill_requests": self.spill_requests,
+            "utilization": self.utilization,
+            "peak_utilization": min(1.0, peak / limit) if limit > 0 else 1.0,
+        }
 
     def set_limit(self, limit_bytes: int) -> None:
         """Resize the envelope. Existing reservations are untouched; only the cap
@@ -134,6 +235,9 @@ class BufferPool:
 
 _process_pool: BufferPool | None = None
 _process_pool_lock = threading.Lock()
+# A shrink that could not be applied because the pool was busy. Remembered, not dropped:
+# see `process_pool`.
+_pending_shrink: int | None = None
 
 
 def process_pool(limit_bytes: int) -> BufferPool:
@@ -148,20 +252,47 @@ def process_pool(limit_bytes: int) -> BufferPool:
     this one envelope, so applying a cheap query's smaller budget mid-flight would shrink
     the envelope an expensive concurrent query is already running inside — pushing it into
     spurious spilling, or failing a reservation for work Carbonite had correctly admitted.
-    Growth always applies at once (capacity the autoscaler just added must not wait), and a
-    deferred shrink lands on the next call once the pool is idle.
+    Growth always applies at once (capacity the autoscaler just added must not wait).
+
+    A deferred shrink is **remembered**. It used to be discarded outright, so the smaller
+    budget only ever landed if some later call happened to ask for that same figure while
+    the pool was idle — which for a shrink caused by an autoscaler taking RAM away is not
+    something that happens at all. The envelope then stayed at the larger limit for the
+    life of the process and admitted against memory the box no longer had. The pending
+    figure is applied on the first subsequent call that finds the pool idle, and is
+    superseded by any later reconcile so it can never resurrect a stale budget.
+
+    Args:
+        limit_bytes: The envelope this caller wants in force.
+
+    Returns:
+        The shared `BufferPool`.
     """
-    global _process_pool
-    if _process_pool is None:
+    global _process_pool, _pending_shrink
+    pool = _process_pool
+    if pool is None:
         with _process_pool_lock:
             if _process_pool is None:
                 _process_pool = BufferPool(limit_bytes)
+                _pending_shrink = None
                 return _process_pool
-    if limit_bytes > _process_pool.limit or (
-        limit_bytes < _process_pool.limit and _process_pool.used == 0
-    ):
-        _process_pool.set_limit(limit_bytes)
-    return _process_pool
+            pool = _process_pool
+    with _process_pool_lock:
+        if limit_bytes > pool.limit:
+            pool.set_limit(limit_bytes)
+            _pending_shrink = None
+        elif limit_bytes < pool.limit:
+            if pool.used == 0:
+                pool.set_limit(limit_bytes)
+                _pending_shrink = None
+            else:
+                # Busy: hold the smallest requested shrink so it lands the moment the
+                # envelope is free, rather than being forgotten.
+                _pending_shrink = min(_pending_shrink or limit_bytes, limit_bytes)
+        elif _pending_shrink is not None and pool.used == 0:
+            pool.set_limit(_pending_shrink)
+            _pending_shrink = None
+    return pool
 
 
 def current_process_pool() -> BufferPool | None:
@@ -171,3 +302,16 @@ def current_process_pool() -> BufferPool | None:
     holds against its envelope without forcing a pool into existence.
     """
     return _process_pool
+
+
+def reset_process_pool() -> None:
+    """Drop the process-wide pool so the next `process_pool` call builds a fresh one.
+
+    For tests, which otherwise inherit whatever envelope and lifetime high-water an
+    earlier test left in this process — the same reason `reset_process_limiter` exists
+    for the concurrency limiter.
+    """
+    global _process_pool, _pending_shrink
+    with _process_pool_lock:
+        _process_pool = None
+        _pending_shrink = None

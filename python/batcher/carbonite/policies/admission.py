@@ -8,11 +8,10 @@ letting the query OOM.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from batcher.carbonite.memory.estimator import binding_operator, learned_plan_peak
 from batcher.carbonite.memory.pressure import total_memory_bytes
-from batcher.plan.physical import PhysicalOp
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds
 from batcher.plan.stats import Provenance
 
@@ -77,11 +76,11 @@ class BudgetingAdmission:
         # against what the family really used — admitting a query the plan over-sized
         # (avoiding a needless spill route) and catching one the plan under-sized
         # (avoiding an OOM). Cold families pass through unchanged.
-        model = ctx.memory_model
-        if model is not None:
-            peak = model.plan_peak(plan.ops)
-        else:
-            peak = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+        #
+        # The shared rule, not a local `max`: admission and the distributed grant must
+        # size against the identical figure, or a query is admitted against one envelope
+        # and granted another.
+        peak = learned_plan_peak(plan, ctx.memory_model)
         if peak <= envelope:
             return FeasibilityVerdict(feasible=True)
         # Over budget: offer the envelope as the per-operator bound so the engine can
@@ -94,32 +93,15 @@ class BudgetingAdmission:
         # *advisory* — it still routes the plan out-of-core, but the conductor will not
         # fail a query on it. Rejecting on a guess breaks the admission contract that a
         # guess never fails a legitimate query.
+        binding = binding_operator(plan)
         return FeasibilityVerdict(
             feasible=False,
             binding_constraint="memory",
             suggested_bounds=ResourceBounds(
                 m_max_bytes=envelope, c_max_credits=0, n_max_parallelism=0
             ),
-            advisory=_binding_op_is_a_guess(plan.ops),
+            # Naming the operator is what turns "this query will spill" into something a
+            # reader can act on: it says which join/aggregate/sort to reshape.
+            binding_op=None if binding is None else f"{binding.kind}#{int(binding.op_id)}",
+            advisory=binding is None or binding.properties.provenance is Provenance.DEFAULT,
         )
-
-
-def _binding_op_is_a_guess(ops: Sequence[PhysicalOp]) -> bool:
-    """Whether the operator whose memory binds admission was sized from a pure guess.
-
-    The binding operator is the one holding the plan's peak envelope. `Provenance.DEFAULT`
-    means its row count came from a Selinger constant with nothing measured behind it — a
-    number that can be wrong by orders of magnitude in either direction. Every stronger
-    provenance (a proof, a footer, a sketch, or a past measurement) is trusted.
-
-    Args:
-        ops: The plan's annotated operators.
-
-    Returns:
-        True when the peak-memory operator's cardinality is an unmeasured guess.
-    """
-    sized = [op for op in ops if op.bounds.m_max_bytes > 0]
-    if not sized:
-        return True  # nothing was sizable; any verdict over it is a guess
-    binding = max(sized, key=lambda op: op.bounds.m_max_bytes)
-    return binding.properties.provenance is Provenance.DEFAULT

@@ -21,6 +21,8 @@ argument — and because that module is at its size limit.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, col
 
@@ -119,8 +121,6 @@ def sort_for_ordered_aggs(tr, ds: Dataset) -> Dataset:
     Returns:
         The dataset sorted by the requested ordering.
     """
-    from sqlglot import expressions as exp
-
     distinct_orders = {sql for sql, _ in tr._agg_order}
     if len(distinct_orders) > 1:
         raise NotImplementedError(

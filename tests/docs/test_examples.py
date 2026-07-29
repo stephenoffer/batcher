@@ -32,7 +32,10 @@ _SKIP = "# examples: skip"
 def _example_files() -> list[Path]:
     if not EXAMPLES_ROOT.is_dir():
         return []
-    return sorted(p for p in EXAMPLES_ROOT.glob("*.py"))
+    # Recursive: the per-API-family scripts live in subdirectories (`expressions/`,
+    # `metrics/`, ...) so the tree stays navigable as it grows. A flat glob would
+    # collect the handful at the root and silently skip every one of those.
+    return sorted(p for p in EXAMPLES_ROOT.rglob("*.py") if "__pycache__" not in p.parts)
 
 
 def _is_skipped(text: str) -> bool:

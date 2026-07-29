@@ -19,13 +19,16 @@ It imports the callable builder from `udf` lazily, inside the probe, so there is
 
 from __future__ import annotations
 
-import pickle
 import threading
 import warnings
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import ceil_div
+from batcher.core.udf.processes import is_picklable
+from batcher.core.udf.sizing import warn_if_row_is_unsplittable
+from batcher.metadata.hardware_scope import scoped
 from batcher.plan.logical import MapBatches
 
 __all__ = [
@@ -45,33 +48,45 @@ PROC_BATCHES_PER_WORKER = 3
 # The smallest batch worth handing a process worker: below this the pickle/IPC per batch
 # outweighs the work, so tinier batches are coalesced up to at least this many rows.
 PROC_MIN_BATCH_ROWS = 65_536
-# The smallest batch worth handing a *thread* worker for a light (GIL-releasing or cheap)
-# `fn` with no explicit `batch_size`: a Python `map_batches` call pays a fixed per-call
-# overhead (FFI + framework conversion + schema build) the morsel makes dominate. Measured,
-# coarsening a NumPy `fn` from the morsel to this floor cut a 6 M-row map+reduce ~4x (108 ms
-# -> ~27 ms); throughput is flat from here up, so this is the smallest batch on the plateau.
-_THREAD_MIN_COARSE_ROWS = 131_072
-# The coarsening ceiling: past this the per-call overhead is already amortized, and a
-# smaller cap keeps more batches in flight (load balance) and a row-exploding / wide-row
-# `fn`'s transient per-thread output bounded.
+# The batch a *light* (GIL-releasing or cheap-per-row) `fn` with no explicit `batch_size`
+# wants. A Python `map_batches` call pays a fixed per-call overhead (FFI + framework
+# conversion + schema build) that the morsel makes dominate, so coarsening amortizes it —
+# but only up to a point: past ~2 M rows the batch count drops below what keeps cores busy
+# and the GIL-bound per-call Arrow conversion serializes, making it *worse* than the morsel.
+#
+# 1 M is the measured bottom of that curve, and is optimal at 6 M and 12 M input rows too,
+# so it is a per-call row count rather than a function of the total. A previous revision set
+# 131,072 as "flat from here up"; it is not — that is 2.7x off the optimum. Full curve in
+# `docs/internals/daft_parity_ledger.md`.
+_THREAD_LIGHT_COARSE_ROWS = 1_048_576
+# The coarsening ceiling for a *heavy* `fn`, which keeps the per-worker split so every core
+# stays busy. Left where it was: the measurement above concerns per-call overhead on the light
+# path, and raising this would multiply the core-filling path's resident footprint (one batch
+# per worker, times every worker) on a claim nothing here tests.
 _THREAD_MAX_COARSE_ROWS = 262_144
+# Per-batch input-byte budget for the coarsened thread path. A row count alone cannot bound
+# memory: 1 M rows is 29 MB of narrow numerics and 4 GB of decoded frames. Wide rows shrink
+# the batch instead of taking the row target, which is the same rule `udf/stream.py` applies
+# to its CPU chunks (`_CPU_STREAM_BATCH_BYTES`), reused here so the two paths agree on how
+# many bytes one callback should hold.
+_THREAD_COARSE_BATCH_BYTES = 128 << 20
 # A `fn` whose measured per-row compute is below this is "light" — dominated by the fixed
 # per-call overhead, so coarse batches win and leaving cores idle costs nothing. Above it,
 # real per-row work makes filling every core matter, so keep the per-worker split. (NumPy
 # `charge` measures ~7 ns/row; a pure-Python per-row transform is 10-100x that.)
 _LIGHT_FN_ROW_SECONDS = 5e-8
-# Thread/process cost probe (see `_prefer_processes`): time the `fn` on a sample of this
-# many rows. Processes are chosen only when two concurrent thread calls fail to speed up by
+# Thread/process cost probe (see `_prefer_processes`): time the `fn` on this many rows.
+# Processes are chosen only when two concurrent thread calls fail to speed up by
 # `_GIL_BOUND_MAX` (the `fn` holds the GIL) AND the estimated single-thread whole-job time
-# exceeds `_PROC_WORTH_SECONDS` (cpu-heavy enough that multi-core beats the process overhead).
+# exceeds `_PROC_WORTH_SECONDS` (cpu-heavy enough to beat the process overhead).
 _PROBE_ROWS = 65_536
 _PROBE_REPEATS = 3
 # Wall-clock ceiling for one `fn`'s per-row-cost probe. The probe RUNS the user's `fn`, so its
 # cost is the `fn`'s cost: a warm call plus `_PROBE_REPEATS` timed calls over `_PROBE_ROWS` rows
 # used to be paid before the query started, whatever the `fn` did per row. A `fn` already slower
-# than this on the sample is decisively "heavy" — the only verdict the probe feeds — so one
-# measurement answers the question and repeating it just multiplies a real cost (a remote API
-# call, a model forward). A cheap `fn` still gets every repeat, because every repeat is cheap.
+# than this is decisively "heavy" — the only verdict the probe feeds — so one measurement
+# answers it; repeating multiplies a real cost (a billed call, a model forward). A cheap
+# `fn` still gets every repeat, because every repeat is cheap.
 _PROBE_TIME_BUDGET_SECONDS = 0.05
 _GIL_BOUND_MAX = 1.4
 _PROC_WORTH_SECONDS = 0.5
@@ -112,7 +127,8 @@ def _learning_hub():
         from batcher.core.runtime import default_hub
 
         return default_hub()
-    except Exception:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "resolve the learning hub", exc)
         return None
 
 
@@ -123,8 +139,9 @@ def _learned_strategy(key: str) -> dict:
     if hub is None:
         return {}
     try:
-        return hub.get_keyed_param(_LEARN_NS, key) or {}
-    except Exception:  # pragma: no cover - learning must never break a query
+        return hub.get_keyed_param(scoped(_LEARN_NS), key) or {}
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "read learned UDF strategy", exc)
         return {}
 
 
@@ -139,9 +156,10 @@ def _persist_strategy(key: str | None, **fields: object) -> None:
     if hub is None:
         return
     try:
-        entry = {**(hub.get_keyed_param(_LEARN_NS, key) or {}), **fields}
-        hub.put_keyed_param(_LEARN_NS, key, entry)
-    except Exception:  # pragma: no cover - learning must never break a query
+        entry = {**(hub.get_keyed_param(scoped(_LEARN_NS), key) or {}), **fields}
+        hub.put_keyed_param(scoped(_LEARN_NS), key, entry)
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("core", "persist learned UDF strategy", exc)
         return
 
 
@@ -226,25 +244,39 @@ def thread_batch_target(
 ) -> int:
     """Coarse per-batch row count for a threaded CPU `fn` with no explicit `batch_size`.
 
-    The floor is one coarse batch per worker (`total / num_workers`, so every core is fed),
-    capped at ``_THREAD_MAX_COARSE_ROWS`` (bounding a row-exploding / wide-row `fn`), never
-    below the morsel. For a `fn` measured as *light* per row (a cheap vectorized transform
-    whose cost is dominated by the fixed per-call overhead, not real work), the floor is
-    lifted to the amortization plateau (`_THREAD_MIN_COARSE_ROWS`): a few coarse batches beat
-    many morsel-sized ones because the per-call overhead — and GIL contention on any per-call
-    Arrow conversion — falls, and the wasted work from fewer-than-core batches is nil when the
-    `fn` is cheap. A `fn` measured as heavy (real per-row work) keeps the per-worker split so
-    every core stays busy. The per-row cost is measured once on a sample and cached.
+    Two regimes, chosen by a once-per-`fn` measurement of its per-row cost. **Heavy** (real
+    per-row work) gets one coarse batch per worker (`total / num_workers`) so every core is
+    fed, capped at ``_THREAD_MAX_COARSE_ROWS``. **Light** (cost dominated by the fixed
+    per-call overhead) gets ``_THREAD_LIGHT_COARSE_ROWS``, the measured optimum — leaving
+    cores idle costs nothing when the `fn` is cheap, and fewer calls means less overhead.
+
+    Either way the result is byte-bounded (`_byte_bounded`), because a row count cannot bound
+    memory on its own. Relation-level no-op: same rows, per-batch by contract.
     """
     per_worker = ceil_div(total_rows, max(1, num_workers))
-    floor = morsel
+    target = min(_THREAD_MAX_COARSE_ROWS, max(morsel, per_worker))
     # Only worth probing (and coarsening) when the input is big enough for the batch count
     # to matter; a small query keeps the morsel and pays no probe latency.
     if total_rows > _PROBE_MIN_ROWS:
         row_secs = _fn_row_seconds(op, current)
         if row_secs is not None and row_secs < _LIGHT_FN_ROW_SECONDS:
-            floor = _THREAD_MIN_COARSE_ROWS  # cheap per row -> coarsen onto the plateau
-    return max(floor, min(_THREAD_MAX_COARSE_ROWS, max(morsel, per_worker)))
+            target = max(target, _THREAD_LIGHT_COARSE_ROWS)
+    return _byte_bounded(target, morsel, current)
+
+
+def _byte_bounded(target: int, morsel: int, current: list[pa.RecordBatch]) -> int:
+    """`target` rows, reduced so one batch holds at most ``_THREAD_COARSE_BATCH_BYTES``.
+
+    Never below the morsel: that is already the engine's unit of work, and shrinking past it
+    would trade the memory bound for per-call overhead the morsel path itself accepts. With no
+    sample to measure a row width from, the target passes through unchanged.
+    """
+    rows = sum(b.num_rows for b in current)
+    if rows <= 0:
+        return target
+    per_row = max(1, sum(b.nbytes for b in current) // rows)
+    warn_if_row_is_unsplittable(per_row)  # this path's copy of the dead end; see `sizing`
+    return max(morsel, min(target, max(1, _THREAD_COARSE_BATCH_BYTES // per_row)))
 
 
 def _prefer_processes(op: MapBatches, total_rows: int, current: list[pa.RecordBatch]) -> bool:
@@ -431,7 +463,7 @@ def _process_capable(op: MapBatches) -> bool:
     `batch_format` is fine — the numpy/pandas/torch conversion runs in the child from
     the picklable ``(fn, batch, fmt)`` payload, no closure required.
     """
-    return not isinstance(op.fn, type) and op.num_gpus <= 0 and _is_picklable(op.fn)
+    return not isinstance(op.fn, type) and op.num_gpus <= 0 and is_picklable(op.fn)
 
 
 def _process_safe(op: MapBatches) -> bool:
@@ -444,7 +476,7 @@ def _process_safe(op: MapBatches) -> bool:
         return _reject("a factory/class fn would reload per process")
     if op.num_gpus > 0:
         return _reject("a GPU fn must keep a single process/CUDA context")
-    if not _is_picklable(op.fn):
+    if not is_picklable(op.fn):
         return _reject("the fn is not picklable (a lambda or closure)")
     return True
 
@@ -458,11 +490,3 @@ def _reject(reason: str) -> bool:
             stacklevel=3,
         )
     return False
-
-
-def _is_picklable(obj: object) -> bool:
-    try:
-        pickle.dumps(obj)
-        return True
-    except Exception:
-        return False

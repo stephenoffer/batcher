@@ -36,6 +36,7 @@ def _greatest_least_single(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_greatest_least_single,
+    expr_matches=(Greatest, Least),
 )
 def greatest_least_single_arg(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`greatest(x)` → `x`, `least(x)` → `x`. The extremum of one value is that value — including a
@@ -61,6 +62,7 @@ def _greatest_least_flatten(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_greatest_least_flatten,
+    expr_matches=(Greatest, Least),
 )
 def greatest_least_flatten_nested(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`greatest(a, greatest(b, c))` → `greatest(a, b, c)`, and the `least` dual. The extremum over
@@ -91,6 +93,7 @@ def _greatest_least_dedup(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_greatest_least_dedup,
+    expr_matches=(Greatest, Least),
 )
 def greatest_least_dedup_args(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`greatest(a, b, a)` → `greatest(a, b)`, and the `least` dual. The extremum is idempotent
@@ -117,6 +120,7 @@ def _greatest_least_fold(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_greatest_least_fold,
+    expr_matches=(Greatest, Least, Lit),
 )
 def greatest_least_fold_literals(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`greatest(2, 5, 3)` → `5`, and the `least` dual, when *every* argument is a literal of one

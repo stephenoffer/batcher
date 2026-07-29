@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 from batcher.ml.llm.engines.base import Engine, EngineFactory
+from batcher.ml.llm.engines.parallelism import local_device_name, warn_about_tensor_parallelism
+from batcher.ml.llm.engines.templates import warn_if_chat_template_unused
+from batcher.ml.llm.sizing import fit_to_window, prompt_window, sized_window
 
 __all__ = ["vllm_engine"]
 
@@ -17,7 +20,7 @@ __all__ = ["vllm_engine"]
 def vllm_engine(
     model: str,
     *,
-    chat: bool = False,
+    chat: bool | None = None,
     system: str | None = None,
     sampling: dict[str, object] | None = None,
     guided_json: dict[str, object] | None = None,
@@ -39,11 +42,20 @@ def vllm_engine(
     system prompt is encoded once; long prefills interleave with decode) that Ray Data
     users must turn on by hand. Any value you pass in `engine_kwargs` wins.
 
-    `max_model_len` is left to vLLM's model default. Whatever the window ends up being, a
-    prompt that would overflow it is **truncated to fit** using the worker's own tokenizer
-    (with a warning naming how many rows were cut), rather than failing the whole request
-    over one long row. Truncation is skipped entirely when no tokenizer is reachable — a
-    character heuristic would cut in the wrong place and corrupt output silently.
+    `max_model_len` is left to vLLM's model default, or pass ``max_model_len="auto"`` to
+    size the context window from the data. The KV cache is reserved from that number, so a
+    128K default over a corpus of 2K-token prompts spends almost all of the cache on lengths
+    the data never reaches — capacity that would otherwise be concurrent sequences. Auto
+    sizing measures the first batch, converts characters to tokens at a rate no tokenizer
+    beats, adds the generation budget and headroom, and rounds up; if the model refuses the
+    result it falls back to the model's own window with a warning. Because it defers the
+    engine build to the first batch, it changes *when* the model loads on that path only.
+
+    Whatever the window ends up being, a prompt that would overflow it is **truncated to
+    fit** using the worker's own tokenizer (with a warning naming how many rows were cut),
+    rather than failing the whole request over one long row. Truncation is skipped entirely
+    when no tokenizer is reachable — a character heuristic would cut in the wrong place and
+    corrupt output silently.
 
     Examples:
         .. doctest::
@@ -56,11 +68,14 @@ def vllm_engine(
         model: the model id or path handed to ``vllm.LLM``.
         chat: send each prompt as a **chat conversation** (``LLM.chat``), so vLLM applies
             the model's own chat template. Set this for any instruction-tuned or chat
-            model: the completion path (the default, matching a base model) skips the
-            template, and the model then answers a prompt in a format it was never tuned
-            on — degraded output with nothing to signal it. Not compatible with an image
-            column (an image has no place in a text conversation); use the completion
-            path for vision.
+            model: the completion path skips the template, and the model then answers a
+            prompt in a format it was never tuned on — degraded output with nothing to
+            signal it. Left unset it stays on the completion path (matching a base model)
+            but **warns** if the model turns out to ship a chat template, since that
+            combination is almost always the mistake above; an explicit ``False`` is taken
+            as a decision and is silent, which is what constrained-choice classification
+            wants. Not compatible with an image column (an image has no place in a text
+            conversation); use the completion path for vision.
         system: a system turn prepended to every conversation (with `chat`).
         sampling: `SamplingParams` kwargs (``temperature``, ``top_p``, ``max_tokens``,
             ``stop``, ``n``, ``seed``, ...). Defaults to greedy (``temperature=0``).
@@ -85,7 +100,8 @@ def vllm_engine(
             memory at <1% quality loss, and keeps native precision (BF16/FP16) elsewhere
             — the zero-config win Ray Data users must select by hand per GPU. Pass an
             explicit string (``"fp8"``, ``"awq"``, ...) to force it, or ``None`` to disable.
-        engine_kwargs: passed to ``vllm.LLM``: ``max_model_len``,
+        engine_kwargs: passed to ``vllm.LLM``: ``max_model_len`` (a token count, or
+            ``"auto"`` to size it from the data — see above),
             ``gpu_memory_utilization``, ``tensor_parallel_size`` (for a model larger than
             one GPU), ``speculative_config`` / ``spec_decode_disable_by_queue_size``
             (speculative decoding), ``enable_lora`` / ``max_loras`` / ``max_cpu_loras``
@@ -110,7 +126,6 @@ def vllm_engine(
         # `quantization` still wins.
         kwargs = _with_auto_quant(quantization, engine_kwargs)
         enable_lora = lora_path is not None or bool(lora_paths)
-        llm = LLM(model=model, enable_lora=enable_lora, **kwargs)
         sampling_kwargs = {"temperature": 0.0, **(sampling or {})}
         gkw = _guided_decoding_kwargs(guided_json, guided_regex, guided_choice, guided_grammar)
         if gkw is not None:
@@ -119,16 +134,44 @@ def vllm_engine(
             sampling_kwargs["guided_decoding"] = GuidedDecodingParams(**gkw)
         params = SamplingParams(**sampling_kwargs)
         lora_table = _lora_table(lora_path, lora_paths)
+        # `max_model_len="auto"` sizes the KV cache from the data, which means the engine
+        # cannot exist until a batch does. Everything else builds eagerly, exactly as before,
+        # so the opt-in path is the only one whose construction timing changed.
+        auto_window = kwargs.get("max_model_len") == "auto"
+        if auto_window:
+            # The sentinel is Batcher's, not vLLM's — it must not reach the engine.
+            del kwargs["max_model_len"]
+        built: dict = {}
 
-        tokenizer = _worker_tokenizer(llm)
-        window = _prompt_window(llm, kwargs)
+        def _build(prompts: list) -> None:
+            kw = dict(kwargs)
+            # On the GPU worker, where the device is real; no footprint here, so only the
+            # interconnect half of the advice can fire.
+            warn_about_tensor_parallelism(
+                int(kw.get("tensor_parallel_size", 1) or 1), 0.0, None, local_device_name()
+            )
+            if auto_window:
+                sized = sized_window(prompts, sampling_kwargs)
+                if sized is not None:
+                    kw["max_model_len"] = sized
+            built["llm"] = _construct(LLM, model, enable_lora, kw)
+            built["tokenizer"] = _worker_tokenizer(built["llm"])
+            if chat is None:
+                warn_if_chat_template_unused(built["tokenizer"], model)
+            built["window"] = prompt_window(built["llm"], kw)
+
+        if not auto_window:
+            _build([])
 
         def engine(prompts: list) -> list[str]:
+            if "llm" not in built:
+                _build(prompts)
+            llm = built["llm"]
             # Route per-row by adapter (a request may carry an "adapter" tag), co-batching
             # the adapters where vLLM supports it; usage + order are preserved.
-            prompts = _fit_to_window(prompts, tokenizer, window)
+            prompts = fit_to_window(prompts, built["tokenizer"], built["window"])
             texts, usage, reasons, logprobs = _generate_signals(
-                llm, params, prompts, lora_table, chat=chat, system=system
+                llm, params, prompts, lora_table, chat=bool(chat), system=system
             )
             usage_sink().report(usage)
             finish_reason_sink().report(reasons)
@@ -179,72 +222,6 @@ def _worker_tokenizer(llm: object) -> object | None:
         return getter()
     except Exception:  # pragma: no cover - vLLM version differences
         return None
-
-
-def _prompt_window(llm: object, engine_kwargs: dict) -> int | None:
-    """The token budget a prompt must fit in, or `None` when it cannot be determined.
-
-    Prefers the explicit `max_model_len`, else asks the live vLLM config. Reserves a
-    slice of the window for the generation itself: filling the whole context with prompt
-    leaves no room to decode, which fails just as hard as an over-long prompt.
-    """
-    declared = engine_kwargs.get("max_model_len")
-    if not isinstance(declared, int):
-        config = getattr(getattr(llm, "llm_engine", None), "model_config", None)
-        declared = getattr(config, "max_model_len", None)
-    if not isinstance(declared, int) or declared <= 0:
-        return None
-    return max(1, declared - _RESERVED_OUTPUT_TOKENS)
-
-
-#: Tokens held back from the context window for the generation itself.
-_RESERVED_OUTPUT_TOKENS = 512
-
-
-def _fit_to_window(prompts: list, tokenizer: object | None, window: int | None) -> list:
-    """Truncate any over-length prompt to `window` tokens, leaving the rest untouched.
-
-    A single over-length row used to fail the **whole** request, losing a batch's worth
-    of GPU work to one bad input. Windowing keeps the batch alive and warns, so the
-    truncation is visible rather than silent. A no-op when no tokenizer or window is
-    available — see `_worker_tokenizer` for why guessing is worse than not truncating.
-    """
-    if tokenizer is None or window is None:
-        return prompts
-    texts = [p["prompt"] if isinstance(p, dict) else p for p in prompts]
-    fitted = _truncate_to_window(texts, tokenizer, window)
-    return [
-        {**p, "prompt": text} if isinstance(p, dict) else text
-        for p, text in zip(prompts, fitted, strict=True)
-    ]
-
-
-def _truncate_to_window(prompts: list, tokenizer: object, max_tokens: int) -> list:
-    """Each prompt cut to its first `max_tokens` tokens, warning once if any was cut.
-
-    Keeps the **head** of the prompt: an instruction-shaped prompt puts the task up
-    front, so a tail cut is likelier to remove the answer's context than the question.
-    """
-    out = []
-    truncated = 0
-    for prompt in prompts:
-        ids = tokenizer.encode(str(prompt))
-        if len(ids) <= max_tokens:
-            out.append(prompt)
-            continue
-        truncated += 1
-        out.append(tokenizer.decode(ids[:max_tokens]))
-    if truncated:
-        import warnings
-
-        warnings.warn(
-            f"{truncated} of {len(prompts)} prompts exceeded the model's context window "
-            f"and were truncated to {max_tokens} tokens. Shorten the prompts, or raise "
-            "vllm_engine(max_model_len=...), to avoid losing their tails.",
-            UserWarning,
-            stacklevel=3,
-        )
-    return out
 
 
 def _group_indices_by_adapter(prompts: list) -> dict[str | None, list[int]]:
@@ -415,6 +392,32 @@ def _chat_messages(prompt: object, system: str | None) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": str(text)})
     return messages
+
+
+def _construct(LLM: object, model: str, enable_lora: bool, kwargs: dict) -> object:
+    """Build the vLLM engine, retrying once without a sized window if that window is refused.
+
+    A `max_model_len` above what the model's config allows is a hard error in vLLM, and the
+    model's true maximum is not known until the engine exists. Rather than guess it from a
+    side channel, an auto-sized window that the model rejects falls back to the model's own
+    default — the pre-sizing behavior — so auto-sizing can cost throughput but never a run.
+    """
+    try:
+        return LLM(model=model, enable_lora=enable_lora, **kwargs)  # type: ignore[operator]
+    except Exception:
+        if "max_model_len" not in kwargs:
+            raise
+        import warnings
+
+        warnings.warn(
+            f"vllm_engine(max_model_len='auto') proposed a {kwargs['max_model_len']}-token "
+            f"window that this model refused; falling back to its default window. Pass an "
+            f"explicit max_model_len to size the KV cache yourself.",
+            UserWarning,
+            stacklevel=2,
+        )
+        del kwargs["max_model_len"]
+        return LLM(model=model, enable_lora=enable_lora, **kwargs)  # type: ignore[operator]
 
 
 def _vllm_batch_defaults(engine_kwargs: dict[str, object]) -> dict[str, object]:

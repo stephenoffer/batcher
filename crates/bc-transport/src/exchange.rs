@@ -131,6 +131,14 @@ impl ShuffleExchange {
         token: Option<String>,
         tls: Option<crate::TlsServerConfig>,
     ) -> TransportResult<Self> {
+        // A fresh worker is the only thing that reliably runs after a dead one. Shm
+        // buckets live in tmpfs (RAM) and are freed at teardown — which a SIGKILL, an OOM
+        // kill, or a spot reclamation never reaches — and each restart advertises a fresh
+        // ephemeral port, so the dead directories accumulate instead of being reused.
+        // Sweeping the ones whose owning pid is gone is what keeps that from being an
+        // unbounded RAM leak on a churning node.
+        crate::shared::reap_stale_shm();
+
         let store = Arc::new(PartitionStore::default());
         // Reuse FlightServer's binding logic but keep our own handle on the
         // store so publish() can register after the server is running.
@@ -231,6 +239,33 @@ impl ShuffleExchange {
     /// Number of partitions currently retained (telemetry / leak tests).
     pub async fn partition_count(&self) -> usize {
         self.store.len().await
+    }
+
+    /// Bytes this worker's published partitions currently hold in memory.
+    ///
+    /// The shuffle's resident footprint. It is anonymous memory the kernel cannot reclaim
+    /// and that no reservation accounts for, so before this the only way the control plane
+    /// could see it was by inferring it from process RSS — which cannot attribute it to the
+    /// shuffle, and so cannot tell an operator whether the answer is "publish less" or
+    /// "hold less state". Synchronous and lock-free: it is meant to be polled.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.store.retained_bytes()
+    }
+
+    /// Yield at least `target` bytes of published shuffle output to disk, returning what
+    /// was actually freed.
+    ///
+    /// The hook a memory pool calls when a reservation it cannot grant would otherwise
+    /// fail. Published buckets are the right thing to ask for first: they are finished work
+    /// waiting to be collected, so spilling one costs a re-read and blocks nobody.
+    ///
+    /// Non-blocking. Returns `0` if the store is busy or has nothing resident, which the
+    /// caller must treat as "not right now" rather than as an error — the alternative,
+    /// blocking on the store's lock from an arbitrary thread, can deadlock the runtime
+    /// serving the fetches that would drain it.
+    pub fn try_spill_at_least(&self, target: usize) -> usize {
+        self.store.try_spill_at_least(target)
     }
 
     /// Fetch a remote partition from `(addr, ticket)` with a credit-bounded
@@ -475,6 +510,11 @@ impl PeerChannels {
         self.channels.lock().await.clear();
     }
 
+    /// Whether this peer currently holds no connections.
+    async fn is_empty(&self) -> bool {
+        self.channels.lock().await.is_empty()
+    }
+
     async fn len(&self) -> usize {
         self.channels.lock().await.len()
     }
@@ -560,6 +600,26 @@ impl ClientPool {
         credits: u32,
         token: Option<&str>,
     ) -> TransportResult<Vec<RecordBatch>> {
+        let out = self
+            .fetch_once_with_retry(addr, ticket, credits, token)
+            .await;
+        if out.is_err() {
+            // Every failure path lands here, including a first `acquire` that could not
+            // connect at all — which is the common shape for a peer that has gone away, and
+            // the one that still leaves an entry behind. See `forget_unreachable`.
+            self.forget_unreachable(addr).await;
+        }
+        out
+    }
+
+    /// One pooled fetch, redialing once if the cached connections turn out to be stale.
+    async fn fetch_once_with_retry(
+        &self,
+        addr: &str,
+        ticket: &ShuffleTicket,
+        credits: u32,
+        token: Option<&str>,
+    ) -> TransportResult<Vec<RecordBatch>> {
         let channel = self.channel(addr).await?;
         let mut client = FlightClient::from_channel(channel);
         match credit_exchange(&mut client, ticket, credits, token).await {
@@ -571,6 +631,37 @@ impl ClientPool {
                 credit_exchange(&mut client, ticket, credits, token).await
             }
             other => other,
+        }
+    }
+
+    /// Drop a peer's entry once it has proved unreachable, freeing its connections.
+    ///
+    /// The map is keyed by advertised address and nothing ever removed from it. A
+    /// `ClientPool` is process-lifetime (one pooled consumer per worker, shared by every
+    /// session), and a worker advertises an *ephemeral* port — so every peer restart, every
+    /// autoscaling replacement, and every actor recycle mints a new key. The old entry
+    /// stayed forever holding up to `connections_per_peer` tonic channels, each a live
+    /// HTTP/2 connection with its own buffers and file descriptor. On a churning cluster
+    /// that is an unbounded leak of both memory and fds in the one process that must
+    /// outlive every query.
+    ///
+    /// Eviction is deliberately tied to *proven* unreachability — a connection error whose
+    /// redial also failed — rather than to idleness. A peer that is merely quiet between
+    /// queries should keep its warm connections: re-establishing them is the cost this pool
+    /// exists to avoid, and dropping them would trade a bounded leak for a per-query
+    /// handshake. `reset` alone was not enough because it clears the channel vector and
+    /// leaves the key.
+    async fn forget_unreachable(&self, addr: &str) {
+        // Only if it holds no connections: a concurrent fetch to the same peer may already
+        // have rebuilt it, and removing a live entry would drop channels those fetches are
+        // streaming on. An entry whose `acquire` never managed to connect is empty by
+        // construction, which is exactly the case that used to be left behind.
+        let gone = match self.peers.get(addr) {
+            Some(peer) => peer.value().is_empty().await,
+            None => return,
+        };
+        if gone {
+            self.peers.remove(addr);
         }
     }
 

@@ -15,7 +15,12 @@ import pyarrow as pa
 from batcher.plan.expr_ir import AggExpr, Expr
 from batcher.plan.ir_specs import aggregates_ir, group_keys_ir, sort_keys_ir
 from batcher.plan.ir_tags import Op
-from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases, _validate_refs
+from batcher.plan.logical.base import (
+    LogicalPlan,
+    _reject_duplicate_aliases,
+    _validate_refs,
+    available_column_set,
+)
 from batcher.plan.logical.relational import Projection
 from batcher.plan.schema import SchemaRef
 from batcher.plan.streaming import Watermark
@@ -87,7 +92,7 @@ class Aggregate(LogicalPlan):
     watermark: Watermark | None = None
 
     def __post_init__(self) -> None:
-        available = set(self.input.available_columns())
+        available = available_column_set(self.input)
         for key in self.group_keys:
             _validate_refs(key.expr, available, what=f"group_by key {key.alias!r}")
         for spec in self.aggregates:
@@ -145,7 +150,7 @@ class Sort(LogicalPlan):
     limit: int | None = None
 
     def __post_init__(self) -> None:
-        available = set(self.input.available_columns())
+        available = available_column_set(self.input)
         for key in self.keys:
             _validate_refs(key.expr, available, what="sort key")
 

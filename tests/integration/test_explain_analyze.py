@@ -56,12 +56,17 @@ def test_stats_carries_planned_estimate():
     assert all(hasattr(o, "est_rows") for o in st.ops)
 
 
-def test_stats_rejects_map_batches():
-    from batcher._internal.errors import BackendError
+def test_stats_measures_map_batches_without_an_estimate():
+    """A UDF plan is measured but never *estimated*: Kyber cannot size past an opaque
+    callback, and inventing a number would make `est_error` compare a measurement against a
+    guess. So the stage carries real rows and time, and `est_rows` stays absent."""
+    import math
 
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]})).ml.map_batches(lambda b: b, output_columns=["x"])
-    with pytest.raises(BackendError, match="map_batches"):
-        ds.stats()
+    st = ds.stats()
+    stage = next(o for o in st.ops if o.kind == "MapBatches")
+    assert stage.rows_out == 3
+    assert math.isnan(stage.est_rows)
 
 
 def test_event_log_written_on_collect(tmp_path):

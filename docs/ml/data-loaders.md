@@ -200,7 +200,7 @@ print(first.schema.names, first.num_rows)
 ```
 
 For learned statistics such as standardization, one-hot encoding, or imputation, fit a
-[preprocessor](preprocessors.md) on the train split and `transform` the stream. The fit
+[preprocessor](preprocessors/index.md) on the train split and `transform` the stream. The fit
 is one mergeable pass over the data, and the transform is an engine stage. Neither one
 runs in the training loop.
 
@@ -222,7 +222,7 @@ In order of frequency:
 - [PyTorch](pytorch.md): device transfer, collate, zero-copy, and DDP in full.
 - [Distributed training](distributed-training.md): the multi-rank sharding contract.
 - [Streaming for training](streaming.md): the bounded-memory ingest path.
-- [Preprocessors](preprocessors.md): the fit-on-train, transform-the-stream contract.
+- [Preprocessors](preprocessors/index.md): the fit-on-train, transform-the-stream contract.
 - [Tensor columns](../deep-dives/tensor-columns.md): how a fixed-shape tensor reaches the
   loop with its shape intact.
 - [GPU execution](../deep-dives/gpu-execution.md): what the device is waiting on when it

@@ -20,6 +20,7 @@ import pyarrow as pa
 import batcher as bt
 from batcher import col
 from batcher.kyber.registry import DEFAULT_REGISTRY
+from batcher.kyber.rules.extra import string_folds as sf
 from batcher.kyber.rules.extra import strings as st
 from batcher.plan.expr_ir import Binary, Col, IsNotNull, Lit, StrFunc
 from batcher.plan.logical import Filter
@@ -75,7 +76,13 @@ def test_all_rules_registered():
 
 
 def test_rule_count():
-    assert len(_RULE_NAMES) == len(st.__all__) == 13
+    # The family spans two modules: `strings` holds the pattern rewrites and `string_folds`
+    # the constant folds. The contract is over their union — every name accounted for
+    # exactly once, so a rule cannot be dropped by a split or exported from both halves.
+    exported = [*st.__all__, *sf.__all__]
+    assert len(exported) == len(set(exported)), "a rule is exported from both halves"
+    assert sorted(exported) == _RULE_NAMES == sorted(_RULE_NAMES)
+    assert len(_RULE_NAMES) == 13
 
 
 # --- like_without_wildcards_to_eq -------------------------------------------
@@ -398,79 +405,79 @@ def test_replace_identity_idempotent():
 
 
 def test_upper_of_ascii_literal_folds():
-    out = st.fold_case_of_literal(_proj(StrFunc("upper", Lit("abc"))), None)
+    out = sf.fold_case_of_literal(_proj(StrFunc("upper", Lit("abc"))), None)
     assert _expr_ir(out) == Lit("ABC").to_ir()
 
 
 def test_lower_of_ascii_literal_folds():
-    out = st.fold_case_of_literal(_proj(StrFunc("lower", Lit("AbC"))), None)
+    out = sf.fold_case_of_literal(_proj(StrFunc("lower", Lit("AbC"))), None)
     assert _expr_ir(out) == Lit("abc").to_ir()
 
 
 def test_case_of_non_ascii_literal_does_not_fold():
     # Full Unicode case mapping is the engine's to define, not Python's.
-    assert st.fold_case_of_literal(_proj(StrFunc("upper", Lit("ß"))), None) is None
+    assert sf.fold_case_of_literal(_proj(StrFunc("upper", Lit("ß"))), None) is None
 
 
 def test_case_of_column_does_not_fold():
-    assert st.fold_case_of_literal(_proj(col("s").str.upper()), None) is None
+    assert sf.fold_case_of_literal(_proj(col("s").str.upper()), None) is None
 
 
 def test_fold_case_idempotent():
-    once = st.fold_case_of_literal(_proj(StrFunc("upper", Lit("abc"))), None)
-    assert st.fold_case_of_literal(once, None) is None
+    once = sf.fold_case_of_literal(_proj(StrFunc("upper", Lit("abc"))), None)
+    assert sf.fold_case_of_literal(once, None) is None
 
 
 # --- fold_len_of_literal ----------------------------------------------------
 
 
 def test_len_of_literal_folds_to_character_count():
-    out = st.fold_len_of_literal(_proj(StrFunc("len", Lit("héllo"))), None)
+    out = sf.fold_len_of_literal(_proj(StrFunc("len", Lit("héllo"))), None)
     assert _expr_ir(out) == Lit(5).to_ir()
 
 
 def test_octet_length_of_literal_folds_to_byte_count():
-    out = st.fold_len_of_literal(_proj(StrFunc("octet_length", Lit("héllo"))), None)
+    out = sf.fold_len_of_literal(_proj(StrFunc("octet_length", Lit("héllo"))), None)
     assert _expr_ir(out) == Lit(6).to_ir()
 
 
 def test_bit_length_of_literal_folds():
-    out = st.fold_len_of_literal(_proj(StrFunc("bit_length", Lit("héllo"))), None)
+    out = sf.fold_len_of_literal(_proj(StrFunc("bit_length", Lit("héllo"))), None)
     assert _expr_ir(out) == Lit(48).to_ir()
 
 
 def test_len_of_column_does_not_fold():
-    assert st.fold_len_of_literal(_proj(col("s").str.len()), None) is None
+    assert sf.fold_len_of_literal(_proj(col("s").str.len()), None) is None
 
 
 # --- fold_concat_of_literals ------------------------------------------------
 
 
 def test_concat_of_two_literals_folds():
-    out = st.fold_concat_of_literals(_proj(Binary("concat", Lit("a"), Lit("b"))), None)
+    out = sf.fold_concat_of_literals(_proj(Binary("concat", Lit("a"), Lit("b"))), None)
     assert _expr_ir(out) == Lit("ab").to_ir()
 
 
 def test_concat_chain_of_literals_folds_in_one_pass():
     expr = Binary("concat", Binary("concat", Lit("a"), Lit("b")), Lit("c"))
-    out = st.fold_concat_of_literals(_proj(expr), None)
+    out = sf.fold_concat_of_literals(_proj(expr), None)
     assert _expr_ir(out) == Lit("abc").to_ir()
 
 
 def test_concat_with_a_column_does_not_fold():
-    assert st.fold_concat_of_literals(_proj(Binary("concat", Col("s"), Lit("b"))), None) is None
+    assert sf.fold_concat_of_literals(_proj(Binary("concat", Col("s"), Lit("b"))), None) is None
 
 
 def test_concat_with_an_int_literal_does_not_fold():
     # The engine casts the int to Utf8 with Arrow's formatting, which is not Python's.
-    assert st.fold_concat_of_literals(_proj(Binary("concat", Lit(1), Lit("b"))), None) is None
+    assert sf.fold_concat_of_literals(_proj(Binary("concat", Lit(1), Lit("b"))), None) is None
 
 
 # --- fold_substr_of_literal -------------------------------------------------
 
 
 def test_substr_of_literal_folds():
-    out = st.fold_substr_of_literal(
+    out = sf.fold_substr_of_literal(
         _proj(StrFunc("substr", Lit("abcdef"), start=2, length=3)), None
     )
     assert _expr_ir(out) == Lit("bcd").to_ir()
@@ -478,30 +485,30 @@ def test_substr_of_literal_folds():
 
 def test_substr_of_literal_clips_a_zero_start():
     # DuckDB/engine semantics: the window [0, 2] clips to [1, 2] → 'ab' (not 'abc').
-    out = st.fold_substr_of_literal(
+    out = sf.fold_substr_of_literal(
         _proj(StrFunc("substr", Lit("abcdef"), start=0, length=3)), None
     )
     assert _expr_ir(out) == Lit("ab").to_ir()
 
 
 def test_substr_of_literal_negative_start_counts_from_the_end():
-    out = st.fold_substr_of_literal(
+    out = sf.fold_substr_of_literal(
         _proj(StrFunc("substr", Lit("abcdef"), start=-2, length=4)), None
     )
     assert _expr_ir(out) == Lit("ef").to_ir()
 
 
 def test_substr_of_literal_without_length_runs_to_the_end():
-    out = st.fold_substr_of_literal(_proj(StrFunc("substr", Lit("abcdef"), start=2)), None)
+    out = sf.fold_substr_of_literal(_proj(StrFunc("substr", Lit("abcdef"), start=2)), None)
     assert _expr_ir(out) == Lit("bcdef").to_ir()
 
 
 def test_substr_of_literal_empty_window():
-    out = st.fold_substr_of_literal(
+    out = sf.fold_substr_of_literal(
         _proj(StrFunc("substr", Lit("abcdef"), start=9, length=2)), None
     )
     assert _expr_ir(out) == Lit("").to_ir()
 
 
 def test_substr_of_column_does_not_fold():
-    assert st.fold_substr_of_literal(_proj(col("s").str.substr(2, 3)), None) is None
+    assert sf.fold_substr_of_literal(_proj(col("s").str.substr(2, 3)), None) is None

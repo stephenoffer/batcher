@@ -75,6 +75,39 @@ pub(crate) fn join_batches_with(
     gather_join_output(left, right, &idx, output)
 }
 
+/// Range (inequality) join: one or two inequalities, executed output-sensitively.
+///
+/// The relation is exactly the one the cartesian-product-plus-filter plan produces —
+/// `bc_runtime::join::range_join_indices` is pinned against that oracle — but nothing
+/// quadratic is materialized on the way there. A breaker: both sides are needed whole
+/// because a match is a function of the global sort order on each axis.
+pub(crate) fn range_join_batches(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    conditions: &[bc_ir::RangeCondition],
+    join_type: JoinType,
+    output: &[JoinOutputCol],
+) -> Result<RecordBatch, InterpError> {
+    let left_names: Vec<String> = conditions.iter().map(|c| c.left_key.clone()).collect();
+    let right_names: Vec<String> = conditions.iter().map(|c| c.right_key.clone()).collect();
+    let left_cols = columns_by_name(left, &left_names)?;
+    let right_cols = columns_by_name(right, &right_names)?;
+    let ops: Vec<join::RangeOp> = conditions.iter().map(|c| map_range_op(c.op)).collect();
+    let idx = join::range_join_indices(&left_cols, &right_cols, &ops, map_join_type(join_type))?;
+    gather_join_output(left, right, &idx, output)
+}
+
+/// Wire enum → runtime enum. Separate types because `bc-ir` sits *below* `bc-runtime`
+/// in the crate DAG, so neither can name the other's.
+fn map_range_op(op: bc_ir::RangeOp) -> join::RangeOp {
+    match op {
+        bc_ir::RangeOp::Lt => join::RangeOp::Lt,
+        bc_ir::RangeOp::Le => join::RangeOp::Le,
+        bc_ir::RangeOp::Gt => join::RangeOp::Gt,
+        bc_ir::RangeOp::Ge => join::RangeOp::Ge,
+    }
+}
+
 /// ASOF (nearest-match) join: each left row matched to the right row whose `on` key
 /// is nearest in `direction` within its `by` group. A breaker (both sides fully
 /// materialized), left-style (every left row emitted; unmatched → null right cols).
@@ -220,7 +253,17 @@ fn gather_column(source: &dyn Array, indices: &UInt32Array) -> Result<ArrayRef, 
         })
         .collect::<Result<_, _>>()?;
     let refs: Vec<&dyn Array> = pieces.iter().map(|p| p.as_ref()).collect();
-    Ok(arrow::compute::concat(&refs)?)
+    // `bc_runtime::gather::concat_columns`, not arrow's `concat` — the reassembly is not free
+    // for the column type that most needs the parallel gather above it. Arrow's `concat` drives
+    // `MutableArrayData::extend` once per row, so stitching a `Utf8` column's chunks back
+    // together is a *serial* copy of every byte the parallel `take` just produced, and it
+    // dominates: on the sf10 60M x 15M join, gathering one string build-side column ran the
+    // whole `hash_join` at 40% CPU and 741 ms, against 339 ms at 69% for the same join gathering
+    // an integer column instead. `concat_columns` sums the lengths into the offset buffer and
+    // copies each input's bytes into its own disjoint output slice across cores, and delegates
+    // to arrow for every type (and every offset overflow) it does not fast-path — so this is the
+    // same bytes in the same order, only assembled on more than one core.
+    Ok(bc_runtime::gather::concat_columns(&refs)?)
 }
 
 /// The schema a join's gathered output carries: one nullable field per `output` column,
@@ -550,6 +593,52 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use bc_ir::{JoinStrategy, JoinType};
+
+    /// The identity short-circuit must be invisible: a side whose index buffer is exactly
+    /// `0..n` returns the source column itself, and that must equal what the gather produces.
+    /// A *prefix* of the identity is not the identity — it selects a subset — so the second
+    /// half pins that the short-circuit declines it rather than returning the full column.
+    #[test]
+    fn an_identity_gather_returns_the_source_column_unchanged() {
+        let rows = 6usize;
+        let ident: Vec<u32> = (0..rows as u32).collect();
+        assert!(is_identity_permutation(
+            &UInt32Array::from(ident.clone()),
+            rows
+        ));
+
+        let left = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())) as ArrayRef],
+        )
+        .expect("batch");
+        let idx = join::JoinIndices {
+            left: UInt32Array::from(ident),
+            right: UInt32Array::from(vec![0u32; rows]),
+        };
+        let out = gather_join_output(
+            &left,
+            &left,
+            &idx,
+            &[JoinOutputCol {
+                side: JoinSide::Left,
+                name: "a".into(),
+                alias: "a".into(),
+            }],
+        )
+        .expect("gather");
+        assert_eq!(out.column(0).as_ref(), left.column(0).as_ref());
+
+        // A shorter buffer selects a subset, so it must not be treated as the identity.
+        assert!(!is_identity_permutation(
+            &UInt32Array::from(vec![0u32, 1, 2]),
+            rows
+        ));
+    }
 
     /// The chunked gather must reproduce the single-shot gather **exactly**, not merely as a
     /// multiset — it is what preserves join output order, and a `LIMIT` above the join turns any

@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from batcher._internal.errors import AccessDeniedError
 from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
 
 __all__ = ["SecurityContext", "current_security", "security"]
@@ -94,8 +95,48 @@ def security(
     Yields:
         None. The policy is in effect for the duration of the block.
     """
+    _check_principal_is_acceptable(principal)
     token = _CURRENT.set(SecurityContext(catalog, principal, audit))
     try:
         yield
     finally:
         _CURRENT.reset(token)
+
+
+def _check_principal_is_acceptable(principal: Principal) -> None:
+    """Enforce `governance.require_verified_principal`, and reject expired claims.
+
+    Checked when the block is *entered* rather than at each read: a deployment that
+    requires verified identities wants the failure where the identity was chosen, not
+    buried in the middle of a pipeline.
+
+    Expiry is always checked, regardless of the setting. A principal carrying an `exp` is
+    one a verifier built from a credential, and honouring that expiry costs nothing —
+    whereas ignoring it would let a long-running process keep acting on an identity whose
+    token lapsed hours ago.
+
+    Args:
+        principal: The identity the block will run as.
+
+    Raises:
+        AccessDeniedError: If verification is required and the principal is unverified, or
+            if the principal's claims have expired.
+    """
+    from batcher.config import active_config
+
+    if principal.expired():
+        raise AccessDeniedError(
+            f"The claims for principal {principal.name!r} have expired.",
+            hint="Re-authenticate to obtain a fresh credential.",
+        )
+    if not active_config().governance.require_verified_principal:
+        return
+    if not principal.verified:
+        raise AccessDeniedError(
+            f"Principal {principal.name!r} was asserted, not verified, and "
+            "`governance.require_verified_principal` is on.",
+            hint=(
+                "Build the principal with a verifier — bt.authenticate(credential) — "
+                "rather than constructing it directly."
+            ),
+        )

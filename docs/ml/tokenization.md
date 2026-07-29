@@ -207,7 +207,7 @@ running it every epoch is pure waste.
 
 ## See also
 
-- [Preprocessors](preprocessors.md): the fit and transform contract, and the rest of the family.
+- [Preprocessors](preprocessors/index.md): the fit and transform contract, and the rest of the family.
 - [LLM inference](llm.md): generation over the tokens, and sequence packing in context.
 - [Data loaders](data-loaders.md): getting the token column into a training loop.
 - [Distributed training](distributed-training.md): the loader that reads the tokens you

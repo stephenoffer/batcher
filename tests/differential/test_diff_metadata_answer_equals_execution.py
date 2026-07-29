@@ -101,3 +101,58 @@ def test_metadata_answer_matches_duckdb(duck, column, agg):
     }[agg]
     want = duck.sql(sql).to_arrow_table()
     assert_tables_equal(got, want)
+
+
+# --- a filtered count answered from metadata, against the rows the filter really keeps ---
+
+#: Fractional literals against an integer column. `pa.scalar(-2.5, int64)` is `-2`, so a
+#: predicate typed to the column's type stops meaning what the caller wrote.
+_FRACTIONAL = [-2.5, -0.5, -0.1, 0.1, 0.5, 2.5]
+_INT_ROWS = list(range(-5, 6))
+
+
+@pytest.mark.parametrize("literal", _FRACTIONAL)
+@pytest.mark.parametrize("op", ["gt", "ge", "lt", "le", "eq", "ne"])
+def test_a_filtered_count_matches_the_rows_that_filter_keeps(op, literal):
+    """`count()` is answered from metadata; it must equal materializing the same filter.
+
+    `column_predicate_count` built its comparison scalar with the *column's* type, so on an
+    Int64 column a fractional literal was truncated toward zero before the count was taken.
+    ``n > -0.5`` was counted as ``n > 0`` and silently lost every row where ``n == 0``, and
+    ``n == -2.5`` — which no integer can satisfy — counted the rows equal to `-2`. Because
+    this answers `COUNT(*)` *without executing*, the count contradicted the rows the very
+    same filter returns: `count()` said 1 where `to_pydict()` returned nothing.
+    """
+    import operator
+
+    py_op = {
+        "gt": operator.gt, "ge": operator.ge, "lt": operator.lt,
+        "le": operator.le, "eq": operator.eq, "ne": operator.ne,
+    }[op]  # fmt: skip
+    ds = bt.from_arrow(pa.table({"n": pa.array(_INT_ROWS, pa.int64())}))
+    predicate = getattr(bt.col("n"), f"__{op}__")(literal)
+    filtered = ds.filter(predicate)
+
+    shortcut = filtered.count()
+    materialized = len(filtered.to_pydict()["n"])
+    expected = sum(1 for v in _INT_ROWS if py_op(v, literal))
+
+    assert shortcut == materialized, (
+        f"count() said {shortcut} but the filter returns {materialized} rows"
+    )
+    assert shortcut == expected, f"n {op} {literal}: got {shortcut}, expected {expected}"
+
+
+def test_an_integer_column_never_equals_a_fractional_literal():
+    """The starkest shape: no integer is `-2.5`, so the count must be zero, not the count of -2."""
+    ds = bt.from_arrow(pa.table({"n": pa.array([-3, -2, -2, -1, 0], pa.int64())}))
+    assert ds.filter(bt.col("n") == -2.5).count() == 0
+    assert ds.filter(bt.col("n") != -2.5).count() == 5
+
+
+@pytest.mark.parametrize("literal", [2, 2.5, -3])
+def test_a_lossless_literal_still_takes_the_metadata_path(literal):
+    """The guard must not disturb the case it was already right about."""
+    ds = bt.from_arrow(pa.table({"f": pa.array([1.5, 2.5, 3.5, 10.0], pa.float64())}))
+    filtered = ds.filter(bt.col("f") > literal)
+    assert filtered.count() == len(filtered.to_pydict()["f"])

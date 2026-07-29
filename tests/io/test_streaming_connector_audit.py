@@ -464,10 +464,17 @@ class _SpyPubSubClient:
     def __init__(self, batches: list[list[str]]) -> None:
         self._batches = list(batches)
         self.acked: list[str] = []
+        self.timeouts: list[object] = []
 
-    def pull(self, request: dict) -> Any:
+    # `timeout` is what stops an idle subscription blocking the poll loop forever, so the
+    # double has to accept it exactly as `SubscriberClient.pull` does. It did not, and the
+    # mismatch made both Pub/Sub acknowledgement tests fail with a `TypeError` rather than
+    # checking anything about acknowledgement.
+    def pull(self, request: dict, timeout: object = None) -> Any:
         import datetime
         import types
+
+        self.timeouts.append(timeout)
 
         ids = self._batches.pop(0) if self._batches else []
         received = [
@@ -520,6 +527,9 @@ def test_pubsub_acknowledges_after_the_publish():
     next(it)
     next(it)  # publishes epoch 1, then pulls epoch 2
     assert client.acked == ["ack-m1", "ack-m2"], "ack did not track the publish"
+    # And every pull carried a deadline: without one an idle subscription blocks the poll
+    # loop indefinitely instead of returning empty and letting the trigger fire again.
+    assert all(t is not None for t in client.timeouts), "a pull went out with no timeout"
 
 
 def test_pubsub_offsets_are_stable_across_processes():

@@ -14,13 +14,23 @@ by every shuffle shape.
 
 from __future__ import annotations
 
+import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
+from batcher._internal import events
 from batcher._internal.errors import ResourceError
 
 __all__ = ["RecoveryPolicy", "ShuffleRecovery"]
+
+# Ceiling on one backoff sleep, however many rounds have elapsed. `base * 2**round` is
+# unbounded in the exponent, so a policy configured with a generous base and a generous
+# attempt budget can put a reducer to sleep for longer than the query it is recovering —
+# and a worker that is coming back does so on cluster-restart timescales, not exponential
+# ones. Capping keeps the decorrelation the backoff exists for while bounding the wait.
+_MAX_BACKOFF_S = 30.0
 
 _Result = TypeVar("_Result")
 _Failed = TypeVar("_Failed")
@@ -50,8 +60,18 @@ class ShuffleRecovery:
     clean run) — useful telemetry and a test hook.
     """
 
-    def __init__(self, policy: RecoveryPolicy | None = None) -> None:
+    def __init__(self, policy: RecoveryPolicy | None = None, *, label: str = "") -> None:
+        """Build a recovery loop.
+
+        Args:
+            policy: How many rounds to try and how long to back off between them.
+            label: Which shuffle this is (``aggregate``/``join``/``sort``/``window``).
+                Carried on the events this loop publishes — without it a recompute is
+                observable but unattributable, which on a plan with three shuffles is
+                barely better than not seeing it.
+        """
         self._policy = policy or RecoveryPolicy()
+        self._label = label
         self.recomputes = 0
 
     def run(
@@ -79,18 +99,36 @@ class ShuffleRecovery:
                 break
             recompute(failed)
             self.recomputes += 1
+            # The one signal that distinguishes "this query transparently survived worker
+            # loss" from "this query was mysteriously slow". Published per *failure*, so it
+            # costs nothing on the clean path.
+            events.publish(
+                events.RECOVERY,
+                name=self._label,
+                event="recompute",
+                shuffle=self._label,
+                round=round_idx,
+                attempt_budget=self._policy.max_attempts,
+                failed=str(failed),
+            )
             # Exponential backoff before the next round so a flaky network/cluster
             # is not hammered in a tight recompute→retry loop. Equal jitter
             # (`half + U[0, half]`) keeps at least half the backoff while decorrelating
             # a correlated preemption wave's retries, so survivors aren't stampeded by
             # every lost reducer retrying at the same instant.
             if self._policy.backoff_base_s > 0:
-                import random
-                import time
-
-                ceiling = self._policy.backoff_base_s * (2**round_idx)
+                ceiling = min(self._policy.backoff_base_s * (2**round_idx), _MAX_BACKOFF_S)
                 half = ceiling / 2.0
                 time.sleep(half + random.uniform(0.0, half))
+        events.publish(
+            events.RECOVERY,
+            name=self._label,
+            event="give_up",
+            shuffle=self._label,
+            round=self._policy.max_attempts,
+            attempt_budget=self._policy.max_attempts,
+            failed=str(failed),
+        )
         raise ResourceError(
             f"shuffle did not recover after {self._policy.max_attempts} attempts "
             f"(still unreachable: {failed})"

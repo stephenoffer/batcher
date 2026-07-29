@@ -51,13 +51,19 @@ class SourcePlacement:
     second failure of a relocated source recoverable.
     """
 
-    __slots__ = ("_hosts", "_workers")
+    __slots__ = ("_hosts", "_on_host", "_workers")
 
     def __init__(self, workers: int) -> None:
         self._workers = workers
         # Only relocated sources are stored; an absent entry means "still on its own
         # worker", so a clean run allocates nothing and behaves exactly as before.
         self._hosts: dict[int, int] = {}
+        # The reverse index: host -> the relocated sources it now holds. Maintained rather
+        # than derived because `sources_on` is asked once per worker death, and deriving it
+        # meant walking every source in the fleet to ask where each one lives — an O(W)
+        # scan per failure, on a path that only runs when the cluster is already losing
+        # workers and a correlated preemption wave can be losing many at once.
+        self._on_host: dict[int, set[int]] = {}
 
     def host_of(self, src: int) -> int:
         """The worker holding `src`'s latest output — `src` itself until it moves."""
@@ -68,9 +74,30 @@ class SourcePlacement:
 
         A dead worker loses the map output it was holding, but which source that is
         depends on the current placement rather than on the host id.
+
+        Args:
+            host: The worker index.
+
+        Returns:
+            The source ids whose latest output is on `host`.
         """
-        return {s for s in range(self._workers) if self.host_of(s) == host}
+        out = set(self._on_host.get(host, ()))
+        # `host` still holds its own source unless that one was itself relocated away.
+        if 0 <= host < self._workers and host not in self._hosts:
+            out.add(host)
+        return out
 
     def relocate(self, src: int, host: int) -> None:
-        """Record that `src` was recomputed onto `host`."""
+        """Record that `src` was recomputed onto `host`.
+
+        Args:
+            src: The source whose output was regenerated.
+            host: The worker it now lives on.
+        """
+        previous = self._hosts.get(src, src)
+        if previous in self._on_host:
+            self._on_host[previous].discard(src)
+            if not self._on_host[previous]:
+                del self._on_host[previous]
         self._hosts[src] = host
+        self._on_host.setdefault(host, set()).add(src)

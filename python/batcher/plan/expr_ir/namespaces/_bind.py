@@ -133,13 +133,14 @@ _DESCRIPTIONS: dict[str, str] = {
     ),
     "dayofweek": (
         "The day of week, Sunday = 0 through Saturday = 6.\n\n"
+        "For ISO numbering use ``isodow``; they differ only on Sunday, as the example is.\n\n"
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.dayofweek()).to_pydict()\n'
-        "        {'r': [4]}"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.dayofweek()).to_pydict()  # a Sunday\n'
+        "        {'r': [0]}"
     ),
     "dayofyear": (
         "The day of year, 1 through 366.\n\n"
@@ -183,13 +184,14 @@ _DESCRIPTIONS: dict[str, str] = {
     ),
     "isodow": (
         "The ISO day of week, Monday = 1 through Sunday = 7.\n\n"
+        "For the DuckDB numbering (Sunday = 0 through Saturday = 6) use ``dayofweek``.\n\n"
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.isodow()).to_pydict()\n'
-        "        {'r': [4]}"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.isodow()).to_pydict()  # a Sunday\n'
+        "        {'r': [7]}"
     ),
     "century": (
         "The century, e.g. 2021 → 21.\n\n"
@@ -222,14 +224,14 @@ _DESCRIPTIONS: dict[str, str] = {
         "        {'r': [3]}"
     ),
     "last_day": (
-        "The last day of the month at 00:00:00 (→ Timestamp).\n\n"
+        "The last day of the instant's month (→ Date).\n\n"
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
         '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
         '        >>> ds.select(r=bt.col("d").dt.last_day()).to_pydict()\n'
-        "        {'r': [datetime.datetime(2024, 2, 29, 0, 0)]}"
+        "        {'r': [datetime.date(2024, 2, 29)]}"
     ),
     # --- .list per-row reductions over each list value ----------------------
     # The reductions return null on an empty or null list; len/n_unique return 0
@@ -250,7 +252,7 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> import batcher as bt\n"
         '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.sum()).to_pydict()\n'
-        "        {'r': [6.0]}"
+        "        {'r': [6]}"
     ),
     "min": (
         "The smallest element of each list.\n\n"
@@ -259,7 +261,7 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> import batcher as bt\n"
         '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.min()).to_pydict()\n'
-        "        {'r': [1.0]}"
+        "        {'r': [1]}"
     ),
     "max": (
         "The largest element of each list.\n\n"
@@ -268,7 +270,7 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> import batcher as bt\n"
         '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.max()).to_pydict()\n'
-        "        {'r': [3.0]}"
+        "        {'r': [3]}"
     ),
     "mean": (
         "The arithmetic mean of the elements of each list (→ Float64).\n\n"

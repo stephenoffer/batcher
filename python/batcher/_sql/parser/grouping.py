@@ -7,6 +7,8 @@ their first argument.
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._internal.errors import PlanError
 from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs, sort_for_ordered_aggs
 from batcher._sql.parser.core_utils import (
@@ -16,6 +18,12 @@ from batcher._sql.parser.core_utils import (
     _unwrap_alias,
 )
 from batcher._sql.parser.expressions import _AGG_FUNCS
+from batcher._sql.parser.expressions.aggregates import (
+    build_anon_agg,
+    build_typed_agg,
+    is_agg_node,
+    iter_agg_nodes,
+)
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, Expr, col
 from batcher.plan.expr_ir.selectors import expand_selectors, has_selector
@@ -61,8 +69,6 @@ def _expand_star(tr, star, visible: list[str]) -> dict[str, Expr]:
 
 
 def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
-    from sqlglot import expressions as exp
-
     named: dict[str, Expr] = {}
     for p in projections:
         # `SELECT *` (Star) or `SELECT t.*` (a Column wrapping a Star) → keep
@@ -103,16 +109,12 @@ def _is_group_agg(a) -> bool:
 
     An aggregate inside a (scalar) subquery belongs to that inner query, not this one.
     """
-    from sqlglot import expressions as exp
-
     if isinstance(a.parent, exp.Window):
         return False
     return a.find_ancestor(exp.Subquery) is None
 
 
 def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=None) -> tuple:
-    from sqlglot import expressions as exp
-
     # Plain (non-ROLLUP/CUBE/GROUPING SETS) GROUP BY: no level is ever rolled up, so
     # GROUPING(...) is the constant 0. (The grouping-sets path handles it per level.)
     scopes = [*projections, having.this] if having is not None else list(projections)
@@ -182,20 +184,20 @@ def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=
     used_aliases = set(group_cols) | set(group_exprs)
     for p in projections:
         inner = _unwrap_alias(p)
-        if isinstance(inner, exp.AggFunc):
+        if is_agg_node(inner):
             _register_agg(tr, inner, _alias_of(p), used_aliases)
         else:
-            for a in inner.find_all(exp.AggFunc):
+            for a in iter_agg_nodes(inner):
                 if _is_group_agg(a):
                     _register_agg(tr, a, None, used_aliases)
     # A window item's *inner* aggregates are group aggregates feeding the window, so
     # they must be registered here alongside the SELECT list's own.
     for w in windows or ():
-        for a in _unwrap_alias(w).find_all(exp.AggFunc):
+        for a in iter_agg_nodes(_unwrap_alias(w)):
             if _is_group_agg(a):
                 _register_agg(tr, a, None, used_aliases)
     if having is not None:
-        for a in having.this.find_all(exp.AggFunc):
+        for a in iter_agg_nodes(having.this):
             if _is_group_agg(a):
                 _register_agg(tr, a, None, used_aliases)
     # An aggregate the query only ever names in ORDER BY (`... ORDER BY MIN(x)`) still
@@ -203,7 +205,7 @@ def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=
     # registered here, materialized as an internal column, and dropped by the projection
     # that follows the sort.
     for o in order.expressions if order is not None else ():
-        for a in o.find_all(exp.AggFunc):
+        for a in iter_agg_nodes(o):
             if _is_group_agg(a):
                 _register_agg(tr, a, None, used_aliases)
 
@@ -274,8 +276,6 @@ def _distinct_on(tr, ds: Dataset, projections, order, on_exprs) -> Dataset:
     sort expressions are materialized as internal ``__bc_`` columns first so they stay
     resolvable even when absent from the SELECT list, and never leak through ``SELECT *``.
     """
-    from sqlglot import expressions as exp
-
     on_cols: list[str] = []
     temp: dict[str, Expr] = {}
     for i, e in enumerate(on_exprs):
@@ -333,9 +333,15 @@ def _register_agg(tr, node, preferred: str | None, used: set) -> None:
         tr._agg_distinct[alias] = tr._agg_pending_distinct.pop()
 
 
-def _agg(tr, node) -> AggExpr:
-    from sqlglot import expressions as exp
-
+def _agg(tr, node) -> AggExpr | Expr:
+    if isinstance(node, exp.Anonymous):
+        # A DuckDB aggregate sqlglot does not model (`product`, `sem`, `count_star`, …).
+        return build_anon_agg(tr, node)
+    typed = build_typed_agg(tr, node)
+    if typed is not None:
+        # Two-input (`corr`, `arg_max`, `regr_*`) or composite (`stddev_pop`, `sem`)
+        # aggregates, which a name-to-tag table cannot express.
+        return typed
     fname = type(node).__name__.lower()
     if fname == "count":
         # COUNT(*) vs COUNT(expr) vs COUNT(DISTINCT expr)

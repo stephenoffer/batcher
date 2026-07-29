@@ -11,12 +11,13 @@ for choosing/deriving the full output, `with_columns` for adding/replacing.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float, require_int
 from batcher.api._join_helpers import (
     _as_expr,
     _as_key_expr,
@@ -62,11 +63,8 @@ from batcher.api.dataset.compat import (
     build_last,
     build_memory_usage,
 )
-from batcher.api.dataset.dq import DatasetDQ
-from batcher.api.dataset.meta import DatasetMeta
-from batcher.api.dataset.ml import DatasetML
-from batcher.api.dataset.scd import DatasetSCD
 from batcher.api.groupby import GroupBy
+from batcher.api.multi_group import MultiLevelGroupBy, cube_levels, rollup_levels
 from batcher.api.terminal import (
     _collect,
     _count,
@@ -103,6 +101,10 @@ from batcher.plan.schema import suggest_columns
 from batcher.plan.streaming import Watermark
 
 if TYPE_CHECKING:
+    from batcher.api.dataset.dq import DatasetDQ
+    from batcher.api.dataset.meta import DatasetMeta
+    from batcher.api.dataset.ml import DatasetML
+    from batcher.api.dataset.scd import DatasetSCD
     from batcher.api.io_namespace import Writer
     from batcher.api.stats import RunStats
 
@@ -243,6 +245,34 @@ def _reject_sliding_window_key(alias: str, expr: Expr) -> None:
             f".explode({alias!r}).group_by({alias!r}).agg(...)\n"
             "A tumbling window (no slide) is a single start and can be grouped directly."
         )
+
+
+def _multiset_sortable(schema: pa.Schema) -> bool:
+    """Whether sorting by every column is a sound way to compare two relations as multisets.
+
+    `Dataset.equals(ordered=False)` asks whether two results hold the same rows in any
+    order. Sorting both by all columns answers that in compiled Arrow code — but only for
+    types where the sort's ordering and Arrow's equality agree on which values are the
+    same value. Three families where they do not:
+
+    - **Floating point.** Arrow's equality treats ``-0.0 == 0.0`` and ``NaN != NaN``,
+      neither of which the row-wise comparison does, so the two spellings disagree in
+      *both* directions on exactly the ``-0.0``/``NaN`` edge cases the engine is
+      elsewhere careful about.
+    - **Nested types** (list, map). `sort_indices` raises on them outright.
+    - **Dictionary-encoded** columns. `sort_indices` is not implemented for them.
+
+    Anything not provably in the clear falls back to the row-wise comparison, which is
+    slower but is the behavior that shipped.
+    """
+    return all(
+        not (
+            pa.types.is_floating(field.type)
+            or pa.types.is_nested(field.type)
+            or pa.types.is_dictionary(field.type)
+        )
+        for field in schema
+    )
 
 
 class Dataset:
@@ -817,7 +847,7 @@ class Dataset:
             items.append(Projection(alias, _as_expr(expr)))
         if not items:
             raise PlanError(_empty_projection_message("select", columns))
-        return windowed_project(self, items)
+        return windowed_project(self, items, collapse=True)
 
     def with_columns(self, *exprs: Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Add or replace columns, keeping all existing ones.
@@ -1018,6 +1048,12 @@ class Dataset:
                 >>> ds.ml.map(lambda r: {"x": r["x"] * 10}).to_pydict()
                 {'x': [10, 20, 30]}
         """
+        # Imported here, not at module scope: the four accessor namespaces pull in the ML,
+        # data-quality, metadata-shortcut, and SCD stacks — and through the metadata one,
+        # the whole optimizer — none of which a pipeline that never touches an accessor
+        # needs. Deferring them is most of what `import batcher` used to spend.
+        from batcher.api.dataset.ml import DatasetML
+
         return DatasetML(self)
 
     @property
@@ -1041,6 +1077,8 @@ class Dataset:
                 >>> ds.dq.in_range("age", 0, 120).drop().to_pydict()
                 {'id': [1], 'age': [30]}
         """
+        from batcher.api.dataset.dq import DatasetDQ
+
         return DatasetDQ(self)
 
     @property
@@ -1069,6 +1107,8 @@ class Dataset:
                 >>> ds.meta.none_match(bt.col("x") > 100)
                 True
         """
+        from batcher.api.dataset.meta import DatasetMeta
+
         return DatasetMeta(self)
 
     @property
@@ -1089,6 +1129,8 @@ class Dataset:
                 >>> hasattr(ds.scd, "type2")
                 True
         """
+        from batcher.api.dataset.scd import DatasetSCD
+
         return DatasetSCD(self)
 
     def map_batches(
@@ -1097,11 +1139,19 @@ class Dataset:
         *,
         batch_size: int | None = None,
         input_columns: list[str] | None = None,
+        preserves_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
-        concurrency: int | None = None,
+        concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
+        fn_args: tuple | None = None,
+        fn_kwargs: dict | None = None,
+        fn_constructor_args: tuple | None = None,
+        fn_constructor_kwargs: dict | None = None,
+        accelerator_type: str | None = None,
+        resources: dict[str, float] | None = None,
+        model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
         timeout: float = 0.0,
@@ -1112,7 +1162,9 @@ class Dataset:
     ) -> Dataset:
         """Apply a Python function to each Arrow batch (sugar for `ds.ml.map_batches`).
 
-        Kept top-level for the familiar spelling; see `ds.ml` for the full ML surface.
+        Kept top-level for the familiar spelling, and it now forwards every option
+        `ds.ml.map_batches` accepts, so reaching the accessor is a matter of taste rather
+        than a requirement. See `ds.ml` for the fuller explanation of each.
 
         `num_workers` defaults to ``"auto"`` — the per-batch calls fan across all
         local cores, so a batch transform is parallel by default rather than
@@ -1126,11 +1178,22 @@ class Dataset:
             input_columns: The columns `fn` reads, letting projection pushdown prune the
                 scan to just those; ``None`` keeps every column alive. Omitting one `fn`
                 does read is a correctness bug — it gets pruned out from under it.
+            preserves_columns: The columns `fn` returns unchanged, which lets a later
+                `filter` on them run *below* the UDF so the model scores fewer rows.
+                Naming a column `fn` rewrites changes the result.
             output_columns: The output column names, when `fn` reshapes the schema.
             num_workers: Worker fan-out; ``"auto"`` spreads across local cores.
             num_gpus: GPUs reserved per worker.
-            concurrency: Maximum concurrent workers; ``None`` lets the engine choose.
+            concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: The batch type passed to `fn` (``"pyarrow"`` by default).
+            fn_args: Positional arguments appended to every call: ``fn(batch, *fn_args)``.
+            fn_kwargs: Keyword arguments forwarded to every ``fn(batch, ...)`` call.
+            fn_constructor_args: Positional arguments for a class `fn`'s one-per-worker
+                construction, such as a checkpoint path.
+            fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
+            accelerator_type: Pin actors to a device model (e.g. ``"NVIDIA_A100"``).
+            resources: Custom Ray resources per worker, e.g. ``{"TPU": 4}``.
+            model_memory_gb: The model's footprint, for memory budgeting.
             multiprocessing: Use processes instead of threads for a CPU-bound `fn`.
             max_errored_rows: How many per-row errors to tolerate before failing.
             timeout: Wall-clock ceiling (seconds) for one `fn` call; 0 = no timeout.
@@ -1157,11 +1220,19 @@ class Dataset:
             fn,
             batch_size=batch_size,
             input_columns=input_columns,
+            preserves_columns=preserves_columns,
             output_columns=output_columns,
             num_workers=num_workers,
             num_gpus=num_gpus,
             concurrency=concurrency,
             batch_format=batch_format,
+            fn_args=fn_args,
+            fn_kwargs=fn_kwargs,
+            fn_constructor_args=fn_constructor_args,
+            fn_constructor_kwargs=fn_constructor_kwargs,
+            accelerator_type=accelerator_type,
+            resources=resources,
+            model_memory_gb=model_memory_gb,
             multiprocessing=multiprocessing,
             max_errored_rows=max_errored_rows,
             timeout=timeout,
@@ -1507,8 +1578,12 @@ class Dataset:
         available = self._plan.available_columns()
         if callable(mapping):
             renamed = {c: mapping(c) for c in available}
-            produced = list(renamed.values())
-            collisions = sorted({n for n in produced if produced.count(n) > 1})
+            # One counting pass, not a `list.count()` per element: the latter is quadratic
+            # in the column count, and `rename(str.lower)` over a wide relation is exactly
+            # the call that would hit it hardest — thousands of columns, and the collision
+            # check running longer than everything else the rename does.
+            produced = Counter(renamed.values())
+            collisions = sorted(name for name, n in produced.items() if n > 1)
             if collisions:
                 raise PlanError(
                     f"rename(): the function maps several columns onto {collisions}; "
@@ -1617,8 +1692,8 @@ class Dataset:
         """
         if num_files is not None and target_size_mb is not None:
             raise PlanError("repartition(): pass num_files or target_size_mb, not both")
-        if num_files is not None and num_files < 1:
-            raise PlanError(f"repartition(): num_files must be >= 1, got {num_files}")
+        if num_files is not None:
+            num_files = require_int(num_files, func="repartition", arg="num_files", minimum=1)
         if target_size_mb is not None and target_size_mb <= 0:
             raise PlanError(f"repartition(): target_size_mb must be > 0, got {target_size_mb}")
         by_cols = () if by is None else ((by,) if isinstance(by, str) else tuple(by))
@@ -1766,6 +1841,7 @@ class Dataset:
                 >>> ds.top_k(2, "x").to_pydict()
                 {'x': [5, 4]}
         """
+        k = require_int(k, func="top_k", arg="k", minimum=0)
         keys = by if isinstance(by, list) else [by]
         return self.sort(*keys, descending=descending).limit(k)
 
@@ -2458,8 +2534,8 @@ class Dataset:
                 >>> ds.sort("x").limit(2, offset=1).to_pydict()
                 {'x': [2, 3]}
         """
-        if n < 0 or offset < 0:
-            raise PlanError("limit() requires non-negative n and offset")
+        n = require_int(n, func="limit", arg="n", minimum=0)
+        offset = require_int(offset, func="limit", arg="offset", minimum=0)
         return self._derive(Limit(self._plan, n, offset))
 
     def head(self, n: int = 5) -> Dataset:
@@ -2540,10 +2616,8 @@ class Dataset:
                 >>> bt.from_pydict({"x": [10, 20, 30, 40, 50]}).gather_every(2).to_pydict()
                 {'x': [10, 30, 50]}
         """
-        if n < 1:
-            raise PlanError(f"gather_every(): n must be >= 1, got {n}")
-        if offset < 0:
-            raise PlanError(f"gather_every(): offset must be non-negative, got {offset}")
+        n = require_int(n, func="gather_every", arg="n", minimum=1)
+        offset = require_int(offset, func="gather_every", arg="offset", minimum=0)
         idx = "__bc_gather_idx"
         keep = (Col(idx) >= offset) & ((Col(idx) - offset) % n == 0)
         return self.with_row_index(idx).filter(keep).drop(idx)
@@ -2587,7 +2661,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [5, 3, 8, 1]}).bottom_k(2, "x").sort("x").to_pydict()
                 {'x': [1, 3]}
         """
-        return self.top_k(k, by, descending=False)
+        return self.top_k(require_int(k, func="bottom_k", arg="k"), by, descending=False)
 
     def slice(self, offset: int, length: int | None = None) -> Dataset:
         """Rows ``[offset, offset + length)`` — the Polars ``slice`` spelling of ``limit``.
@@ -2606,8 +2680,8 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).slice(1, 2).to_pydict()
                 {'x': [2, 3]}
         """
-        if length is None:
-            length = self.count()
+        offset = require_int(offset, func="slice", arg="offset")
+        length = self.count() if length is None else require_int(length, func="slice", arg="length")
         return self.limit(length, offset)
 
     def melt(
@@ -2935,6 +3009,16 @@ class Dataset:
             return False
         if ordered:
             return left.equals(right)
+        if left.num_rows != right.num_rows:
+            return False
+        # Two multisets are equal iff sorting both by every column yields identical
+        # relations, and Arrow sorts in compiled code over its own buffers. The row-wise
+        # spelling this replaces (`sorted(map(repr, table.to_pylist()))`) built a Python
+        # dict and a string per row on each side — a per-row touch in the control plane,
+        # and 33x slower on a million rows.
+        if _multiset_sortable(left.schema):
+            keys = [(name, "ascending") for name in left.schema.names]
+            return left.sort_by(keys).equals(right.sort_by(keys))
         return sorted(map(repr, left.to_pylist())) == sorted(map(repr, right.to_pylist()))
 
     # --- interoperability protocols ---------------------------------------------------
@@ -3160,7 +3244,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2]}).coalesce(1).count()
                 2
         """
-        return self.repartition(n)
+        return self.repartition(require_int(n, func="coalesce", arg="n", minimum=1))
 
     def lazy(self) -> Dataset:
         """Return this dataset unchanged — a `Dataset` is always lazy.
@@ -3521,7 +3605,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [5, 3, 8]}).nlargest(2, "x").sort("x").to_pydict()
                 {'x': [5, 8]}
         """
-        return self.top_k(n, columns)
+        return self.top_k(require_int(n, func="nlargest", arg="n"), columns)
 
     def nsmallest(self, n: int, columns: str | list[str]) -> Dataset:
         """The `n` rows with the smallest `columns` — the pandas ``nsmallest``.
@@ -3540,7 +3624,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [5, 3, 8]}).nsmallest(2, "x").sort("x").to_pydict()
                 {'x': [3, 5]}
         """
-        return self.bottom_k(n, columns)
+        return self.bottom_k(require_int(n, func="nsmallest", arg="n"), columns)
 
     def round(self, decimals: int = 0) -> Dataset:
         """Round every numeric column to `decimals` places — the pandas ``round``.
@@ -3688,7 +3772,7 @@ class Dataset:
                 >>> 0 < ds.sample_frac(0.5, seed=1).count() < 100
                 True
         """
-        return self.sample(fraction=frac, seed=seed)
+        return self.sample(fraction=require_float(frac, func="sample_frac", arg="frac"), seed=seed)
 
     def drop_constant_columns(self) -> Dataset:
         """Drop every column holding a single distinct value — the zero-variance filter.
@@ -3824,8 +3908,7 @@ class Dataset:
         """
         from batcher.plan.expr_ir.nodes import row_number
 
-        if n < 1:
-            raise PlanError(f"sample_per_group(): n must be >= 1, got {n}")
+        n = require_int(n, func="sample_per_group", arg="n", minimum=1)
         keys = [by] if isinstance(by, str) else list(by)
         order = order_by if order_by is not None else keys[0]
         rank = "__bc_group_rank"
@@ -4365,6 +4448,104 @@ class Dataset:
             _reject_sliding_window_key(alias, expr)
         return GroupBy(self, keys, named)
 
+    def rollup(self, *keys: str) -> MultiLevelGroupBy:
+        """Aggregate at every prefix of `keys`, plus the grand total (SQL ``ROLLUP``).
+
+        The subtotal report: ``ds.rollup("region", "city").agg(total=col("v").sum())``
+        returns a row per (region, city), a row per region with `city` null, and one
+        grand-total row with both null. An inactive key reads as NULL, which is how SQL
+        marks a subtotal row.
+
+        Args:
+            *keys: The rollup key columns, most significant first.
+
+        Returns:
+            A `MultiLevelGroupBy` to finish with ``.agg(...)``.
+
+        Raises:
+            PlanError: If a key is not a column of this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"r": ["e", "e", "w"], "v": [1, 2, 4]})
+                >>> ds.rollup("r").agg(n=bt.col("v").sum()).sort("r").to_pydict()
+                {'r': ['e', 'w', None], 'n': [3, 4, 7]}
+        """
+        self._check_group_keys(keys, "rollup")
+        return MultiLevelGroupBy(self, keys, rollup_levels(keys))
+
+    def cube(self, *keys: str) -> MultiLevelGroupBy:
+        """Aggregate at every *subset* of `keys` (SQL ``CUBE``).
+
+        The cross-tabulation: every combination of the keys, from all of them down to
+        the grand total, so a two-key cube gives per-pair, per-first, per-second and
+        overall rows. Costs 2ⁿ levels, so keep `n` small.
+
+        Args:
+            *keys: The cube key columns.
+
+        Returns:
+            A `MultiLevelGroupBy` to finish with ``.agg(...)``.
+
+        Raises:
+            PlanError: If a key is not a column of this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": ["x"], "b": ["y"], "v": [2]})
+                >>> len(ds.cube("a", "b").agg(n=bt.col("v").sum()).to_pydict()["n"])
+                4
+        """
+        self._check_group_keys(keys, "cube")
+        return MultiLevelGroupBy(self, keys, cube_levels(keys))
+
+    def grouping_sets(self, *sets: Sequence[str]) -> MultiLevelGroupBy:
+        """Aggregate at exactly the grouping levels given (SQL ``GROUPING SETS``).
+
+        The explicit form the other two are shorthands for: each argument is one level's
+        key list, and ``()`` is the grand total. Use it when the levels you want are not
+        a prefix chain or a full cube.
+
+        Args:
+            *sets: One key-name sequence per grouping level.
+
+        Returns:
+            A `MultiLevelGroupBy` to finish with ``.agg(...)``.
+
+        Raises:
+            PlanError: If a key is not a column of this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": ["x", "x"], "b": ["y", "z"], "v": [1, 2]})
+                >>> out = ds.grouping_sets(["a"], ["b"], []).agg(n=bt.col("v").sum())
+                >>> sorted(out.to_pydict()["n"])
+                [1, 2, 3, 3]
+        """
+        levels = [tuple(level) for level in sets]
+        keys: list[str] = []
+        for level in levels:
+            keys.extend(k for k in level if k not in keys)
+        self._check_group_keys(tuple(keys), "grouping_sets")
+        return MultiLevelGroupBy(self, tuple(keys), levels)
+
+    def _check_group_keys(self, keys: tuple[str, ...], what: str) -> None:
+        """Reject a non-column key with the same message `group_by` uses."""
+        available = set(self._plan.available_columns())
+        for k in keys:
+            if not isinstance(k, str) or k not in available:
+                cols = sorted(available)
+                raise PlanError(
+                    f"{what}() key {k!r} is not a column; available: {cols}"
+                    f"{suggest_columns(str(k), cols)}"
+                )
+
     def agg(self, *aggs: Expr, **aggregates: Expr) -> Dataset:
         """Aggregate over the whole dataset (no grouping).
 
@@ -4888,7 +5069,7 @@ class Dataset:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).corr("a", "b")
+                >>> round(bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).corr("a", "b"), 6)
                 1.0
         """
         from batcher.plan.functions.aggregate import corr
@@ -5148,6 +5329,7 @@ class Dataset:
                 >>> ds.approx_quantile("x", 0.5) is not None
                 True
         """
+        q = require_float(q, func="approx_quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"approx_quantile(q) requires q in [0, 1], got {q}")
         self._require_column(column, "approx_quantile")
@@ -5202,6 +5384,7 @@ class Dataset:
                 >>> ds.approx_percentile("x", 90) is not None
                 True
         """
+        p = require_float(p, func="approx_percentile", arg="p")
         if not 0.0 <= p <= 100.0:
             raise PlanError(f"approx_percentile(p) requires p in [0, 100], got {p}")
         return self.approx_quantile(column, p / 100.0)

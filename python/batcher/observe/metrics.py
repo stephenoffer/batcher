@@ -70,6 +70,10 @@ class _Collector:
             # flat.
             self.partitions_done_total = 0
             self.skipped_total = 0
+            # Fault tolerance. These were invisible before: the engine recovers from
+            # worker loss transparently, so a query that survived two deaths and one
+            # that was simply slow looked identical from outside.
+            self._recovery_events: dict[str, int] = defaultdict(int)
             self.infer_batches_total = 0
             self.infer_rows_total = 0
             self.infer_latency_ms_total = 0.0
@@ -115,6 +119,11 @@ class _Collector:
                 self._skipped_by_reason[reason] += count
             elif kind == events.GPU:
                 self._record_gpu(fields)
+            elif kind == events.RECOVERY:
+                # Keyed by the `event` discriminator, so one series distinguishes a
+                # recompute from a speculative backup from a retired replica. Bounded by
+                # `RECOVERY_EVENTS`, so it cannot grow.
+                self._recovery_events[str(fields.get("event", "unknown"))] += 1
 
     def _record_gpu(self, fields: dict[str, Any]) -> None:
         """Fold one GPU sample in as a per-device gauge. Assumes the lock is held."""
@@ -177,6 +186,7 @@ class _Collector:
                 },
                 "logs": dict(sorted(self._log_counts.items())),
                 "partitions": {"done_total": self.partitions_done_total},
+                "recovery": dict(self._recovery_events),
                 "skipped": {
                     "total": self.skipped_total,
                     "by_reason": dict(sorted(self._skipped_by_reason.items())),
@@ -325,6 +335,12 @@ def prometheus_text() -> str:
         "partitions_done_total", snap["partitions"]["done_total"], "Distributed partitions done"
     )
     counter("skipped_total", snap["skipped"]["total"], "Rows dropped under on_read_error=skip")
+
+    if snap["recovery"]:
+        out.append("# HELP batcher_recovery_total Fault-tolerance actions by kind")
+        out.append("# TYPE batcher_recovery_total counter")
+        for event_name, count in sorted(snap["recovery"].items()):
+            out.append(f'batcher_recovery_total{{event="{event_name}"}} {count}')
     counter("inference_batches_total", snap["inference"]["batches_total"], "Inference batches run")
     counter("inference_rows_total", snap["inference"]["rows_total"], "Rows through inference")
     counter(

@@ -12,7 +12,13 @@ import shutil
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
-from batcher.dist.spill import _fd_safe, _iter_spill_morsels, _make_store, _work_dir
+from batcher.dist.spill import (
+    _fd_safe,
+    _iter_spill_morsels,
+    _make_store,
+    _work_dir,
+    map_projection,
+)
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Window
@@ -55,7 +61,7 @@ def stream_spilling_window(
     writers: dict[int, object] = {}
     handles: list[object] = [None] * n_buckets
     try:
-        for batch in _iter_spill_morsels(source):
+        for batch in _iter_spill_morsels(source, map_projection(window, sid)):
             rows = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not rows:
                 continue
@@ -74,12 +80,23 @@ def stream_spilling_window(
         for b in range(n_buckets):
             if handles[b] is None:
                 continue
-            bucket = store.read(handles[b])
+            # Reserved so the pool sees this read, and released once consumed so peak
+            # scratch is the outstanding buckets rather than the whole spilled input. Each
+            # bucket holds complete partitions and is read exactly once.
+            with store.read_reserved(handles[b]) as stream:
+                bucket = list(stream)
+            store.release(handles[b])
             if not bucket:
                 continue
             for rb in nat.execute_plan(win_json, [bucket], cfg_json):
                 if rb.num_rows:
                     yield rb
     finally:
+        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
+        # open (a partition phase abandoned by an exception) and deletes both tiers' files
+        # — the `rmtree` only ever reached the *local* one, so a failed query that had
+        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
+        # with nothing recording that they existed.
+        store.cleanup()
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)

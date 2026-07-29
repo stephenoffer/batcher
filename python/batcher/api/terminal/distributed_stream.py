@@ -36,11 +36,12 @@ def distributable_scan_source(plan: LogicalPlan, sources: list[Source]) -> int |
     """
     from batcher import core
     from batcher.dist.executor import _is_splittable_source
-    from batcher.dist.executors.plan_analysis import _single_source, _source_ids
+    from batcher.dist.executors.plan_analysis import _single_source
+    from batcher.plan.visitor import scanned_source_ids
 
     if not _single_source(plan) or core.has_map_batches(plan):
         return None
-    ids = _source_ids(plan)
+    ids = scanned_source_ids(plan)
     if len(ids) != 1:
         return None
     sid = next(iter(ids))

@@ -23,7 +23,7 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
-from batcher.io.manifest import WrittenFile
+from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.splits import Split
 
 __all__ = [
@@ -255,3 +255,77 @@ class LanceSink:
         except Exception as exc:
             raise BackendError(f"failed to write Lance dataset {path!r}: {exc}") from exc
         return WrittenFile(path=path, rows=table.num_rows, bytes=0)
+
+    def commit(self, manifest: WriteManifest, path: str) -> None:  # noqa: ARG002 (no-op)
+        """Finalize the write — nothing to do, because Lance already published it.
+
+        `ds.write(...)` calls `commit` on every sink unconditionally, after merging the
+        shards' manifests. Every other format writer inherits a `commit` from `FileSink`;
+        this sink cannot, because `FileSink` writes a *file handle* and a Lance dataset is a
+        directory that `lance.write_dataset` owns end to end. Without this method the write
+        raised ``AttributeError: 'LanceSink' object has no attribute 'commit'`` **after
+        writing the data**, so every `format="lance"` write failed while leaving a valid
+        dataset on disk.
+
+        There is deliberately no `_SUCCESS` marker, which is what `FileSink.commit` publishes
+        to distinguish a complete output directory from a half-written one. A Lance dataset
+        already carries its own transactional manifest — a version is visible only once it is
+        committed — so the marker would add nothing and would put a foreign file inside a
+        directory whose layout Lance defines.
+
+        Args:
+            manifest: Every file the write produced, merged across shards.
+            path: The dataset root that was written.
+        """
+        return None
+
+    def write_partitioned(
+        self,
+        table: pa.Table,
+        path: str,
+        *,
+        partition_by: list[str] | None = None,
+        file_index: int = 0,
+    ) -> list[WrittenFile]:
+        """One shard of a partitioned or distributed write.
+
+        Declines the two shapes it cannot honour, with a message naming the alternative,
+        rather than letting the caller hit ``AttributeError: 'LanceSink' object has no
+        attribute 'write_partitioned'`` — which is what a `partition_by=` or
+        `distributed=True` Lance write raised, from inside a Ray task, after three retries.
+
+        `partition_by` is a Hive directory layout, and a Lance dataset is a single
+        self-describing directory with its own fragment layout; nesting one per key would
+        produce N datasets rather than one partitioned dataset. A concurrent multi-shard
+        write is declined for a sharper reason: every shard would commit to the same
+        transactional manifest, and the outcome of that race is the dataset's business, not
+        something this sink can promise. Write from one worker, or give each shard its own
+        path and read the directory back as one relation.
+
+        Args:
+            table: This shard's rows.
+            path: The dataset root.
+            partition_by: Hive partition columns, if the caller asked for any.
+            file_index: This shard's index within the write.
+
+        Returns:
+            The single written dataset, when there is exactly one shard and no partitioning.
+
+        Raises:
+            BackendError: If partitioning was requested, or this is not the only shard.
+        """
+        if partition_by:
+            raise BackendError(
+                "Lance does not support partition_by: a Lance dataset is one self-describing "
+                "directory, so a Hive layout would write a separate dataset per key. Write "
+                "the whole dataset and use a filter on read, or write each partition to its "
+                "own path yourself."
+            )
+        if file_index != 0:
+            raise BackendError(
+                "a Lance write cannot be sharded: every shard would commit to the same "
+                "transactional manifest. Write it from one worker (`distributed=False`), or "
+                "write each shard to its own path under a directory and read the directory "
+                "back as one relation."
+            )
+        return [self.write(table, path)]

@@ -17,9 +17,11 @@ from collections.abc import Sequence
 
 import pyarrow as pa
 
+from batcher._internal.hardware import fingerprint
 from batcher._internal.mathx import safe_div
 from batcher._internal.native import engine
 from batcher.config import active_config
+from batcher.core.runtime import current_query_id
 from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilization
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
@@ -93,6 +95,11 @@ def _record_op_feedback(
     workers, whose `op_id`s address their own sub-plan and cannot be correlated with the
     driver's tree — they still feed the per-`kind` cost calibration.
     """
+    # The machine these measurements describe. A worker stamps its *own* fingerprint into the
+    # document before shipping it, so a heterogeneous cluster's rows stay attributed to the
+    # node that produced them; falling back to this process's fingerprint is right for every
+    # single-node run and for a worker whose document predates the stamp.
+    local_fingerprint = fingerprint()
     for op in ops:
         rows_in = op.get("rows_in", 0)
         rows_out = op.get("rows_out", 0)
@@ -112,7 +119,10 @@ def _record_op_feedback(
                 spill_bytes=int(op.get("spill_bytes", 0) or 0),
                 peak_rss_bytes=int(op.get("peak_rss_bytes", 0) or 0),
                 cpu_utilization=cpu_utilization(
-                    op.get("cpu_ns", 0), op.get("elapsed_ns", 0), op.get("threads", 1)
+                    op.get("cpu_ns", 0),
+                    op.get("elapsed_ns", 0),
+                    op.get("threads", 1),
+                    op.get("wall_span_ns", 0),
                 ),
                 threads=int(op.get("threads", 0) or 0),
                 n_input=int(rows_in),
@@ -121,6 +131,16 @@ def _record_op_feedback(
                 signature=_signature_of(annotated),
                 n_estimated=_raw_estimate_of(annotated),
                 expr_factor=annotated.properties.expr_factor if annotated else 1.0,
+                # The engine flattens its hardware counters into the same document, so they
+                # read as ordinary keys. `or 0` covers both an older engine that omits the key
+                # and a platform that reports null for a counter it cannot read.
+                minor_faults=int(op.get("minor_faults", 0) or 0),
+                major_faults=int(op.get("major_faults", 0) or 0),
+                vol_ctx_switches=int(op.get("vol_ctx_switches", 0) or 0),
+                invol_ctx_switches=int(op.get("invol_ctx_switches", 0) or 0),
+                io_read_bytes=int(op.get("io_read_bytes", 0) or 0),
+                io_write_bytes=int(op.get("io_write_bytes", 0) or 0),
+                hw_fingerprint=str(op.get("hw_fingerprint", "") or local_fingerprint),
             )
         )
 
@@ -160,10 +180,16 @@ class LocalExecutor:
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
         _ensure_native_tracing(_native)
+        # The id makes this execution cancellable. `""` outside a `query_scope` — which is
+        # every non-terminal-op caller — and the engine then registers nothing and polls
+        # nothing, so an uncancellable path costs exactly what it did before.
+        query_id = current_query_id() or None
         if self._feedback is None:
-            return _native.execute_plan(plan.to_json(), sources, engine_cfg)
+            return _native.execute_plan(plan.to_json(), sources, engine_cfg, query_id)
 
-        out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg)
+        out, metrics_json = _native.execute_plan_metered(
+            plan.to_json(), sources, engine_cfg, query_id
+        )
         record_exec_metrics(self._feedback, metrics_json, cfg.execution.morsel_rows, plan.ops)
         return out
 
@@ -202,7 +228,10 @@ def execute_local_metered(
     _ensure_native_tracing(_native)
     cfg = active_config()
     out, metrics_json = _native.execute_plan_metered(
-        plan.to_json(), sources, cfg.engine_config_json_with(plan.op_budgets())
+        plan.to_json(),
+        sources,
+        cfg.engine_config_json_with(plan.op_budgets()),
+        current_query_id() or None,
     )
     try:
         ops = json.loads(metrics_json).get("ops", [])

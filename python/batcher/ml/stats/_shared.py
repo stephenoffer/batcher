@@ -9,10 +9,43 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher.plan.expr_ir.constructors import col
+
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
+    from batcher.plan.expr_ir import Expr
 
-__all__ = ["require_columns", "scalar"]
+__all__ = ["indicator", "require_columns", "scalar"]
+
+
+def indicator(name: str) -> Expr:
+    """A per-row "did it happen" column as a boolean, whichever way it is encoded.
+
+    A success/correctness flag arrives as either a boolean or a 0/1 integer, and a test has no
+    reason to care which. Comparing against a fixed literal does care: `col(x) == 1` fails on a
+    boolean column and `col(x) == True` fails on an integer one, both as a raw Arrow
+    `RuntimeError` from inside the engine rather than an error at the API edge. Casting is the
+    one spelling that accepts both, and it keeps nulls null so a missing observation stays
+    missing instead of counting as a failure.
+
+    Args:
+        name: The column holding the per-row flag.
+
+    Returns:
+        A boolean expression that is true on the rows where the flag is set.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.stats._shared import indicator
+            >>> bt.from_pydict({"hit": [1, 0, 1]}).select(h=indicator("hit")).to_pydict()
+            {'h': [True, False, True]}
+
+            >>> bt.from_pydict({"hit": [True, None]}).select(h=indicator("hit")).to_pydict()
+            {'h': [True, None]}
+    """
+    return col(name).cast("boolean")
 
 
 def require_columns(ds: Dataset, *names: str) -> None:
@@ -33,8 +66,13 @@ def require_columns(ds: Dataset, *names: str) -> None:
             >>> require_columns(bt.from_pydict({"a": [1]}), "a")
     """
     available = ds.columns
+    # Membership against a set: the check runs per requested name, and `available` is the
+    # relation's full width — a wide feature table turned a handful of name checks into a
+    # scan of thousands of columns each. The list is kept for the error message, which
+    # needs the original order to suggest a close match.
+    present = set(available)
     for name in names:
-        if name not in available:
+        if name not in present:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
 
             raise ColumnNotFoundError(

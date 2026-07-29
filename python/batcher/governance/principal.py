@@ -40,6 +40,16 @@ class Principal:
     name: str
     roles: frozenset[str] = field(default_factory=frozenset)
     attrs: Mapping[str, str] = field(default_factory=dict)
+    #: Who vouched for these claims — ``"os"``, an OIDC issuer URL, a token-signer name.
+    #: Empty means nobody did: the caller simply asserted them. Set only by a
+    #: `CredentialVerifier`; constructing a `Principal` with an `issuer` by hand proves
+    #: nothing, which is why `governance.require_verified_principal` is a *deployment*
+    #: control rather than a security boundary. See `governance.authn`.
+    issuer: str = ""
+    #: Unix seconds after which these claims are stale, or None for no expiry. A verifier
+    #: sets this from the credential so a long-lived process cannot keep acting on an
+    #: identity whose token expired an hour ago.
+    expires_at: float | None = None
 
     def __post_init__(self) -> None:
         """Validate, then freeze `roles` and `attrs`.
@@ -94,7 +104,12 @@ class Principal:
 
         The generated dataclass repr renders `attrs` as a `mappingproxy(...)`, which is
         neither what the user wrote nor something they can paste back."""
-        return f"Principal({self.name!r}, roles={sorted(self.roles)!r}, attrs={dict(self.attrs)!r})"
+        base = f"Principal({self.name!r}, roles={sorted(self.roles)!r}, attrs={dict(self.attrs)!r}"
+        if self.issuer:
+            base += f", issuer={self.issuer!r}"
+        if self.expires_at is not None:
+            base += f", expires_at={self.expires_at!r}"
+        return base + ")"
 
     def has_role(self, role: str) -> bool:
         """Whether this principal holds `role`.
@@ -141,3 +156,57 @@ class Principal:
             empty exemption list must exempt nobody, never everybody.
         """
         return not self.roles.isdisjoint(frozenset(roles))
+
+    @property
+    def verified(self) -> bool:
+        """Whether an issuer vouched for these claims, rather than the caller asserting them.
+
+        True exactly when `issuer` is non-empty. A `CredentialVerifier` sets it after
+        checking a signature; nothing else should.
+
+        This is **not** a security boundary. In-process code can set `issuer` by hand, and
+        no library can stop it. What it expresses is a deployment's intent — with
+        `governance.require_verified_principal`, a query whose identity nobody established
+        is refused rather than silently trusted. The boundary remains the process.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Principal("ana", roles=["analyst"]).verified
+                False
+                >>> bt.Principal("ana", roles=["analyst"], issuer="os").verified
+                True
+
+        Returns:
+            True if these claims carry an issuer.
+        """
+        return bool(self.issuer)
+
+    def expired(self, now: float | None = None) -> bool:
+        """Whether these claims are past `expires_at`.
+
+        A principal with no expiry never expires, which is the right default for the OS
+        identity of a process and the wrong one for a bearer token — so a verifier that
+        reads an `exp` claim must carry it through.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Principal("ana", issuer="os").expired()
+                False
+                >>> bt.Principal("ana", issuer="idp", expires_at=0.0).expired()
+                True
+
+        Args:
+            now: Unix seconds to compare against; defaults to the current time.
+
+        Returns:
+            True if the claims have expired.
+        """
+        if self.expires_at is None:
+            return False
+        import time
+
+        return (now if now is not None else time.time()) >= self.expires_at

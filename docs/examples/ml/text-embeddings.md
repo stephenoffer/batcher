@@ -226,6 +226,6 @@ Three ways to score, and the corpus size decides which:
 - [Inference](../../ml/inference.md): the pool and stage-overlap mechanics.
 - [Multimodal](../../ml/multimodal.md): the `.list` vector expressions in full.
 - [ML API reference](../../api/ml.md): `ds.ml.embed`, `build_vector_index`, `vector_search`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the 47× on text embeddings
-  comes from.
+- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the 33,611 text/s on text
+  embeddings comes from.
 - [Tensor columns](../../deep-dives/tensor-columns.md): how a vector column is laid out.

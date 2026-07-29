@@ -49,19 +49,20 @@ _STR_INT = frozenset(
         "bit_length",
         "octet_length",
         "crc32",
+        "hamming",
         "hash64",
         "xxhash64",
         "json_extract_int",
     }
 )
-_STR_FLOAT = frozenset({"json_extract_float"})
+_STR_FLOAT = frozenset({"json_extract_float", "jaccard_similarity"})
 
 # `dt` accessor (`DateFunc`) output types. Every field-extraction fn yields Int64;
-# these four are the exceptions. `last_day` yields a timestamp regardless of whether
-# the input is a date or a timestamp (verified against the engine).
+# these four are the exceptions. `last_day` names a day, so it yields a **date** for
+# either input type — as it does in DuckDB, Spark and Polars.
 _DATE_STR = frozenset({"dayname", "monthname"})
 _DATE_BOOL = frozenset({"is_leap_year"})
-_DATE_TS = frozenset({"last_day"})
+_DATE_DATE = frozenset({"last_day"})
 # `list` accessor (`ListFunc`) output types. `len`/`n_unique`/`arg_max`/`arg_min`
 # count or index → Int64; `reverse`/`sort`/`unique` return a list of the same element
 # type. The floating reductions (`sum`/`mean`/`median`/`product`/`std`/`var`/`l2_norm`)
@@ -119,6 +120,14 @@ _STR_STR = frozenset(
         "reverse",
         "translate",
         "unhex",
+        "url_encode",
+        "url_decode",
+        "regexp_escape",
+        "parse_filename",
+        "parse_dirname",
+        "parse_dirpath",
+        "to_binary",
+        "from_binary",
     }
 )
 
@@ -430,6 +439,10 @@ def _strfunc_type(fn: str) -> pa.DataType | None:
         return pa.list_(pa.string())
     if fn == "regexp_extract_all":
         return pa.list_(pa.string())  # every match of the pattern
+    if fn == "regexp_split":
+        return pa.list_(pa.string())
+    if fn == "parse_path":
+        return pa.list_(pa.string())  # the path's components
     if fn in _STR_BOOL:
         return pa.bool_()
     if fn in _STR_INT:
@@ -447,8 +460,8 @@ def _datefunc_type(fn: str) -> pa.DataType | None:
         return pa.string()
     if fn in _DATE_BOOL:
         return pa.bool_()
-    if fn in _DATE_TS:
-        return pa.timestamp("us")
+    if fn in _DATE_DATE:
+        return pa.date32()
     from batcher.plan.expr_ir.fn_names import DATE_FNS
 
     # Every remaining date field-extraction fn (year/month/day/hour/epoch/…) is Int64.

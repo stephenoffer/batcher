@@ -212,7 +212,7 @@ print(sorted(deduped.to_pydict()["id"]))
 
 Two of the four documents were going to cost a forward pass each for nothing. On a real
 crawl the near-duplicate rate is routinely 20% to 40%, and that is the same fraction off
-your GPU bill. See [preprocessors](preprocessors.md) for the MinHash and LSH tuning.
+your GPU bill. See [preprocessors](preprocessors/index.md) for the MinHash and LSH tuning.
 
 ## Fuse dense and lexical rankings
 

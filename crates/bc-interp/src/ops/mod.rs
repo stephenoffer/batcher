@@ -39,6 +39,7 @@ pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store
 pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, gather_join_output_with, join_batches,
     join_batches_with, join_output_schema, join_top_n, key_indices, map_join_type,
+    range_join_batches,
 };
 pub(crate) use materialize::materialize;
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
@@ -84,19 +85,39 @@ fn eval_jit(jit: &Jit, expr: &bc_expr::Expr, batch: &RecordBatch) -> Result<Arra
     Ok(expr.eval(batch)?)
 }
 
+/// Filter with no compiled predicate and no cross-morsel ordering state.
+///
+/// This is what the sequential oracle uses. It stays on the *static* conjunct order
+/// deliberately: the oracle's job is to be the reference every other path is checked
+/// against, and a reference that carries adaptive state is a worse reference even when the
+/// adaptation cannot change its answer (which, for the conjuncts of an `AND`, it cannot).
 pub(crate) fn filter_batch(
     batch: &RecordBatch,
     predicate: &bc_expr::Expr,
 ) -> Result<RecordBatch, InterpError> {
-    filter_batch_jit(batch, predicate, &None)
+    filter_batch_jit(batch, predicate, &None, None)
 }
 
-/// Filter using a pre-compiled predicate when possible.
+/// Filter using a pre-compiled predicate when possible, and a measured conjunct order when
+/// the caller keeps one per operator.
 pub(crate) fn filter_batch_jit(
     batch: &RecordBatch,
     predicate: &bc_expr::Expr,
     jit: &Jit,
+    order: Option<&bc_expr::ConjunctOrder>,
 ) -> Result<RecordBatch, InterpError> {
+    // A conjunctive predicate the JIT did not take whole gets its conjuncts
+    // short-circuited: the cheap one runs at full width, the rest only over the rows
+    // it kept (`bc_expr::Expr::short_circuit_filter_mask`, which owns the argument for
+    // why that is the same mask). Gated on `jit.is_none()` because a fully compiled
+    // predicate is already a single fused pass with no intermediate mask to save —
+    // splitting it would trade the better fast path for the lesser one. The mask is
+    // interchangeable with the one below, so both feed the same gather.
+    if jit.is_none() {
+        if let Some(mask) = predicate.short_circuit_filter_mask_with(batch, order)? {
+            return Ok(filter_record_batch(batch, &mask)?);
+        }
+    }
     let mask = eval_jit(jit, predicate, batch)?;
     let mask = mask
         .as_any()
@@ -365,6 +386,18 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::Skewness => agg::AggFunc::Skewness,
         AggFunc::Kurtosis => agg::AggFunc::Kurtosis,
         AggFunc::Histogram => agg::AggFunc::Histogram,
+        AggFunc::AnyValue => agg::AggFunc::AnyValue,
+        AggFunc::Entropy => agg::AggFunc::Entropy,
+        AggFunc::Mad => agg::AggFunc::Mad,
+        // Same permille encoding as `Quantile`: the param is a fraction on the wire and
+        // an integer permille in the runtime, so the two cannot drift apart.
+        AggFunc::QuantileDisc => {
+            agg::AggFunc::QuantileDisc((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+        }
+        // `k` is a count, not a fraction, so it rides `param` unscaled.
+        AggFunc::ApproxTopK => agg::AggFunc::ApproxTopK(item.param.unwrap_or(1.0).round() as u16),
+        AggFunc::KurtosisPop => agg::AggFunc::KurtosisPop,
+        AggFunc::KahanSum => agg::AggFunc::KahanSum,
     }
 }
 
@@ -458,6 +491,12 @@ fn sort_indices(
         // sort-then-slice — single-node == every partitioning. One extra unique key over the
         // same O(n log k) partial sort; the radix/parallel fast paths are full-sort only.
         let mut sort_columns = eval_sort_columns(batch, keys)?;
+        // NB: a row-encoded partial sort was tried here and does NOT pay. Arrow's
+        // `partial_sort` keeps a bounded region of size `limit` (O(n log limit)) and barely
+        // touches the tail, while the encode pass is O(n) in row *width* whatever the limit
+        // is; selecting the limit-th encoded row and sorting the prefix measured 0.60x to
+        // 0.66x at every limit tried. Multi-key top-N keeps arrow's path — see
+        // `bc_arrow::row_sort`, which declines to offer a limited form for this reason.
         let row_index = Arc::new(UInt64Array::from_iter_values(0..batch.num_rows() as u64));
         sort_columns.push(SortColumn {
             values: row_index,
@@ -518,24 +557,33 @@ pub(crate) fn sort_indices_of(
         // stability the radix/string single-key paths guarantee. (Not the specialized arrow
         // primitive, but this type is off the fast path anyway.)
     }
+    let options = sort_options(keys);
+    // Row-encoded stable sort. Identical permutation to the `lexsort` fallback below, but
+    // the ascending row-index tie-break lives in the *comparator* instead of being encoded
+    // as a trailing key column — so the encoder writes and every comparison memcmps four
+    // fewer bytes per row, which on a narrow two-key sort is about a third of the encoded
+    // width. `bc_arrow::row_sort` owns that equivalence argument and pins it against this
+    // very fallback.
+    if let Some(idx) = bc_arrow::row_sort::stable_lexsort_indices(vals, &options) {
+        return Ok(idx);
+    }
+
     let mut columns: Vec<SortColumn> = vals
         .iter()
-        .zip(keys)
-        .map(|(values, k)| SortColumn {
+        .zip(&options)
+        .map(|(values, o)| SortColumn {
             values: values.clone(),
-            options: Some(SortOptions {
-                descending: k.descending,
-                nulls_first: k.nulls_first,
-            }),
+            options: Some(*o),
         })
         .collect();
-    // Append an ascending row-index as the final tie-break so `lexsort` (which is unstable in
-    // arrow) resolves rows equal on every real key to input order — the stability the single-key
-    // radix/string paths already guarantee. Without it, the parallel sample-sort and the external
-    // merge sort (each calling this over a differently-sized slice) order fully-tied rows
-    // differently from this sequential oracle, breaking seq == par bit-for-bit. The slice this
-    // sorts is always gathered in ascending original-row order, so a slice-local `0..n` preserves
-    // the input's relative order of tied rows.
+    // Reached only for a key type the row encoder rejects. Append an ascending row-index as
+    // the final tie-break so `lexsort` (which is unstable in arrow) resolves rows equal on
+    // every real key to input order — the stability the single-key radix/string paths already
+    // guarantee. Without it, the parallel sample-sort and the external merge sort (each
+    // calling this over a differently-sized slice) order fully-tied rows differently from this
+    // sequential oracle, breaking seq == par bit-for-bit. The slice this sorts is always
+    // gathered in ascending original-row order, so a slice-local `0..n` preserves the input's
+    // relative order of tied rows.
     let n = vals.first().map(|v| v.len()).unwrap_or(0);
     let row_index: ArrayRef = Arc::new(arrow::array::UInt32Array::from_iter_values(0..n as u32));
     columns.push(SortColumn {
@@ -546,6 +594,16 @@ pub(crate) fn sort_indices_of(
         }),
     });
     Ok(lexsort_to_indices(&columns, None)?)
+}
+
+/// The per-key `SortOptions` for `keys`, in key order.
+fn sort_options(keys: &[SortKey]) -> Vec<SortOptions> {
+    keys.iter()
+        .map(|k| SortOptions {
+            descending: k.descending,
+            nulls_first: k.nulls_first,
+        })
+        .collect()
 }
 
 /// Gather `batch`'s rows in `indices` order (a single-threaded take of every column).
@@ -588,9 +646,17 @@ fn take_batch(
 /// bit-identical to the `(key, row_index)` partial sort at a fraction of the cost (radix is O(n)
 /// and touches the values directly). Multi-key top-N keeps the partial `lexsort` (the row format
 /// is inherent to comparing several columns; the win is specific to the one-key case).
-fn top_k_indices(
-    batch: &RecordBatch,
+/// The `k` best rows of a morsel, over key columns the caller has already evaluated and
+/// normalized.
+///
+/// Taking pre-evaluated keys is what lets `parallel_top_n` run each ORDER BY expression once per
+/// morsel and reuse it for the selection, the top-N bound check and the candidate gather.
+/// Evaluating them here instead would repeat a computed key's work, and would repeat
+/// `normalize_sort_key`'s whole-column scan for a float key.
+fn top_k_indices_of(
+    key_arrays: &[ArrayRef],
     keys: &[SortKey],
+    num_rows: usize,
     k: usize,
 ) -> Result<arrow::array::UInt32Array, InterpError> {
     use arrow::array::UInt32Array;
@@ -607,7 +673,7 @@ fn top_k_indices(
     // exactly the stable sort's top-k — proven for a float key with `-0.0`/`0.0`, NaN and
     // heavy ties by `parallel_top_n_float_key_matches_eager`.
     if keys.len() == 1 {
-        let v = normalize_sort_key(keys[0].expr.eval(batch)?);
+        let v = key_arrays[0].clone();
         let opts = SortOptions {
             descending: keys[0].descending,
             nulls_first: keys[0].nulls_first,
@@ -650,14 +716,10 @@ fn top_k_indices(
     // `parallel_top_n_float_key_matches_eager` (float key with -0.0/NaN/heavy ties).
     use arrow::array::make_comparator;
     use std::cmp::Ordering;
-    let n = batch.num_rows();
-    let key_arrays: Vec<ArrayRef> = keys
-        .iter()
-        .map(|key| Ok(normalize_sort_key(key.expr.eval(batch)?)))
-        .collect::<Result<Vec<_>, InterpError>>()?;
+    let n = num_rows;
     let comparators = keys
         .iter()
-        .zip(&key_arrays)
+        .zip(key_arrays)
         .map(|(key, arr)| {
             make_comparator(
                 arr.as_ref(),
@@ -695,24 +757,55 @@ pub(crate) fn parallel_top_n(
     use rayon::prelude::*;
 
     let schema = parts[0].schema();
+    // A bound on the first key's cut-off, shared across workers. Once any morsel has produced
+    // `k` candidates, a morsel whose entire first-key range is strictly worse than that cannot
+    // contribute and is dropped for the price of one min/max pass — the cheap half of
+    // DataFusion's dynamic top-K filter, applied where the data is already in hand.
+    // `bc_runtime::topn` owns the soundness argument; the bound only ever tightens, so a stale
+    // read costs a missed skip and never a wrong answer.
+    let bound = bc_runtime::topn::TopNBound::new(keys[0].descending);
     // Per morsel (parallel): its ≤k local top-k indices, and the key columns gathered to those
-    // rows — narrow (only the ORDER BY expressions), never the payload.
+    // rows — narrow (only the ORDER BY expressions), never the payload. `None` for a morsel the
+    // bound excluded.
     let per: Vec<(usize, UInt32Array, Vec<ArrayRef>)> = parts
         .par_iter()
         .enumerate()
         .filter(|(_, b)| b.num_rows() > 0)
-        .map(|(p, b)| -> Result<_, InterpError> {
-            let idx = top_k_indices(b, keys, k)?;
-            let key_cols = keys
+        .map(|(p, b)| -> Result<Option<_>, InterpError> {
+            // Evaluate the ORDER BY expressions ONCE per morsel and reuse them for the
+            // selection, the bound check and the candidate gather. They used to be evaluated
+            // twice — once inside the selection and again here — which for a computed key is
+            // the expression run twice, and for a float key is `normalize_sort_key` scanning
+            // the whole column twice looking for `-0.0`/NaN.
+            let key_arrays: Vec<ArrayRef> = keys
                 .iter()
-                .map(|key| {
-                    let col = normalize_sort_key(key.expr.eval(b)?);
-                    Ok(bc_runtime::gather::take_column(col.as_ref(), &idx)?)
-                })
+                .map(|key| Ok(normalize_sort_key(key.expr.eval(b)?)))
+                .collect::<Result<_, InterpError>>()?;
+
+            if let Some((min, max)) = bc_runtime::topn::i64_key_range(&key_arrays[0]) {
+                if bound.excludes_range(min, max) {
+                    return Ok(None);
+                }
+            }
+
+            let idx = top_k_indices_of(&key_arrays, keys, b.num_rows(), k)?;
+            let key_cols = key_arrays
+                .iter()
+                .map(|col| Ok(bc_runtime::gather::take_column(col.as_ref(), &idx)?))
                 .collect::<Result<Vec<ArrayRef>, InterpError>>()?;
-            Ok((p, idx, key_cols))
+            // Only a *full* candidate set of `k` rows bounds the global cut-off; fewer than `k`
+            // proves nothing about the k-th best.
+            if idx.len() == k {
+                if let Some(v) = bound.candidate_bound(&key_cols[0]) {
+                    bound.publish(v);
+                }
+            }
+            Ok(Some((p, idx, key_cols)))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Flatten the candidates in morsel order into: per-key concatenated columns + the two
     // locator arrays (which source morsel, which row within it).
@@ -751,7 +844,7 @@ pub(crate) fn parallel_top_n(
     }
     // Tie-break by the candidate's ORIGINAL position — its source morsel, then its row within
     // that morsel — NOT by its position in the flattened candidate array. Those differ exactly
-    // when a morsel's `top_k_indices` returns its rows in some order other than ascending row:
+    // when a morsel's `top_k_indices_of` returns its rows in some order other than ascending row:
     // the multi-key (and single-key non-radix/non-string) path uses an *unstable* quickselect,
     // so among rows tied on the key the flatten order is arbitrary. The eager oracle breaks
     // such ties by original row, so tie-breaking on the flatten position let a different tied
@@ -946,6 +1039,15 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
         WindowFn::NthValue => window::WindowFn::NthValue,
         WindowFn::ForwardFill => window::WindowFn::ForwardFill,
         WindowFn::BackwardFill => window::WindowFn::BackwardFill,
+        WindowFn::Var => window::WindowFn::Var,
+        WindowFn::Stddev => window::WindowFn::Stddev,
+        WindowFn::Product => window::WindowFn::Product,
+        WindowFn::BoolAnd => window::WindowFn::BoolAnd,
+        WindowFn::BoolOr => window::WindowFn::BoolOr,
+        WindowFn::BitAnd => window::WindowFn::BitAnd,
+        WindowFn::BitOr => window::WindowFn::BitOr,
+        WindowFn::BitXor => window::WindowFn::BitXor,
+        WindowFn::CountDistinct => window::WindowFn::CountDistinct,
     }
 }
 
@@ -1311,7 +1413,7 @@ mod sort_tests {
     /// A **float** single sort key must agree with the eager stable oracle too.
     ///
     /// A float key has no O(n) single-key path (neither the string builder nor the radix), so
-    /// `top_k_indices` routes it through the quickselect. That path selects rather than sorts,
+    /// `top_k_indices_of` routes it through the quickselect. That path selects rather than sorts,
     /// and its within-morsel order is unstable — so this pins that `parallel_top_n` still yields
     /// the stable sort's exact top-k, which it does because it breaks ties by original
     /// `(morsel, row)`, not by the quickselect's output order. The bug this guards: with `-0.0`
@@ -1706,5 +1808,111 @@ mod window_frame_tests {
         assert!(map_frame(None)
             .expect("absent frame is not an error")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod topn_bound_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use bc_expr::Expr;
+    use std::sync::Arc;
+
+    /// `clustered` puts each morsel's keys in its own ascending band, the way time-ordered or
+    /// key-partitioned data arrives; otherwise every morsel draws from the whole range, which is
+    /// the shape the bound provably cannot help.
+    fn morsels(count: usize, rows: usize, clustered: bool) -> Vec<RecordBatch> {
+        (0..count)
+            .map(|m| {
+                let k: Int64Array = (0..rows)
+                    .map(|i| {
+                        Some(if clustered {
+                            (m * rows + i) as i64
+                        } else {
+                            ((m * rows + i).wrapping_mul(2_654_435_761) % 1_000_000_007) as i64
+                        })
+                    })
+                    .collect();
+                let payload: Int64Array = (0..rows).map(|i| Some(i as i64)).collect();
+                RecordBatch::try_from_iter(vec![
+                    ("k", Arc::new(k) as ArrayRef),
+                    ("p", Arc::new(payload) as ArrayRef),
+                ])
+                .expect("morsel")
+            })
+            .collect()
+    }
+
+    fn keys() -> Vec<SortKey> {
+        vec![SortKey {
+            expr: Expr::Col { name: "k".into() },
+            descending: false,
+            nulls_first: false,
+        }]
+    }
+
+    /// What the bound is worth, as the two costs it trades: selecting a morsel's local top-k
+    /// against reading its key range. Ignored by default — it is a measurement, not a contract.
+    ///
+    /// ```text
+    /// cargo test --release -p bc-interp topn_bound_tests -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing study for the top-N morsel skip; run with --release -- --ignored"]
+    fn report_the_top_n_skip_saving() {
+        const MORSELS: usize = 256;
+        const ROWS: usize = 16_384;
+        let keys = keys();
+
+        for (shape, clustered) in [("clustered", true), ("random", false)] {
+            let parts = morsels(MORSELS, ROWS, clustered);
+            for k in [10_usize, 100, 1_000] {
+                // Cost of the work a skip avoids: one morsel's selection, plus the narrow gather.
+                let key_arrays: Vec<ArrayRef> = keys
+                    .iter()
+                    .map(|key| normalize_sort_key(key.expr.eval(&parts[0]).unwrap()))
+                    .collect();
+                let mut select_ms = f64::MAX;
+                let mut range_ms = f64::MAX;
+                for _ in 0..20 {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(top_k_indices_of(&key_arrays, &keys, ROWS, k).unwrap());
+                    select_ms = select_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(bc_runtime::topn::i64_key_range(&key_arrays[0]));
+                    range_ms = range_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+
+                // How many morsels the bound actually excludes, replaying the operator's sequence
+                // single-threaded so the count is deterministic.
+                let bound = bc_runtime::topn::TopNBound::new(false);
+                let mut skipped = 0usize;
+                for b in &parts {
+                    let ka: Vec<ArrayRef> = keys
+                        .iter()
+                        .map(|key| normalize_sort_key(key.expr.eval(b).unwrap()))
+                        .collect();
+                    if let Some((min, max)) = bc_runtime::topn::i64_key_range(&ka[0]) {
+                        if bound.excludes_range(min, max) {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                    let idx = top_k_indices_of(&ka, &keys, b.num_rows(), k).unwrap();
+                    if idx.len() == k {
+                        let cand = bc_runtime::gather::take_column(ka[0].as_ref(), &idx).unwrap();
+                        if let Some(v) = bound.candidate_bound(&cand) {
+                            bound.publish(v);
+                        }
+                    }
+                }
+                println!(
+                "{shape:>9} k={k:>5}: select {select_ms:>7.3} ms/morsel, range {range_ms:>7.3} \
+                 ms/morsel ({:>5.1}x cheaper), skipped {skipped}/{MORSELS}, gauge_off={}",
+                select_ms / range_ms,
+                bound.is_off()
+            );
+            }
+        }
     }
 }

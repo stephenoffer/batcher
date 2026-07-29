@@ -61,6 +61,7 @@ from batcher.kyber.rule import Phase
 # `_rewrite_node` (a leaf `Expr → Expr` rule applied to every expression a node carries,
 # returning None when nothing changed) is the boolean family's helper — imported, not
 # re-implemented.
+from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.boolean_algebra import _rewrite_node
 from batcher.plan.expr_ir import Binary, Case, Cast, Expr, IsNotNull, IsNull, Lit
 from batcher.plan.expr_ir.core import IsInf, IsNan
@@ -123,11 +124,6 @@ _INFALLIBLE: frozenset[tuple[pa.DataType, pa.DataType]] = frozenset(
 )
 
 
-def _schema(node: LogicalPlan) -> SchemaRef | None:
-    """The input schema that types `node`'s expressions (`None` when unknown)."""
-    return node.input.available_schema()
-
-
 def _target(expr: Cast) -> pa.DataType | None:
     """The Arrow type a `Cast` produces (`None` for a dtype name we don't know)."""
     return DTYPE_REGISTRY.get(expr.dtype)
@@ -173,7 +169,13 @@ def _drop_identity_cast(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_cast_to_inferred_type", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="drop_cast_to_inferred_type",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(Cast,),
+    expr_schema=_drop_identity_cast,
+)
 def drop_cast_to_inferred_type(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop `cast(e, T)` when `e` **already has** type `T` — for any expression `e`, not
     just a bare column.
@@ -186,8 +188,7 @@ def drop_cast_to_inferred_type(node: LogicalPlan, _ctx: OptimizerContext) -> Log
     leaves alone because the two flags differ. Fires only when `infer_type` *proves* the
     type; an unknown one is left as it is.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_identity_cast(e, schema))
+    return schema_rule(node, _drop_identity_cast, carries=(Cast,))
 
 
 def _canonicalize_alias(expr: Expr) -> Expr:
@@ -201,6 +202,7 @@ def _canonicalize_alias(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=_NODES,
     expr=_canonicalize_alias,
+    expr_matches=(Cast,),
 )
 def canonicalize_cast_dtype_alias(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a cast's dtype name to the one canonical spelling of its Arrow type:
@@ -234,6 +236,7 @@ def _fold_cast_lit(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=_NODES,
     expr=_fold_cast_lit,
+    expr_matches=(Cast, Lit),
 )
 def fold_cast_of_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Evaluate `cast(<literal>, T)` at plan time for the conversions `normalize.fold`
@@ -276,7 +279,13 @@ def _push_into_case(expr: Expr, schema: SchemaRef | None) -> Expr:
     return Case(branches, arms[-1])
 
 
-@rule(name="push_cast_into_case_literal_branches", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="push_cast_into_case_literal_branches",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(Cast,),
+    expr_schema=_push_into_case,
+)
 def push_cast_into_case_literal_branches(
     node: LogicalPlan, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -293,8 +302,7 @@ def push_cast_into_case_literal_branches(
     `otherwise`) folds; one non-literal arm and the rule declines, because casting it per row
     would be work, not a saving.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _push_into_case(e, schema))
+    return schema_rule(node, _push_into_case, carries=(Cast,))
 
 
 # --- infallible-cast simplifications ----------------------------------------
@@ -318,7 +326,13 @@ def _try_to_strict(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="try_cast_to_strict_when_infallible", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="try_cast_to_strict_when_infallible",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(Cast,),
+    expr_schema=_try_to_strict,
+)
 def try_cast_to_strict_when_infallible(
     node: LogicalPlan, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -333,8 +347,7 @@ def try_cast_to_strict_when_infallible(
     only when `infer_type` proves the source type; a string source (parse) or a float→int
     (overflow) target keeps its `TRY_CAST` semantics untouched.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _try_to_strict(e, schema))
+    return schema_rule(node, _try_to_strict, carries=(Cast,))
 
 
 def _drop_cast_in_null_check(expr: Expr, schema: SchemaRef | None) -> Expr:
@@ -345,7 +358,13 @@ def _drop_cast_in_null_check(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_infallible_cast_in_null_check", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="drop_infallible_cast_in_null_check",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(IsNull, IsNotNull),
+    expr_schema=_drop_cast_in_null_check,
+)
 def drop_infallible_cast_in_null_check(
     node: LogicalPlan, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -360,8 +379,7 @@ def drop_infallible_cast_in_null_check(
     would hide the error), and a fallible `TRY_CAST` **manufactures** nulls —
     `is_null(try_cast('x', 'int64'))` is TRUE where `is_null('x')` is FALSE.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_cast_in_null_check(e, schema))
+    return schema_rule(node, _drop_cast_in_null_check, carries=(IsNull, IsNotNull))
 
 
 def _strip_string_cast(operand: Expr, schema: SchemaRef | None) -> Expr:
@@ -384,7 +402,14 @@ def _drop_concat_cast(expr: Expr, schema: SchemaRef | None) -> Expr:
     return Binary("concat", left, right)
 
 
-@rule(name="drop_string_cast_in_concat", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="drop_string_cast_in_concat",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(Binary,),
+    expr_ops=("concat",),
+    expr_schema=_drop_concat_cast,
+)
 def drop_string_cast_in_concat(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`cast(x, 'string') || y` → `x || y` for an Int64/Float64/Bool/String `x`.
 
@@ -397,8 +422,7 @@ def drop_string_cast_in_concat(node: LogicalPlan, _ctx: OptimizerContext) -> Log
     internal cast is arrow's default safe cast — a distinction with no difference precisely
     when no value can fail. A temporal or nested source keeps its explicit cast.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_concat_cast(e, schema))
+    return schema_rule(node, _drop_concat_cast, carries=(Binary,))
 
 
 def _drop_float_cast_in_predicate(expr: Expr, schema: SchemaRef | None) -> Expr:
@@ -409,7 +433,13 @@ def _drop_float_cast_in_predicate(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_numeric_cast_in_float_predicate", phase=Phase.NORMALIZE, matches=_NODES)
+@rule(
+    name="drop_numeric_cast_in_float_predicate",
+    phase=Phase.NORMALIZE,
+    matches=_NODES,
+    expr_matches=(IsNan, IsInf),
+    expr_schema=_drop_float_cast_in_predicate,
+)
 def drop_numeric_cast_in_float_predicate(
     node: LogicalPlan, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -423,5 +453,4 @@ def drop_numeric_cast_in_float_predicate(
     Float64 source: a *string* source would make the explicit cast a parse, which can fail or
     NULL, and the predicate's internal cast would then be reading a different array.
     """
-    schema = _schema(node)
-    return _rewrite_node(node, lambda e: _drop_float_cast_in_predicate(e, schema))
+    return schema_rule(node, _drop_float_cast_in_predicate, carries=(IsNan, IsInf))

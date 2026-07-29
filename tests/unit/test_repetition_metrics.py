@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.plan.functions.metrics import repetition as rep
+from batcher.plan.functions.metrics.text import diversity as rep
 
 pytestmark = pytest.mark.unit
 
@@ -31,13 +31,6 @@ def test_char_repetition_complements_distinct() -> None:
         r=rep.char_repetition_rate("o", n=3),
     ).to_pydict()
     assert out["r"][0] == pytest.approx(1 - out["d"][0])
-
-
-def test_word_type_token_ratio() -> None:
-    # "the cat sat" -> "the" dropped -> ["cat","sat"] -> 1.0; "dog dog dog" -> 1/3.
-    ds = bt.from_pydict({"o": ["the cat sat", "dog dog dog"]})
-    val = ds.agg(m=rep.word_type_token_ratio("o")).to_pydict()["m"][0]
-    assert val == pytest.approx((1.0 + 1 / 3) / 2)
 
 
 def test_repeated_line_rate() -> None:

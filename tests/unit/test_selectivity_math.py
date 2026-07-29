@@ -515,3 +515,82 @@ def test_case_branches_partition_and_stay_a_probability():
         )
     )
     assert 0.0 <= got <= 1.0
+
+
+# --- `col OP col`: P(a < b) from two columns' bounds ------------------------------------
+#
+# A comparison between two columns used to take the Selinger constant for `col OP literal`,
+# which is a different predicate's constant and ignores bounds already in hand. These are the
+# identities the replacement has to satisfy.
+
+_PAIRS = [
+    ((0, 100), (0, 100)),  # identical spans
+    ((0, 100), (50, 150)),  # partial overlap
+    ((0, 10), (5, 6)),  # one span inside the other
+    ((-5, 5), (0, 1)),  # straddling zero
+    ((3, 7), (0, 100)),  # wholly contained
+]
+
+
+@pytest.mark.parametrize(("left", "right"), _PAIRS)
+def test_column_pair_is_a_probability(left, right):
+    from batcher.kyber.stats.selectivity.scalars import fraction_left_below_right
+
+    assert 0.0 <= fraction_left_below_right(left, right) <= 1.0
+
+
+@pytest.mark.parametrize(("left", "right"), _PAIRS)
+def test_column_pair_is_antisymmetric(left, right):
+    """`P(a < b) + P(b < a) = 1`.
+
+    Over continuous spans the tie has zero measure, so the two strict orderings partition
+    the space. A formula that double-counted the overlap would break this.
+    """
+    from batcher.kyber.stats.selectivity.scalars import fraction_left_below_right as f
+
+    assert f(left, right) + f(right, left) == pytest.approx(1.0)
+
+
+def test_disjoint_column_spans_are_certainties():
+    """Non-overlapping spans need no uniformity assumption — the answer is exact.
+
+    This is the case the flat constant got most wrong: it claimed 1/3 for a comparison whose
+    outcome is already determined by the two columns' bounds.
+    """
+    from batcher.kyber.stats.selectivity.scalars import fraction_left_below_right as f
+
+    assert f((0, 10), (20, 30)) == 1.0
+    assert f((20, 30), (0, 10)) == 0.0
+
+
+def test_identical_column_spans_are_a_coin_flip():
+    from batcher.kyber.stats.selectivity.scalars import fraction_left_below_right as f
+
+    assert f((0, 100), (0, 100)) == pytest.approx(0.5)
+
+
+def test_degenerate_column_span_reduces_to_one_sided_interpolation():
+    """A single-valued column is the literal case, and must agree with it."""
+    from batcher.kyber.stats.selectivity.scalars import fraction_left_below_right as f
+
+    assert f((50, 50), (0, 100)) == pytest.approx(0.5)  # P(50 < b), b uniform on [0, 100]
+    assert f((0, 100), (50, 50)) == pytest.approx(0.5)  # P(a < 50)
+    assert f((1, 1), (2, 2)) == 1.0
+    assert f((2, 2), (1, 1)) == 0.0
+
+
+def test_unusable_column_bounds_defer_rather_than_guess():
+    """Missing, non-ordered, or inverted bounds return None so the caller keeps its constant."""
+    from batcher.kyber.stats.selectivity.scalars import fraction_left_below_right as f
+
+    assert f(None, (0, 10)) is None
+    assert f((0, 10), None) is None
+    assert f(("a", "z"), (0, 10)) is None  # strings have no ordinal here
+    assert f((10, 0), (0, 10)) is None  # inverted: nonsense, not an estimate
+
+
+def test_column_pair_complements_across_the_operator():
+    """`sel(a < b) + sel(a >= b) = 1` through the real predicate path, not just the helper."""
+    lt = _s(bt.col("x") < bt.col("y"))
+    ge = _s(bt.col("x") >= bt.col("y"))
+    assert lt + ge == pytest.approx(1.0)

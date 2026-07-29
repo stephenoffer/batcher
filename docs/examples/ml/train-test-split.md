@@ -174,7 +174,7 @@ matters on a real corpus.
 - [Training-data dedup](training-data-dedup.md): remove the twins before splitting.
 - [Recommender features](recommender-features.md): the point-in-time filter that is the
   time-split's cousin.
-- [Preprocessors](../../ml/preprocessors.md): what each `fit` learns, and from which split.
+- [Preprocessors](../../ml/preprocessors/index.md): what each `fit` learns, and from which split.
 - [Streaming for training](../../ml/streaming.md): deterministic, resumable sample order
   across DDP ranks.
 - [Data loaders](../../ml/data-loaders.md): handing `train` and `test` to a training loop.

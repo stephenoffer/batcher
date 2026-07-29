@@ -144,7 +144,13 @@ fn concat_column(batches: &[RecordBatch], c: usize) -> Result<ArrayRef, InterpEr
         }
     }
     let cols: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
-    Ok(arrow::compute::concat(&cols)?)
+    // The `Int64`/`Float64` arms above are a parallel memcpy; everything else went to arrow's
+    // `concat`, which copies a variable-width column row by row on one core. That left the
+    // *string* half of every materialized relation serial — and this function is what
+    // concatenates a whole probe side before an un-shardable join. `concat_columns` gives the
+    // string columns the same treatment the numeric ones already had, and delegates to arrow for
+    // the types it does not fast-path, so the result is byte-identical either way.
+    Ok(bc_runtime::gather::concat_columns(&cols)?)
 }
 
 /// Concatenate a `Utf8`/`Binary` column that no longer fits 32-bit offsets by widening it

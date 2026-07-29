@@ -3,9 +3,9 @@
 Three scheduling knobs, none of which can change a result (a chunk only shards a morsel, a
 prefetch depth only reorders when a chunk is read):
 
-* the GPU sub-batch row cap, seeded from a model's learned VRAM-safe size (`_learned_gpu_cap`);
-* a CPU stage's byte-adaptive chunk, which shrinks on wide post-decode rows (`_cpu_batch_rows`);
-* the source-read prefetch depth, deepened for a source measured as slow (`_learned_read_depth`).
+* the GPU sub-batch row cap, seeded from a model's learned VRAM-safe size (`learned_gpu_cap`);
+* a CPU stage's byte-adaptive chunk, which shrinks on wide post-decode rows (`cpu_batch_rows`);
+* the source-read prefetch depth, deepened for a source measured as slow (`learned_read_depth`).
 
 The invariance gate runs a two-stage chain (a CPU stage feeding a GPU-tagged stage — the tag makes
 it stream-eligible; the `fn` itself runs on the CPU here) with the learned GPU cap seeded tiny vs
@@ -21,7 +21,8 @@ import pytest
 import batcher as bt
 from batcher.config import Config, config_context
 from batcher.core import default_hub
-from batcher.core.udf import stream
+from batcher.core.udf import sizing
+from batcher.metadata.hardware_scope import scoped
 
 pytestmark = pytest.mark.unit
 
@@ -48,19 +49,19 @@ def _stage2(b: pa.RecordBatch) -> pa.RecordBatch:
 
 def test_gpu_batch_rows_narrow_fills_to_cap():
     narrow = pa.record_batch({"x": pa.array(list(range(1000)), pa.int64())})
-    assert stream._gpu_batch_rows(narrow, row_cap=256) == 256  # narrow rows fill the cap
+    assert sizing.gpu_batch_rows(narrow, row_cap=256) == 256  # narrow rows fill the cap
 
 
 def test_gpu_batch_rows_wide_shrinks_below_cap():
     # A wide per-row payload (~1 MB/row) must batch far fewer than the cap to stay in budget.
     wide = pa.record_batch({"x": pa.array([b"\0" * (1 << 20)] * 200)})
-    got = stream._gpu_batch_rows(wide, row_cap=256)
+    got = sizing.gpu_batch_rows(wide, row_cap=256)
     assert 1 <= got < 256
 
 
 def test_gpu_batch_rows_respects_learned_cap():
     narrow = pa.record_batch({"x": pa.array(list(range(1000)), pa.int64())})
-    assert stream._gpu_batch_rows(narrow, row_cap=32) == 32  # learned cap caps the fill
+    assert sizing.gpu_batch_rows(narrow, row_cap=32) == 32  # learned cap caps the fill
 
 
 # --- _learned_gpu_cap: cold default vs seeded --------------------------------------------
@@ -68,14 +69,14 @@ def test_gpu_batch_rows_respects_learned_cap():
 
 def test_learned_gpu_cap_cold_is_config_default():
     op = bt.from_arrow(pa.table({"x": [1]})).ml.map_batches(_stage2, num_gpus=1)._plan
-    assert stream._learned_gpu_cap(op) == stream._GPU_STREAM_BATCH_ROWS
+    assert sizing.learned_gpu_cap(op) == sizing._GPU_STREAM_BATCH_ROWS
 
 
 def test_learned_gpu_cap_seeded_caps_down():
     op = bt.from_arrow(pa.table({"x": [1]})).ml.map_batches(_stage2, num_gpus=1)._plan
-    sig = stream._stage_sig(op)
-    default_hub().put_keyed_param(stream._GPU_BATCH_NS, sig, {"ema": 40.0})
-    assert stream._learned_gpu_cap(op) == 40  # min(config cap, learned)
+    sig = sizing.stage_sig(op)
+    default_hub().put_keyed_param(scoped(sizing._GPU_BATCH_NS), sig, {"ema": 40.0})
+    assert sizing.learned_gpu_cap(op) == 40  # min(config cap, learned)
 
 
 # --- _cpu_batch_rows: byte-adaptive shrink on wide rows ----------------------------------
@@ -83,12 +84,12 @@ def test_learned_gpu_cap_seeded_caps_down():
 
 def test_cpu_batch_rows_narrow_keeps_morsel():
     narrow = pa.record_batch({"x": pa.array(list(range(1000)), pa.int64())})
-    assert stream._cpu_batch_rows(narrow, morsel=16_384) == 16_384
+    assert sizing.cpu_batch_rows(narrow, morsel=16_384) == 16_384
 
 
 def test_cpu_batch_rows_wide_shrinks():
     wide = pa.record_batch({"x": pa.array([b"\0" * (4 << 20)] * 100)})  # ~4 MB/row
-    assert stream._cpu_batch_rows(wide, morsel=16_384) < 16_384
+    assert sizing.cpu_batch_rows(wide, morsel=16_384) < 16_384
 
 
 # --- _learned_read_depth: slow source deepens the prefetch -------------------------------
@@ -96,19 +97,21 @@ def test_cpu_batch_rows_wide_shrinks():
 
 def test_read_depth_cold_is_base():
     src = bt.from_arrow(pa.table({"x": [1, 2, 3]}))._sources[0]
-    assert stream._learned_read_depth(src) == stream._STREAM_PREFETCH_DEPTH
+    assert sizing.learned_read_depth(src) == sizing._STREAM_PREFETCH_DEPTH
 
 
 def test_read_depth_deepens_for_a_slow_source():
     src = bt.from_arrow(pa.table({"x": [1, 2, 3]}))._sources[0]
-    default_hub().put_keyed_param(stream._SCAN_TPUT_NS, src.identity(), {"ema": 1000.0})  # slow
-    assert stream._learned_read_depth(src) > stream._STREAM_PREFETCH_DEPTH
+    default_hub().put_keyed_param(
+        scoped(sizing._SCAN_TPUT_NS), src.identity(), {"ema": 1000.0}
+    )  # slow
+    assert sizing.learned_read_depth(src) > sizing._STREAM_PREFETCH_DEPTH
 
 
 def test_ema_round_trip():
-    stream._fold_ema(stream._SCAN_TPUT_NS, "k", 100.0)
-    assert stream._read_ema(stream._SCAN_TPUT_NS, "k") == 100.0
-    assert stream._read_ema(stream._SCAN_TPUT_NS, None) is None
+    sizing.fold_ema(sizing._SCAN_TPUT_NS, "k", 100.0)
+    assert sizing._read_ema(sizing._SCAN_TPUT_NS, "k") == 100.0
+    assert sizing._read_ema(sizing._SCAN_TPUT_NS, None) is None
 
 
 # --- result-invariance: the streaming GPU chunk size never changes the output ------------
@@ -120,10 +123,12 @@ def _run_chain(t: pa.Table):
 
 def test_streaming_gpu_batch_size_is_result_invariant():
     t = pa.table({"x": list(range(5000))})
-    sig = stream._stage_sig(bt.from_arrow(t).ml.map_batches(_stage2, num_gpus=1)._plan)
+    sig = sizing.stage_sig(bt.from_arrow(t).ml.map_batches(_stage2, num_gpus=1)._plan)
 
     cold = _run_chain(t)  # config-default GPU chunk
-    default_hub().put_keyed_param(stream._GPU_BATCH_NS, sig, {"ema": 8.0})  # tiny learned chunk
+    default_hub().put_keyed_param(
+        scoped(sizing._GPU_BATCH_NS), sig, {"ema": 8.0}
+    )  # tiny learned chunk
     warm = _run_chain(t)
 
     assert cold == warm  # chunk size only shards — byte-identical result
@@ -149,7 +154,7 @@ def test_the_learned_gpu_cap_can_recover_and_is_not_a_one_way_ratchet():
     """
     import pyarrow as pa
 
-    cap = stream._GPU_STREAM_BATCH_ROWS
+    cap = sizing._GPU_STREAM_BATCH_ROWS
     sig = "test.ratchet_model"
 
     def morsel(per_row_bytes: int, rows: int) -> pa.RecordBatch:
@@ -161,20 +166,20 @@ def test_the_learned_gpu_cap_can_recover_and_is_not_a_one_way_ratchet():
     wide, narrow = morsel(3_000_000, 4), morsel(64, 512)
     # A wide morsel really does size down, and a narrow one really does size up — otherwise
     # this test would pass on a broken implementation that ignored width entirely.
-    assert stream._gpu_batch_rows(wide, cap) < stream._gpu_batch_rows(narrow, cap)
+    assert sizing.gpu_batch_rows(wide, cap) < sizing.gpu_batch_rows(narrow, cap)
 
     # Run 1 is all wide rows: the learned cap settles small.
-    default_hub().put_keyed_param(stream._GPU_BATCH_NS, sig, {})
-    stream._fold_ema(stream._GPU_BATCH_NS, sig, float(stream._gpu_batch_rows(wide, cap)))
-    after_wide = stream._read_ema(stream._GPU_BATCH_NS, sig)
+    default_hub().put_keyed_param(scoped(sizing._GPU_BATCH_NS), sig, {})
+    sizing.fold_ema(sizing._GPU_BATCH_NS, sig, float(sizing.gpu_batch_rows(wide, cap)))
+    after_wide = sizing._read_ema(sizing._GPU_BATCH_NS, sig)
     assert after_wide is not None
 
     # Run 2 is all narrow rows. The observation is sized against the CONFIG cap, so it
     # reports what the narrow data permits and the EMA climbs back.
     learned_cap = min(cap, int(after_wide))
-    stream._fold_ema(stream._GPU_BATCH_NS, sig, float(stream._gpu_batch_rows(narrow, cap)))
-    assert stream._read_ema(stream._GPU_BATCH_NS, sig) > after_wide  # recovered
+    sizing.fold_ema(sizing._GPU_BATCH_NS, sig, float(sizing.gpu_batch_rows(narrow, cap)))
+    assert sizing._read_ema(sizing._GPU_BATCH_NS, sig) > after_wide  # recovered
 
     # Sizing against the previously *learned* cap — what the old code folded — could not
     # have exceeded it, which is precisely why the EMA could only ever fall.
-    assert stream._gpu_batch_rows(narrow, learned_cap) <= learned_cap
+    assert sizing.gpu_batch_rows(narrow, learned_cap) <= learned_cap

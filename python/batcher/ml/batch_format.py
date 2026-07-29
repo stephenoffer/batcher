@@ -45,14 +45,49 @@ def to_format(batch: pa.RecordBatch, fmt: str) -> Any:
     if fmt == "pandas":
         return batch.to_pandas()
     if fmt == "torch":
-        return arrays_to_torch(next(to_numpy_batches([batch])))
+        arrays = next(to_numpy_batches([batch]))
+        _warn_dropped(arrays, fmt)
+        return arrays_to_torch(arrays)
     if fmt == "polars":
         pl = _require_polars()
         return pl.from_arrow(pa.Table.from_batches([batch]))
     if fmt == "jax":
         jnp = _require_jax()
-        return {name: jnp.asarray(arr) for name, arr in next(to_numpy_batches([batch])).items()}
+        arrays = next(to_numpy_batches([batch]))
+        _warn_dropped(arrays, fmt)
+        return {n: jnp.asarray(a) for n, a in arrays.items() if a.dtype.kind in "biufc"}
     raise ValueError(f"unknown batch_format {fmt!r}; expected one of {FORMATS}")
+
+
+#: Column sets already warned about, so a dropped column is reported once per stage rather
+#: than once per batch (a 10,000-batch scan would otherwise emit 10,000 identical warnings).
+_WARNED_DROPS: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def _warn_dropped(arrays: dict[str, Any], fmt: str) -> None:
+    """Warn once that a tensor `batch_format` is dropping this batch's non-numeric columns.
+
+    ``batch_format="torch"`` (and ``"jax"``) can only hand a `fn` numeric columns, so a
+    string ``id``/``label``/``caption`` alongside the features vanished from the dict with no
+    signal at all — the `fn` then either raised a `KeyError` far from its cause, or, worse,
+    ran fine and wrote a result with the identifying column silently gone. The loader path
+    has warned about exactly this since it was written (`converters._warn_dropped_non_numeric`);
+    the `map_batches` path did not, which is the more common way to meet it.
+    """
+    dropped = tuple(sorted(n for n, a in arrays.items() if a.dtype.kind not in "biufc"))
+    if not dropped or (fmt, dropped) in _WARNED_DROPS:
+        return
+    _WARNED_DROPS.add((fmt, dropped))
+    import warnings
+
+    warnings.warn(
+        f"batch_format={fmt!r} cannot represent non-numeric column(s) {list(dropped)}, so the "
+        f"function will not receive them and they will be missing from its output. Keep them by "
+        f"using batch_format='pyarrow' (or 'pandas'), or select the numeric columns explicitly "
+        f"with `input_columns=` so the drop is intentional.",
+        UserWarning,
+        stacklevel=4,
+    )
 
 
 def result_to_arrowable(result: Any, fmt: str) -> Any:
@@ -66,14 +101,49 @@ def result_to_arrowable(result: Any, fmt: str) -> Any:
     if fmt == "numpy":
         return result  # a {col: ndarray} dict — from_pydict handles ndarrays
     if fmt == "pandas":
-        return pa.RecordBatch.from_pandas(result, preserve_index=False)
+        return _pandas_result(result)
     if fmt == "torch":
         return _tensors_to_numpy(result)
     if fmt == "polars":
-        return result.to_arrow() if hasattr(result, "to_arrow") else result
+        return _polars_result(result)
     if fmt == "jax":
         return _tensors_to_numpy(result)
     raise ValueError(f"unknown batch_format {fmt!r}; expected one of {FORMATS}")
+
+
+def _pandas_result(result: Any) -> Any:
+    """A ``batch_format="pandas"`` result reduced to something the Arrow normalizer accepts.
+
+    A frame is the documented return, but the natural one-column transform is
+    ``df["x"] * 2`` — a `Series`. That used to reach `RecordBatch.from_pandas`, which asks
+    for ``.columns`` and fails with ``'Series' object has no attribute 'columns'``: an error
+    that names neither `map_batches` nor pandas nor the fix. A named `Series` becomes its own
+    one-column frame; an Arrow object or a plain dict passes straight through, so a `fn` that
+    finds it easier to build the result some other way is not forced back into pandas.
+    """
+    if isinstance(result, pa.RecordBatch | pa.Table | dict):
+        return result
+    if type(result).__name__ == "Series" and type(result).__module__.startswith("pandas"):
+        if result.name is None:
+            raise ValueError(
+                "map_batches with batch_format='pandas' returned an unnamed Series; Arrow needs "
+                "a column name. Return a DataFrame, or name it with `series.rename('col')`."
+            )
+        return {str(result.name): result.to_numpy()}
+    return pa.RecordBatch.from_pandas(result, preserve_index=False)
+
+
+def _polars_result(result: Any) -> Any:
+    """A ``batch_format="polars"`` result reduced the same way `_pandas_result` reduces pandas.
+
+    A polars `Series` is the one-column analog of the pandas case and always carries a name,
+    so it converts unconditionally.
+    """
+    if isinstance(result, pa.RecordBatch | pa.Table | dict):
+        return result
+    if type(result).__name__ == "Series" and type(result).__module__.startswith("polars"):
+        return result.to_frame().to_arrow()
+    return result.to_arrow() if hasattr(result, "to_arrow") else result
 
 
 def _tensors_to_numpy(result: Any) -> Any:

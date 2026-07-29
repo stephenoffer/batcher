@@ -124,7 +124,8 @@ def _validate_template(template: str, names: list[str]) -> None:
         if field:
             # ``{a.b}`` / ``{a[0]}`` reference column ``a``; take that root.
             referenced.add(field.split(".", 1)[0].split("[", 1)[0])
-    missing = sorted(f for f in referenced if f and not f.isdigit() and f not in names)
+    known = set(names)
+    missing = sorted(f for f in referenced if f and not f.isdigit() and f not in known)
     if missing:
         from batcher._internal.errors import PlanError
 

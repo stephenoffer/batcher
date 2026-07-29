@@ -16,7 +16,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    append_projections,
+    columns_arg,
+    require_column_kind,
+)
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -146,10 +151,10 @@ class TextStatFeaturizer(Preprocessor):
         Returns:
             A new lazy `Dataset` with the text-feature columns appended.
         """
+        require_column_kind(ds, self.columns, what="TextStatFeaturizer", kind="string")
         projections = {
             f"{name}_{feature}": _feature_expr(name, feature)
             for name in self.columns
             for feature in self.features
         }
-        out = ds.with_columns(**projections)
-        return out.drop(*self.columns) if self.drop_original else out
+        return append_projections(ds, projections, self.columns, drop_original=self.drop_original)

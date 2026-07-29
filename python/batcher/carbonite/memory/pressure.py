@@ -44,6 +44,12 @@ _DEFAULT_ALPHA = 0.5
 # How strongly a high flap rate stiffens the hysteresis: a fully-flapping history (rate 1.0)
 # cuts the de-escalation weight to `1 - _FLAP_STIFFEN` of the default (a much stickier level).
 _FLAP_STIFFEN = 0.8
+# Where ELEVATED begins, as a fraction of the soft limit. The level exists to give the
+# engine a *warning* band it can act in before the soft limit forces spilling — 90% of soft
+# is 76.5% of the envelope on the defaults, which is roughly one large morsel's worth of
+# headroom on a typical budget. Named rather than inlined because two things must agree
+# about it: the classifier here, and the morsel/cache ladders that react to the level.
+_ELEVATED_FRACTION_OF_SOFT = 0.9
 
 
 class PressureLevel(IntEnum):
@@ -206,15 +212,57 @@ class PressureMonitor:
         return self._classify(max(raw, prev))
 
     def _classify(self, used: float) -> PressureLevel:
-        """Bucket a used-fraction into a level. Pure."""
+        """Bucket a used-fraction into a level. Pure.
+
+        A config with `hard_limit < soft_limit` is a misconfiguration, and taken literally
+        it deletes two of the four bands: every reading past the soft limit is also past
+        the hard one, so the ladder jumps NORMAL → CRITICAL with no ELEVATED warning band
+        and no SPILL band at all — the engine never spills, it only ever hits the emergency
+        stop. `hard` is the cap and is authoritative, so `soft` is pulled *down* to it
+        (never `hard` up, which would let a query run past a limit its operator set). The
+        ladder is then well-formed for any config: an ELEVATED band below the cap, and
+        CRITICAL at it.
+        """
         mem = self._config.memory
-        if used >= mem.hard_limit:
+        hard = mem.hard_limit
+        soft = min(mem.soft_limit, hard)
+        if used >= hard:
             return PressureLevel.CRITICAL
-        if used >= mem.soft_limit:
+        if used >= soft:
             return PressureLevel.SPILL
-        if used >= mem.soft_limit * 0.9:
+        if used >= soft * _ELEVATED_FRACTION_OF_SOFT:
             return PressureLevel.ELEVATED
         return PressureLevel.NORMAL
+
+    def headroom_bytes(self) -> int:
+        """Bytes that may still be allocated before the *soft* limit is reached.
+
+        The forward-looking companion to `level()`: a level says which band the engine is
+        in, this says how much room is left in it. An operator deciding whether to
+        materialize one more partition wants the byte figure, not the band — and computing
+        it at the call site means re-deriving the soft threshold there, which is exactly
+        how two components end up disagreeing about where the line is.
+
+        Returns:
+            Remaining bytes under the soft limit; `0` once it is reached or passed.
+        """
+        used = self._engine_used_fraction()
+        envelope = self.envelope_bytes()
+        return max(0, int(envelope * (self._config.memory.soft_limit - used)))
+
+    def reset(self) -> None:
+        """Forget the hysteresis average and the flap accounting.
+
+        A monitor is per-`ResourceManager` and therefore per-query, but the flap statistics
+        it accumulates describe a *channel's* behaviour over time. A long-lived session
+        that reuses one monitor across unrelated queries otherwise carries the first
+        query's oscillation into the second's de-escalation weight.
+        """
+        self._ewma = None
+        self._prev_level = None
+        self._last_dir = 0
+        self._reversals = 0
+        self._samples = 0
 
     @staticmethod
     def _engine_used_fraction() -> float:
@@ -235,7 +283,7 @@ class PressureMonitor:
         candidates: list[float] = []
         pool = current_process_pool()
         if pool is not None and pool.limit > 0:
-            candidates.append(pool.used / pool.limit)
+            candidates.append(pool.utilization)
         total = probe.total_memory_bytes()
         if total:
             footprint = probe.cgroup_current_bytes() or probe.process_rss_bytes()
@@ -256,11 +304,6 @@ class PressureMonitor:
     def _available_bytes(total: int) -> int:
         """Available RAM, never reported as more than the `total` this monitor budgets to."""
         return min(probe.available_bytes(), total)
-
-    @staticmethod
-    def _read_available_bytes() -> int:
-        """One uncached live reading of available RAM. Kept as a seam tests can replace."""
-        return probe.read_available_bytes()
 
 
 def hysteresis_alpha_from_flap(flap_rate: float | None) -> float | None:

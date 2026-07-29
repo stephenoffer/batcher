@@ -264,7 +264,26 @@ impl FlightService for FlightHandler {
             while let Some(msg) = inbound.next().await {
                 match msg {
                     Ok(data) => {
-                        let granted = decode_credits(&data.app_metadata);
+                        // Clamp the top-up so outstanding permits can never exceed the
+                        // window the exchange was seeded with.
+                        //
+                        // The crate's headline property is that the producer never buffers
+                        // more than `credits` batches ahead of the consumer — and it was
+                        // enforced entirely by the *consumer's* arithmetic. A consumer that
+                        // over-grants (a bug in a top-up, or a peer that simply chooses to)
+                        // made the producer encode and hold the whole partition, so a
+                        // misbehaving reducer OOM'd a healthy mapper. Worse, tokio's
+                        // `add_permits` panics past `MAX_PERMITS`, so a large enough claimed
+                        // grant took the serve task down rather than merely over-buffering.
+                        //
+                        // Bounding it here makes the property the *producer's* invariant,
+                        // which is where a memory bound belongs. Liveness is unaffected: the
+                        // consumer grants only after consuming, so the clamp binds only on a
+                        // grant that was already more than the window allows.
+                        let claimed = decode_credits(&data.app_metadata);
+                        let room =
+                            initial.saturating_sub(credits_for_pump.available_permits() as u32);
+                        let granted = claimed.min(room);
                         if granted > 0 {
                             gauge_for_pump.on_grant_message();
                             for _ in 0..granted {

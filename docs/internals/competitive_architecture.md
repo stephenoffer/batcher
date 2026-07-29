@@ -57,11 +57,12 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 
 | Dimension | vs DuckDB | vs Polars | vs Spark/Databricks | vs Flink | vs Ray Data / Daft | vs Snowflake |
 |---|---|---|---|---|---|---|
-| Small-query latency | = | = | **W** | — | **W** | **W** |
+| Small-query latency | **= on a repeated shape** (2x faster), **L on a first-seen one** (2.8x slower — 8 ms of optimizer, twice; ceiling 8) | = | **W** | — | **W** | **W** |
 | Single-node ≤10M rows | **W** | **W** | **W** | — | **W** | — |
 | Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5) | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
 | Optimizer breadth | = (302 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
+| Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M) — ceiling 7 | — | — | — | — | — |
 | Learned/adaptive | **W** | **W** | **W** | — | **W** | = |
 | String execution | **L** (no StringView, dict decoded at leaf) | **L** | = | — | L | L |
 | Streaming guarantees | — | — | L | **✗** | — | — |
@@ -104,12 +105,14 @@ training, where Batcher does not compete — see ceilings):
 
 - **Daft** is the closest. It has native URL-download, image decode/resize/crop/`to_mode`,
   a variable-shape tensor type, and embedding/cosine expressions — a strong multimodal surface.
-  Batcher now matches its **image center-crop** (`.image.center_crop`) and **grayscale
-  color-convert** (`.image.to_grayscale`), and leads on **audio**: Daft has **no native
+  Batcher's image surface now **covers Daft's completely**: center-crop, offset `crop`,
+  `encode` (png/jpeg/bmp/gif), and `convert` over the full `L`/`LA`/`RGB`/`RGBA` palette,
+  with the four header facts (`width`/`height`/`channels`/`mode`) from **one** read where
+  Daft spends a call per fact. It leads on **audio**: Daft has **no native
   mel-spectrogram / MFCC** (per-row UDFs), which Batcher does in-engine (both torchaudio-matched).
-  Daft still leads on the
-  **variable-shape tensor type** (ceiling below) and richer color-mode conversions (Batcher
-  has grayscale, not the full `to_mode` palette).
+  Daft still leads on the **variable-shape tensor type** (ceiling below). The
+  color-conversion gap this bullet used to record is closed; see
+  `daft_parity_ledger.md`.
 - **Ray Data** has good CPU preprocessors (scalers/encoders/imputers) and a tensor type, but
   multimodal decode is a torch/PIL **UDF per batch**, not an engine expression; **no native
   mel-spectrogram**; fuzzy-match/minhash are user code.
@@ -168,6 +171,41 @@ default.
 high-selectivity filter gather tax; a spilling streaming breaker to remove the fall-back-to-
 materializing condition; growing the JIT to vectorized aggregate/hash kernels.
 
+**A hole in the claim above, found and closed 2026-07-24.** "Peak memory is the breakers' state
+plus one morsel per worker, a constant, independent of the input size" was **not true when a
+join fanned out**. The streaming probe was `stream.map(|morsel| gather_join_output_with(...))`:
+one input morsel produced exactly **one** output `RecordBatch`, however many rows that was. A
+16,384-row probe morsel against a 20,000-row build side with a single distinct key produces 327
+million rows, and that was emitted as one batch — measured at **13.1 GB RSS in a fresh process**
+with streaming on by default.
+
+It was never a cartesian-only problem. Any high-fan-out join hit it, including an ordinary
+equi-join on a skewed key: a build side holding 100,000 duplicates of one key turns each probe
+row carrying it into 100,000 output rows in the same single batch. The bound does hold for
+row-preserving and row-reducing operators, which is most of them, and that is why this survived
+the 46-test oracle suite — every one of those tests is correct, and none of them fans out. A
+correctness suite cannot see a memory property.
+
+**Fixed:** the probe now morselizes its *output* rather than assuming one morsel in implies one
+morsel out, emitting as many `DEFAULT_MORSEL_ROWS`-bounded batches as the fan-out requires. The
+common 1:1 foreign-key case is untouched — when the whole result fits one morsel it is gathered
+from the unsliced indices, so `gather_join_output_with`'s identity-permutation fast path (which
+replaces a full column copy with an `Arc::clone`) still fires and that path is byte-for-byte what
+it was. Metrics keep their contract: probe `rows_in` is attributed to the first chunk only, so
+chunking cannot inflate the input count, while `rows_out` accumulates. The `peak_bytes` counter
+becomes *true* rather than merely defined — its doc comment always said "a pipeline operator
+holds one morsel at a time, so its peak is the largest morsel it ever produced".
+
+Measured on the same cartesian query, in two steps. Morselizing the *output* gave
+**13,139 MB → 5,179 MB and 17,104 ms → 10,287 ms**; the residual was the `JoinIndices`
+themselves, two `u32` arrays over every output row, which only slicing the probe on the *input*
+side can bound. Adding that (sized from the fan-out the previous slice measured) gave
+**5,179 MB → 728 MB and 10,287 ms → 5,360 ms**. Together: **13,139 MB → 728 MB (18x) and
+17,104 ms → 5,360 ms (3.2x)**, identical results throughout. The time came free with the memory
+— the predicate above the join now runs over cache-resident morsels instead of a 10 GB batch. `a_high_fanout_join_emits_bounded_morsels`
+pins the property against a skewed equi-join, asserting both the morsel cap and equality with the
+materializing oracle.
+
 ### 2. No string-optimized representation (partly closed)
 
 Zero `StringView`/`Utf8View` anywhere in the codebase (German strings — DuckDB and Polars both
@@ -190,27 +228,62 @@ operand orders, null keys, and null dictionary *values*.
 Still open on this axis: `StringView`, dictionary survival through project/join, and a
 dictionary-aware string join key. Filters and group-by are now dict-native; the rest is not.
 
+**Also closed this pass, for conjunctive filters.** Batcher evaluated *every* conjunct of an
+`AND` over *every* row and `and_kleene`'d the masks, so a five-predicate filter that kept 1.65%
+of its rows paid five full-width passes. DuckDB does not: `ExpressionExecutor::Select` walks
+the conjuncts against a selection vector so conjunct *n+1* sees only what conjunct *n* kept.
+`Expr::short_circuit_filter_mask` (`bc-expr/src/select.rs`) is the Arrow-shaped equivalent —
+evaluate the cheapest conjunct at full width, then *compact* (gather the survivors of only the
+columns the remaining conjuncts name) and evaluate the rest against that. Measured over 64
+morsels of a 17-column lineitem shape, whole Filter operator including the gather both paths
+pay: **TPC-H q6 1.50x, a `LIKE` behind a cheap guard 2.03x, a `regexp_matches` behind one
+5.73x.** The mask alone is 1.90x / 2.92x / 8.75x.
+
+It is bit-identical by construction rather than by measurement, and the guard is the
+interesting part: only conjuncts whose failures are *schema*-driven, never *row*-driven, may
+be skipped (`Expr::is_infallible_predicate`, exhaustive with no wildcard arm). Checked
+arithmetic, `Div`, a strict `CAST` and every string-*producing* function can raise on one row
+and not its neighbour, so their predicates take the old path untouched; the six
+boolean-returning string predicates cannot, and are admitted — but only over a column that is
+already UTF-8, since evaluating one over `Binary` casts it and *that* rejects a row's bytes one
+at a time. The equivalence is pinned by
+`crates/bc-expr/tests/short_circuit_filter.rs`, which asserts mask-for-mask agreement with
+whole-batch evaluation on every predicate shape above before it reports a timing.
+
+What DuckDB still has here that Batcher does not is the *online* half: `AdaptiveFilter` is a
+randomized hill-climb over the conjunct order on measured time, which is what corrects a
+static cost model that ordered a cheap unselective predicate ahead of an expensive selective
+one. See `competitor_technique_review.md` for the mechanism and the four call sites that need
+a per-operator state slot.
+
 ### 3. Shuffle is RAM-only, and the fix is written but never called
 
 `PartitionStore` is an in-memory `HashMap` (`bc-transport/src/store.rs:72`). No disk tier, no
 spill, no external shuffle service. A dead worker loses its buckets → lineage recompute (re-read
 the source, re-run the map — the longest phase). Spark writes shuffle to disk and re-fetches it.
 
-The mitigation **already exists and is dead code**:
-- `carbonite/resilience/replication.py::assign_replica_hosts` — implemented, doctested, **zero
-  call sites**.
-- `dist/flight_worker.py:292::replicate_buckets` — "the core of recompute-free recovery",
-  **never called**.
-- Every reducer takes `replicas=None`; **no caller ever passes it**.
-- `DistributedConfig.shuffle_replication` is defined, validated, and **set to 2 by the spot
-  profile** — and *nothing reads it*.
+The mitigation is **partly wired** (this section previously said "dead code"; that is now
+half-true and the half matters):
+- `carbonite/resilience/replication.py::assign_replica_hosts` and
+  `dist/flight_worker.py::replicate_buckets` are called by
+  `dist/shuffle_replication.py::replicate_shuffle_output`.
+- That has **exactly one caller** — the flat aggregate reduce (`flight_aggregate.py`). The
+  combiner tree (which is the path a *large* cluster takes, i.e. where node loss is likeliest),
+  join, sort, and window still pass `replicas=None`, so they fall back to full lineage recompute.
+- `DistributedConfig.shuffle_replication` defaults to **1**, not 2.
 
-So on a spot cluster today you get recompute, not re-fetch, while the config claims otherwise.
-Wiring four call sites converts preemption from recompute to re-fetch.
+So on a spot cluster you get re-fetch for a flat `GROUP BY` and recompute for everything else.
 
-Related: `clear_plan`/`release` are bound in Rust and called **only** by the streaming pipeline —
-so a long-lived batch fleet accumulates every bucket of every stage until OOM. The Rust doc
-comment warns about exactly this.
+**Bucket eviction: FIXED (2026-07-26).** `clear_plan`/`release` were bound end to end through
+Rust with **zero production call sites** — only the streaming pipeline released anything — so a
+session-scoped fleet (`reuse_session_fleet`, on by default) accumulated every bucket of every
+stage of every query until the node OOMed. Now evicted at two points: `dist/fleet/eviction.py`
+from `query_shuffle_scope`'s exit (cross-query), and `FlightMaterializedSource.cleanup()` before
+its `_actors is None` early return (intra-query, the borrowed-fleet case that was the leak).
+`bc-transport::clear_plan_shared` frees the matching `/dev/shm` files, which nothing freed at
+all — tmpfs is RAM-backed, so that was a second leak on the same node. Regression coverage:
+`tests/integration/test_shuffle_bucket_eviction.py`, keyed on `ShuffleSession.partition_count`,
+which is the only thing that can observe a leak before it is fatal.
 
 ### 4. Streaming is micro-batch, and cannot express Flink's guarantees
 
@@ -277,9 +350,157 @@ tasks from executors (routinely 10k–100k tasks/stage), which is what buys dyna
 work stealing off a slow node, and fine-grained recovery. Batcher's coarse unit means a straggler's
 *entire* partition must be redone, and skew cannot be diluted by over-partitioning.
 
-Compounding it: **speculation is off by default** (`max_backups = 0`), **salting is off**
-(`skew_join_salt = 0`), **locality is off** (`locality_aware_scheduling = False`). Out of the box,
-resilience is Ray task retries + single-stage lineage recompute + whole-query retry.
+Compounding it: **salting is off** (`skew_join_salt = 0`) and **locality is off**
+(`locality_aware_scheduling = False`). Out of the box, resilience is Ray task retries +
+single-stage lineage recompute + whole-query retry.
+
+Speculation is **on** (`speculation_max_backups = 1`) — this section previously said it was off
+at `max_backups = 0`, which the config contradicts. The granularity argument above stands
+regardless: a backup duplicates one coarse task, it does not make the unit finer.
+
+Since 2026-07-26 all of this is at least **observable**: recompute rounds, worker loss,
+speculative backups, replica retirement, and proactive spot migration publish
+`events.RECOVERY` (`_internal/events.py`), which `observe` folds into
+`batcher_recovery_total{event=...}` and the live job view. Before that the entire recovery
+machinery ran silently, so a query that survived losing two workers and one that was merely
+slow were indistinguishable from outside.
+
+### 7. A range join was a materialized cartesian product — **fixed below ~1M rows**
+
+The IR had exactly two join nodes: `HashJoin` (equi) and `AsofJoin`. Everything else — every
+inequality, every interval containment, every band join — lowered to a cartesian `HashJoin` on a
+synthetic `__cross_key` with the predicate as a `Filter` above it. The intermediate was
+`|L| x |R|` rows no matter how few survived: quadratic in time *and* memory, 13.1 GB RSS for
+`n = 20,000`, and at `n = 100,000` it did not run.
+
+**`bc_ir::RelOp::RangeJoin` is now a real operator** (`crates/bc-runtime/src/join/range.rs`): a
+sorted-suffix scan for one inequality, **IEJoin** (Khayyat et al., the algorithm DuckDB's
+`PhysicalIEJoin` implements) for two, with both axis sorts and the sweep parallelized.
+`derive_range_join` (`kyber/rules/joins/range_join.py`) moves up to two crossing inequality
+conjuncts off the filter and into the join, materializing a computed operand
+(`a.ts - 5 < b.ts`) as a hidden column when it has to.
+
+Batcher's own before-and-after is decisive — this removed the wall:
+
+| n | Batcher before | Batcher now |
+|---|---|---|
+| 10,000 | 3,380 ms | **35 ms** |
+| 20,000 | 15,573 ms | **42 ms** |
+| 40,000 | 64,249 ms | **49 ms** |
+| 100,000 | did not run | **78 ms** |
+| 2,000,000 | did not run | **1,093 ms** |
+
+**Against DuckDB it is still a loss, and the earlier version of this section said the opposite.**
+DuckDB picks `IE_JOIN` only when its cardinality estimate for both inputs clears
+`merge_join_threshold` (default 1,000, `src/execution/physical_plan/plan_comparison_join.cpp`);
+a table registered from Arrow does not clear it, so DuckDB falls back to `NESTED_LOOP_JOIN`. The
+first measurement here was against that fallback and reported 15-643x in Batcher's favour. With
+the same data ingested by an untimed `CREATE TABLE`, DuckDB plans `IE_JOIN`:
+
+| n | Batcher | DuckDB (native, `IE_JOIN`) | DuckDB (arrow, `NESTED_LOOP_JOIN`) |
+|---|---|---|---|
+| 10,000 | 35 ms | **15 ms** | 492 ms |
+| 20,000 | 42 ms | **19 ms** | 1,886 ms |
+| 40,000 | 49 ms | **38 ms** | 7,561 ms |
+| 100,000 | 78 ms | **78 ms** | 47,503 ms |
+| 200,000 | 146 ms | **97 ms** | *(not run)* |
+| 500,000 | 251 ms | **138 ms** | *(not run)* |
+| 1,000,000 | 476 ms | **274 ms** | *(not run)* |
+| 2,000,000 | 1,093 ms | **383 ms** | *(not run)* |
+
+**That was the state when this section was written. It has since been rewritten** — see
+`engine_improvements_ledger.md` entry 14 — and the operator is now 2.4x to 7.5x faster than the
+table above, which puts it *ahead* of DuckDB below about half a million rows:
+
+| n | Batcher (now) | DuckDB (`IE_JOIN`) | Batcher is |
+|---|---|---|---|
+| 10,000 | 3.7 ms | 9.5 ms | **2.6x faster** |
+| 100,000 | 19 ms | 56 ms | **3.0x faster** |
+| 500,000 | 87 ms | 132 ms | **1.5x faster** |
+| 1,000,000 | 194 ms | 188 ms | **0.97x, parity** |
+| 2,000,000 | 418 ms | 303 ms | 0.73x |
+| 5,000,000 | 1,493 ms | 656 ms | 0.44x |
+
+(Best of three runs each, taken once the box was quiet. Earlier runs shared it with another
+session's benchmark and the ratios moved by up to 0.2x; the shape held across all of them. The sorts became the bottleneck once
+the mark-scan hypothesis was measured and discarded; an order-preserving `u64` key per
+primitive type and a dense-rank sweep took them from 758 ms to 158 ms at two million rows.)
+
+**Batcher now wins below a million rows and reaches parity at a million.** Above that DuckDB
+still wins, and the cause is specific. This implementation's cost is
+`O(n log n)` for the sorts, `O(k)` for the emitted pairs, and a third term for *skipping* the
+unset bits of the mark array — each left row scans the axis-1 suffix from its own bound to the
+end. `MarkSet`'s summary level makes that `~ L x n / 4096` rather than `L x n / 64`, which is
+why it stays invisible to about a million rows and dominates past that. DuckDB does not pay it:
+`PhysicalIEJoin` decomposes the sorted union into blocks and prunes block *pairs* whose key
+ranges cannot intersect, so its inner loop never walks a suffix holding no answers.
+
+**So the honest state of this ceiling: the quadratic plan is gone, the memory wall with it, and
+the operator now wins below ~500,000 rows and loses above ~1,000,000.** The named next step is the block
+decomposition above — which is also what would make the operator *distributable*, since both
+need the same "which block pairs can intersect" pruning. Today the distributed planner has no
+range-join staging and executes the operator whole, which satisfies single-node == distributed
+(`test_distributed_equals_single_node`) without scaling it out.
+
+One property worth recording separately, because it is real and it is not an execution win: on
+the zero-copy Arrow input both engines actually share, Batcher is **14x to 600x faster**, because
+DuckDB will not choose its own range join without statistics it only has for its own storage. A
+user handing DuckDB an Arrow table gets the quadratic plan. That belongs in the same place as
+the rest of the `duckdb` vs `duckdb_arrow` findings in `benchmarks/TPCH_FINDINGS.md`, and it
+must not be quoted as "Batcher beats DuckDB at range joins."
+
+### 8. A first-seen query shape costs ~8 ms of optimizer, in Python
+
+Measured at `n = 10,000`, DuckDB in native storage, median over 12 never-seen query shapes:
+
+| Query shape | Batcher | DuckDB | optimizer runs |
+|---|---|---|---|
+| `count(*)` over a filter | 25.8 ms | 10.0 ms | **2** |
+| `sum()` over a filter | 17.8 ms | 9.2 ms | 1 |
+| plain projection, no aggregate | 18.1 ms | 11.2 ms | 1 |
+| filter only, one table | **9.2 ms** | **2.0 ms** | 1 |
+
+A *repeated* shape hits `kyber.plan_cache` and costs 0.12 ms of planning; the same range-join
+query is then 4.5 ms against DuckDB's 9.4 ms, i.e. **2x faster**. The whole gap is cold.
+
+Two separate costs, and an earlier draft of this section conflated them:
+
+1. **One optimizer pass is ~5-8 ms**, and that alone decides any query whose execution is
+   under ~10 ms. The single-table filter row is the clean case: 9.2 ms against 2.0 ms, with no
+   join and nothing to execute.
+2. **`count(*)` over a filter runs the optimizer twice**, adding ~8 ms. The metadata-answer
+   layer (`_answer_filtered_count_star`) optimizes the aggregate's *input* to see whether the
+   surviving count is derivable from statistics, then execution optimizes the root. This is
+   narrow — it is the only shape that does it — and the first draft here wrongly generalized
+   it to every query.
+
+**Where the 8 ms goes, measured per phase.** Of a 5.34 ms optimize on the simplest query, one
+phase carrying **282 rules costs 4.19 ms — 78%**. The other six phases together cost 0.19 ms.
+The driver is not naive about it: node-local rules already share one bottom-up traversal, and
+leaf `Expr -> Expr` rules already share one expression walk within it. What remains is that
+**every one of the 282 leaf rewrites is invoked on every expression node**, each opening with
+its own `isinstance` check — roughly 2,800 Python calls for a two-predicate filter.
+
+**Four attempts to remove it, and the cost is diffuse.** Each was measured on the
+single-table filter, whose optimize is 5.3 ms:
+
+| Attempt | Reasoning | Measured |
+|---|---|---|
+| Collapse the two memo entries | they looked like one rewrite keyed twice | no change — they optimize *different plans* |
+| Cache the eligible leaf list per node type | rebuilt from every rule at every node | no change (~0.1 ms) |
+| Memoize the whole fused expression pass per node | the node-rule `noop` argument applies to it too | 3% (5.32 -> 5.15 ms) |
+| Index the node rules by node type per pass | ~14,000 `matches` tests a query before any rule fires | **slower** (5.44 ms) |
+
+Instrumentation explains why: the fused expression pass runs only **4 times a query** with 427
+leaf slots in total, so the 94 leaf rewrites are not the cost. The 188 *node* rules are, spread
+across **19 traversals a query** with nothing dominant inside them — no single term to remove.
+All four attempts were reverted.
+
+That makes this an **architectural** cost rather than a hot spot: 282 rules over 7 phases,
+iterated to a fixpoint, in Python, for a plan of four nodes. The candidate fixes are therefore
+structural too — fewer passes (converge detection per rule family rather than per phase), or
+moving the fixpoint loop out of Python — and neither is a tuning exercise. It remains the
+largest single latency item on the board.
 
 ## Claims to retire
 

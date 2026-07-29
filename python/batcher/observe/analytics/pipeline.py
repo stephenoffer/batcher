@@ -9,7 +9,7 @@ from __future__ import annotations
 from statistics import median
 from typing import Any
 
-from .series import percentiles
+from batcher.observe.analytics.series import percentiles
 
 __all__ = ["pipeline_report"]
 

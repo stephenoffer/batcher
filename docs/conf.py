@@ -141,6 +141,17 @@ exclude_patterns = [
     # The same again: the running ledger of the engine-wide defect hunt (found / fixed /
     # open). A contributor's working record, not a site page.
     "internals/bug_hunt_ledger.md",
+    # The enterprise-requirement scorecard against the commercial platforms (Databricks,
+    # Snowflake, SageMaker, Anyscale, SkyPilot). Every cell carries an evidence citation or
+    # reads UNMEASURED. A working record for contributors deciding what to build next, and it
+    # names gaps in a register a published page should not carry.
+    "internals/platform_parity_scorecard.md",
+    # The three per-platform ledgers the scorecard above hoists from. Same reason: working
+    # records with an explicit ⚠️ register of claims that still need a primary source, which
+    # is exactly the kind of thing a published page must not carry.
+    "internals/snowflake_parity.md",
+    "internals/anyscale_parity.md",
+    "internals/orchestration_parity.md",
     # The running index of improvements to the estimators' mathematics (cardinality,
     # sketches, cost, learning, resource control). A working record for anyone touching
     # one of those closed forms, not a page a user reads.
@@ -153,6 +164,10 @@ exclude_patterns = [
     # user-supplied UDFs and callables (map_batches/map, class model UDFs, the batch-inference
     # plane, and the threads/processes/GPU scheduling beneath). A working record, not a user page.
     "internals/udf_improvements_ledger.md",
+    # The running record of the Daft-versus-Batcher capability gap: what was measured, what
+    # closed, what is open, and where the comparison runs the other way. A contributor
+    # working document (and deliberately blunt about what it does not claim), not a site page.
+    "internals/daft_parity_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
@@ -164,10 +179,24 @@ exclude_patterns = [
     # A contributor working record (scope + dependency-ordered migration), not a site page.
     "internals/rust_optimizer_port.md",
     # A code-checked audit of Batcher's architecture against DuckDB / Polars / Spark /
-    # Flink / Ray Data / Daft / Snowflake: where it genuinely wins, where it loses, the
+    # Flink / Daft / Snowflake: where it genuinely wins, where it loses, the
     # structural ceilings, and the claims the code does not support. A working record for
     # contributors (and deliberately blunt about our own marketing), not a site page.
     "internals/competitive_architecture.md",
+    # The parts list behind that scorecard: which specific mechanisms DuckDB / Polars /
+    # DataFusion / Spark / Daft have that Batcher does not, each cited to the
+    # competitor file it was read from, plus the ranked build order. A contributor working
+    # record, not a site page.
+    "internals/competitor_technique_review.md",
+    # The build log against that parts list: one row per landed engine improvement with its
+    # source technique, its safety argument and its measurement, plus what is still open. A
+    # contributor working record, not a site page.
+    "internals/engine_improvements_ledger.md",
+    # The other half of that review: gaps found by *executing* the reference engines and
+    # Batcher side by side over their whole function surface, the wrong answers that
+    # measurement turned up, and the build log against them. A contributor working record,
+    # not a site page.
+    "internals/competitor_parity_census.md",
     # A code-checked parity scorecard against the Databricks stack (Catalyst/AQE, Photon,
     # Reyden/Lakehouse//RT) covering the optimizer, vectorized execution, the distributed
     # path, and the enterprise surface — plus the Databricks claims that are secondary-

@@ -11,7 +11,7 @@ use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow::datatypes::DataType;
 use bc_arrow::canon_float_array;
 
-use crate::eval::date::add_months;
+use crate::eval::temporal::date::add_months;
 use crate::{BinaryOp, Expr, ExprError, Literal};
 
 /// Whether comparing this type's values raw would disagree with the engine's float identity.
@@ -105,29 +105,81 @@ pub(crate) fn try_scalar_binary(
     if !matches!(op, Add | Sub | Mul | Eq | Ne | Lt | Le | Gt | Ge) {
         return Ok(None);
     }
-    // Exactly one operand a numeric (Int/Float) literal; the other is the column.
-    let is_num_lit = |e: &Expr| matches!(e, Expr::Lit { value } if matches!(value, Literal::Int(_) | Literal::Float(_)));
+    // Exactly one operand a literal; the other is the column.
+    let is_lit = |e: &Expr| matches!(e, Expr::Lit { .. });
     let (arr_expr, lit_expr, lit_on_right) = match (left, right) {
-        (a, l) if is_num_lit(l) => (a, l, true),
-        (l, a) if is_num_lit(l) => (a, l, false),
+        (a, l) if is_lit(l) => (a, l, true),
+        (l, a) if is_lit(l) => (a, l, false),
         _ => return Ok(None),
     };
     let Expr::Lit { value: lit } = lit_expr else {
         return Ok(None);
     };
-
-    let arr = arr_expr.eval(batch)?;
-    // Only Int64/Float64 columns broadcast here; defer decimals/strings/dates to the
-    // array path's coercion, which handles their wider promotion rules.
-    if !matches!(arr.data_type(), Int64 | Float64) {
+    // A non-numeric literal has no arithmetic arm here (`Utf8 || Utf8` is `Concat`, which
+    // keeps the array path), so reject that combination before evaluating the column
+    // rather than after.
+    let numeric_lit = matches!(lit, Literal::Int(_) | Literal::Float(_));
+    let is_cmp = matches!(op, Eq | Ne | Lt | Le | Gt | Ge);
+    if !numeric_lit && !is_cmp {
         return Ok(None);
     }
+
+    let arr = arr_expr.eval(batch)?;
     let lit_arr = lit.to_array(1);
-    // Mirror `coerce_numeric`: a mixed Int/Float pair promotes to Float64.
-    let (arr, lit_arr) = match (arr.data_type(), lit_arr.data_type()) {
-        (Int64, Float64) => (cast(&arr, &Float64)?, lit_arr),
-        (Float64, Int64) => (arr, cast(&lit_arr, &Float64)?),
-        _ => (arr, lit_arr),
+    let (arr, lit_arr) = if numeric_lit {
+        // Only Int64/Float64 columns broadcast here; defer decimals to the array path's
+        // coercion, which handles their wider promotion rules.
+        if !matches!(arr.data_type(), Int64 | Float64) {
+            return Ok(None);
+        }
+        // Mirror `coerce_numeric`: a mixed Int/Float pair promotes to Float64.
+        match (arr.data_type(), lit_arr.data_type()) {
+            (Int64, Float64) => (cast(&arr, &Float64)?, lit_arr),
+            (Float64, Int64) => (arr, cast(&lit_arr, &Float64)?),
+            _ => (arr, lit_arr),
+        }
+    } else {
+        // A `Utf8`, `Boolean`, `Date32` or naive-`Timestamp` column against its own
+        // literal type — `o_orderpriority = '1-URGENT'`, `l_shipdate < DATE '1995-03-15'`.
+        // These are the most common predicates in the benchmark suite and they were paying
+        // a full N-row materialization of the literal: `Literal::to_array(n)` builds a
+        // `StringArray` of *n* copies of the needle, offsets and bytes, once per morsel per
+        // evaluation. A one-element `Scalar` broadcasts instead.
+        //
+        // Served on an **exact** type match, because that is what makes it bit-identical
+        // rather than merely equivalent. The array path applies three adjustments before
+        // comparing, and an exact match makes each provably the identity:
+        // `align_date_timestamp_for_cmp` only fires on a Date-vs-Timestamp pair,
+        // `align_decimals_for_cmp` only on two decimals of differing scale, and
+        // `canon_float_array` is an `Arc::clone` for anything that is not a float. So a
+        // mixed pair (`Utf8` vs `LargeUtf8`, a tz-aware timestamp against a naive literal,
+        // an `Int64` column against a `Date` literal) is declined here and keeps the array
+        // path's coercion, unchanged.
+        //
+        // The one mixed pair served here is a **string literal against a temporal column**
+        // (`EventDate >= '2013-07-01'`), which `coerce_numeric` handles by casting the
+        // literal to the column's temporal type. That cast is elementwise, so casting the
+        // one-element literal and broadcasting is the same value as casting the
+        // materialized N-row copy — including the error, since an unparseable string fails
+        // identically on one element or N. What it saves is real: the array path re-parses
+        // the *same* ISO string once per row, which showed up as 6.3% of ClickBench q39 in
+        // `arrow_cast::parse::parse_date`, and a bare date range over `hits` measured
+        // 24.7 ms against 7.5 ms for the already-typed `DATE '...'` spelling.
+        let temporal_vs_string = matches!(
+            (arr.data_type(), lit_arr.data_type()),
+            (
+                DataType::Date32 | DataType::Date64 | DataType::Timestamp(..),
+                DataType::Utf8 | DataType::LargeUtf8
+            )
+        );
+        if temporal_vs_string {
+            let typed = cast(&lit_arr, arr.data_type())?;
+            (arr, typed)
+        } else if arr.data_type() != lit_arr.data_type() {
+            return Ok(None);
+        } else {
+            (arr, lit_arr)
+        }
     };
 
     // Canonicalize both float operands for the comparison arms, exactly as the array path
@@ -205,6 +257,7 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
     // by widening to a common scale. Align here only for the comparison arms, so `*`/`+`
     // keep their own scale-propagation rules untouched.
     let (l, r) = if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+        let (l, r) = align_date_timestamp_for_cmp(&l, &r)?;
         let (l, r) = align_decimals_for_cmp(&l, &r)?;
         // Float identity is the engine's, not the raw bits' — see `canon_floats_for_cmp`.
         (canon_float_array(&l), canon_float_array(&r))
@@ -249,6 +302,15 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
         Or => Arc::new(boolean::or_kleene(as_bool(l, "or")?, as_bool(r, "or")?)?),
         // SQL `||`: cast both operands to Utf8 and concatenate element-wise.
         // A null on either side yields a null (matching DuckDB's `||` operator).
+        //
+        // Two *lists* concatenate as lists, not as their rendered text. `[1,2] || [3]`
+        // is `[1,2,3]` in DuckDB, Spark and Polars alike; casting them to Utf8 first
+        // produced the string `'[1, 2][3]'` — a wrong answer with no error, which is the
+        // worst shape a defect can take. The list kernel is the same one `list_concat`
+        // uses, so the operator and the function cannot disagree.
+        Concat if matches!(l.data_type(), DataType::List(_) | DataType::LargeList(_)) => {
+            return crate::eval::list_ops::list_set::eval_list_set(crate::ListSetOp::Concat, l, r);
+        }
         Concat => {
             use arrow::array::StringArray;
             use arrow::compute::kernels::concat_elements::concat_elements_utf8;
@@ -534,6 +596,52 @@ fn floor_div(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
 /// capped at Decimal128's 38 digits. Non-decimal or already-identical operands (and any
 /// pair that isn't two `Decimal128`s — e.g. Decimal256 or a mixed width) pass through
 /// unchanged, deferring to the existing path.
+/// A `DATE` compared against a `TIMESTAMP` column: widen the date to midnight.
+///
+/// `ts = DATE '1995-01-02'` is a query DuckDB answers — it casts the DATE up to TIMESTAMP at
+/// 00:00:00 and compares instants — and arrow's comparison kernels reject outright, raising
+/// "Invalid comparison operation: Timestamp(Microsecond, None) == Date32". That gap is not
+/// hypothetical: the fold rule that builds `InList` is a predicate-*shape* rewrite with no
+/// access to the schema, so `ts IN (DATE …, DATE …)` reaches the engine as exactly this pair,
+/// and `tests/differential/test_diff_in_list.py` pins it against DuckDB.
+///
+/// Casting the *date* up (rather than truncating the timestamp down to a date) is what makes
+/// `ts = DATE '1995-01-02'` false for a timestamp at 12:00 on that day, which is DuckDB's
+/// answer and SQL's. Widening never loses information, so no comparison can flip.
+///
+/// A tz-aware timestamp is handled by casting the date to the *naive* type and letting the
+/// zone-stripping arm of `coerce_numeric` line the two timestamps up: the stored values are
+/// UTC instants either way, and dropping the zone needs no timezone database (casting *to* a
+/// named zone would fail on an arrow build without `chrono-tz`).
+fn align_date_timestamp_for_cmp(
+    l: &ArrayRef,
+    r: &ArrayRef,
+) -> Result<(ArrayRef, ArrayRef), ExprError> {
+    use DataType::{Date32, Date64, Timestamp};
+    let naive = |unit: &arrow::datatypes::TimeUnit| Timestamp(*unit, None);
+    match (l.data_type(), r.data_type()) {
+        (Timestamp(unit, tz), Date32 | Date64) => {
+            let target = naive(unit);
+            let left = if tz.is_some() {
+                cast(l, &target)?
+            } else {
+                l.clone()
+            };
+            Ok((left, cast(r, &target)?))
+        }
+        (Date32 | Date64, Timestamp(unit, tz)) => {
+            let target = naive(unit);
+            let right = if tz.is_some() {
+                cast(r, &target)?
+            } else {
+                r.clone()
+            };
+            Ok((cast(l, &target)?, right))
+        }
+        _ => Ok((l.clone(), r.clone())),
+    }
+}
+
 fn align_decimals_for_cmp(l: &ArrayRef, r: &ArrayRef) -> Result<(ArrayRef, ArrayRef), ExprError> {
     use DataType::Decimal128;
     if let (Decimal128(p1, s1), Decimal128(p2, s2)) = (l.data_type(), r.data_type()) {
@@ -886,6 +994,174 @@ mod scalar_path_tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The same bit-for-bit obligation for the *non-numeric* literals, which broadcast as
+    /// a `Scalar` instead of materializing N copies of the value.
+    ///
+    /// `o_orderpriority = '1-URGENT'` and `l_shipdate < DATE '1995-03-15'` are the two most
+    /// common predicate shapes in the benchmark suite, so this path is hot; and a string
+    /// literal is exactly where a broadcast is worth most, because materializing it copies
+    /// offsets *and* bytes. Nulls in the column are included because a scalar comparison
+    /// must null the same rows an array comparison does.
+    #[test]
+    fn scalar_path_equals_array_path_for_non_numeric_literals() {
+        use arrow::array::{BooleanArray, Date32Array, StringArray, TimestampMicrosecondArray};
+
+        let str_col: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("1-URGENT"),
+            None,
+            Some("5-LOW"),
+            Some(""),
+        ]));
+        let bool_col: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+        ]));
+        let date_col: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(9_131),
+            None,
+            Some(0),
+            Some(-1),
+        ]));
+        let ts_col: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_000),
+            None,
+            Some(0),
+            Some(-5),
+        ]));
+
+        let cases: [(&str, &ArrayRef, Vec<Literal>); 4] = [
+            (
+                "s",
+                &str_col,
+                vec![
+                    Literal::Str("1-URGENT".into()),
+                    Literal::Str("".into()),
+                    Literal::Str("zzz".into()),
+                ],
+            ),
+            (
+                "b",
+                &bool_col,
+                vec![Literal::Bool(true), Literal::Bool(false)],
+            ),
+            (
+                "d",
+                &date_col,
+                vec![Literal::Date(9_131), Literal::Date(0), Literal::Date(-1)],
+            ),
+            (
+                "t",
+                &ts_col,
+                vec![Literal::Timestamp(1_000), Literal::Timestamp(0)],
+            ),
+        ];
+        let ops = [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ];
+
+        for (cname, col, lits) in cases {
+            let b = batch(cname, (*col).clone());
+            for lit in &lits {
+                for &op in &ops {
+                    for lit_on_right in [true, false] {
+                        let col_expr = Expr::Col {
+                            name: cname.to_string(),
+                        };
+                        let lit_expr = Expr::Lit { value: lit.clone() };
+                        let (l, r) = if lit_on_right {
+                            (col_expr, lit_expr)
+                        } else {
+                            (lit_expr, col_expr)
+                        };
+                        let fast = try_scalar_binary(op, &l, &r, &b)
+                            .unwrap()
+                            .expect("the scalar fast path must engage on an exact type match");
+                        let la = l.eval(&b).unwrap();
+                        let ra = r.eval(&b).unwrap();
+                        let slow = eval_binary(op, &la, &ra).unwrap();
+                        assert_eq!(
+                            fast.as_ref(),
+                            slow.as_ref(),
+                            "mismatch op={op:?} lit={lit:?} on_right={lit_on_right} col={cname}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A type *mismatch* must be declined, not served, because the array path's coercion is
+    /// what gives it its meaning. These are the three shapes that would silently change
+    /// behaviour if the exact-match gate were loosened to "both are strings" or "both are
+    /// temporal": a `LargeUtf8` column, a tz-aware timestamp against a naive literal, and
+    /// an integer column against a date literal.
+    #[test]
+    fn a_mismatched_literal_type_is_declined() {
+        use arrow::array::{Int64Array, LargeStringArray, TimestampMicrosecondArray};
+        use arrow::datatypes::TimeUnit;
+
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), None]));
+        let tz: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone("UTC".to_string()),
+        );
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        assert_eq!(
+            tz.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+
+        for (cname, col, lit) in [
+            ("s", &large, Literal::Str("a".into())),
+            ("t", &tz, Literal::Timestamp(1)),
+            ("i", &ints, Literal::Date(1)),
+        ] {
+            let b = batch(cname, (*col).clone());
+            let out = try_scalar_binary(
+                BinaryOp::Eq,
+                &Expr::Col {
+                    name: cname.to_string(),
+                },
+                &Expr::Lit { value: lit.clone() },
+                &b,
+            )
+            .unwrap();
+            assert!(
+                out.is_none(),
+                "a {} column against {lit:?} must keep the array path",
+                col.data_type()
+            );
+        }
+    }
+
+    /// A non-numeric literal has no arithmetic arm, so `Add`/`Sub`/`Mul` must decline
+    /// rather than reach a kernel that would reject the pair with a different error than
+    /// the array path raises.
+    #[test]
+    fn arithmetic_with_a_non_numeric_literal_is_declined() {
+        use arrow::array::StringArray;
+        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("a")]));
+        let b = batch("s", col);
+        for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
+            let out = try_scalar_binary(
+                op,
+                &Expr::Col { name: "s".into() },
+                &Expr::Lit {
+                    value: Literal::Str("a".into()),
+                },
+                &b,
+            )
+            .unwrap();
+            assert!(out.is_none(), "{op:?} on a string literal must be declined");
         }
     }
 
@@ -1353,5 +1629,86 @@ mod floor_div_tests {
     #[test]
     fn empty_input() {
         assert_eq!(fd_i64(vec![], vec![]), Vec::<Option<i64>>::new());
+    }
+
+    /// A string literal against a temporal column must give the **same** answer through the
+    /// broadcasting scalar path as through the array path that materializes and casts the
+    /// literal per row.
+    ///
+    /// `try_scalar_binary` now serves this mixed pair (it parses the ISO string once instead
+    /// of once per row). The two paths are only equivalent because `cast` is elementwise, so
+    /// this pins that claim across both operand orders, all six comparison operators, a
+    /// Date32 and a Timestamp column, and rows on either side of the literal plus a null.
+    #[test]
+    fn temporal_column_against_a_string_literal_matches_the_array_path() {
+        use crate::{BinaryOp, Expr, Literal};
+        use arrow::array::{
+            ArrayRef, BooleanArray, Date32Array, RecordBatch, TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        // 2013-07-01 is day 15887; the timestamp column is the same instant in µs.
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(15886),
+            Some(15887),
+            Some(15888),
+            None,
+        ]));
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(15886 * 86_400_000_000),
+            Some(15887 * 86_400_000_000),
+            Some(15888 * 86_400_000_000),
+            None,
+        ]));
+        let cases: [(&str, ArrayRef, DataType, &str); 2] = [
+            ("d", date, DataType::Date32, "2013-07-01"),
+            (
+                "t",
+                ts,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "2013-07-01T00:00:00",
+            ),
+        ];
+
+        for (name, col, dt, lit) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, dt, true)]));
+            let batch = RecordBatch::try_new(schema, vec![col.clone()]).unwrap();
+            for op in [
+                BinaryOp::Eq,
+                BinaryOp::Ne,
+                BinaryOp::Lt,
+                BinaryOp::Le,
+                BinaryOp::Gt,
+                BinaryOp::Ge,
+            ] {
+                for lit_on_right in [true, false] {
+                    let c = Expr::Col { name: name.into() };
+                    let l = Expr::Lit {
+                        value: Literal::Str(lit.into()),
+                    };
+                    let (left, right) = if lit_on_right {
+                        (c.clone(), l.clone())
+                    } else {
+                        (l.clone(), c.clone())
+                    };
+                    // The fast path under test.
+                    let fast = super::try_scalar_binary(op, &left, &right, &batch)
+                        .unwrap()
+                        .expect("temporal-vs-string should take the scalar path");
+                    // The reference: materialize the literal to N rows, as the array path does.
+                    let n = batch.num_rows();
+                    let (la, ra) = if lit_on_right {
+                        (col.clone(), Literal::Str(lit.into()).to_array(n))
+                    } else {
+                        (Literal::Str(lit.into()).to_array(n), col.clone())
+                    };
+                    let slow = super::eval_binary(op, &la, &ra).unwrap();
+                    let f = fast.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let s = slow.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    assert_eq!(f, s, "col={name} op={op:?} lit_on_right={lit_on_right}");
+                }
+            }
+        }
     }
 }

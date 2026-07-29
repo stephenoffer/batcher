@@ -188,9 +188,9 @@ are dropped up to that budget, and the rest of the batch goes through. Beyond th
 error propagates, so a genuine bug on clean data still fails fast.
 :::
 
-Batcher's audio pipeline (torchaudio mel features into a ResNet-18) runs **12.5× faster
-than Ray Data**, and none of that comes from the model. It comes from the decode running in
-the data plane and the CPU stage overlapping the GPU stage instead of taking turns.
+Batcher's audio pipeline (torchaudio mel features into a ResNet-18) runs at **38,546 clip/s**
+on 8xT4, and none of that comes from the model. It comes from the decode running in the data
+plane and the CPU stage overlapping the GPU stage instead of taking turns.
 
 ## Long recordings
 
@@ -230,7 +230,7 @@ composable.
 - [Image classification](image-classification.md): the same decode → model shape, for pixels.
 - [Image captioning](image-captioning.md): the same shape again, with a vision-language model.
 - [ML API reference](../../api/ml.md): `bt.read.audio`, `ds.ml.infer`, `max_errored_rows`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the 12.5× on the audio
-  pipeline comes from.
+- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the 38,546 clip/s on the
+  audio pipeline comes from.
 - [GPU execution](../../deep-dives/gpu-execution.md): the CPU/GPU overlap that produces it.
 - [HuggingFace integration](../../integrations/huggingface.md): loading Whisper and friends.

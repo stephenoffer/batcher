@@ -173,8 +173,18 @@ fn scatter_by_gather(
     Ok(take(concatenated.as_ref(), &UInt32Array::from(inv), None)?)
 }
 
+// **Deliberately process-local, and deliberately a different constant from the shuffle's.**
+//
+// This only spreads one batch's rows across the rayon workers of a single `execute_plan`
+// call; the bucket ids never leave the process, so `ahash` is the right choice and the
+// portability argument in `crate::keys::SHUFFLE_HASHER` does not apply.
+//
+// It used to be the byte-identical quadruple the shuffle used, which invited exactly the
+// wrong inference — that the two must agree, and therefore that changing one means
+// changing the other. They are independent. A distinct constant makes that legible instead
+// of relying on a reader noticing.
 const SEED: ahash::RandomState =
-    ahash::RandomState::with_seeds(0x1234_5678, 0x9abc_def0, 0x0fed_cba9, 0x8765_4321);
+    ahash::RandomState::with_seeds(0x7715_D0E1, 0x0F17_2AC0, 0x5EED_1234, 0xB0CC_A115);
 
 /// Hash-partition `0..num_rows` into `nbuckets` index lists by the partition keys, so
 /// equal keys share a bucket (whole window partitions never split). The per-row bucket

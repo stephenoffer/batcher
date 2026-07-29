@@ -23,7 +23,9 @@ use serde::Deserialize;
 
 mod analyze;
 mod error;
+mod select;
 pub use error::ExprError;
+pub use select::ConjunctOrder;
 
 // The per-variant evaluation bodies (and `Expr::eval` itself) live in `eval`; the
 // wire-contract enum definitions stay here in `lib.rs`.
@@ -134,6 +136,15 @@ pub enum Expr {
         std: Option<Vec<f64>>,
         #[serde(default)]
         channels_first: bool,
+        /// `Crop` only: the top-left corner of the window. `#[serde(default)]`, so every
+        /// other image op's IR round-trips unchanged.
+        #[serde(default)]
+        x: Option<i64>,
+        #[serde(default)]
+        y: Option<i64>,
+        /// `Encode` only: the target container format.
+        #[serde(default)]
+        format: Option<String>,
     },
 
     /// An audio decode op over a binary (audio-bytes) sub-expression. Library-backed
@@ -181,6 +192,26 @@ pub enum Expr {
     /// An array literal `[e0, e1, …]` — each row becomes a `List` of the
     /// per-row element values (all elements coerced to a common type).
     Array { elements: Vec<Expr> },
+
+    /// Build a Date/Timestamp from integer inputs — the inverse of the `Date` field
+    /// extractions.
+    ///
+    /// One variant covers both directions because they share every hard part (null
+    /// propagation, range validation, the Arrow builder): `make_date`/`make_timestamp`
+    /// assemble calendar *parts*, and the `from_unix_*` functions reinterpret a single
+    /// *epoch count* at a stated unit. The unit has to be stated — an `Int64` column of
+    /// epoch values carries no record of whether it counts seconds, millis, or micros,
+    /// and a plain `CAST(x AS TIMESTAMP)` has to guess (it assumes microseconds), which
+    /// silently turns epoch seconds into 1970.
+    ///
+    /// Arity is checked at evaluation: 3 args for `make_date`, 6 for `make_timestamp`,
+    /// 1 for every `from_unix_*`. An out-of-range or non-existent date (month 13,
+    /// February 30) yields null rather than erroring, so one bad row cannot abort a scan.
+    MakeTemporal {
+        #[serde(rename = "fn")]
+        func: MakeTemporalFunc,
+        args: Vec<Expr>,
+    },
 
     /// `hash(e0, e1, …, seed)` — a deterministic 64-bit hash of the row's *values* → Int64.
     ///
@@ -419,6 +450,10 @@ pub enum Math2Func {
     Lcm,
     /// `hypot(a, b)` = sqrt(a² + b²), the Euclidean norm (DuckDB `hypot`).
     Hypot,
+    /// `nextafter(a, b)` — the next representable `f64` after `a` in the direction of
+    /// `b` (DuckDB `nextafter`). One ULP, which is what makes it useful for testing a
+    /// boundary; `a + tiny` cannot express it.
+    NextAfter,
 }
 
 /// Image decode operations for the `.image` namespace. `Decode` reads each
@@ -452,6 +487,23 @@ pub enum ImageFunc {
     /// `resize(width, height)` → re-encoded PNG bytes at the new size (Daft
     /// `image.resize`). Null/undecodable input → null. → Binary.
     Resize,
+    /// `crop(x, y, width, height)` → the requested region, re-encoded as PNG bytes. The
+    /// arbitrary-offset counterpart of `CenterCrop`, for pulling a detection's bounding box
+    /// out of a frame and keeping it as an image rather than as a tensor. A window that
+    /// runs past an edge is clipped to the image, so the output can be smaller than
+    /// requested; a window entirely outside it is null. Null/undecodable input → null.
+    /// → Binary.
+    Crop,
+    /// `encode(format)` → the image re-encoded in `format` (`png`, `jpeg`, `bmp`, `gif`),
+    /// pixels unchanged. Normalizes a mixed-format corpus to one codec, or trades a PNG
+    /// for a smaller JPEG. Null/undecodable input → null. → Binary.
+    Encode,
+    /// `convert(mode)` → the image converted to color mode `L`, `LA`, `RGB`, or `RGBA`,
+    /// re-encoded as PNG. The general form of `ToGrayscale`, which is `L` plus a resize;
+    /// this changes only the channels, so it is the step for normalizing a corpus that
+    /// mixes RGB and RGBA before a model that wants one of them. Reads the `format` slot,
+    /// like `Encode`. Null/undecodable input → null. → Binary.
+    Convert,
     /// `dhash()` → a 64-bit *difference hash*: the perceptual fingerprint that makes
     /// image near-duplicate detection expressible. Two visually similar images differ
     /// in few bits, so `bit_count(a ^ b)` is their Hamming distance and a threshold on
@@ -484,6 +536,14 @@ pub enum ListSetOp {
     Except,
     #[serde(rename = "array_union")]
     Union,
+    /// `list_concat(a, b)` — the left list's elements followed by the right's, with
+    /// **no** deduplication and **no** reordering. It rides `ListSetOp` because the two
+    /// operands and the list result are the same shape, but it is not a set operation:
+    /// duplicates survive, and a NULL list counts as empty rather than making the row
+    /// null (DuckDB `list_concat(NULL, [1])` is `[1]`, where `list_union(NULL, [1])` is
+    /// NULL).
+    #[serde(rename = "array_concat")]
+    Concat,
 }
 
 /// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
@@ -653,6 +713,24 @@ pub enum MathFunc {
     /// Population count: the number of set bits in the Int64 two's-complement value
     /// (DuckDB `bit_count`). → Float64 (integral-valued).
     BitCount,
+    /// `even(x)` — round *away from zero* to the nearest even integer (DuckDB `even`):
+    /// `2.1 → 4`, `-2.1 → -4`, `2.0 → 2`. Not `round`-then-adjust; the rounding
+    /// direction is outward, which is why `3.0` is `4` and not `2`.
+    Even,
+    /// `gamma(x)` — the gamma function Γ(x) (DuckDB `gamma`), the continuous extension
+    /// of the factorial: `Γ(n) = (n-1)!` for a positive integer.
+    Gamma,
+    /// `lgamma(x)` — the natural log of |Γ(x)| (DuckDB `lgamma`). Computed directly
+    /// rather than as `ln(gamma(x))`, which overflows to `inf` above ~171.
+    Lgamma,
+    /// `sec(x)` = 1/cos(x) (Spark `sec`).
+    Sec,
+    /// `csc(x)` = 1/sin(x) (Spark `csc`).
+    Csc,
+    /// `rint(x)` — round half to **even** (Spark `rint`, IEEE-754 `roundTiesToEven`).
+    /// Distinct from `round`, which is half away from zero here and in DuckDB:
+    /// `rint(2.5)` is `2`, `round(2.5)` is `3`.
+    Rint,
 }
 
 /// String functions. `upper`/`lower` → Utf8; `len` → Int64; `contains`/
@@ -736,6 +814,52 @@ pub enum StrFunc {
     /// Extract the boolean value at JSON `pattern` path; null if absent or
     /// non-boolean. → Boolean.
     JsonExtractBool,
+    /// Number of elements in the JSON array at `pattern` path; null if the path is
+    /// absent or the value there is not an array. Counted by structural skipping, so
+    /// no element is parsed. → Int64.
+    JsonArrayLength,
+    /// The keys of the JSON object at `pattern` path, **in source order**; null if the
+    /// path is absent or the value is not an object. → List<Utf8>.
+    JsonObjectKeys,
+    /// The elements of the JSON array at `pattern` path, each rendered as
+    /// `json_extract_string` renders a leaf (string verbatim, container compacted, JSON
+    /// null as a null element); null if absent or not an array. This is what turns a
+    /// JSON array column into a list column that `explode` and `.list` can work on.
+    /// → List<Utf8>.
+    JsonArrayValues,
+    /// The JSON type at `pattern` path: `object`, `array`, `string`, `number`,
+    /// `boolean`, or `null`; null if the path is absent. → Utf8.
+    JsonType,
+    /// Whether a value exists at `pattern` path. A JSON `null` counts as present — the
+    /// distinction `json_extract_*` cannot express, since both absent and null extract
+    /// to null. → Boolean.
+    JsonExists,
+    /// The value at `pattern` path as text, **JSON-quoted** — DuckDB `json_value`.
+    /// Unlike `JsonExtractString` (which unquotes a string and renders a container),
+    /// this returns the raw JSON token for a scalar and **null for an object or an
+    /// array**, which is the distinction DuckDB draws between the two functions. → Utf8.
+    JsonValue,
+    /// Whether the document contains `pattern` as a value, at the top level of an array
+    /// or as any member of an object — DuckDB `json_contains`. → Boolean.
+    JsonContains,
+    /// The document re-rendered with two-space indentation (DuckDB `json_pretty`).
+    /// Invalid JSON → null. → Utf8.
+    JsonPretty,
+    /// The document's *shape* with each leaf replaced by its type name (DuckDB
+    /// `json_structure`), e.g. `{"a":1}` → `{"a":"UBIGINT"}`. Invalid JSON → null. → Utf8.
+    JsonStructure,
+    /// The single character at a Unicode code point (DuckDB/Spark `chr`). Takes an
+    /// **integer** input, so it is handled before the Utf8 downcast. → Utf8.
+    Chr,
+    /// The integer written in base `start` (2..=36), no padding, `-` for a negative
+    /// value (DuckDB `to_base`, and `bin` at base 2). Integer input. → Utf8.
+    ToBase,
+    /// A byte count as human-readable text with binary units — `1024` → `1.0 KiB`
+    /// (DuckDB `format_bytes` / `formatReadableSize`). Integer input. → Utf8.
+    FormatBytes,
+    /// The same with decimal (SI) units — `1000` → `1.0 kB` (DuckDB
+    /// `formatReadableDecimalSize`). Integer input. → Utf8.
+    FormatBytesSi,
     /// Deterministic FNV-1a 64-bit hash of the UTF-8 bytes (→ Int64; the u64 digest
     /// reinterpreted as i64). Stable across partitions, runs, and machines — the
     /// building block for surrogate keys and slowly-changing-dimension change
@@ -795,6 +919,10 @@ pub enum StrFunc {
     /// Number of non-overlapping matches of regex `pattern` (DuckDB `regexp_count`).
     /// → Int64.
     RegexpCount,
+    /// Split on every match of regex `pattern` → a `List<Utf8>` of the pieces between
+    /// matches. The regex counterpart of `Split`, whose delimiter is a literal. An empty
+    /// string yields `[""]` and a null input a null list, matching `Split`. → List<Utf8>.
+    RegexpSplit,
     /// Levenshtein edit distance to the literal string `pattern` (DuckDB
     /// `levenshtein` against a constant). → Int64.
     Levenshtein,
@@ -835,6 +963,84 @@ pub enum StrFunc {
     /// and comments, decodes entities, collapses whitespace, and separates elements with
     /// a space. Lenient on malformed markup. Null → null. → Utf8. See `eval::str::html`.
     StripHtml,
+    /// Compress the raw bytes with the codec named by `pattern` (`gzip`, `zlib`,
+    /// `deflate`, `zstd`, `brotli`, or `lz4`). Accepts Utf8 (its UTF-8 bytes) or Binary.
+    /// Null → null; an unknown codec is an error. → Binary. See `eval::str::compress`.
+    Compress,
+    /// Inverse of `Compress` under the codec named by `pattern`. Input that is not a valid
+    /// frame for that codec yields **null** rather than erroring, matching `from_base64`
+    /// and `unhex` — one corrupt blob in a scan is a bad row, not a bad query, which is
+    /// why there is no separate `try_decompress`. → Binary (nullable).
+    Decompress,
+    /// Re-case an identifier into the style named by `pattern`: `snake`, `upper_snake`,
+    /// `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train`.
+    /// One word splitter serves every style (separators, lower→upper transitions, and
+    /// acronym runs), so the styles never disagree about where the words were. Null →
+    /// null; an unknown style is an error, not a silent passthrough. → Utf8.
+    /// See `eval::str::case`.
+    ToCase,
+    /// Percent-encode for use in a URL (DuckDB `url_encode`): everything outside the
+    /// RFC 3986 unreserved set becomes `%XX` over the UTF-8 bytes, including `/` and
+    /// `+` — this encodes a *component*, not a whole URL. Null → null. → Utf8.
+    UrlEncode,
+    /// Inverse of `UrlEncode` (DuckDB `url_decode`). A malformed escape (`%` not
+    /// followed by two hex digits, or bytes that do not decode as UTF-8) is left
+    /// **as written** rather than erroring or nulling the row — verified against DuckDB,
+    /// which returns `'a%2'` for `url_decode('a%2')`. Null → null. → Utf8.
+    UrlDecode,
+    /// Escape the regex metacharacters in the value (DuckDB `regexp_escape`), so it can
+    /// be embedded in a pattern as a literal. Null → null. → Utf8.
+    RegexpEscape,
+    /// The final component of a path (DuckDB `parse_filename`): everything after the
+    /// last separator. → Utf8.
+    ParseFilename,
+    /// The directory part of a path (DuckDB `parse_dirname`) — the *first* component,
+    /// which is `/` for an absolute POSIX path. Not the same as `ParseDirpath`, which is
+    /// everything before the filename; DuckDB genuinely has both. → Utf8.
+    ParseDirname,
+    /// Everything before the last separator of a path (DuckDB `parse_dirpath`). → Utf8.
+    ParseDirpath,
+    /// A path split into its components (DuckDB `parse_path`), with a leading `/` kept
+    /// as its own first element for an absolute POSIX path. → List<Utf8>.
+    ParsePath,
+    /// Hamming distance to the literal string `pattern` (DuckDB `hamming`/`mismatches`):
+    /// the number of positions at which the two differ. Defined only for equal-length
+    /// strings, which DuckDB enforces — an unequal length is an error, not a silent
+    /// truncation. → Int64.
+    Hamming,
+    /// Jaccard similarity to the literal string `pattern` (DuckDB `jaccard`): the size of
+    /// the intersection over the size of the union of the two strings' *character sets*.
+    /// `[0, 1]`. Distinct from `.list.jaccard`, which is over list elements. → Float64.
+    JaccardSimilarity,
+    /// The value's UTF-8 bytes as a string of `0`/`1` (DuckDB `to_binary`), 8 characters
+    /// per byte, most significant bit first. Null → null. → Utf8.
+    ToBinary,
+    /// Inverse of `ToBinary` (DuckDB `from_binary`). Input that is not a whole number of
+    /// 8 `0`/`1` characters, or does not decode as UTF-8, yields **null**, matching
+    /// `unhex`. → Utf8 (nullable).
+    FromBinary,
+}
+
+/// Temporal *constructors* carried by [`Expr::MakeTemporal`] — the inverse direction of
+/// [`DateFunc`]'s extractions. Wire tags are snake_case (the contract with Python).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MakeTemporalFunc {
+    /// `(year, month, day)` → Date32. An impossible date is null, not an error.
+    MakeDate,
+    /// `(year, month, day, hour, minute, second)` → Timestamp(Microsecond).
+    MakeTimestamp,
+    /// Epoch **seconds** → Timestamp(Microsecond).
+    FromUnixSeconds,
+    /// Epoch **milliseconds** → Timestamp(Microsecond).
+    FromUnixMillis,
+    /// Epoch **microseconds** → Timestamp(Microsecond).
+    FromUnixMicros,
+    /// Epoch **nanoseconds** → Timestamp(Microsecond). Truncates toward negative
+    /// infinity, so the result is the microsecond containing the instant.
+    FromUnixNanos,
+    /// Days since 1970-01-01 → Date32 (Spark `date_from_unix_date`).
+    FromUnixDate,
 }
 
 /// Date/time field extractions (→ Int64). Wire tags are snake_case (the contract

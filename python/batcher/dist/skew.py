@@ -74,7 +74,11 @@ def join_skew_key(left_ir: str, right_ir: str, join: Join) -> str:
         [left_ir, right_ir, list(join.left_keys), list(join.right_keys), join.join_type],
         sort_keys=True,
     )
-    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+    # `usedforsecurity=False` because this is a cache key, not a security claim — and on a
+    # FIPS-enforcing host a bare `sha1()` *raises*, so learned skew would not merely be
+    # unavailable there, the join would fail. Saying what the digest is for is what makes
+    # OpenSSL allow it, and it changes no byte of the key.
+    return hashlib.sha1(payload.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
 def load_learned_hot_keys(shape_key: str) -> list[str] | None:
@@ -89,7 +93,11 @@ def load_learned_hot_keys(shape_key: str) -> list[str] | None:
 
         val = default_hub().get_keyed_param(_SKEW_NAMESPACE, shape_key)
         return list(val) if val is not None else None
-    except Exception:
+    except Exception as exc:
+        # Noted, not silent. The write half already reports a failing hub; the read half
+        # swallowed it, so a hub that could not be reached disabled learned skew *forever*
+        # with nothing in the log to say why the pre-pass kept re-running.
+        note_suppressed("dist", "load learned hot keys", exc)
         return None
 
 

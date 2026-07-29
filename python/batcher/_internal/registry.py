@@ -28,9 +28,15 @@ class Registry(Generic[T]):
 
     Used as a module-level singleton per extension point, e.g.
     ``SOURCES = Registry[Source]("source")``.
+
+    Entries normally register at import, as a side effect of the defining module being
+    imported. A registry whose family is large and rarely-used can instead pass `on_miss`
+    and register on first demand — see `complete`.
     """
 
-    def __init__(self, kind: str, *, doc: str = "") -> None:
+    def __init__(
+        self, kind: str, *, doc: str = "", on_miss: Callable[[], None] | None = None
+    ) -> None:
         """Create an empty registry.
 
         Args:
@@ -38,10 +44,36 @@ class Registry(Generic[T]):
                 noun every error from this registry is phrased around.
             doc: An optional documentation path, attached to unknown-name errors so a
                 user who mistyped a name is pointed at the list of real ones.
+            on_miss: An optional one-shot hook run before a lookup is declared a miss and
+                before any call that promises a *complete* view of the registry. It exists
+                so a family of entries can register itself the first time anyone asks for
+                one, instead of at import. See `complete`.
         """
         self._kind = kind
         self._doc = doc
         self._items: dict[str, T] = {}
+        self._on_miss = on_miss
+        self._completed = on_miss is None
+
+    def complete(self) -> None:
+        """Run the deferred-registration hook, at most once.
+
+        The extension points here are populated by importing the modules that register
+        into them, and for a large family — every database, warehouse, and message broker
+        Batcher can read — that import is most of what ``import batcher`` costs, paid by
+        every process whether or not it ever names one of those formats. `on_miss` lets
+        the family register on first demand instead; this is the "now I actually need
+        them" trigger, called from every lookup that could otherwise answer from an
+        incomplete registry.
+
+        Idempotent, and self-disarming *before* the hook runs, so a hook that registers
+        through this same registry cannot recurse.
+        """
+        hook = self._on_miss
+        if self._completed or hook is None:
+            return
+        self._completed = True
+        hook()
 
     def register(self, name: str) -> Callable[[T], T]:
         """Decorator that registers `obj` under `name` and returns it unchanged."""
@@ -95,6 +127,12 @@ class Registry(Generic[T]):
         try:
             return self._items[name]
         except (KeyError, TypeError):
+            pass
+        # A miss may only mean the family that owns this name has not registered yet.
+        self.complete()
+        try:
+            return self._items[name]
+        except (KeyError, TypeError):
             raise unknown_value(
                 BatcherError,
                 self._kind,
@@ -111,15 +149,21 @@ class Registry(Generic[T]):
 
     def names(self) -> list[str]:
         """The registered names, sorted."""
+        self.complete()
         return sorted(self._items)
 
     def __contains__(self, name: object) -> bool:
+        if name in self._items:
+            return True
+        self.complete()
         return name in self._items
 
     def __iter__(self) -> Iterator[str]:
+        self.complete()
         return iter(sorted(self._items))
 
     def __len__(self) -> int:
+        self.complete()
         return len(self._items)
 
     def __repr__(self) -> str:

@@ -30,7 +30,15 @@ from typing import Any
 
 from batcher._internal.errors import ConfigError
 from batcher._internal.logging import get_logger
+from batcher.metadata.hardware_scope import measured_here
 from batcher.metadata.store import MetadataBackend, check_backend
+from batcher.metadata.views import (
+    PER_KIND_MAX,
+    SIGNED_HISTORY_MAX,
+    bucket_by_kind,
+    chronological_signed,
+    trimmed,
+)
 from batcher.plan.feedback import OperatorFeedback
 
 __all__ = ["MetadataHub"]
@@ -41,33 +49,18 @@ _log = get_logger("metadata")
 _OP_STATS = "op_stats"
 _LEARNED_PARAMS = "learned_params"
 
-# Cap on the in-memory view of signature-carrying feedback. The consumer averages the
-# last handful of observations per signature, so this is orders of magnitude more than it
-# reads; it exists only to bound a long-lived session's memory. Nothing is lost — the
-# backend still holds the full history.
-_SIGNED_HISTORY_MAX = 4096
-
-# Cap on the retained rows *per operator family* in the `op_stats_by_kind` view. Every
-# consumer of that view reduces a family's rows to a median or a regression coefficient,
-# so the newest few thousand samples decide the fit and older ones only cost memory and
-# time. Without a cap the view — and the per-query fit over it — grows for the life of
-# the process. The backend still holds the full history.
-_PER_KIND_MAX = 4096
-
-# Bounded views are trimmed only once they exceed their cap by this factor, so a trim
-# costs O(cap) once every O(cap) records rather than O(cap) on every record.
-_TRIM_SLACK = 2
+# Cap on the `op_stats` rows a *forgettable* backend retains, and how often it is enforced.
+# The views above are bounded; the table beneath them was not, so a long-lived session grew
+# the store by one row per operator per query for its whole life with nothing reading the
+# old ones. The cap sits far above what rebuilding either view needs, so pruning is
+# invisible to consumers. A durable backend keeps everything — that is what it is for, and
+# it simply does not offer the `delete` this uses.
+_OP_STATS_MAX = 65_536
+_OP_STATS_PRUNE_EVERY = 4_096
 
 # Sentinel for "the parsed view has no entry under this key" — distinct from a stored `None`,
 # which `_unchanged` must be able to recognize as already-written.
 _MISSING = object()
-
-
-def _trimmed(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
-    """`rows` bounded to its newest `cap` entries, trimming only past the slack factor."""
-    if len(rows) > cap * _TRIM_SLACK:
-        del rows[:-cap]
-    return rows
 
 
 # `OperatorFeedback`'s field names, resolved once. Every field is a scalar, so the row is
@@ -151,7 +144,7 @@ class MetadataHub:
         self._keyed_stored: dict[str, set[str]] = {}
         # Bucketed-by-kind view of the feedback history: loaded from the backend once,
         # then folded forward by `record`. Consumers reduce each bucket to a median or a
-        # regression, so buckets are bounded (`_PER_KIND_MAX`) — the whole point is that
+        # regression, so buckets are bounded (`PER_KIND_MAX`) — the whole point is that
         # neither a read nor a record costs anything proportional to session history.
         self._by_kind: dict[str, list[dict[str, Any]]] | None = None
         # Chronological, bounded, in-memory view of the signature-carrying feedback rows.
@@ -204,14 +197,33 @@ class MetadataHub:
         # Fold the row into whichever derived views have been materialized. A view
         # still `None` has not been read yet; its lazy load will pick this row up
         # from the backend, so there is nothing to do.
-        if self._by_kind is not None:
+        # Same filter `_load_by_kind` applies; the two must agree or it leaks after a write.
+        if self._by_kind is not None and measured_here(row):
             bucket = self._by_kind.setdefault(row["kind"], [])
             bucket.append(row)
-            _trimmed(bucket, _PER_KIND_MAX)
+            trimmed(bucket, PER_KIND_MAX)
         if self._signed is not None and row["signature"]:
             self._signed.append(row)  # keep the hot view current without a re-scan
             self._signed_appends += 1
-            _trimmed(self._signed, _SIGNED_HISTORY_MAX)
+            trimmed(self._signed, SIGNED_HISTORY_MAX)
+        if self._seq % _OP_STATS_PRUNE_EVERY == 0:
+            self._prune_op_stats()
+
+    def _prune_op_stats(self) -> None:
+        """Bound the stored operator feedback to its newest `_OP_STATS_MAX` rows.
+
+        Amortized: the scan-and-drop costs O(stored) but runs once every
+        `_OP_STATS_PRUNE_EVERY` records. Keys carry a monotonic sequence number, so "newest"
+        is exact without parsing values. A backend with no `delete` is left alone.
+        """
+        delete = getattr(self._backend, "delete", None)
+        if delete is None:
+            return
+        keys = [key for key, _value in self._backend.scan(_OP_STATS, ())]
+        if len(keys) <= _OP_STATS_MAX:
+            return
+        keys.sort(key=lambda k: k[1])  # (op_id, seq) -> oldest sequence first
+        delete(_OP_STATS, keys[: len(keys) - _OP_STATS_MAX])
 
     @property
     def signed_appends(self) -> int:
@@ -257,15 +269,20 @@ class MetadataHub:
         return out
 
     def op_stats_by_kind(self) -> dict[str, list[dict[str, Any]]]:
-        """All recorded operator feedback bucketed by operator `kind`.
+        """Operator feedback **measured on this machine**, bucketed by operator `kind`.
 
         The shape Kyber's cost calibration consumes: per-row/per-byte coefficients
         are fit per operator family (`scan`, `filter`, `hash_join`, ...), not per
         operator id.
 
+        Restricted to rows measured on **this machine class** (`metadata.hardware_scope`):
+        everything fit from this view is in machine units and none of it transfers. Its
+        counterpart `op_stats_with_signature` is deliberately *not* restricted, because
+        cardinality is a property of the data.
+
         The backend is scanned exactly once; `record` folds every later row straight
         into its bucket, so a steady-state read is O(1) rather than a re-parse of the
-        session's whole history. Each bucket keeps its newest `_PER_KIND_MAX` rows —
+        session's whole history. Each bucket keeps its newest `PER_KIND_MAX` rows —
         far more than the median/regression its consumers fit needs, and enough to
         keep a long-lived session's planning cost flat.
 
@@ -275,17 +292,8 @@ class MetadataHub:
         return self._by_kind
 
     def _load_by_kind(self) -> dict[str, list[dict[str, Any]]]:
-        """One-time bucketed load of the feedback history from the backend."""
-        buckets: dict[str, list[dict[str, Any]]] = {}
-        try:
-            for _key, value in self._backend.scan(_OP_STATS, ()):
-                row = json.loads(value)
-                buckets.setdefault(row.get("kind", ""), []).append(row)
-        except Exception:  # pragma: no cover - calibration must not break planning
-            _log.warning("could not scan op_stats", exc_info=True)
-        for bucket in buckets.values():
-            _trimmed(bucket, _PER_KIND_MAX)
-        return buckets
+        """One-time bucketed load of this machine's feedback history from the backend."""
+        return bucket_by_kind(self._backend.scan(_OP_STATS, ()))
 
     def op_stats_with_signature(self) -> list[dict[str, Any]]:
         """Signature-carrying operator feedback, **oldest first**.
@@ -303,7 +311,7 @@ class MetadataHub:
 
         Read on every optimize, so it must not cost the whole history: the backend is
         scanned exactly once, and `record` keeps the view current thereafter. The view is
-        capped at the newest `_SIGNED_HISTORY_MAX` rows, far above the handful of recent
+        capped at the newest `SIGNED_HISTORY_MAX` rows, far above the handful of recent
         observations per signature the consumer averages — the persisted store keeps
         everything regardless.
 
@@ -315,19 +323,7 @@ class MetadataHub:
 
     def _load_signed(self) -> list[dict[str, Any]]:
         """One-time chronological load of the signature-carrying rows from the backend."""
-        ordered: list[tuple[int, dict[str, Any]]] = []
-        try:
-            for key, value in self._backend.scan(_OP_STATS, ()):
-                row = json.loads(value)
-                if not row.get("signature"):
-                    continue
-                seq = int(key[1]) if len(key) > 1 else 0
-                ordered.append((seq, row))
-        except Exception:  # pragma: no cover - learning must not break planning
-            _log.warning("could not scan op_stats", exc_info=True)
-            return []
-        ordered.sort(key=lambda pair: pair[0])
-        rows = [row for _seq, row in ordered[-_SIGNED_HISTORY_MAX:]]
+        rows = chronological_signed(self._backend.scan(_OP_STATS, ()))
         self._signed_appends = len(rows)
         return rows
 

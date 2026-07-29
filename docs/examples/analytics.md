@@ -86,3 +86,25 @@ out = bt.sql(
 print(out.to_pydict())
 # {'region': ['W', 'E'], 'revenue': [90, 60]}
 ```
+
+## What to change first
+
+Three edits turn this into a real query, and each one is a single line:
+
+1. Swap `from_pydict` for {doc}`a reader <../user-guide/reading-data>`, such as
+   `bt.read.parquet("s3://bucket/orders/")`. Nothing below it changes.
+1. Add a `filter` before the `group_by`. The optimizer pushes it toward the scan, so a
+   partitioned or statistics-carrying source skips files rather than reading them. Confirm
+   it did with {doc}`ds.explain() <../user-guide/explain-plans>`.
+1. End with a write instead of a print: `out.write.parquet(...)`. See
+   {doc}`../user-guide/writing-data`.
+
+## See also
+
+- {doc}`analytics/index`: focused recipes for cohorts, funnels, sessions, and top-k, each
+  with the trap that makes it harder than it looks.
+- {doc}`../user-guide/aggregations` and {doc}`../user-guide/window-functions`: the two
+  operators this page leans on, in full.
+- {doc}`../user-guide/joins`: join types, and which side gets built.
+- {doc}`etl`: the other worked example, ending in a written table.
+- {doc}`../tutorials/optimizing-a-slow-query`: what to do when this shape meets real data.

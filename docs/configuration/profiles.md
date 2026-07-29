@@ -162,3 +162,14 @@ A recipe is an ordinary `Config`. Define it once, then activate it process-wide 
 `set_config` or per block with `config_context`. Because `Config` is immutable, the
 same object can be reused freely and combined by chaining `replace` calls. See
 {doc}`options` for every field you can change.
+
+## See also
+
+- {doc}`index`: the runtime entry points, `set_config` and `config_context`.
+- {doc}`options`: every configurable field, with its default and its unit.
+- {doc}`environment`: the same settings as `BATCHER_*` variables, and the precedence order
+  when both are present.
+- {doc}`../user-guide/performance`: which of these knobs actually moves a slow query, and
+  in what order to try them.
+- {doc}`../integrations/ray`: attaching to a cluster, and what the `distributed.*` fields
+  above control once you are on one.

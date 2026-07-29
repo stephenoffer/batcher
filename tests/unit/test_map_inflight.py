@@ -10,38 +10,16 @@ the ordering and heal invariants are checked deterministically.
 from __future__ import annotations
 
 import collections
-import sys
-import types
 
 import pytest
 
+from _fake_ray import install_fake_ray
 from batcher.carbonite.resilience import RecoveryPolicy
 from batcher.ml.gpu import _INFLIGHT_DEPTH_MAX, recommend_inflight_depth
 
 
 def _raise(exc: BaseException):
     raise exc
-
-
-def _install_fake_ray(monkeypatch) -> tuple[type, type]:
-    exc = types.ModuleType("ray.exceptions")
-
-    class RayError(Exception):
-        pass
-
-    class RayTaskError(RayError):
-        pass
-
-    exc.RayError = RayError
-    exc.RayTaskError = RayTaskError
-    ray_mod = types.ModuleType("ray")
-    ray_mod.exceptions = exc
-    ray_mod.wait = lambda refs, num_returns=1: ([refs[0]], refs[1:])
-    ray_mod.get = lambda ref: ref()
-    ray_mod.kill = lambda actor: None
-    monkeypatch.setitem(sys.modules, "ray", ray_mod)
-    monkeypatch.setitem(sys.modules, "ray.exceptions", exc)
-    return RayError, RayTaskError
 
 
 class _Remote:
@@ -98,7 +76,7 @@ def test_recommend_depth_capped():
 def test_pipeline_pool_order_invariant_to_depth(monkeypatch, depth):
     from batcher.dist.executors import map as mapmod
 
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     actors = [_FakeActor() for _ in range(3)]
     parts = [f"p{i}" for i in range(10)]
     results = mapmod._pipeline_actor_pool(actors, parts, depth)
@@ -108,7 +86,7 @@ def test_pipeline_pool_order_invariant_to_depth(monkeypatch, depth):
 def test_pipeline_pool_empty_partitions(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     assert mapmod._pipeline_actor_pool([_FakeActor()], [], 4) == []
 
 
@@ -118,7 +96,7 @@ def test_pipeline_pool_empty_partitions(monkeypatch):
 def test_drive_pool_depth_gt1_ordering(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    _install_fake_ray(monkeypatch)
+    install_fake_ray(monkeypatch)
     monkeypatch.setattr(mapmod, "_actor_inflight_depth", lambda: 4)
 
     class _FakeMapActor:
@@ -141,7 +119,7 @@ def test_drive_pool_depth_gt1_ordering(monkeypatch):
 def test_drive_pool_reclaims_all_refs_of_a_dead_actor(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    RayError, _ = _install_fake_ray(monkeypatch)
+    RayError, _ = install_fake_ray(monkeypatch)
     monkeypatch.setattr(mapmod, "_actor_inflight_depth", lambda: 2)
 
     runs: collections.Counter = collections.Counter()
@@ -184,7 +162,7 @@ def test_drive_pool_reclaims_all_refs_of_a_dead_actor(monkeypatch):
 def test_drive_pool_reraises_deterministic_error_at_depth(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    _, RayTaskError = _install_fake_ray(monkeypatch)
+    _, RayTaskError = install_fake_ray(monkeypatch)
     monkeypatch.setattr(mapmod, "_actor_inflight_depth", lambda: 4)
 
     class _BugActor:

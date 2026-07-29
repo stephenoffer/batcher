@@ -8,6 +8,8 @@ respectively. Kept beside the join rewrites because `from_clause.py` is at its s
 
 from __future__ import annotations
 
+from sqlglot import expressions as exp
+
 from batcher._internal.errors import PlanError
 from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
 from batcher.api.dataset import Dataset
@@ -35,8 +37,6 @@ def lateral_select(tr, ds: Dataset, lateral) -> Dataset:
     Returns:
         The relation with the lateral's expressions appended as columns.
     """
-    from sqlglot import expressions as exp
-
     inner = lateral.this
     inner = inner.this if isinstance(inner, exp.Subquery) else inner
     # sqlglot spells the FROM key `from_` in some versions and `from` in others; reading
@@ -73,8 +73,6 @@ def lateral_unnest(ds: Dataset, join) -> Dataset:
     ordinality column the operator does not emit) are each rejected explicitly rather than
     silently mistranslated.
     """
-    from sqlglot import expressions as exp
-
     unnest = join.this
     on = join.args.get("on")
     # `LEFT JOIN UNNEST(...) ON TRUE` is SQL's spelling of an outer unnest: the row
@@ -138,8 +136,6 @@ def lateral_unnest(ds: Dataset, join) -> Dataset:
 
 def is_true_literal(node) -> bool:
     """Whether an ON predicate is the constant `TRUE`."""
-    from sqlglot import expressions as exp
-
     while isinstance(node, exp.Paren):
         node = node.this
     return isinstance(node, exp.Boolean) and bool(node.this)

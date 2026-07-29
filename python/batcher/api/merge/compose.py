@@ -141,10 +141,15 @@ def _validate(
             "merge(): no WHEN clauses — a merge with no clauses would rewrite the target "
             "unchanged. Add when_matched()/when_not_matched()/when_not_matched_by_source()."
         )
-    missing_target = [k for k in keys if k not in columns]
+    # Each side's names go into a set once: a linear scan per key made validating a
+    # multi-key merge against a wide table cost keys x width comparisons, and
+    # `source.columns` rebuilds its list on every access.
+    target_names = set(columns)
+    source_names = set(source.columns)
+    missing_target = [k for k in keys if k not in target_names]
     if missing_target:
         raise PlanError(f"merge(): key column(s) {missing_target} are not in the target")
-    missing_source = [k for k in keys if k not in source.columns]
+    missing_source = [k for k in keys if k not in source_names]
     if missing_source:
         raise PlanError(f"merge(): key column(s) {missing_source} are not in the source")
 

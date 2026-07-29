@@ -16,7 +16,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir.constructors import col, lit
+from batcher.ml._estimator import linear_score, require_fitted, require_rows
+from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -144,6 +145,7 @@ class ElasticNet:
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
         d = len(self.features)
+        require_rows(self, ds.count(), 2, because="its moments divide by n - 1")
         aggregates: dict[str, object] = {
             f"__m{i}": mean(col(name)) for i, name in enumerate(columns)
         }
@@ -199,11 +201,8 @@ class ElasticNet:
         Returns:
             A new lazy `Dataset` with the prediction column appended.
         """
-        if not self.coef_:
-            raise PlanError(f"{type(self).__name__} must be fitted before predict.")
-        expression = lit(self.intercept_)
-        for weight, name in zip(self.coef_, self.features, strict=True):
-            expression = expression + lit(weight) * col(name)
+        require_fitted(self, self.coef_)
+        expression = linear_score(self.features, self.coef_, self.intercept_)
         return ds.with_columns(**{self.output_column: expression})
 
 

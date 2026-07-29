@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import collections
 import sys
-import types
 
 import pytest
 
+from _fake_ray import install_fake_ray
 from batcher.carbonite.resilience import RecoveryPolicy
 
 
@@ -23,35 +23,10 @@ def _raise(exc: BaseException):
     raise exc
 
 
-def _install_fake_ray(monkeypatch) -> tuple[type, type]:
-    """Install a minimal `ray` whose refs are thunks: `ray.get(ref)` calls the thunk
-    (returning its value or raising), `ray.wait` pops one in FIFO order."""
-    exc = types.ModuleType("ray.exceptions")
-
-    class RayError(Exception):
-        pass
-
-    class RayTaskError(RayError):
-        pass
-
-    exc.RayError = RayError
-    exc.RayTaskError = RayTaskError
-
-    ray_mod = types.ModuleType("ray")
-    ray_mod.exceptions = exc
-    ray_mod.wait = lambda refs, num_returns=1: ([refs[0]], refs[1:])
-    ray_mod.get = lambda ref: ref()
-    ray_mod.kill = lambda actor: None
-
-    monkeypatch.setitem(sys.modules, "ray", ray_mod)
-    monkeypatch.setitem(sys.modules, "ray.exceptions", exc)
-    return RayError, RayTaskError
-
-
 def test_gather_resubmits_a_lost_partition(monkeypatch):
     from batcher.dist.executors.ray_runtime import gather_map_results
 
-    RayError, _ = _install_fake_ray(monkeypatch)
+    RayError, _ = install_fake_ray(monkeypatch)
     calls: collections.Counter = collections.Counter()
 
     def submit(idx):
@@ -68,7 +43,7 @@ def test_gather_resubmits_a_lost_partition(monkeypatch):
 def test_gather_reraises_deterministic_udf_error(monkeypatch):
     from batcher.dist.executors.ray_runtime import gather_map_results
 
-    _, RayTaskError = _install_fake_ray(monkeypatch)
+    _, RayTaskError = install_fake_ray(monkeypatch)
 
     def submit(idx):
         return lambda: _raise(RayTaskError("a real bug in the UDF"))
@@ -81,7 +56,7 @@ def test_gather_reraises_deterministic_udf_error(monkeypatch):
 def test_gather_gives_up_after_max_attempts(monkeypatch):
     from batcher.dist.executors.ray_runtime import gather_map_results
 
-    RayError, _ = _install_fake_ray(monkeypatch)
+    RayError, _ = install_fake_ray(monkeypatch)
     calls: collections.Counter = collections.Counter()
 
     def submit(idx):
@@ -97,7 +72,7 @@ def test_gather_gives_up_after_max_attempts(monkeypatch):
 def test_actor_pool_replaces_a_dead_actor(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    RayError, _ = _install_fake_ray(monkeypatch)
+    RayError, _ = install_fake_ray(monkeypatch)
     crashed: set = set()
 
     class _Remote:
@@ -146,7 +121,7 @@ def test_actor_pool_replaces_a_dead_actor(monkeypatch):
 def test_actor_pool_reraises_deterministic_error(monkeypatch):
     from batcher.dist.executors import map as mapmod
 
-    _, RayTaskError = _install_fake_ray(monkeypatch)
+    _, RayTaskError = install_fake_ray(monkeypatch)
 
     class _Remote:
         def __init__(self, fn):
@@ -185,7 +160,7 @@ def test_actor_pool_reraises_deterministic_error(monkeypatch):
 def _install_fake_ray_with_fatal(monkeypatch) -> tuple[type, type]:
     """`_install_fake_ray`, plus the `RuntimeEnvSetupError` that Ray really defines —
     a `RayError` that is emphatically NOT a worker loss."""
-    RayError, _ = _install_fake_ray(monkeypatch)
+    RayError, _ = install_fake_ray(monkeypatch)
     exc = sys.modules["ray.exceptions"]
 
     class RuntimeEnvSetupError(RayError):

@@ -8,13 +8,17 @@ use arrow::datatypes::DataType;
 
 use crate::{ExprError, StrFunc};
 
+mod case;
 mod chunk;
+mod compress;
 mod html;
 mod jaro;
 mod json;
 mod like;
 mod minhash;
+mod numfmt;
 mod regex_cache;
+mod uri_path;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
 /// Apply a string function to a **dictionary** column's distinct values and gather the
@@ -84,9 +88,15 @@ pub(crate) fn eval_str(
     // dropped every non-UTF-8 row. DuckDB's `hex(BLOB)`/`md5(BLOB)`/… operate on the
     // bytes regardless of textual validity; do the same here.
     if matches!(arr.data_type(), DataType::Binary | DataType::LargeBinary) {
-        if let Some(out) = eval_bytes(func, arr)? {
+        if let Some(out) = eval_bytes(func, arr, pattern)? {
             return Ok(out);
         }
+    }
+    // Int → Utf8 functions (`chr`, `to_base`/`bin`, `format_bytes`, and `hex` of an
+    // integer) are dispatched before the Utf8 downcast below, which would reject their
+    // argument outright. Every other function declines here and takes the string path.
+    if let Some(out) = numfmt::eval_numeric_input(func, arr, start)? {
+        return Ok(out);
     }
     // A `Binary`-typed column (how ClickBench's `hits` string columns arrive — a
     // `BYTE_ARRAY` with no UTF-8 logical annotation) is coerced to `Utf8` so string
@@ -323,6 +333,105 @@ pub(crate) fn eval_str(
                     .collect::<BooleanArray>(),
             )
         }
+        StrFunc::JsonArrayLength => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::array_length(v, &path)))
+                    .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::JsonType => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::value_type(v, &path)))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::JsonValue => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::json_value(v, &path)))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::JsonContains => {
+            let needle = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| json::contains(v, needle)))
+                    .collect::<BooleanArray>(),
+            )
+        }
+        StrFunc::JsonPretty => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(json::pretty))
+                .collect::<StringArray>(),
+        ),
+        StrFunc::JsonStructure => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(json::structure))
+                .collect::<StringArray>(),
+        ),
+        // Int → Utf8, handled before the Utf8 downcast above. Reaching here means the
+        // argument was text, which these have no meaning for.
+        StrFunc::Chr | StrFunc::ToBase | StrFunc::FormatBytes | StrFunc::FormatBytesSi => {
+            return Err(ExprError::ExpectedString {
+                func: format!("{func:?}"),
+                got: "Utf8 (this function takes an integer)".into(),
+            })
+        }
+        StrFunc::JsonExists => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| json::path_exists(v, &path)))
+                    .collect::<BooleanArray>(),
+            )
+        }
+        StrFunc::JsonObjectKeys | StrFunc::JsonArrayValues => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            let keys = matches!(func, StrFunc::JsonObjectKeys);
+            // Both shapes emit one `List<Utf8>` per row; the extracted text is a subset
+            // of the document, so the input's value bytes bound the output's.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
+            for o in s.iter() {
+                // A null input, an absent path, or a value of the wrong shape all yield a
+                // null list rather than an empty one, keeping "no answer" distinct from
+                // "an empty object/array", which is a real and different fact.
+                let produced = o.is_some_and(|v| {
+                    if keys {
+                        match json::object_keys(v, &path) {
+                            Some(ks) => {
+                                for k in ks {
+                                    builder.values().append_value(k);
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        match json::array_values(v, &path) {
+                            Some(vs) => {
+                                for e in vs {
+                                    builder.values().append_option(e);
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                });
+                builder.append(produced);
+            }
+            Arc::new(builder.finish())
+        }
         StrFunc::Hash64 => Arc::new(
             s.iter()
                 .map(|o| o.map(|v| fnv1a64(v.as_bytes()) as i64))
@@ -515,14 +624,66 @@ pub(crate) fn eval_str(
         StrFunc::RegexpExtractAll => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
             let re = compile_regex(pattern, func)?;
+            // The capture-group index rides `start`, as it does for the scalar
+            // `RegexpExtract`. Without it every call collected the *whole* match, so
+            // `regexp_extract_all('100-200', '(\d+)-(\d+)', 1)` answered
+            // `['100-200']` where DuckDB says `['100']` — a wrong answer, not a refusal,
+            // because the group argument was simply dropped on the way down.
+            let group = start.unwrap_or(0).max(0) as usize;
+            // DuckDB rejects a group the pattern does not have rather than returning
+            // empty lists; `captures_len` counts group 0, so the last valid index is
+            // one less.
+            if group >= re.captures_len() {
+                return Err(ExprError::InvalidArgument {
+                    func: format!("{func:?}"),
+                    reason: format!(
+                        "pattern has {} group(s); cannot access group {group}",
+                        re.captures_len() - 1
+                    ),
+                });
+            }
             // One list per row; match volume per row is unknown, so pre-size only the
             // outer offset buffer and let the inner value builder grow as matches land.
             let mut builder = ListBuilder::with_capacity(StringBuilder::new(), s.len());
             for o in s.iter() {
                 match o {
                     Some(v) => {
-                        for m in re.find_iter(v) {
-                            builder.values().append_value(m.as_str());
+                        if group == 0 {
+                            for m in re.find_iter(v) {
+                                builder.values().append_value(m.as_str());
+                            }
+                        } else {
+                            for c in re.captures_iter(v) {
+                                // A group that did not participate in this match is a
+                                // NULL element in DuckDB (the scalar `regexp_extract`
+                                // yields `''` instead — the two genuinely differ).
+                                match c.get(group) {
+                                    Some(m) => builder.values().append_value(m.as_str()),
+                                    None => builder.values().append_null(),
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        StrFunc::RegexpSplit => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            let re = compile_regex(pattern, func)?;
+            // The pieces together are at most the input bytes, so both buffers pre-size
+            // from the input the way the literal `Split` does.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
+            for o in s.iter() {
+                match o {
+                    Some(v) => {
+                        for part in re.split(v) {
+                            builder.values().append_value(part);
                         }
                         builder.append(true);
                     }
@@ -537,6 +698,71 @@ pub(crate) fn eval_str(
                 s.iter()
                     .map(|o| o.map(|v| re.find_iter(v).count() as i64))
                     .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::UrlEncode => Arc::new(map_str(s, uri_path::url_encode)),
+        StrFunc::UrlDecode => Arc::new(map_str(s, uri_path::url_decode)),
+        StrFunc::RegexpEscape => Arc::new(map_str(s, uri_path::regexp_escape)),
+        StrFunc::ParseFilename => Arc::new(map_str_borrow(s, uri_path::parse_filename)),
+        StrFunc::ParseDirname => Arc::new(map_str_borrow(s, uri_path::parse_dirname)),
+        StrFunc::ParseDirpath => Arc::new(map_str_borrow(s, uri_path::parse_dirpath)),
+        StrFunc::ParsePath => {
+            use arrow::array::{Array, ListBuilder, StringBuilder};
+            // Components are borrowed slices of the input, so the value buffer needs at
+            // most the input's bytes — the same pre-sizing `Split` uses.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
+            for o in s.iter() {
+                match o {
+                    Some(v) => {
+                        for part in uri_path::parse_path(v) {
+                            builder.values().append_value(part);
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        StrFunc::ToBinary => Arc::new(map_str(s, uri_path::to_binary)),
+        StrFunc::FromBinary => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(uri_path::from_binary))
+                .collect::<StringArray>(),
+        ),
+        StrFunc::Hamming => {
+            use arrow::array::Array;
+            let target = require_pattern(pattern, func)?;
+            // Unequal lengths have no Hamming distance; DuckDB raises rather than
+            // comparing a prefix, and a silent prefix comparison would answer a
+            // caller's bug with a plausible number.
+            let mut out = Vec::with_capacity(s.len());
+            for o in s.iter() {
+                match o {
+                    None => out.push(None),
+                    Some(v) => match uri_path::hamming(v, target) {
+                        Some(d) => out.push(Some(d)),
+                        None => {
+                            return Err(ExprError::InvalidArgument {
+                                func: format!("{func:?}"),
+                                reason: "strings must be of equal length".into(),
+                            })
+                        }
+                    },
+                }
+            }
+            Arc::new(Int64Array::from(out))
+        }
+        StrFunc::JaccardSimilarity => {
+            use arrow::array::Float64Array;
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| uri_path::jaccard(v, target)))
+                    .collect::<Float64Array>(),
             )
         }
         StrFunc::Levenshtein => {
@@ -572,8 +798,69 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::Soundex => Arc::new(map_str(s, soundex)),
+        // A text column compresses its UTF-8 bytes. Decompressing text is accepted for
+        // the same reason `unhex` accepts it: the bytes are what matter, and refusing
+        // would only force a `cast("binary")` that changes nothing.
+        StrFunc::Compress | StrFunc::Decompress => {
+            use arrow::array::Array;
+            let rows: Vec<Option<&[u8]>> = (0..s.len())
+                .map(|i| (!s.is_null(i)).then(|| s.value(i).as_bytes()))
+                .collect();
+            compress_rows(func, &rows, pattern)?
+        }
+        StrFunc::ToCase => {
+            let style = pattern.ok_or_else(|| ExprError::MissingArgument {
+                func: "ToCase".to_string(),
+                arg: "style",
+            })?;
+            // Reject the style once, before touching a row: an unknown style is a plan
+            // error, and raising it per row would emit the same message n times.
+            if !case::STYLES.contains(&style) {
+                return Err(case::unknown_style(style));
+            }
+            Arc::new(map_str(s, |v| case::to_case(v, style).unwrap_or_default()))
+        }
     };
     Ok(out)
+}
+
+/// Apply `Compress`/`Decompress` to a column already reduced to `Option<&[u8]>` rows.
+///
+/// Both the Utf8 and the Binary path funnel here, so the two cannot drift: a text column
+/// and the same bytes as a BLOB compress identically. The codec is validated once, before
+/// any row is touched — an unknown codec is a plan error, and raising it per row would
+/// emit the same message n times.
+fn compress_rows(
+    func: StrFunc,
+    rows: &[Option<&[u8]>],
+    pattern: Option<&str>,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::BinaryBuilder;
+
+    let codec = pattern.ok_or_else(|| ExprError::MissingArgument {
+        func: format!("{func:?}"),
+        arg: "codec",
+    })?;
+    if !compress::CODECS.contains(&codec) {
+        return Err(compress::unknown_codec(&format!("{func:?}"), codec));
+    }
+    let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
+    for row in rows {
+        match row {
+            None => b.append_null(),
+            Some(v) => match func {
+                StrFunc::Compress => {
+                    b.append_value(compress::compress(v, codec).expect("codec validated above")?)
+                }
+                // A frame that will not decode is a null row, not a failed batch.
+                _ => match compress::decompress(v, codec).expect("codec validated above") {
+                    Some(out) => b.append_value(out),
+                    None => b.append_null(),
+                },
+            },
+        }
+    }
+    Ok(Arc::new(b.finish()))
 }
 
 /// Whether `c` is a Unicode space separator (general category `Zs`).
@@ -805,7 +1092,11 @@ fn initcap(v: &str) -> String {
 /// functions defined over raw bytes (matching DuckDB's `hex`/`md5`/`sha*`/`base64`/
 /// `octet_length` over a BLOB), and `None` for a text-oriented function so the caller
 /// falls back to the Utf8 path.
-fn eval_bytes(func: StrFunc, arr: &ArrayRef) -> Result<Option<ArrayRef>, ExprError> {
+fn eval_bytes(
+    func: StrFunc,
+    arr: &ArrayRef,
+    pattern: Option<&str>,
+) -> Result<Option<ArrayRef>, ExprError> {
     use arrow::array::{BinaryArray, LargeBinaryArray};
     // Iterate the rows as `Option<&[u8]>` for either binary offset width.
     let bytes: Vec<Option<&[u8]>> = match arr.data_type() {
@@ -824,6 +1115,9 @@ fn eval_bytes(func: StrFunc, arr: &ArrayRef) -> Result<Option<ArrayRef>, ExprErr
         _ => return Ok(None),
     };
     let out: ArrayRef = match func {
+        StrFunc::Compress | StrFunc::Decompress => {
+            return compress_rows(func, &bytes, pattern).map(Some)
+        }
         StrFunc::OctetLength => Arc::new(
             bytes
                 .iter()
@@ -1162,32 +1456,6 @@ fn compile_regex(pattern: Option<&str>, func: StrFunc) -> Result<Arc<regex::Rege
 /// `regex::Regex::replace` instead interprets `$1` as a group and leaves `\1` untouched,
 /// so `regexp_replace('ab', '(a)(b)', '\2\1')` returned the literal `\2\1` rather than
 /// `ba`. This wraps the template so the substitution matches DuckDB.
-struct Re2Rewrite<'a>(&'a str);
-
-impl regex::Replacer for Re2Rewrite<'_> {
-    fn replace_append(&mut self, caps: &regex::Captures, dst: &mut String) {
-        let mut chars = self.0.chars();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
-                    Some(d) if d.is_ascii_digit() => {
-                        if let Some(m) = caps.get(d as usize - '0' as usize) {
-                            dst.push_str(m.as_str());
-                        }
-                    }
-                    Some('\\') => dst.push('\\'),
-                    // Unreachable for a template that passed `re2_rewrite_valid`; kept
-                    // total so the function never panics on a hand-written IR document.
-                    Some(other) => dst.push(other),
-                    None => {}
-                }
-            } else {
-                dst.push(c);
-            }
-        }
-    }
-}
-
 /// Whether a rewrite `template` is valid for a regex with `max_group` capture groups.
 ///
 /// RE2 rejects a template whose only escapes are not `\0`..`\9` or `\\`, or that
@@ -1211,20 +1479,119 @@ fn re2_rewrite_valid(template: &str, max_group: usize) -> bool {
     true
 }
 
+/// Expand one match's rewrite `template` into `dst`, reading groups out of `locs`.
+///
+/// DuckDB/RE2 rewrite semantics: `\N` expands to capture group `N`'s text, an unmatched
+/// group expands to nothing, and `\\` is a literal backslash. Groups are read from a
+/// reusable [`regex::CaptureLocations`] plus the subject string rather than an allocated
+/// `Captures`, which is what keeps the replace loop free of per-row allocation.
+fn expand_rewrite(template: &str, locs: &regex::CaptureLocations, hay: &str, dst: &mut String) {
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(d) if d.is_ascii_digit() => {
+                    if let Some((a, b)) = locs.get(d as usize - '0' as usize) {
+                        dst.push_str(&hay[a..b]);
+                    }
+                }
+                Some('\\') => dst.push('\\'),
+                // Unreachable for a template that passed `re2_rewrite_valid`; kept total
+                // so the function never panics on a hand-written IR document.
+                Some(other) => dst.push(other),
+                None => {}
+            }
+        } else {
+            dst.push(c);
+        }
+    }
+}
+
 /// Apply a `regexp_replace`/`regexp_replace_all` with DuckDB rewrite semantics.
 /// `global` picks first-match vs all-matches. An invalid rewrite template leaves each
 /// row unchanged (DuckDB behaviour).
+///
+/// Written against a **reused** capture buffer rather than `Regex::replace`, which is a
+/// per-row allocator: each call builds a fresh `Captures` (an owned slot vector) and a
+/// `CaptureMatches` iterator, then hands back a `Cow` that `into_owned` copies again. On
+/// ClickBench q28 (`regexp_replace` over 10M `Referer` values) that dominated the query --
+/// profiled at 29.9% in `Regex::create_captures`, 15.9% in `CaptureMatches::next` and 10.8%
+/// dropping the iterator, against only ~10% in the actual regex search.
+///
+/// `capture_locations` is allocated once per column and `captures_read_at` writes into it,
+/// so the per-row cost is the search plus the output bytes. Match semantics are the
+/// regex crate's own leftmost-first scan either way, and the rewrite expansion is shared
+/// with [`expand_rewrite`], so the result is bit-identical to the `Replacer` path.
 fn regexp_replace_with(s: &StringArray, re: &regex::Regex, rep: &str, global: bool) -> StringArray {
+    use arrow::array::{Array, StringBuilder};
+
     if !re2_rewrite_valid(rep, re.captures_len().saturating_sub(1)) {
         return map_str_borrow(s, |v| v);
     }
-    map_str(s, |v| {
-        if global {
-            re.replace_all(v, Re2Rewrite(rep)).into_owned()
-        } else {
-            re.replace(v, Re2Rewrite(rep)).into_owned()
+    let mut locs = re.capture_locations();
+    let mut out = String::new();
+    let mut b = StringBuilder::with_capacity(s.len(), s.value_data().len());
+    for row in s.iter() {
+        let Some(hay) = row else {
+            b.append_null();
+            continue;
+        };
+        // `at` is the byte offset the next search starts from; `copied` is how much of
+        // `hay` has already been written out. They differ only for an empty match, where
+        // the scan must advance a character to terminate but nothing has been consumed.
+        let mut at = 0usize;
+        let mut copied = 0usize;
+        let mut matched = false;
+        let mut last_end: Option<usize> = None;
+        while at <= hay.len() {
+            let Some(m) = re.captures_read_at(&mut locs, hay, at) else {
+                break;
+            };
+            let (ms, me) = (m.start(), m.end());
+            // The regex crate's match iterator drops an **empty** match that ends where the
+            // previous match ended, so `a*` over "ab" yields "a" then the empty match at 2 --
+            // not a second empty match at 1. Skipping it here is what makes this loop agree
+            // with `replace_all` (pinned by `regexp_replace_matches_the_regex_crates_own_replacer`).
+            if ms == me && Some(me) == last_end {
+                match hay[me..].chars().next() {
+                    Some(c) => {
+                        at = me + c.len_utf8();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            if !matched {
+                matched = true;
+                out.clear();
+                out.reserve(hay.len());
+            }
+            out.push_str(&hay[copied..ms]);
+            expand_rewrite(rep, &locs, hay, &mut out);
+            copied = me;
+            last_end = Some(me);
+            if !global {
+                break;
+            }
+            // An empty match would otherwise spin on the same offset forever; step one
+            // character past it, exactly as the regex crate's own `replace_all` does.
+            at = if me == ms {
+                match hay[me..].chars().next() {
+                    Some(c) => me + c.len_utf8(),
+                    None => break,
+                }
+            } else {
+                me
+            };
         }
-    })
+        if matched {
+            out.push_str(&hay[copied..]);
+            b.append_value(&out);
+        } else {
+            b.append_value(hay);
+        }
+    }
+    b.finish()
 }
 
 fn require_pattern(pattern: Option<&str>, func: StrFunc) -> Result<&str, ExprError> {
@@ -1870,7 +2237,9 @@ mod tests {
         let row = |i: usize| {
             let v = list.value(i);
             let v = v.as_any().downcast_ref::<StringArray>().unwrap();
-            (0..v.len()).map(|j| v.value(j).to_string()).collect::<Vec<_>>()
+            (0..v.len())
+                .map(|j| v.value(j).to_string())
+                .collect::<Vec<_>>()
         };
         assert_eq!(row(0), ["the cat", "cat sat"]); // overlapping bigrams
         assert_eq!(row(1), ["solo"]); // fewer than n tokens → one all-tokens gram
@@ -1984,6 +2353,70 @@ mod tests {
         assert_eq!(damerau_levenshtein("ca", "abc"), 2);
     }
 
+    /// `regexp_extract_all` collects a *capture group* of every match when one is asked
+    /// for, not the whole match. The group index rides `start`, as it does for the scalar
+    /// `RegexpExtract`; before it was honoured the kernel called `find_iter`
+    /// unconditionally, so group 1 of `(\d+)-(\d+)` came back as the whole `100-200`.
+    #[test]
+    fn regexp_extract_all_collects_the_requested_capture_group() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+        use std::sync::Arc;
+
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("100-200, 300-400")]));
+        let row = |group: i64| -> Vec<Option<String>> {
+            let out = eval_str(
+                StrFunc::RegexpExtractAll,
+                &arr,
+                Some(r"(\d+)-(\d+)"),
+                None,
+                Some(group),
+                None,
+            )
+            .unwrap();
+            let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = list.value(0);
+            let strings = values.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..strings.len())
+                .map(|i| (!strings.is_null(i)).then(|| strings.value(i).to_string()))
+                .collect()
+        };
+        let owned = |v: &[&str]| -> Vec<Option<String>> {
+            v.iter().map(|s| Some((*s).to_string())).collect()
+        };
+        // Group 0 (and the default) is the whole match; 1 and 2 are the two halves.
+        assert_eq!(row(0), owned(&["100-200", "300-400"]));
+        assert_eq!(row(1), owned(&["100", "300"]));
+        assert_eq!(row(2), owned(&["200", "400"]));
+
+        // A branch that did not participate is a NULL element, matching DuckDB — the
+        // scalar `regexp_extract` yields `""` for the same case, so the two differ.
+        let alt: ArrayRef = Arc::new(StringArray::from(vec![Some("a1 b")]));
+        let out = eval_str(
+            StrFunc::RegexpExtractAll,
+            &alt,
+            Some(r"(\d)|(x)"),
+            None,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value(0).len(), 1);
+        assert!(list.value(0).is_null(0));
+
+        // A group the pattern does not have is rejected, not silently empty.
+        assert!(eval_str(
+            StrFunc::RegexpExtractAll,
+            &arr,
+            Some(r"(\d+)"),
+            None,
+            Some(5),
+            None,
+        )
+        .is_err());
+    }
+
     /// `regexp_replace`/`regexp_replace_all` use DuckDB's RE2 rewrite template: `\1`..`\9`
     /// are capture-group backreferences, `\0` the whole match, `\\` a literal backslash,
     /// and `$` is literal. The old code passed the template to the `regex` crate verbatim,
@@ -2070,5 +2503,117 @@ mod tests {
             out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
             "a"
         );
+    }
+
+    /// The allocation-free replace loop must be **bit-identical** to driving the `regex`
+    /// crate's own `replace`/`replace_all` with the same rewrite semantics.
+    ///
+    /// `regexp_replace_with` was rewritten to reuse one `CaptureLocations` instead of
+    /// allocating a `Captures` per row (29.9% of ClickBench q28 was `create_captures`).
+    /// That hand-rolls the scan loop, so the two places it could drift from the library
+    /// are pinned here: **empty matches**, where the scan must step a character to
+    /// terminate without consuming input, and **multibyte UTF-8**, where stepping by one
+    /// byte would slice a char boundary and panic. Patterns that can match empty (`a*`,
+    /// `x?`, `(?:)`) are included deliberately, as are non-ASCII subjects.
+    #[test]
+    fn regexp_replace_matches_the_regex_crates_own_replacer() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        // The reference: expand the RE2 template through the regex crate's `Captures`.
+        fn reference(hay: &str, re: &regex::Regex, rep: &str, global: bool) -> String {
+            let expand = |caps: &regex::Captures, dst: &mut String| {
+                let mut chars = rep.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        match chars.next() {
+                            Some(d) if d.is_ascii_digit() => {
+                                if let Some(m) = caps.get(d as usize - '0' as usize) {
+                                    dst.push_str(m.as_str());
+                                }
+                            }
+                            Some('\\') => dst.push('\\'),
+                            Some(other) => dst.push(other),
+                            None => {}
+                        }
+                    } else {
+                        dst.push(c);
+                    }
+                }
+            };
+            if global {
+                re.replace_all(hay, |c: &regex::Captures| {
+                    let mut s = String::new();
+                    expand(c, &mut s);
+                    s
+                })
+                .into_owned()
+            } else {
+                re.replace(hay, |c: &regex::Captures| {
+                    let mut s = String::new();
+                    expand(c, &mut s);
+                    s
+                })
+                .into_owned()
+            }
+        }
+
+        let subjects = [
+            "",
+            "ab",
+            "xaby",
+            "abab",
+            "aaa",
+            "no-match-here",
+            "https://www.example.com/a/b",
+            "héllo wörld",
+            "日本語テキスト",
+            "a日b日c",
+            "trailing",
+            "//",
+            "a",
+            "\\escaped",
+        ];
+        let patterns = [
+            "(a)(b)",
+            "a*",
+            "x?",
+            "(?:)",
+            "[^/]+",
+            "^https?://(?:www\\.)?([^/]+)/.*$",
+            "(\\w+)",
+            "日",
+            "(é)",
+            "$",
+            "^",
+        ];
+        let templates = [r"\1", r"\0", r"\2\1", "-", "", r"\\", r"[\1]"];
+
+        let arr: ArrayRef = Arc::new(StringArray::from(
+            subjects.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+        ));
+        for pat in patterns {
+            let re = regex::Regex::new(pat).unwrap();
+            for rep in templates {
+                if !super::re2_rewrite_valid(rep, re.captures_len().saturating_sub(1)) {
+                    continue; // invalid template is a documented no-op, covered elsewhere
+                }
+                for (func, global) in [
+                    (StrFunc::RegexpReplace, false),
+                    (StrFunc::RegexpReplaceAll, true),
+                ] {
+                    let out = eval_str(func, &arr, Some(pat), Some(rep), None, None).unwrap();
+                    let got = out.as_any().downcast_ref::<StringArray>().unwrap();
+                    for (i, hay) in subjects.iter().enumerate() {
+                        assert_eq!(
+                            got.value(i),
+                            reference(hay, &re, rep, global),
+                            "pattern={pat:?} template={rep:?} global={global} subject={hay:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

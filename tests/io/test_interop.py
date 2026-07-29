@@ -86,8 +86,14 @@ def test_from_arrow_batch_and_list():
 
 
 def test_from_arrow_empty_list_raises():
-    with pytest.raises(ValueError, match="empty batch list"):
+    """Typed, and the message names the way out — a Dataset is a handle to a schema as
+    well as to rows, and an empty batch list carries neither."""
+    from batcher._internal.errors import PlanError
+
+    with pytest.raises(PlanError, match="at least one record batch") as excinfo:
         from_arrow([])
+    assert isinstance(excinfo.value, ValueError)  # the historical type still catches it
+    assert "from_pydict" in str(excinfo.value)
 
 
 def test_from_pydict_roundtrip():

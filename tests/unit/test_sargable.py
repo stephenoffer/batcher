@@ -237,3 +237,37 @@ def test_full_optimizer_exposes_raw_column():
     ir = json.dumps(Optimizer().optimize(plan).ir)
     assert '"add"' not in ir  # the wrapper is gone
     assert '{"int": 400}' in ir or '"int": 400' in ir
+
+
+# --- the registered rules, not just the standalone functions ----------------
+
+#: One query per registered sargable rule, each written in the shape only that rule
+#: rewrites. The rewritten form is always `col OP literal`, which is what zone-map
+#: pruning and source pushdown match on.
+_FIRES = {
+    "sarg_flip_comparison": lambda ds: ds.filter(bt.lit(5) == col("a")),
+    "sarg_add_const": lambda ds: ds.filter(col("a") + bt.lit(2) == bt.lit(7)),
+    "sarg_sub_const": lambda ds: ds.filter(col("a") - bt.lit(2) == bt.lit(7)),
+    "sarg_rsub_const": lambda ds: ds.filter(bt.lit(9) - col("a") == bt.lit(7)),
+    "sarg_mul_const": lambda ds: ds.filter(col("a") * bt.lit(3) == bt.lit(9)),
+    "sarg_xor_const": lambda ds: ds.filter((col("a") ^ bt.lit(3)) == bt.lit(9)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FIRES))
+def test_registered_rule_still_rewrites(name):
+    # These six are registered as node rules so the driver runs them inside its shared
+    # expression traversal rather than each walking the whole plan. A rule that stops being
+    # reached by that traversal is invisible: every result stays correct and only the
+    # predicate silently keeps its un-sargable shape. So the assertion is that the *plan*
+    # changes, driven through the registry rather than by calling the pass directly.
+    from batcher.kyber.optimizer import optimize_logical
+
+    plan = _FIRES[name](bt.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]}))._plan
+    assert optimize_logical(plan).to_ir() != plan.to_ir(), f"{name} no longer fires"
+
+
+def test_every_sargable_rule_is_covered_above():
+    # If a rule is added to the family, this fails until it gets a firing case.
+    registered = {r.name for r in DEFAULT_REGISTRY.rules() if r.name.startswith("sarg_")}
+    assert registered == set(_FIRES)
