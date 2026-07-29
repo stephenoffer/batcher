@@ -17,6 +17,12 @@ hint* (`num_cpus`), never a result, so error costs throughput, not correctness:
 * It is a **mean** over the operator's run. A bursty op (e.g. IO-decode that spikes)
   has a low mean but high peaks; packing by the mean can cause CFS contention and
   hurt tail latency. The `cpu_share_min` floor bounds, but does not eliminate, this.
+* Low utilization has **two causes with opposite fixes** — a family that never wanted
+  the cores, and one whose cores were taken from it. Only the first should shrink the
+  share; shrinking under contention packs more tasks onto contended cores and lowers
+  utilization further, which shrinks the share again. A family whose measured history
+  shows preemption or paging (`plan.feedback.oversubscribed`) is therefore suppressed
+  and keeps its static prior.
 * Utilization is measured **per core across the single-node run** (`cpu_ns / (wall x
   threads)`). An op that parallelizes poorly (or is tiny) reads artificially low, and
   the thread count is the configured/host core count, which can differ from rayon's
@@ -40,6 +46,7 @@ from statistics import median
 from batcher._internal.logging import note_suppressed
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
+from batcher.plan.feedback import oversubscribed
 
 __all__ = ["class_ir_tag", "load_cpu_utilization", "recommend_num_cpus"]
 
@@ -137,6 +144,13 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
         out: dict[str, float] = {}
         for tag, rows in hub.op_stats_by_kind().items():
             utils = [u for r in rows if (u := float(r.get("cpu_utilization", 0.0) or 0.0)) > 0.0]
+            # A family whose cores were *taken* reads exactly like one that never wanted them,
+            # and shrinking its share is the wrong half of that ambiguity — it packs more tasks
+            # onto the cores already being fought over, which lowers utilization further and
+            # shrinks the share again. Suppress the learned value and keep the static prior;
+            # this is the signal `oversubscribed` exists to supply.
+            if oversubscribed(rows):
+                continue
             # Confidence gate: enough samples AND concentrated enough to trust the median.
             if len(utils) >= min_samples and _is_confident(utils):
                 med = median(utils)

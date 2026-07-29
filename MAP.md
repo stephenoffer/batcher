@@ -340,7 +340,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 493 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 807 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 494 | The opt-in GPU execution backend for supported relational shapes. |
@@ -1155,7 +1155,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | module | lines | what it is |
 |---|---|---|
 | `estimator.py` | 298 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `learned.py` | 414 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
+| `learned.py` | 423 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
 | `probe.py` | 341 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
@@ -1872,7 +1872,7 @@ The neutral type vocabulary and inference for the plan layer.
 |---|---|---|
 | `footprint.py` | 86 | How much memory live Arrow data actually keeps resident. |
 | `infer.py` | 489 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
-| `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
+| `lattice.py` | 103 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `media.py` | 83 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
 | `widths.py` | 220 | Static per-column byte widths derived from a column's Arrow type. |
@@ -2063,7 +2063,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1320 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
-| `join/range/band.rs` | 250 | The band join: two inequalities that bound **one** right key from both sides. |
+| `join/range/band.rs` | 240 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 456 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
 | `join/range/mod.rs` | 619 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
@@ -2194,8 +2194,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `countmin.rs` | 194 | Count-Min — frequency (heavy-hitter) estimation. |
 | `ddsketch.rs` | 423 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
 | `frequent.rs` | 234 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |
-| `hll.rs` | 339 | HyperLogLog++ — distinct-count (cardinality) estimation. |
-| `kll.rs` | 517 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |
+| `hll.rs` | 394 | HyperLogLog++ — distinct-count (cardinality) estimation. |
+| `kll.rs` | 541 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |
 | `lib.rs` | 81 | `bc-sketches` — mergeable probabilistic sketches for the optimizer. |
 | `reservoir.rs` | 362 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
 | `stats.rs` | 334 | Per-column statistics derived from a single scan. |

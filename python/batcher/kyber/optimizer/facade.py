@@ -25,9 +25,11 @@ from batcher.kyber.rules.projections import (
 )
 from batcher.kyber.rules.selection import BuildSideDecision
 from batcher.metadata import MetadataHub
+from batcher.metadata.io_stats import relative_read_cost
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.physical import PhysicalPlan
 from batcher.plan.resource import HardwareProfile
+from batcher.plan.source_stats import source_identity
 from batcher.plan.stats import RelStats
 from batcher.plan.visitor import children
 
@@ -73,10 +75,16 @@ class Optimizer:
         # Coefficients calibrated from measured op_stats (defaults until a workload
         # has run): this is what lets the cost model reflect the real engine.
         coeffs = calibrate(self._hub, self._config)
+        # Each source's measured read throughput, as a multiplier on what its bytes cost
+        # relative to the plan's median source. Cold, single-source, or unidentifiable
+        # sources all yield 1.0, which is the ranking this had before there was a measurement.
+        io_factors = relative_read_cost(self._hub, [source_identity(s) for s in self._sources])
         # The fleet the plan will run across drives the `net` axis. `1` single-node, which
         # makes that axis identically zero — so a single-node plan is ranked exactly as it
         # was before shuffle volume was costed at all.
-        cost_model = CostModel(estimator, coeffs, workers=self._hardware.worker_count)
+        cost_model = CostModel(
+            estimator, coeffs, workers=self._hardware.worker_count, source_io_factors=io_factors
+        )
         return OptimizerContext(
             config=self._config,
             sources=self._sources,

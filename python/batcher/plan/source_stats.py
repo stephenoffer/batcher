@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
-__all__ = ["SourceStatistics", "source_stats_key"]
+__all__ = ["SourceStatistics", "source_identity", "source_stats_key"]
 
 
 # Per-instance serials for shape-keyed sources, and the counter that issues them.
@@ -55,6 +55,31 @@ def _instance_serial(source: object) -> int:
             return serial
     except TypeError:  # not weak-referenceable
         return id(source)
+
+
+def source_identity(source: object) -> str:
+    """A source's own `identity()`, or `""` when it does not have one.
+
+    The bare identity, as distinct from `source_stats_key` below: this is what a *per-source*
+    learned figure keyed on the data itself — a measured read throughput, a persisted
+    footerless-format row count — is stored under. It lives here, in the neutral layer, so the
+    conductor that writes such a figure and the optimizer that reads it back agree on the
+    spelling. They cannot import each other, and two spellings of a key is a store that
+    silently never hits.
+
+    Args:
+        source: A bound source.
+
+    Returns:
+        The source's identity, or `""` when it declares none.
+    """
+    identity_fn = getattr(source, "identity", None)
+    if not callable(identity_fn):
+        return ""
+    try:
+        return str(identity_fn() or "")
+    except Exception:  # pragma: no cover - a source that cannot identify itself
+        return ""
 
 
 def source_stats_key(source: object) -> str | None:

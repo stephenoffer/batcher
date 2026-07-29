@@ -150,3 +150,111 @@ snapshots.
 
 **M39-M40.** `InProcessBackend.clear` added for `refresh`; every backend that can forget now
 does, so the hub's prune is no longer a no-op on three of the four configurations.
+
+## M41-M48 — measured contention, which nothing outside the profiler read
+
+Core records `invol_ctx_switches` and `major_faults` per operator. `plan/feedback.py` says of
+the first that it is "the normalized form the sizing loops read" — and no sizing loop read it.
+Both CPU-share loops sized `num_cpus` from `cpu_utilization` alone.
+
+**M41. The CPU-share loops amplified contention.** Low utilization has two causes with
+opposite fixes: a family that never wanted the cores, and a family whose cores were taken.
+Both read as low, and the loops assumed the first. Shrinking a contended family's reservation
+lets the scheduler pack more of its tasks onto the cores they are already fighting over, which
+lowers utilization, which shrinks the reservation again — a loop with no step in it that looks
+wrong. `plan.feedback.oversubscribed` reads the preemption and major-fault history and both
+loops (`kyber.cpu_shares`, `dist.adaptive_sizing`) now suppress the learned value rather than
+shrink, keeping the planner's weight.
+
+**M42-M45.** The median preemption rate, not the max, so one contended run inside a clear
+history does not latch a family; a `PAGING_FAULTS_PER_CORE_SECOND` threshold, so a first-touch
+fault is not read as paging; no measurement reads as no evidence, so the prior behavior stands;
+suppression rather than a *raise*, because over-provisioning a fleet off a per-family signal is
+a larger change than the amplifying loop it would close.
+
+## M46-M55 — a scanned byte is not the same price everywhere
+
+**M46. The measured per-source read throughput had no consumer but `explain`.** The module
+docstring claimed "the optimizer/Carbonite consume it"; they did not. The cost model priced
+every scanned byte identically, which is one coefficient fitted across a cold object-store read
+of many small files and a page-cache hit at once — and a plan joining one of each is ranked as
+though reading either were equally cheap. Which side to build, which to broadcast, and which
+join order to take all turn on that comparison. `relative_read_cost` now feeds the `Scan` io
+term.
+
+**M47. The baseline is the plan's own median source, not an absolute figure.** A cost model
+ranks alternatives, so only the ratio between this plan's sources can change a decision; an
+absolute anchor would additionally re-scale the `io` axis against `cpu`, which is a re-tuning
+of the model rather than a sharpening of it. It also cannot drift — a uniformly faster fleet
+moves every source together and every multiplier stays at 1.0.
+
+**M48. It is a strict refinement.** A cold store, a single-source plan, an unmeasured source,
+or a caller that supplies no factors all price at 1.0, so those rankings are byte-for-byte what
+they were. Clamped four-fold either way, so one unlucky measurement cannot dominate.
+
+**M49. Throughput was stored unscoped, against the subsystem's own rule.** `hardware_scope`
+names "device throughput" as the canonical machine-unit measurement, and this was keyed by
+source identity alone — so a heterogeneous cluster blended the driver's local-NVMe read of a
+path with a worker's cold S3 read of the same path into one figure wrong for both.
+
+**M50. The plan cache did not see it.** Cost calibration and CPU shares each needed an explicit
+epoch in the key because they bypass the generation counter; the read-cost factors are a third
+such door, and without them a memoized plan would freeze at whichever throughputs were in force
+when it was first cached — for a cold store, all-1.0, meaning the measurement would never be
+spent at all. Folded in at half-octave buckets, so the memo survives the smoothed figure
+twitching.
+
+**M51-M55.** `plan.source_stats.source_identity` gives the conductor that writes a per-source
+figure and the optimizer that reads it back one spelling of the key (they cannot import each
+other, and two spellings is a store that silently never hits); `api._source_identity` delegates
+to it rather than keeping a second copy; `relative_read_cost` returns the reference price for
+an unmeasured source rather than guessing in either direction.
+
+## M56-M59 — a small read is not a throughput measurement (found by benchmarking)
+
+The first version of M46 was instrumented against TPC-H sf1 before being believed, and the
+instrumentation is what caught this: the read-cost factor fired on **261 of 289** plans, at
+the clamp, and it was measuring the wrong thing entirely.
+
+**M56. Below a certain size, measured MB/s is inverted.** A read's elapsed time is byte
+movement *plus* a fixed cost — resolving the source, opening a handle, crossing FFI, the first
+allocation — and for a small relation the fixed part is nearly all of it. Since that part
+barely varies with size, the *smaller* the relation the slower it appears. On sf1 that made
+`nation` (25 rows) and `region` (5 rows) read as sixteen times more expensive per byte than
+`part`, so every plan touching a dimension table was re-ranked on an artifact of call
+overhead. `record_source_io` now refuses a read below `_MIN_MEASURED_BYTES` / `_MIN_MEASURED_MS`
+rather than recording a figure that is not a throughput.
+
+**M57. A dead band, so the measurement is spent only where it means something.** Two relations
+on the same storage differ in measured MB/s by compression ratio, column width, cache warmth,
+and where the scheduler happened to run. None of that is a reason to move a plan. Inside
+`_DEAD_BAND` the factor is exactly 1.0; outside it the case this exists for — a cold object
+store against a local file, a network volume against NVMe — still passes through.
+
+**M58. Re-verified, not re-asserted.** After both guards the same instrumented sf1 run reports
+**0 of 273** plans with a non-unit factor, so the change is provably inert on that benchmark
+and its rankings are byte-for-byte unchanged. That is the property M48 claimed; now it is
+measured.
+
+**M59.** The episode is the argument for the design: a signal that fires on the wrong
+population is worse than no signal, and only running it against a real workload showed which
+it was.
+
+## M60-M63 — the column sketch allocated a 16 KB HLL per morsel
+
+**M60.** `merge_column_stats` built a fresh `ColumnStats` for every (column, morsel) and merged
+it in. A `HyperLogLog::default_precision()` is a 16 KB register array, so a 49-morsel,
+16-column relation allocated and zeroed roughly 12 MB and then walked all of it again taking
+register-wise maxima — on the query path, to summarize data already in hand.
+`ColumnStats::update` folds an array into the existing sketch instead: one HLL per column.
+
+**M61.** The distinct estimate is unchanged **bit-for-bit**, because an HLL register is a
+maximum and sequential adds and merged maxima give the same array.
+
+**M62.** The quantile sketch is *not* bit-identical — KLL compaction depends on arrival order —
+and accumulating is if anything the more accurate of the two, since it compacts fewer times.
+Both consumers (range selectivity, range-partition boundaries) are an estimate and a scheduling
+decision; neither is a result.
+
+**M63.** `merge` stays, and stays the right tool for what it is for: combining sketches built on
+different *partitions*, which is the distributed path and which this does not replace.

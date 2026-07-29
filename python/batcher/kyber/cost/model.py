@@ -94,9 +94,16 @@ class CostModel:
         estimator: CardinalityEstimator,
         coeffs: CostCoefficients | None = None,
         workers: int = 1,
+        source_io_factors: list[float] | None = None,
     ) -> None:
         self._est = estimator
         self._c = coeffs or active_config().optimizer.cost_coeffs
+        # Per-source multipliers on the cost of a scanned byte, from each source's *measured*
+        # read throughput relative to this plan's median source
+        # (`metadata.io_stats.relative_read_cost`). `None` — what every caller that does not
+        # supply them gets, and what a cold store yields — prices every source alike, exactly
+        # as before. See `_source_io_factor`.
+        self._io_factors = source_io_factors or []
         # Workers the plan will run across, from `HardwareProfile.worker_count`. `1` — the
         # default every existing caller gets — makes the `net` axis identically zero, so a
         # single-node plan is ranked exactly as it was before that axis was populated.
@@ -213,13 +220,33 @@ class CostModel:
             return local
         return replace(local, net=net_cost(node, self._rows, self.row_bytes, self._workers))
 
+    def _source_io_factor(self, source_id: int) -> float:
+        """What a byte scanned from this source costs, relative to the plan's median source.
+
+        A byte read from a cold object store and a byte read from the page cache are the same
+        byte to the `io` axis, and they are two orders of magnitude apart in reality. When a
+        plan joins one of each, the comparison the cost model exists to make — which side to
+        build, which to broadcast, which order to join in — is made between two numbers that
+        differ only by row count. This is the measured correction to that, and its baseline is
+        the plan's own median source, so it can only change a *ranking* and never re-scale the
+        `io` axis against `cpu`.
+
+        `1.0` for an unmeasured source, a source id outside the supplied list, or a caller that
+        supplied none at all — so a cold store and every existing construction site rank plans
+        exactly as they did.
+        """
+        if 0 <= source_id < len(self._io_factors):
+            return self._io_factors[source_id]
+        return 1.0
+
     def _local_cost(self, node: LogicalPlan) -> Cost:
         """`op_cost` without the `net` axis — the cpu/mem/io an operator costs on one node."""
         c = self._c
         out_rows = self._rows(node)
 
         if isinstance(node, Scan):
-            return Cost(cpu=c.scan_row * out_rows, io=self.row_bytes(node) * out_rows)
+            io = self.row_bytes(node) * out_rows * self._source_io_factor(node.source_id)
+            return Cost(cpu=c.scan_row * out_rows, io=io)
 
         if isinstance(node, Filter):
             in_rows = self._rows(node.input)
