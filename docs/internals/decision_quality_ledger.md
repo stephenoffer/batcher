@@ -203,11 +203,23 @@ one morsel; with D55 it holds its fan-out, so packing `n` of them per core is `n
 on one node. An explode is also not obviously IO-bound — it is a gather that materializes
 `fanout x` the rows, which is memory-bandwidth work, not waiting.
 
-Not changed here for two reasons. The static prior is *overridden* by the measured CPU
-utilization of the operator family as soon as one run records it (`_cpu_share` ->
-`recommend_num_cpus`), so the loop already corrects it; and moving a scheduling prior is a
-packing-density change that wants `bench-dist`, not an argument. Stated so the interaction
-is visible rather than inherited.
+Not changed, and the reason was **checked rather than asserted** — the claim "the loop
+already corrects it" is exactly the kind of note that is worth nothing unverified.
+
+Measured end to end: an explode records `op_stats` under the `unnest` tag with a positive
+`cpu_utilization` on every run, and `load_cpu_utilization` surfaces it — *after* the refresh
+throttle. That last part is the non-obvious bit and cost some time to find: the first
+optimize of a process caches an empty map against a cold hub, and `_REFRESH_AFTER` (64 hub
+version bumps) holds it there, so twenty-five runs of a query still read `{}` and only around
+sixty runs refresh it. That is the documented throttle working, not a fault, but it means
+"the loop corrects it" is true on a *warm* store and not on a lightly-exercised one.
+
+What the measurement then says is the opposite of the worry: for the shape measured the
+learned utilization is ~0.011 of a core, which supports the CPU-light classification rather
+than contradicting it. That is one shape at one size and the figure is overhead-dominated,
+so it does not settle the general case — but the concern narrows to the **memory** side
+(`n` co-packed explodes at ~100 MB each), which is a packing-density question for
+`bench-dist` rather than an argument.
 
 ## The correction that switched itself off when warm (`carbonite/memory`)
 
@@ -246,3 +258,5 @@ columnar source's width estimate genuinely moves.
 |---|-----|-------------|
 | D67 | test | **A cross-product test over `{narrow, embedding, image, video_frame} x {1, 8, 1024 workers}`.** Every other test in this ledger pins one decision; the failures it exists for were never in one rule. A width, a memory envelope, a morsel, a task count, and a shuffle cost all read the same data, each looked reasonable on its own, and together they sized a multimodal pipeline by three orders of magnitude wrong. This is `CLAUDE.md`'s `{collect, spill, iter_batches, distributed} x {nulls, empty, NaN, descending}` discipline applied to *decisions* rather than results: it asserts the invariants that must hold in **every** cell — the width is within an order of magnitude of the truth, a morsel never exceeds its byte budget, a task never holds more than the byte target, the envelope is monotone in the modality, single-node is charged no network, and shuffle cost is monotone in both the fleet and the row width. |
 | D68 | test | **The matrix was checked against the pre-session commit and 13 of its 27 cells fail there**, which is what makes it worth having rather than a set of assertions true by construction. Two of those (the image and video-frame width cells) fail on *behaviour* — a decoded frame was sized at the 32-byte variable-length prior. The other eleven fail because the API did not exist: there was no `net` axis to be monotone in, and `morsel_target` took no plan to size a cold store from. Both are meaningful and they are not the same thing, so the distinction is recorded rather than reported as thirteen caught regressions. |
+
+| D69 | test | The open item above was verified rather than left as a plausible note. The learned CPU-share override does activate for `Unnest` (`op_stats` records `cpu_utilization` on every explode, `class_ir_tag` maps the family, `load_cpu_utilization` surfaces it) — but only past `_REFRESH_AFTER`, because the first optimize of a process caches an empty map against a cold hub and holds it for 64 version bumps. Twenty-five runs still read `{}`; around sixty refresh it. Worth recording because "a measurement will correct this" reads as immediate and is not. |
