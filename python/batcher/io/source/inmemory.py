@@ -121,6 +121,7 @@ class InMemorySource:
     """
 
     __slots__ = (
+        "__weakref__",  # lets `plan.source_stats` key statistics per instance, not by `id()`
         "_batches",
         "_bounds_cache",
         "_cache",

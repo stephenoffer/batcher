@@ -89,6 +89,16 @@ _ACCESSOR_RE = re.compile(r"Namespace$")
 # the list from becoming the place oversized files go to be forgotten. Every entry
 # is printed on each run so the set stays visible and shrinks over time.
 STRUCTURE_ALLOW: dict[str, str] = {
+    # Sat at exactly 500 lines — the ceiling — so adding a single `__slots__` entry tipped
+    # it over. That entry is `__weakref__`, and it is load-bearing rather than cosmetic:
+    # without it the only per-instance handle on an in-memory source is `id()`, which
+    # CPython reuses the moment an object is freed, so four transient frames shared one
+    # learned-statistics key and each planned from another relation's distinct counts and
+    # most-common-values (see `plan/source_stats.py::source_stats_key`). The real fix is to
+    # split the widening helpers (`_widen_*`, the narrow-type mapping) out of the source
+    # class they sit above — a genuinely separate concern — but that is a refactor to do
+    # deliberately, not as a side effect of a one-line correctness fix.
+    "python/batcher/io/source/inmemory.py": "at the ceiling; one __slots__ entry tipped it — extract the _widen_* helpers next",
     # Sat at 499 lines — one under the ceiling — so wiring shuffle-output replication
     # into the reduce tipped it over. The replication logic itself was extracted to
     # `dist/shuffle_replication.py` rather than left inline; what remains is the reduce

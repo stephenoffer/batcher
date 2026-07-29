@@ -17,12 +17,44 @@ manifest count (exact — may answer `count()`) and an estimate such as Postgres
 
 from __future__ import annotations
 
+import itertools
+import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
 __all__ = ["SourceStatistics", "source_stats_key"]
+
+
+# Per-instance serials for shape-keyed sources, and the counter that issues them.
+#
+# Weak keys, so an entry dies with its source and the table cannot grow without bound; a
+# monotonic counter, so a serial is never reused even though an address is. `id()` was the
+# previous key and is the bug: CPython hands the next object the address of the one just
+# freed, which for a transient in-memory frame is immediate.
+_SERIALS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_NEXT_SERIAL = itertools.count(1)
+_SERIAL_LOCK = threading.Lock()
+
+
+def _instance_serial(source: object) -> int:
+    """A process-unique, never-reused serial for `source`, allocated on first use.
+
+    Falls back to `id()` for a source that cannot be weak-referenced, which is exactly the
+    pre-existing behavior — a collision there is no worse than it already was, and refusing
+    to key such a source at all would silently stop it learning anything.
+    """
+    try:
+        with _SERIAL_LOCK:
+            serial = _SERIALS.get(source)
+            if serial is None:
+                serial = next(_NEXT_SERIAL)
+                _SERIALS[source] = serial
+            return serial
+    except TypeError:  # not weak-referenceable
+        return id(source)
 
 
 def source_stats_key(source: object) -> str | None:
@@ -36,10 +68,17 @@ def source_stats_key(source: object) -> str | None:
       - A source with a **data-stable** identity (a file path, a table URI) is keyed by it,
         so what one run measures the next run reads back.
       - A source whose identity is only *shape*-based — in-memory batches, keyed by schema
-        and row count — is keyed by **object identity** instead. Its `identity()` is
+        and row count — is keyed by a **per-instance serial** instead. Its `identity()` is
         documented to collide across different relations of the same shape, and keying
         statistics on it would re-create the very collision this exists to prevent. Such
         data has no cross-run life anyway, so a process-local key loses nothing.
+
+        The serial is not `id()`, and that distinction is the whole of `_instance_serial`.
+        CPython reuses an address the moment an object is freed, and a transient frame is
+        freed immediately — so four in-memory sources created in sequence produced **one**
+        statistics key between them, each reading and overwriting the others' distinct
+        counts, most-common-values and quantile grids. Nothing failed, because a statistic
+        never changes a result; the plans were simply built from another relation's data.
       - A source that cannot key itself at all gets `None`: its statistics are simply not
         learned, which is strictly better than filing them where another table reads them.
 
@@ -54,7 +93,7 @@ def source_stats_key(source: object) -> str | None:
         return None
     prefix = _tenant_prefix()
     if not getattr(source, "stable_stats_identity", True):
-        return f"{prefix}obj:{id(source)}"
+        return f"{prefix}obj:{_instance_serial(source)}"
     try:
         return f"{prefix}id:{identity()}"
     except Exception:  # pragma: no cover - a source that cannot key itself

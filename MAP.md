@@ -179,7 +179,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 |---|---|---|
 | `gating.py` | 301 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 99 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
-| `staging.py` | 433 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
+| `staging.py` | 441 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/dataset/` — 5 · conductor
 
@@ -283,7 +283,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
 | `run.py` | 492 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 204 | What the conductor needs to know about a plan's size before it runs it. |
-| `stages.py` | 219 | The three ways the conductor can execute an admitted plan, plus the source read. |
+| `stages.py` | 226 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
 ### `batcher/api/security/` — 5 · conductor
 
@@ -338,7 +338,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 463 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 493 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 807 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
@@ -1317,7 +1317,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 115 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 145 | Retry for the object-store failures that are worth retrying, and only those. |
 | `sink.py` | 499 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1138 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1169 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
@@ -1570,7 +1570,7 @@ Source connectors — the façade over the source implementation modules.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 184 | The `Source` protocol — the contract every connector satisfies. |
-| `inmemory.py` | 500 | `InMemorySource` — a relation already materialized as Arrow record batches. |
+| `inmemory.py` | 501 | `InMemorySource` — a relation already materialized as Arrow record batches. |
 | `inmemory_stats.py` | 295 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 186 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
 | `materialized.py` | 70 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
@@ -1695,7 +1695,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `resource.py` | 230 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 168 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 207 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
@@ -1723,10 +1723,10 @@ Ecosystem-compatible spellings bound onto `Expr`.
 
 | module | lines | what it is |
 |---|---|---|
-| `binder.py` | 38 | Attach the compatibility aliases onto `Expr`. |
+| `binder.py` | 45 | Attach the compatibility aliases onto `Expr`. |
 | `guidance.py` | 262 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 | `names.py` | 426 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
-| `namespaces.py` | 307 | Ecosystem-compatible spellings on the typed accessor namespaces. |
+| `namespaces.py` | 310 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 | `operators.py` | 385 | Method-form spellings of the `Expr` operators (the pandas ``Series.add`` family). |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract

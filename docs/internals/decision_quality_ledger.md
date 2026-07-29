@@ -327,3 +327,32 @@ serialize/read-back round trip — and its cost for a tensor column is unmeasure
 also has no case in `benchmarks/`, so there is nothing to A/B against. Widening the trigger
 first and measuring second is the wrong order for a transform whose whole justification is a
 cost comparison. The arithmetic above is the reason to build that benchmark case.
+
+---
+
+# Part 2 — common data patterns
+
+The brief: for the ~200 shapes data actually arrives in (skew, one huge file, millions of
+tiny ones, partitioning, clustering, nulls, duplicates), does the engine pick the right
+strategy? What follows is what a probe harness *measured*, not what the code reads like.
+
+## Millions of small files
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D72 | perf | **One query re-derived a many-file source's row count three times.** Routing, partition sizing, the GPU backend decision, the metadata-answer path, and the post-run learned-stats loop each ask independently and none knows the others did. Measured on a 512-file directory of 400,000 rows: `row_count` was three calls accounting for **0.104 s of a 0.157 s query** — two thirds of the wall clock re-deriving one number. The cost is not footer I/O (cached per path) but the walk: a fresh `ThreadPoolExecutor` and a Python call per file, per call, which at a million files is three full metadata passes before a single data page is read. Memoized per source, whose every input (`_files()` listing, per-path footers, `_n_rows`) is already fixed for its lifetime. Measured end to end at fixed total rows: 64 files 23.9 → 13.0 ms, 512 files 99.2 → 55.5 ms, 2,048 files 294.9 → **195.0 ms**. |
+| D73 | test | The memo covers the `None` answer too (a format that cannot count cheaply), because that is the case that walked every footer to conclude nothing. Correctness, the `n_rows` cap, and per-source isolation are pinned. |
+
+## Skew — the distribution uniformity gets exactly wrong
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D74 | fidelity | **Most-common values were measured only *after* a query of the shape had run**, so the first one planned a skewed key under uniformity. Measured on 100,000 rows with one value at 50%: `k = 7` estimated at **20 rows against a true 49,868** — a 2,487x under-estimate, and a Zipf column 139x under. That figure sizes the filter, then the join built on its output, then that join's memory envelope. For a **resident** source the data is already in memory, which is precisely the argument that already justifies seeding the distinct count there — so heavy hitters are now seeded from the same batches. The hot-key case goes from 2,487x under to **1.1x**. |
+| D75 | perf | Seeded over a *bounded sample* (`_sketch_sample`), exactly as the post-run pass does: Misra-Gries is ~56 ns a cell against the ndv sketch's ~4, so sketching a whole large source here would add to every cold query what `_STATS_SAMPLE_ROWS` exists to cap. A frequency is a fraction of rows and a uniform sample preserves it, which is what makes the bound sound rather than merely cheap. `avg_bytes` is deliberately left unwritten, because `learn_column_stats` gates its own "already known" check on that key so seeding cannot suppress the pass that is the only source of quantile grids. |
+| D76 | docs | **Honest limit.** A value *below* `mcv_min_fraction` (0.05) is not recorded, and once the top values' mass is known a non-top value draws from the residual — so a Zipf tail value at 2.1% went from 139x under to 209x under. Both are unusable; the case is only fixed by the measured selectivity the post-run pass records, which is exact (2,107 of 2,107). Seeding moves MCV behaviour from run 2 to run 1, and where MCV cannot help it does not pretend to. |
+
+## Statistics keyed by a reused address
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D77 | bug | **Four in-memory sources created in sequence shared one statistics key.** `source_stats_key` keys a shape-identified source by object identity *precisely so* two relations of the same shape cannot share a slot — and it used `id()`, which CPython reuses the moment an object is freed. A transient frame is freed immediately, so each new source read and overwrote the previous one's distinct counts, most-common-values and quantile grids. Nothing failed, because a statistic never changes a result; the plans were simply built from another relation's data. Reproduced with a six-iteration loop yielding **one distinct key**. Now a per-instance serial from a weak-keyed table: never reused, dies with its source. (`InMemorySource` gained `__weakref__`, which took the file one line past the 500-line ceiling — allowlisted with the `_widen_*` extraction named as the real fix.) |

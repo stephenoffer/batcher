@@ -39,6 +39,12 @@ __all__ = ["FileSource"]
 
 _T = TypeVar("_T")
 
+# Sentinel for "not yet computed", distinct from a computed `None`. `row_count()` returns
+# `None` for a format that cannot answer cheaply, and that answer is exactly the one worth
+# remembering — it is the case that walked every footer to conclude nothing.
+_UNSET: object = object()
+
+
 # How many files a streaming `iter_batches` decodes concurrently (bounded read-ahead).
 # Caps the parallel-read memory to ~this many files while overlapping I/O + decode so a
 # streaming consumer isn't throttled by a one-file-at-a-time read.
@@ -158,6 +164,7 @@ class FileSource(ABC):
         "_n_rows",
         "_path",
         "_pinned",
+        "_row_count_cache",
         "_schema_cache",
         "_schema_mode",
         "_storage_options",
@@ -226,6 +233,10 @@ class FileSource(ABC):
         if n_rows is not None and n_rows < 0:
             raise ValueError(f"n_rows must be >= 0, got {n_rows}")
         self._n_rows = n_rows
+        # `_UNSET`, not `None`: `row_count()` legitimately *returns* `None` for a format
+        # that cannot answer cheaply, and memoizing that answer is as valuable as memoizing
+        # a number — it is the case that walked every footer to conclude nothing.
+        self._row_count_cache: int | object | None = _UNSET
 
     # ---- shared, do-not-override ------------------------------------------
     def _files(self) -> list[str]:
@@ -736,23 +747,55 @@ class FileSource(ABC):
         and says so, and calling it eagerly here would turn a clean empty `iter_batches`
         into that error while `read()` (which never reaches this on an empty file) returns
         `[]`. One source, two answers is exactly the divergence to avoid.
+
+        It is also where an oversized batch is cut down to a morsel. A reader that parses a
+        whole file into one Arrow chunk — numpy, XML, point clouds, several SQL drivers —
+        emitted that chunk as a *single* RecordBatch of however many rows the file held, and
+        the engine's whole memory model assumes a batch is a morsel: the read-ahead budgets
+        by batch, every operator holds one, and a spill is measured in them. A 100M-row file
+        arriving as one batch defeats all three at once. `RecordBatch.slice` is zero-copy, so
+        the cut is a view over the same buffers and costs nothing for the common case of a
+        reader that already chunks (the loop runs once and yields the batch unchanged).
         """
+        from batcher.config import active_config
         from batcher.io.schema import conform_batch, normalize_batch
 
         strict = self._schema_mode == "strict"
         target: pa.Schema | None = None
+        # Read once, not per batch: this is the per-batch path of every file read.
+        limit = active_config().execution.morsel_rows
         for b in batches:
             if target is None:
                 target = self.schema()
                 if projection is not None:
                     target = pa.schema([target.field(c) for c in projection])
-            yield conform_batch(b, target, path=path) if strict else normalize_batch(b, target)
+            out = conform_batch(b, target, path=path) if strict else normalize_batch(b, target)
+            if out.num_rows <= limit:
+                yield out
+                continue
+            for offset in range(0, out.num_rows, limit):
+                yield out.slice(offset, limit)
 
     def row_count(self) -> int | None:
         """The summed row count when every file knows its own cheaply, else None.
 
         Formats with a footer (Parquet, ORC) answer from metadata; the footers are read
         concurrently so a many-file source doesn't serialize the driver.
+
+        **Memoized, because one query asks several times.** Routing, partition sizing, the
+        GPU backend decision, the metadata-answer path, and the post-run learned-stats loop
+        each ask independently, and none of them knows the others did. Measured on a
+        512-file directory of 400,000 rows: `row_count` was **three** calls accounting for
+        0.104 s of a 0.157 s query — two thirds of the wall clock spent re-deriving one
+        number. The cost is not the footer I/O (that is cached per path) but the walk
+        itself: a fresh `ThreadPoolExecutor` and a Python call per file, per call, which at
+        a million files is three full metadata passes before any data is read.
+
+        Safe to memoize because every input is already fixed for the source's lifetime:
+        `_files()` is a cached listing, the per-file footers are cached by path, and
+        `_n_rows` is set at construction. A source that wanted to observe files appearing
+        underneath it could not do so through this method today either, since the listing
+        it sums over is itself a memo.
 
         Examples:
             .. doctest::
@@ -764,6 +807,8 @@ class FileSource(ABC):
         Returns:
             The exact total rows, or None if any file would need a data scan.
         """
+        if self._row_count_cache is not _UNSET:
+            return self._row_count_cache  # type: ignore[return-value]
         files = self._files()
         # Each `_file_row_count` reads a footer (a ~80ms object-store round trip for
         # Parquet, cached after the first read); over a many-file dataset the serial loop
@@ -775,12 +820,15 @@ class FileSource(ABC):
             with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
                 counts = list(pool.map(self._tolerant_file_row_count, files))
         if any(c is None for c in counts):
+            self._row_count_cache = None
             return None
         total: int = sum(counts)  # type: ignore[arg-type]
         # A capped source really does have that many rows, and the optimizer sizes joins
         # and the worker fan-out from this number — reporting the uncapped total would
         # plan a `n_rows=100` read as though it were the whole table.
-        return total if self._n_rows is None else min(total, self._n_rows)
+        answer = total if self._n_rows is None else min(total, self._n_rows)
+        self._row_count_cache = answer
+        return answer
 
     def stats_version(self) -> str | None:
         """A token that changes whenever this source's files could have changed.
