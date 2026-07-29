@@ -484,3 +484,20 @@ silent-shortening hazard of Program 6. Two other things it shared.
 - **Why it was worth fixing:** a test that fails only under load is the worst kind. It guards
   a real property (spilling returns pages to the process, not just to a counter) and teaches
   people to ignore it.
+
+### #29 — The tiered store's row count is now actually checked
+
+- **Was:** `SpillHandle.num_rows` has carried the count all along, with a docstring saying it
+  is there so "a caller can detect a truncated bucket". **No caller did.** The capability
+  existed; the guard did not.
+- **Now:** `read_stream` — the single read path, which `read` and `read_reserved` both go
+  through — counts as it yields and raises a typed `ResourceError` if the bucket comes back
+  short, naming both counts and the likely causes.
+- **Why this tier is more exposed than the Rust one:** it writes to the **remote** tier as
+  well, where a partially-written object is an ordinary outcome of an interrupted upload,
+  and the bucket may be read back much later by a different process.
+- **Proof:** `test_a_truncated_bucket_is_refused_rather_than_read_short` constructs the
+  boundary exactly (a reference bucket of three batches, minus its 8-byte end-of-stream
+  marker) rather than cutting an arbitrary fraction — a cut inside a message arrow catches on
+  its own, and only the boundary case needs the count. Paired with an intact-bucket test, so
+  the check cannot become a way to fail every spilling query.

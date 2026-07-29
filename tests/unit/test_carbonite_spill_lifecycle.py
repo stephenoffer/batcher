@@ -167,6 +167,36 @@ def test_free_disk_reading_is_ttl_cached(tmp_path, monkeypatch) -> None:
     assert calls["n"] == 2
 
 
+def test_classifying_the_volume_does_not_route_around_the_cache(tmp_path, monkeypatch) -> None:
+    """`disk_pressure` reads free space through the TTL cache and then took `total` twice
+    with raw `shutil.disk_usage` calls — once directly, once inside `disk_floor_bytes`.
+
+    The store consults the pressure once per bucket open, so a 4,096-way partitioned spill
+    made 8,192 uncached `statvfs` calls: more than the storm the cache was added to stop,
+    for a number that moves even less than free space does.
+    """
+    import shutil
+
+    spill_disk.reset_disk_sampling()
+    calls = {"n": 0}
+
+    class _Usage:
+        total = 100 << 30
+        used = 0
+        free = 80 << 30
+
+    def counted(_path):
+        calls["n"] += 1
+        return _Usage()
+
+    monkeypatch.setattr(shutil, "disk_usage", counted)
+    for _ in range(50):
+        spill_disk.disk_pressure(str(tmp_path))
+
+    # One reading of free, one of capacity, for the whole window.
+    assert calls["n"] == 2
+
+
 def test_disk_floor_shrinks_on_a_small_volume(tmp_path, monkeypatch) -> None:
     """A fixed 256 MiB reserve is a quarter of a 1 GiB container scratch mount."""
     import shutil
@@ -201,3 +231,56 @@ def test_an_unknown_compression_codec_is_recorded_not_silent(monkeypatch) -> Non
     )
     assert spill_disk.ipc_options("zstandard") is None
     assert seen, "a codec that does not exist must be reported, not silently dropped"
+
+
+def test_a_truncated_bucket_is_refused_rather_than_read_short(tmp_path) -> None:
+    """A spilled bucket cut at a message boundary must fail, not shorten the answer.
+
+    An Arrow IPC *stream* truncated at a message boundary -- the last complete batch present,
+    the end-of-stream marker gone -- is byte-for-byte a shorter valid stream, so
+    `pa.ipc.open_stream` returns the batches it finds and reports success. The reducer then
+    computes a correct answer over the wrong rows, with nothing recording that it happened.
+
+    The boundary is constructed exactly, from a reference bucket of three batches minus its
+    8-byte end-of-stream marker, rather than by cutting an arbitrary fraction: a cut that
+    lands *inside* a message arrow catches on its own, and only the boundary case needs the
+    row count `SpillHandle` has always carried for it.
+    """
+    from batcher._internal.errors import ResourceError
+
+    eos_bytes = 8  # continuation marker + zero length
+
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+
+    # A reference bucket of three batches: its length is the boundary.
+    ref = store.writer("ref")
+    for _ in range(3):
+        ref.write(_batch(1000))
+    ref_handle = ref.close()
+    boundary = os.path.getsize(ref_handle.path) - eos_bytes
+
+    # The real bucket: five batches, cut back to the three-batch boundary.
+    w = store.writer("b0")
+    for _ in range(5):
+        w.write(_batch(1000))
+    handle = w.close()
+    assert handle.num_rows == 5000
+    with open(handle.path, "r+b") as fh:
+        fh.truncate(boundary)
+
+    with pytest.raises(ResourceError) as exc:
+        list(store.read_stream(handle))
+    assert "3000" in str(exc.value) and "5000" in str(exc.value)
+
+
+def test_an_intact_bucket_reads_back_without_complaint(tmp_path) -> None:
+    """The truncation check must not fire on a healthy bucket, or it would be a way to fail
+    every spilling query rather than a guard on a rare one."""
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+    w = store.writer("b0")
+    for _ in range(4):
+        w.write(_batch(500))
+    handle = w.close()
+
+    assert sum(b.num_rows for b in store.read_stream(handle)) == 2000
+    assert sum(b.num_rows for b in store.read(handle)) == 2000

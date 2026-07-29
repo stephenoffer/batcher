@@ -336,18 +336,40 @@ class TieredSpillStore:
         The reader that grace recursion uses to re-partition an over-large bucket
         without first loading the entire bucket into memory.
 
+        Every batch is counted and the total checked against the handle's `num_rows` when the
+        stream ends. That check is not paranoia about I/O in general: an Arrow IPC **stream**
+        truncated at a message boundary -- the last complete batch present, the end-of-stream
+        marker gone -- is byte-for-byte a shorter *valid* stream, so `open_stream` returns the
+        batches it finds and reports success. Measured: five batches of 1,000 rows cut after
+        the third read back as 3,000 rows with no error. The reducer then computes a correct
+        answer over the wrong rows, and nothing anywhere records that it happened. The remote
+        tier makes it likelier still, since a partially-written object is an ordinary outcome
+        of an interrupted upload.
+
+        `SpillHandle.num_rows` has always carried the count for exactly this ("a caller can
+        detect a truncated bucket"), and no caller did.
+
         Args:
             handle: The bucket to read.
 
         Yields:
             Each `RecordBatch` in write order.
+
+        Raises:
+            ResourceError: If the bucket reads back short of the rows written to it.
         """
+        seen = 0
         if handle.tier is SpillTier.LOCAL:
             with _open_local_map(handle.path) as mm:
-                yield from pa.ipc.open_stream(mm)
+                for batch in pa.ipc.open_stream(mm):
+                    seen += batch.num_rows
+                    yield batch
         else:
             with disk.fsspec_open(handle.path, "rb") as fh:
-                yield from pa.ipc.open_stream(fh)
+                for batch in pa.ipc.open_stream(fh):
+                    seen += batch.num_rows
+                    yield batch
+        _verify_complete(handle, seen)
 
     def release(self, handle: SpillHandle) -> None:
         """Delete one bucket now that its reader is done with it.
@@ -406,3 +428,24 @@ class TieredSpillStore:
         tb: TracebackType | None,
     ) -> None:
         self.cleanup()
+
+
+def _verify_complete(handle: SpillHandle, seen: int) -> None:
+    """Fail if a bucket read back fewer rows than were written to it.
+
+    Only a *short* read is an error. Reading more cannot come from truncation and would mean
+    the recorded count is itself wrong, which is not worth failing a query over. A handle
+    written before the count existed reports `0`, which this correctly treats as "nothing to
+    check" rather than as an empty bucket.
+    """
+    if not handle.num_rows or seen >= handle.num_rows:
+        return
+    from batcher._internal.errors import ResourceError
+
+    raise ResourceError(
+        f"spilled bucket {handle.path} read back {seen} rows but {handle.num_rows} were "
+        f"written to it, so it is truncated or was modified underneath the query. This "
+        f"would otherwise have silently dropped {handle.num_rows - seen} rows from the "
+        f"result. Check for a full or evicted spill volume, or an interrupted upload to "
+        f"memory.spill_remote_uri."
+    )
