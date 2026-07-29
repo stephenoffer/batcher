@@ -185,6 +185,14 @@ that way:
 If anyone quotes a big Ray Data multiplier out of this paper, they had to work
 against the text to do it.
 
+## The roadmap in Section 12
+
+Section 12 now opens by naming the remaining work as four programs rather than a
+list of bugs: a storage engine (decides sf10, most separable), radix-partitioned
+high-cardinality aggregation (the one systematic kernel gap), durability at scale
+(the Spark gap, most incremental), and a real streaming runtime (bounded runtime
+work, per Section 4). Ordered by what each unblocks, not by size.
+
 ## Open items
 
 1. **Repetitions and confidence intervals.** Table 2 is a single run per scale on

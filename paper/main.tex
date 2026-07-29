@@ -1084,12 +1084,11 @@ PySpark 4.2.0, PyArrow 19.0.1. The harness refuses to report a timing for any
 query whose result does not match DuckDB, compared as an order-independent
 multiset. Timings are best-of-$N$ warm.
 
-Two hazards cost real time and are worth naming. A shared machine is not a
-benchmark machine: at load average 16--41 a repeated run swung $\pm$25\%, so
-claims moving less than $2\times$ are quoted from a run at load under 5. And an
-in-place rebuild of the compiled extension silently replaces the engine under a
-running benchmark, so we stamp the shared object's timestamp around every run and
-discard any run in which it moved.
+Two hazards cost real time. A shared machine is not a benchmark machine: at load
+average 16--41 a repeated run swung $\pm$25\%, so claims moving less than
+$2\times$ are quoted from a run at load under 5. And an in-place rebuild of the
+compiled extension silently replaces the engine mid-benchmark, so we stamp its
+timestamp around every run and discard any run in which it moved.
 
 \subsection{Does the algebra remove the fork?}
 
@@ -1164,11 +1163,11 @@ machine, no SQL front-end differences, no scan in the timed region for anybody.
 8 of 11 from DuckDB and 9 of 11 from Polars.
 
 On ClickBench~\cite{clickbench} (43 queries, correctness-gated) \sys{} wins 43 of
-43 against DuckDB on identical Arrow input, 35 of 40 against Polars, the five
-losses all sub-3\,ms queries where fixed overhead dominates, and 26 of 43 against
-DuckDB's native store. Those losses are diagnostic rather than diffuse:
-essentially all are high-cardinality grouping and \texttt{COUNT(DISTINCT)} over
-string or near-unique keys, the same shape behind the two remaining TPC-H losses.
+43 against DuckDB on identical Arrow input, 35 of 40 against Polars (the five
+losses are sub-3\,ms queries where fixed overhead dominates), and 26 of 43 against
+its native store. Those losses are diagnostic: essentially all are
+high-cardinality grouping and \texttt{COUNT(DISTINCT)} over string or near-unique
+keys, the shape behind the two remaining TPC-H losses too.
 
 \subsection{Scaling out}
 \label{sec:scaleout}
@@ -1278,7 +1277,13 @@ with row groups sized to Ray's own target block size.
 % ===========================================================================
 
 A roadmap beats a scoreboard, so this section is specific about what does not
-work yet. Each item is measured and each is localized to named work.
+work yet. Each item is measured, and together they are four programs of work
+rather than a list of bugs: a storage engine, which decides the sf10 result and
+is the most separable because it sits below the algebra; radix-partitioned
+high-cardinality aggregation, the one systematic kernel gap; durability at scale,
+whose parts are independent and so the most incremental; and a real streaming
+runtime, which \cref{sec:streaming} argues is bounded work on the runtime rather
+than a second engine.
 
 \textbf{The adaptive loop's cost is half-fixed, and we have not re-timed it.} At
 sf10 it used to lose to one-shot planning on 20 of 22 queries, 3{,}889\,ms against

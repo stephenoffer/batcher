@@ -1174,7 +1174,7 @@ Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
 
 | module | lines | what it is |
 |---|---|---|
-| `disk.py` | 323 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
+| `disk.py` | 369 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
 | `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
 | `store.py` | 408 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 | `writer.py` | 284 | One spill bucket, streamed to whichever tier its first batch can afford. |
@@ -1299,7 +1299,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 115 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 145 | Retry for the object-store failures that are worth retrying, and only those. |
 | `sink.py` | 499 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1121 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1138 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
@@ -1355,7 +1355,7 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 |---|---|---|
 | `_ndarray.py` | 47 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
 | `hdf5.py` | 128 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
-| `numpy.py` | 86 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
+| `numpy.py` | 130 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
 | `point_cloud.py` | 297 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
 | `shards.py` | 197 | Sharded training dataset — fixed-size Arrow-IPC shards + a JSON index. |
 | `tensor.py` | 98 | Fixed-shape tensor columns — multi-dimensional arrays as one Arrow column. |
@@ -1462,7 +1462,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `autoloader.py` | 295 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 235 | Development streaming sources — `rate` and `socket` (Spark parity). |
 | `eventhubs.py` | 230 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
-| `kafka.py` | 335 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
+| `kafka.py` | 361 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kinesis.py` | 408 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 181 | Google Cloud Pub/Sub broker source — subscription pull batches. |
 | `pulsar.py` | 364 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
@@ -1476,7 +1476,7 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 | module | lines | what it is |
 |---|---|---|
 | `schema.py` | 124 | The fixed broker message schema, the message record, and option redaction. |
-| `source.py` | 316 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
+| `source.py` | 331 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
 | `split.py` | 186 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
 
 ### `batcher/io/formats/streaming/checkpoint/` — 2 · neutral IO
@@ -1577,7 +1577,7 @@ Splits — independently-readable, picklable slices of a source.
 | `columnar_footer.py` | 372 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
 | `file_identity.py` | 142 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
 | `file_skipping.py` | 285 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
-| `free_counts.py` | 59 | Free row counts from file headers — metadata that costs one header read. |
+| `free_counts.py` | 75 | Free row counts from file headers — metadata that costs one header read. |
 | `key_pruning.py` | 265 | Key-driven file pruning — the copy-on-write MERGE's "which files must I rewrite?". |
 | `lakehouse_manifest.py` | 190 | Manifest-derived statistics for lakehouse tables (Delta, Iceberg). |
 | `parquet_manifest.py` | 154 | Per-**file** Parquet bounds, in the add-action layout, for file-level pruning. |
