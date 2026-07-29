@@ -396,3 +396,28 @@ the properties of *its* buckets decide whether "bounded" is true.
   processed below depth 0) and keep `row_number` equal to the in-memory kernel. This is a
   forward guard rather than a red-to-green regression: before the change there was no split
   to test.
+
+### #24 — The out-of-core join re-splits a skewed bucket pair
+
+- **Was:** `stream_spilling_join` hash-partitioned into a constant number of buckets and read
+  **both** sides of each pair whole before joining. Under key skew one pair holds far more
+  than its share, so it OOMed at exactly the point spilling was meant to prevent it — the
+  standard reason a skewed Spark join dies.
+- **Now:** both handles are measured before either is read, and an over-large pair is
+  streamed into salted sub-buckets — the same salt and count on both sides, so equal keys
+  co-locate and each sub-pair is an independent join whose union is the same relation.
+- **The probe side counts:** the bucket count is sized from the build side alone, so a fact
+  table with a hot key leaves a *probe* bucket orders of magnitude over the envelope even
+  when every build bucket fits. Both sides are measured.
+- **Proof:** `test_spill_join_resplits_a_skewed_bucket_pair`, for inner **and** the outer
+  joins — the union of sub-pair joins is only the same relation if unmatched-row emission is
+  per-pair correct, which is the subtle part.
+
+### #25 — The distributed join reduce's sub-bucketing was inert too
+
+- **Was:** `_spill_paths_to_subbuckets` re-partitioned a reducer's staged bucket with
+  `partition_batches` — the same unsalted hash the shuffle used to build that bucket. When
+  both counts are powers of two (the reduce uses 16), every row lands in `bucket & 15`: one
+  sub-bucket, and a full write and re-read to change nothing. The same defect as #21, in the
+  distributed half.
+- **Now:** salted, so the re-partition actually separates keys the shuffle put together.

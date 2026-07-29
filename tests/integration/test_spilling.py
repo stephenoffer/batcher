@@ -231,6 +231,74 @@ def test_spill_join_matches_in_memory(how):
     assert _norm(spilled) == _norm(in_memory)
 
 
+@pytest.mark.parametrize("how", ["inner", "left", "right"])
+def test_spill_join_resplits_a_skewed_bucket_pair(monkeypatch, how):
+    """A skewed join key must re-split rather than materialize the hot bucket pair.
+
+    The bucket count is a constant, so under key skew one pair holds far more than its share
+    -- and both sides were read whole before the join, so a skewed pair OOMs at exactly the
+    point spilling was meant to have prevented it. This is the standard reason a skewed Spark
+    join dies.
+
+    Asserted for the outer joins too, not just inner: the union of the sub-pair joins is only
+    the same relation if unmatched-row emission is per-pair correct, which is the subtle part.
+    """
+    import dataclasses
+
+    from batcher.config import active_config, set_config
+    from batcher.dist.spill_breakers import join as join_mod
+
+    depths: list[int] = []
+    real = join_mod._join_bucket_pair
+
+    def traced(*args):
+        depths.append(args[-1])
+        yield from real(*args)
+
+    monkeypatch.setattr(join_mod, "_join_bucket_pair", traced)
+
+    # One hot key on both sides, plus cold keys that match only partially.
+    lk = [7] * 3000 + list(range(50))
+    lv = list(range(len(lk)))
+    rk = [7] * 40 + list(range(25, 75))
+    rv = list(range(len(rk)))
+    left = [
+        pa.record_batch(
+            {
+                "k": pa.array(lk[i : i + 500], type=pa.int64()),
+                "lv": pa.array(lv[i : i + 500], type=pa.int64()),
+            }
+        )
+        for i in range(0, len(lk), 500)
+    ]
+    right = [
+        pa.record_batch({"k": pa.array(rk, type=pa.int64()), "rv": pa.array(rv, type=pa.int64())})
+    ]
+    lt, rt = pa.Table.from_batches(left), pa.Table.from_batches(right)
+
+    in_memory = bt.from_arrow(lt).join(bt.from_arrow(rt), on="k", how=how).collect()
+
+    cfg = active_config()
+    mem = dataclasses.replace(cfg.memory, spill_bucket_max_bytes=4096)
+    set_config(cfg.replace(memory=mem))
+    try:
+        spilled = (
+            bt.from_batches(lambda: iter(left), left[0].schema)
+            .join(bt.from_batches(lambda: iter(right), right[0].schema), on="k", how=how)
+            .collect(spill=True, num_partitions=4)
+        )
+    finally:
+        set_config(cfg)
+
+    assert max(depths) > 0, (
+        "no bucket pair was re-split even though one key carries 3,000 of 3,050 left rows "
+        "against a 4 KiB per-bucket envelope -- the hot pair was read whole"
+    )
+    assert _norm(spilled) == _norm(in_memory), (
+        f"a re-split bucket pair diverged from the in-memory join ({how})"
+    )
+
+
 @pytest.mark.parametrize("num_partitions", [1, 8, 64])
 def test_spill_join_partition_invariant(num_partitions):
     lf, ls, rf, rs, lt, rt = _join_datasets()
@@ -609,9 +677,7 @@ def test_spill_global_window_avg_matches_in_memory(descending, num_partitions):
             functions={"a": ("avg", "v"), "s": ("sum", "v"), "c": ("count", "v"), "rk": "rank"},
         )
 
-    spilled = q(bt.from_batches(factory, schema)).collect(
-        spill=True, num_partitions=num_partitions
-    )
+    spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=num_partitions)
     in_memory = q(bt.from_arrow(table)).collect()
     assert spilled.column_names == in_memory.column_names
     assert _norm(spilled) == _norm(in_memory)
@@ -647,9 +713,7 @@ def test_spill_global_window_first_value_matches_in_memory(descending, num_parti
     def q(ds):
         return ds.window(order_by=[("k", descending)], functions={"fv": ("first_value", "v")})
 
-    spilled = q(bt.from_batches(factory, schema)).collect(
-        spill=True, num_partitions=num_partitions
-    )
+    spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=num_partitions)
     in_memory = q(bt.from_arrow(table)).collect()
     assert _norm(spilled) == _norm(in_memory)
 
