@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 940 Python modules across 146 packages and 179 Rust files across 13 crates.
+Covering 942 Python modules across 146 packages and 180 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -168,7 +168,7 @@ The public, fluent, lazy, expression-first API surface.
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
-| `source_stats.py` | 309 | Per-source statistics collection for the conductor. |
+| `source_stats.py` | 323 | Per-source statistics collection for the conductor. |
 | `stats.py` | 383 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 
 ### `batcher/api/adaptive/` — 5 · conductor
@@ -766,8 +766,8 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 396 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
-| `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
+| `annotate.py` | 402 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `calibration.py` | 350 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 173 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
@@ -1168,7 +1168,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `admission.py` | 134 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
-| `flow_control.py` | 484 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
+| `flow_control.py` | 485 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 232 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 218 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
@@ -1195,7 +1195,7 @@ Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
 | `disk.py` | 369 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
 | `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
 | `store.py` | 451 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
-| `writer.py` | 284 | One spill bucket, streamed to whichever tier its first batch can afford. |
+| `writer.py` | 379 | One spill bucket, streamed to whichever tier its first batch can afford. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem
 
@@ -1570,8 +1570,9 @@ Source connectors — the façade over the source implementation modules.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 184 | The `Source` protocol — the contract every connector satisfies. |
-| `inmemory.py` | 501 | `InMemorySource` — a relation already materialized as Arrow record batches. |
-| `inmemory_stats.py` | 295 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
+| `inmemory.py` | 530 | `InMemorySource` — a relation already materialized as Arrow record batches. |
+| `inmemory_aggregates.py` | 170 | Exact aggregate answers over an immutable in-memory Arrow relation. |
+| `inmemory_stats.py` | 362 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 186 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
 | `materialized.py` | 70 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
 | `read.py` | 160 | The neutral read helpers every executor calls a `Source` through. |
@@ -1707,7 +1708,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 5087 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 5171 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 176 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 366 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -1869,8 +1870,9 @@ The neutral type vocabulary and inference for the plan layer.
 | module | lines | what it is |
 |---|---|---|
 | `footprint.py` | 86 | How much memory live Arrow data actually keeps resident. |
-| `infer.py` | 485 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
+| `infer.py` | 489 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
+| `media.py` | 83 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
 | `widths.py` | 220 | Static per-column byte widths derived from a column's Arrow type. |
 
@@ -1935,7 +1937,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 107 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 109 | Overlap a producer generator with its consumer on a background thread. |
-| `registry.py` | 175 | A single generic registry pattern, used for every extension point. |
+| `registry.py` | 177 | A single generic registry pattern, used for every extension point. |
 | `sql_errors.py` | 57 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/errors/` — 0 · utility
@@ -2059,9 +2061,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1320 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
-| `join/range/keys.rs` | 417 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
+| `join/range/band.rs` | 221 | The band join: two inequalities that bound **one** right key from both sides. |
+| `join/range/keys.rs` | 444 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
-| `join/range/mod.rs` | 599 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/mod.rs` | 619 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
 | `join/scratch_bench.rs` | 2 | TEMPORARY scratch measurement — not part of the crate's contract. |
 | `join/sort_merge.rs` | 180 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 243 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |

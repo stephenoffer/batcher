@@ -501,3 +501,33 @@ silent-shortening hazard of Program 6. Two other things it shared.
   marker) rather than cutting an arbitrary fraction — a cut inside a message arrow catches on
   its own, and only the boundary case needs the count. Paired with an intact-bucket test, so
   the check cannot become a way to fail every spilling query.
+
+### #30 — A local volume that fills *mid-bucket* now carries over to the remote tier
+
+- **Was:** the spill tier is chosen per bucket, by re-measuring free disk at open. That
+  handles a volume that is *already* low; it cannot handle one that fills **during** a
+  bucket — and at scale that is the case that matters, because a bucket is a whole
+  partition. A 16-way spill of a terabyte writes ~60 GB per bucket, and the check at open is
+  one sample taken before any of it was written. `memory.spill_remote_uri` is documented to
+  keep an out-of-core query alive when local disk fills, and it only did so at bucket
+  boundaries.
+- **The reasoning that blocked this was wrong.** The code said mid-stream failover would
+  "silently drop" the batches already streamed because they "are not retained". They are not
+  retained *in memory* — they are **on disk**, in the bucket's own file. They can be read
+  back and re-written to the remote tier **one batch at a time**, so the carry-over is
+  bounded by a single batch and does not undo the spilling it is rescuing.
+- **Now:** on `ENOSPC` with a remote tier configured, the local stream is abandoned (not
+  finished — writing its end-of-stream marker would need the disk that just refused), the
+  remote stream is opened, every complete batch is streamed across, the local file is
+  deleted, and the failed batch is retried remotely.
+- **It refuses rather than half-succeeds:** if the rows recovered do not match the rows the
+  writer knows it wrote, the half-made remote bucket is removed and the caller raises the
+  original actionable error. A partial carry-over would turn a loud out-of-space failure
+  into a silently short bucket — strictly worse than the failure it replaces. The file may
+  legitimately end mid-message (the write that filled the disk was partway through one), so
+  the *read* is allowed to stop there; a failure of the *re-write* propagates, because that
+  is the remote tier refusing and not something to absorb.
+- **Proof:** `test_a_volume_that_fills_mid_bucket_carries_over_to_remote` — four batches, the
+  volume filling after the second, must end as a REMOTE bucket holding all 400 rows with the
+  local partial file gone. Paired with `test_a_mid_bucket_fill_still_fails_loudly_with_no_remote_tier`,
+  because with nowhere to carry the bucket the query must still fail rather than pretend.
