@@ -239,3 +239,10 @@ the Rust walk carries nested leaves; until then D49's fix (nested bounds no long
 the widths only sharpened on sources that set `content_byte_size`, and TPC-H reads Parquet,
 which does not. There is nothing for the threshold to be re-tuned *against* until a
 columnar source's width estimate genuinely moves.
+
+## The ensemble, not the rule (`tests/unit/test_decision_surface_matrix.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D67 | test | **A cross-product test over `{narrow, embedding, image, video_frame} x {1, 8, 1024 workers}`.** Every other test in this ledger pins one decision; the failures it exists for were never in one rule. A width, a memory envelope, a morsel, a task count, and a shuffle cost all read the same data, each looked reasonable on its own, and together they sized a multimodal pipeline by three orders of magnitude wrong. This is `CLAUDE.md`'s `{collect, spill, iter_batches, distributed} x {nulls, empty, NaN, descending}` discipline applied to *decisions* rather than results: it asserts the invariants that must hold in **every** cell — the width is within an order of magnitude of the truth, a morsel never exceeds its byte budget, a task never holds more than the byte target, the envelope is monotone in the modality, single-node is charged no network, and shuffle cost is monotone in both the fleet and the row width. |
+| D68 | test | **The matrix was checked against the pre-session commit and 13 of its 27 cells fail there**, which is what makes it worth having rather than a set of assertions true by construction. Two of those (the image and video-frame width cells) fail on *behaviour* — a decoded frame was sized at the 32-byte variable-length prior. The other eleven fail because the API did not exist: there was no `net` axis to be monotone in, and `morsel_target` took no plan to size a cold store from. Both are meaningful and they are not the same thing, so the distinction is recorded rather than reported as thirteen caught regressions. |
