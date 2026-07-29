@@ -32,7 +32,12 @@ from batcher.core.stats import (
     tdigest_quantile,
 )
 from batcher.core.streaming_query import StreamingQueryEngine, make_processor
-from batcher.core.udf import execute_with_udfs, has_map_batches, prebuild_factories
+from batcher.core.udf import (
+    execute_with_udfs,
+    has_map_batches,
+    prebuild_factories,
+    release_prebuilt,
+)
 
 __all__ = [
     "ExecutionContext",
@@ -50,6 +55,7 @@ __all__ = [
     "make_processor",
     "prebuild_factories",
     "record_exec_metrics",
+    "release_prebuilt",
     "reset_default_hub",
     "scan_only_result",
     "tail_quantiles",

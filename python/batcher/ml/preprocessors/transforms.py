@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
-from batcher.plan.expr_ir.constructors import col, lit, when
+from batcher.plan.expr_ir.constructors import col, lit, nullif, when
 from batcher.plan.functions.analysis._normal import normal_ppf
 
 if TYPE_CHECKING:
@@ -224,10 +224,17 @@ class LogTransformer(Preprocessor):
         Returns:
             A new lazy `Dataset` with the fitted columns log-transformed.
         """
+        # The `otherwise` arm covers both an undefined logarithm and a null input, and it used
+        # to emit `nan` — which the class docstring has always said it must not. The difference
+        # is not cosmetic: a NaN escapes `is_null()`, so a downstream null check reports the
+        # column clean, and it propagates through `mean`/`sum` to poison every aggregate over
+        # it. `nullif(x, x)` is an always-null expression of the right numeric type, which the
+        # IR has no literal for.
         shifted = {name: col(name) + lit(self.offset) for name in self.columns}
+        null = nullif(lit(0.0), lit(0.0))
         return ds.with_columns(
             **{
-                name: when(expression > lit(0.0)).then(expression.ln()).otherwise(lit(float("nan")))
+                name: when(expression > lit(0.0)).then(expression.ln()).otherwise(null)
                 for name, expression in shifted.items()
             }
         )

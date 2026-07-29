@@ -329,8 +329,11 @@ class InferencePool:
             An iterator of the workers' output batches, in input order.
         """
         workers: Queue[Worker] = Queue()
+        built: list[Worker] = []
         for _ in range(self._num_workers):
-            workers.put(self._factory())
+            worker = self._factory()
+            built.append(worker)
+            workers.put(worker)
 
         def dispatch(batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
             worker = workers.get()
@@ -340,32 +343,60 @@ class InferencePool:
                 workers.put(worker)
 
         pending: deque[Future[tuple[pa.RecordBatch, float]]] = deque()
-        with ThreadPoolExecutor(max_workers=self._num_workers) as pool:
+        try:
+            with ThreadPoolExecutor(max_workers=self._num_workers) as pool:
 
-            def pop_head() -> pa.RecordBatch:
-                out, latency_ms = pending.popleft().result()  # blocks until the head is done
-                target = self._next_target(out, latency_ms)
-                if target is not None:
-                    self._batcher.set_target(target)
-                return out
+                def pop_head() -> pa.RecordBatch:
+                    out, latency_ms = pending.popleft().result()  # blocks until the head is done
+                    target = self._next_target(out, latency_ms)
+                    if target is not None:
+                        self._batcher.set_target(target)
+                    return out
 
-            def drain(block: bool) -> Iterator[pa.RecordBatch]:
-                while pending and (block or pending[0].done()):
-                    yield pop_head()
+                def drain(block: bool) -> Iterator[pa.RecordBatch]:
+                    while pending and (block or pending[0].done()):
+                        yield pop_head()
 
-            def submit(rebatched: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
-                """Submit one batch, first yielding results down to the in-flight bound.
+                def submit(rebatched: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
+                    """Submit one batch, first yielding results down to the in-flight bound.
 
-                Blocking on the head here is what applies backpressure all the way to the
-                source iterator: `run` stops pulling input while the pool is saturated."""
-                while len(pending) >= self._max_inflight:
-                    yield pop_head()
-                pending.append(pool.submit(dispatch, rebatched))
+                    Blocking on the head here is what applies backpressure all the way to the
+                    source iterator: `run` stops pulling input while the pool is saturated."""
+                    while len(pending) >= self._max_inflight:
+                        yield pop_head()
+                    pending.append(pool.submit(dispatch, rebatched))
 
-            for batch in batches:
-                for rebatched in self._batcher.push(batch):
-                    yield from submit(rebatched)
-                    yield from drain(block=False)
-            for tail in self._batcher.flush():
-                yield from submit(tail)
-            yield from drain(block=True)
+                for batch in batches:
+                    for rebatched in self._batcher.push(batch):
+                        yield from submit(rebatched)
+                        yield from drain(block=False)
+                for tail in self._batcher.flush():
+                    yield from submit(tail)
+                yield from drain(block=True)
+        finally:
+            _close_workers(built)
+
+
+def _close_workers(workers: list[Worker]) -> None:
+    """Call each worker's optional ``close()`` once the pool is done with it.
+
+    `num_workers` models are the point of this pool, and each one can hold a CUDA context,
+    an HTTP session, or a database handle. Without this they were released only whenever the
+    garbage collector happened to reach them — so a script running two pools back to back
+    could hold both generations of models in VRAM at once and OOM on the second. This mirrors
+    `core.udf.lifecycle.teardown_udf`, including its best-effort contract: the results are
+    already produced, so a failing `close` must not fail the run.
+
+    Deduplicated by identity, because a factory is allowed to hand every slot the *same*
+    object (`apply._apply_udf_autobatch` does exactly that to share one loaded model across
+    the dispatch slots), and closing one model `num_workers` times is not a teardown.
+    """
+    seen: set[int] = set()
+    for worker in workers:
+        if id(worker) in seen:
+            continue
+        seen.add(id(worker))
+        close = getattr(worker, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()

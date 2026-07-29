@@ -32,30 +32,40 @@ from batcher.plan.expr_rewrite import (
     map_node_expressions,
     transform_expr_up,
 )
-from batcher.plan.logical import Filter, LogicalPlan, Project
+from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type
 
 __all__ = [
+    "is_date",
     "is_float",
     "is_integer",
     "is_string",
+    "is_timestamp",
     "node_schema",
     "nullable",
     "schema_rule",
 ]
 
 
+#: The node types that carry expressions, and so the ones whose expressions can be typed.
+#: This is the same set `plan.expr_rewrite.map_node_expressions` rewrites; every one of them
+#: evaluates its expressions against its *input's* schema, whether those are a predicate, a
+#: projection, a group key, a sort key, or a window frame's partitioning. `Scan` has no
+#: input, and `Join` carries no expressions through that path.
+_EXPR_NODES = (Filter, Project, Aggregate, Sort, Window)
+
+
 def node_schema(node: LogicalPlan) -> SchemaRef | None:
     """The schema the expressions carried by `node` are evaluated against.
 
     Args:
-        node: A `Filter` or `Project` whose expressions a rule wants to type.
+        node: A node that carries expressions and whose operands a rule wants to type.
 
     Returns:
         The input schema, or ``None`` when it cannot be inferred.
     """
-    if not isinstance(node, (Filter, Project)):
+    if not isinstance(node, _EXPR_NODES):
         return None
     try:
         return node.input.available_schema()
@@ -88,6 +98,29 @@ def is_string(expr: Expr, schema: SchemaRef | None) -> bool:
     """Whether `expr` provably has a UTF-8 string type under `schema`."""
     t = _typed(expr, schema)
     return t is not None and (pa.types.is_string(t) or pa.types.is_large_string(t))
+
+
+def is_date(expr: Expr, schema: SchemaRef | None) -> bool:
+    """Whether `expr` provably has a Date type under `schema`.
+
+    The counterpart to `is_timestamp`, and needed for the same reason: a rule that folds a
+    comparison onto a temporal literal must emit a *date* literal for a date column and a
+    *timestamp* literal for a timestamp one, so it has to be able to tell them apart.
+    """
+    t = _typed(expr, schema)
+    return t is not None and pa.types.is_date(t)
+
+
+def is_timestamp(expr: Expr, schema: SchemaRef | None) -> bool:
+    """Whether `expr` provably has a Timestamp type under `schema`.
+
+    A `Date` answers ``False``. The distinction matters to any rule that folds a
+    comparison onto a temporal literal: a `Date` column compared against a timestamp
+    literal is a different comparison, so a rule that cannot tell them apart must not
+    fire on either.
+    """
+    t = _typed(expr, schema)
+    return t is not None and pa.types.is_timestamp(t)
 
 
 def nullable(expr: Expr, schema: SchemaRef | None) -> bool:

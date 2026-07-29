@@ -19,11 +19,15 @@ from batcher.io.formats.streaming.checkpoint.state_store import StateStore
 
 __all__ = ["CheckpointStore"]
 
+#: Micro-batches between log sweeps. The logs are bounded by this many rows rather than by
+#: one, which is the same guarantee at a sixty-fourth of the fsyncs.
+_PRUNE_EVERY = 64
+
 
 class CheckpointStore:
     """Bundles the three checkpoint logs for one streaming query."""
 
-    __slots__ = ("_dir", "commits", "offsets", "state")
+    __slots__ = ("_dir", "_pruned_through", "commits", "offsets", "state")
 
     def __init__(self, location: str) -> None:
         os.makedirs(location, exist_ok=True)
@@ -31,6 +35,7 @@ class CheckpointStore:
         self.offsets = OffsetLog(os.path.join(location, "offsets.sqlite"))
         self.commits = CommitLog(os.path.join(location, "commits.sqlite"))
         self.state = StateStore(os.path.join(location, "state"))
+        self._pruned_through = 0
 
     @property
     def location(self) -> str:
@@ -64,9 +69,19 @@ class CheckpointStore:
 
         Recovery only ever consults the last committed batch's offsets and the commit-log
         maximum, so rows before `keep_through` (the last committed batch) are dead weight.
-        Called after every commit, this keeps ``offsets.sqlite`` / ``commits.sqlite`` from
-        growing one row per micro-batch forever on a long-running stream.
+
+        Pruning is *amortized* rather than run on every commit. Running it per micro-batch
+        cost two more `DELETE` statements and two more fsyncs per epoch — on top of the two
+        the epoch already pays — almost always to remove a single row, so a low-latency
+        trigger spent more of its budget deleting bookkeeping than writing it. Sweeping every
+        `_PRUNE_EVERY` batches keeps the logs bounded by a small constant instead of by one
+        row, which is the property that actually matters, at a fraction of the syncs. The
+        counter is per-store rather than derived from `keep_through` so a restart cannot land
+        on a stride boundary and skip the sweep forever.
         """
+        if keep_through - self._pruned_through < _PRUNE_EVERY:
+            return
+        self._pruned_through = keep_through
         self.offsets.prune(keep_through)
         self.commits.prune(keep_through)
 

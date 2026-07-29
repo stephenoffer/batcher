@@ -68,7 +68,9 @@ from batcher.plan.logical import (
     Join,
     Limit,
     LogicalPlan,
+    RangeJoin,
     RowId,
+    Sample,
     Sort,
     Union,
     Window,
@@ -847,6 +849,34 @@ def _dispatch(
                 table = table.add_column(0, field, index)
                 return table if not above else _apply_above(above, table)
 
+    # A fixed-count `sample(n=...)` keeps the `n` smallest-hash rows of the WHOLE relation,
+    # so — unlike the fraction form, which is a per-row predicate and rides the map path
+    # above — running it per partition keeps `n` rows from EVERY partition. It is not
+    # row-wise, so until now it reached `_unsupported` and raised on distributed data.
+    #
+    # It is, however, mergeable top-N: a row among the globally `n` smallest hashes is also
+    # among its own partition's `n` smallest (its partition holds a subset of the rows, so
+    # its rank there is no worse than its global rank), so the union of the per-partition
+    # results *contains* the global answer, and re-applying the same operator to that union
+    # selects exactly it. `bc_interp::ops::reshape::sample_n_batches` states that contract
+    # and breaks hash ties by row *content*, so no `preserve_order` is needed here (unlike
+    # the `Limit` path above): the result does not depend on how the input was split.
+    #
+    # `hub=None`: the per-worker plan is truncated to `n` rows, so its row count must not be
+    # learned as the source's cardinality.
+    sample_split = _split_at(plan, Sample)
+    if sample_split is not None:
+        above, sample = sample_split
+        if sample.n is not None and _single_source(sample.input) and not _has_breaker(sample.input):
+            sid = next(iter(scanned_source_ids(sample.input)))
+            if sid < len(sources) and _is_splittable_source(sources[sid]):
+                from batcher.dist.executors.map import _distributed_map
+
+                partials = _distributed_map(sample, sources, workers, None)
+                # `sample` innermost: the global n-smallest of the union of the partials,
+                # then whatever the user stacked above it.
+                return _apply_above([*above, sample], partials)
+
     agg_split = _split_at(plan, Aggregate)
     if agg_split is not None:
         above, agg = agg_split
@@ -950,6 +980,33 @@ def _dispatch(
         above, asof = asof_split
         if asof.left_by and _join_sides_are_map_only(asof):
             return _distributed_asof(above, asof, sources, workers)
+
+    # RANGE (inequality) join: broadcast the build side, split the probe side. An
+    # inequality has no equality to co-partition on — a hash shuffle would put `a.x` and the
+    # `b.y` values it is less than in different buckets — so the shuffle every other join
+    # uses is simply not available. Replicating the build side is: each probe task sees the
+    # WHOLE right, so each left row's match set is computed in its own partition.
+    #
+    # Gated on the probe side reading a genuinely SPLITTABLE source, which the other join
+    # paths do not need: an equi-join chooses broadcast-vs-shuffle from the planner's
+    # size-based `strategy`, so it already has a cheap plan for a small input. A range join
+    # has only the one strategy, so the size question has to be asked here — and without it
+    # a 200-row-against-50-row interval join was partitioned to disk and handed to Ray tasks,
+    # which costs orders of magnitude more than running it locally. `_unsupported` states
+    # the rule this follows: with every source in memory "there is no distributed data to
+    # speak of, so executing it on one node is the correct plan, not a fallback."
+    range_split = _split_at(plan, RangeJoin)
+    if range_split is not None:
+        above, rj = range_split
+        from batcher.dist.executors.join import _BROADCAST_SAFE
+
+        probe_ids = scanned_source_ids(rj.left)
+        if (
+            rj.join_type in _BROADCAST_SAFE
+            and _join_sides_are_map_only(rj)
+            and all(i < len(sources) and _is_splittable_source(sources[i]) for i in probe_ids)
+        ):
+            return _distributed_range_join(above, rj, sources, workers, hub)
 
     # A top-level sort over a scannable input distributes via range partitioning on the
     # leading key. That key must be a plain COLUMN (the range partitioner splits on its
@@ -1210,3 +1267,71 @@ def _distributed_asof(
     else:
         result = pa.Table.from_batches(batches)
     return result if not above else _apply_above(above, result)
+
+
+# --- RANGE (inequality) join (broadcast the build side) ------------------------
+# Also here rather than in the `executors` subpackage, which is at its file-count ceiling.
+# Unlike every other join, an inequality has no equality to co-partition on: hashing `a.x`
+# and the `b.y` values it is less than sends them to different buckets, so the shuffle is
+# not merely slower, it is wrong. Broadcast is the shape that works, and the probe
+# machinery is the equi-join's (`broadcast_probe_join`) with only the reducer IR differing.
+
+
+def _range_join_reducer_ir(rj: RangeJoin) -> dict:
+    """IR for the per-task range join of a left chunk (source 0) against the full right
+    (source 1). Mirrors `RangeJoin.to_ir()` but substitutes the per-task scans."""
+    return {
+        "op": "range_join",
+        "left": {"op": "scan", "source_id": 0},
+        "right": {"op": "scan", "source_id": 1},
+        "conditions": [
+            {"left_key": c.left_key, "right_key": c.right_key, "op": c.op} for c in rj.conditions
+        ],
+        "join_type": rj.join_type,
+        "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in rj.output],
+    }
+
+
+def _distributed_range_join(
+    above: list[LogicalPlan],
+    rj: RangeJoin,
+    sources: list[Source],
+    workers: int,
+    hub=None,
+) -> pa.Table:
+    """Broadcast the right side and range-join each partition of the left against it.
+
+    Exact for the `_BROADCAST_SAFE` join types the dispatcher gates on: each probe task
+    holds the whole right side, so a left row's match set is fully determined inside its
+    own partition, and each left row is in exactly one partition. `right`/`full` are
+    excluded because a right row's matched-ness spans partitions.
+
+    When the right side does not fit the broadcast budget there is no second strategy to
+    fall back to — the shuffle the equi-join would use does not exist for an inequality —
+    so this raises with the actual fix rather than silently running the whole join on one
+    node (`_unsupported`'s rule) or replicating an over-large side into an OOM.
+    """
+    from batcher.dist.executors.join import broadcast_probe_join
+
+    result = broadcast_probe_join(
+        above,
+        rj,
+        rj.left,
+        rj.right,
+        _range_join_reducer_ir(rj),
+        sources,
+        workers,
+        hub=hub,
+    )
+    if result is not None:
+        return result
+
+    from batcher._internal.errors import PlanError
+
+    raise PlanError(
+        "distributed range (inequality) join requires one side small enough to broadcast, "
+        "and this query's right side is empty or over the broadcast budget. An inequality "
+        "has no join key to co-partition on, so there is no shuffle fallback. Filter or "
+        "pre-aggregate the right side, raise `OptimizerConfig.broadcast_max_bytes`, or run "
+        "it single-node (`distributed=False`)."
+    )

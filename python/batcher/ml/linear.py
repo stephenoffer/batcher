@@ -16,7 +16,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, linear_score, require_fitted
+from batcher.ml._estimator import (
+    argmax_prediction,
+    linear_score,
+    require_fitted,
+    require_rows,
+)
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -28,7 +33,7 @@ __all__ = ["LinearRegression", "LogisticRegression", "Ridge", "RidgeClassifier"]
 
 
 def _solve(
-    ds: Dataset, features: Sequence[str], target: str, alpha: float
+    ds: Dataset, features: Sequence[str], target: str, alpha: float, estimator: object
 ) -> tuple[list[float], float]:
     """Fit linear coefficients and intercept from the moments of `features` and `target`."""
     import numpy as np
@@ -44,16 +49,25 @@ def _solve(
             raise ColumnNotFoundError(
                 unknown_message("column", name, ds.columns, hint="Pass an existing column.")
             )
+    d = len(features)
+    n = ds.count()
+    require_rows(estimator, n, 2, because="the covariance it is built from divides by n - 1")
     means = ds.agg(**{name: mean_(col(name)) for name in columns}).collect()
     center = {name: float(means.column(name)[0].as_py()) for name in columns}
-    n = ds.count()
     covariance = covariance_matrix(ds, columns).to_pydict()
     matrix = np.array([covariance[name] for name in columns], dtype=float).T
-    d = len(features)
     sxx = matrix[:d, :d]
     sxy = matrix[:d, d]
     system = (n - 1) * sxx + alpha * np.eye(d)
-    coefficients = np.linalg.solve(system, (n - 1) * sxy)
+    try:
+        coefficients = np.linalg.solve(system, (n - 1) * sxy)
+    except np.linalg.LinAlgError as exc:
+        # Singular means the features are linearly dependent, which `LinAlgError` never says.
+        raise PlanError(
+            f"the features {list(features)} are linearly dependent, so the least-squares "
+            f"system has no unique solution. Drop the redundant column (a duplicate, a "
+            f"constant, or a one-hot keeping every level), or use Ridge(alpha=...)."
+        ) from exc
     intercept = center[target] - sum(
         coefficients[i] * center[name] for i, name in enumerate(features)
     )
@@ -116,7 +130,7 @@ class LinearRegression:
         Returns:
             ``self``, fitted.
         """
-        self.coef_, self.intercept_ = _solve(ds, self.features, self.target, self._alpha)
+        self.coef_, self.intercept_ = _solve(ds, self.features, self.target, self._alpha, self)
         return self
 
     def predict(self, ds: Dataset) -> Dataset:
@@ -288,6 +302,7 @@ class LogisticRegression:
                 )
         terms = [lit(1.0), *[col(name) for name in self.features]]
         m = len(terms)
+        require_rows(self, ds.count(), m, because="IRLS needs one row per fitted term")
         beta = np.zeros(m)
         for iteration in range(self.max_iter):
             eta = self._linear_predictor(list(beta[1:]), float(beta[0]))
@@ -449,7 +464,9 @@ class RidgeClassifier:
         for label in labels:
             indicator = when(col(self.target) == lit(label)).then(lit(1.0)).otherwise(lit(-1.0))
             one_vs_rest = ds.with_columns(__bt_ind=indicator)
-            coefficients, intercept = _solve(one_vs_rest, self.features, "__bt_ind", self.alpha)
+            coefficients, intercept = _solve(
+                one_vs_rest, self.features, "__bt_ind", self.alpha, self
+            )
             self.classes_.append(label)
             self.weights_[label] = coefficients
             self.bias_[label] = intercept

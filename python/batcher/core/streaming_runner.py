@@ -68,7 +68,16 @@ class LocalRunner:
     existed; it is the reference the distributed runner has to agree with.
     """
 
-    __slots__ = ("_iterator", "_predicate", "_processor", "_projection", "_sink", "_source")
+    __slots__ = (
+        "_iterator",
+        "_last_token",
+        "_predicate",
+        "_processor",
+        "_projection",
+        "_should_stop",
+        "_sink",
+        "_source",
+    )
 
     def __init__(
         self,
@@ -78,15 +87,27 @@ class LocalRunner:
         *,
         projection: list[str] | None = None,
         predicate: dict | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self._source = source
         self._processor = processor
         self._sink = sink
+        # Handed to a source that knows how to end its own poll loop. Without it, stopping a
+        # query parked on an idle unbounded source did not merely take a while — `stage()`
+        # sat inside `next()` waiting for data that might never come, and `stop()` blocked
+        # forever joining the thread. A source that does not accept the signal is unaffected;
+        # it simply keeps the old behavior.
+        self._should_stop = should_stop
+        attach = getattr(source, "set_stop_signal", None)
+        if attach is not None and should_stop is not None:
+            attach(should_stop)
         # Kyber's source pushdown for this plan, or None when there is none to push (a
         # `map_batches` pipeline, whose UDF is opaque to the optimizer).
         self._projection = projection
         self._predicate = predicate
         self._iterator: Iterator[pa.RecordBatch] | None = None
+        # What the sink said it wrote for the last published epoch. See `last_sink_token`.
+        self._last_token: str | None = None
 
     def stage(self, batch_id: int) -> pa.RecordBatch | None:  # noqa: ARG002
         if self._iterator is None:
@@ -116,13 +137,38 @@ class LocalRunner:
         return {0: self._source.snapshot_position()}
 
     def publish(self, batch_id: int, staged: pa.RecordBatch) -> tuple[int, int]:
-        emitted = 0
-        for rows in self._processor.process(staged):
-            if rows.num_rows:
-                self._sink.write_batch(batch_id, pa.Table.from_batches([rows]))
-                emitted += rows.num_rows
+        """Write the micro-batch's whole output as **one** sink write.
+
+        This used to call `write_batch` once per record batch the processor returned, all
+        under the same `batch_id` — and a sink's exactly-once machinery is keyed on exactly
+        that id. The second write of an epoch therefore found the epoch already written and
+        *dropped its rows*: a `FileStreamSink` skipped the `part-batch<id>` file that already
+        existed, and a `DeltaStreamSink` found its own `(app_id, batch_id)` transaction in the
+        log and committed nothing. It was invisible because a processor usually returns one
+        batch — a plan whose output exceeds a morsel, or a union, returns several, and only
+        then did the tail of the epoch silently vanish.
+
+        Concatenating first is also the cheaper spelling: one table, one write, one commit.
+        """
+        rows = [b for b in self._processor.process(staged) if b.num_rows]
+        emitted = sum(b.num_rows for b in rows)
+        self._last_token = None
+        if rows:
+            self._last_token = self._sink.write_batch(batch_id, pa.Table.from_batches(rows))
         _confirm(self._source)
         return staged.num_rows, emitted
+
+    def last_sink_token(self) -> str | None:
+        """What the sink reported writing for the epoch just published, if anything.
+
+        Every `StreamSink` returns one — a `part-batch` path, a Delta
+        ``(app_id, batch_id)`` marker, a `foreach_batch:{id}` receipt — and the commit log
+        has a `sink_token` column to record it in. Nothing carried the value between them,
+        so the column was NULL for every row ever written: the log could say *that* a batch
+        committed and never *what* the sink did for it, which is the difference between a
+        recoverable audit trail and a row of batch ids.
+        """
+        return self._last_token
 
     def seek(self, position: dict) -> None:
         from batcher.io.source import is_checkpointable

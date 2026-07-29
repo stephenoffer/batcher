@@ -27,7 +27,7 @@ These come from general engine mechanisms rather than per-workload tuning, which
 
 The three sections below are those mechanisms.
 
-## Why the GPU stays fed
+## Where the utilization comes from
 
 The naive way to run decode into inference is to decode the whole partition, then run the forward pass. The GPU idles through the decode. Batcher overlaps them: the CPU decode of morsel *k+1* runs while the GPU forward of morsel *k* is still in flight.
 

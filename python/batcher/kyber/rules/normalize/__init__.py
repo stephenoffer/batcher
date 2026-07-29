@@ -15,6 +15,12 @@ The pure functions stay importable for unit tests.
 
 from __future__ import annotations
 
+# Registration order *is* within-phase run order, so these imports are ordered by when
+# their rules must register, not alphabetically. `disjunctions` was split out of `ranges`
+# and its rules registered last there, so it is imported directly after it — sorting the
+# block moves `or_equalities_to_in_list` / `or_to_in_and_range` ahead of nine rules that
+# used to precede them, which `just surface-diff` reports as a behavior change.
+# isort: off
 from batcher.kyber.rules.normalize.fold import ConstantFolding, fold_constants
 from batcher.kyber.rules.normalize.predicates import (
     boolean_case_to_predicate,
@@ -25,9 +31,11 @@ from batcher.kyber.rules.normalize.predicates import (
 from batcher.kyber.rules.normalize.ranges import (
     date_trunc_to_range,
     like_prefix_to_range,
-    or_to_in_and_range,
 )
+from batcher.kyber.rules.normalize.disjunctions import or_to_in_and_range
 from batcher.kyber.rules.normalize.simplify import ExprSimplification, simplify_expressions
+
+# isort: on
 
 __all__ = [
     "ConstantFolding",

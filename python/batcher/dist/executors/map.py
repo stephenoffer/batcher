@@ -1262,11 +1262,17 @@ class _MapActor:
         bucket reads via shared memory / direct memory — no driver round-trip) instead
         of waiting for the driver to hand it a materialized partition."""
         from batcher import core
-        from batcher.carbonite.transfer.server import fetch
+        from batcher.carbonite.transfer.lifecycle import process_client
         from batcher.io.source import InMemorySource
         from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
 
-        rows = fetch(addr, ticket)
+        # The *pooled* client, not the one-shot `server.fetch`. This runs once per morsel
+        # on the GPU consumer of the streaming pipeline — the hottest fetch in the engine —
+        # and the one-shot form opens a fresh gRPC channel every time, so the stage paid a
+        # full connection handshake ahead of each morsel it was supposed to be overlapping
+        # with the previous one's forward pass. `server.fetch`'s own docstring names the
+        # pooled client as the form for repeated fetches; this was the repeated fetch.
+        rows = process_client().fetch(addr, str(ticket))
         if not rows:
             return None
         out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])

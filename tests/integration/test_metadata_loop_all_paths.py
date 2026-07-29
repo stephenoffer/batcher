@@ -1,6 +1,14 @@
 """The metadata loop (Core collects → Kyber reads → Core executes) closes on every
 execution path — single-node native, UDF/map_batches, and distributed — and the
-distributed path produces results identical to single-node."""
+distributed path produces results identical to single-node.
+
+The **out-of-core** routes are covered next door, in
+`test_spill_closes_learning_loops.py`, and deliberately so: they close a *subset* of these
+loops (everything except `learn_column_stats`, which measures the scanned batches an
+out-of-core run never holds), so asserting the full set here would be wrong. That split is
+also how the gap survived — this file's "every execution path" once meant the three named
+above, and the three spill routes returned early, recording almost nothing.
+"""
 
 from __future__ import annotations
 
@@ -40,11 +48,30 @@ def test_udf_path_collects_metadata():
 
 
 def test_native_path_still_collects_metadata():
+    """The native path learns the distinct count of a column the estimator will consult.
+
+    A *group key* is the canonical such column: `_estimate_aggregate` reads its ndv to size
+    the output. This asserted the ndv of a column the query never mentioned, which the
+    deliberate `learnable_columns` bounding in `learn_column_stats` stopped sketching — that
+    sketch is O(rows x columns), and running it over every column of every scan cost 22.9s
+    on top of a 0.73s read to learn things nothing would ever ask for.
+    """
     hub = core.default_hub()
     t = pa.table({"nlk": [i % 3 for i in range(300)], "nlv": list(range(300))})
     ds = bt.from_arrow(t)
-    ds.filter(col("nlv") > 10).collect()  # local native path
+    ds.group_by("nlk").agg(s=col("nlv").sum()).collect()  # local native path
     assert abs(_learned(hub, ds).get("nlk", 0) - 3) < 1
+
+
+def test_native_path_does_not_sketch_a_column_nothing_consults():
+    """The other half of the bounding, and the reason the test above had to change: a
+    column no estimator will read is deliberately left unmeasured, so the first query that
+    *can* use it is the one that pays for it."""
+    hub = core.default_hub()
+    t = pa.table({"unread": [i % 3 for i in range(300)], "nlv2": list(range(300))})
+    ds = bt.from_arrow(t)
+    ds.filter(col("nlv2") > 10).collect()
+    assert "unread" not in _learned(hub, ds)
 
 
 def test_adaptive_path_collects_metadata():
@@ -64,20 +91,37 @@ def test_adaptive_path_collects_metadata():
     assert abs(_learned(hub, fact_ds).get("adk", 0) - 7) < 1  # learned from the fact scan
 
 
-def test_native_path_records_cpu_utilization():
-    # The CPU half of the adaptive loop: a real run measures per-operator CPU time
-    # (Rust `cpu_ns`) and transcribes it to a [0, 1] utilization on the hub, which
-    # Kyber later folds into each task's `num_cpus`. A CPU-heavy aggregate over
-    # enough rows registers measurable CPU time regardless of timer granularity.
+def test_native_path_reports_cpu_utilization_as_unmeasured_not_fabricated():
+    """The CPU half of the adaptive loop is inert on this tier, deliberately and safely.
+
+    A utilization needs work-summed-across-threads *and* the wall span it spread over, and
+    the morsel meter has only the first: `elapsed_ns` is already summed over every worker,
+    and no operator owns a clock interval outright in a pipeline. So
+    `bc_interp::stream::meter` reports `cpu_ns: 0` — "not measured" — and
+    `plan.feedback.cpu_utilization` maps that to `0.0`, which every consumer
+    (`kyber.cpu_shares.load_cpu_utilization`) skips as "no signal", keeping its prior.
+
+    This previously asserted a *positive* utilization, which held only while the meter
+    reported `elapsed_ns` as `cpu_ns` — dividing a number by itself, so every operator of
+    every query scored exactly `1 / threads` (a hardcoded 6.25% on a 16-core box).
+    `explain(analyze=True)` printed that as "CPU idle, not CPU-limited" on queries running
+    at 8-10x parallelism: confidently backwards. The `0` is the truthful answer until a
+    per-operator wall span is carried as its own `OpMetric` field, which is a two-sided IR
+    change. What must stay true is that the field is *present and non-fabricated*.
+    """
     hub = core.default_hub()
     n = 1_000_000
     t = pa.table({"cuk": [i % 17 for i in range(n)], "cuv": list(range(n))})
     bt.from_arrow(t).group_by("cuk").agg(s=col("cuv").sum()).collect()
     rows = [r for rs in hub.op_stats_by_kind().values() for r in rs]
     assert rows, "operator feedback was recorded"
-    assert any(r.get("cpu_utilization", 0.0) > 0.0 for r in rows), (
-        "at least one operator registered measurable CPU utilization"
-    )
+    utils = [r.get("cpu_utilization") for r in rows]
+    assert all(u is not None for u in utils), "the field must be carried, not dropped"
+    # Never the `1 / threads` fingerprint of the fabricated constant.
+    threads = [r.get("threads") or 1 for r in rows]
+    assert not any(
+        u > 0.0 and abs(u - 1.0 / th) < 1e-9 for u, th in zip(utils, threads, strict=True)
+    ), "utilization is dividing elapsed_ns by itself again"
 
 
 def _op_stats_count(hub) -> int:

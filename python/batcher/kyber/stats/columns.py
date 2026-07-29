@@ -48,6 +48,7 @@ __all__ = [
     "limit_columns",
     "project_columns",
     "range_join_columns",
+    "row_id_columns",
     "sample_columns",
     "scan_columns",
     "union_columns",
@@ -280,6 +281,34 @@ def window_columns(node, child: RelStats) -> dict[str, ColumnStat]:
     for spec in node.functions:
         if spec.func in _UNIT_RANGE_WINDOW_FUNCS:
             out[spec.alias] = ColumnStat(min=0.0, max=1.0, provenance=Provenance.DEFAULT)
+    return out
+
+
+def row_id_columns(node, child: RelStats) -> dict[str, ColumnStat]:
+    """`RowId` output column stats: the counter is appended, every input column is untouched.
+
+    Structurally identical to an unranked `window_columns`: `with_row_index` adds a column
+    and reorders, removes, and rewrites nothing, so every input column's stats carry through
+    at their original provenance (`EXACT` included).
+
+    The counter itself is *derivable* rather than measured — it is `offset ..
+    offset + rows - 1`, one distinct value per row, never null — so it is recorded only when
+    the row count is `EXACT`. Under an estimated count the range would be a guess, and a
+    guessed min/max on a synthetic key is exactly the input a downstream `filter(idx < k)`
+    would size itself against.
+    """
+    out = dict(child.columns)
+    if child.rows_exact and child.rows >= 1:
+        rows = float(child.rows)
+        offset = float(node.offset)
+        out[node.alias] = ColumnStat(
+            min=offset,
+            max=offset + rows - 1.0,
+            null_count=0.0,
+            ndv=rows,
+            provenance=child.provenance,
+            ndv_provenance=child.provenance,
+        )
     return out
 
 

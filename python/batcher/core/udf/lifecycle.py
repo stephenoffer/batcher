@@ -16,7 +16,7 @@ import contextlib
 
 from batcher.plan.logical import MapBatches
 
-__all__ = ["build_udf_callable", "teardown_udf"]
+__all__ = ["build_udf_callable", "release_prebuilt", "teardown_udf"]
 
 
 def build_udf_callable(fn: object) -> object:
@@ -50,3 +50,29 @@ def teardown_udf(built: object, op: MapBatches) -> None:
     if callable(close):
         with contextlib.suppress(Exception):
             close()
+
+
+def release_prebuilt(plan: object) -> None:
+    """Close every class-UDF instance `prebuild_factories` built into `plan`.
+
+    `teardown_udf` deliberately declines a prebuilt instance — "that owner's to tear down at
+    *its* lifetime end, not here" — and the streaming entry points that call
+    `prebuild_factories` are that owner. They never did it, so a load-once model streamed
+    through `iter_batches` held its GPU allocation, HTTP session, or database handle for the
+    lifetime of the process. Not even garbage collection reclaimed it: the plan holds the
+    instance, and the caller usually holds the plan.
+
+    Best-effort and idempotent-ish by the same contract as `teardown_udf`: the rows are
+    already produced, so a failing `close` must not fail the query, and a model whose `close`
+    tolerates a second call is the ordinary shape.
+    """
+    from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import walk
+
+    for node in walk(plan):
+        if not isinstance(node, MapBatches) or isinstance(node.fn, type):
+            continue  # a *type* was never built here; `teardown_udf` owns that case
+        close = getattr(node.fn, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()

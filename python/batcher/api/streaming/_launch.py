@@ -141,8 +141,14 @@ def start_streaming_query(
     except BaseException:
         # `start()` opens the sink and recovers from the checkpoint before the loop
         # thread launches; if either raises, the query never runs, so it must not linger
-        # in the registry as a phantom active stream.
+        # in the registry as a phantom active stream. The store never reaches the loop's
+        # own teardown on this path either, so its connections are closed here.
         _deregister(query_name)
+        if store is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                store.close()
         raise
     return query
 

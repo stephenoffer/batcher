@@ -1,6 +1,6 @@
 # Rule: Testing (Everything Is Tested, Correctness Before Speed)
 
-Batcher's claim is to be faster *and* correct than DuckDB/Spark/Polars/Ray Data.
+Batcher's claim is to be faster *and* correct than DuckDB/Spark/Polars.
 That is only credible if correctness is mechanically proven against an oracle on
 every change. Tests are not optional follow-up — they are part of the change.
 

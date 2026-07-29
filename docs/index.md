@@ -2,12 +2,13 @@
 
 ```{raw} html
 <div class="bt-hero">
-  <p class="bt-hero-eyebrow">Any data &middot; Any AI workload &middot; Batch &amp; streaming</p>
-  <p class="bt-hero-tagline">One engine for every kind of data, and every kind of AI.</p>
+  <p class="bt-hero-eyebrow">Any data &middot; Any workload &middot; Batch &amp; streaming</p>
+  <p class="bt-hero-tagline">One engine for every kind of data, from SQL to models.</p>
   <p class="bt-hero-sub">
     Structured tables, unstructured text, images, audio, video. SQL, DataFrames, and
-    expressions. Batch jobs and live streams. Batcher runs all of it on a single
-    engine &mdash; from a laptop to a cluster &mdash; and tunes itself as the query runs.
+    expressions. Batch jobs and live streams, analytics and inference. Batcher runs all
+    of it on a single engine &mdash; from a laptop to a cluster &mdash; and tunes itself
+    as the query runs.
   </p>
   <p class="bt-hero-cta">
     <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
@@ -303,24 +304,6 @@ Polars compute the wrong revenue, and the harness refuses to time them.
 These are the headline results. The full picture, including the methodology behind every
 figure, is in {doc}`benchmarks/index`.
 
-### AI and multimodal
-
-Ten GPU workload families on 8xT4, real models, every run gated on prediction agreement. On
-every family where device utilization was sampled, the GPU holds at or above the 80% target:
-
-![Horizontal bar chart of sustained GPU utilization by workload family on 8xT4 with real models and 100 percent output agreement. Compute-bound ResNet-50 FP16 inference holds 100 percent at 4,707 images per second, a decode-heavy JPEG to ResNet pipeline 93.4 percent at 3,860, fractional GPU packing of EfficientNet-B0 89 percent at 6,764, zero-config inference with no batch size given 82 percent at 2,451, ResNet-50 batch inference 81 percent at 2,504, and image embeddings 80 percent at 2,502. A dashed line marks the 80 percent target.](_static/diagrams/gpu_utilization.svg)
-
-Throughput on the model workloads runs from **33,611 text/s** embedding with MiniLM and
-**38,546 clip/s** on audio feature extraction down to **169 img/s** on a diffusion model, and
-`iter_torch_batches` feeds a training loop at **1.06 M rows/s** zero-copy. Decoding JPEGs into
-tensors runs at 5,693 img/s, 2.4x Daft. `map_batches(Model, num_gpus=1)` with no batch size
-given picks a VRAM-safe default and lands within 2% of the hand-tuned path.
-
-Stage-overlapped streaming is why the device stays fed. The CPU decode of the next morsel runs
-while the GPU forward of the current one is still in flight.
-
-![Two panels comparing a two-stage ResNet-50 pipeline before and after stage overlap, with the same result and the same order. Throughput rises from 942 to 2,504 images per second. GPU utilization rises from 30 percent to 81 percent of the device kept busy.](_static/diagrams/stage_overlap.svg)
-
 ### Analytics: three suites, measured 2026-07-18
 
 Single node, 16 cores, release build. Every engine reads the **identical zero-copy Arrow
@@ -346,6 +329,26 @@ the ranges above, so the headline reflects execution rather than planning.
 
 The same lazy control plane answers `count()` in **0.05 ms** after a chain of transformations,
 and reading 20M rows across 64 Parquet files and summing a column takes **72 ms**.
+
+### AI and multimodal
+
+Models are one workload family the engine runs, alongside the SQL, streaming, and lakehouse
+work above, and they run on the same operators and the same plan. Ten GPU workload families
+on 8xT4, real models, every run gated on prediction agreement. On every family where device
+utilization was sampled, the GPU holds at or above the 80% target:
+
+![Horizontal bar chart of sustained GPU utilization by workload family on 8xT4 with real models and 100 percent output agreement. Compute-bound ResNet-50 FP16 inference holds 100 percent at 4,707 images per second, a decode-heavy JPEG to ResNet pipeline 93.4 percent at 3,860, fractional GPU packing of EfficientNet-B0 89 percent at 6,764, zero-config inference with no batch size given 82 percent at 2,451, ResNet-50 batch inference 81 percent at 2,504, and image embeddings 80 percent at 2,502. A dashed line marks the 80 percent target.](_static/diagrams/gpu_utilization.svg)
+
+Throughput on the model workloads runs from **33,611 text/s** embedding with MiniLM and
+**38,546 clip/s** on audio feature extraction down to **169 img/s** on a diffusion model, and
+`iter_torch_batches` feeds a training loop at **1.06 M rows/s** zero-copy. Decoding JPEGs into
+tensors runs at 5,693 img/s, 2.4x Daft. `map_batches(Model, num_gpus=1)` with no batch size
+given picks a VRAM-safe default and lands within 2% of the hand-tuned path.
+
+Stage-overlapped streaming is what produces those utilization figures. The CPU decode of the
+next morsel runs while the GPU forward of the current one is still in flight.
+
+![Two panels comparing a two-stage ResNet-50 pipeline before and after stage overlap, with the same result and the same order. Throughput rises from 942 to 2,504 images per second. GPU utilization rises from 30 percent to 81 percent of the device kept busy.](_static/diagrams/stage_overlap.svg)
 
 ### Cluster against cluster
 
@@ -402,6 +405,7 @@ If you would rather be handed an ordered reading list for your role, use
 getting-started/index
 tutorials/index
 examples/index
+cookbook/index
 learning-paths/index
 ```
 

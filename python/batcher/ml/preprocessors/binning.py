@@ -118,7 +118,7 @@ class KBinsDiscretizer(Preprocessor):
         """Replace each fitted column with its integer bin index ``0..n_bins-1``.
 
         The index is how many learned edges the value meets or exceeds, computed by a
-        `CASE` chain.
+        `CASE` chain. A null stays null, and does not become a bin.
 
         Examples:
             .. doctest::
@@ -129,6 +129,10 @@ class KBinsDiscretizer(Preprocessor):
                 >>> kb = KBinsDiscretizer(["v"], n_bins=2, strategy="uniform").fit(ds)
                 >>> kb.transform(ds).to_pydict()
                 {'v': [0, 0, 1, 1, 1]}
+
+                >>> gaps = bt.from_pydict({"v": [0.0, None, 10.0]})
+                >>> kb.transform(gaps).to_pydict()
+                {'v': [0, None, 1]}
 
         Args:
             ds: The dataset to discretize.
@@ -144,5 +148,13 @@ class KBinsDiscretizer(Preprocessor):
             expr = self.n_bins - 1
             for i in range(len(edges) - 1, -1, -1):
                 expr = when(col(c) < edges[i]).then(i).otherwise(expr)
-            new[c] = expr
+            # A null compares false against every edge, so the CASE chain fell all the way
+            # through to the `otherwise` and binned every missing value into the TOP bin.
+            # Nothing errored and nothing warned: a model then trained on fabricated values
+            # sitting at one end of the feature's range, which is the worst place to put
+            # them. Every other preprocessor here leaves a null alone, and so does sklearn.
+            # The `then` arm is reached only where the value IS null, so casting that null
+            # to the bin type yields a null of the right type. The IR has no null literal,
+            # and this needs none.
+            new[c] = when(col(c).is_null()).then(col(c).cast("int64")).otherwise(expr)
         return ds.with_columns(**new)

@@ -18,9 +18,10 @@ and calling that a change would spin the fixpoint forever.
 dropping or duplicating a sub-expression preserves the query's *error behavior* as
 well as its value. It answers whether an expression is deterministic and total: a
 conservative whitelist of columns, literals, wrapping arithmetic, comparisons, the
-boolean connectives, the null/NaN/inf predicates, and structural nodes over safe
-children. It deliberately excludes division and modulo (a zero divisor aborts),
-strict casts (which error on a bad value), and every opaque function call.
+boolean connectives, the null/NaN/inf predicates, the pure constructors (list, struct,
+row hash), and structural nodes over safe children. It deliberately excludes division
+and modulo (a zero divisor aborts), strict casts (which error on a bad value), and every
+opaque function call.
 """
 
 from __future__ import annotations
@@ -43,10 +44,12 @@ from batcher.plan.expr_ir import (
     NullIf,
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
+from batcher.plan.expr_ir.nodes import Array, HashRows, MakeStruct
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.visitor import transform_up
 
-__all__ = ["SAFE_BINARY_OPS", "rewrite_node", "safe_expr"]
+__all__ = ["SAFE_BINARY_OPS", "rewrite_node", "safe_expr", "whole_plan_expr_rule"]
 
 #: Binary operators that are deterministic and cannot raise. Wrapping add/sub/mul,
 #: the comparisons, and the Kleene boolean connectives are total. Division and modulo
@@ -78,6 +81,15 @@ def safe_expr(expr: Expr) -> bool:
         return safe_expr(expr.input)
     if isinstance(expr, (Coalesce, Greatest, Least)):
         return all(safe_expr(e) for e in expr.inputs)
+    if isinstance(expr, Array):
+        # A list literal is a pure constructor: it allocates a list per row and cannot
+        # fail on any element value, so it is total exactly when its elements are.
+        return all(safe_expr(e) for e in expr.elements)
+    if isinstance(expr, MakeStruct):
+        return all(safe_expr(e) for _, e in expr.fields)
+    if isinstance(expr, HashRows):
+        # A row hash is defined for every input, nulls included, and never raises.
+        return all(safe_expr(e) for e in expr.inputs)
     if isinstance(expr, NullIf):
         return safe_expr(expr.left) and safe_expr(expr.right)
     if isinstance(expr, Case):
@@ -85,6 +97,29 @@ def safe_expr(expr: Expr) -> bool:
             expr.otherwise
         )
     return False
+
+
+def whole_plan_expr_rule(leaf: Callable[[Expr], Expr]):
+    """Lift a leaf `Expr -> Expr` rewrite into a whole-plan rule body.
+
+    The `plan_rule` counterpart to `rewrite_node`: where that lifts a leaf over the
+    expressions of *one* node, this lifts it over every expression of every node in the
+    tree. Use it when a rewrite has no node-type it can be indexed on and must simply run
+    everywhere.
+
+    Args:
+        leaf: The leaf rewrite, applied bottom-up to every sub-expression.
+
+    Returns:
+        A `f(plan, ctx) -> plan` suitable for `plan_rule`.
+    """
+
+    def apply(plan: LogicalPlan, _ctx) -> LogicalPlan:
+        return transform_up(
+            plan, lambda node: map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
+        )
+
+    return apply
 
 
 def rewrite_node(node: LogicalPlan, leaf: Callable[[Expr], Expr]) -> LogicalPlan | None:

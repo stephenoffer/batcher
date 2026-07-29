@@ -208,9 +208,16 @@ def _r_math(e: Any, d: int) -> str:
     return f"{render_expr(e.input, d + 1)}.{e.fn}()"
 
 
-def _r_variadic(fn: str):
+def _r_variadic(fn: str, *, field: str = "inputs"):
+    """Render an n-ary node as ``fn(a, b, …)``.
+
+    `field` names the attribute holding the children. Most variadic nodes call it
+    ``inputs``; `Array` calls its own ``elements`` (it is a list *literal*, not a call
+    over sub-expressions), so it renders through the same helper with the name it uses.
+    """
+
     def render(e: Any, d: int) -> str:
-        parts = ", ".join(render_expr(x, d + 1) for x in e.inputs)
+        parts = ", ".join(render_expr(x, d + 1) for x in getattr(e, field))
         return f"{fn}({parts})"
 
     return render
@@ -245,6 +252,6 @@ _RENDERERS = {
     "Coalesce": _r_variadic("coalesce"),
     "Greatest": _r_variadic("greatest"),
     "Least": _r_variadic("least"),
-    "Array": _r_variadic("array"),
+    "Array": _r_variadic("array", field="elements"),
     "Case": _r_case,
 }

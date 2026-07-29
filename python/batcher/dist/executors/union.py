@@ -29,10 +29,20 @@ def _distributed_union(
 
     # Each branch scans its own source ids out of the shared `sources` list.
     tables = [execute_distributed(inp, sources, workers, transport) for inp in union.inputs]
-    result = pa.concat_tables(tables) if tables else pa.table({})
+    # Typed, not `pa.table({})`: a column-less table is not this union's relation, so an
+    # empty result would disagree with the same query's non-empty run on names and types
+    # and fail to concatenate against it.
+    result = pa.concat_tables(tables) if tables else _empty_union(union)
     if union.distinct:
         result = _dedup(result)
     return result if not above else _apply_above(above, result)
+
+
+def _empty_union(union: Union) -> pa.Table:
+    """The union's schema with no rows."""
+    from batcher.dist.executors.plan_analysis import empty_result_table
+
+    return empty_result_table(union, union.available_columns())
 
 
 def _dedup(table: pa.Table) -> pa.Table:

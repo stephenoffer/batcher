@@ -258,9 +258,15 @@ def test_distributed_equals_single_node(duck):
 
     A range join is decomposable — a left row's matches depend on the whole right side
     and on nothing else about the left — so no amount of partitioning may change the
-    answer. Today the distributed planner has no range-join staging and falls back to
-    executing it whole, which satisfies the invariant; this test is what would fail if a
-    future staging rewrite got the decomposition wrong.
+    answer. `_distributed_range_join` is that decomposition (broadcast the build side,
+    split the probe side), and it engages once the probe reads a splittable source; these
+    in-memory inputs are deliberately below that gate, so this case pins that the
+    single-node plan a small range join still takes returns DuckDB's answer.
+
+    The distributed path itself is covered by
+    `tests/integration/test_distributed_sample_and_range_join.py` (over Parquet), and its
+    algebra — the probe side partitioned over four inequalities and four fan-outs — by
+    `tests/unit/test_sample_and_range_join_mergeability.py`, which needs no cluster.
     """
     n = 200
     pt = pa.table({"x": [(i * 37) % 500 for i in range(n)], "pid": list(range(n))})

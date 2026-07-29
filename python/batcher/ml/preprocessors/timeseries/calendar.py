@@ -26,7 +26,12 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    append_projections,
+    columns_arg,
+    require_column_kind,
+)
 from batcher.plan.expr_ir.constructors import col, lit
 from batcher.plan.functions.temporal import date_part
 
@@ -118,6 +123,12 @@ class DateTimeFeaturizer(Preprocessor):
     Stateless — nothing is learned, so the same expression applies to training and serving
     data and there is no state to keep in sync.
 
+    The column must be a timestamp or date. A **string** column is also accepted, because it
+    may hold parseable timestamps and the schema cannot tell — but a string that does not
+    parse yields a **null in every appended part**, silently. If the parts come back all
+    null, that is the cause: cast the column first
+    (``ds.with_columns(t=bt.col("t").cast("timestamp"))``) so a bad format fails loudly.
+
     Examples:
         .. doctest::
 
@@ -167,11 +178,11 @@ class DateTimeFeaturizer(Preprocessor):
         Returns:
             A new lazy `Dataset` with the calendar-part columns appended.
         """
+        require_column_kind(ds, self.columns, what="DateTimeFeaturizer", kind="temporal")
         projections = {
             f"{name}_{part}": _part_expr(name, part) for name in self.columns for part in self.parts
         }
-        out = ds.with_columns(**projections)
-        return out.drop(*self.columns) if self.drop_original else out
+        return append_projections(ds, projections, self.columns, drop_original=self.drop_original)
 
 
 class CyclicalEncoder(Preprocessor):
@@ -234,6 +245,7 @@ class CyclicalEncoder(Preprocessor):
         Returns:
             A new lazy `Dataset` with the circular coordinates appended.
         """
+        require_column_kind(ds, self.columns, what="CyclicalEncoder", kind="temporal")
         projections = {}
         for name in self.columns:
             for part in self.parts:
@@ -242,5 +254,4 @@ class CyclicalEncoder(Preprocessor):
                 )
                 projections[f"{name}_{part}_sin"] = angle.sin()
                 projections[f"{name}_{part}_cos"] = angle.cos()
-        out = ds.with_columns(**projections)
-        return out.drop(*self.columns) if self.drop_original else out
+        return append_projections(ds, projections, self.columns, drop_original=self.drop_original)

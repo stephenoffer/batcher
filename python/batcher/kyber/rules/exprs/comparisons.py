@@ -79,7 +79,14 @@ _LE_SELF = _self_cmp("le", True)
 _GE_SELF = _self_cmp("ge", True)
 
 
-@rule(name="self_comparison_lt_to_false", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="self_comparison_lt_to_false",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_LT_SELF,
+    expr_matches=(Binary,),
+    expr_ops=("lt",),
+)
 def self_comparison_lt_to_false(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -87,7 +94,14 @@ def self_comparison_lt_to_false(
     return schema_rule(node, _LT_SELF, carries=(Binary,))
 
 
-@rule(name="self_comparison_gt_to_false", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="self_comparison_gt_to_false",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_GT_SELF,
+    expr_matches=(Binary,),
+    expr_ops=("gt",),
+)
 def self_comparison_gt_to_false(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -95,7 +109,14 @@ def self_comparison_gt_to_false(
     return schema_rule(node, _GT_SELF, carries=(Binary,))
 
 
-@rule(name="self_comparison_ne_to_false", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="self_comparison_ne_to_false",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_NE_SELF,
+    expr_matches=(Binary,),
+    expr_ops=("ne",),
+)
 def self_comparison_ne_to_false(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -103,7 +124,14 @@ def self_comparison_ne_to_false(
     return schema_rule(node, _NE_SELF, carries=(Binary,))
 
 
-@rule(name="self_comparison_eq_to_true", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="self_comparison_eq_to_true",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_EQ_SELF,
+    expr_matches=(Binary,),
+    expr_ops=("eq",),
+)
 def self_comparison_eq_to_true(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -111,7 +139,14 @@ def self_comparison_eq_to_true(
     return schema_rule(node, _EQ_SELF, carries=(Binary,))
 
 
-@rule(name="self_comparison_le_to_true", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="self_comparison_le_to_true",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_LE_SELF,
+    expr_matches=(Binary,),
+    expr_ops=("le",),
+)
 def self_comparison_le_to_true(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -119,7 +154,14 @@ def self_comparison_le_to_true(
     return schema_rule(node, _LE_SELF, carries=(Binary,))
 
 
-@rule(name="self_comparison_ge_to_true", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="self_comparison_ge_to_true",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_GE_SELF,
+    expr_matches=(Binary,),
+    expr_ops=("ge",),
+)
 def self_comparison_ge_to_true(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:

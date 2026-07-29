@@ -717,8 +717,13 @@ class _StrNamespace:
     def strip_chars(self, chars: str | None = None) -> StrFunc:
         """Trim from both ends — the Polars ``strip_chars`` spelling of :meth:`trim`.
 
+        Note the divergence from Polars: with ``chars=None`` this strips the ASCII **space**
+        only, following SQL ``TRIM`` (and DuckDB), not the whole whitespace class. Tabs and
+        newlines survive. Pass them explicitly — ``strip_chars(" \t\n")`` — when the input
+        may carry them, which scraped and CSV text usually does.
+
         Args:
-            chars: The set of characters to strip; whitespace when ``None``.
+            chars: The characters to strip; the ASCII space when ``None``.
 
         Returns:
             A Utf8 expression with the leading and trailing characters removed.
@@ -737,7 +742,7 @@ class _StrNamespace:
         """Trim from the left — the Polars ``strip_chars_start`` spelling of :meth:`lstrip`.
 
         Args:
-            chars: The set of characters to strip; whitespace when ``None``.
+            chars: The characters to strip; the ASCII space when ``None``.
 
         Returns:
             A Utf8 expression with the leading characters removed.
@@ -756,7 +761,7 @@ class _StrNamespace:
         """Trim from the right — the Polars ``strip_chars_end`` spelling of :meth:`rstrip`.
 
         Args:
-            chars: The set of characters to strip; whitespace when ``None``.
+            chars: The characters to strip; the ASCII space when ``None``.
 
         Returns:
             A Utf8 expression with the trailing characters removed.
@@ -1348,12 +1353,18 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.email_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"[\w.+-]+@[\w-]+\.[\w.]+")
+        return self.regexp_count(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
     # --- corpus cleaning and detection ----------------------------------------------
 
-    _URL_RE = r"https?://\S+"
-    _EMAIL_RE = r"[\w.+-]+@[\w-]+\.[\w.]+"
+    _URL_RE = r"https?://\S*[^\s.,;:!?)\]}]"
+    r"""A URL run, stopping before trailing sentence punctuation.
+
+    A plain ``\S+`` swallowed the period in "read https://a.example." and returned a URL
+    with a trailing dot, which does not resolve. Ending the match on a character that
+    cannot close a URL keeps "https://a.example/x?q=1" whole while dropping the
+    punctuation that belongs to the sentence."""
+    _EMAIL_RE = r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
     _NON_ASCII_RE = r"[^\x00-\x7F]"
 
     def remove_urls(self) -> StrFunc:
@@ -1696,7 +1707,7 @@ class _StrNamespace:
         """
         return self.regexp_matches(r"^\s*[-*+]\s")
 
-    _PHONE_RE = r"\d{3}[-.\s]\d{3}[-.\s]\d{4}"
+    _PHONE_RE = r"\(?\d{3}\)?[-.\s]\s?\d{3}[-.\s]\d{4}"
 
     def has_phone(self) -> StrFunc:
         """True where the text contains a phone-number-shaped run of digits.
@@ -2537,15 +2548,18 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.is_email()).to_pydict()
                 {'r': [True, False]}
         """
-        return self.regexp_matches(r"^[\w.+-]+@[\w-]+\.[\w.]+$")
+        return self.regexp_matches(r"^[\w.+-]+@[\w-]+(?:\.[\w-]+)+$")
 
     # --- pandas-compatible string spellings -----------------------------------------
 
     def strip(self, chars: str | None = None) -> StrFunc:
         """Trim from both ends — the pandas ``str.strip`` spelling of :meth:`trim`.
 
+        Unlike Python's ``str.strip()``, the no-argument form removes the ASCII **space**
+        only, following SQL ``TRIM``. Pass ``strip(" \t\n")`` to also drop tabs and newlines.
+
         Args:
-            chars: The set of characters to strip; whitespace when ``None``.
+            chars: The characters to strip; the ASCII space when ``None``.
 
         Returns:
             A Utf8 expression with leading and trailing characters removed.
@@ -3670,7 +3684,7 @@ class _StrNamespace:
         return StrFunc("replace", self._e, pattern=pattern, replacement=replacement)
 
     def trim(self, chars: str | None = None) -> StrFunc:
-        """Trim from both ends: any of ``chars`` if given, else whitespace.
+        """Trim from both ends: any of ``chars`` if given, else the ASCII space.
 
         DuckDB ``trim``; Polars ``strip_chars``. ``chars`` is treated as a set of
         characters to strip, not a prefix/suffix string.
@@ -3713,7 +3727,7 @@ class _StrNamespace:
         return StrFunc("trim", self.regexp_replace_all(r"\s+", " "))
 
     def lstrip(self, chars: str | None = None) -> StrFunc:
-        """Trim from the left: any of ``chars`` if given, else whitespace.
+        """Trim from the left: any of ``chars`` if given, else the ASCII space.
 
         Args:
             chars: The set of characters to strip; whitespace if omitted.
@@ -3732,7 +3746,7 @@ class _StrNamespace:
         return StrFunc("l_trim", self._e, pattern=chars)
 
     def rstrip(self, chars: str | None = None) -> StrFunc:
-        """Trim from the right: any of ``chars`` if given, else whitespace.
+        """Trim from the right: any of ``chars`` if given, else the ASCII space.
 
         Args:
             chars: The set of characters to strip; whitespace if omitted.

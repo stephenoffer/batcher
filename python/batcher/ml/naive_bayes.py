@@ -122,10 +122,23 @@ class GaussianNB:
         global_variance = ds.agg(
             **{f"v{i}": var_pop(col(name)) for i, name in enumerate(self.features)}
         ).collect()
-        smoothing = self.var_smoothing * max(
+        widest = max(
             float(global_variance.column(f"v{i}")[0].as_py() or 0.0)
             for i in range(len(self.features))
         )
+        if widest <= 0.0:
+            # `var_smoothing` is a *fraction of the widest feature variance* (as in sklearn),
+            # so when every feature is constant across the whole dataset the floor is zero,
+            # every class variance is zero, and the Gaussian log-likelihood divides by it —
+            # surfacing as `ValueError: math domain error` from inside `predict`. A single
+            # training row reaches the same place. Neither message says the features carry no
+            # information, which is the actual problem.
+            raise PlanError(
+                f"GaussianNB cannot fit: every feature in {list(self.features)} has zero "
+                f"variance across the {total} training row(s), so there is no distribution to "
+                f"learn. Drop the constant features, or fit on more rows."
+            )
+        smoothing = self.var_smoothing * widest
         aggregates: dict[str, object] = {"__bt_n": col(self.target).count()}
         for i, name in enumerate(self.features):
             aggregates[f"m{i}"] = mean_(col(name))
@@ -375,7 +388,15 @@ class BernoulliNB:
         self.log_neg_prob_: dict[object, list[float]] = {}
 
     def _present(self, name: str):
-        """The 0/1 indicator that feature `name` is present (above the threshold)."""
+        """The 0/1 indicator that feature `name` is present (above the threshold).
+
+        A null counts as **absent**, because a null compares false against the threshold.
+        That is a modeling decision rather than an accident, and the one that keeps the model
+        coherent: "absent" is a state Bernoulli NB explicitly models, and the same indicator
+        builds both the fitted presence probabilities and the prediction, so a missing value
+        means the same thing on both sides. Impute first if missingness should mean something
+        else for your data.
+        """
         return when(col(name) > lit(self.threshold)).then(lit(1.0)).otherwise(lit(0.0))
 
     def fit(self, ds: Dataset) -> BernoulliNB:

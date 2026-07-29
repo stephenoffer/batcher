@@ -48,6 +48,55 @@ def _validate_concurrency(concurrency: int | tuple[int, int] | None) -> None:
         )
 
 
+def _require_number(value: object, *, param: str, minimum: float, whole: bool = False) -> None:
+    """Reject a non-numeric or out-of-range `map_batches` option, naming it.
+
+    The retry options were range-checked but not *type*-checked, so a string or `None` got
+    as far as the comparison and raised Python's own
+    ``'<' not supported between instances of 'str' and 'int'`` — which names neither the
+    option nor what it wanted. `model_memory_gb` and `max_errored_rows` were not checked at
+    all: a negative or non-numeric model size fed the resource layer and Kyber's cost model
+    silently, and a fractional error budget was accepted as if it meant something.
+    """
+    from batcher._internal.errors import PlanError
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PlanError(
+            f"{param} must be a number >= {minimum:g}, got {type(value).__name__} {value!r}."
+        )
+    if value < minimum:
+        raise PlanError(f"{param} must be >= {minimum:g}, got {value!r}.")
+    if whole and float(value) != int(value):
+        raise PlanError(f"{param} must be a whole number, got {value!r}.")
+
+
+def _normalize_resources(resources: object) -> tuple[tuple[str, float], ...]:
+    """Validate and normalize the custom-resource request into the node's tuple form.
+
+    These names and amounts go straight to Ray's scheduler, so a negative amount, a
+    non-numeric one, or a non-string name is a request that can never be satisfied — and
+    every one of them was accepted in silence. A non-dict got as far as `.items()` and
+    raised `AttributeError`.
+    """
+    from batcher._internal.errors import PlanError
+
+    if resources is None:
+        return ()
+    if not isinstance(resources, dict):
+        raise PlanError(
+            f"resources must be a {{name: amount}} dict, e.g. {{'TPU': 4}}, got "
+            f"{type(resources).__name__}."
+        )
+    for name, amount in resources.items():
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"resources keys must be non-empty resource names, got {name!r}.")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount <= 0:
+            raise PlanError(
+                f"resources[{name!r}] must be a positive number of units, got {amount!r}."
+            )
+    return tuple(sorted((str(n), float(a)) for n, a in resources.items()))
+
+
 def _normalize_retry(
     timeout: float,
     max_retries: int,
@@ -62,12 +111,9 @@ def _normalize_retry(
     """
     from batcher._internal.errors import PlanError
 
-    if timeout < 0:
-        raise PlanError(f"timeout must be >= 0 seconds (0 = no timeout), got {timeout}")
-    if max_retries < 0:
-        raise PlanError(f"max_retries must be >= 0, got {max_retries}")
-    if retry_backoff < 0:
-        raise PlanError(f"retry_backoff must be >= 0 seconds, got {retry_backoff}")
+    _require_number(timeout, param="timeout", minimum=0)
+    _require_number(max_retries, param="max_retries", minimum=0, whole=True)
+    _require_number(retry_backoff, param="retry_backoff", minimum=0)
     if retry_on is None:
         types: tuple[type[BaseException], ...] = ()
     else:
@@ -100,6 +146,124 @@ def _require_column(ds: Dataset, column: str, *, param: str) -> None:
     )
 
 
+def _require_query_vector(ds: Dataset, query: list[float], column: str, *, method: str) -> None:
+    """Reject a query vector that cannot match `column`, before the engine tries to.
+
+    A query of the wrong length is *the* vector-search mistake — an embedding produced by a
+    different model, or by the same model at a different Matryoshka dimension — and the
+    engine's answer to it was a raw ``RuntimeError: string function list.CosineSimilarity:
+    list dimensions must be equal, got left length 2 and right length 3`` from inside the
+    kernel. An empty query was worse: ``ValueError: array() requires at least one element``,
+    which names nothing at all.
+
+    The width can only be checked when the column is a fixed-size list, which is what an
+    embedding column normally is. A variable-length list column still gets the empty and
+    non-numeric checks, and its width mismatch is left to the engine as before.
+    """
+    from batcher._internal.errors import PlanError
+
+    _require_column(ds, column, param="column")
+    if not query:
+        raise PlanError(
+            f"{method} got an empty query vector; pass the embedding to search for, with the "
+            f"same number of dimensions as {column!r}."
+        )
+    width = _fixed_width(ds, column)
+    if width is not None and width != len(query):
+        raise PlanError(
+            f"{method} got a {len(query)}-dimensional query but {column!r} holds "
+            f"{width}-dimensional vectors. They must match — this usually means the query was "
+            f"embedded by a different model, or at a different Matryoshka dimension."
+        )
+
+
+def _fixed_width(ds: Dataset, column: str) -> int | None:
+    """The per-row width of `column` when the schema fixes one, else ``None``."""
+    import pyarrow as pa
+
+    schema = ds.schema
+    field = schema.field(column) if column in schema.names else None
+    if field is None:
+        return None
+    if pa.types.is_fixed_size_list(field.type):
+        return field.type.list_size
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    if is_tensor_column(field.type) and len(field.type.shape) == 1:
+        return int(field.type.shape[0])
+    return None
+
+
+def _warn_extract_overwrites(ds: Dataset, schema: dict, prompt_column: str | None) -> None:
+    """Warn when an `extract` schema field replaces a column that already exists.
+
+    Extracted fields are written with `with_columns` semantics, so a schema field named
+    after an existing column silently replaces it. Naming one after the **prompt column** is
+    the version that bites: the extraction eats its own input, and the prompts are simply
+    gone from the result with nothing raised. Nobody asks for that on purpose, and the
+    general case — quietly overwriting a column the pipeline still needs — is worth a word
+    too. A warning rather than an error, because replacing a column is a legitimate thing to
+    ask an extraction to do once you know you are asking for it.
+    """
+    clashes = sorted(set(schema) & set(ds.columns))
+    if not clashes:
+        return
+    import warnings
+
+    from batcher._internal.errors import DataWarning
+
+    prompt = f" — including the prompt column {prompt_column!r}" if prompt_column in clashes else ""
+    warnings.warn(
+        f"extract() schema field(s) {clashes} already exist on this dataset and will be "
+        f"replaced by the extracted values{prompt}. Rename the schema field if you meant to "
+        f"keep the original column.",
+        DataWarning,
+        stacklevel=3,
+    )
+
+
+def _require_llm_columns(
+    ds: Dataset,
+    *,
+    method: str,
+    prompt_column: str | None,
+    template: str | None,
+    image_column: str | None,
+) -> None:
+    """Check the column arguments of `generate`/`extract`/`classify` at the API edge.
+
+    `template` was already checked — it produces a clear "references column(s) not in the
+    data" error naming the available columns — but the plainer `prompt_column` and
+    `image_column` next to it were not, and failed with a bare pyarrow
+    ``KeyError: 'Field "nope" does not exist in schema'`` from inside the UDF. Two arguments
+    of the same call reporting the same mistake two different ways is the kind of gap that
+    makes an API feel arbitrary, and the bare one is the harder to act on.
+
+    A `template` supersedes `prompt_column` for prompt building, so when one is given the
+    prompt column is not read and is not required to exist — checking it there would reject a
+    call that works.
+    """
+    if prompt_column is not None and template is None:
+        _require_column(ds, prompt_column, param=f"{method}(prompt_column=)")
+    if image_column is not None:
+        _require_column(ds, image_column, param=f"{method}(image_column=)")
+
+
+def _require_columns(ds: Dataset, columns: list[str] | None, *, param: str) -> None:
+    """`_require_column` for a whole selection, checked eagerly and left alone when ``None``.
+
+    The loaders (`to_numpy_batches`, `iter_torch_batches`, `to_torch`, `to_tf`,
+    `stream_loader`) are **generators**, so a mistyped column name did not raise where it was
+    written. It raised a bare pyarrow ``KeyError: 'Field "NOPE" does not exist in schema'`` on
+    the first pull — which, for a training loader, is inside the first step of the training
+    loop, with no mention of the parameter, the method, or the columns that do exist.
+    """
+    if not columns:
+        return
+    for column in columns:
+        _require_column(ds, column, param=param)
+
+
 def _validate_fn(fn: object) -> None:
     """Reject a `map_batches` `fn` that cannot be called, eagerly at the API edge.
 
@@ -123,6 +287,44 @@ def _validate_fn(fn: object) -> None:
             "map_batches fn must be callable — a function, or a class to load once per worker; "
             f"got {type(fn).__name__}."
         )
+
+
+def _reject_model_id_only(
+    method: str, model: object, given: dict[str, tuple[object, object]]
+) -> None:
+    """Reject options that only apply when `model` is a model *identifier*, not a callable.
+
+    `infer` and `embed` have two shapes. Given a HuggingFace model id they build the encoder
+    themselves, so `column`, `output_column`, `device`, `normalize` and friends are theirs to
+    honor. Given a callable or class they forward straight to `map_batches`, where those
+    arguments have no meaning at all — and every one of them was being dropped in silence.
+
+    That is the worst kind of silence: ``embed(MyEncoder, normalize=True)`` returned
+    unnormalized vectors, and ``infer(Model, output_column="pred")`` wrote to whatever the
+    callable happened to name its column. Both look like they worked. Naming the ignored
+    arguments and refusing is the only version a user can act on.
+
+    Args:
+        method: The method name, for the message (``"infer"`` / ``"embed"``).
+        model: The `model` argument, which decides which shape this call is.
+        given: ``{name: (value, default)}`` for each identifier-only option.
+
+    Raises:
+        PlanError: if `model` is not a model identifier and any option differs from default.
+    """
+    if isinstance(model, str):
+        return
+    ignored = sorted(name for name, (value, default) in given.items() if value != default)
+    if not ignored:
+        return
+    from batcher._internal.errors import PlanError
+
+    raise PlanError(
+        f"ds.ml.{method}() got {ignored}, which only apply when the first argument is a model "
+        f"identifier — with a callable or class the call forwards to map_batches, where they "
+        f"have no effect. Move that behavior inside the callable, and use output_columns=[...] "
+        f"to declare the schema it produces."
+    )
 
 
 def _validate_output_columns(
@@ -219,56 +421,165 @@ def _row_adapter(fn: Callable, cols: tuple[str, ...] | None, max_concurrency: in
 
 def _bind_fn(
     fn: Callable | type,
+    fn_args: tuple | None,
     fn_kwargs: dict | None,
+    fn_constructor_args: tuple | None,
     fn_constructor_kwargs: dict | None,
 ) -> Callable | type:
-    """Bind extra call / constructor kwargs onto `fn`, preserving load-once semantics.
+    """Bind extra call / constructor arguments onto `fn`, preserving load-once semantics.
 
-    `fn_kwargs` are forwarded to every batch call, `fn_constructor_kwargs` to a class's
-    one-per-worker construction (the Ray Data ``map_batches`` convention). A class stays a
-    class after binding, so the engine still loads the model once per worker rather than
-    per batch.
+    `fn_args`/`fn_kwargs` are forwarded to every batch call as ``fn(batch, *args, **kwargs)``,
+    and `fn_constructor_args`/`fn_constructor_kwargs` to a class's one-per-worker
+    construction (the Ray Data ``map_batches`` convention). A class stays a class after
+    binding, so the engine still loads the model once per worker rather than per batch.
+
+    The positional halves matter more than symmetry: the natural spelling of a model class is
+    ``Classifier("bert-base-uncased", device="cuda")``, and with only the keyword forms a
+    user whose ``__init__`` takes a positional checkpoint path had no way to pass it at all
+    short of subclassing.
     """
-    fkw = fn_kwargs or {}
-    ckw = fn_constructor_kwargs or {}
-    if ckw and not isinstance(fn, type):
+    fargs, fkw = tuple(fn_args or ()), fn_kwargs or {}
+    cargs, ckw = tuple(fn_constructor_args or ()), fn_constructor_kwargs or {}
+    if (cargs or ckw) and not isinstance(fn, type):
         from batcher._internal.errors import PlanError
 
         raise PlanError(
-            "fn_constructor_kwargs only applies to a class fn (loaded once per worker); "
-            f"got {type(fn).__name__}. Pass a class, or move the values into fn_kwargs."
+            "fn_constructor_args/fn_constructor_kwargs only apply to a class fn (loaded once "
+            f"per worker); got {type(fn).__name__}. Pass a class, or move the values into "
+            "fn_args/fn_kwargs."
         )
-    if not fkw and not ckw:
+    if not (fargs or fkw or cargs or ckw):
         return fn
     if isinstance(fn, type):
-        base = fn
-        from batcher.core.udf.async_udf import is_async_udf
+        return _bound_model(fn, cargs, ckw, fargs, fkw)
+    from batcher.api.dataset.callbacks import _AsyncBoundBatchFn, _BoundBatchFn
+    from batcher.core.udf.async_udf import is_async_udf
 
-        if is_async_udf(base):
-            # An async model must stay async through the wrapper, or the coroutine `__call__`
-            # returns is never awaited (it is routed to the sync path and coerced as garbage).
-            class _BoundModel:
-                def __init__(self) -> None:
-                    self._inner = base(**ckw)
+    binder = _AsyncBoundBatchFn if is_async_udf(fn) else _BoundBatchFn
+    return binder(fn, fargs, fkw)
 
-                async def __call__(self, batch: object) -> object:
-                    return await self._inner(batch, **fkw)
 
-        else:
+def _bound_model(base: type, cargs: tuple, ckw: dict, fargs: tuple, fkw: dict) -> type:
+    """A class that builds `base(*cargs, **ckw)` once and calls it with `fargs`/`fkw`.
 
-            class _BoundModel:
-                def __init__(self) -> None:
-                    self._inner = base(**ckw)
+    Still a class, so `build_udf_callable` keeps instantiating it exactly once per worker —
+    binding arguments must never turn a load-once model into a per-batch reload.
 
-                def __call__(self, batch: object) -> object:
-                    return self._inner(batch, **fkw)
+    The wrapper forwards `close()`, which the previous version did not: `teardown_udf` looks
+    for `close` on the *built* object, found none on the wrapper, and silently skipped the
+    teardown of every model configured with `fn_constructor_kwargs`. A load-once model's
+    `close` is exactly where a GPU allocation or an HTTP session is released, so the
+    difference showed up as VRAM that never came back between partitions.
+    """
+    from batcher.core.udf.async_udf import is_async_udf
 
-        _BoundModel.__name__ = f"Bound{base.__name__}"
-        _BoundModel.__qualname__ = _BoundModel.__name__
-        return _BoundModel
-    import functools
+    class _Bound:
+        def __init__(self) -> None:
+            self._inner = base(*cargs, **ckw)
 
-    return functools.partial(fn, **fkw)
+        def close(self) -> None:
+            close = getattr(self._inner, "close", None)
+            if callable(close):
+                close()
+
+    if is_async_udf(base):
+        # An async model must stay async through the wrapper, or the coroutine `__call__`
+        # returns is never awaited (it is routed to the sync path and coerced as garbage).
+        class _BoundModel(_Bound):
+            async def __call__(self, batch: object) -> object:
+                return await self._inner(batch, *fargs, **fkw)
+
+    else:
+
+        class _BoundModel(_Bound):  # type: ignore[no-redef]
+            def __call__(self, batch: object) -> object:
+                return self._inner(batch, *fargs, **fkw)
+
+    _BoundModel.__name__ = f"Bound{base.__name__}"
+    _BoundModel.__qualname__ = _BoundModel.__name__
+    return _BoundModel
+
+
+#: Column count above which an undeclared `input_columns` is worth a warning. Below it the
+#: unpruned read costs little and the advice would be noise on every narrow table; the field
+#: guides put the interesting range at "wide tables (50+ columns), 10-50x I/O difference",
+#: and 12 is where a scan is already reading several columns nothing downstream will touch.
+_WIDE_TABLE_COLUMNS = 12
+
+
+def _warn_if_pushdown_is_defeated(
+    input_columns: object, columns: list[str], output_columns: object
+) -> None:
+    """Warn when an opaque UDF over a wide table forces the scan to read every column.
+
+    Projection pushdown is the single highest-impact IO optimization in the field guides
+    (2-10x on a wide table, 10-50x past 50 columns), and it is the one Batcher does
+    automatically — right up to a `map_batches`. The `fn` is a Python callback, so the
+    optimizer cannot see which columns it reads and must assume *all* of them; the scan then
+    reads the whole table to feed a stage that may touch two columns.
+
+    `input_columns` is the declaration that restores it, and there is no way to infer it. So
+    the one case where Batcher's automatic pushdown silently stops working is worth saying
+    out loud, at the call site that caused it, rather than leaving it to be discovered in a
+    profile.
+
+    A stage whose `output_columns` carry every input column through is exempt: it genuinely
+    needs all of them, so there is nothing to declare and the advice would be wrong. That is
+    the shape of every append-a-column UDF — `ds.ml.generate`, `embed`, `classify` — which
+    would otherwise be told to prune columns it is contractually obliged to return.
+    """
+    if input_columns is not None or len(columns) < _WIDE_TABLE_COLUMNS:
+        return
+    if output_columns is not None and set(columns) <= set(output_columns):
+        return
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        f"map_batches over {len(columns)} columns did not declare input_columns, so the "
+        f"optimizer must assume the fn reads all of them and the scan cannot prune. Pass "
+        f"input_columns=[...] naming what the fn actually reads to restore projection "
+        f"pushdown.",
+        PerformanceWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_if_training_on_sorted_data(plan: object, shuffle: bool, window: object) -> None:
+    """Warn when a training loader is built over an explicitly sorted plan without shuffling.
+
+    Training on ordered data is the classic silent convergence bug: the model sees all of one
+    class, then all of the next, and the loss curve looks merely disappointing rather than
+    wrong. The guides file it under "training loss not decreasing" and "non-deterministic
+    results", where the listed causes are the learning rate and the data — never the ordering.
+
+    `shuffle=False` is the right default here because it is `torch.utils.data.DataLoader`'s,
+    and a user reaching for this method is coming from torch. So instead of changing the
+    default, the *plan* is inspected: a `sort` the user wrote themselves, feeding a loader
+    with no shuffling, is a combination almost nobody wants. Pure plan shape — no scan, no
+    cost, and silent for a corpus that was never sorted.
+    """
+    if shuffle or window:
+        return
+    from batcher.plan.logical import Sort
+    from batcher.plan.profile import logical_preorder
+
+    if not any(isinstance(node, Sort) for _depth, node in logical_preorder(plan)):
+        return
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        "this dataset is explicitly sorted and the loader was built without shuffling, so "
+        "each training step sees a contiguous run of the sort key — the model learns the "
+        "ordering, and the only symptom is a loss curve that looks merely disappointing. "
+        "Pass shuffle=True (or local_shuffle_buffer_size=N) unless the order is the point, "
+        "as it is for a sequence model.",
+        PerformanceWarning,
+        stacklevel=3,
+    )
 
 
 def _warn_if_model_reloads(fn: object, num_gpus: float) -> None:
@@ -345,7 +656,9 @@ class DatasetML:
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
+        fn_args: tuple | None = None,
         fn_kwargs: dict | None = None,
+        fn_constructor_args: tuple | None = None,
         fn_constructor_kwargs: dict | None = None,
         accelerator_type: str | None = None,
         resources: dict[str, float] | None = None,
@@ -460,8 +773,13 @@ class DatasetML:
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: What `fn` sees — ``"pyarrow"``, ``"numpy"``, ``"pandas"``,
                 or ``"torch"``.
+            fn_args: Extra positional arguments forwarded to every call, after the batch:
+                ``fn(batch, *fn_args)`` (the Ray Data convention).
             fn_kwargs: Extra keyword arguments forwarded to every ``fn(batch, ...)`` call
                 (the Ray Data convention).
+            fn_constructor_args: Positional arguments for a class `fn`'s one-per-worker
+                construction, e.g. the checkpoint path in ``Classifier("bert-base")``;
+                invalid for a plain-function `fn`.
             fn_constructor_kwargs: Extra keyword arguments for a class `fn`'s
                 one-per-worker construction; invalid for a plain-function `fn`.
             accelerator_type: Pin actors to a device model (e.g. ``"NVIDIA_A100"``).
@@ -511,6 +829,9 @@ class DatasetML:
         validate_batch_size(batch_size)
         validate_num_gpus(num_gpus)
         _validate_concurrency(concurrency)
+        _require_number(max_errored_rows, param="max_errored_rows", minimum=0, whole=True)
+        _require_number(model_memory_gb, param="model_memory_gb", minimum=0)
+        normalized_resources = _normalize_resources(resources)
         timeout_s, retries, backoff_s, retry_types = _normalize_retry(
             timeout, max_retries, retry_backoff, retry_on
         )
@@ -521,8 +842,9 @@ class DatasetML:
         _validate_fn(fn)
         _validate_output_columns(output_columns)
         _warn_async_combos(fn, multiprocessing, num_gpus)
-        fn = _bind_fn(fn, fn_kwargs, fn_constructor_kwargs)
+        fn = _bind_fn(fn, fn_args, fn_kwargs, fn_constructor_args, fn_constructor_kwargs)
         _warn_if_model_reloads(fn, num_gpus)
+        _warn_if_pushdown_is_defeated(input_columns, self._ds.columns, output_columns)
         cols = tuple(output_columns) if output_columns is not None else None
         return self._ds._derive(
             MapBatches(
@@ -539,7 +861,7 @@ class DatasetML:
                 concurrency=concurrency,
                 batch_format=batch_format,
                 accelerator_type=accelerator_type,
-                resources=tuple(sorted((resources or {}).items())),
+                resources=normalized_resources,
                 model_memory_gb=model_memory_gb,
                 multiprocessing=multiprocessing,
                 max_errored_rows=max_errored_rows,
@@ -675,7 +997,10 @@ class DatasetML:
 
         Pass a **callable or class** instead for full control (a class loads the model
         once per worker — the GPU-inference pattern); the call then mirrors
-        `map_batches`, with `output_columns` declaring the result schema.
+        `map_batches`, with `output_columns` declaring the result schema. The options
+        that exist only to configure the identifier path — `column`, `output_column`,
+        `task`, `device`, `dtype`, `model_kwargs` — are **rejected** in that shape rather
+        than ignored, because the callable is where that behavior now lives.
 
         Either way `num_gpus`/`concurrency`/`accelerator_type`/`model_memory_gb` place
         and size the model on GPU actors while upstream preprocessing stays on CPU
@@ -751,6 +1076,18 @@ class DatasetML:
                 accelerator_type=accelerator_type,
                 model_memory_gb=model_memory_gb,
             )
+        _reject_model_id_only(
+            "infer",
+            model,
+            {
+                "column": (column, None),
+                "output_column": (output_column, "prediction"),
+                "task": (task, None),
+                "device": (device, None),
+                "dtype": (dtype, None),
+                "model_kwargs": (model_kwargs, None),
+            },
+        )
         return self.map_batches(
             model,
             batch_size=batch_size,
@@ -1429,6 +1766,7 @@ class DatasetML:
 
         if k < 1:
             raise PlanError(f"nearest_neighbors k must be >= 1, got {k}")
+        _require_query_vector(self._ds, query, column, method="nearest_neighbors")
         q = array(*[lit(float(x)) for x in query])
         vec = col(column)
         # cosine/l2/l1/hamming are distances (smaller = nearer); dot is a similarity.
@@ -1631,6 +1969,7 @@ class DatasetML:
         from batcher._internal.errors import PlanError
         from batcher.plan.expr_ir import array, col, lit
 
+        _require_query_vector(self._ds, query, column, method="similarity_to")
         q = array(*[lit(float(x)) for x in query])
         vec = col(column)
         if metric == "cosine":
@@ -1942,6 +2281,7 @@ class DatasetML:
                 >>> for batch in DataLoader(iterable, batch_size=None):  # doctest: +SKIP
                 ...     train_step(batch["image"], batch["label"])
         """
+        _require_columns(self._ds, columns, param="columns")
         from batcher.ml.loader import stream_loader
 
         return stream_loader(
@@ -2016,6 +2356,7 @@ class DatasetML:
                 >>> for batch in loader:  # doctest: +SKIP
                 ...     train_step(batch["image"], batch["label"])
         """
+        _require_columns(self._ds, columns, param="columns")
         from batcher.ml.loader import iter_torch_batches
 
         return iter_torch_batches(
@@ -2115,11 +2456,13 @@ class DatasetML:
                 >>> for batch in loader:  # doctest: +SKIP
                 ...     train_step(batch)
         """
+        _require_columns(self._ds, columns, param="columns")
         from torch.utils.data import DataLoader, IterableDataset
 
         from batcher.ml.converters import _worker_stride
 
         window = local_shuffle_buffer_size
+        _warn_if_training_on_sorted_data(self._ds._plan, shuffle, window)
         if window is None and shuffle:
             window = 8192
         accessor = self
@@ -2177,6 +2520,7 @@ class DatasetML:
                 >>> tf_ds = ds.ml.to_tf(batch_size=256)  # doctest: +SKIP
                 >>> model.fit(tf_ds)  # doctest: +SKIP
         """
+        _require_columns(self._ds, columns, param="columns")
         from batcher.ml.converters import to_tf_dataset
 
         return to_tf_dataset(self._ds.iter_batches(batch_size), columns=columns)
@@ -2207,6 +2551,7 @@ class DatasetML:
                 >>> next(ds.ml.to_numpy_batches(batch_size=2))
                 {'x': array([1, 2])}
         """
+        _require_columns(self._ds, columns, param="columns")
         from batcher.ml.converters import to_numpy_batches
 
         return to_numpy_batches(self._ds.iter_batches(batch_size), columns=columns)
@@ -2297,6 +2642,13 @@ class DatasetML:
                 >>> ds.ml.generate(shout, prompt_column="q").to_pydict()
                 {'q': ['2+2?', 'capital of France?'], 'response': ['2+2?', 'CAPITAL OF FRANCE?']}
         """
+        _require_llm_columns(
+            self._ds,
+            method="generate",
+            prompt_column=prompt_column,
+            template=template,
+            image_column=image_column,
+        )
         from batcher.ml.llm import llm_udf
 
         udf = llm_udf(
@@ -2403,6 +2755,13 @@ class DatasetML:
                 >>> out.to_pydict()
                 {'note': ['Paid 42 USD to Acme'], 'vendor': ['Acme'], 'total': [42.0]}
         """
+        _require_llm_columns(
+            self._ds,
+            method="extract",
+            prompt_column=prompt_column,
+            template=template,
+            image_column=image_column,
+        )
         from batcher.ml.llm import llm_extract_udf
 
         udf = llm_extract_udf(
@@ -2414,6 +2773,7 @@ class DatasetML:
             image_column=image_column,
         )
         new = [c for c in schema if c not in self._ds.columns]
+        _warn_extract_overwrites(self._ds, schema, prompt_column)
         return self.map_batches(
             udf,
             output_columns=[*self._ds.columns, *new] if new else None,
@@ -2487,6 +2847,13 @@ class DatasetML:
                 >>> labelled.to_pydict()
                 {'review': ['loved it', 'awful'], 'label': ['positive', 'negative']}
         """
+        _require_llm_columns(
+            self._ds,
+            method="classify",
+            prompt_column=prompt_column,
+            template=template,
+            image_column=image_column,
+        )
         from batcher.ml.llm import llm_classify_udf
 
         udf = llm_classify_udf(
@@ -2538,7 +2905,10 @@ class DatasetML:
 
         Pass a **callable or class** instead for any other embedding model (text or
         image → vector); the call then mirrors `map_batches`, with `output_columns`
-        declaring the result schema.
+        declaring the result schema. The options that exist only to configure the
+        identifier path — `column`, `output_column`, `device`, `normalize`, `fp16`,
+        `output_type` — are **rejected** in that shape rather than ignored, because the
+        callable is where that behavior now lives.
 
         `num_gpus`/`concurrency`/`accelerator_type`/`model_memory_gb` place and size
         the model on GPU actors, the same scheduling as `infer`.
@@ -2614,6 +2984,18 @@ class DatasetML:
                 accelerator_type=accelerator_type,
                 model_memory_gb=model_memory_gb,
             )
+        _reject_model_id_only(
+            "embed",
+            model,
+            {
+                "column": (column, None),
+                "output_column": (output_column, "embedding"),
+                "device": (device, None),
+                "normalize": (normalize, False),
+                "fp16": (fp16, False),
+                "output_type": (output_type, "tensor"),
+            },
+        )
         return self.map_batches(
             model,
             batch_size=batch_size,
@@ -2659,6 +3041,7 @@ class DatasetML:
                 ... )
                 >>> images = urls.ml.download("url", output_column="bytes")  # doctest: +SKIP
         """
+        _require_column(self._ds, url_column, param="url_column")
         from batcher.ml.decode import download_dataset
 
         return download_dataset(

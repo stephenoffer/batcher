@@ -83,7 +83,12 @@ class UdfExecutor:
         # Kyber decides which columns each source must supply; Core executes with them. A UDF
         # that declared `input_columns` prunes the scan to those (plus what the plan above
         # needs); an undeclared one still reads everything, because the `fn` is a black box.
-        batches = core.execute_with_udfs(plan, sources, kyber.required_columns_per_source(plan))
+        # Hand the profiling sink down when this run is being measured, so an ML pipeline
+        # gets a per-stage `stats()` tree instead of the "no per-operator metrics" refusal.
+        recorder = getattr(ctx.profile, "stage_recorder", None) if ctx.profile else None
+        batches = core.execute_with_udfs(
+            plan, sources, kyber.required_columns_per_source(plan), recorder=recorder
+        )
         schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
         collect_source_metadata(ctx.hub, sources)

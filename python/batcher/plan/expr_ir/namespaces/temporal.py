@@ -468,9 +468,18 @@ class _DtNamespace:
         """Whole `micros_per_unit` units from `other` to this timestamp (truncated).
 
         Both sides are read as microseconds since the epoch and subtracted, so the
-        difference is exact fixed-width arithmetic — no calendar ambiguity."""
+        difference is exact fixed-width arithmetic — no calendar ambiguity.
+
+        The truncation is toward *zero*, not toward negative infinity, which is what DuckDB's
+        `date_diff` does and what every docstring here promises. Plain `//` floors, so a
+        backwards interval of 2.5 days returned -3 while the same interval measured forwards
+        returned 2: the operation was not antisymmetric, and an SLA computed in the other
+        direction silently gained a whole day. Dividing the magnitude and reapplying the sign
+        keeps `a.days_between(b) == -b.days_between(a)` for every input.
+        """
         delta = self._e.cast("int64") - other.cast("int64")
-        return (delta // micros_per_unit).cast("int64")
+        magnitude = delta.abs() // micros_per_unit
+        return (delta.sign().cast("int64") * magnitude).cast("int64")
 
     def seconds_between(self, other: Expr) -> Expr:
         """Whole seconds from `other` to this timestamp (negative if `other` is later).

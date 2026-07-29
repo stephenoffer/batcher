@@ -12,14 +12,27 @@ from __future__ import annotations
 __all__ = ["GROUPBY_UNSUPPORTED"]
 
 
+#: Where every spelling of "run my Python function over each group" now points.
+#:
+#: The advice this replaces was "drop to ds.map_batches() after a shuffle", and it was
+#: wrong in a way that returns wrong answers rather than raising: `map_batches` sees
+#: arbitrary batches, and a group is not confined to one of them. Measured over 50k rows
+#: and 20 keys, **every** key's rows spanned more than one `map_batches` call, so a
+#: per-group callback written that way silently ran once per fragment of each group.
+#: `repartition(by=)` does not fix it either — it lays out output files and leaves the
+#: batching untouched.
+_PER_GROUP_PYTHON = (
+    "Spelled ds.group_by('k').map_groups(fn) here: fn receives one whole group as a "
+    "pyarrow RecordBatch (pass batch_format='pandas' for a frame). Do NOT call "
+    "map_batches straight after grouping — a group spans several batches, so the callback "
+    "would silently see fragments. For a plain reduction use .agg(...), and to broadcast a "
+    "group statistic back onto every row use ds.window(partition_by=['k'], functions={...})."
+)
+
+
 GROUPBY_UNSUPPORTED: dict[str, str] = {
     # --- per-group Python: caps the job at one machine, so Batcher does not offer it ---
-    "apply": (
-        "A GroupBy has no per-group Python callback (it would materialize one frame per "
-        "key and cap the job at one machine). Aggregate with .agg(...), keep every row "
-        "with a window (ds.window(partition_by=[...], functions={...})), or drop to "
-        "ds.map_batches() after a shuffle."
-    ),
+    "apply": _PER_GROUP_PYTHON,
     "transform": (
         "A broadcast-back-to-rows transform is a window, not a group_by: "
         "ds.window(partition_by=['k'], functions={'gmean': ('avg', 'x')}) adds the group "
@@ -114,6 +127,6 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
         "Batcher's pivot is a Dataset method, not a grouped one: "
         "ds.pivot(index=['k'], on='col', values='v', aggregate='sum')."
     ),
-    "applyInPandas": "Spelled ds.map_batches(fn) after grouping, or .agg(...) for reductions.",
+    "applyInPandas": _PER_GROUP_PYTHON,
     "cogroup": "Co-grouping two frames is a join on the key: ds.join(other, on='k').",
 }

@@ -43,6 +43,56 @@ def _chunks(items: list, size: int) -> list[list]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+#: How far a vector's L2 norm may sit from 1.0 before it is judged un-normalized. Loose
+#: enough that float32 accumulation over a few thousand dimensions never trips it.
+_UNIT_NORM_TOLERANCE = 0.05
+#: Warned once per process: this is checked per batch, and a whole corpus from the same
+#: endpoint would otherwise repeat one message thousands of times.
+_NORM_WARNED = False
+
+
+def _warn_if_not_unit_norm(vectors: list) -> None:
+    """Warn once when `normalize=False` is paired with an endpoint that does not normalize.
+
+    `normalize=False` is the right default for OpenAI, whose API returns unit vectors — and
+    re-normalizing a unit vector is pure cost. But the same request shape is spoken by Azure,
+    Together, and **vLLM's embedding server**, and vLLM does *not* normalize. Point this
+    encoder at one of those, keep the default, and every cosine similarity downstream is
+    computed against un-normalized vectors: a silently wrong ranking, with nothing raised and
+    no test that fails.
+
+    So rather than guess a default per provider, the vectors are measured. One norm over the
+    first batch's first vector settles it.
+
+    Args:
+        vectors: The batch's embeddings, in request order.
+    """
+    global _NORM_WARNED
+    if _NORM_WARNED or not vectors:
+        return
+    import math
+
+    first = vectors[0]
+    if first is None or len(first) == 0:
+        return
+    norm = math.sqrt(sum(float(v) * float(v) for v in first))
+    if abs(norm - 1.0) <= _UNIT_NORM_TOLERANCE:
+        return
+    _NORM_WARNED = True
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        f"this endpoint returned a vector with L2 norm {norm:.3f}, not 1.0, and "
+        f"normalize=False. A dot product over these is not cosine similarity, so any "
+        f"nearest-neighbour search over them ranks by magnitude as well as direction. Pass "
+        f"normalize=True unless you are scoring with a metric that expects raw magnitudes.",
+        PerformanceWarning,
+        stacklevel=4,
+    )
+
+
 class _ApiEncoder:
     """Base class UDF: embed a text column by calling `_embed_chunk` over sub-batches.
 
@@ -94,6 +144,8 @@ class _ApiEncoder:
         raw = batch.column(self._text_column).to_pylist()
         texts = ["" if v is None else str(v) for v in raw]
         vectors = self._embed_all(texts)
+        if not self._normalize:
+            _warn_if_not_unit_norm(vectors)
         col = _to_embedding_column(
             vectors, normalize=self._normalize, output_type=self._output_type
         )

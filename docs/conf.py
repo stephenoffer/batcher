@@ -179,12 +179,12 @@ exclude_patterns = [
     # A contributor working record (scope + dependency-ordered migration), not a site page.
     "internals/rust_optimizer_port.md",
     # A code-checked audit of Batcher's architecture against DuckDB / Polars / Spark /
-    # Flink / Ray Data / Daft / Snowflake: where it genuinely wins, where it loses, the
+    # Flink / Daft / Snowflake: where it genuinely wins, where it loses, the
     # structural ceilings, and the claims the code does not support. A working record for
     # contributors (and deliberately blunt about our own marketing), not a site page.
     "internals/competitive_architecture.md",
     # The parts list behind that scorecard: which specific mechanisms DuckDB / Polars /
-    # DataFusion / Spark / Daft / Ray Data have that Batcher does not, each cited to the
+    # DataFusion / Spark / Daft have that Batcher does not, each cited to the
     # competitor file it was read from, plus the ranked build order. A contributor working
     # record, not a site page.
     "internals/competitor_technique_review.md",

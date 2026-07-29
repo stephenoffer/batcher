@@ -9,10 +9,15 @@ subsystems, and is split out of `terminal.core` to keep that module within size 
 
 from __future__ import annotations
 
-from batcher._internal.errors import BackendError
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.profile import Decision, OpProfile, QueryProfile
+from batcher.plan.profile import (
+    Decision,
+    OpProfile,
+    ProfileCollector,
+    QueryProfile,
+    merge_metric_ops,
+)
 
 __all__ = [
     "admission_decision",
@@ -21,6 +26,7 @@ __all__ = [
     "planned_profile",
     "record_plan",
     "record_spill",
+    "resource_decision",
     "run_profiled",
     "verdict_summary",
 ]
@@ -46,8 +52,7 @@ def record_spill(prof, partitions: int, reason: str | None = None) -> None:
             subsystem="carbonite",
             category="spill",
             summary=(
-                f"executed out-of-core under bounded memory ({partitions} partitions)"
-                f"{because}"
+                f"executed out-of-core under bounded memory ({partitions} partitions){because}"
             ),
             detail={"partitions": partitions, "reason": reason},
         )
@@ -120,6 +125,28 @@ def admission_decision(verdict) -> Decision:
     )
 
 
+def resource_decision(rm) -> Decision:
+    """A neutral `Decision` carrying Carbonite's live resource reading for the profile.
+
+    `explain(analyze=True)` reports what the query *did* and what the optimizer *chose*,
+    and said nothing about the envelope it ran in. That is the missing half of a slow-query
+    diagnosis: the same plan is fast with headroom and slow at the edge of the budget, and
+    from the plan alone the two look identical.
+
+    Args:
+        rm: The Carbonite `ResourceManager` the query ran under.
+
+    Returns:
+        A `Decision` whose detail is the manager's `stats()` snapshot.
+    """
+    stats = rm.stats()
+    pool = stats.get("pool") or {}
+    summary = f"memory pressure {stats.get('pressure_level', 'UNKNOWN')}"
+    if pool:
+        summary += f", envelope {pool.get('peak_utilization', 0.0):.0%} used at peak"
+    return Decision(subsystem="carbonite", category="resources", summary=summary, detail=stats)
+
+
 def explain(
     plan: LogicalPlan,
     sources: list[Source],
@@ -175,23 +202,74 @@ def _io_throughput_decisions(sources: list[Source], hub) -> list:
     return out
 
 
-def _logical_op_profiles(plan: LogicalPlan, depth: int = 0) -> list[OpProfile]:
-    """Planned-only `OpProfile`s from the un-lowered LOGICAL plan tree, pre-order.
+def _logical_op_profiles(
+    plan: LogicalPlan, metric_ops: list[dict] | None = None
+) -> list[OpProfile]:
+    """`OpProfile`s from the un-lowered LOGICAL plan tree, pre-order.
 
     The seam a UDF plan takes: a `map_batches`/inference pipeline has no engine IR (its
     `to_ir()` deliberately raises), so the estimate/measure join `build_op_profiles`
     performs off the lowered IR cannot run. This walks the logical tree via
-    `batcher.plan.visitor.children`, naming each operator by its node type, so `explain()`
-    still renders a readable operator tree — `MapBatches` included — instead of crashing.
-    The `op_id` is the pre-order index, matching the ordering `walk_ir` would assign.
-    """
-    from batcher.plan.visitor import children
+    `logical_preorder`, naming each operator by its node type, so `explain()` renders a
+    readable operator tree — `MapBatches` included — instead of crashing.
 
-    out = [OpProfile(op_id=0, kind=type(plan).__name__, depth=depth)]
-    for child in children(plan):
-        for op in _logical_op_profiles(child, depth + 1):
-            out.append(OpProfile(op_id=len(out), kind=op.kind, depth=op.depth))
+    `metric_ops` are the `StageRecorder`'s measurements for the same tree, numbered by the
+    same walk, so `stats()` on an ML pipeline shows measured rows and time per stage rather
+    than refusing. `None` leaves every row planned-only, which is `explain()` without
+    `analyze`.
+    """
+    from batcher.plan.profile import logical_preorder
+
+    measured = {int(m.get("op_id", -1)): m for m in (metric_ops or [])}
+    nodes = list(logical_preorder(plan))
+    out: list[OpProfile] = []
+    for op_id, (depth, node) in enumerate(nodes):
+        m = measured.get(op_id)
+        # Prefer the measured operator name, as `build_op_profiles` does: it is the only
+        # thing that can tell a per-row `map` from a vectorized `map_batches`, which are the
+        # same node type but 10-100x apart in cost.
+        kind = str(m.get("kind")) if m and m.get("kind") else type(node).__name__
+        if m is None:
+            out.append(OpProfile(op_id=op_id, kind=kind, depth=depth))
+            continue
+        out.append(
+            OpProfile(
+                op_id=op_id,
+                kind=kind,
+                depth=depth,
+                measured=True,
+                rows_in=_rows_in(m, op_id, nodes, measured),
+                rows_out=int(m.get("rows_out", 0)),
+                elapsed_ms=float(m.get("elapsed_ns", 0)) / 1e6,
+                result_bytes=int(m.get("result_bytes", 0)),
+                threads=int(m.get("threads", 0)),
+                backend=str(m.get("backend", "")),
+            )
+        )
     return out
+
+
+def _rows_in(metric: dict, op_id: int, nodes: list, measured: dict) -> int:
+    """A stage's input rows, read off the stage below it when it could not count them.
+
+    The streaming path meters a stage by wrapping its *output* generator, which sees no
+    input — so it reports `rows_in=0` and the tree supplies it instead. In a linear chain
+    (which is the only shape that path takes) a stage's input is exactly the output of the
+    node directly beneath it, i.e. the next entry in the pre-order walk. Without this the
+    table shows `0` for every streamed stage, which reads as "this stage consumed nothing"
+    rather than "this seam could not observe it".
+    """
+    rows_in = int(metric.get("rows_in", 0))
+    if rows_in:
+        return rows_in
+    child_id = op_id + 1
+    if child_id >= len(nodes):
+        return 0
+    depth, _node = nodes[op_id]
+    child_depth, _child = nodes[child_id]
+    if child_depth != depth + 1:  # not this node's child — a sibling or an ancestor's
+        return 0
+    return int(measured.get(child_id, {}).get("rows_out", 0))
 
 
 def _udf_planned_profile(plan: LogicalPlan, sources: list[Source], hub) -> QueryProfile:
@@ -253,8 +331,13 @@ def run_profiled(
     config, so the profile reflects reality: single-node gives every operator a measured
     row in the driver tree; a distributed aggregate adds a measured *worker map sub-plan*
     section (its own op-id space, kept separate rather than joined). Raises `PlanError` for
-    an unbounded source and `BackendError` for a `map_batches`/ML pipeline (the opaque UDF
-    path emits no per-operator metrics — profile the relational portion instead).
+    an unbounded source.
+
+    A `map_batches`/ML pipeline has no engine IR to number operators against, so its stages
+    are measured by the orchestrator instead (`StageRecorder`) and rendered against the
+    logical tree. That path used to refuse outright, which left the batch-inference shape —
+    the one the ML surface exists for — with no answer to "which stage is the bottleneck",
+    the first question every tuning guide asks.
     """
     import time
 
@@ -270,12 +353,6 @@ def run_profiled(
         raise PlanError(
             "explain(analyze=True)/stats() materializes the result, but the dataset "
             "has an unbounded source."
-        )
-    if core.has_map_batches(plan):
-        raise BackendError(
-            "explain(analyze=True)/stats() is not available for map_batches/ML pipelines "
-            "(the opaque UDF path emits no per-operator metrics); profile the relational "
-            "portion instead."
         )
     collector = ProfileCollector()
     # Pass plan + sources so the size-aware "auto" decision matches `collect()`. Resolving
@@ -296,6 +373,62 @@ def run_profiled(
         budget = PressureMonitor().budget_bytes()
     except Exception:  # pragma: no cover - a missing budget just omits the memory-% line
         budget = 0
+    if core.has_map_batches(plan):
+        return _udf_measured_profile(
+            plan, sources, collector, total_ms=total_ms, rows=table.num_rows, query_id=query_id
+        )
     return collector.to_profile(
         total_ms=total_ms, rows=table.num_rows, query_id=query_id, memory_budget_bytes=budget
+    )
+
+
+def _udf_measured_profile(
+    plan: LogicalPlan,
+    sources: list[Source],
+    collector: ProfileCollector,
+    *,
+    total_ms: float,
+    rows: int,
+    query_id: str,
+) -> QueryProfile:
+    """A measured `QueryProfile` for a `map_batches`/ML pipeline, off the logical tree.
+
+    The engine numbers operators against the lowered IR, which this plan shape does not have,
+    so the stages are numbered against the logical plan instead and the two never mix. Row
+    estimates stay absent: Kyber cannot size past an opaque UDF, and inventing a number here
+    would make `est_error` compare a measurement against a guess.
+
+    **Distributed is the one case this cannot measure.** The stages then run inside Ray
+    workers, in other processes, while the recorder lives on the driver — so it collects
+    nothing. The profile says so rather than rendering an empty table that looks like a run
+    which did no work, and it still carries any `worker_ops` the workers shipped back.
+    """
+    from batcher import core
+    from batcher.plan.profile import worker_op_profiles
+
+    metric_ops = collector.stage_recorder.metric_ops()
+    workers = (
+        worker_op_profiles(merge_metric_ops(collector.worker_metrics))
+        if collector.worker_metrics
+        else ()
+    )
+    summary = (
+        "map_batches/UDF pipeline measured per stage against the logical tree "
+        "(no engine IR, so no row estimates to compare against)"
+    )
+    if not metric_ops:
+        summary = (
+            "map_batches/UDF pipeline ran in worker processes, so the driver measured no "
+            "stages; per-stage timings are available on a single-node run"
+        )
+    note = Decision(subsystem="core", category="explain", summary=summary)
+    return QueryProfile(
+        ops=tuple(_logical_op_profiles(plan, metric_ops)),
+        total_ms=total_ms,
+        rows=rows,
+        query_id=query_id,
+        measured=bool(metric_ops) or bool(workers),
+        distributed=collector.distributed,
+        decisions=(note, *_io_throughput_decisions(sources, core.default_hub())),
+        worker_ops=workers,
     )

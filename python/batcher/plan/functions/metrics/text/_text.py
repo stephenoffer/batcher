@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr
+from batcher.plan.functions.collection import element
 
 __all__ = ["char_ngrams", "mean_ratio", "normalize", "tokens"]
 
@@ -26,8 +27,16 @@ def normalize(text: Expr) -> Expr:
 
 
 def tokens(text: Expr) -> Expr:
-    """The normalized whitespace-delimited tokens of a text column, as a list."""
-    return normalize(text).str.split(" ")
+    """The normalized whitespace-delimited tokens of a text column, as a list.
+
+    Splitting an *empty* normalized string yields `[""]` rather than `[]`, which would give a
+    row with no tokens a phantom single token: `n_unique / len` reads 1/1 instead of scoring
+    the row zero. That is not hypothetical — normalization drops articles, so a generation
+    stuck on "the the the" normalizes to empty and scored a perfect diversity of 1.0, the exact
+    degeneration `distinct_token_ratio` exists to catch. Dropping empty tokens makes the list
+    genuinely empty so `mean_ratio`'s zero-denominator guard fires.
+    """
+    return normalize(text).str.split(" ").list.filter(element() != lit(""))
 
 
 def char_ngrams(text: Expr, n: int) -> Expr:

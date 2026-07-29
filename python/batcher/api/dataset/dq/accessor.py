@@ -22,6 +22,35 @@ if TYPE_CHECKING:
 __all__ = ["DatasetDQ"]
 
 
+def _require_comparable(ds: Any, column: str, low: Any, high: Any) -> None:
+    """Reject an `in_range` bound whose type the column cannot be compared against.
+
+    A numeric bound on a text column reached the engine and returned
+    ``Invalid comparison operation: Utf8 >= Int64`` — an Arrow message naming two type
+    codes and neither the check, the column, nor the bound. The schema knows both sides
+    before anything runs.
+
+    Only a clear mismatch is rejected. Numeric bounds against a numeric column, and any
+    bound against a column whose type is not yet known, pass through as before.
+    """
+    import pyarrow as pa
+
+    schema = ds.schema
+    if column not in schema.names:
+        return  # the constraint's own filter reports an unknown column
+    dtype = schema.field(column).type
+    numeric_bounds = all(
+        isinstance(b, (int, float)) and not isinstance(b, bool) for b in (low, high)
+    )
+    text_column = pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+    if numeric_bounds and text_column:
+        raise PlanError(
+            f"in_range({column!r}, {low!r}, {high!r}) compares numeric bounds against a "
+            f"{dtype} column. Point it at a numeric column, cast this one "
+            f"(`bt.col({column!r}).cast('float64')`), or use accepted_values/matches for text."
+        )
+
+
 class DatasetDQ:
     """Accessor for data-quality expectations over a `Dataset` (``ds.dq``).
 
@@ -115,6 +144,7 @@ class DatasetDQ:
             raise PlanError(
                 f"in_range({column!r}): low ({low!r}) > high ({high!r}) — swap the arguments?"
             )
+        _require_comparable(self._ds, column, low, high)
         c = Col(column)
         return self._add(
             RowConstraint(f"in_range({column}, {low}, {high})", c.is_null() | c.between(low, high))
@@ -138,6 +168,19 @@ class DatasetDQ:
                 >>> ds.dq.matches("code", r"^[A-Z][0-9]$").drop().to_pydict()
                 {'code': ['A1', 'B2']}
         """
+        # Compile it here so a malformed pattern names the check and the column. The engine
+        # otherwise reported a bare `invalid regular expression: [` from the Rust matcher,
+        # with no indication of which of a pipeline's checks carried it. Python's regex
+        # dialect is not the engine's, so this catches the malformed patterns rather than
+        # every pattern the engine would reject; a dialect difference still surfaces there.
+        import re
+
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise PlanError(
+                f"matches({column!r}, {pattern!r}) is not a valid regular expression: {exc}."
+            ) from exc
         c = Col(column)
         return self._add(
             RowConstraint(
@@ -163,9 +206,19 @@ class DatasetDQ:
                 >>> ds.dq.accepted_values("c", ["a", "b"]).drop().to_pydict()
                 {'c': ['a', 'b']}
         """
+        allowed = list(values)
+        if not allowed:
+            # An empty allow-list makes every non-null row a violation, so `.drop()`
+            # silently empties the dataset. That is never the intent — it is a config
+            # value that arrived empty — and every sibling that takes a set of values
+            # (`classify(labels=)`, `random_split`) already refuses one.
+            raise PlanError(
+                f"accepted_values({column!r}): values must be non-empty; an empty "
+                "allow-list rejects every row."
+            )
         c = Col(column)
         return self._add(
-            RowConstraint(f"accepted_values({column})", c.is_null() | c.is_in(list(values)))
+            RowConstraint(f"accepted_values({column})", c.is_null() | c.is_in(allowed))
         )
 
     def check(self, predicate: Expr, *, name: str) -> DatasetDQ:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 
+from batcher._internal.errors import PlanError
 from batcher._internal.mathx import ceil_div
 from batcher.ml.permutation import _FeistelPermutation, epoch_permutation
 
@@ -98,7 +99,7 @@ def usable_length(total: int, world_size: int, *, drop_last: bool = True) -> int
         The epoch's length in sample positions, a multiple of `world_size`.
     """
     if world_size <= 0:
-        raise ValueError("world_size must be positive")
+        raise PlanError("world_size must be positive")
     if drop_last:
         return (total // world_size) * world_size
     return total + (-total % world_size)
@@ -175,7 +176,7 @@ def _rank_positions(
     is what keeps a trillion-sample epoch free: it slices, counts and iterates lazily.
     """
     if not (0 <= rank < world_size):
-        raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+        raise PlanError(f"rank {rank} out of range for world_size {world_size}")
     usable = usable_length(num_samples, world_size, drop_last=drop_last)
     start = max(0, global_consumed)
     first = rank
@@ -200,7 +201,7 @@ def num_rank_batches(
     agrees everywhere.
     """
     if batch_size < 1:
-        raise ValueError("batch_size must be positive")
+        raise PlanError("batch_size must be positive")
     total = len(_rank_positions(num_samples, world_size, rank, global_consumed, drop_last))
     return total // batch_size if drop_last else ceil_div(total, batch_size)
 
@@ -248,7 +249,7 @@ def rank_index_batches(
             [[0, 2], [4, 6]]
     """
     if batch_size < 1:
-        raise ValueError("batch_size must be positive")
+        raise PlanError("batch_size must be positive")
     import numpy as np
 
     permutation = epoch_permutation(num_samples, epoch=epoch, seed=seed, shuffle=shuffle)

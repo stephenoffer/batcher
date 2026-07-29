@@ -398,6 +398,18 @@ pub(crate) fn eval_list_binary(
     let right = as_var_list(right, &format!("list.{func:?} (right)"))?;
     let (la, ra) = (left.as_list::<i32>(), right.as_list::<i32>());
 
+    // `Jaccard` is a positional *equality* rate, not a numeric reduction, so it is
+    // meaningful over strings — a token list, a list of ids. The shared path below casts
+    // every element array to Float64, and casting Utf8 to Float64 yields nulls rather than
+    // an error, so a string list scored 0.0 agreement even against an identical list. Route
+    // string elements through a native comparison instead of that lossy cast.
+    if matches!(func, ListBinaryFunc::Jaccard)
+        && crate::eval::list_ops::jaccard_str::is_string_list(la)
+        && crate::eval::list_ops::jaccard_str::is_string_list(ra)
+    {
+        return crate::eval::list_ops::jaccard_str::jaccard_utf8(la, ra);
+    }
+
     // Embeddings are overwhelmingly `f32`; keeping them at native width halves the bytes
     // the inner loop streams. Accumulation is `f64` either way, so the two paths agree
     // bit-for-bit (`accumulate_pair`'s tests pin this).
@@ -798,6 +810,44 @@ mod tests {
         (0..x.len())
             .map(|i| (!x.is_null(i)).then(|| x.value(i)))
             .collect()
+    }
+
+    /// `jaccard` over string lists compares elements, rather than casting them to Float64.
+    ///
+    /// The shared numeric path casts every element array to Float64, and Utf8 -> Float64 is a
+    /// *safe* cast that yields nulls instead of failing. Every position therefore disagreed
+    /// and a string list scored 0.0 against an identical copy of itself — a silently wrong
+    /// answer for anything using this as a near-duplicate score.
+    #[test]
+    fn jaccard_compares_strings_by_value() {
+        let left = str_lists(&[
+            Some(vec!["a", "b", "c"]),
+            Some(vec!["a", "b"]),
+            Some(vec!["x"]),
+            None,
+            Some(vec![]),
+        ]);
+        let right = str_lists(&[
+            Some(vec!["a", "b", "c"]), // identical -> 1.0
+            Some(vec!["a", "z"]),      // one of two agrees -> 0.5
+            Some(vec!["y"]),           // none agree -> 0.0
+            Some(vec!["a"]),           // null row -> null
+            Some(vec![]),              // no positions -> null
+        ]);
+        let out = eval_list_binary(ListBinaryFunc::Jaccard, &left, &right).unwrap();
+        assert_eq!(
+            f64s(&out),
+            vec![Some(1.0), Some(0.5), Some(0.0), None, None]
+        );
+    }
+
+    /// The numeric branch is unchanged by the string carve-out above.
+    #[test]
+    fn jaccard_still_compares_numbers_positionally() {
+        let left = lists(&[Some(vec![1.0, 2.0, 3.0]), Some(vec![5.0, 6.0])]);
+        let right = lists(&[Some(vec![1.0, 9.0, 3.0]), Some(vec![5.0, 6.0])]);
+        let out = eval_list_binary(ListBinaryFunc::Jaccard, &left, &right).unwrap();
+        assert_eq!(f64s(&out), vec![Some(2.0 / 3.0), Some(1.0)]);
     }
 
     #[test]

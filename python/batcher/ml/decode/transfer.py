@@ -10,7 +10,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.decode.stage import _bounded_map, _shared_pool, _with_column
+from batcher.ml.decode.stage import (
+    _bounded_map,
+    _require_source_column,
+    _shared_pool,
+    _with_column,
+)
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -44,6 +49,7 @@ def upload_dataset(
         extension: appended to the file name (e.g. ``".jpg"``).
         max_concurrency: concurrent writes per batch.
     """
+    _require_source_column(ds, data_column, who="upload_dataset", param="data_column=")
     base = directory.rstrip("/")
 
     def _write(fs: Any, name: str, data: bytes | None) -> str | None:
@@ -125,6 +131,7 @@ def download_dataset(
         PlanError: on an invalid `on_error`, a negative `retries`, or an
             `error_column` without ``on_error="null"``.
     """
+    _require_source_column(ds, url_column, who="download_dataset", param="url_column=")
     if on_error not in ("raise", "null"):
         raise PlanError(f"download on_error must be 'raise' or 'null', got {on_error!r}")
     if retries < 0:

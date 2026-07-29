@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.errors import PlanError
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
@@ -71,10 +72,45 @@ def resolve_num_workers(num_workers: int | str, num_gpus: float) -> int:
     ``multiprocessing=True`` to use those cores across processes. An explicit int wins.
     """
     if num_workers != "auto":
-        return max(1, int(num_workers))  # type: ignore[arg-type]
+        return max(1, _as_worker_count(num_workers))
     if num_gpus > 0:
         return 1
     return available_cpu_count()  # usable local cores (cgroup/affinity aware), not host count
+
+
+def _as_worker_count(num_workers: object) -> int:
+    """Coerce an explicit `num_workers` to an int, or say what it should have been.
+
+    The only accepted values are ``"auto"`` and an integer, but anything `int()` could
+    parse got through and anything it could not raised `int()`'s own message —
+    ``invalid literal for int() with base 10: 'AUTO'`` — which names neither the parameter
+    nor the two things it takes. ``"AUTO"`` is the mistake worth catching by name: it is a
+    plausible spelling of the default, and it failed as a parse error rather than as an
+    unrecognized option.
+    """
+    # A float was never a documented value, but `int()` accepted one, so `num_workers=4.0`
+    # has always worked. Keep it working when it is integral and reject it only when
+    # truncating would silently change the answer — rejecting 4.0 outright would break
+    # callers for no benefit, and accepting 2.5 as 2 is the surprise worth stopping.
+    if isinstance(num_workers, float) and not isinstance(num_workers, bool):
+        if num_workers.is_integer():
+            return int(num_workers)
+        raise PlanError(
+            f"num_workers must be 'auto' or a whole number, got {num_workers!r}; it would "
+            f"otherwise be truncated to {int(num_workers)}."
+        )
+    if isinstance(num_workers, bool) or not isinstance(num_workers, (int, str)):
+        raise PlanError(
+            f"num_workers must be 'auto' or an integer, got {type(num_workers).__name__} "
+            f"{num_workers!r}."
+        )
+    try:
+        return int(num_workers)
+    except ValueError:
+        hint = " Did you mean 'auto'?" if str(num_workers).strip().lower() == "auto" else ""
+        raise PlanError(
+            f"num_workers must be 'auto' or an integer, got {num_workers!r}.{hint}"
+        ) from None
 
 
 def _accelerator_pool_size(resources: dict[str, float] | None, num_partitions: int) -> int | None:

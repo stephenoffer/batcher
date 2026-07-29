@@ -73,14 +73,14 @@ class CaseBuilder:
 
     def then(self, value: IntoExpr) -> CaseBuilder:
         if self._pending is None:
-            raise ValueError("then() must follow when()")
+            raise PlanError("then() must follow when()")
         self._branches.append((self._pending, _wrap(value)))
         self._pending = None
         return self
 
     def otherwise(self, value: IntoExpr) -> Case:
         if self._pending is not None:
-            raise ValueError("dangling when() without then()")
+            raise PlanError("dangling when() without then()")
         return Case(self._branches, _wrap(value))
 
 

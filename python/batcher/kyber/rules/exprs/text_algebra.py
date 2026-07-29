@@ -61,6 +61,7 @@ def _replace_all(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_replace_all,
+    expr_matches=(StrFunc,),
 )
 def regexp_replace_all_plain_to_replace(
     node: Filter | Project, _ctx: OptimizerContext
@@ -90,6 +91,7 @@ def _split(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_split,
+    expr_matches=(StrFunc,),
 )
 def regexp_split_plain_to_split(
     node: Filter | Project, _ctx: OptimizerContext
@@ -127,6 +129,7 @@ def _compose_substr(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_compose_substr,
+    expr_matches=(StrFunc,),
 )
 def compose_nested_substr(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold two stacked `substr` calls into one.

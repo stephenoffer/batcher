@@ -43,7 +43,7 @@ class DeltaStreamSource:
 
     bounded = False
 
-    __slots__ = ("_cdf", "_cursor", "_storage_options", "_table_uri")
+    __slots__ = ("_cdf", "_cursor", "_max_versions", "_storage_options", "_table", "_table_uri")
 
     def __init__(
         self,
@@ -51,17 +51,52 @@ class DeltaStreamSource:
         *,
         starting_version: int = 0,
         change_feed: bool = False,
+        max_versions_per_trigger: int | None = None,
         storage_options: dict[str, str] | None = None,
     ) -> None:
         self._table_uri = table_uri
         self._cdf = change_feed
         self._storage_options = storage_options
         self._cursor = starting_version - 1  # next read starts at starting_version
+        if max_versions_per_trigger is not None and max_versions_per_trigger < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"max_versions_per_trigger must be >= 1, got {max_versions_per_trigger}"
+            )
+        # Backpressure, the change-feed analogue of Auto Loader's `max_files_per_trigger`.
+        # A window is *every commit since the last pass*, so a first run reads the table's
+        # entire history and a resumed one reads however much accumulated while the query was
+        # down. The rows already stream batch by batch, so memory is bounded — but the *epoch*
+        # is not: the micro-batch does not end until the whole backlog drains, so the trigger
+        # cadence collapses and no checkpoint is written until it finishes. Capping the
+        # versions a pass admits drains the backlog across many bounded epochs instead.
+        self._max_versions = max_versions_per_trigger
+        self._table: Any = None
 
     def _delta_table(self) -> Any:
-        return require_deltalake().DeltaTable(
-            self._table_uri, storage_options=self._storage_options
-        )
+        """The table handle, refreshed in place rather than rebuilt.
+
+        Constructing a `DeltaTable` parses the transaction log, and a streaming pass needed
+        two of them — one to read the latest version and one to open the change feed — on
+        *every trigger*. On a table with a long log that is the dominant per-trigger cost and
+        it grows with the table's history. `update_incremental` reads only the commits added
+        since the handle was built, which is exactly the question a stream is asking anyway;
+        a delta-rs without it falls back to a rebuild.
+        """
+        if self._table is None:
+            self._table = require_deltalake().DeltaTable(
+                self._table_uri, storage_options=self._storage_options
+            )
+            return self._table
+        refresh = getattr(self._table, "update_incremental", None)
+        if refresh is None:  # pragma: no cover - older delta-rs
+            self._table = require_deltalake().DeltaTable(
+                self._table_uri, storage_options=self._storage_options
+            )
+        else:
+            refresh()
+        return self._table
 
     def schema(self) -> pa.Schema:
         # delta-rs returns an Arrow C-interface (arro3) schema; adapt to pyarrow.
@@ -74,9 +109,6 @@ class DeltaStreamSource:
             pa.field("_commit_timestamp", pa.timestamp("us")),
         ]
         return pa.schema(list(base) + extra)
-
-    def _latest_version(self) -> int:
-        return int(self._delta_table().version())
 
     def snapshot_position(self) -> dict:
         return {"version": self._cursor}
@@ -117,12 +149,17 @@ class DeltaStreamSource:
         return table.combine_chunks().to_batches()[0]
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        latest = self._latest_version()
+        table = self._delta_table()
+        latest = int(table.version())
         start = self._cursor + 1
         if start > latest:
             return  # no new commits since the last pass
+        if self._max_versions is not None:
+            # Leave the rest of the backlog for later passes, oldest-version-first, so a
+            # large catch-up drains across bounded epochs each of which checkpoints.
+            latest = min(latest, start + self._max_versions - 1)
         try:
-            reader = self._delta_table().load_cdf(starting_version=start, ending_version=latest)
+            reader = table.load_cdf(starting_version=start, ending_version=latest)
             batches = pa.RecordBatchReader.from_stream(reader)
         except Exception as exc:
             raise BackendError(

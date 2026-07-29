@@ -1,0 +1,216 @@
+\begin{thebibliography}{10}
+
+\bibitem{armbrust2015sparksql}
+Michael Armbrust, Reynold~S. Xin, Cheng Lian, Yin Huai, Davies Liu, Joseph~K.
+  Bradley, Xiangrui Meng, Tomer Kaftan, Michael~J. Franklin, Ali Ghodsi, and
+  Matei Zaharia.
+\newblock {Spark SQL}: Relational data processing in {Spark}.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  2015.
+
+\bibitem{auer2002ucb}
+Peter Auer, Nicol{\`o} Cesa-Bianchi, and Paul Fischer.
+\newblock Finite-time analysis of the multiarmed bandit problem.
+\newblock {\em Machine Learning}, 47(2--3):235--256, 2002.
+
+\bibitem{avnur2000eddies}
+Ron Avnur and Joseph~M. Hellerstein.
+\newblock Eddies: Continuously adaptive query processing.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  2000.
+
+\bibitem{black2002ciphers}
+John Black and Phillip Rogaway.
+\newblock Ciphers with arbitrary finite domains.
+\newblock In {\em Topics in Cryptology --- CT-RSA}, 2002.
+
+\bibitem{boncz2005monetdb}
+Peter~A. Boncz, Marcin Zukowski, and Niels Nes.
+\newblock {MonetDB/X100}: Hyper-pipelining query execution.
+\newblock In {\em Conference on Innovative Data Systems Research (CIDR)}, 2005.
+
+\bibitem{clickbench}
+{ClickHouse, Inc.}
+\newblock {ClickBench}: A benchmark for analytical databases, 2024.
+
+\bibitem{dean2004mapreduce}
+Jeffrey Dean and Sanjay Ghemawat.
+\newblock {MapReduce}: Simplified data processing on large clusters.
+\newblock In {\em USENIX Symposium on Operating Systems Design and
+  Implementation (OSDI)}, 2004.
+
+\bibitem{deshpande2007adaptive}
+Amol Deshpande, Zachary Ives, and Vijayshankar Raman.
+\newblock Adaptive query processing.
+\newblock {\em Foundations and Trends in Databases}, 1(1):1--140, 2007.
+
+\bibitem{daft}
+{Eventual Computing}.
+\newblock Daft: A distributed query engine for large-scale multimodal data,
+  2024.
+
+\bibitem{flajolet2007hyperloglog}
+Philippe Flajolet, {\'E}ric Fusy, Olivier Gandouet, and Fr{\'e}d{\'e}ric
+  Meunier.
+\newblock {HyperLogLog}: The analysis of a near-optimal cardinality estimation
+  algorithm.
+\newblock In {\em Conference on Analysis of Algorithms (AofA)}, 2007.
+
+\bibitem{graefe1994volcano}
+Goetz Graefe.
+\newblock Volcano---an extensible and parallel query evaluation system.
+\newblock {\em IEEE Transactions on Knowledge and Data Engineering},
+  6(1):120--135, 1994.
+
+\bibitem{gray1997datacube}
+Jim Gray, Surajit Chaudhuri, Adam Bosworth, Andrew Layman, Don Reichart, Murali
+  Venkatrao, Frank Pellow, and Hamid Pirahesh.
+\newblock Data cube: A relational aggregation operator generalizing group-by,
+  cross-tab, and sub-totals.
+\newblock {\em Data Mining and Knowledge Discovery}, 1(1):29--53, 1997.
+
+\bibitem{idc2025structured}
+{International Data Corporation}.
+\newblock Worldwide global {DataSphere} structured and unstructured data
+  forecast, 2025--2029.
+\newblock Technical Report US52800025, International Data Corporation, 2025.
+
+\bibitem{kabra1998midquery}
+Navin Kabra and David~J. DeWitt.
+\newblock Efficient mid-query re-optimization of sub-optimal query execution
+  plans.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  1998.
+
+\bibitem{karnin2016kll}
+Zohar Karnin, Kevin Lang, and Edo Liberty.
+\newblock Optimal quantile approximation in streams.
+\newblock In {\em IEEE Symposium on Foundations of Computer Science (FOCS)},
+  2016.
+
+\bibitem{khayyat2015iejoin}
+Zuhair Khayyat, William Lucia, Meghna Singh, Mourad Ouzzani, Paolo Papotti,
+  Jorge-Arnulfo Quian{\'e}-Ruiz, Nan Tang, and Panos Kalnis.
+\newblock Lightning fast and space efficient inequality joins.
+\newblock {\em Proceedings of the VLDB Endowment}, 8(13), 2015.
+
+\bibitem{kipf2019learned}
+Andreas Kipf, Thomas Kipf, Bernhard Radke, Viktor Leis, Peter Boncz, and Alfons
+  Kemper.
+\newblock Learned cardinalities: Estimating correlated joins with deep
+  learning.
+\newblock In {\em Conference on Innovative Data Systems Research (CIDR)}, 2019.
+
+\bibitem{leis2014morsel}
+Viktor Leis, Peter Boncz, Alfons Kemper, and Thomas Neumann.
+\newblock Morsel-driven parallelism: A {NUMA}-aware query evaluation framework
+  for the many-core age.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  2014.
+
+\bibitem{leis2015goodjoin}
+Viktor Leis, Andrey Gubichev, Atanas Mirchev, Peter Boncz, Alfons Kemper, and
+  Thomas Neumann.
+\newblock How good are query optimizers, really?
+\newblock {\em Proceedings of the VLDB Endowment}, 9(3):204--215, 2015.
+
+\bibitem{luby1988feistel}
+Michael Luby and Charles Rackoff.
+\newblock How to construct pseudorandom permutations from pseudorandom
+  functions.
+\newblock {\em SIAM Journal on Computing}, 17(2):373--386, 1988.
+
+\bibitem{marcus2021bao}
+Ryan Marcus, Parimarjan Negi, Hongzi Mao, Nesime Tatbul, Mohammad Alizadeh, and
+  Tim Kraska.
+\newblock {Bao}: Making learned query optimization practical.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  2021.
+
+\bibitem{marcus2019neo}
+Ryan Marcus, Parimarjan Negi, Hongzi Mao, Chi Zhang, Mohammad Alizadeh, Tim
+  Kraska, Olga Papaemmanouil, and Nesime Tatbul.
+\newblock {Neo}: A learned query optimizer.
+\newblock {\em Proceedings of the VLDB Endowment}, 12(11), 2019.
+
+\bibitem{markl2004progressive}
+Volker Markl, Vijayshankar Raman, David Simmen, Guy Lohman, Hamid Pirahesh, and
+  Miso Cilimdzic.
+\newblock Robust query processing through progressive optimization.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  2004.
+
+\bibitem{moritz2018ray}
+Philipp Moritz, Robert Nishihara, Stephanie Wang, Alexey Tumanov, Richard Liaw,
+  Eric Liang, Melih Elibol, Zongheng Yang, William Paul, Michael~I. Jordan, and
+  Ion Stoica.
+\newblock {Ray}: A distributed framework for emerging {AI} applications.
+\newblock In {\em USENIX Symposium on Operating Systems Design and
+  Implementation (OSDI)}, 2018.
+
+\bibitem{mosaicstreaming}
+{MosaicML / Databricks}.
+\newblock {StreamingDataset}: Fast, accurate streaming of training data from
+  cloud storage, 2023.
+
+\bibitem{raasveldt2019duckdb}
+Mark Raasveldt and Hannes M{\"u}hleisen.
+\newblock {DuckDB}: An embeddable analytical database.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  2019.
+\newblock Demonstration.
+
+\bibitem{idc2018datasphere}
+David Reinsel, John Gantz, and John Rydning.
+\newblock The digitization of the world: From edge to core.
+\newblock IDC White Paper US44413318, International Data Corporation, November
+  2018.
+
+\bibitem{selinger1979access}
+P.~Griffiths Selinger, M.~M. Astrahan, D.~D. Chamberlin, R.~A. Lorie, and T.~G.
+  Price.
+\newblock Access path selection in a relational database management system.
+\newblock In {\em ACM SIGMOD International Conference on Management of Data},
+  1979.
+
+\bibitem{sparkaqe}
+{The Apache Software Foundation}.
+\newblock Adaptive query execution --- {Spark SQL} performance tuning guide,
+  2024.
+
+\bibitem{arrow}
+{The Apache Software Foundation}.
+\newblock Apache {Arrow}: A cross-language development platform for in-memory
+  analytics, 2024.
+
+\bibitem{arrowflight}
+{The Apache Software Foundation}.
+\newblock Arrow {Flight RPC}, 2024.
+
+\bibitem{raydata}
+{The Ray Team}.
+\newblock Ray data: Scalable datasets for {ML}, 2024.
+
+\bibitem{tpch}
+{Transaction Processing Performance Council}.
+\newblock {TPC Benchmark H} standard specification, 2022.
+
+\bibitem{polars}
+Ritchie Vink and {Polars contributors}.
+\newblock Polars: {DataFrames} for the new era, 2024.
+
+\bibitem{zaharia2012rdd}
+Matei Zaharia, Mosharaf Chowdhury, Tathagata Das, Ankur Dave, Justin Ma, Murphy
+  McCauley, Michael~J. Franklin, Scott Shenker, and Ion Stoica.
+\newblock Resilient distributed datasets: A fault-tolerant abstraction for
+  in-memory cluster computing.
+\newblock In {\em USENIX Symposium on Networked Systems Design and
+  Implementation (NSDI)}, 2012.
+
+\bibitem{zaharia2013dstreams}
+Matei Zaharia, Tathagata Das, Haoyuan Li, Timothy Hunter, Scott Shenker, and
+  Ion Stoica.
+\newblock Discretized streams: Fault-tolerant streaming computation at scale.
+\newblock In {\em ACM Symposium on Operating Systems Principles (SOSP)}, 2013.
+
+\end{thebibliography}

@@ -20,6 +20,26 @@ from batcher.plan.types import retained_bytes
 
 __all__ = ["stream_stream_join", "stream_watermark_dedup"]
 
+#: Chunks a retained state table may accumulate before it is compacted.
+#:
+#: Streaming state grows by `concat_tables` — one chunk per micro-batch — and shrinks by
+#: `filter`, which preserves the chunk structure. So a stream running for an hour at a 100ms
+#: trigger carried a 36,000-chunk table into every anti-join and every eviction, and the
+#: per-chunk dispatch cost grew without bound even while the *row* count stayed inside the
+#: watermark window. Nothing caught it: the memory cap measures bytes, and the bytes were
+#: fine. Compacting past this many chunks keeps the fragmentation bounded for the price of
+#: one copy of state that is bounded by construction.
+_MAX_STATE_CHUNKS = 64
+
+
+def _compact(table: pa.Table | None) -> pa.Table | None:
+    """Collapse a retained state table's chunks once it has fragmented too far."""
+    if table is None or table.num_columns == 0:
+        return table
+    if table.column(0).num_chunks > _MAX_STATE_CHUNKS:
+        return table.combine_chunks()
+    return table
+
 
 def _event_micros(
     col: pa.Array | pa.ChunkedArray | pa.Scalar,
@@ -129,7 +149,13 @@ def stream_watermark_dedup(
     seen: pa.Table | None = None
     wm: int | None = None
 
-    for raw in source.iter_batches(None):
+    # Read through Kyber's pushdown, which `optimize` has already computed. Reading with
+    # `iter_batches(None)` decoded every column of every message no matter how narrow the
+    # dedup subset was — the same gap the relational streaming path had, and worse here
+    # because a dedup is usually a two-column question asked of a wide event.
+    from batcher.io.source import iter_source
+
+    for raw in iter_source(source, opt.source_projections.get(0), opt.source_predicates.get(0)):
         if raw.num_rows == 0:
             continue
         for b in core.execute_local(opt, [[raw]], feedback=hub):
@@ -164,11 +190,16 @@ def stream_watermark_dedup(
                 cand = _event_micros(hi).as_py() - lateness
                 wm = cand if wm is None else max(wm, cand)
             if new.num_rows:
-                fresh = new.select([*subset, et])
+                # `dict.fromkeys` rather than a set literal: order is the state table's
+                # column order and must be stable, and a dedup keyed *on* the event-time
+                # column would otherwise select it twice and give the state two columns
+                # with one name — which the anti-join then resolves ambiguously.
+                fresh = new.select(list(dict.fromkeys([*subset, et])))
                 seen = fresh if seen is None else pa.concat_tables([seen, fresh])
             if seen is not None and wm is not None:
                 keep = pc.greater_equal(_event_micros(seen.column(et)), wm)
                 seen = seen.filter(keep)
+            seen = _compact(seen)
             _check_stream_state(seen, "watermark-dedup")
             if new.num_rows:
                 rebatch = batch_size is not None
@@ -222,16 +253,26 @@ def stream_stream_join(
         hi = pc.max(col)
         return _event_micros(hi).as_py() if hi.is_valid else None
 
-    def evict():
-        # A buffered row can be dropped once the *other* stream's watermark has moved
-        # past its match window: left row t can still match a future right row only if
-        # t >= wmR - within (and symmetrically).
-        if state["wmR"] is not None and state["bufL"] is not None:
+    def evict(*, prune_left: bool, prune_right: bool) -> None:
+        """Drop buffered rows the opposite watermark has moved past.
+
+        A buffered left row t can still match a future right row only while
+        ``t >= wmR - within`` (and symmetrically), so eviction of one side depends on the
+        *other* side's watermark and on that side's own new rows.
+
+        Both sides used to be re-filtered on every batch of either stream. Half of that was
+        always redundant: pushing a left batch cannot make a buffered right row evictable
+        unless it advanced `wmL`, and a filter over the whole retained buffer is the most
+        expensive thing this operator does per micro-batch. The side that just received rows
+        is always pruned (an arriving row can already be outside the window — this path has
+        no late filter); the opposite side only when its governing watermark moved.
+        """
+        if prune_left and state["wmR"] is not None and state["bufL"] is not None:
             keep = pc.greater_equal(_event_micros(state["bufL"].column(lt)), state["wmR"] - within)
-            state["bufL"] = state["bufL"].filter(keep)
-        if state["wmL"] is not None and state["bufR"] is not None:
+            state["bufL"] = _compact(state["bufL"].filter(keep))
+        if prune_right and state["wmL"] is not None and state["bufR"] is not None:
             keep = pc.greater_equal(_event_micros(state["bufR"].column(rt)), state["wmL"] - within)
-            state["bufR"] = state["bufR"].filter(keep)
+            state["bufR"] = _compact(state["bufR"].filter(keep))
 
     def emit(side_table, other_buf, *, left_side):
         """Join `side_table` against the opposite buffer, interval-filtered."""
@@ -261,18 +302,36 @@ def stream_stream_join(
             key = "bufL" if left_side else "bufR"
             state[key] = table if state[key] is None else pa.concat_tables([state[key], table])
             hi = micros(table.column(lt if left_side else rt))
+            wk = "wmL" if left_side else "wmR"
+            advanced = False
             if hi is not None:
-                wk = "wmL" if left_side else "wmR"
                 cand = hi - lateness
-                state[wk] = cand if state[wk] is None else max(state[wk], cand)
-            evict()
+                previous = state[wk]
+                state[wk] = cand if previous is None else max(previous, cand)
+                advanced = state[wk] != previous
+            # The side that just grew is always pruned; the other only when the watermark
+            # that governs it actually moved.
+            evict(
+                prune_left=left_side or advanced,
+                prune_right=(not left_side) or advanced,
+            )
             # Either buffer grows unbounded if its opposite watermark stalls (a
             # one-sided stream), so cap both after eviction.
             _check_stream_state(state["bufL"], "stream-join")
             _check_stream_state(state["bufR"], "stream-join")
         return out
 
-    it_l, it_r = sources[0].iter_batches(None), sources[1].iter_batches(None)
+    # Both sides read through the pushdown their own `optimize` already computed; reading
+    # with `iter_batches(None)` decoded every column of both streams, and on this path the
+    # decoded columns are also *buffered* until the watermark releases them.
+    from batcher.io.source import iter_source
+
+    it_l = iter_source(
+        sources[0], left_opt.source_projections.get(0), left_opt.source_predicates.get(0)
+    )
+    it_r = iter_source(
+        sources[1], right_opt.source_projections.get(0), right_opt.source_predicates.get(0)
+    )
     done_l = done_r = False
     while not (done_l and done_r):
         if not done_l:

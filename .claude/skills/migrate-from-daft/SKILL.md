@@ -44,6 +44,7 @@ Both engines are lazy: Daft builds a plan and runs on `collect()`/`show()`; Batc
 | `df.with_column("c", e)` | `ds.with_columns(c=e)` |
 | `df.where(pred)` | `ds.filter(pred)` |
 | `df.groupby("k").agg(...)` | `ds.group_by("k").agg(total=col("v").sum())` |
+| `df.groupby("k").map_groups(fn)` | `ds.group_by("k").map_groups(fn)` |
 | `df.join(o, on="k")` | `ds.join(o, on="k", how="inner")` |
 | `df.sort("a", desc=True)` | `ds.sort("a", descending=True)` |
 | `df.limit(n)` | `ds.limit(n)` |

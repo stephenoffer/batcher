@@ -106,6 +106,33 @@ variance. `fit` lowers to the existing `group_by().agg(...)` and `distinct()`
 operators, so it is partition-independent. A fit on a distributed dataset learns the
 same statistics as a single-node fit.
 
+## What happens to a missing value
+
+A preprocessor never invents a value for a missing one. A null goes in and a null comes
+out, so a gap in the data stays a gap the model can see rather than becoming a real value
+at one end of the feature's range:
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import KBinsDiscretizer
+
+gaps = bt.from_pydict({"v": [0.0, 2.0, 8.0, 10.0, None]})
+print(KBinsDiscretizer("v", n_bins=2, strategy="uniform").fit_transform(gaps).to_pydict())
+# {'v': [0, 0, 1, 1, None]}
+```
+
+Three groups depart from that, each deliberately:
+
+| Preprocessor | A null becomes | Why |
+|---|---|---|
+| `SimpleImputer`, `GroupImputer` | the fitted fill value | Filling nulls is the whole point of them. |
+| `LabelEncoder`, `OrdinalEncoder`, `FrequencyEncoder` | `unknown_value` | A missing value is not a category, so it joins the unknown bucket. |
+| `OneHotEncoder`, `LabelBinarizer`, `RareCategoryEncoder` | all-zero indicators, or the rare bucket | It belongs to no class, which the indicators already express. |
+
+Reach for `MissingIndicator` before an encoder when the difference between "absent" and
+"rare" carries signal for your model. It adds a 0/1 column recording where the nulls were,
+so the information survives whatever the next step does with them.
+
 ## Where they run
 
 `transform` is a lazy `Dataset`, so it composes with the rest of a pipeline and the

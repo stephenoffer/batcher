@@ -166,6 +166,17 @@ spray punctuation, drift into non-ASCII, emit a URL, leak a code block, or run t
    :nosignatures:
 
    all_caps_rate
+   word_count_quantile
+   trailing_whitespace_rate
+   min_char_length
+   max_char_length
+   leading_whitespace_rate
+   has_tab_rate
+   empty_or_whitespace_rate
+   double_space_rate
+   char_length_range
+   char_length_quantile
+   blank_line_rate
    repeated_punctuation_rate
    non_ascii_rate
    url_rate

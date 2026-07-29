@@ -15,7 +15,13 @@ from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
 from batcher.dist.executors.plan_analysis import _single_source
-from batcher.dist.spill import _fd_safe, _iter_spill_morsels, _make_store, _work_dir
+from batcher.dist.spill import (
+    _fd_safe,
+    _iter_spill_morsels,
+    _make_store,
+    _work_dir,
+    map_projection,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import Join
 
@@ -43,7 +49,13 @@ def execute_spilling_join(
     batches = list(stream_spilling_join(join, sources, num_partitions, spill_dir))
     if batches:
         return pa.Table.from_batches(batches)
-    return pa.table({o.alias: [] for o in join.output})
+    # Typed, not null-typed. `pa.table({alias: []})` gave every column a null type, so an
+    # empty out-of-core join disagreed with the in-memory one on the result *schema* —
+    # "spilled == in-memory" has to hold for empty results too, which is why the spilling
+    # aggregate routes its empty through `empty_result_table` rather than a dict of lists.
+    from batcher.dist.executors.plan_analysis import empty_result_table
+
+    return empty_result_table(join, [o.alias for o in join.output])
 
 
 def stream_spilling_join(
@@ -87,7 +99,15 @@ def stream_spilling_join(
         right_schema = _side_schema(nat, right_ir, sources[right_sid], cfg_json)
 
         left_handles = _spill_side(
-            nat, left_ir, list(join.left_keys), sources[left_sid], n_buckets, store, "L", cfg_json
+            nat,
+            left_ir,
+            list(join.left_keys),
+            sources[left_sid],
+            n_buckets,
+            store,
+            "L",
+            cfg_json,
+            map_projection(join, left_sid),
         )
         right_handles = _spill_side(
             nat,
@@ -98,21 +118,36 @@ def stream_spilling_join(
             store,
             "R",
             cfg_json,
+            map_projection(join, right_sid),
         )
 
         for b in range(n_buckets):
             if left_handles[b] is None and right_handles[b] is None:
                 continue
-            left_b = (store.read(left_handles[b]) if left_handles[b] else None) or [
-                _empty_batch(left_schema)
-            ]
-            right_b = (store.read(right_handles[b]) if right_handles[b] else None) or [
-                _empty_batch(right_schema)
-            ]
-            for rb in nat.execute_plan(join_ir, [left_b, right_b], cfg_json):
-                if rb.num_rows > 0:
-                    yield rb
+            # `read_reserved` accounts each side's resident footprint against the process
+            # buffer pool: reading a bucket back is the one step of spilling that can undo
+            # it, and a plain `read` told the pool nothing, so a concurrent query sizing its
+            # own state saw headroom this join was already using.
+            left_b = _read_bucket(store, left_handles[b]) or [_empty_batch(left_schema)]
+            right_b = _read_bucket(store, right_handles[b]) or [_empty_batch(right_schema)]
+            try:
+                for rb in nat.execute_plan(join_ir, [left_b, right_b], cfg_json):
+                    if rb.num_rows > 0:
+                        yield rb
+            finally:
+                # Equal keys hash to one bucket on both sides, so this pair will never be
+                # read again. Releasing it here bounds peak scratch to the outstanding
+                # bucket pairs rather than to both spilled sides in full.
+                for handle in (left_handles[b], right_handles[b]):
+                    if handle is not None:
+                        store.release(handle)
     finally:
+        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
+        # open (a partition phase abandoned by an exception) and deletes both tiers' files
+        # — the `rmtree` only ever reached the *local* one, so a failed query that had
+        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
+        # with nothing recording that they existed.
+        store.cleanup()
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -228,7 +263,17 @@ def _empty_batch(schema: pa.Schema) -> pa.RecordBatch:
     return pa.RecordBatch.from_pylist([], schema=schema)
 
 
-def _spill_side(nat, sub_ir, key_names, source, n_buckets, store, tag, engine_config):
+def _read_bucket(store, handle) -> list[pa.RecordBatch] | None:
+    """One spilled bucket, read with its resident footprint reserved against the pool."""
+    if handle is None:
+        return None
+    with store.read_reserved(handle) as stream:
+        return list(stream)
+
+
+def _spill_side(
+    nat, sub_ir, key_names, source, n_buckets, store, tag, engine_config, projection=None
+):
     """Stream a source through its sub-plan, hash-partition by key, spill by tier.
     Returns a list of per-bucket `SpillHandle`s (None where a bucket received no
     rows). Buckets overflow local→remote through the shared tiered `store`."""
@@ -236,7 +281,7 @@ def _spill_side(nat, sub_ir, key_names, source, n_buckets, store, tag, engine_co
     handles: list[object] = [None] * n_buckets
     key_idx: list[int] | None = None
 
-    for batch in _iter_spill_morsels(source):
+    for batch in _iter_spill_morsels(source, projection):
         rows = nat.execute_plan(sub_ir, [[batch]], engine_config)
         if not rows:
             continue

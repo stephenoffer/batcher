@@ -124,6 +124,8 @@ PUSH_FOLDABLE_INTO_CASE_RULES = [
             _make_push_rule(op),
             matches=(Filter, Project),
             expr_fn=_push_foldable(op),
+            expr_matches=(Binary,),
+            expr_ops=(op,),
         )
     )
     for op in sorted(_PUSHABLE_OPS)
@@ -142,6 +144,7 @@ def _flatten_case_else(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_flatten_case_else,
+    expr_matches=(Case,),
 )
 def flatten_nested_case_in_else(
     node: Filter | Project, _ctx: OptimizerContext
@@ -236,6 +239,7 @@ def _drop_branch_matching_else(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_drop_branch_matching_else,
+    expr_matches=(Case,),
 )
 def drop_case_branch_matching_else(
     node: Filter | Project, _ctx: OptimizerContext
@@ -267,6 +271,7 @@ def _push_not_into_case(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_push_not_into_case,
+    expr_matches=(Case, Not),
 )
 def push_not_into_case_branches(
     node: Filter | Project, _ctx: OptimizerContext
@@ -311,6 +316,7 @@ def _prune_dominated_literal(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_prune_dominated_literal,
+    expr_matches=(Greatest, Least, Lit),
 )
 def prune_dominated_literal_in_greatest_least(
     node: Filter | Project, _ctx: OptimizerContext

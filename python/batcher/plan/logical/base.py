@@ -14,7 +14,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import ColumnNotFoundError, PlanError
 from batcher.plan.expr_ir import Col, Expr
 from batcher.plan.expr_ir import referenced_columns as _referenced_columns
 
@@ -117,15 +117,23 @@ def available_column_set(plan: LogicalPlan) -> set[str]:
 
 
 def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
-    """Raise `PlanError` if `expr` references a column not in `available`.
+    """Raise `ColumnNotFoundError` if `expr` references a column not in `available`.
 
     The single source of the "unknown column(s)" validation message; `what`
     labels the site (e.g. ``"filter"``, ``f"projection {alias!r}"``).
+
+    The error is the narrow `ColumnNotFoundError` rather than a bare `PlanError`, so
+    `except ColumnNotFoundError` and `except KeyError` both catch the most common plan
+    mistake there is. It subclasses `PlanError`, so handlers catching that still work, and
+    the message is unchanged — only the type is more specific.
     """
     missing = _referenced_columns(expr) - available
     if missing:
-        raise PlanError(
-            f"{what} references unknown column(s) {sorted(missing)}; available: {sorted(available)}"
+        raise ColumnNotFoundError(
+            f"{what} references unknown column(s) {sorted(missing)}; "
+            f"available: {sorted(available)}",
+            column=sorted(missing)[0],
+            available=sorted(available),
         )
 
 

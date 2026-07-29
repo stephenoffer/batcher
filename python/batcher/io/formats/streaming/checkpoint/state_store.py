@@ -17,6 +17,26 @@ from pyarrow import ipc
 __all__ = ["StateStore"]
 
 
+def _sync_dir(directory: str) -> None:
+    """Flush a directory entry so a completed rename survives a crash.
+
+    A rename is durable only once the *directory* is synced; syncing the file alone leaves
+    a window where the data is on disk under a name nothing points to. Best-effort: some
+    filesystems (and Windows) refuse to open a directory for syncing, and a checkpoint that
+    cannot sync its directory is still better than one that refuses to run.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:  # pragma: no cover - platform-dependent
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - platform-dependent
+        pass
+    finally:
+        os.close(fd)
+
+
 class StateStore:
     """Per-micro-batch Arrow-IPC snapshots of the running state under a directory."""
 
@@ -35,12 +55,25 @@ class StateStore:
         Any scalar that must ride with the state (the windowed fold's watermark) travels in
         the batch's Arrow schema metadata, which IPC persists — so there is no separate
         sidecar to keep consistent with the ``.arrow`` file.
+
+        The write is made **durable** before the rename, and the rename itself is made
+        durable by syncing the directory. The rename alone is atomic, not durable: it
+        guarantees a reader never sees a half-written snapshot, and guarantees nothing about
+        an OS-level crash. The engine snapshots the state and *then* records the commit, so
+        without these syncs a crash could leave the commit on disk and the state not — and
+        recovery would resume past data it had consumed with an empty running aggregate,
+        which is silent wrong output rather than a lost query. Two fsyncs per stateful
+        micro-batch is what that ordering costs to actually hold.
         """
         path = self._path(batch_id)
         tmp = f"{path}.tmp"
-        with ipc.new_file(tmp, state.schema) as writer:
-            writer.write_batch(state)
+        with open(tmp, "wb") as fh:
+            with ipc.new_file(fh, state.schema) as writer:
+                writer.write_batch(state)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        _sync_dir(self._dir)
 
     def restore(self, batch_id: int) -> pa.RecordBatch | None:
         """Reload the running state snapshot for `batch_id`, or None if absent."""

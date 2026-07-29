@@ -1,7 +1,7 @@
 # Batcher v2 — Engineering Contract
 
 Batcher is a native, JIT-compiling, **adaptive** data engine: a Python control plane over a
-Rust data plane on Apache Arrow, aiming to beat DuckDB, Spark, Ray Data, and Polars from
+Rust data plane on Apache Arrow, aiming to beat DuckDB, Spark, and Polars from
 sub-second queries to PB-scale, batch and streaming, single-node and distributed.
 
 The moat is **stage-boundary re-optimization on *measured* cardinalities** (`api/adaptive/`)
@@ -149,7 +149,7 @@ it routes to the rest) ·
 `apply-governance-and-security`
 
 **Migrating onto it:** `migrate-from-spark` · `migrate-from-polars-or-pandas` ·
-`migrate-from-duckdb-sql` · `migrate-from-ray-data` · `migrate-from-daft`
+`migrate-from-duckdb-sql` · `migrate-from-daft`
 
 The user-facing catalog is `docs/agents/index.md`; `tests/docs/test_skill_coverage.py`
 fails if a skill is added without being listed there.

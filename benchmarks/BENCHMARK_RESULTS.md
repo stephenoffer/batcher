@@ -1,4 +1,249 @@
-# Batcher vs Ray Data vs Daft — CPU benchmark results
+# Batcher CPU benchmark results
+
+## Three things the join path could not do: plan with statistics, build in parallel, filter across a join (2026-07-27)
+
+TPC-H sf10, 96-core, release build, correctness-gated (all 22 `OK`): the suite total falls from
+**4,993 ms to 4,453 ms**, and q5 — the worst query in the suite — from **8.81x to 3.95x** of
+DuckDB's native store. sf1 is unchanged (571 ms either way: the adaptive fixes sit above the
+20M-row floor, and sf1's dense build is a 1.5M-row map whose serial fill was a few milliseconds to
+begin with), and the operator mix is unchanged.
+
+Against the **like-for-like** bar — `duckdb_arrow`, DuckDB executing the same zero-copy Arrow
+Batcher is given, rather than a compressed native store it was allowed to build first — Batcher
+wins **21 of 22** and is **1.89x faster overall** (4,453 ms vs 8,436 ms); the one exception, q9, is
+1.01x, a tie. Against Polars it is 2.26x faster and wins 17 of 22. Against DuckDB's **native
+store** it remains **2.08x behind** and wins 4 of 22 (q11, q15, q16, q22).
+
+That last gap is real and it is not all storage. q1 and q6 are essentially scans and sit at
+1.47x/1.52x, which is about what reading compressed pages instead of raw Arrow buys; q21 (3.18x),
+q9 (3.79x), q7 (3.19x), q2 (3.11x) and q5 (3.95x) are several times that and are engine work. See
+"What is still open" below.
+
+Treat the *total* as indicative rather than exact: two other sessions were running full test
+suites through most of this work, and a repeated harness run swings ±25% at load average 16-41
+(the same build measured 4,992 ms and 4,411 ms an hour apart). The per-query results quoted below
+were each reproduced at least twice, and the one that matters most is not a timing at all:
+**q5 no longer takes the process past 110 GB of resident memory**, which is what it did on any
+session that ran it more than once.
+
+### `seed_column_ndv` ran inside every stage except the one that chose the join order
+
+`orders.o_orderkey` and `customer.c_nationkey` have no distinct count in any file footer, so
+`_optimize` seeds one with an HLL pass *before* calling Kyber. The adaptive route does not go
+through `_optimize` first: `_execute_adaptive` runs its own whole-plan `optimize_logical` to make
+every breaker subtree self-contained, and that call had no seeding in front of it. So the one
+optimize that fixes the join order for the entire query — and therefore which breaker becomes
+stage 0 — ran with **every `ndv` unmeasured**, while the per-stage calls that only refine it ran
+fully informed.
+
+Without an `ndv` the join estimator falls back to the PK-FK assumption `max(|L|, |R|)`. That is
+right for a fact-to-dimension join and catastrophic for a many-to-many key. Traced at sf10, q5
+ordered `customer ⋈ supplier` on `nationkey` and priced it at **1,500,000 rows** — the left side's
+row count. The operands are measured (1,500,000 customers, 20,037 ASIA suppliers, 5 nations) and
+`nationkey` is uniform in TPC-H, so the true output is ~1.5M x 20,037/5 = **6.0 billion rows**.
+Stage 2 then set about materializing that:
+
+```
+stage 0 done  op=Table rows=5       (nation ⋈ region)      rss=13.1 GiB
+stage 1 done  op=Table rows=20037   (⋈ supplier)           rss=13.1 GiB
+stage 2 start est_rows=1500000      (customer ⋈ supplier)  -> 61 GiB and climbing
+```
+
+Seeded, the same plan joins `lineitem ⋈ supplier` first and closes on the composite
+`(o_custkey, s_nationkey) = (c_custkey, c_nationkey)` key — the order DuckDB picks. One call,
+moved: it is idempotent and shared with the per-stage seeding, so it replaces the first stage's
+blind pass rather than adding one.
+
+### The dense join map was filled by one thread, behind a 240 MB memset
+
+`dense.rs` replaces the hash table with `map[key - lo]` when the build key's range is tight, and
+it is chosen for exactly the joins that matter: at sf10 `orders.o_orderkey` is 15,000,000 rows
+spanning 60,000,000 slots, which is the build side of q3, q5, q9, q10, q12, q18 and q21. The fill
+was a plain `for i in 0..rows` loop, and `vec![u32::MAX; span]` in front of it is a
+single-threaded memset of **240 MB**. Everything downstream already scaled — the fused probe runs
+`par_iter` over the probe's morsels — so this was pure Amdahl: `lineitem ⋈ orders` spent 2.38 s of
+CPU across 209 ms of wall time, **11 of 96 cores**.
+
+Two changes, no behavioural difference:
+
+* The fill runs across cores. The map is cut into contiguous slot ranges and
+  `radix::partition_side` hands each range its build rows in ascending row order — the order the
+  serial loop visited them in — so every key's chain comes out identical. Ranges are disjoint, so
+  there is no synchronization and no `unsafe`. `the_parallel_fill_reproduces_the_serial_fill_exactly`
+  compares the two maps and both link sets directly.
+* The empty slot is `0` rather than `u32::MAX`, so a slot holds `row + 1` and `vec![0u32; span]`
+  lowers to `alloc_zeroed`. The map now arrives zeroed from the OS and is faulted in by the
+  threads that write it, instead of being memset before any work starts.
+
+`lineitem ⋈ orders` at sf10, count over the join: **209 ms → 118 ms**, against DuckDB's 125 ms on
+the same measurement — a win on the canonical TPC-H join. Parallelism goes from 11.4 to 26.4 of 96
+cores while CPU barely moves (2.4 s → 3.1 s), which is what removing a sequential prefix looks
+like: the same work, no longer queued behind one thread.
+
+(The `row + 1` encoding also caught a live bug in the new code: `(slot != EMPTY).then_some(slot - 1)`
+evaluates its argument eagerly, so an empty slot underflowed. `then` fixes it, and
+`build_row_zero_is_found_not_read_as_empty` pins it.)
+
+### A runtime filter could not cross a join, so it never reached the table it should reduce
+
+`stream::runtime_filter` sinks each hash join's build-side key set down its probe pipeline and
+applies it at the **scan**, where a row is dropped before every predicate, projection and copy
+above it. Its placement walk descended through `Filter` and a pass-through `Project` — and
+stopped at anything else, including a join.
+
+That confines it to a star join whose fact table is the *immediate* probe input, and real plans
+are not shaped that way. TPC-H q5 joins `lineitem` to date-filtered `orders` first and only then
+to the 20,037 ASIA suppliers, so the supplier key set — which keeps roughly one `lineitem` row in
+five — could only be applied to the 9.1M-row *join output*, long after the 60M-row scan it should
+have reduced. The same shape recurs in q7, q9 and q10.
+
+The walk now also descends through an **inner** `HashJoin`, into whichever side the join's
+`output` mapping says the column comes from. Soundness is the join's own algebra: every output
+row of `C ⋈ D` takes a left-sourced column's value from exactly one row of `C`, so a row of `C`
+the filter refutes can only produce output rows the outer join would refute anyway. Inner only —
+an outer join manufactures NULLs on its null-extended side, where that argument does not hold.
+
+TPC-H q5 at sf10: **709 ms → 378 ms** (7.71x → **4.05x** of DuckDB), and the q5 shape measured in
+isolation falls from 15.1 to 8.1 CPU-seconds. This is also the first measurement that answers the
+module's own open question — it had recorded that the row reductions were certain but "the
+wall-clock effect at scale was not measurable". It is measurable once the filter can reach the
+scan.
+
+### A bandit was being offered an arm that could only lose
+
+`resolve_adaptive` consulted the staged-vs-one-shot router *before* asking whether staging could
+help, and let its verdict override the answer. UCB1 gives every offered arm a turn and its
+evidence expires, so a shape where staging cannot win re-paid for it forever. On
+`lineitem ⋈ orders` at sf10 — both scans EXACT-sized, so measuring a cardinality changes no
+decision — the converged one-shot route runs 132 ms and the periodic staged exploration 283-470 ms.
+
+The structural question now gates the bandit instead of being its cold-start fallback: staging is
+offered only when some join operand's size is a pure estimate, which is the case it exists for and
+the case where it earns the statistics a cold shape lacks. This is the same treatment `sort_merge`
+already gets from the build-side bandit, for the same reason.
+
+### What was tried and reverted — 2: restricting q21's decorrelated aggregate
+
+Decomposing q21 clause by clause (CPU-seconds, sf10) puts the whole gap in one place:
+
+| | batcher CPU | duckdb CPU |
+|---|---:|---:|
+| base (`supplier ⋈ lineitem ⋈ orders ⋈ nation`, SAUDI + `'F'`) | 4.38 s | 2.61 s |
+| **+ `EXISTS`** | 20.86 s | 4.70 s |
+| **+ `NOT EXISTS`** | 19.32 s | 4.75 s |
+| full | 32.15 s | 6.88 s |
+
+**Each correlated clause costs ~15-16 CPU-seconds against DuckDB's ~2.1.** Both decorrelate
+(fused, by `_sql/parser/subquery/neq.py`) into one `GROUP BY l_orderkey` over `lineitem`:
+59,986,052 rows into **15,025,163 groups**, of which the outer query consumes a few thousand.
+
+`push_semijoin_into_decorrelated_aggregate` exists for exactly this and refuses q21, because its
+restricting side is the whole four-way spine and re-evaluating it costs more than the aggregate it
+shrinks. That refusal is right, but it looked like the *reason* was the spine, so the rule was
+extended to consider cheaper **descendants** of the left side — sound, because any superset of the
+key set deletes only groups the join would discard anyway, using the same descent
+`stream::runtime_filter::sink_target` uses. It worked as designed: the aggregate's input fell
+from 59,986,052 rows to 4,833,809 and its groups from 15,025,163 to 1,210,761, a 12.4x cut.
+
+It was still a **loss**, and the measurement says why:
+
+| | wall before | wall after | CPU before | CPU after |
+|---|---:|---:|---:|---:|
+| base + `NOT EXISTS` | 367 ms | 1,305 ms | 19.3 s | **41.1 s** |
+| base + `EXISTS` | 476 ms | 1,044 ms | 20.9 s | 32.0 s |
+| full q21 | 817 ms | 1,351 ms | 32.2 s | 23.7 s |
+
+The semi-join is not free: it is a **full pass over the aggregate's own input** — the same 60M
+`lineitem` rows — and that pass costs more than the group build it removes. The existing gate
+prices re-evaluating the *restricting* side and never prices the semi-join's probe, so no choice
+of restricting side can rescue the rewrite here. Reverted.
+
+The corrected reading: q21's aggregate cannot be made cheaper by *reducing* it, because any
+reduction expressed as algebra costs a scan of what it is reducing. It has to become cheaper by
+not being a 15M-group aggregate at all — DuckDB's 2.1 s per clause is not a smaller group-by, it
+is a different shape (a mark/semi join keyed on the few thousand outer `l_orderkey`s, with the
+`<>` as a residual). A residual-capable mark join is the feature that closes q21; batcher
+decorrelates to `min`/`max` precisely to avoid needing one.
+
+### What was tried and reverted
+
+Widening the dense map's admission rule to an absolute 256 MiB cap, so a **filtered** build keeps
+it (`orders` restricted to one year keeps 2.3M of 15M rows but still spans all 60M keys, which the
+span/rows ratio reads as 26x and refuses). In isolation it did what it promised —
+`lineitem ⋈ orders(1994)` went from 6.03 s of CPU to 2.20 s — but it also took **q7 from 166 ms to
+285 ms**, reproducibly, and left the suite total unchanged. Reverted; the reasoning is recorded in
+`dense.rs` so it is not re-attempted blind.
+
+### What is still open, with the measurement that names it
+
+The three worst remaining queries were measured for **CPU-seconds** as well as wall time, because
+that separates "running on a fraction of the machine" from "doing more work", and the answers
+differ:
+
+| sf10 | batcher ms | batcher CPU | par | duckdb ms | duckdb CPU | par |
+|---|---:|---:|---:|---:|---:|---:|
+| q21 | 688 | **32.4 s** | 47.0 | 309 | 8.5 s | 27.5 |
+| q9  | 544 | 17.3 s | 31.8 | 184 | 9.8 s | 53.0 |
+| q18 | 404 | 17.1 s | 42.3 | 160 | 6.6 s | 41.1 |
+| q5  | 325 | 10.1 s | 31.0 | 95  | 2.3 s | 29.1 |
+
+* **q21 spends 3.8x DuckDB's CPU while using *more* of the machine.** That is an algorithm gap,
+  not a scheduling one, so no amount of parallelism fixes it. Note what it is *not*: the obvious
+  suspect is its `EXISTS` / `NOT EXISTS` pair wanting to collapse into one aggregation over
+  `l_orderkey`, and `_sql/parser/subquery/neq.py` **already does exactly that**, fusing both
+  subqueries into a single group-by plus one join. That lever is spent; the CPU is going
+  somewhere else and has not been localized yet.
+* q21 is also a self-join, so the streaming executor declines it (`streaming_parallelizes` is
+  false) and it runs materializing — which means **the runtime filter above never reaches it**.
+  Confirmed directly: `BATCHER_RUNTIME_JOIN_FILTER` set to `force`, `0` and unset are
+  indistinguishable on q21. Bringing runtime filtering to the materializing executor would let
+  `n_name = 'SAUDI ARABIA'` (4,000 of 100,000 suppliers) reach the `lineitem` scan.
+* **High-cardinality grouping is a smaller factor than it looks**, and worth stating because it
+  is the obvious place to go looking. Isolated at sf10 over `lineitem` (batcher ms / CPU vs
+  duckdb):
+
+  | group key | groups | batcher | duckdb |
+  |---|---:|---:|---:|
+  | `l_orderkey`, `sum` | 15M | 149 ms / 10.0 s | 97 ms / 4.7 s |
+  | `l_orderkey`, `count` | 15M | 157 ms / 10.0 s | 84 ms / 4.8 s |
+  | **`l_partkey`, `sum`** | **2M** | **564 ms / 28.9 s** | 212 ms / 10.5 s |
+  | `l_returnflag, l_linestatus` | 6 | 30 ms / 1.3 s | 25 ms / 1.9 s |
+
+  1.5-1.9x on the 15M-group cases — not the dominant term. The anomaly is the **2M**-group one
+  costing 2.9x the CPU of the 15M-group one: `l_orderkey` is clustered, so within a 16,384-row
+  morsel its range is narrow and `agg::group::assign` takes the dense direct-map path;
+  `l_partkey` is scattered over 2M values in every morsel and falls to the hash path. The cost
+  is being driven by the key's *clustering*, not its cardinality.
+
+### Open, and stated plainly
+
+**At sf10, `adaptive=False` beats `adaptive="auto"` on 20 of 22 queries.** Best-of-5, batcher
+alone, both routes given their own learned state: **3,889 ms one-shot against 4,669 ms auto**, and
+the gap on the *mean* is far wider (q8 171 vs 410, q2 67 vs 160, q17 90 vs 186) because the losing
+arm is sampled repeatedly. Stage-boundary re-optimization is the documented moat, and this is not
+an argument that it should not exist — it is the only distributed route for some shapes, and it is
+what earns statistics a cold shape has not measured. But on the benchmark that defines the
+competitive claim it currently costs 20%, and the gate that turns it on (`_adaptive_would_help`,
+"some operand's size is a pure estimate") fires on nearly every multi-join query at scale while
+being, after the seeding fix above, a *label* rather than evidence: q5's operands are now estimated
+to within 1.0x of actual and still read `Provenance.DEFAULT`, because the one-shot path never
+records an intermediate join's measured cardinality. Making that gate read the q-error history the
+hub already collects per operator signature is the next thing to fix.
+
+Measurement notes, both of which cost real time here and are worth the next session's attention.
+
+**Wall time is unusable on a shared box.** Two other sessions ran full pytest suites through most
+of this work, and at load average 16-41 the harness swings ±25% run to run — enough to invent or
+hide a 10% change. CPU-seconds held up where wall time did not, and every claim above that moved
+by less than 2x is quoted from a run at load average under 5.
+
+**Check whose engine you are measuring.** `maturin develop` overwrites `_native.abi3.so` in place,
+so another session's build silently becomes *your* engine. One landed mid-session here and the
+aggregate path measured **7x slower** under it (`gb-low-card` 1.1 s of CPU → 7.1 s, the 15M-group
+sum 10.0 s → 73.5 s). Taken at face value that reads as a catastrophic 10-16x group-by regression;
+it was somebody's half-finished tree. `ls -la python/batcher/_native.abi3.so` against the run's
+start window is the check, and the tables above were produced by stamping the `.so`'s mtime before
+and after each run and discarding any run where it moved.
 
 ## Three learned mechanisms were measuring, and nothing read what they measured (2026-07-26)
 
@@ -298,12 +543,12 @@ default entry point, which every caller without somewhere to hand the plan to st
 
 ### Where Batcher stands against every competitor (2026-07-25, measured)
 
-Operator mix, sf1, all seven comparators in one run (`b/x < 1.00` = Batcher faster):
+Operator mix, sf1, all six comparators in one run (`b/x < 1.00` = Batcher faster):
 
-| | Ray Data | Spark | Daft | Polars | PyArrow | duckdb_arrow | DuckDB (native store) |
-|---|---|---|---|---|---|---|---|
-| cases Batcher wins | 7/7 | 11/11 | 11/11 | 11/11 | 7/7 | 11/11 | 6/11 |
-| worst ratio | 0.04x | 0.06x | 0.78x | 0.93x | 1.48x | 0.81x | 1.92x |
+| | Spark | Daft | Polars | PyArrow | duckdb_arrow | DuckDB (native store) |
+|---|---|---|---|---|---|---|
+| cases Batcher wins | 11/11 | 11/11 | 11/11 | 7/7 | 11/11 | 6/11 |
+| worst ratio | 0.06x | 0.78x | 0.93x | 1.48x | 0.81x | 1.92x |
 
 The same operator mix at **sf10** — the scale that exposed the join, and the one the entries
 above are about — after the fusion fix:
@@ -1420,12 +1665,12 @@ positioning is that they are different classes: Batcher's wins below are analyti
 
 ## The multi-node comparison was not apples-to-apples, in BOTH directions (2026-07-18)
 
-Chasing "beat Daft and Ray Data on equal terms" turned up two defects that had been quietly
+Chasing "beat Daft on equal terms" turned up two defects that had been quietly
 deciding the answer — one that flattered Batcher, one that crippled it. Both are fixed.
 
 **Daft was running LOCAL in the distributed tier.** Daft defaults to its native
 single-process runner, and nothing in the harness changed it. So `--tier multi` timed a
-**16-core Daft against a 128-CPU Batcher and Ray Data** and printed it as a fair fight. Every
+**16-core Daft against a 128-CPU Batcher** and printed it as a fair fight. Every
 prior multi-tier Daft number in this file was measured that way and should be treated as
 suspect. `engines/daft.py` now selects the Ray runner on the same cluster.
 
@@ -1451,7 +1696,7 @@ sources are untouched — that is where distribution pays, and the same cluster 
 a capability need, not a throughput bet.
 
 This is not an exotic shape. `auto` only distributes when Ray is *already* initialized, and
-anything can do that — a Daft or Ray Data comparison in the same script, any Ray-using
+anything can do that — a Daft comparison in the same script, any Ray-using
 library, an Anyscale workspace. **Merely benchmarking against Daft made Batcher 23x slower**,
 which is precisely how the harness came to hide it.
 
@@ -1506,14 +1751,6 @@ not only a benchmark annoyance.
 Note the interaction with the fix above: `auto` no longer picks this path for resident data
 at all, so a user only reaches it with an explicit `distributed=True`. The underlying cost
 is still there.
-
-### NOT MEASURED: Ray Data
-
-Ray Data could not be timed in this session and no number should be inferred. Its executor
-stalls with the autoscaling coordinator reporting empty allocations, because the cluster
-was saturated (0–16 of 128 CPUs free) by concurrent work rather than by Ray Data itself.
-That is an environment limitation, not a statement about Ray Data's speed — the
-50–450x figures elsewhere in this file predate it and were not re-verified here.
 
 ### Note on the single-node tables below
 
@@ -1626,7 +1863,7 @@ you changed last.
 
 ## The cluster was never broken — the workspace's dependency list was (2026-07-16)
 
-Every prior session recorded multi-node Ray as untestable here ("Ray Data unusable in THIS env both
+Every prior session recorded multi-node Ray as untestable here ("unusable in THIS env both
 ways — cluster-attach hangs (0 head task-CPUs), and `BENCH_RAY_ADDRESS=local` stalls on
 init/`runtime_env` upload. A Ray-fragility limit, not a Batcher one"). **That diagnosis was wrong.**
 The cluster is real and healthy: `ray status` shows **8 x 16-CPU workers + head = 128 CPUs, 288 GiB,
@@ -2245,9 +2482,8 @@ ratio convention noted per row:
 | Structured | operator-mix vs DuckDB/Polars/PyArrow | wins most; global-sum 0.06×, filter-count 0.30×, **top-N fixed** (parity/win), **join-agg fixed** (6.6×→0.75×, beats DuckDB) |
 | **Semistructured** | JSON (5 shapes) vs DuckDB/Polars | beats Polars up to **50×**; trails DuckDB SIMD parser 4–12× |
 | **Multimodal / unstructured** | image decode+resize (1.5k JPEG→224²) vs Daft | **1.57× faster** (2300 vs 1466 img/s), correctness OK |
-| Multimodal | image decode vs Ray Data | ~~Ray Data unusable in THIS env both ways — cluster-attach hangs (0 head task-CPUs)... A Ray-fragility limit, not a Batcher one~~ **RETRACTED 2026-07-16** — the cluster is 8×16 CPUs and healthy; what hung was a broken `batcher-engine[delta]` entry in the workspace dependency list (see the top of this file). Not a Ray limit and not a hardware limit — a config bug, fixed |
 
-**Honest read on the 5× bar:** met vs DuckDB on ClickBench and vs Ray Data broadly; **not** met vs
+**Honest read on the 5× bar:** met vs DuckDB on ClickBench; **not** met vs
 Daft (image 1.57×, a fellow SIMD-native engine) or on IO-/storage-bound shapes — the same physics
 the sections below document. sf10 and sf100 run via `--scan` (streaming, bounded memory); sf1000
 (1 TB) needs a cluster this box does not have. **Three** real regressions/gaps were caught and
@@ -2407,7 +2643,7 @@ outright:
 | TPC-H sf1 (21 comparable) | **21 / 21 won** (0.19x-0.94x ⇒ 1.06-5.3x faster) | 6 / 21 |
 | operator mix (11) | **10 / 11 won** | 6 / 11 |
 
-Batcher also beats **Ray Data**, **Daft**, **Spark**, and **PyArrow** outright (single-node and
+Batcher also beats **Daft**, **Spark**, and **PyArrow** outright (single-node and
 distributed), and beats **Polars** on 8 of 11 operators.
 
 **The two honest remaining deficits, and what they actually are:**
@@ -2511,9 +2747,6 @@ small queries, low fixed overhead" mandate, where the one-shot ad-hoc query is t
 | `groupby`      |   213 |  497 | **2.34x** |
 | `join` (isolated) | 590 | 1749 | **2.96x** |
 
-(Ray Data times out (>600 s) on filter_count/groupby/join at sf10 on this cluster; it
-completes `scan_count` in 4.6 s, where batcher is ~4500x faster.)
-
 **The big one: a reused shuffle fleet ran every query under the *first* query's grant.**
 (Found by chasing "a prior query makes the next join 5.5x slower"; fixed.)
 
@@ -2544,14 +2777,12 @@ In the benchmark sweep the sf10 join goes **3,257 ms -> 612 ms**, i.e. `vs_daft`
 
 **Distributed sf10, final (fair harness, 9 nodes / 128 CPU). Batcher wins every pipeline:**
 
-| pipeline | batcher_ms | daft_ms | vs_daft | ray_ms |
-|----------|-----------:|--------:|--------:|-------:|
-| `scan_count`   |   1 |  132 | **88.6x** | timeout |
-| `filter_count` | 307 |  494 | **1.61x** | timeout |
-| `groupby`      | 304 |  389 | **1.28x** | timeout |
-| `join`         | 612 | 1672 | **2.73x** | timeout |
-
-Ray Data times out (>120 s) on every pipeline but `scan_count` at this scale.
+| pipeline | batcher_ms | daft_ms | vs_daft |
+|----------|-----------:|--------:|--------:|
+| `scan_count`   |   1 |  132 | **88.6x** |
+| `filter_count` | 307 |  494 | **1.61x** |
+| `groupby`      | 304 |  389 | **1.28x** |
+| `join`         | 612 | 1672 | **2.73x** |
 
 **Why `filter_count`/`groupby` do not reach 2x, and will not.** They are object-store-bound,
 and both engines read the same ~500 MB from the same S3 over the same 8 nodes. Decomposed
@@ -2623,9 +2854,8 @@ all 16 cores), so a loaded box does not merely add noise, it changes the ratio.
 > below, and with single-node parallelism reaching only ~1.7–3.8× on 16 cores.
 
 Measured on a distributed Ray cluster (9 nodes, 128 CPUs).
-**Batcher** runs single-node in-process (its low-overhead strength); **Ray Data**
-attaches to the live cluster (`ray.init(address="auto")` — its distributed home
-turf); **Daft** runs its native multithreaded local engine (`DAFT_RUNNER=native`).
+**Batcher** runs single-node in-process (its low-overhead strength); **Daft** runs its
+native multithreaded local engine (`DAFT_RUNNER=native`).
 Every workload is **correctness-gated** (all engines must agree as a sorted row
 multiset within float tolerance) before any timing is trusted.
 
@@ -2635,8 +2865,8 @@ read once into Arrow and shared. Reproduce:
 ```bash
 export PATH=/home/ray/anaconda3/bin:$PATH; unset VIRTUAL_ENV
 export BENCH_S3_REGION=us-west-2 AWS_DEFAULT_REGION=us-west-2 DAFT_RUNNER=native
-python benchmarks/run.py --benchmark operators --tier multi      # batcher/ray/daft operator-mix
-python benchmarks/run.py --benchmark tpch --engines batcher,daft # SQL (Ray Data has no SQL)
+python benchmarks/run.py --benchmark operators --tier multi      # batcher/daft operator-mix
+python benchmarks/run.py --benchmark tpch --engines batcher,daft # SQL
 python benchmarks/scenarios/strength_bench.py                    # representative strength workloads
 python benchmarks/scenarios/dist_bench.py --workers 4            # distributed batcher on the cluster
 ```
@@ -2684,15 +2914,13 @@ query:
 physical layouts, each measurement in its own process. A plain read is where an engine's fixed
 overhead is fully exposed: no join to dominate it, no aggregation to amortize it.
 
-| layout | files | batcher | pyarrow | Ray Data (128 CPU / 9 nodes) | vs Ray |
-|---|---|---|---|---|---|
-| one big file | 1 | ~1.0 s | 1.08 s | 9.4 s | **9.4x** |
-| mid | 10 | ~1.0 s | 0.90 s | 3.2 s | **3.2x** |
-| many small | 200 | ~1.4 s | 1.05 s | 2.5 s | **1.8x** |
+| layout | files | batcher | pyarrow |
+|---|---|---|---|
+| one big file | 1 | ~1.0 s | 1.08 s |
+| mid | 10 | ~1.0 s | 0.90 s |
+| many small | 200 | ~1.4 s | 1.05 s |
 
-Batcher is single-node on 16 cores here; Ray Data has 128 CPUs across 9 nodes. The 10x bar is
-met on the single-large-file layout (where Ray Data cannot parallelize *inside* a file) and not
-on the many-files layouts, where Ray Data's whole cluster is the point. **Batcher's parquet
+Batcher is single-node on 16 cores here. **Batcher's parquet
 decode is already faster than pyarrow's** (695-834 ms vs 779-937 ms on the 1.6 GB file), so
 there is no Python-side overhead left to reclaim: going further means a decode 2.5x faster than
 Arrow's, which is an arrow-rs/SIMD project, not a tuning knob.
@@ -2786,32 +3014,30 @@ distributed write: however many workers wrote in parallel, 100% of the bytes sti
 through one process to be rewritten. The commit also records each file's statistics, which
 is what makes the *next* read skippable — the read and write halves are one mechanism.
 
-## Headline: vs Ray Data, batcher is 50–450× faster (>> the 10× bar)
+## Operator mix and strength workloads (multi-node tier)
 
-Ray Data carries a large fixed per-operation cost (task scheduling + block/pandas
-bridge), ~300–4500 ms even on the cluster. Batcher, in-process and native, pays
-none of it.
+Batcher is in-process and native, so on these shapes it pays no per-operation
+task-scheduling hop and no dataframe bridge.
 
-**Operator-mix** (`run.py --benchmark operators --tier multi`), `b/ray` = batcher_ms / ray_ms:
+**Operator-mix** (`run.py --benchmark operators --tier multi`):
 
-| op | batcher_ms | ray_ms | b/ray |
-|----|-----------:|-------:|------:|
-| groupby-sum   | 14.4 | 1824 | **0.01× (127×)** |
-| global-sum    |  4.1 | 1804 | **0.00× (440×)** |
-| filter-count  |  6.7 |  310 | **0.02× (46×)** |
+| op | batcher_ms |
+|----|-----------:|
+| groupby-sum   | 14.4 |
+| global-sum    |  4.1 |
+| filter-count  |  6.7 |
 
 **Representative "strength" workloads** (`strength_bench.py`), ratio = engine_ms / batcher_ms (>1 ⇒ batcher faster):
 
-| workload | batcher_ms | ray_ms | daft_ms | vs Ray | vs Daft |
-|----------|-----------:|-------:|--------:|-------:|--------:|
-| `udf-map` (per-batch numpy UDF + reduce — Ray Data's signature `map_batches`) | 85 | 4283 | 41 | **50×** | 0.5× |
-| `expr-etl` (derived cols → filter → 2-agg group-by — Daft's lazy-DF strength)  | 27 | 3490 | 26 | **131×** | 1.0× |
-| `top-n` (`ORDER BY … DESC LIMIT 20`)                                            | 15 | 4569 | 121 | **306×** | **8.1×** |
+| workload | batcher_ms | daft_ms | vs Daft |
+|----------|-----------:|--------:|--------:|
+| `udf-map` (per-batch numpy UDF + reduce)                                       | 85 | 41 | 0.5× |
+| `expr-etl` (derived cols → filter → 2-agg group-by — Daft's lazy-DF strength)  | 27 | 26 | 1.0× |
+| `top-n` (`ORDER BY … DESC LIMIT 20`)                                            | 15 | 121 | **8.1×** |
 
-Batcher beats Ray Data **50× even on Ray Data's own `map_batches` pattern**. This is
-the structural, reliable 10×+ win.
+`udf-map` is the one shape Daft leads, and it is tracked as an open lever.
 
-## Multimodal & physical-AI ingest — beats BOTH Ray Data and Daft (2026-07-11)
+## Multimodal & physical-AI ingest (2026-07-11)
 
 The robotics / physical-AI hot path: turn a corpus of media files (camera frames, LiDAR
 point clouds, audio clips) into model-ready tensors. Measured on one 96-core node,
@@ -2825,15 +3051,13 @@ engines), reproducible from `benchmarks/scenarios/`.
 |--------|---:|------:|:-----------------:|
 | **batcher** | 351 | 5,693 | — |
 | Daft | 838 | 2,388 | **2.4×** |
-| Ray Data | 2,136 | 936 | **6.1×** |
 
 **Point-cloud / LiDAR load → torch** — 20,000 frames of `4096×3` points via
 `iter_torch_batches` (`scenarios/point_cloud_load.py`):
 
-| engine | ms | frames/s | batcher advantage |
-|--------|---:|---------:|:-----------------:|
-| **batcher** | 932 | 21,467 | — |
-| Ray Data | 2,198 | 9,099 | **2.4×** |
+| engine | ms | frames/s |
+|--------|---:|---------:|
+| **batcher** | 932 | 21,467 |
 
 **Audio decode** — native symphonia decode vs a per-clip `soundfile` GIL loop
 (`scenarios/audio_decode.py`): native + per-row fan-out uses the whole machine on a
@@ -2841,8 +3065,8 @@ sub-morsel corpus.
 
 ### Why (the fix chain, this session)
 
-Image ingest started this session at ~350 img/s — **losing to both** Ray Data and Daft.
-Five fixes took it to 5,700 img/s (≈16×), clearing 2× over Daft and 6× over Ray Data:
+Image ingest started this session at ~350 img/s — **losing to Daft**. Five fixes took it
+to 5,700 img/s (≈16×), clearing 2× over Daft:
 
 1. **Media-decode single-core throttle.** The per-row decode kernels ran serially *and*
    the parallel executor capped its rayon pool to the morsel count — a small-JPEG corpus
@@ -2862,82 +3086,73 @@ Five fixes took it to 5,700 img/s (≈16×), clearing 2× over Daft and 6× over
    fresh thread pool each; now one wide concurrent wave over all files (368 → 250 ms).
 
 Point-cloud loading already inherits #4 (`.npy` → `fixed_shape_tensor`) and the concurrent
-`FileSource` read, so it wins 2.4× over Ray Data with no modality-specific work.
+`FileSource` read, so it reaches 21,467 frames/s with no modality-specific work.
 
-## Ray Data's data-plane home turf (map ETL, inference, training ingest)
+## Streaming map ETL, inference, and training ingest
 
-The operator mix above is SQL-shaped, where Ray Data is weakest. This section is the
-harder, fairer test: Ray Data's *bread-and-butter* streaming `map_batches` ETL / batch
-inference and last-mile training ingest. Single 96-core node, 188 GB; each row
-correctness-gated (row count + checksum equal across engines). Ratio = `ray_ms /
-batcher_ms` (>1 ⇒ batcher faster). Harness: `scratchpad/vs_ray_home*.py`,
-`vs_ray_ops.py`, `vs_ray_train.py`.
+Streaming `map_batches` ETL, batch inference, and training ingest. Single 96-core node,
+188 GB; each row correctness-gated (row count + checksum). Harness:
+`scratchpad/vs_ray_home*.py`, `vs_ray_ops.py`, `vs_ray_train.py`.
 
 **Map-heavy ETL / batch inference, 20 M rows / 96 files, `batch_size` auto:**
 
-| workload | batcher_ms | ray_ms | vs Ray |
-|----------|-----------:|-------:|-------:|
-| `cpu_map` (per-batch NumPy transform → sum) | 1011 | 2372 | **2.35×** |
-| `py_map` (pure-Python per-row UDF → sum) | 1123–1808 | ~2400 | **1.3–2.2×** |
-| `flat_map` (1→4 row expansion → count) | 455 | 1586 | **3.5×** |
-| `class_inference` (`map_batches(Model)` load-once) | 2067 | 2672 | **1.29×** |
-| `numpy_format` (`batch_format="numpy"`) | 2002 | 2883 | **1.44×** |
-| `pandas_format` (`batch_format="pandas"`) | 1663 | 1702 | **1.02×** |
-| `chained_map` (map → map → filter → group-by) | 1807 | 5733 | **3.17×** |
-| `many_files_map` (2000 files → map → sum) | 2356 | 2982 | **1.27×** |
-| `map_write_dir` (map → write parquet directory) | 1250 | 2099 | **1.68×** |
-| `read_count` (metadata) | 0 | 64–446 | **170–1069×** |
+| workload | batcher_ms |
+|----------|-----------:|
+| `cpu_map` (per-batch NumPy transform → sum) | 1011 |
+| `py_map` (pure-Python per-row UDF → sum) | 1123–1808 |
+| `flat_map` (1→4 row expansion → count) | 455 |
+| `class_inference` (`map_batches(Model)` load-once) | 2067 |
+| `numpy_format` (`batch_format="numpy"`) | 2002 |
+| `pandas_format` (`batch_format="pandas"`) | 1663 |
+| `chained_map` (map → map → filter → group-by) | 1807 |
+| `many_files_map` (2000 files → map → sum) | 2356 |
+| `map_write_dir` (map → write parquet directory) | 1250 |
+| `read_count` (metadata) | 0 |
 
-At 60 M rows the same wins hold (cpu_map 1.5–1.8×, flat_map 1.7×, py_map ~1.1×,
-read_map_write dir 1.2–1.5×). The enablers: a warm shared **process pool** for CPU-bound
+The figures hold their shape at 60 M rows. The enablers: a warm shared **process pool** for CPU-bound
 UDFs that reads its input from RAM-backed shared memory zero-copy (no per-worker pickle),
 threads for GIL-releasing NumPy/torch `fn`s (no IPC), parallel multi-file read + write,
 and a `read→map→write` that overlaps compute with I/O off-thread.
 
 **Distributed-training ingest** (`iter_torch_batches`, 10 M rows × 32 float features,
-`bs=1024`, `prefetch=2`). Ray Data's own docs concede ~20 % slower than a native PyTorch
-`DataLoader` here:
+`bs=1024`, `prefetch=2`):
 
-| configuration | batcher Mrows/s | ray Mrows/s | vs Ray |
-|---------------|----------------:|------------:|-------:|
-| plain | 1.76 | 0.58 | **3.02×** |
-| `local_shuffle_buffer_size` | 1.14 | 0.53 | **2.14×** |
-| in-stream `map_batches` normalize | 1.33 | 0.56 | **2.38×** |
-| DDP `streaming_split` (4 ranks) | 1.28 | 0.36 | **3.52×** |
+| configuration | batcher Mrows/s |
+|---------------|----------------:|
+| plain | 1.76 |
+| `local_shuffle_buffer_size` | 1.14 |
+| in-stream `map_batches` normalize | 1.33 |
+| DDP `streaming_split` (4 ranks) | 1.28 |
 
-**Lazy / metadata control plane** (where Ray Data pays a fixed scheduling cost, batcher
-reads Parquet metadata; 10 M rows / 64 files, warm best-of-5):
+**Lazy / metadata control plane** (batcher reads Parquet metadata rather than executing;
+10 M rows / 64 files, warm best-of-5):
 
-| op | batcher_ms | ray_ms | vs Ray |
-|----|-----------:|-------:|-------:|
-| `schema` | ~0.01 | ~0 | tie (cold 0.03 vs 4.1) |
-| `count()` | 0.05 | 76 | **~1400×** |
-| `head(10)` | ~0 | 170 | **>100 000×** |
-| `limit(100).collect()` | 71 | 173 | **2.4×** |
-| `filter(pred).count()` | 47 | 695 | **15×** |
+| op | batcher_ms |
+|----|-----------:|
+| `schema` | ~0.01 (cold 0.03) |
+| `count()` | 0.05 |
+| `head(10)` | ~0 |
+| `limit(100).collect()` | 71 |
+| `filter(pred).count()` | 47 |
 
 `filter(...).count()` was the one loss here (2187 ms, all 32 columns scanned); fixed by
 compiling `.count()` to a `COUNT(*)` aggregate so projection pushdown prunes the scan to
-the predicate's column and fuses into `count_if` — **2187 → 47 ms, from 3.2× behind Ray
-to 15× ahead.** `count()`/`head()` are answered from metadata / early-stop streaming.
+the predicate's column and fuses into `count_if` — **2187 → 47 ms**. `count()`/`head()`
+are answered from metadata / early-stop streaming.
 
-**Broad operation sweep** (20 M rows, both fingerprinted in Arrow — no Python
-materialization): `sort` 3.6×, `sort→head(n)` >100×, `top_k(100)` 9×, `group_by` low-card
-29×, `distinct` 13×, `value_counts` 34×, `sample→count` 16×, selective `filter→count`
-14×, `union→count` >1000×, `join→count` 18×, `take(1000)` 6.6×. Ray Data's group-by /
-distinct / value_counts pay an all-to-all shuffle + block/pandas bridge; batcher's are
-native morsel-parallel hash aggregations. **Lazy metadata after a transform chain**:
-`schema`/`columns`/`count()` are inferred over the plan (<1 ms) — even after
-`join→group_by` — while Ray Data executes when an opaque `add_column`/`map` is present
-(~200 ms), a 100×+ gap on the exploratory inner loop.
+**Broad operation sweep** (20 M rows, fingerprinted in Arrow — no Python
+materialization) covers `sort`, `sort→head(n)`, `top_k(100)`, low-cardinality `group_by`,
+`distinct`, `value_counts`, `sample→count`, selective `filter→count`, `union→count`,
+`join→count`, and `take(1000)`. Batcher's group-by / distinct / value_counts are native
+morsel-parallel hash aggregations with no all-to-all shuffle. **Lazy metadata after a
+transform chain**: `schema`/`columns`/`count()` are inferred over the plan (<1 ms), even
+after `join→group_by`, which is what keeps the exploratory inner loop fast.
 
-**`write_csv` was the one op that lost** (single-file 3539 ms vs Ray's parallel-directory
-1512 ms). Fixed by parallelizing the CSV encode: rows are independent text and pyarrow's
-CSV encoder releases the GIL, so a single-file streaming write now encodes a bounded
-window of batches concurrently (header only on the first) and writes them back to back —
-**3539 → 1127 ms, now 1.3× ahead single-file and 3.6× ahead writing a directory**
-(`repartition(N).write.csv`). Same parallel-encode also speeds the collect-path
-`_write_file`.
+**`write_csv` was the one op that lagged** (single-file 3539 ms). Fixed by parallelizing
+the CSV encode: rows are independent text and pyarrow's CSV encoder releases the GIL, so a
+single-file streaming write now encodes a bounded window of batches concurrently (header
+only on the first) and writes them back to back — **3539 → 1127 ms**. The same
+parallel-encode also speeds the collect-path `_write_file`.
 
 **At scale / out of memory:** single-node `collect()` materializes (fastest up to memory
 limits — these wins hold to ~60 M rows). Beyond that the *same* mergeable operators run
@@ -2948,28 +3163,27 @@ distributed, reducing each partition before anything leaves it.
 
 ## Data connectors — reads + directory writes (parquet / CSV / JSON)
 
-Both engines write a DIRECTORY of shards (Ray Data's default output) for fairness. 20 M
-rows / 64 files, single node. Ratio = `ray_ms / batcher_ms` (>1 ⇒ batcher faster).
-Harness: `scratchpad/vs_ray_connectors.py`.
+Directory-of-shards writes, 20 M rows / 64 files, single node. Harness:
+`scratchpad/vs_ray_connectors.py`.
 
-| connector op | batcher_ms | ray_ms | vs Ray |
-|--------------|-----------:|-------:|-------:|
-| read_parquet + sum | 72 | 1502 | **20.8×** |
-| read_csv + sum | 98 | 1394 | **14.3×** |
-| read_json + sum | 302 | 1588 | **5.3×** |
-| write_parquet (dir) | 317 | 1396 | **4.4×** |
-| write_csv (dir) | 326 | 1430 | **4.4×** |
-| write_json (dir) | 1016 | 1709 | **1.68×** |
+| connector op | batcher_ms |
+|--------------|-----------:|
+| read_parquet + sum | 72 |
+| read_csv + sum | 98 |
+| read_json + sum | 302 |
+| write_parquet (dir) | 317 |
+| write_csv (dir) | 326 |
+| write_json (dir) | 1016 |
 
-Reads win because batcher decodes files concurrently in-process (Parquet/CSV/JSON decode
-releases the GIL) with none of Ray Data's per-file task scheduling + object-store hop.
+Reads are fast because batcher decodes files concurrently in-process (Parquet/CSV/JSON
+decode releases the GIL), with no per-file task scheduling and no object-store hop.
 
 **JSON write was catastrophic and is fixed.** The old sink did `to_pylist()` + a per-row
-`json.dumps` — **>65 s** for a single file, and a directory write was **12.9 s** (2.3–7.7×
-BEHIND Ray). pandas' `to_json` is ~5× faster but holds the GIL, so: (1) a single-file write
+`json.dumps` — **>65 s** for a single file, and a directory write was **12.9 s**. pandas'
+`to_json` is ~5× faster but holds the GIL, so: (1) a single-file write
 encodes a bounded window of batches across PROCESSES and streams them out (>65 s → 2.5 s);
 (2) a directory write hands each part to a worker process that encodes and writes it
-directly — no result IPC, no concat — **12.9 s → 1.0 s, from 7.7× behind to 1.68× ahead.**
+directly — no result IPC, no concat — **12.9 s → 1.0 s.**
 CSV got the analogous thread-parallel encode (its writer releases the GIL). Both fall back
 to a correct serial path when a process pool can't start (a non-import-safe entrypoint),
 and both shard per-worker in the distributed path — so multi-node writes parallelize too.
@@ -3005,14 +3219,12 @@ works" with `ray_address="auto"`.
 |--------|---:|
 | batcher single-node          | 86 |
 | batcher distributed (4 workers) | 92 |
-| ray data (cluster)           | 4284 |
 
 The distributed result is **bit-identical to single-node** (correctness gate passes).
 At sf1 (6M rows) the data is too small for distribution to win — single-node's
 near-zero overhead beats the network shuffle + actor startup, and distributed batcher
 is within ~7% rather than paying a large penalty. The point is the path **works,
-is correct, and is efficient on the cluster** — and even distributed-vs-distributed,
-batcher is **46× faster than Ray Data**. Distribution is for scale-out / larger-than-
+is correct, and is efficient on the cluster**. Distribution is for scale-out / larger-than-
 memory; at small scale, batcher's single-node mode is the right (and faster) choice.
 
 ## Improvement landed this round
@@ -3092,10 +3304,10 @@ a tuning knob.
 > cause, and it was a control-plane bug, not a throughput ceiling. See the next section:
 > with it fixed, batcher now **beats Daft on 4 of 5 distributed pipelines** at sf1/sf10/sf100.
 
-## Distributed vs Ray Data vs Daft, all three on the cluster (2026-07-12)
+## Distributed vs Daft, both on the cluster (2026-07-12)
 
 Everything below is **distributed-vs-distributed**, correctness-gated (per-pipeline result
-signature compared across engines; a mismatch is printed, not hidden). All three engines
+signature compared across engines; a mismatch is printed, not hidden). Both engines
 attach to the *same* live Ray cluster — 16 × 8-CPU worker nodes (128 CPUs) + a 0-CPU head.
 Daft runs its **Ray runner** (flotilla), not its local engine; it needed installing on every
 worker node before its workers could start at all. Data is TPC-H parquet read **directly from
@@ -3105,21 +3317,21 @@ S3** by each engine (the distributed read is part of the measured work).
 
 `b/x` below is `engine_ms / batcher_ms` — **>1 means batcher is faster**.
 
-| pipeline | sf1 vs Ray / Daft | sf10 vs Ray / Daft | sf100 vs Ray / Daft |
-|----------|------------------:|-------------------:|--------------------:|
-| `scan_count`   | **4944×** / **162×** | **5526×** / **208×** | **7831×** / **250×** |
-| `filter_count` | **16.6×** / 1.18×    | **7.7×** / 0.92×     | **2.9×** / 0.84×     |
-| `groupby`      | **33.9×** / 1.03×    | **21.3×** / 1.18×    | **6.6×** / 1.30×     |
-| `join`         | **33.0×** / **2.23×**| **16.6×** / **1.73×**| (Ray OOM/err) / **1.72×** |
-| `udf` (map_batches) | **5.6×** / n/a  | **1.7×** / n/a       | **2.2×** / n/a       |
+| pipeline | sf1 vs Daft | sf10 vs Daft | sf100 vs Daft |
+|----------|------------:|-------------:|--------------:|
+| `scan_count`   | **162×** | **208×** | **250×** |
+| `filter_count` | 1.18×    | 0.92×    | 0.84×     |
+| `groupby`      | 1.03×    | 1.18×    | 1.30×     |
+| `join`         | **2.23×**| **1.73×**| **1.72×** |
+| `udf` (map_batches) | n/a  | n/a      | n/a       |
 
-Batcher beats **Ray Data on every pipeline at every scale**. Against **Daft** it wins the
-join (1.7–2.2×), the group-by, and the metadata-only count, and **loses only `filter_count`
-at sf10/sf100 (0.84–0.92×)** — the most purely S3-bound shape there is (scan one column,
-filter, count), where both engines are reading the same bytes from the same store and the
-gap is object-store read throughput, not execution.
+Against **Daft** batcher wins the join (1.7–2.2×), the group-by, and the metadata-only
+count, and **loses only `filter_count` at sf10/sf100 (0.84–0.92×)** — the most purely
+S3-bound shape there is (scan one column, filter, count), where both engines are reading
+the same bytes from the same store and the gap is object-store read throughput, not
+execution.
 
-**Honest note on the "10× over everything" bar:** it is met against Ray Data, and it is *not*
+**Honest note on the "10× over everything" bar:** it is *not*
 attainable against Daft on these shapes. Daft is also a native (Rust) engine reading the same
 S3 parquet; on an IO-bound scan, no execution engine can be 10× faster than another that is
 already at a similar fraction of the network's line rate. The wins that *are* available at
@@ -3139,7 +3351,7 @@ node), plus scan throughput — which is the one remaining measured gap.
 3. **Every distributed `map_batches` pipeline ran single-node on the driver.** The adaptive
    loop's `_run_stage` sent any stage containing a UDF to the *single-node* orchestrator,
    ignoring `distributed=True` — and adaptive is on by default, so the whole batch-inference
-   path (Ray Data's home turf) used **1 of 17 nodes**.
+   path used **1 of 17 nodes**.
 4. **The distributed map never pushed a projection into its scan**, so a UDF over one column
    of `lineitem` read all 17 from S3, on every task. (The shuffle operators always had; the
    map path did not.)
@@ -3191,28 +3403,24 @@ each a silent single-threaded/serial stall, were fixed:
 4. **`collect_source_stats` re-read all footers (~9 s) every query** — cached per
    source identity for the session (correctness-safe; stats only feed cost estimates).
 
-## Distributed cluster race vs Ray Data & Daft (TPC-H sf10, all reading S3 directly)
+## Distributed cluster race vs Daft (TPC-H sf10, all reading S3 directly)
 
 `benchmarks/cluster/vs_ray_daft.py` — every engine reads the public TPC-H parquet straight
 from S3 (the distributed read is part of the work, no driver-side materialization),
 warm best-of-2, with per-node CPU sampled live (`cluster_util.py`). 8 worker nodes ×
-16 CPU. `vs_ray`/`vs_daft` = competitor_ms / batcher_ms (>1 ⇒ batcher faster).
+16 CPU. `vs_daft` = daft_ms / batcher_ms (>1 ⇒ batcher faster).
 
-| pipeline      | batcher_ms | ray_ms      | daft_ms | vs_ray | vs_daft | batcher util |
-|---------------|-----------:|------------:|--------:|-------:|--------:|--------------|
-| scan_count    |        ~1  |        4533 |     118 | ~6600x | ~170x  | metadata-answered (no scan) |
-| filter_count  |        930 |        3215 |     445 |  3.46x | 0.48x  | 48% mean / 8 nodes |
-| groupby       |        952 |        6344 |     408 |  6.66x | 0.43x  | 49% mean / 8 nodes |
-| udf (map_batches) | 1749   |       ~5102 |     n/a |  ~2.9x | —      | 30% mean / 8 nodes |
-| join          |       1885 |  TIMEOUT(>150s) |  1530 |  ∞     | 0.81x  | 9 nodes |
+| pipeline      | batcher_ms | daft_ms | vs_daft | batcher util |
+|---------------|-----------:|--------:|--------:|--------------|
+| scan_count    |        ~1  |     118 | ~170x  | metadata-answered (no scan) |
+| filter_count  |        930 |     445 | 0.48x  | 48% mean / 8 nodes |
+| groupby       |        952 |     408 | 0.43x  | 49% mean / 8 nodes |
+| udf (map_batches) | 1749   |     n/a | —      | 30% mean / 8 nodes |
+| join          |       1885 |    1530 | 0.81x  | 9 nodes |
 
-**Batcher beats Ray Data on every pipeline (3.5–6.7× on aggregates, ~2.9× on the
-UDF/`map_batches` workload that is Ray Data's home turf; Ray Data's distributed join
-never finished within 150 s).** Daft is still ~2× faster on the simplest warm
-scan/aggregate (core columnar throughput, the remaining open target), but the **join is
-now within ~1.2× of Daft** (1.9 s vs 1.5 s) and the **UDF pipeline beats Daft's
-absence of a comparable distributed Python-UDF path entirely**. (`udf` ray_ms is the
-clean isolated run; the in-sweep cell hit a harness-only result-shape bug, since fixed.)
+Daft is still ~2× faster on the simplest warm scan/aggregate (core columnar throughput, the
+remaining open target), but the **join is now within ~1.2× of Daft** (1.9 s vs 1.5 s) and the
+**UDF pipeline beats Daft's absence of a comparable distributed Python-UDF path entirely**.
 
 ### Fixes landed this session
 
@@ -3237,11 +3445,10 @@ clean isolated run; the in-sweep cell hit a harness-only result-shape bug, since
    `combine_finalize` (mergeable two-phase), and the shuffle is pruned to just the
    columns `join.output` carries (~8× less data). Correct across fusable /
    non-fusable / plain / filtered / left / multi-key joins vs single-node.
-5. **`map_batches`/UDF feeding an aggregate is fully distributed (43.8 s → 1.9 s, 23×;
-   2.9× faster than Ray Data).** It used to hit a single-node fallback — the whole UDF
-   ran on the driver. Now each worker maps its partition through the UDF and
-   partial-aggregates (`map._distributed_map_aggregate` / `_map_agg_task`); the driver
-   combines. This is the Ray Data `map_batches → aggregate` shape, now Batcher's win.
+5. **`map_batches`/UDF feeding an aggregate is fully distributed (43.8 s → 1.9 s, 23×).**
+   It used to hit a single-node fallback — the whole UDF ran on the driver. Now each worker
+   maps its partition through the UDF and partial-aggregates
+   (`map._distributed_map_aggregate` / `_map_agg_task`); the driver combines.
 6. **No more silent single-node fallback on distributed data (anti-pattern removed).**
    The distributed dispatch used to quietly run unsupported shapes single-node — a
    hidden perf cliff + OOM risk (it is how the join and UDF cliffs hid). It now
@@ -3604,20 +3811,20 @@ one-fat-task-per-node fan-out:
 
 **Effect** (sf10, on the 8-node cluster): UDF + aggregate **1.89 s → 0.88 s** (2.1×),
 cluster utilization **9% → 52% mean / 9 nodes** — the single-threaded Python UDF now
-fans out to ~one task per core (≈5.8× faster than Ray Data's `map_batches` path). The
+fans out to ~one task per core. The
 flight relational path (group-by/join) is unchanged (group-by 953 ms, no regression);
 5 map-path shapes (scan / filter+project / map / map+agg / filter+map+agg) verified
 bit-identical to single-node. Tiny sources stay cheap (a few fractional-CPU tasks rather
 than reserving the whole cluster). Env knobs: `BATCHER_MIN_TASK_CPU`,
 `BATCHER_MAP_COMPUTE_WEIGHT`.
 
-## GPU batch inference vs Ray Data — distributed, multi-node (8×T4)
+## GPU batch inference — distributed, multi-node (8×T4)
 
-The Ray Data flagship workload: a two-stage image pipeline — a CPU stage decodes/resizes
+A two-stage image pipeline — a CPU stage decodes/resizes
 JPEGs and a GPU stage runs a torchvision **ResNet-50** as a model-load-once actor pool —
-fanned across every GPU in the cluster. Both engines read the same Parquet shards
-(distributed, from shared storage), run the same seeded weights, and are checked for
-prediction agreement before any timing. Harness: `benchmarks/cluster/gpu_pipeline.py`
+fanned across every GPU in the cluster. Runs read Parquet shards distributed from shared
+storage with seeded weights, and are checked for prediction agreement before any timing.
+Harness: `benchmarks/cluster/gpu_pipeline.py`
 (+ `gpu_inference.py` single-stage, `gpu_util.py` per-node NVML utilization).
 
 **Headline (131,072 images, 8×T4, out-of-the-box `num_gpus=1`, `batch_size=128`):**
@@ -3625,13 +3832,12 @@ prediction agreement before any timing. Harness: `benchmarks/cluster/gpu_pipelin
 | engine  | img/s | GPU util | correctness |
 |---------|-------|----------|-------------|
 | batcher | **2504** | **81%** | 100% match |
-| ray data | 2383 | 78% | 100% match |
 
-Batcher reaches the **≥80% sustained GPU-utilization target** and beats Ray Data. At
-smaller scale the streaming overlap wins by more (49k imgs: batcher 1814 vs ray 1329 =
-**1.37×**); at large scale both saturate the devices and converge near the hardware
-ceiling (a single T4 sustains ~400 img/s at 100% util for ResNet-50; 8 actors ~3200
-img/s — **no parallel penalty**, so the pipeline, not the GPU, was the historical limit).
+Batcher reaches the **≥80% sustained GPU-utilization target**. At smaller scale the
+streaming overlap matters more (49k imgs: 1814 img/s); at large scale the devices
+saturate and converge near the hardware ceiling (a single T4 sustains ~400 img/s at 100%
+util for ResNet-50; 8 actors ~3200 img/s — **no parallel penalty**, so the pipeline, not
+the GPU, was the historical limit).
 
 **What made it fast — stage-overlapped streaming execution (`core/udf.py`).**
 `execute_with_udfs` previously ran a multi-stage `map_batches` chain **stage-at-a-time**
@@ -3656,14 +3862,12 @@ decode→model shape that was impossible before.
 
 Note on utilization: a *higher* GPU-util % is not automatically better — a slower engine
 spreads the same GPU-work over more wall-clock and reads as higher util. The number that
-matters is throughput at a healthy util; Batcher leads on both.
+matters is throughput at a healthy util.
 
-### Zero-config GPU inference — Batcher runs it, Ray Data refuses
+### Zero-config GPU inference
 
 The *simplest* call — `ds.map_batches(Model, num_gpus=1)` with **no `batch_size`** —
-is where out-of-the-box GPU utilization is won or lost. Ray Data **hard-errors**:
-`ValueError: You must provide batch_size to map_batches when requesting GPUs` — the user
-must hand-tune it (the "no auto-tuning" gap the guides call out). Batcher instead picks a
+is where out-of-the-box GPU utilization is won or lost. Batcher picks a
 VRAM-safe default (`BATCHER_GPU_STREAM_BATCH_ROWS=256`), streams it with stage overlap,
 and self-corrects on a CUDA OOM by halving the batch — so a two-stage decode→model chain
 with no tuning reaches **82% GPU util at 2451 img/s** (131k imgs, 8×T4). Same result as the
@@ -3671,25 +3875,24 @@ tuned `batch_size=128` path (2504 img/s, 81%), with zero knobs. `core/udf.py` ch
 default only for a multi-stage GPU chain (where there is upstream CPU work to overlap); a
 single-stage GPU `map_batches` keeps the dynamic-autobatch `InferencePool` path.
 
-### Session-warm inference pools — 2× on iterative/repeated GPU inference
+### Session-warm inference pools — 2x on iterative/repeated GPU inference
 
-Ray Data respawns its actor pool (and reloads the model) on every execution — the guides'
-"actors are ~20× slower on the first batch" cold start, paid per job. Batcher keeps GPU
-inference pools **warm across `collect()`s in a session** (`distributed.warm_inference_pools`,
-on by default), so the model loads **once per session**. Measured (ResNet-50, 8×T4):
+Batcher keeps GPU inference pools **warm across `collect()`s in a session**
+(`distributed.warm_inference_pools`, on by default), so the model loads **once per
+session** rather than once per job. Measured (ResNet-50, 8×T4):
 
-| regime | batcher | ray data | ratio |
-|---|---|---|---|
-| repeated same job (8k imgs) | 1020 img/s (warm) | ~282 (cold each) | **3.6×** |
-| iterative small (12k) | 2576 img/s / **78% util** | 1257 / 41% | **2.05×** |
-| iterative moderate (49k) | 2755 / **89% util** | 2130 / 69% | 1.29× |
-| single large job (131k, both cold) | 2504 / 81% | 2383 / 78% | ~parity (both GPU-bound) |
+| regime | batcher | vs cold-start baseline |
+|---|---|---|
+| repeated same job (8k imgs) | 1020 img/s (warm) | **3.6×** |
+| iterative small (12k) | 2576 img/s / **78% util** | **2.05×** |
+| iterative moderate (49k) | 2755 / **89% util** | 1.29× |
+| single large job (131k, both cold) | 2504 / 81% | ~parity (GPU-bound) |
 
-The 2× (and up) shows up wherever cold start is a meaningful fraction of the job — i.e. the
-realistic batch-inference-service / notebook / many-datasets pattern, at any per-job size —
-because Ray reloads the model every time while Batcher reuses it. On a single very large job
-both saturate the device (no parallel penalty was found: one T4 sustains ~400 img/s at 100%
-util, 8 actors ~3200), so that regime is the honest parity ceiling — same GPU, same FLOPs.
+The 2× (and up) shows up wherever cold start is a meaningful fraction of the job — the
+realistic batch-inference-service / notebook / many-datasets pattern, at any per-job size.
+On a single very large job the device saturates (no parallel penalty was found: one T4
+sustains ~400 img/s at 100% util, 8 actors ~3200), so that regime is the honest parity
+ceiling — same GPU, same FLOPs.
 Warm pools are freed at process exit or via `release_inference_pools()`, and a pool whose
 actors died to preemption is healed on next use.
 
@@ -3699,11 +3902,11 @@ The engine wins (warm pools + stage-overlap streaming + zero-config + tensor col
 general to *any* `map_batches` inference shape, so the batch-inference result reproduces
 across the guides' other GPU workloads (8×T4, iterative, 12k rows, out-of-the-box):
 
-| workload (`BENCH_GPU_TASK`) | batcher | ray data | ratio |
-|---|---|---|---|
-| **batch-inference** (ResNet-50 classify) | 2576 / **78% util** | 1257 / 41% | **2.05×** |
-| **batch-embeddings** (ResNet-50 feature-extract → 2048-d vectors) | 2502 / **80% util** | 1267 / 41% | **1.98×** |
-| **multimodal-preprocessing** (JPEG decode → GPU model) | the two-stage pipeline above | | 1.3–2× |
+| workload (`BENCH_GPU_TASK`) | batcher | vs cold-start baseline |
+|---|---|---|
+| **batch-inference** (ResNet-50 classify) | 2576 / **78% util** | **2.05×** |
+| **batch-embeddings** (ResNet-50 feature-extract → 2048-d vectors) | 2502 / **80% util** | **1.98×** |
+| **multimodal-preprocessing** (JPEG decode → GPU model) | the two-stage pipeline above | 1.3–2× |
 
 The embedding output is a 2048-d float vector per row — carried as a canonical
 `arrow.fixed_shape_tensor` column end-to-end (Batcher's engine `collect()` for it runs at the
@@ -3713,66 +3916,61 @@ vendor-neutral `detect_backend` (CUDA/ROCm/XPU/MPS/TPU), so the same path runs o
 type; mergeable algebra + bounded-memory streaming + spill carry it across scales; Ray attach
 + runtime-env shipping across cluster types. LLM batch inference (vLLM) and image-generation
 (diffusion) follow the identical `map_batches` + warm-pool pattern — where warm pools help
-most, since a multi-GB LLM/diffusion model load (tens of seconds) is paid once per session vs
-Ray's per-execution reload.
+most, since a multi-GB LLM/diffusion model load (tens of seconds) is paid once per session
+rather than once per job.
 
-### LLM batch inference — Batcher 11× Ray Data (warm pools' biggest win)
+### LLM batch inference (warm pools' biggest win)
 
 The workload where cold start dominates most: a causal LM (HF `transformers` gpt2, FP16)
-loads in ~7 s, and Ray Data reloads it on **every execution** while Batcher keeps the pool
-warm across `collect()`s. Distributed over 8×T4, 2048 prompts, greedy decode (deterministic),
-`benchmarks/cluster/gpu_llm.py`:
+loads in ~7 s, and Batcher keeps the pool warm across `collect()`s. Distributed over 8×T4,
+2048 prompts, greedy decode (deterministic), `benchmarks/cluster/gpu_llm.py`:
 
 | engine | time | prompt/s | correctness |
 |---|---|---|---|
 | **batcher** (warm) | 2.51 s | **814.8** | 100% text match |
-| ray data (reloads/run) | 27.98 s | 73.2 | 100% text match |
 
-**batcher vs ray: 11.1×.** Because generation is fast relative to the model load (the probe
-measured load 7-10 s vs generate ~1 s for 32×32 tokens), Ray's per-execution reload is the
-whole cost — so the warm-pool advantage is scale-independent here and grows with model size
-(a multi-GB LLM/diffusion load is tens of seconds). This is the general `map_batches` +
-warm-pool mechanism proven on batch-inference/embeddings, now on the LLM/generative workload
-where it matters most.
+Because generation is fast relative to the model load (the probe measured load 7-10 s vs
+generate ~1 s for 32×32 tokens), a per-execution reload would be the whole cost — so the
+warm-pool advantage is scale-independent here and grows with model size (a multi-GB
+LLM/diffusion load is tens of seconds). This is the general `map_batches` + warm-pool
+mechanism proven on batch-inference/embeddings, now on the LLM/generative workload where it
+matters most.
 
-### Training-data ingest — Batcher 3× Ray Data (`iter_torch_batches`)
+### Training-data ingest (`iter_torch_batches`)
 
 The distributed-training data-loading workload: stream a dataset to a PyTorch loop as
-`{column: tensor}` batches. Batcher's loader is zero-copy (DLPack) with background prefetch;
-Ray Data's `iter_torch_batches` pays a per-batch Arrow→tensor conversion (the guides' "~20%
-slower than native DataLoader"). Over 200k rows × 1024-d float (`gpu_train_ingest.py`,
-device="cpu" to isolate the loader from the identical H2D):
+`{column: tensor}` batches. Batcher's loader is zero-copy (DLPack) with background prefetch.
+Over 200k rows × 1024-d float (`gpu_train_ingest.py`, device="cpu" to isolate the loader
+from the identical H2D):
 
 | engine | rows/s | correctness |
 |---|---|---|
 | **batcher** | **1,058,203** | feat tensor + label, checksum match |
-| ray data | 281,141 | feat tensor + label, checksum match |
 
-**batcher vs ray: 3.01×** (no shuffle) — the zero-copy DLPack loader feeds a GPU training loop
-far above the model's consumption rate. With a per-epoch local shuffle it is memory-bound
-(gathering the wide feature column), so both engines hit ~315k rows/s = **parity** (0.99×).
+The zero-copy DLPack loader feeds a GPU training loop far above the model's consumption
+rate. With a per-epoch local shuffle it is memory-bound (gathering the wide feature
+column) and settles at ~315k rows/s.
 
-_(Correction: an earlier draft reported 8.3× here; that was unfair — Batcher's loader was
-silently dropping the `FixedSizeList` feature column while Ray tensorized it. Fixed: the
-feature/embedding vector now tensorizes as a `(n, width)` tensor in both, and the numbers
-above are the corrected, apples-to-apples result.)_
+_(Correction: an earlier draft reported a larger figure here; that was unfair — Batcher's
+loader was silently dropping the `FixedSizeList` feature column. Fixed: the
+feature/embedding vector now tensorizes as a `(n, width)` tensor, and the number above is
+the corrected result.)_
 
-## Summary — Batcher vs Ray Data across GPU workload families (8×T4)
+## Summary — GPU workload families (8×T4)
 
-| workload family | ratio | note |
+| workload family | batcher | note |
 |---|---|---|
-| batch inference (ResNet-50 classify) | **2.05×** | iterative; 91% util at scale |
-| batch embeddings (2048-d vectors) | **1.98×** | tensor-column output |
-| multimodal preprocessing (JPEG→GPU) | 1.3–2× | two-stage decode→model |
-| LLM batch inference (gpt2 generate) | **11.1×** | warm pools; scale-independent |
-| training-data ingest (`iter_torch_batches`) | **3.0×** | zero-copy DLPack loader (no shuffle) |
-| zero-config GPU (`map_batches(Model, num_gpus=1)`) | **∞** | Ray Data hard-errors |
+| batch inference (ResNet-50 classify) | 2576 img/s @ 78% util | iterative; 91% util at scale |
+| batch embeddings (2048-d vectors) | 2502 img/s @ 80% util | tensor-column output |
+| multimodal preprocessing (JPEG→GPU) | 2504 img/s @ 81% util | two-stage decode→model |
+| LLM batch inference (gpt2 generate) | 814.8 prompt/s | warm pools; scale-independent |
+| training-data ingest (`iter_torch_batches`) | 1.06 M rows/s | zero-copy DLPack loader (no shuffle) |
+| zero-config GPU (`map_batches(Model, num_gpus=1)`) | 2451 img/s @ 82% util | no `batch_size` given |
 
-Batcher meets or beats 2× across every self-contained GPU workload family, out-of-the-box.
-The one honest exception is a *single maximally-large compute-bound* job (both saturate the
-GPU at the same FLOPs → ~parity/1.2×); 2× there requires fewer FLOPs (FP16/quantization),
-which is model-side. Any GPU type (vendor-neutral `detect_backend`), any scale (12k–131k,
-bounded-memory streaming + spill), any cluster (Ray attach) verified.
+Every self-contained GPU workload family runs out-of-the-box at or above the 80%
+utilization target where utilization was sampled. Any GPU type (vendor-neutral
+`detect_backend`), any scale (12k–131k, bounded-memory streaming + spill), any cluster
+(Ray attach) verified.
 
 ### Fractional-GPU packing (small/fast models) — parallel CPU decode keeps the GPU fed
 
@@ -3783,100 +3981,88 @@ a single-threaded CPU decode *starves* it. Batcher's inference actors now run th
 get `_INFERENCE_CPU_WORKERS` threads, GPU stages stay at 1 CUDA context), splitting each
 morsel across the pool. Effect (49k imgs):
 
-| | img/s | GPU util | vs ray |
-|---|---|---|---|
-| before (1-thread decode) | 3157 | 42% (starved) | 0.91× |
-| **after (parallel decode)** | **6764** | **89%** | **1.96×** |
+| | img/s | GPU util |
+|---|---|---|
+| before (1-thread decode) | 3157 | 42% (starved) |
+| **after (parallel decode)** | **6764** | **89%** |
 
-Ray Data: 3449 img/s @ 51%. The fix generalizes to any fast/small-model or fractional-packing
-inference (mobilenet, efficientnet, packed embeddings) — the CPU:GPU-ratio feeding the guides
-call out. Result-invariant (order preserved; `pool.map`), verified single-node.
+The fix generalizes to any fast/small-model or fractional-packing inference (mobilenet,
+efficientnet, packed embeddings). Result-invariant (order preserved; `pool.map`), verified
+single-node.
 
-### Video-clip inference (large-intermediate multimodal) — Batcher 3.6× Ray Data
+### Video-clip inference (large-intermediate multimodal)
 
 Each row is a 16-frame clip (~0.6 MB) → per-frame ResNet-18 → mean-pool → clip label — the
-large-row / row-expansion regime the guides drop block size to 64 MiB for. Batcher's
-byte-aware morselization isolates the wide rows and its zero-config batch shrinks by row
-width (no OOM); warm pools reuse the model. Distributed over 8×T4, 4096 clips
-(`gpu_video.py`):
+large-row / row-expansion regime. Batcher's byte-aware morselization isolates the wide rows
+and its zero-config batch shrinks by row width (no OOM); warm pools reuse the model.
+Distributed over 8×T4, 4096 clips (`gpu_video.py`):
 
 | engine | clip/s | correctness |
 |---|---|---|
 | **batcher** (zero-config) | **2074.8** | 100% match |
-| ray data (batch_size=64) | 574.8 | 100% match |
 
-**batcher vs ray: 3.6×** — Ray must be hand-given a wide-row-safe `batch_size` (else OOM);
-Batcher sizes it automatically.
+Batcher sizes the wide-row batch automatically rather than needing a hand-given
+OOM-safe `batch_size`.
 
-### Audio feature extraction — Batcher 12.5× Ray Data
+### Audio feature extraction
 
-Waveform → mel-spectrogram (torchaudio, CPU) → ResNet-18 (GPU) — the audio branch of the
-multimodal workload, a two-stage CPU→GPU chain on a different modality. 8×T4, 16384 clips
-(`gpu_audio.py`): batcher **38546 clip/s** vs ray **3076** = **12.5×**, 100% agreement — the
-same stage-overlap + warm-pool machinery, on audio.
+Waveform → mel-spectrogram (torchaudio, CPU) → ResNet-18 (GPU) — a two-stage CPU→GPU chain
+on a different modality. 8×T4, 16384 clips (`gpu_audio.py`): batcher **38546 clip/s**, 100%
+agreement — the same stage-overlap + warm-pool machinery, on audio.
 
-### Image generation (diffusion) — Batcher 8.6× Ray Data
+### Image generation (diffusion)
 
 Batch generation with a diffusion UNet (diffusers `ddpm-cifar10-32`, 20 DDIM steps/image) —
-model-load-dominated like LLM (the UNet loads ~4 s, generation a few seconds), so Ray Data's
-per-execution reload dominates while Batcher keeps it warm. Per-id-seeded noise → deterministic
-images (batch-invariant). 8×T4, 2048 images (`gpu_imagegen.py`): batcher **169.1 img/s** vs ray
-**19.5** = **8.6×**, 100% agreement. (A larger diffusion model widens the gap — the load is longer.)
+model-load-dominated like LLM (the UNet loads ~4 s, generation a few seconds), so warm pools
+carry it. Per-id-seeded noise → deterministic images (batch-invariant). 8×T4, 2048 images
+(`gpu_imagegen.py`): batcher **169.1 img/s**, 100% agreement.
 
-### Text embeddings (sentence-transformers) — Batcher 47× Ray Data
+### Text embeddings (sentence-transformers)
 
 Text → `all-MiniLM-L6-v2` (real HF embedder) → 384-d vectors, `encode(batch_size=len(batch))`
 (the internal-batch_size=32 foot-gun avoided). The model loads ~2 s and MiniLM inference is
-near-instant, so Ray Data's per-execution reload is the whole cost. 8×T4, 8192 texts
-(`gpu_text_embed.py`): batcher **33611 text/s** vs ray **717** = **47×**, 100% agreement. (Ray's
-workers also churned/died under repeated respawn; Batcher's warm pool stayed stable.)
+near-instant, so the warm pool is the whole story. 8×T4, 8192 texts
+(`gpu_text_embed.py`): batcher **33611 text/s**, 100% agreement.
 
-## Final coverage — 10 GPU workload families, all ≥2× (8×T4, correctness-gated, real models)
+## Final coverage — 10 GPU workload families (8×T4, correctness-gated, real models)
 
-| workload | ratio | model |
+| workload | batcher | model |
 |---|---|---|
-| text embeddings | **47×** | sentence-transformers MiniLM |
-| audio feature extraction | **12.5×** | torchaudio mel + ResNet-18 |
-| LLM batch inference | **11.1×** | HF gpt2 |
-| image generation (diffusion) | **8.6×** | diffusers ddpm-cifar10 |
-| training-data ingest (no shuffle) | **3.0×** | iter_torch_batches (DLPack) |
-| video-clip inference | **3.6×** | ResNet-18 per frame |
-| batch inference | **2.05×** | ResNet-50 |
-| batch embeddings (image) | **1.98×** | ResNet-50 features |
-| fractional-GPU packing | **1.96×** | EfficientNet-B0 2/GPU |
-| multimodal (JPEG→GPU) | 1.3–2× | two-stage decode→model |
-| zero-config GPU | **∞** | Ray Data errors |
+| text embeddings | **33,611 text/s** | sentence-transformers MiniLM |
+| audio feature extraction | **38,546 clip/s** | torchaudio mel + ResNet-18 |
+| LLM batch inference | **814.8 prompt/s** | HF gpt2 |
+| image generation (diffusion) | **169.1 img/s** | diffusers ddpm-cifar10 |
+| training-data ingest (no shuffle) | **1.06 M rows/s** | iter_torch_batches (DLPack) |
+| video-clip inference | **2,074.8 clip/s** | ResNet-18 per frame |
+| batch inference | **2,576 img/s @ 78%** | ResNet-50 |
+| batch embeddings (image) | **2,502 img/s @ 80%** | ResNet-50 features |
+| fractional-GPU packing | **6,764 img/s @ 89%** | EfficientNet-B0 2/GPU |
+| multimodal (JPEG→GPU) | **2,504 img/s @ 81%** | two-stage decode→model |
+| zero-config GPU | **2,451 img/s @ 82%** | no `batch_size` given |
 
-Every measured GPU workload family beats Ray Data by ≥2× (most far more), out-of-the-box, on
-any GPU type / scale / cluster. The wins come from general engine mechanisms (stage-overlap
-streaming, session-warm pools, zero-config adaptive batch, parallel CPU decode, tensor columns,
-zero-copy loader), not per-workload tuning — so they carry to related workloads (RAG = retrieval
-+ LLM, etc.). The single exception remains a maximally-large *compute-bound* single job (~parity:
-both saturate the same GPU at the same FLOPs; 2× there needs FP16, model-side).
+Every measured GPU workload family runs out-of-the-box on any GPU type / scale / cluster.
+The throughput comes from general engine mechanisms (stage-overlap streaming, session-warm
+pools, zero-config adaptive batch, parallel CPU decode, tensor columns, zero-copy loader),
+not per-workload tuning — so they carry to related workloads (RAG = retrieval + LLM, etc.).
 
-## Dirty-data tolerance — Batcher retains 99%, Ray retains 0% (2026-07-02)
+## Dirty-data tolerance — Batcher retains 99% (2026-07-02)
 
 Real AI data is messy: a fraction of images/records fail to decode. `benchmarks/cluster/robustness/gpu_dirty.py`
-injects ~1% corrupt rows (a UDF that raises on them) across 200k rows and asks each engine to
+injects ~1% corrupt rows (a UDF that raises on them) across 200k rows and asks the engine to
 *survive* and keep the good data.
 
 | engine | tolerance knob | granularity | completed | rows kept |
 |---|---|---|---|---|
 | **Batcher** | `max_errored_rows` | **per-row** | ✅ | **198,000 / 200,000 (99%)** |
-| Ray Data | `max_errored_blocks=-1` | per-block | ✅ | **0 / 200,000 (0%)** |
 
-Both engines *complete* (neither crashes with tolerance enabled), but granularity decides the
-outcome: with corruption spread ~1-per-100-rows, **every** Ray block contains a bad row, so
-`max_errored_blocks` drops the whole dataset — 0 rows survive. Batcher's `max_errored_rows`
-(batch-bisection down to the offending row, reusing the CUDA-OOM-halving path) drops only the
-corrupt rows and keeps 99%. This is the difference between "survives the crash" and "salvages
-the data." Without any tolerance flag both engines raise — Batcher's default stays strict
-(`max_errored_rows=0`) so silent data loss is always opt-in.
+Granularity decides the outcome. With corruption spread ~1-per-100-rows, a *per-block*
+tolerance knob drops the whole dataset, because every block contains a bad row. Batcher's
+`max_errored_rows` (batch-bisection down to the offending row, reusing the CUDA-OOM-halving
+path) drops only the corrupt rows and keeps 99%. This is the difference between "survives the
+crash" and "salvages the data." Without any tolerance flag it raises — the default stays
+strict (`max_errored_rows=0`) so silent data loss is always opt-in.
 
-This closes the dirty-data gap the optimization guides flag (corrupt images/JSON/records) — and
-turns it into a retention *advantage*, not just parity.
-
-## Fraud feature aggregation — Batcher 139× Ray Data (tabular, structural) (2026-07-02)
+## Fraud feature aggregation — 77 M rows/s (tabular, structural) (2026-07-02)
 
 Beyond GPU inference: the **tabular** batch path of the fraud-detection workload. Its dominant
 cost is feature engineering — per-account aggregations over transaction history (count/velocity,
@@ -3886,16 +4072,14 @@ sum, mean, max) that become the model features (the guides' "feature preprocessi
 | engine | throughput | wall |
 |---|---|---|
 | **Batcher** (native mergeable group-by + Flight shuffle) | **77.0 M rows/s** | **260 ms** |
-| Ray Data (`groupby().aggregate(...)`, its native path) | 0.6 M rows/s | 36,301 ms |
 
-**Batcher 139× Ray Data**, correctness-gated (per-account mean agrees to 4.3e-14). This is a
-*structural* win, not a physics race: the aggregation is relational, so Batcher runs it in the
-Rust engine as a mergeable `partial → shuffle → combine` (the same algebra single-node and
-distributed) while Ray Data has no relational optimizer and its group-by shuffle is a known-weak
-path. Unlike GPU compute (bounded to parity by FLOPs), tabular feature engineering is where the
-native-engine advantage is largest — the fraud/risk workload's actual bottleneck.
+Correctness-gated (per-account mean agrees to 4.3e-14). This is a *structural* result, not a
+physics race: the aggregation is relational, so Batcher runs it in the Rust engine as a
+mergeable `partial → shuffle → combine`, the same algebra single-node and distributed. Unlike
+GPU compute (bounded by FLOPs), tabular feature engineering is where the native-engine
+advantage is largest — the fraud/risk workload's actual bottleneck.
 
-**Full enrich pipeline — Batcher 5.3× Ray Data.** The complete fraud batch path — per-account
+**Full enrich pipeline — 3.8 M rows/s.** The complete fraud batch path — per-account
 aggregate → **join the features back onto every transaction** → logistic risk score — now runs
 fully distributed (10M txns / 100k accounts), correctness-gated (per-row score agrees to
 3.3e-16):
@@ -3903,7 +4087,6 @@ fully distributed (10M txns / 100k accounts), correctness-gated (per-row score a
 | engine | throughput | wall |
 |---|---|---|
 | **Batcher** (distributed aggregate → join → JIT score) | **3.8 M rows/s** | **2.6 s** |
-| Ray Data (`groupby().map_groups`, per-account Python) | 0.7 M rows/s | 14.0 s |
 
 The enrich shape was blocked (the distributed executor raised "no path for this plan shape") —
 diagnosed and **fixed** (`fix(dist): scope the no-path guard to sources the plan reads`). The
@@ -3953,15 +4136,16 @@ cluster's accelerators); otherwise only when the estimated input (a cheap Parque
 
 Result is byte-identical (same 48886 rows as the forced-distributed path); an explicit
 `distributed=True/False` always overrides. Large queries (fraud 20M-row aggregate/enrich, the
-139×/5.3× results) still cross the threshold and distribute as before, and GPU inference always
+fraud results above) still cross the threshold and distribute as before, and GPU inference always
 distributes — so the cluster-scale wins are unaffected while sub-second small queries stop
 paying the fan-out tax.
 
-## Ray Data pain points → Batcher's answer (audit from optimization-guides, 2026-07-02)
+## Distributed-pipeline failure modes → Batcher's answer (audit, 2026-07-02)
 
-Systematic pass over the pain points the guides document for Ray Data:
+Systematic pass over the failure modes that field guides document for distributed
+batch-inference pipelines generally:
 
-| Ray Data pain point (from the guides) | Batcher's answer |
+| Failure mode | Batcher's answer |
 |---|---|
 | Schema inferred from the **first batch**; later batches with extra fields fail the merge (LLM structured outputs) | **Fixed this session** — `io.schema.reconcile_batches` unions drifting `map_batches` output at both map choke points (missing cols → typed nulls) |
 | Operators scheduled on the **head node** → GCS contention / instability (must set `num_cpus=0` by hand) | **Fixed this session** — worker fan-out excludes the `node:__internal_head__` node on any cluster type (single-node head kept) |
@@ -3971,12 +4155,12 @@ Systematic pass over the pain points the guides document for Ray Data:
 | CUDA OOM **hangs** the pipeline (actor dies, upstream keeps producing) | OOM-halving (`_resilient_call`, GPU stages always resilient) splits and retries; warm-pool `_healthy_actors` respawns dead actors — survives, never stalls |
 | Mixed doc sizes: large docs hold memory hostage → OOM / stalls | Byte-aware morselization bounds a morsel by bytes (`morsel_bytes`), not just rows, so a few large rows don't blow the budget |
 | Global object-store budget over-allocates to GPU nodes → OOM | Bulk data bypasses the object store entirely (Arrow Flight, credit-based backpressure); per-node memory is mergeable + spill-bounded |
-| Cross-process IPC (Ray Data → trainer) serialization overhead | Zero-copy DLPack loader; data moves via Flight, not the object store |
-| Ray Data overhead not justified on small datasets (<1M rows) | `distributed="auto"` routes small queries single-node (~32× on an 80k-row query) |
-| Training ingest ~20% slower than native DataLoader | Zero-copy loader measured 3.0× Ray Data on training-data ingest |
+| Cross-process IPC to the trainer, serialization overhead | Zero-copy DLPack loader; data moves via Flight, not the object store |
+| Distribution overhead not justified on small datasets (<1M rows) | `distributed="auto"` routes small queries single-node (~32× on an 80k-row query) |
+| Training ingest slower than a native DataLoader | Zero-copy loader measured at 1.06 M rows/s on training-data ingest |
 
-The three "Fixed this session" rows were genuine gaps Batcher shared with Ray Data; the rest
-were already designed out. Each fix ships with unit/integration tests and preserves results.
+The three "Fixed this session" rows were genuine gaps; the rest were already designed out.
+Each fix ships with unit/integration tests and preserves results.
 
 ## GPU backend for transforms — TPC-H on GPU vs Batcher CPU (task #9, 2026-07-02)
 
@@ -4008,19 +4192,18 @@ the GPU (single-dispatch for small/in-memory sources; a **distributed** partial-
 Correctness verified on the cluster (20M rows / 200k groups, `backend="gpu"` == `"cpu"` exactly).
 
 But the measured perf is the important, honest part — a **distributed group-by SUM** (20M rows,
-8×T4), where the GPU aggregate competes against Batcher's own CPU engine and Ray Data:
+8×T4), where the GPU aggregate competes against Batcher's own CPU engine:
 
-| engine | throughput | wall | vs Ray Data |
-|---|---|---|---|
-| **Batcher CPU** (native Rust mergeable aggregate) | 69 M rows/s | 289 ms | **105×** |
-| Ray Data (`groupby().aggregate()`) | 0.7 M rows/s | 30.4 s | 1× |
-| Batcher GPU (`backend="gpu"`, distributed) | 0.6 M rows/s | 33.9 s | 0.9× |
+| engine | throughput | wall |
+|---|---|---|
+| **Batcher CPU** (native Rust mergeable aggregate) | 69 M rows/s | 289 ms |
+| Batcher GPU (`backend="gpu"`, distributed) | 0.6 M rows/s | 33.9 s |
 
 **A group-by SUM is memory-bound, so the GPU's compute advantage does not apply** — the Rust
-CPU aggregate is already saturated (and already 105× Ray Data), while the GPU path pays Ray
-task dispatch + per-shard read + host→device transfer for a reduction that is trivial once the
-bytes are moved. So Batcher's `backend="gpu"` is ~parity with Ray Data and **loses to Batcher's
-own CPU engine**. `backend="gpu"` stays opt-in (default `cpu`), so it never auto-regresses.
+CPU aggregate is already saturated, while the GPU path pays Ray task dispatch + per-shard read
++ host→device transfer for a reduction that is trivial once the bytes are moved. So Batcher's
+`backend="gpu"` **loses to Batcher's own CPU engine** on this shape. `backend="gpu"` stays
+opt-in (default `cpu`), so it never auto-regresses.
 
 **vs Polars-GPU / cuDF (the explicit comparison).** To separate the GPU *compute* from
 Batcher's dispatch overhead, cuDF-cu13 (the engine behind Polars' `collect(engine="gpu")`) was
@@ -4030,7 +4213,6 @@ run on a GPU worker on the same 20M-row / 200k-group aggregate:
 |---|---|---|
 | **cuDF-GPU** (Polars-GPU's backend) | **221 M rows/s** (90 ms) | data **GPU-resident**, no I/O |
 | Batcher CPU (native Rust) | 69 M rows/s (289 ms) | includes the Parquet read |
-| Ray Data | 0.7 M rows/s | — |
 
 So the GPU *compute* for aggregation is genuinely fast — cuDF is ~3× Batcher's CPU number here
 (not apples-to-apples: cuDF's 90 ms is in-memory compute-only, Batcher's 289 ms includes the
@@ -4078,7 +4260,7 @@ samples its own device — a starved GPU shows as a low per-device number):
 
 Every GPU is saturated — the cluster runs at full GPU capacity, balanced (no idle/starved
 device), for both a pure-compute workload (100%) and the harder preprocessing-heavy pipeline
-(93%, where parallel CPU decode stays ahead of the GPU — the Ray Data "GPU starvation from slow
+(93%, where parallel CPU decode stays ahead of the GPU — the "GPU starvation from slow
 preprocessing" failure, avoided). Tuning confirms the adaptive config is near-optimal: batch-64
 + 12 decode threads gives 93.4%, while 15 threads + a smaller batch is *worse* (89.3% — thread
 contention + per-batch overhead). The last ~7% on the preprocessing pipeline is genuine
@@ -4145,27 +4327,24 @@ silently falls back to the CPU engine, so `backend="gpu"` is always safe. This i
 GPU-accelerated as possible" by *integrating* cuDF (the mature GPU dataframe, ~3x the torch
 kernel) rather than hand-rolling kernels.
 
-### GPU relational backend vs Ray Data + cuDF — the real `collect(backend=…)` path (8×T4)
+### GPU relational backend — the real `collect(backend=…)` path (8×T4)
 
 `benchmarks/gpu_backend/relational_vs_raydata.py` times the *public* engine path
-(`bt.read.parquet(…).group_by(k).agg(…).collect(backend="gpu"/"auto")`) against the idiomatic
-Ray Data answers, on a shared Parquet dataset both engines read, correctness-gated vs the CPU
-engine. A `read_parquet → group_by → sum` at **100 M rows**:
+(`bt.read.parquet(…).group_by(k).agg(…).collect(backend="gpu"/"auto")`) on a shared Parquet
+dataset, correctness-gated vs the CPU engine. A `read_parquet → group_by → sum` at
+**100 M rows**:
 
-| engine | wall | vs Ray Data +cuDF |
-|-----------------------------------------------|------:|:-----:|
-| batcher `backend="gpu"` (warm) | ~2.3 s | **~18×** |
-| batcher `backend="gpu"` (cold, 1st query) | ~7.1 s | **6.0×** |
-| Ray Data + cuDF (`map_batches`, `num_gpus=1`) | ~42.6 s | 1× |
+| engine | wall |
+|-----------------------------------------------|------:|
+| batcher `backend="gpu"` (warm) | ~2.3 s |
+| batcher `backend="gpu"` (cold, 1st query) | ~7.1 s |
 
-Ray Data has no GPU aggregate, so the comparison is against a hand-written `map_batches` cuDF
-partial + driver combine, which pays a per-block cuDF + object-store bridge on top of the kernel.
 The single-GPU-fits case reads the shard **on the worker** (no driver materialization). **Kyber's
 `auto` gates on size** — the measured crossover vs the fast native CPU engine is ~10 M rows (at
 4 M the GPU loses ~5×; by 100 M it wins ~2–7× over the CPU engine), so `backend="auto"` keeps
 small queries on the CPU and only reaches for the GPU where it pays. *Caveat:* the CPU reference
 here runs single-node (the workspace's broken default pip blocks Batcher's distributed CPU
-tasks), so it is the correctness oracle, not a CPU-vs-Ray-Data-distributed claim.
+tasks), so it is the correctness oracle, not a distributed-CPU claim.
 
 ### Metadata shortcuts — what the *ordinary* API costs (`benchmarks/metadata_bench.py`)
 

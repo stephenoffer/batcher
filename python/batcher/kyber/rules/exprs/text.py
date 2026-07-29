@@ -119,6 +119,7 @@ def _regexp_contains(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_regexp_contains,
+    expr_matches=(StrFunc,),
 )
 def regexp_plain_to_contains(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`regexp_matches(x, 'abc') -> contains(x, 'abc')` when the pattern is plain text.
@@ -146,6 +147,7 @@ def _regexp_starts(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_regexp_starts,
+    expr_matches=(StrFunc,),
 )
 def regexp_prefix_to_starts_with(
     node: Filter | Project, _ctx: OptimizerContext
@@ -173,6 +175,7 @@ def _regexp_ends(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_regexp_ends,
+    expr_matches=(StrFunc,),
 )
 def regexp_suffix_to_ends_with(
     node: Filter | Project, _ctx: OptimizerContext
@@ -196,6 +199,7 @@ def _regexp_equality(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_regexp_equality,
+    expr_matches=(StrFunc,),
 )
 def regexp_anchored_to_equality(
     node: Filter | Project, _ctx: OptimizerContext
@@ -233,7 +237,14 @@ def _reverse_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
     return out if out is expr or is_string(out, schema) else expr
 
 
-@rule(name="str_reverse_involution", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="str_reverse_involution",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(StrFunc,),
+    expr_ops=("reverse",),
+    expr_schema=_reverse_leaf,
+)
 def str_reverse_involution(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`reverse(reverse(x)) -> x`. String reversal is an involution over the code
     points, so a doubled call is the identity, null row included.
@@ -255,7 +266,13 @@ def _repeat_once_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="repeat_once_to_input", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="repeat_once_to_input",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_repeat_once_leaf,
+    expr_matches=(StrFunc,),
+)
 def repeat_once_to_input(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`repeat(x, 1) -> x`. One copy of a string is the string, and the engine agrees
     on the null row (both sides yield null) and the empty one. Removing the call
@@ -281,7 +298,13 @@ def _full_substr(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_full_substr", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="drop_full_substr",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_full_substr,
+    expr_matches=(StrFunc,),
+)
 def drop_full_substr(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`substr(x, 0)` or `substr(x, 1)` with no length `-> x`.
 
@@ -305,7 +328,13 @@ def _empty_translate(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_translate_with_empty_source", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="drop_translate_with_empty_source",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_empty_translate,
+    expr_matches=(StrFunc,),
+)
 def drop_translate_with_empty_source(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:

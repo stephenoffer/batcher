@@ -691,8 +691,10 @@ class Writer:
         """
         from batcher.io.formats.streaming.sinks import MemoryStreamSink
 
+        # The plan's output schema goes to the sink, so a stream that matches nothing still
+        # reads back as this query's relation rather than as a table with no columns.
         return self._start_stream(
-            MemoryStreamSink(name, output_mode=output_mode),
+            MemoryStreamSink(name, output_mode=output_mode, schema=self._ds.schema),
             trigger,
             output_mode,
             query_name,

@@ -12,6 +12,8 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
+from batcher.config import active_config
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
 
@@ -155,9 +157,7 @@ class InMemorySource:
         ephemeral: bool = False,
     ) -> None:
         if not batches:
-            raise ValueError("InMemorySource requires at least one record batch")
-        from batcher.config import active_config
-
+            raise PlanError("InMemorySource needs at least one record batch, for its schema")
         self._batches = batches
         self._zone_maps = zone_maps
         self.ephemeral = ephemeral

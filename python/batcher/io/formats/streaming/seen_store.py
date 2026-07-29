@@ -32,6 +32,31 @@ CREATE TABLE IF NOT EXISTS seen_files (
 """
 
 
+def _tune(conn: sqlite3.Connection) -> None:
+    """Put the store in write-ahead-log mode, which is what this access pattern wants.
+
+    SQLite's default rollback journal rewrites and fsyncs a journal file around every
+    commit, and this store commits once per discovery pass — so at a 200ms trigger the
+    engine was paying two full journal cycles a second to remember a handful of filenames.
+    WAL appends instead, and lets a reader run while a writer commits.
+
+    ``synchronous=NORMAL`` is correct here rather than merely faster. Under WAL it still
+    survives a *process* crash; what it gives up is durability across an OS crash, where the
+    last few commits may be lost. Losing them re-offers those files on the next pass, and a
+    re-offered file is exactly the case this design already handles — the epoch's transaction
+    makes the replay idempotent. The failure this store must never have is the opposite one,
+    remembering a file whose rows were never published, and NORMAL cannot produce it.
+
+    Both pragmas are best-effort: a filesystem that refuses WAL (some network mounts) keeps
+    the default journal and the store still works.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:  # pragma: no cover - filesystem-dependent
+        pass
+
+
 class SeenStore:
     """A persistent set of already-processed files, keyed by path.
 
@@ -61,6 +86,7 @@ class SeenStore:
         for tests). The parent directory of an on-disk path must already exist.
         """
         self._conn = sqlite3.connect(path)
+        _tune(self._conn)
         self._conn.execute(_SCHEMA)
         self._conn.commit()
 

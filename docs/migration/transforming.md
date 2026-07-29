@@ -37,6 +37,7 @@ for them.
 | Filter rows | `df[df.a > 1]` | `df.filter(pl.col("a") > 1)` | `df.filter(df.a > 1)` | `ds.filter(col("a") > 1)` |
 | Group + aggregate | `df.groupby("k").agg(...)` | `df.group_by("k").agg(...)` | `df.groupBy("k").agg(...)` | `ds.group_by("k").agg(...)` |
 | Group + sum all | `df.groupby("k").sum()` | `df.group_by("k").sum()` | n/a | `ds.group_by("k").sum()` |
+| Group + Python function | `df.groupby("k").apply(fn)` | `df.group_by("k").map_groups(fn)` | `df.groupBy("k").applyInPandas(fn, s)` | `ds.group_by("k").map_groups(fn)` |
 | Mean aggregate | `df.a.mean()` | `pl.col("a").mean()` | `F.avg("a")` | `col("a").mean()` |
 | Sort | `df.sort_values("a")` | `df.sort("a")` | `df.orderBy("a")` | `ds.sort("a")` |
 | Join | `df.merge(o, on="k")` | `df.join(o, on="k")` | `df.join(o, "k")` | `ds.join(o, on="k")` |
@@ -75,6 +76,7 @@ A terminal operation is what triggers the plan to run. These are the equivalents
 | Summary stats | `df.describe()` | `df.describe()` | `df.summary()` | `ds.describe()` |
 | Null counts | `df.isnull().sum()` | `df.null_count()` | n/a | `ds.null_count()` |
 | Stream batches | n/a | n/a | `df.toLocalIterator()` | `ds.iter_batches()` |
+| Stream as NumPy / tensors | n/a | n/a | n/a | `ds.ml.to_numpy_batches()`, `ds.ml.iter_torch_batches()` |
 | Explain plan | n/a | `df.explain()` | `df.explain()` | `ds.explain()` |
 | Measured per-op stats | n/a | n/a | n/a | `ds.stats()` |
 

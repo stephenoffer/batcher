@@ -54,6 +54,7 @@ def _collapse_window_start(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_collapse_window_start,
+    expr_matches=(WindowStart,),
 )
 def collapse_nested_window_start(
     node: Filter | Project, _ctx: OptimizerContext

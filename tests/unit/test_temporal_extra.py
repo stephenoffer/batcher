@@ -57,10 +57,12 @@ def _pred(node: Filter) -> dict:
 # --- registration ---------------------------------------------------------------
 
 
-def test_fifteen_rules_registered():
+def test_every_rule_this_module_registers_is_registered():
+    # `<>` joins both band families: an inequality is the De Morgan complement of the same
+    # `[L, L+1unit)` band the equality rule builds, so it needs no new bound arithmetic.
     names = {r.name for r in DEFAULT_REGISTRY.rules()}
-    expected = {f"date_trunc_{op}_to_range" for op in ("lt", "le", "gt", "ge")}
-    expected |= {f"strftime_{op}_to_range" for op in ("eq", "lt", "le", "gt", "ge")}
+    expected = {f"date_trunc_{op}_to_range" for op in ("lt", "le", "gt", "ge", "ne")}
+    expected |= {f"strftime_{op}_to_range" for op in ("eq", "ne", "lt", "le", "gt", "ge")}
     expected |= {
         "date_trunc_idempotent",
         "date_trunc_nested_to_coarser",
@@ -70,9 +72,9 @@ def test_fifteen_rules_registered():
         "fold_temporal_literal_comparison",
     }
     assert expected <= names
-    assert len(expected) == 15
-    assert len(DATE_TRUNC_RANGE_RULES) == 4
-    assert len(STRFTIME_RANGE_RULES) == 5
+    assert len(expected) == 17
+    assert len(DATE_TRUNC_RANGE_RULES) == 5
+    assert len(STRFTIME_RANGE_RULES) == 6
 
 
 # --- date_trunc inequalities → bounds --------------------------------------------

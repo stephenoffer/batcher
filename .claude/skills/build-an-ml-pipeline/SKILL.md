@@ -290,4 +290,4 @@ output; `image_column=` handles VLM prompts.
 - `docs/tutorials/{batch-inference,distributed-training-pipeline,feature-engineering}.md`;
   `examples/ml_inference.py`, `examples/preprocessors.py`.
 - Skills: `run-a-distributed-job` (taking this to a cluster — GPU stages force distribution),
-  `write-a-batcher-pipeline`, `debug-a-batcher-query`, `migrate-from-ray-data`/`-daft`.
+  `write-a-batcher-pipeline`, `debug-a-batcher-query`, `migrate-from-daft`.

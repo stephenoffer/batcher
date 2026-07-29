@@ -36,7 +36,6 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import (
     Binary,
-    Coalesce,
     Col,
     Expr,
     InList,
@@ -54,14 +53,11 @@ __all__ = [
     "and_false_annihilator",
     "and_idempotent",
     "bool_eq_literal",
-    "coalesce_simplify",
     "complement_total_bool",
-    "dedup_in_list",
     "fold_not_comparison",
     "or_absorption",
     "or_idempotent",
     "or_true_annihilator",
-    "single_in_list",
 ]
 
 # Binary ops that are deterministic and cannot raise (no div/mod, whose zero divisor
@@ -162,6 +158,8 @@ def _and_false(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_and_false,
+    expr_matches=(Binary,),
+    expr_ops=("and",),
 )
 def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND FALSE → FALSE`. Under the engine's Kleene AND, `NULL AND FALSE` and
@@ -186,6 +184,8 @@ def _or_true(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_or_true,
+    expr_matches=(Binary,),
+    expr_ops=("or",),
 )
 def or_true_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR TRUE → TRUE`. Under the engine's Kleene OR, `NULL OR TRUE` and
@@ -213,6 +213,8 @@ def _and_idem(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_and_idem,
+    expr_matches=(Binary,),
+    expr_ops=("and",),
 )
 def and_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND x → x`. In Kleene logic `v AND v = v` for every value (`T,F,N`), so a
@@ -237,6 +239,8 @@ def _or_idem(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_or_idem,
+    expr_matches=(Binary,),
+    expr_ops=("or",),
 )
 def or_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR x → x`. In Kleene logic `v OR v = v` for every value, so a
@@ -274,6 +278,8 @@ def _and_absorb(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_and_absorb,
+    expr_matches=(Binary,),
+    expr_ops=("and",),
 )
 def and_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND (x OR y) → x`. The Kleene absorption law holds for all three values
@@ -297,6 +303,8 @@ def _or_absorb(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_or_absorb,
+    expr_matches=(Binary,),
+    expr_ops=("or",),
 )
 def or_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR (x AND y) → x`. The dual Kleene absorption law, valid for all three
@@ -327,6 +335,8 @@ def _complement(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_complement,
+    expr_matches=(Binary,),
+    expr_ops=("and", "or"),
 )
 def complement_total_bool(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND NOT x → FALSE` and `x OR NOT x → TRUE`, but **only** when `x` never
@@ -355,6 +365,7 @@ def _fold_not_comparison(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_fold_not_comparison,
+    expr_matches=(Not,),
 )
 def fold_not_comparison(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (a = b) → a <> b`, `NOT (a < b) → a >= b`, … — push `NOT` into a
@@ -393,6 +404,8 @@ def _bool_eq_literal(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_bool_eq_literal,
+    expr_matches=(Binary,),
+    expr_ops=("eq", "ne"),
 )
 def bool_eq_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x = TRUE → x`, `x = FALSE → NOT x` (and the `<>` duals) for a boolean `x`.
@@ -406,94 +419,9 @@ def bool_eq_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPl
 # --- IN-list cleanup --------------------------------------------------------
 
 
-def _single_in_list(expr: Expr) -> Expr:
-    if isinstance(expr, InList) and len(expr.values) == 1:
-        return Binary("eq", expr.input, Lit(expr.values[0]))
-    return expr
-
-
-@rule(
-    name="single_in_list",
-    phase=Phase.NORMALIZE,
-    matches=(Filter, Project),
-    expr=_single_in_list,
-)
-def single_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`x IN (v) → x = v`. A one-element membership test is exactly an equality, with
-    identical null behavior (`NULL IN (v)` and `NULL = v` are both null). Turns the
-    opaque hash-set probe into a `col = literal` shape that constant propagation and
-    pruning understand."""
-    return _rewrite_node(node, _single_in_list)
-
-
-def _dedup_in_list(expr: Expr) -> Expr:
-    if isinstance(expr, InList) and len(expr.values) > 1:
-        unique = tuple(dict.fromkeys(expr.values))
-        if len(unique) < len(expr.values):
-            return InList(expr.input, unique)
-    return expr
-
-
-@rule(
-    name="dedup_in_list",
-    phase=Phase.NORMALIZE,
-    matches=(Filter, Project),
-    expr=_dedup_in_list,
-)
-def dedup_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`x IN (a, b, a) → x IN (a, b)`. Set membership is unchanged by duplicate values,
-    so de-duplicating (first occurrence kept) shrinks the probe set with no change to
-    the result. May expose a single-element list for `single_in_list` to fold to an
-    equality."""
-    return _rewrite_node(node, _dedup_in_list)
-
-
-# --- COALESCE flattening ----------------------------------------------------
-
-
-def _coalesce_simplify(expr: Expr) -> Expr:
-    if not isinstance(expr, Coalesce):
-        return expr
-    flat: list[Expr] = []
-    for arg in expr.inputs:
-        flat.extend(arg.inputs if isinstance(arg, Coalesce) else [arg])
-    out: list[Expr] = []
-    seen: set[str] = set()
-    for arg in flat:
-        if _safe(arg):
-            k = _key(arg)
-            if k in seen:
-                continue  # an earlier identical (deterministic) arg already covers it
-            seen.add(k)
-        out.append(arg)
-    # NB: truncating the tail after the first non-null *literal* is deliberately NOT done
-    # here. It is sound only when the dropped tail's type is already carried by a kept arm
-    # — otherwise it narrows the result type (a `COALESCE`'s type is the *join* of its
-    # arms', so dropping `CAST(-1 AS DOUBLE)` from `coalesce(5, CAST(-1 AS DOUBLE))` turns
-    # a DOUBLE `5.0` into an INT `5`). That type-guarded truncation lives in
-    # `coalesce_drop_nulls_after_first_non_null` (`_droppable`); doing an unguarded version
-    # here silently changed the output dtype and value. Flatten + dedup below only ever
-    # drop an arm structurally identical to a kept one, so they cannot move the type.
-    if len(out) == 1:
-        return out[0]
-    if _keys(out) == _keys(expr.inputs):
-        return expr
-    return Coalesce(out)
-
-
-@rule(
-    name="coalesce_simplify",
-    phase=Phase.NORMALIZE,
-    matches=(Filter, Project),
-    expr=_coalesce_simplify,
-)
-def coalesce_simplify(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """Flatten and shrink a `COALESCE`: inline a nested `COALESCE`, drop a later
-    duplicate of an earlier `_safe` argument, and unwrap `COALESCE(x)` to `x`. Each step
-    preserves "first non-null argument" *and* the result type: a repeated argument is only
-    ever reached when it is null and is structurally identical to a kept one, so removing
-    it moves neither the value nor the type. Truncating the tail after the first non-null
-    *literal* is left to `coalesce_drop_nulls_after_first_non_null`, which guards it with a
-    type check (`_droppable`) — dropping a differently-typed tail here would narrow the
-    `COALESCE`'s join type (turning DOUBLE `5.0` into INT `5`)."""
-    return _rewrite_node(node, _coalesce_simplify)
+# Registration order *is* within-phase run order, and several modules import this one for
+# `_rewrite_node`/`_key`, so `extra/__init__` is not where this module first loads. Importing
+# the split-off half here instead pins it to the position it held when the two were one file,
+# whichever import gets here first. The cycle is fine: everything the sibling imports from
+# this module is defined above.
+from batcher.kyber.rules.extra import membership_simplify as _membership  # noqa: E402,F401

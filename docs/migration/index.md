@@ -103,10 +103,10 @@ print(ported.equals(original))
 ## Porting with a coding agent
 
 Each source system has an agent skill that turns these tables into a procedure:
-`migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`,
-`migrate-from-ray-data`, and `migrate-from-daft`. Beyond the mappings, each carries the
-concept shifts that silently produce wrong or slow results, and a recipe that finishes by
-proving the ported script returns the same rows as the original. See {doc}`../agents/index`.
+`migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`, and
+`migrate-from-daft`. Beyond the mappings, each carries the concept shifts that silently
+produce wrong or slow results, and a recipe that finishes by proving the ported script
+returns the same rows as the original. See {doc}`../agents/index`.
 
 ## Reporting a problem
 

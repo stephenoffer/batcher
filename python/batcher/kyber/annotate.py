@@ -31,11 +31,15 @@ __all__ = ["annotate_ops"]
 # Memory-budgeting model (consumed by Carbonite admission). Materializing
 # operators ("breakers") hold ~all their rows; streaming operators hold ~one morsel.
 # The tunables (row footprint, morsel size, unknown-size threshold) live in `Config`.
-# `AsofJoin` materializes a sorted side to search; `WatermarkStreamJoin` holds a window
-# buffer and `WatermarkDedup` a seen-key set. All three hold far more than a morsel, and
-# omitting them budgeted each at ~one morsel — an *under*-estimate of peak memory, which is
-# the direction that lets Carbonite over-admit and OOM. Being listed here only ever raises
-# the envelope from a morsel to `rows x width`.
+# `AsofJoin` materializes a sorted side to search; `RangeJoin` needs both sides whole
+# (a match is a function of the global sort order on each axis — `bc_interp::ops::joins`
+# says so in as many words) and gathers its whole output; `WatermarkStreamJoin` holds a
+# window buffer and `WatermarkDedup` a seen-key set. All four hold far more than a morsel,
+# and omitting them budgeted each at ~one morsel — an *under*-estimate of peak memory, which
+# is the direction that lets Carbonite over-admit and OOM. `RangeJoin` was the sharpest case
+# precisely because it is the one operator here whose output is super-linear in its inputs:
+# a 50,000 x 50,000 inequality join estimated at 833M rows was admitted against a 393 KB
+# envelope. Being listed here only ever raises the envelope from a morsel to `rows x width`.
 _BREAKER_KINDS = frozenset(
     {
         "Aggregate",
@@ -43,6 +47,7 @@ _BREAKER_KINDS = frozenset(
         "Distinct",
         "Join",
         "AsofJoin",
+        "RangeJoin",
         "Window",
         "WatermarkStreamJoin",
         "WatermarkDedup",
@@ -56,6 +61,28 @@ _BREAKER_KINDS = frozenset(
 _CPU_LIGHT_KINDS = frozenset(
     {"Scan", "Filter", "Project", "Limit", "Sample", "RowId", "Union", "Unnest", "Unpivot"}
 )
+
+
+def _is_fixed_count_sample(node: LogicalPlan) -> bool:
+    """Whether `node` is the materializing form of `Sample`.
+
+    `Sample` is the one operator whose two forms sit on opposite sides of this line, so it
+    cannot be settled by kind alone the way `_BREAKER_KINDS` settles the rest:
+
+    - a **fraction** sample keeps a row iff a seeded hash of it falls under the fraction —
+      a per-row predicate holding nothing, genuinely one morsel;
+    - a **fixed-count** `sample(n=)` keeps the `n` smallest-hash rows of the whole relation.
+      `bc_interp::ops::reshape::sample_n_batches` calls it "a breaker: it must see all rows",
+      holding a size-`n` heap of row encodings.
+
+    Budgeted by kind, the second was handed one morsel however large `n` was — a
+    `sample(n=100_000)` was admitted against 131 KB. The estimator already produces exactly
+    the right figure for it (`min(n, input)` rows *is* the heap size), so recognizing the
+    form is the whole fix.
+    """
+    from batcher.plan.logical import Sample
+
+    return isinstance(node, Sample) and node.n is not None
 
 
 def _cpu_share(
@@ -111,6 +138,7 @@ def annotate_ops(
             est = estimator.estimate(node)
             rows = est.rows
             kind = type(node).__name__
+            materializes = kind in _BREAKER_KINDS or _is_fixed_count_sample(node)
             known = 0.0 <= rows < unknown_rows
             # Byte-true width: learned per-column widths when measured, else the flat
             # `row_bytes` default (so a cold-start envelope is unchanged). A column of
@@ -118,7 +146,7 @@ def annotate_ops(
             width = estimator.row_width(node, row_bytes)
             if not known:
                 mem = 0  # unknown size — don't budget (never fail a real query on a guess)
-            elif kind in _BREAKER_KINDS:
+            elif materializes:
                 mem = int(rows * width)  # materialized state
             else:
                 # streaming: ~one morsel in flight, byte-bounded.
@@ -128,7 +156,7 @@ def annotate_ops(
             # (possibly tiny) grouped output. Streaming ops inherit the pipeline's
             # width (0 = unset). Carbonite clamps the request to the cpu budget.
             prefers_local = False
-            if known and kind in _BREAKER_KINDS:
+            if known and materializes:
                 # `known` gates the *node's* estimate, but a child can still carry the
                 # placeholder (a join over an unbound source whose parent estimate a rule
                 # collapsed). Summing it blind makes `in_rows` the 1e12 magnitude, `n_par`

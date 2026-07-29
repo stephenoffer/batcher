@@ -52,6 +52,7 @@ from batcher.plan.logical import (
     MapBatches,
     Project,
     RangeJoin,
+    RowId,
     Sample,
     Scan,
     Sort,
@@ -356,6 +357,23 @@ class StatsEstimator:
             else:
                 rows = child.rows * node.fraction
             return RelStats(rows, Provenance.DEFAULT, col_prop.sample_columns(child, rows))
+        if isinstance(node, RowId):
+            # `with_row_index` is strictly 1:1 — it appends a counter and changes nothing
+            # else — so rows, provenance, column stats and the delivered ordering all carry
+            # through. Falling to the `unknown_rows` default (which is what a missing branch
+            # here does) turned an EXACT 1,000-row relation into a 1e12-row guess for every
+            # operator above it: a join above a `with_row_index` picked the wrong build side
+            # and admission sized the query against a fiction.
+            child = self.estimate(node.input)
+            return RelStats(
+                child.rows,
+                child.provenance,
+                col_prop.row_id_columns(node, child),
+                # The counter is ascending and never null, so it is a valid ordering in its
+                # own right — recorded only when the child delivers none, since a data-column
+                # ordering is what a downstream `Sort` is far more likely to be elided by.
+                child.sorted_by or (node.alias,),
+            )
         if isinstance(node, Aggregate):
             return self._estimate_aggregate(node)
         if isinstance(node, Sort):

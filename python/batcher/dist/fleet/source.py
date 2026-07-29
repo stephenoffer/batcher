@@ -43,9 +43,11 @@ class FlightFetchSplit:
         return self.schema_
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        from batcher.carbonite.transfer.server import fetch
+        from batcher.carbonite.transfer.lifecycle import process_client
 
-        batches = fetch(self.addr, self.ticket)
+        # Pooled, so an adaptive stage re-reading this intermediate reuses the channel it
+        # already has to the holding actor rather than dialling it again per read.
+        batches = process_client().fetch(self.addr, str(self.ticket))
         if projection is not None:
             batches = [b.select(projection) for b in batches]
         return batches

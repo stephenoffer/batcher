@@ -11,7 +11,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.decode.stage import _bounded_map, _require_size
+from batcher.ml.decode.stage import (
+    _bounded_map,
+    _require_frames,
+    _require_size,
+    _require_source_column,
+)
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -58,6 +63,8 @@ def video_dataset(
     """
     from batcher.io.formats.ml.tensor import as_tensor_column
 
+    _require_source_column(ds, source_column, who="video_dataset", param="source_column=")
+    num_frames = _require_frames(num_frames, "video_dataset")
     height, width = _require_size(size, "read.video(decode=True)")
     shape = (num_frames, height, width, 3)
     per_row = num_frames * height * width * 3

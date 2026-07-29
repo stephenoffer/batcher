@@ -408,9 +408,25 @@ def _wrap_tasks(ray, resources: dict) -> None:
 
 
 def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
-    """Fallback: optimize + run on the multi-core single-node engine."""
+    """Fallback: optimize + run on the multi-core single-node engine.
+
+    A plan carrying a Python UDF takes the UDF-aware local path instead, for the same reason
+    `executors.write` routes one away from the JSON IR: `MapBatches.to_ir()` raises by design,
+    and `kyber.optimize` lowers the whole plan. So this fallback — the one every distributed
+    run lands on when Ray is unavailable, the cluster is a single node, or resources are too
+    tight to place the workers — could not run a `map_batches` pipeline at all. It failed with
+    ``NotImplementedError: map_batches is executed in Python, not lowered to the engine IR``,
+    an internal message about a wire contract, for the batch-inference workload that is the
+    most likely thing to be run under `distributed=True` in the first place.
+
+    Kyber still optimizes: `optimize_logical` rewrites the plan (pushdown, pruning) without
+    lowering it to IR, and its per-source projections are what keep the scan beneath a UDF
+    from reading every column.
+    """
     from batcher import core, kyber
 
+    if core.has_map_batches(plan):
+        return _single_node_with_udfs(plan, sources)
     physical = kyber.optimize(plan)
     resolved = [
         read_source(src, physical.source_projections.get(i), physical.source_predicates.get(i))
@@ -420,6 +436,26 @@ def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
     if not batches:
         # `Table.from_batches([], schema=None)` raises, and a null-typed guess would make an
         # empty result's schema differ from a non-empty one. The plan knows its own types.
+        from batcher.dist.executors.plan_analysis import empty_result_table
+
+        return empty_result_table(plan, plan.available_columns())
+    return pa.Table.from_batches(batches, schema=batches[0].schema)
+
+
+def _single_node_with_udfs(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
+    """`_single_node` for a plan carrying a Python `map_batches`.
+
+    Optimizes logically (no IR lowering, which `MapBatches` cannot survive) and runs through
+    `core.execute_with_udfs`, the same UDF-aware executor the in-process `collect` uses — so
+    a fallback produces the result the user would have got without asking for `distributed`,
+    rather than an error about the wire contract.
+    """
+    from batcher import core, kyber
+
+    optimized = kyber.optimize_logical(plan, sources=sources)
+    projections = kyber.required_columns_per_source(optimized)
+    batches = core.execute_with_udfs(optimized, sources, source_projections=projections)
+    if not batches:
         from batcher.dist.executors.plan_analysis import empty_result_table
 
         return empty_result_table(plan, plan.available_columns())

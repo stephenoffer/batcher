@@ -161,6 +161,24 @@ def _execute_adaptive(
     from batcher import core
 
     if not core.has_map_batches(plan):
+        # Seed distinct counts BEFORE this optimize, exactly as the one-shot path does in
+        # `orchestration.run._optimize`. No file footer carries an `ndv`, and without one the
+        # join estimator falls back to the PK-FK assumption `max(|L|, |R|)` — which is right
+        # for a fact-to-dimension join and catastrophically wrong for a many-to-many key.
+        # This call fixes the join order for the WHOLE query (and therefore which breaker
+        # becomes stage 0), so planning it blind is not a refinement the per-stage loop can
+        # recover: the stage it picks has already been chosen. TPC-H q5 at sf10 ordered
+        # `customer ⋈ supplier` on `nationkey` here, estimated at 1.5M rows against an actual
+        # 6.0 BILLION, and materializing that stage took the query past 100 GB resident.
+        # Seeded, the same plan joins `lineitem ⋈ supplier` first and closes on the composite
+        # `(o_custkey, s_nationkey) = (c_custkey, c_nationkey)` key.
+        #
+        # Idempotent and shared with the per-stage `run_relational`: a column measured here
+        # lands in the hub and is never re-sketched, so this replaces the first stage's blind
+        # pass rather than adding one.
+        from batcher.api.terminal._metadata import seed_column_ndv
+
+        seed_column_ndv(hub, srcs, plan)
         plan = kyber.optimize_logical(plan, sources=srcs, hub=hub)
     decisions: list = []
     stages = 0

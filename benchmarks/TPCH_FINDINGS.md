@@ -1,6 +1,6 @@
 # TPC-H / ClickBench vs DuckDB, Polars, PyArrow, Daft, Spark — where Batcher's time goes
 
-Companion to `BENCHMARK_RESULTS.md` (which covers Ray Data / Daft on the workloads Batcher
+Companion to `BENCHMARK_RESULTS.md` (which covers Daft on the workloads Batcher
 already wins by 50–450×). This document measures the ones it *loses*: the 22-query TPC-H
 decision-support suite and the single-table operator mix, against the engines with a
 comparable single-node native execution model.
@@ -45,7 +45,7 @@ sharply from the prior round — **q18 4.58×→1.80×, q10 2.38×→1.63×, q5 
 2.16×→1.94×**. It beats Spark on every query (10–33×). DuckDB still leads the join-heavy and
 group-by queries; the recurring residual is ~35–45% rayon scheduling overhead
 (`crossbeam_epoch` epoch-GC contention at 96 workers) — the next target, but any width cap
-must not regress the expensive-per-row (UDF/ML) operators that are Batcher's 50× Ray Data win.
+must not regress the expensive-per-row (UDF/ML) operators.
 
 ## Update 2026-07-10 (cont.) — the DuckDB gap is storage, not execution
 
@@ -88,13 +88,11 @@ bars, which the suite now does.
 
 ### Full operator matrix — raw wall time (ms), TPC-H sf1, best-of-5
 
-The backing numbers for the README's speedup table. All six single-node engines plus Ray
-Data, every row correctness-gated. `duckdb` is DuckDB's native compressed store; `ddb_arrow`
-is the *same* zero-copy Arrow input Batcher runs on (the execution-parity bar). PyArrow
-(Acero) and Ray Data have no window functions (`n/a`). Ray Data now carries native
-`Dataset` impls for group-by / join / sort / filter-project (added this round — the SQL
-engines fan out one query; the two non-SQL engines get hand-written pipelines so they
-compete on the shapes they *can* express).
+The backing numbers for the README's speedup table. All six single-node engines, every row
+correctness-gated. `duckdb` is DuckDB's native compressed store; `ddb_arrow` is the *same*
+zero-copy Arrow input Batcher runs on (the execution-parity bar). PyArrow (Acero) has no
+window functions (`n/a`). The SQL engines fan out one query; a non-SQL engine gets a
+hand-written pipeline so it competes on the shapes it *can* express.
 
 | operator | batcher | duckdb | ddb_arrow | polars | pyarrow | ray | spark |
 |-------------------------|-------:|------:|---------:|------:|-------:|-------:|------:|
@@ -112,11 +110,11 @@ compete on the shapes they *can* express).
 
 Read the win/loss from these directly: Batcher is fastest in every column except `duckdb`
 (native store) on the scan-bound group-by/sort/filter shapes, and `pyarrow` (Acero) on the
-two group-bys (~1.5×). Against Ray Data the span is 22×–2700×; against Spark 13×–197×.
+two group-bys (~1.5×). Against Spark the span is 13×–197×.
 
 ### Scaling — sf1 → sf10 → sf100 vs DuckDB (the gap grows; be honest about it)
 
-Batcher beats Polars/PyArrow/Spark/Ray Data at every scale we ran. Against DuckDB the
+Batcher beats Polars/PyArrow/Spark at every scale we ran. Against DuckDB the
 same-input (`duckdb_arrow`) execution comparison degrades as rows grow:
 
 | scale | in memory? | Batcher vs DuckDB (same-input execution) |
@@ -154,7 +152,7 @@ kill the run):
 
 **Batcher's answer at this scale is distribution** — the same mergeable `partial → combine →
 finalize` operators shard across a cluster (one partition per node, bounded per-node memory), the
-regime it is built for and where it beats Ray Data 50–450× (`BENCHMARK_RESULTS.md`). Closing the
+regime it is built for. Closing the
 *single-node* scale gap to DuckDB is open work: vectorized/SIMD kernels, dictionary-aware
 grouping, and streaming between operators. Landed this round toward it: mimalloc as the global
 allocator (fixed a per-morsel `munmap` TLB-shootdown serialization — and a `local_dynamic_tls`
@@ -176,9 +174,7 @@ python benchmarks/run.py --benchmark tpch --scale 1 --source ~/bench-data/tpch \
     --engines batcher,duckdb,duckdb_arrow,polars,daft,spark
 python benchmarks/run.py --benchmark operators --source ~/bench-data/tpch \
     --engines batcher,duckdb,duckdb_arrow,polars,pyarrow
-# the two non-SQL engines (PyArrow, Ray Data) on their native handles:
-python benchmarks/run.py --benchmark operators --tier multi --source ~/bench-data/tpch \
-    --engines batcher,ray
+# the non-SQL engine (PyArrow) on its native handles is covered by the run above.
 ```
 
 `duckdb_arrow` is the like-for-like execution bar (DuckDB over the same zero-copy Arrow
@@ -243,8 +239,8 @@ Three comparator caveats, all confirmed:
   into 2^32`) and returns a **wrong answer on q6**. A fair Polars comparison must drive its
   LazyFrame API (`suites/standard/tpch_dataframe.py`), not `pl.sql`.
 * **Daft** is also wrong on q6, returns the wrong columns on q18, and cannot express q21/q22.
-* **PyArrow and Ray Data have no SQL surface at all**, so they cannot run TPC-H. They appear
-  only in the operator mix below. Claiming a TPC-H win over them would be meaningless.
+* **PyArrow has no SQL surface at all**, so it cannot run TPC-H. It appears only in the
+  operator mix below. Claiming a TPC-H win over it would be meaningless.
 * **Batcher cannot run q21** — `NotImplementedError: correlated subqueries not supported`.
 
 On q6, Polars and Daft both drop the `l_discount = 0.07` rows (their 75,207,768 is exactly

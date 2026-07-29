@@ -146,6 +146,27 @@ def _make_unwrap_rule(leaf):
     return apply
 
 
+def _register_unwrap(name: str, leaf, op: str):
+    """Register one unwrap rule, declaring its leaf so the driver runs it in the shared
+    expression traversal rather than having it walk every expression itself.
+
+    The leaf tests `expr.op == op` before anything else, so the operator declaration is
+    exact: no mirroring happens at this level (`_oriented` reorients the *operands*, which
+    leaves the node's own operator alone).
+    """
+    return DEFAULT_REGISTRY.add(
+        node_rule(
+            name,
+            Phase.NORMALIZE,
+            _make_unwrap_rule(leaf),
+            matches=(Filter, Project),
+            expr_schema_fn=leaf,
+            expr_matches=(Binary,),
+            expr_ops=(op,),
+        )
+    )
+
+
 # One rule per operator, over two shared bodies -- the registration shape
 # `extra/temporal_sargable` uses for its `(extraction, operator)` cross-product.
 #
@@ -153,14 +174,7 @@ def _make_unwrap_rule(leaf):
 # Comparing the widened integer against a whole number and comparing the integer against
 # the truncated literal are the same predicate, every operator, every sign.
 UNWRAP_INTEGRAL_CAST_RULES = [
-    DEFAULT_REGISTRY.add(
-        node_rule(
-            f"unwrap_float_cast_{op}_integral_literal",
-            Phase.NORMALIZE,
-            _make_unwrap_rule(_integral(op)),
-            matches=(Filter, Project),
-        )
-    )
+    _register_unwrap(f"unwrap_float_cast_{op}_integral_literal", _integral(op), op)
     for op in sorted(_MIRROR)
 ]
 
@@ -174,13 +188,6 @@ UNWRAP_INTEGRAL_CAST_RULES = [
 # these are written to be sound everywhere, so they decline instead. `!=` is excluded for
 # the mirror-image reason.
 UNWRAP_FRACTIONAL_CAST_RULES = [
-    DEFAULT_REGISTRY.add(
-        node_rule(
-            f"unwrap_float_cast_{op}_fractional_literal",
-            Phase.NORMALIZE,
-            _make_unwrap_rule(_fractional(op)),
-            matches=(Filter, Project),
-        )
-    )
+    _register_unwrap(f"unwrap_float_cast_{op}_fractional_literal", _fractional(op), op)
     for op in sorted(_ORDERED)
 ]

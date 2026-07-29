@@ -63,19 +63,30 @@ __all__ = [
 
 # The comparison operators we rewrite (equality + the four inequalities). `ne` is
 # excluded on purpose — see the module docstring.
-_OPS = ("eq", "lt", "le", "gt", "ge")
+_OPS = ("eq", "ne", "lt", "le", "gt", "ge")
 
 # When the literal sits on the *left* (`Y < year(col)`), the effective operator on the
 # extraction is the mirror of the written one.
-_MIRROR = {"eq": "eq", "lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}
+_MIRROR = {"eq": "eq", "ne": "ne", "lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}
 
 # A contiguous, monotonic year-bucket extraction: `first_year(V)` is the first calendar
 # year in bucket `V`, and `span` is how many calendar years the bucket covers. `year`
 # is one year per bucket; DuckDB's `decade` is `floor(year/10)`, i.e. ten years starting
 # at `10·V`.
+#
+# `century` and `millennium` are the same shape with a different origin, and the origin is
+# the whole subtlety: they are **1-based**, so century 20 is 1901–2000 rather than
+# 1900–1999 (verified against the engine — `century(1900-01-01)` is 19 and
+# `century(1901-01-01)` is 20). Getting that off by one would shift every bound by a year.
+#
+# `iso_year` looks like it belongs here and does not: an ISO year boundary is a Monday, not
+# 1 January, so its buckets are not calendar-year aligned and `_year_start` cannot name them
+# (the engine puts `2000-01-01` in ISO year 1999).
 _BUCKETS: dict[str, tuple[Callable[[int], int], int]] = {
     "year": (lambda v: v, 1),
     "decade": (lambda v: v * 10, 10),
+    "century": (lambda v: v * 100 - 99, 100),
+    "millennium": (lambda v: v * 1000 - 999, 1000),
 }
 
 
@@ -95,11 +106,20 @@ def _year_start(year: int, *, is_timestamp: bool) -> _dt.date | None:
 def _column_kind(node: Filter, name: str) -> bool | None:
     """Whether `name` is a naive timestamp (True) or date (False) column, else None.
 
+    The node-taking form, kept for the standalone `rewrite_temporal_filter` entry point
+    that the unit tests drive. The fused path calls `_kind_from_schema` directly with the
+    schema the driver already resolved.
+    """
+    return _kind_from_schema(node.input.available_schema(), name)
+
+
+def _kind_from_schema(schema, name: str) -> bool | None:
+    """Whether `name` is a naive timestamp (True) or date (False) in `schema`, else None.
+
     Returns None when the schema is unknown, the column is absent, the column is
     neither date nor timestamp, or the timestamp carries a timezone (whose extraction
     semantics depend on the session zone — not provably exact here).
     """
-    schema = node.input.available_schema()
     if schema is None or not schema.has(name):
         return None
     dtype = schema.field(name).type
@@ -144,6 +164,11 @@ def _range_expr(column: str, op: str, lo: _dt.date, hi: _dt.date) -> Expr:
     ge_hi = Binary("ge", col, Lit(hi))
     if op == "eq":
         return Binary("and", ge_lo, lt_hi)
+    if op == "ne":
+        # The De Morgan complement of the `eq` band: *outside* `[lo, hi)` on either side.
+        # Both operators flip, which is what makes it a disjunction of the two strict
+        # half-bounds rather than the same pair rejoined by an `OR`.
+        return Binary("or", lt_lo, ge_hi)
     if op == "lt":
         return lt_lo
     if op == "le":
@@ -204,7 +229,38 @@ def _make_rule(fn: str, op: str):
     return _apply
 
 
-# Register one distinct rule per (extraction, operator) pair: 2 × 5 = 10 rules. Each is
+def _make_leaf(fn: str, op: str):
+    """The same rewrite as a *schema leaf*, so the driver can fuse it.
+
+    Twenty-four rules each walking the filter predicate themselves was the single largest
+    remaining cost in planning (46,992 traversal steps on the profiler's benchmark). As a
+    leaf the driver offers each expression to all twenty-four in one shared walk, with the
+    schema resolved once for the node instead of once per rule.
+    """
+
+    def leaf(expr: Expr, schema) -> Expr:
+        if not isinstance(expr, Binary):
+            return expr
+        matched = _match_extraction(expr)
+        if matched is None:
+            return expr
+        matched_fn, column, value, eff_op = matched
+        if matched_fn != fn or eff_op != op:
+            return expr
+        is_timestamp = _kind_from_schema(schema, column)
+        if is_timestamp is None:
+            return expr
+        first_year, span = _BUCKETS[fn]
+        lo = _year_start(first_year(value), is_timestamp=is_timestamp)
+        hi = _year_start(first_year(value) + span, is_timestamp=is_timestamp)
+        if lo is None or hi is None:
+            return expr
+        return _range_expr(column, op, lo, hi)
+
+    return leaf
+
+
+# Register one distinct rule per (extraction, operator) pair: 4 × 6 = 24 rules. Each is
 # indexed on `Filter` so the driver skips it when no filter is present, and each is
 # individually idempotent (its rewritten output has no `DateFunc` left to match).
 TEMPORAL_SARGABLE_RULES = [
@@ -214,6 +270,9 @@ TEMPORAL_SARGABLE_RULES = [
             Phase.NORMALIZE,
             _make_rule(fn, op),
             matches=(Filter,),
+            expr_schema_fn=_make_leaf(fn, op),
+            expr_matches=(Binary,),
+            expr_ops=(op, _MIRROR[op]),
         )
     )
     for fn in _BUCKETS

@@ -151,9 +151,10 @@ def _collect(
             and not core.has_map_batches(plan.input)
         ):
             from batcher.api._join_helpers import _empty_result_schema
+            from batcher.api.terminal.stream.dispatch import _pushdown
             from batcher.core.streaming import stream_limit
 
-            batches = list(stream_limit(plan, sources[0]))
+            batches = list(stream_limit(plan, sources[0], projection=_pushdown(plan)))
             schema = batches[0].schema if batches else _empty_result_schema(plan, columns)
             return pa.Table.from_batches(batches, schema=schema)
 
@@ -183,6 +184,7 @@ def _collect(
     if spill and not distributed:
         from batcher import core, kyber
         from batcher.api.orchestration import auto_num_partitions
+        from batcher.api.orchestration.run import record_cardinality_outcome
         from batcher.dist.spill import spill_collect
 
         hub = core.default_hub()
@@ -191,6 +193,12 @@ def _collect(
         opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
         spilled = spill_collect(opt_lp, sources, partitions)
         if spilled is not None:
+            # This route bypasses `run_relational`, so it must close its own loops — it
+            # recorded nothing at all, which made an explicit `spill=True` the one way to run
+            # a query that taught the optimizer literally nothing. The whole-input measures
+            # (`learn_column_stats`) still cannot run: an out-of-core scan never holds the
+            # batches to measure.
+            record_cardinality_outcome(hub, plan, sources, spilled.num_rows)
             return spilled
         # Other plan shapes have no spilling path → fall through to in-memory.
 
@@ -383,8 +391,9 @@ def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.
 def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
     """Execute through the real path (single-node/spill/distributed) and return `RunStats`.
 
-    Raises `PlanError` for an unbounded source and `BackendError` for a `map_batches`/ML
-    pipeline (the opaque UDF path emits no per-operator metrics).
+    Raises `PlanError` for an unbounded source. A `map_batches`/ML pipeline is measured per
+    stage against its logical tree (see `run_profiled`), so it reports rows and time per
+    stage rather than refusing.
     """
     from batcher.api.stats import RunStats
     from batcher.api.terminal.profile import run_profiled

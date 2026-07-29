@@ -156,11 +156,9 @@ python3 benchmarks/run.py --benchmark tpch --scale 10 \
 | polars | 0.538x | 20/22 | 0.468x | 16/22 |
 | daft | 0.445x | 17/18 | 0.525x | 11/18 |
 | spark | 0.041x* | 22/22 | 0.076x | 22/22 |
-| ray data | 0.001x* | 22/22 | 0.005x* | 22/22 |
 
-\* Spark at sf1 and Ray Data at both scales are carried from earlier verified runs in the
-same session rather than re-measured. Spark sf1 total 14,554.7 ms; Ray Data totals
-449,268.8 ms (sf1) and 709,969.6 ms (sf10). Every other cell is from the runs above.
+\* Spark at sf1 is carried from an earlier verified run in the same session rather than
+re-measured (sf1 total 14,554.7 ms). Every other cell is from the runs above.
 
 Daft's geomean and win counts are taken over the 18 queries it answers **correctly** -- q6
 and q15 return wrong results at both scales and q21/q22 do not plan, so counting them would
@@ -181,8 +179,8 @@ uncompressed Arrow bytes it is 2.4x slower than Batcher. The
 `Arrow is the only columnar contract` invariant (CLAUDE.md #3) means Batcher has no
 compressed form to switch to.
 
-Batcher also beats Polars (0.538x / 0.468x geomean), Daft (0.445x / 0.525x), Spark
-(0.041x / 0.076x) and Ray Data (0.001x / 0.005x) at both scales.
+Batcher also beats Polars (0.538x / 0.468x geomean), Daft (0.445x / 0.525x) and Spark
+(0.041x / 0.076x) at both scales.
 
 ## Where the sf10 deficit against the native store concentrates
 
@@ -234,6 +232,3 @@ is a morsel-scheduling concern rather than a kernel one.
 - **PyArrow is excluded.** It has no SQL surface and the suite deliberately writes no Acero
   TPC-H pipelines, since a hand-rolled reimplementation would benchmark the benchmark rather
   than the engine. It competes in `--benchmark operators`.
-- **Ray Data covers all 22 queries** via the `suites/standard/tpch_ray` pipelines added this
-  session (commit `b2dab69`). Before that it was measured single-threaded on 4 of 22, because
-  `ray.data.from_arrow` produces exactly one block.

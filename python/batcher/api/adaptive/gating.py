@@ -72,10 +72,23 @@ def resolve_adaptive(
     # statistics a cold shape has not learned yet. `learned_adaptive_route` measures both and
     # minimizes regret. Staging only re-plans equivalent algebra, so the arms return the
     # identical relation and the choice is result-invariant.
+    #
+    # But an arm is only worth exploring if it could win, and `staged` cannot win a plan whose
+    # join operands are ALREADY confidently sized: measuring a cardinality the optimizer
+    # already knows exactly changes no decision, so staging can only add its own cost. UCB1
+    # gives every offered arm a turn and its evidence expires, so offering it anyway means
+    # re-paying that cost forever — the same regret `sort_merge` was withheld from the
+    # build-side bandit for, and for the same reason. Measured on `lineitem ⋈ orders` at sf10
+    # (both scans EXACT-sized): the converged one-shot route runs 132 ms, and the periodic
+    # staged exploration 283-470 ms, on a query where the two arms cannot differ in what they
+    # learn. So the structural question is asked FIRST and gates the bandit, rather than being
+    # the cold-start fallback the bandit overrides once it has a verdict.
+    if not _adaptive_would_help(plan, sources, hub):
+        return False
     route = _learned_adaptive_route(plan, hub)
     if route is not None:
         return route == "staged"
-    return _adaptive_would_help(plan, sources, hub)
+    return True
 
 
 def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
@@ -144,20 +157,56 @@ def _total_input_rows(plan: LogicalPlan, estimator) -> float:
 
 
 def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
-    """Whether any join has a breaker-produced operand whose size is only guessed.
+    """Whether any join has a breaker-produced operand whose size is not yet trustworthy.
 
     The size floor this used to check itself now sits in `_large_enough`, ahead of the
     learned router, because it has to bind that too — see `resolve_adaptive`.
+
+    Two conditions have to hold for an operand to justify staging, and the second one is
+    the correction. It must be breaker-produced, so the loop can actually materialize it
+    and measure something. And its size must be genuinely unknown.
+
+    Provenance alone answers the second badly, because it describes where a number came
+    from and not whether that number was right. `Provenance.DEFAULT` is sticky: the
+    one-shot path never records an intermediate operator's measured cardinality against
+    the operand's signature, so a shape can be estimated to within a percent of actual
+    forever and still read as a guess. Measured at sf10, TPC-H q5's operands land within
+    1.0x of actual and carried the default label anyway, which fired this gate on every
+    run and put the query on a route that costs it. The label was standing in for evidence
+    the hub already had.
+
+    So the label now only opens the question, and the measured q-error history closes it.
+    An operand whose signature has a run of observations that never crossed the
+    re-optimization threshold (`kyber.estimate_is_reliable`) is treated as confidently
+    sized whatever its provenance says, because a stage boundary placed there would have
+    had nothing to correct. A cold hub knows nothing, returns `False` from that check, and
+    the gate behaves exactly as it did before any history existed.
     """
     plan_joins = joins(plan)
     if not plan_joins:
         return False
     estimator = _build_estimator(sources, hub)
     return any(
-        not is_streamable(operand) and estimator.estimate(operand).provenance >= Provenance.DEFAULT
+        not is_streamable(operand)
+        and estimator.estimate(operand).provenance >= Provenance.DEFAULT
+        and not _estimate_has_held_up(operand, hub)
         for join in plan_joins
         for operand in (join.left, join.right)
     )
+
+
+def _estimate_has_held_up(operand: LogicalPlan, hub) -> bool:
+    """Whether `operand`'s shape has a measured history of accurate size estimates."""
+    if hub is None:
+        return False
+    try:
+        from batcher.kyber import estimate_is_reliable
+        from batcher.kyber.signature import plan_signature
+
+        return estimate_is_reliable(hub, plan_signature(operand))
+    except Exception as exc:  # pragma: no cover - a learned read must never break routing
+        note_suppressed("api", "read operand q-error reliability", exc)
+        return False
 
 
 def _build_estimator(sources: list[Source], hub):

@@ -7,6 +7,7 @@ only referenced for typing here.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import pyarrow as pa
@@ -96,10 +97,11 @@ class GroupBy:
             PlanError: Always.
         """
         raise PlanError(
-            "a GroupBy is not iterable — looping over groups would materialize one "
-            "frame per key in Python. Aggregate instead: .agg(total=col('x').sum()), "
-            "or use .window(partition_by=[...]) to compute per-group values while "
-            "keeping every row."
+            "a GroupBy is not iterable — looping over groups would pull every group to the "
+            "driver. Aggregate instead: .agg(total=col('x').sum()); use "
+            ".window(partition_by=[...]) to compute per-group values while keeping every "
+            "row; or .map_groups(fn) to run a Python function on each group, which does the "
+            "same work inside the workers."
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -197,6 +199,63 @@ class GroupBy:
         if not resolved:
             raise PlanError("agg() requires at least one aggregate")
         return self._source._derive(self._lower_aggregates(resolved))
+
+    def map_groups(self, fn: Callable, **options: Any) -> Dataset:
+        """Apply a Python function to each group as one whole batch.
+
+        `fn` receives a `pyarrow.RecordBatch` holding every row of one group, in the
+        source's column order, and returns the batch that replaces it — the per-entity
+        shape that `agg` cannot express: building a user's session sequence, fitting a
+        curve per device, ranking a document's chunks. Groups may return different row
+        counts, and the results are concatenated.
+
+        This is the operation `map_batches` after a `group_by` looks like but is not.
+        `map_batches` sees whatever batches the engine produces, and a group spans several
+        of them, so a callback written that way runs on fragments and returns a wrong
+        answer rather than an error. `map_groups` first reduces each group to one row with
+        a **mergeable** aggregate, which is what makes it produce exactly one call per
+        group however many partitions the input has.
+
+        The cost is that one group is materialized at a time, so a single key holding
+        hundreds of millions of rows needs a reduction (`agg`) or a window rather than a
+        callback. Row order *within* a group is not guaranteed; sort inside `fn` when the
+        function depends on it. And because the result is a `map_batches` above a
+        relational breaker, whether `collect(distributed=True)` accepts the plan is the same
+        question as for ``group_by(...).agg(...).map_batches(fn)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> ds = bt.from_pydict({"k": ["a", "b", "a"], "v": [1, 10, 3]})
+                >>> def spread(group):
+                ...     v = group.column("v").to_pylist()
+                ...     return {"k": [group.column("k")[0].as_py()], "spread": [max(v) - min(v)]}
+                >>> out = ds.group_by("k").map_groups(spread, output_columns=["k", "spread"])
+                >>> out.sort("k").to_pydict()
+                {'k': ['a', 'b'], 'spread': [2, 0]}
+
+        Args:
+            fn: Called once per group with that group's rows as a `pyarrow.RecordBatch`.
+            **options: `map_batches` options for the per-group stage, such as
+                ``output_columns``, ``batch_format``, ``num_gpus``, or ``concurrency``.
+
+        Returns:
+            A new lazy `Dataset` holding what `fn` returned for each group, concatenated.
+
+        Raises:
+            PlanError: if every column is a group key, leaving nothing to hand `fn`.
+        """
+        from batcher.api.group_apply import build_map_groups
+
+        if self._named:
+            raise PlanError(
+                "map_groups needs plain column keys; group_by was given a derived key "
+                f"({sorted(self._named)}). Add the derived column with with_columns first, "
+                "then group by its name."
+            )
+        return build_map_groups(self._source, self._keys, fn, options)
 
     def _spec_to_aggs(self, spec: dict[str, Any]) -> dict[str, AggExpr]:
         """Expand a pandas ``{column: "sum"}`` / ``{column: ["min", "max"]}`` agg spec.

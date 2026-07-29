@@ -103,7 +103,7 @@ survives here is a gap someone read the code to confirm.
 
 | Gap | Daft | Notes |
 |---|---|---|
-| Group-wise Python apply | `map_groups` | `GroupBy` exposes 24 reducers and no way to hand a whole group to a Python function — pandas `groupby().apply()`, Polars `group_by().map_groups()`, Spark `applyInPandas`. `map_batches` operates on arbitrary batches, which is not the same thing: a group can span batches. Correct here means shuffling so each group lands whole in one partition before the callback runs, which is a distributed-execution change, not a `GroupBy` method. Deliberately **not** attempted in a hurry: a version that works single-node and silently splits groups across workers is exactly the failure CLAUDE.md's mergeability guard names — wrong results at cluster scale, no error. |
+| Group-wise Python apply | `map_groups` | **Single-node closed; distributed unmeasured.** `GroupBy.map_groups(fn)` in `api/group_apply.py`. The shuffle this row asked for turned out to be one Batcher already has: `array_agg` is a **mergeable** aggregate, so it emits exactly one row per key however many partitions the input has, and that row carries the whole group as list columns. `map_groups` lowers to that aggregation followed by an ordinary `map_batches` over one-row-per-group batches, and rebuilds each group by slicing the list's child array — no per-row Python and no new operator. So the *grouping* is correct at any partition count by the aggregation's own guarantee. `batch_format="pandas"` converts per group, which is the `applyInPandas` shape. **What is left open**: the plan is a `map_batches` above a relational breaker, which `is_map_prefix` excludes from the embarrassingly-parallel route, so whether `collect(distributed=True)` runs it is the same question as for `agg(...).map_batches(fn)` — pre-existing, and not measured when this landed (the shared cluster was saturated). Also still open: one group is materialized at a time, which the streaming carry-over operator described below would remove. |
 | Iceberg partition transforms | `partition_iceberg_bucket`, `partition_iceberg_truncate`, `partition_{years,months,days,hours}` | **Lower value than it first looks.** Batcher's Iceberg sink hands each shard to `pyiceberg`, which applies the table's own partition-spec transforms, so a partitioned write is already correct without these. What is left is manual bucketing and bucketed joins. The temporal four compose from existing expressions; only `bucket` needs an exact `murmur3_x86_32`, which is not in the tree. |
 | Row-identity generators | `monotonically_increasing_id`, `uuid`, `random_int` | **Two are spelling, one is a decision.** `monotonically_increasing_id` is `ds.with_row_index()` and `random_int` is `ds.with_random()` scaled and cast — both exist at `Dataset` level rather than as expressions, so they belong in the migration table. `uuid()` is genuinely absent and should stay absent in its usual form: a random UUID per row is non-deterministic, which breaks the interpreter-as-oracle property the whole test strategy rests on (sequential, parallel and distributed runs would disagree). `with_random` is seed-keyed for exactly that reason. A deterministic v5-style UUID over a key column would be admissible; nobody has asked, and `hash64`/`xxhash64` already cover surrogate keys. |
 | Video frame access | `video_frames`, `video_keyframes`, `get_video_frame_by_idx` | `.video.decode()` already covers `video_metadata` (it returns `{width, height, num_frames, duration_secs, fps}`), so the real gap is frame *extraction*, not metadata. Needs the `video` cargo feature (system FFmpeg). |
@@ -141,6 +141,29 @@ Two things worth having before anyone starts:
 That is a materially smaller piece of work than "a distributed-execution change", and it is
 still not a `GroupBy` method — it needs an operator that can hold one group across a batch
 boundary.
+
+**What shipped instead, and what is still open.** `map_groups` took the third route: reduce
+each group to one row with `array_agg`, which is mergeable and therefore already produces
+one row per key at any partition count, then run the callback over those rows. It needs no
+new operator and no sort, and the grouping is right for the same reason every other
+aggregate's is.
+
+Two things it does not get. It does not get the sort's memory profile: a group is
+materialized whole, so one enormous key has to fit in a worker, and the streaming
+carry-over operator above is the fix for that. And it does not, on its own, answer whether
+the distributed executor's *multi-worker* path will run the plan — a `map_batches` above a
+breaker is outside `is_map_prefix`, so that is the same open question as
+`agg(...).map_batches(fn)`, and closing it closes both.
+
+**A bug this shook out.** Probing the shape under `distributed=True` failed — and so did
+plain `ds.map_batches(fn).collect(distributed=True)`, which plainly should not. The cause was
+not the plan shape: `ray_runtime.lifecycle._single_node`, the fallback every distributed run
+lands on when Ray is unavailable or the cluster is one node, ran `kyber.optimize` and so
+lowered the plan to IR — which `MapBatches.to_ir()` refuses by design. The fallback therefore
+could not execute **any** UDF pipeline, failing with an internal message about the wire
+contract for exactly the batch-inference workload most likely to be run distributed. It now
+routes a UDF plan through `core.execute_with_udfs` after a logical-only optimize, the same
+way `executors.write` already routed one away from the IR.
 
 ## Open — spelling gaps only (no API work)
 

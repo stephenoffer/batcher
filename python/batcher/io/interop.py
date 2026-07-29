@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.errors import BackendError, PlanError
 from batcher.io.source import InMemorySource, IteratorSource, Source
 
 if TYPE_CHECKING:
@@ -94,7 +94,11 @@ def from_arrow(table_or_batches: pa.Table | pa.RecordBatch | list[pa.RecordBatch
         return InMemorySource([table_or_batches])
     batches = list(table_or_batches)
     if not batches:
-        raise ValueError("from_arrow: empty batch list has no schema")
+        raise PlanError(
+            "from_arrow() needs at least one record batch: a Dataset is a handle to a "
+            "schema as well as to rows, and an empty list carries neither. Pass a "
+            "pa.Table (which has a schema even when empty), or bt.from_pydict({...})."
+        )
     return InMemorySource(batches)
 
 
@@ -303,7 +307,10 @@ def _stack_torch_dataset(dataset: Any, to_np: Any) -> dict[str, Any]:
 
     rows = [dataset[i] for i in range(len(dataset))]
     if not rows:
-        raise ValueError("from_torch: empty dataset has no schema")
+        raise PlanError(
+            "from_torch() needs a non-empty dataset: the column names and types are read "
+            "off the first row, so an empty dataset carries no schema to build from."
+        )
     return _stack_rows(rows, lambda v: pa.array(np.stack([to_np(r) for r in v])))
 
 
@@ -313,7 +320,10 @@ def _stack_tf_dataset(tf_dataset: Any) -> dict[str, Any]:
 
     rows = [_tf_element_to_np(el) for el in tf_dataset.as_numpy_iterator()]
     if not rows:
-        raise ValueError("from_tf: empty dataset has no schema")
+        raise PlanError(
+            "from_tf() needs a non-empty dataset: the column names and types are read off "
+            "the first element, so an empty dataset carries no schema to build from."
+        )
     return _stack_rows(rows, lambda v: pa.array(np.stack(v)))
 
 

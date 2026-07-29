@@ -19,6 +19,13 @@ from batcher.kyber.rules.exprs import comparisons as _comparisons  # noqa: F401
 from batcher.kyber.rules.exprs import complex_types as _complex_types  # noqa: F401
 from batcher.kyber.rules.exprs import conditionals as _conditionals  # noqa: F401
 from batcher.kyber.rules.exprs import numeric as _numeric  # noqa: F401
+
+# Registration order is run order: `round_with_zero_digits` registered directly after the
+# rest of the numeric family when the two shared a module.
+# isort: off
+from batcher.kyber.rules.exprs import numeric_rounding as _numeric_rounding  # noqa: F401
+
+# isort: on
 from batcher.kyber.rules.exprs import temporal as _temporal  # noqa: F401
 from batcher.kyber.rules.exprs import text as _text  # noqa: F401
 from batcher.kyber.rules.exprs import text_algebra as _text_algebra  # noqa: F401

@@ -1,0 +1,16 @@
+# CSV, JSON, and Arrow IPC round trips
+
+Text formats carry no schema, so types are inferred on read. That inference is the usual source of a surprise: a zip code column of "01234" becomes an integer and loses the leading zero. Read it, check the schema, and cast at the edge.
+
+The whole script, executed on every test run:
+
+```{literalinclude} ../../../examples/io/text_formats.py
+:language: python
+:linenos:
+```
+
+Run it yourself:
+
+```bash
+python examples/io/text_formats.py
+```

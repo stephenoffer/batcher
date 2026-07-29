@@ -15,7 +15,13 @@ from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
 from batcher.dist.executors.plan_analysis import _single_source
-from batcher.dist.spill import _fd_safe, _iter_spill_morsels, _make_store, _work_dir
+from batcher.dist.spill import (
+    _fd_safe,
+    _iter_spill_morsels,
+    _make_store,
+    _work_dir,
+    map_projection,
+)
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
 from batcher.plan.ir_specs import sort_keys_ir
@@ -64,15 +70,22 @@ def execute_spilling_sort(
 
     Thin consumer of `stream_spilling_sort` — the bounded-memory bucket pipeline is
     one implementation; this collects it, `iter_batches()` streams it."""
-    _, sid = _relabel_single_source(sort.input)
     batches = list(stream_spilling_sort(sort, sources, num_partitions, spill_dir))
     if batches:
         return pa.Table.from_batches(batches)
-    return pa.table({f.name: [] for f in sources[sid].schema()})
+    # Typed, not null-typed, and the *sort's* schema rather than the source's. Building the
+    # empty from `{f.name: [] for f in source.schema()}` gave every column a null type and
+    # the pre-map column set, so an empty out-of-core sort disagreed with the in-memory one
+    # on both the types and the names — the same trap `execute_spilling_aggregate` avoids
+    # with `empty_result_table`, and the reason "spilled == in-memory" has to hold for empty
+    # results too.
+    from batcher.dist.executors.plan_analysis import empty_result_table
+
+    return empty_result_table(sort, sort.available_columns())
 
 
 def stage_and_partition(
-    source, map_ir, key_name, nulls_first, descending, n_buckets, store, cfg_json
+    source, map_ir, key_name, nulls_first, descending, n_buckets, store, cfg_json, projection=None
 ):
     """Map `source` through `map_ir`, sample the key, and range-partition the mapped output
     into `n_buckets` ordered disk buckets (key-ascending; `None` where a bucket got no rows).
@@ -92,7 +105,7 @@ def stage_and_partition(
     # re-reads locally, not re-mapping a possibly-remote source), and sketch the key.
     grids: list[tuple[list[float], int]] = []
     stage = store.writer("stage")
-    for batch in _iter_spill_morsels(source):
+    for batch in _iter_spill_morsels(source, projection):
         for rb in nat.execute_plan(map_ir, [[batch]], cfg_json):
             if not rb.num_rows:
                 continue
@@ -121,6 +134,11 @@ def stage_and_partition(
                     w.write(pb)
     for b, w in writers.items():
         handles[b] = w.close()
+    # The staged copy is the *whole* mapped input and pass 2 has finished re-reading it, so
+    # holding it while the buckets are processed doubled peak scratch for no reader. Giving
+    # it back here is what makes out-of-core sort cost one copy of the data on disk, not two.
+    if stage_handle is not None:
+        store.release(stage_handle)
     return handles
 
 
@@ -154,7 +172,15 @@ def stream_spilling_sort(
     store = _make_store(work_dir)
     try:
         handles = stage_and_partition(
-            sources[sid], map_ir, key.expr.name, nulls_first, desc, n_buckets, store, cfg_json
+            sources[sid],
+            map_ir,
+            key.expr.name,
+            nulls_first,
+            desc,
+            n_buckets,
+            store,
+            cfg_json,
+            map_projection(sort, sid),
         )
         # Sort each bucket, yield in key order (reversed for descending).
         order = range(n_buckets - 1, -1, -1) if desc else range(n_buckets)
@@ -162,22 +188,41 @@ def stream_spilling_sort(
         for b in order:
             if handles[b] is None:
                 continue
-            bucket = store.read(handles[b])
+            # `read_reserved` accounts the bucket's *resident* footprint against the process
+            # buffer pool while it is held. Reading a bucket back is the one step of spilling
+            # that can undo it, and a plain `read` told the pool nothing — so a concurrent
+            # query sizing its own state saw headroom this sort was already using. The
+            # aggregate reduce has always done this; the ordering breakers had not.
+            with store.read_reserved(handles[b]) as stream:
+                bucket = list(stream)
             if not bucket:
                 continue
-            for rb in nat.execute_plan(sort_ir, [bucket], cfg_json):
-                if not rb.num_rows:
-                    continue
-                if sort.limit is not None:
-                    take = min(rb.num_rows, sort.limit - emitted)
-                    if take <= 0:
-                        return
-                    yield rb.slice(0, take)
-                    emitted += take
-                    if emitted >= sort.limit:
-                        return
-                else:
-                    yield rb
+            try:
+                for rb in nat.execute_plan(sort_ir, [bucket], cfg_json):
+                    if not rb.num_rows:
+                        continue
+                    if sort.limit is not None:
+                        take = min(rb.num_rows, sort.limit - emitted)
+                        if take <= 0:
+                            return
+                        yield rb.slice(0, take)
+                        emitted += take
+                        if emitted >= sort.limit:
+                            return
+                    else:
+                        yield rb
+            finally:
+                # Buckets are read once, in key order, so this one will never be read again.
+                # Releasing it as it is consumed bounds peak scratch to the buckets still
+                # outstanding rather than to the whole spilled input — the disk analogue of
+                # the credit window, and what the aggregate reduce already does.
+                store.release(handles[b])
     finally:
+        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
+        # open (a partition phase abandoned by an exception) and deletes both tiers' files
+        # — the `rmtree` only ever reached the *local* one, so a failed query that had
+        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
+        # with nothing recording that they existed.
+        store.cleanup()
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)

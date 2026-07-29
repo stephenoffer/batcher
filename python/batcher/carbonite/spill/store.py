@@ -116,6 +116,9 @@ class TieredSpillStore:
         # How many buckets were pushed to the remote tier. The single number that explains
         # a spill phase that suddenly got slow: it means the local tier filled.
         self._overflowed = 0
+        # Writers handed out and not yet finalized. `cleanup` aborts whatever is left, which
+        # is the only way an abandoned *remote* bucket ever gets deleted.
+        self._open_writers: set[BucketWriter] = set()
 
     def _local_disk_low(self) -> bool:
         """Whether the scratch volume is too full to start another local bucket.
@@ -211,7 +214,9 @@ class TieredSpillStore:
                 f"spill bucket name {name!r} is not a safe path component",
                 hint="use letters, digits, and `. _ - + = @` only — no separators or `..`.",
             )
-        return BucketWriter(self, name)
+        writer = BucketWriter(self, name)
+        self._open_writers.add(writer)
+        return writer
 
     def _on_closed(self, tier: SpillTier | None, path: str | None, written: int | None) -> int:
         """Record a finished bucket's bytes; return its size.
@@ -366,7 +371,19 @@ class TieredSpillStore:
         self._remove_partial(handle.tier, handle.path)
 
     def cleanup(self) -> None:
-        """Remove the files this store created on *both* tiers and reset accounting."""
+        """Remove the files this store created on *both* tiers and reset accounting.
+
+        Writers still open are aborted first. A bucket abandoned mid-stream — an exception
+        in the operator producing its batches, a cancelled query — has no closed path, so it
+        is in neither tier's path list and `cleanup` could not see it. Locally that partial
+        file was swept up by the caller's `rmtree`; on the **remote** tier nothing removed
+        it at all, so every failed out-of-core query that had overflowed left orphaned
+        objects in the bucket, accumulating and billable, with no record that they existed.
+        """
+        for writer in list(self._open_writers):
+            with contextlib.suppress(Exception):
+                writer.abort()
+        self._open_writers.clear()
         for path in self._local_paths:
             with contextlib.suppress(OSError):
                 os.remove(path)

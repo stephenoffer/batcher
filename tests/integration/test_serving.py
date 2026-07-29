@@ -151,15 +151,37 @@ def test_post_json_fails_fast_on_client_error(server):
         )
 
 
-def test_http_client_warns_on_tensor_input():
+def test_http_client_warns_on_json_encoded_tensor_input():
+    """The warning is reserved for the opt-in legacy encoding, which is where it is advice.
+
+    It used to fire under every encoding and then do the slow thing anyway. Now the default
+    (``"auto"``) sends binary and says nothing, so the client has to be asked for ``"json"``
+    to reach the warning at all — which this test did not do, and so asserted a warning the
+    code had deliberately stopped emitting.
+    """
     import contextlib
 
     from batcher._internal.errors import PerformanceWarning
     from batcher.ml.serving.http import _HttpServingClient
 
-    client = _HttpServingClient("http://unused", {}, 1.0, 0)
+    client = _HttpServingClient("http://unused", {}, 1.0, 0, tensor_encoding="json")
     with pytest.warns(PerformanceWarning, match="triton_client"), contextlib.suppress(Exception):
         client.predict({"img": np.zeros((2, 4, 4), dtype=np.uint8)})  # warns before the call
+
+
+def test_http_client_is_silent_on_the_default_encoding():
+    """The other half of that contract: ``"auto"`` is binary transport with nothing to say."""
+    import contextlib
+    import warnings
+
+    from batcher.ml.serving.http import _HttpServingClient
+
+    client = _HttpServingClient("http://unused", {}, 1.0, 0)
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        with contextlib.suppress(Exception):
+            client.predict({"img": np.zeros((2, 4, 4), dtype=np.uint8)})
+    assert not [w for w in seen if "triton_client" in str(w.message)]
 
 
 def test_vllm_engine_builds_factory_lazily():

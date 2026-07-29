@@ -202,7 +202,48 @@ def _validate_similarity_join(
         raise PlanError(
             f"similarity_join(): bands must divide num_bits, got {num_bits} % {bands} != 0"
         )
+    _check_vector_dims(left, right, left_on, right_on)
     return num_bits // bands
+
+
+def _vector_dim(ds: Dataset, column: str) -> int | None:
+    """The declared width of a fixed-size vector column, or `None` if it is not declared.
+
+    `ds.ml.embed` emits `fixed_size_list`, so the width is in the schema for anything that
+    came out of an embedding step. A plain `list` column carries no width and is left to the
+    engine, which checks per row.
+    """
+    try:
+        import pyarrow as pa
+
+        field_type = ds.schema.field(column).type
+    except Exception:
+        return None
+    return field_type.list_size if pa.types.is_fixed_size_list(field_type) else None
+
+
+def _check_vector_dims(left: Dataset, right: Dataset, left_on: str, right_on: str) -> None:
+    """Refuse a similarity join between vectors of different widths, before it runs.
+
+    Embedding the index with one model and the query with another is a named symptom in the
+    RAG guides, and the two sides only differ by a number nobody looks at. The engine does
+    catch it — but as a `RuntimeError` from deep in a Rust kernel ("string function
+    list.CosineSimilarity: list dimensions must be equal"), after the whole scan, in
+    vocabulary that belongs to the engine rather than to the user.
+
+    Both widths are in the schema whenever the vectors came from `ds.ml.embed`, so the
+    mismatch is knowable before a single row is read. Raising here costs nothing and says
+    the thing the user needs to hear: two different models produced these.
+    """
+    left_dim, right_dim = _vector_dim(left, left_on), _vector_dim(right, right_on)
+    if left_dim is None or right_dim is None or left_dim == right_dim:
+        return
+    raise PlanError(
+        f"similarity_join(): {left_on!r} has {left_dim}-dimensional vectors but "
+        f"{right_on!r} has {right_dim}. Cosine similarity is only defined between vectors "
+        f"of the same width, so these were almost certainly produced by two different "
+        f"embedding models — re-embed one side with the model that produced the other."
+    )
 
 
 def _vector_signatures(

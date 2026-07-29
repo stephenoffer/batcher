@@ -36,7 +36,7 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
-from batcher.dist.spill import _fd_safe, _make_store, _work_dir
+from batcher.dist.spill import _fd_safe, _make_store, _work_dir, map_projection
 from batcher.dist.spill_breakers import stage_and_partition
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
@@ -128,7 +128,15 @@ def stream_spilling_global_window(
     store = _make_store(work_dir)
     try:
         handles = stage_and_partition(
-            sources[sid], map_ir, key_name, nulls_first, desc, n_buckets, store, cfg_json
+            sources[sid],
+            map_ir,
+            key_name,
+            nulls_first,
+            desc,
+            n_buckets,
+            store,
+            cfg_json,
+            map_projection(window, sid),
         )
         # Process buckets in *global sort order* (reversed for descending) so the
         # running offsets accumulate correctly.
@@ -145,7 +153,12 @@ def stream_spilling_global_window(
         for b in order:
             if handles[b] is None:
                 continue
-            bucket = store.read(handles[b])
+            # Reserved, so the pool sees the bucket this reduce is holding; released after
+            # the bucket is consumed, so peak scratch is the outstanding buckets rather than
+            # the whole spilled input. Buckets are read once, in global sort order.
+            with store.read_reserved(handles[b]) as stream:
+                bucket = list(stream)
+            store.release(handles[b])
             if not bucket:
                 continue
             out = nat.execute_plan(win_json, [bucket], cfg_json)
@@ -218,5 +231,11 @@ def stream_spilling_global_window(
                 if batch.num_rows:
                     yield batch
     finally:
+        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
+        # open (a partition phase abandoned by an exception) and deletes both tiers' files
+        # — the `rmtree` only ever reached the *local* one, so a failed query that had
+        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
+        # with nothing recording that they existed.
+        store.cleanup()
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)

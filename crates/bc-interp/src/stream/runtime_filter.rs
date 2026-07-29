@@ -23,10 +23,12 @@
 //! sideways-information-passing rules; the two must agree, and they do.
 //!
 //! Only a single `Int64` equi-key, and only while the key can be traced down the probe pipeline
-//! to the node the filter is applied at — through `Filter` (which renames nothing) and through
-//! a `Project` that passes the column straight through. Anything else stops the descent, and
-//! the filter is placed at the deepest node reached. A key that cannot be traced at all is
-//! simply not filtered.
+//! to the node the filter is applied at — through `Filter` (which renames nothing), through a
+//! `Project` that passes the column straight through, and through an **inner `HashJoin`**, into
+//! whichever side its `output` mapping says the column comes from. Anything else stops the
+//! descent, and the filter is placed at the deepest node reached. A key that cannot be traced at
+//! all is simply not filtered. See [`sink_target`] for why crossing an inner join is sound, and
+//! why it is what makes this optimization reach the plans that need it.
 //!
 //! ## Keeping the downside bounded
 //!
@@ -277,10 +279,32 @@ fn place_for_join(
 /// The deepest node in `probe` whose output still carries the join key, and the key's name there.
 ///
 /// Descends only through nodes that neither drop nor recompute the column: a `Filter` (which
-/// changes which rows exist, not which columns) and a `Project` that passes the column through
-/// as a bare column reference, possibly under a different alias. A `Project` that *computes* the
-/// key, or any other node, ends the descent — the filter is then placed on that node's output,
-/// where the column demonstrably still exists and still holds join keys.
+/// changes which rows exist, not which columns), a `Project` that passes the column through as a
+/// bare column reference, and an **inner `HashJoin`**, into whichever side the column comes from.
+/// A `Project` that *computes* the key, or any other node, ends the descent — the filter is then
+/// placed on that node's output, where the column demonstrably still exists and still holds join
+/// keys.
+///
+/// ## Why descending through an inner join matters, and why it is sound
+///
+/// Stopping at a join is what confined this optimization to a star join whose fact table is the
+/// *immediate* probe input. Real plans are not shaped that way: TPC-H q5 joins `lineitem` to the
+/// date-filtered `orders` first and only then to the 20,037 ASIA suppliers, so the supplier key
+/// set — which keeps roughly one `lineitem` row in five — could only be applied to the 9.1M-row
+/// join output, long after the 60M-row scan it should have reduced. The same shape recurs in q7,
+/// q9 and q10.
+///
+/// Soundness is the join's own algebra. Every output row of `C ⋈ D` takes its value of a
+/// left-sourced column from exactly one row of `C` (and a right-sourced one from `D`) — the join
+/// pairs rows, it never invents or alters a value. So a row of `C` whose key the filter refutes
+/// can only produce output rows the *outer* join would refute in turn, and removing it earlier
+/// removes exactly the same rows from the final answer. The `output` mapping is followed to pick
+/// the side and the pre-join name, so a renamed or collided alias tracks the real column.
+///
+/// Inner only. An outer join *manufactures* NULLs on its null-extended side, so a row that the
+/// filter refutes there may still be needed to produce a null-extended output row, and a semi or
+/// anti join's output does not carry the right side's columns at all. Restricting to `Inner` is
+/// what makes "the value came from one input row" true without further reasoning.
 fn sink_target<'a>(probe: &'a RelOp, key: &str) -> (&'a RelOp, String) {
     let mut node = probe;
     let mut name = key.to_string();
@@ -296,6 +320,52 @@ fn sink_target<'a>(probe: &'a RelOp, key: &str) -> (&'a RelOp, String) {
                         name = source.clone();
                         node = input;
                     }
+                    _ => return (node, name),
+                }
+            }
+            RelOp::HashJoin {
+                left,
+                right,
+                join_type: JoinType::Inner,
+                output,
+                ..
+            } => {
+                let Some(col) = output.iter().find(|c| c.alias == name) else {
+                    return (node, name);
+                };
+                name = col.name.clone();
+                node = match col.side {
+                    bc_ir::JoinSide::Left => left,
+                    bc_ir::JoinSide::Right => right,
+                };
+            }
+            // An `Aggregate`, on one of its **group keys**. Every output row's key value is one
+            // that appeared in the input, so a key the filter refutes describes a group the join
+            // above would discard whole — and deleting that group's *input* rows deletes exactly
+            // that group and nothing else. Aggregate values are never touched, because a group is
+            // either entirely kept or entirely removed.
+            //
+            // This is the placement a decorrelated correlated subquery needs. It lowers to
+            // `Join(outer, Aggregate(inner, group_keys=[k]))`, and the aggregate is computed over
+            // the *whole* inner relation even though only the outer's few keys are ever read.
+            // Filtering at the join saves nothing (the groups are already built); filtering here
+            // means they are never built. Unlike the plan-time semi-join that expresses the same
+            // idea (`kyber.rules.joins.agg_semijoin`), this costs no extra pass over the input —
+            // the mask rides the scan the aggregate was doing anyway, which is why that rule
+            // refuses shapes this can still serve.
+            RelOp::Aggregate {
+                input, group_keys, ..
+            } => {
+                let Some(item) = group_keys.iter().find(|k| k.alias == name) else {
+                    return (node, name); // an aggregate *value*, not a key: no such guarantee
+                };
+                match &item.expr {
+                    bc_expr::Expr::Col { name: source } => {
+                        name = source.clone();
+                        node = input;
+                    }
+                    // A computed key (`GROUP BY lower(x)`) cannot be inverted into a predicate on
+                    // an input column, so the filter stops at the aggregate's output.
                     _ => return (node, name),
                 }
             }
@@ -391,6 +461,149 @@ mod tests {
         let (target, name) = sink_target(&plan, "sk");
         assert!(matches!(target, RelOp::Scan { source_id: 0 }));
         assert_eq!(name, "l_suppkey", "the rename must be followed down");
+    }
+
+    fn inner_join(left: RelOp, right: RelOp, out: &[(bc_ir::JoinSide, &str, &str)]) -> RelOp {
+        RelOp::HashJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_keys: vec!["l_orderkey".into()],
+            right_keys: vec!["o_orderkey".into()],
+            join_type: JoinType::Inner,
+            output: out
+                .iter()
+                .map(|(side, name, alias)| bc_ir::JoinOutputCol {
+                    side: *side,
+                    name: (*name).into(),
+                    alias: (*alias).into(),
+                })
+                .collect(),
+            strategy: bc_ir::JoinStrategy::Hash,
+        }
+    }
+
+    /// The placement TPC-H q5 needs: the supplier key set must reach the `lineitem` scan even
+    /// though a `lineitem ⋈ orders` join sits between them. Stopping at the join applied it to
+    /// the 9.1M-row join output instead of the 60M-row scan.
+    #[test]
+    fn descends_through_an_inner_join_into_the_side_that_carries_the_key() {
+        let plan = inner_join(
+            project(scan(0), &[("l_suppkey", col("l_suppkey"))]),
+            scan(1),
+            &[(bc_ir::JoinSide::Left, "l_suppkey", "sk")],
+        );
+        let (target, name) = sink_target(&plan, "sk");
+        assert!(
+            matches!(target, RelOp::Scan { source_id: 0 }),
+            "must reach the probe-side scan, not stop at the join"
+        );
+        assert_eq!(
+            name, "l_suppkey",
+            "the join's output mapping renames it back"
+        );
+    }
+
+    /// The mapping decides the side: a right-sourced column descends into the build side.
+    #[test]
+    fn descends_into_the_build_side_when_the_key_comes_from_there() {
+        let plan = inner_join(
+            scan(0),
+            project(scan(1), &[("o_custkey", col("o_custkey"))]),
+            &[(bc_ir::JoinSide::Right, "o_custkey", "ck")],
+        );
+        let (target, name) = sink_target(&plan, "ck");
+        assert!(matches!(target, RelOp::Scan { source_id: 1 }));
+        assert_eq!(name, "o_custkey");
+    }
+
+    /// An outer join manufactures NULLs on its null-extended side, so a refuted row may still be
+    /// needed to produce an output row. The descent must stop there.
+    #[test]
+    fn stops_at_a_non_inner_join() {
+        let mut plan = inner_join(
+            scan(0),
+            scan(1),
+            &[(bc_ir::JoinSide::Left, "l_suppkey", "sk")],
+        );
+        if let RelOp::HashJoin { join_type, .. } = &mut plan {
+            *join_type = JoinType::Left;
+        }
+        let (target, name) = sink_target(&plan, "sk");
+        assert!(matches!(target, RelOp::HashJoin { .. }));
+        assert_eq!(name, "sk");
+    }
+
+    /// A column the join's output mapping does not name ends the descent, rather than tracking a
+    /// name that means something else on one of the sides.
+    #[test]
+    fn stops_at_an_inner_join_that_does_not_carry_the_key() {
+        let plan = inner_join(
+            scan(0),
+            scan(1),
+            &[(bc_ir::JoinSide::Left, "something_else", "other")],
+        );
+        let (target, _) = sink_target(&plan, "sk");
+        assert!(matches!(target, RelOp::HashJoin { .. }));
+    }
+
+    fn aggregate(input: RelOp, keys: &[(&str, Expr)]) -> RelOp {
+        RelOp::Aggregate {
+            input: Box::new(input),
+            group_keys: keys
+                .iter()
+                .map(|(alias, expr)| ProjectionItem {
+                    expr: expr.clone(),
+                    alias: (*alias).into(),
+                })
+                .collect(),
+            aggregates: Vec::new(),
+        }
+    }
+
+    /// A decorrelated correlated subquery is `Join(outer, Aggregate(inner, by k))`, and the
+    /// aggregate is built over the whole inner relation for the sake of the outer's few keys.
+    /// The filter must reach the aggregate's *input*, where the groups are never built, rather
+    /// than its output, where they already have been.
+    #[test]
+    fn descends_through_an_aggregate_on_its_group_key() {
+        let plan = aggregate(
+            project(scan(0), &[("l_orderkey", col("l_orderkey"))]),
+            &[("k", col("l_orderkey"))],
+        );
+        let (target, name) = sink_target(&plan, "k");
+        assert!(
+            matches!(target, RelOp::Scan { source_id: 0 }),
+            "must reach the input scan, not stop at the aggregate"
+        );
+        assert_eq!(name, "l_orderkey");
+    }
+
+    /// An aggregate *value* carries no such guarantee — `sum(x)` for a refuted key says nothing
+    /// about which input rows produced it — so the descent stops at the aggregate's output.
+    #[test]
+    fn stops_at_an_aggregate_value_column() {
+        let plan = aggregate(scan(0), &[("k", col("l_orderkey"))]);
+        let (target, name) = sink_target(&plan, "total");
+        assert!(matches!(target, RelOp::Aggregate { .. }));
+        assert_eq!(name, "total");
+    }
+
+    /// A computed group key cannot be inverted into a predicate on an input column.
+    #[test]
+    fn stops_at_an_aggregate_with_a_computed_group_key() {
+        let plan = aggregate(
+            scan(0),
+            &[(
+                "k",
+                Expr::Binary {
+                    op: bc_expr::BinaryOp::Add,
+                    left: Box::new(col("a")),
+                    right: Box::new(col("b")),
+                },
+            )],
+        );
+        let (target, _) = sink_target(&plan, "k");
+        assert!(matches!(target, RelOp::Aggregate { .. }));
     }
 
     /// A computed key ends the descent: below the `Project` the column does not exist, and the

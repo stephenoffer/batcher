@@ -112,6 +112,34 @@ def _make_store(work_dir: str) -> TieredSpillStore:
 _SPILL_INPUT_CHUNK_BYTES = 8 << 20  # 8 MiB
 
 
+def map_projection(plan: LogicalPlan, source_id: int) -> list[str] | None:
+    """The columns `source_id` must produce for `plan` — Kyber's answer, for a spill phase.
+
+    Every out-of-core partition phase reads its source through `_iter_spill_morsels`, and
+    every one of them read it *whole*: the `projection` parameter existed and no call site
+    ever passed one. Out-of-core is exactly where that costs the most, because the source
+    read is the dominant IO of a spilling aggregate, join, sort, or window, and a column the
+    plan never touches is decoded, chunked, hash-partitioned, compressed, written to disk,
+    and read back again.
+
+    Asked of the **breaker**, not of its map sub-plan. The sub-plan a partition phase
+    executes per morsel is often a bare `Scan`, which requires every column by definition —
+    what narrows the read is the operator above it (the aggregate's keys and arguments, the
+    sort's key and output, the join's keys and projection). Asking Kyber keeps the decision
+    in Kyber's lane.
+
+    Args:
+        plan: The breaker being spilled, rooted above the scan.
+        source_id: The scan whose projection is wanted.
+
+    Returns:
+        The projection for that source, or ``None`` when the plan does not narrow it.
+    """
+    from batcher import kyber
+
+    return kyber.required_columns_per_source(plan).get(source_id)
+
+
 def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
     """Yield `source`'s batches normalized to ~``_SPILL_INPUT_CHUNK_BYTES``.
 
@@ -313,7 +341,7 @@ def execute_spilling_aggregate(
 
     try:
         # --- partition phase: stream source, partial-aggregate, spill by key ---
-        for batch in _iter_spill_morsels(source):
+        for batch in _iter_spill_morsels(source, map_projection(agg, source_id)):
             mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not mapped:
                 continue
@@ -367,6 +395,12 @@ def execute_spilling_aggregate(
             )
         return _empty_table(agg)
     finally:
+        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
+        # open (a partition phase abandoned by an exception) and deletes both tiers' files
+        # — the `rmtree` only ever reached the *local* one, so a failed query that had
+        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
+        # with nothing recording that they existed.
+        store.cleanup()
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -180,6 +180,7 @@ DATE_PART_THROUGH_TRUNC_RULES = [
             _make_part_rule(part),
             matches=(Filter, Project),
             expr_fn=_part_through_trunc(part),
+            expr_matches=(DateFunc,),
         )
     )
     for part in sorted(_PART_GRANULARITY)
@@ -202,6 +203,7 @@ def _last_day_idempotent(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_last_day_idempotent,
+    expr_matches=(DateFunc,),
 )
 def last_day_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`last_day(last_day(t)) -> last_day(t)`. The last day of a month is itself in
@@ -221,6 +223,7 @@ def _zero_offset(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_zero_offset,
+    expr_matches=(DateOffset,),
 )
 def drop_zero_date_offset(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """A `DateOffset` of zero months, days, and microseconds `-> its input`. Shifting a
@@ -247,6 +250,7 @@ def _combine_offsets(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_combine_offsets,
+    expr_matches=(DateOffset,),
 )
 def combine_adjacent_date_offsets(
     node: Filter | Project, _ctx: OptimizerContext

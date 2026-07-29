@@ -95,10 +95,23 @@ class RankTransformer(Preprocessor):
         """
         # rank_pct() is a window, which cannot write back to its own input column in a single
         # with_columns; compute each rank into a temp, then swap it in for the original.
+        #
+        # A null row ranks too, and it ranked *last* — so every missing value came out at
+        # percentile 1.0, the top of the feature's range, which is the worst place to put one
+        # and looks like an ordinary extreme value downstream. Null it back out afterwards:
+        # a rank is meaningless for a value that is not there.
         temps = {f"__bt_rank_{name}": col(name).rank_pct() for name in self.columns}
         out = ds.with_columns(**temps)
         for name in self.columns:
-            out = out.drop(name).rename({f"__bt_rank_{name}": name})
+            temp = f"__bt_rank_{name}"
+            out = out.with_columns(
+                **{
+                    temp: when(col(name).is_null())
+                    .then(col(name).cast("float64"))
+                    .otherwise(col(temp))
+                }
+            )
+            out = out.drop(name).rename({temp: name})
         return out
 
 

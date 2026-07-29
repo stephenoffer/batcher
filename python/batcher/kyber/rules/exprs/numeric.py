@@ -48,7 +48,6 @@ __all__ = [
     "inf_check_on_integer_to_false",
     "lcm_with_one_to_abs",
     "nan_check_on_integer_to_false",
-    "round_with_zero_digits",
     "xor_of_self_to_zero",
 ]
 
@@ -82,7 +81,14 @@ def _float_div_one(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_float_division_by_one", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="drop_float_division_by_one",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(Binary,),
+    expr_ops=("truediv",),
+    expr_schema=_float_div_one,
+)
 def drop_float_division_by_one(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -104,7 +110,14 @@ def _int_floordiv_one(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="drop_floor_division_by_one", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="drop_floor_division_by_one",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(Binary,),
+    expr_ops=("floor_div",),
+    expr_schema=_int_floordiv_one,
+)
 def drop_floor_division_by_one(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -127,7 +140,14 @@ def _mul_zero(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="fold_mul_by_zero_integer", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_mul_by_zero_integer",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(Binary,),
+    expr_ops=("mul",),
+    expr_schema=_mul_zero,
+)
 def fold_mul_by_zero_integer(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`i * 0 -> 0` for a non-nullable integer `i`. Both guards are needed: a null
     operand would give `NULL`, not `0`, and a float operand would give `NaN` for an
@@ -149,7 +169,14 @@ def _mod_one(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="fold_mod_by_one_integer", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_mod_by_one_integer",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(Binary,),
+    expr_ops=("mod",),
+    expr_schema=_mod_one,
+)
 def fold_mod_by_one_integer(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`i % 1 -> 0` for a non-nullable integer `i`. Every integer is divisible by one,
     so the remainder is zero regardless of sign. Nullability is checked because
@@ -170,7 +197,14 @@ def _xor_self(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="xor_of_self_to_zero", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="xor_of_self_to_zero",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(Binary,),
+    expr_ops=("bit_xor",),
+    expr_schema=_xor_self,
+)
 def xor_of_self_to_zero(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`i ^ i -> 0` for a non-nullable integer `i`. Bitwise exclusive-or of a value
     with itself clears every bit. The nullability guard keeps `NULL ^ NULL`, which is
@@ -189,7 +223,13 @@ def _nan_on_int(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="nan_check_on_integer_to_false", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="nan_check_on_integer_to_false",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(IsNan,),
+    expr_schema=_nan_on_int,
+)
 def nan_check_on_integer_to_false(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -214,7 +254,13 @@ def _inf_on_int(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="inf_check_on_integer_to_false", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="inf_check_on_integer_to_false",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(IsInf,),
+    expr_schema=_inf_on_int,
+)
 def inf_check_on_integer_to_false(
     node: Filter | Project, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
@@ -239,7 +285,13 @@ def _pow_exponent_zero(expr: Expr, schema: SchemaRef | None) -> Expr:
     return expr
 
 
-@rule(name="fold_pow_exponent_zero", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_pow_exponent_zero",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_matches=(Math2Expr,),
+    expr_schema=_pow_exponent_zero,
+)
 def fold_pow_exponent_zero(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`pow(x, 0) -> 1.0` for a non-nullable `x`.
 
@@ -272,6 +324,7 @@ def _hypot_zero(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_hypot_zero,
+    expr_matches=(Math2Expr,),
 )
 def hypot_with_zero_to_abs(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`hypot(x, 0) -> abs(x)`. The Euclidean norm of a single leg is its magnitude.
@@ -290,7 +343,13 @@ def _gcd_zero(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="gcd_with_zero_to_abs", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_gcd_zero)
+@rule(
+    name="gcd_with_zero_to_abs",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_gcd_zero,
+    expr_matches=(Math2Expr,),
+)
 def gcd_with_zero_to_abs(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`gcd(x, 0) -> abs(x)`. Zero is the identity of the greatest-common-divisor
     monoid, and the result is by definition non-negative, which is what `abs`
@@ -307,7 +366,13 @@ def _lcm_one(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="lcm_with_one_to_abs", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_lcm_one)
+@rule(
+    name="lcm_with_one_to_abs",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_lcm_one,
+    expr_matches=(Math2Expr,),
+)
 def lcm_with_one_to_abs(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`lcm(x, 1) -> abs(x)`. One is the identity of the least-common-multiple
     monoid, and the least common multiple is non-negative, so `abs` is the exact
@@ -326,7 +391,13 @@ def _gcd_self(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="gcd_of_self_to_abs", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_gcd_self)
+@rule(
+    name="gcd_of_self_to_abs",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_gcd_self,
+    expr_matches=(Math2Expr,),
+)
 def gcd_of_self_to_abs(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`gcd(x, x) -> abs(x)`. A value's greatest common divisor with itself is its
     magnitude. No nullability guard is needed because `gcd(NULL, NULL)` and
@@ -373,6 +444,8 @@ INT_MATH2_FOLD_RULES = [
             _make_int_math2_rule(fn),
             matches=(Filter, Project),
             expr_fn=_fold_int_math2(fn),
+            expr_matches=(Math2Expr,),
+            expr_ops=(fn,),
         )
     )
     for fn in ("gcd", "lcm")
@@ -418,27 +491,9 @@ SHIFT_FOLD_RULES = [
             _make_shift_rule(op),
             matches=(Filter, Project),
             expr_fn=_fold_shift_op(op),
+            expr_matches=(Binary,),
+            expr_ops=(op,),
         )
     )
     for op in ("shl", "shr")
 ]
-
-
-def _round_zero_digits(expr: Expr) -> Expr:
-    if isinstance(expr, Math2Expr) and expr.fn == "round" and _int_lit(expr.right) == 0:
-        return MathExpr("round", expr.left)
-    return expr
-
-
-@rule(
-    name="round_with_zero_digits",
-    phase=Phase.NORMALIZE,
-    matches=(Filter, Project),
-    expr=_round_zero_digits,
-)
-def round_with_zero_digits(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`round(x, 0) -> round(x)`. Rounding to zero decimal places is the one-argument
-    form, which skips the scaling multiply and divide the general path performs. It
-    also feeds the existing nested-rounding collapse, which only recognizes the
-    single-argument node."""
-    return rewrite_node(node, _round_zero_digits)

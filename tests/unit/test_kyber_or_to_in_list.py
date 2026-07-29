@@ -55,7 +55,7 @@ def test_the_optimizer_is_idempotent_on_the_result():
     terminate. The dedup keeps first-occurrence order for the same reason: a reordering
     rewrite would produce a different-but-equal list on every pass.
     """
-    from batcher.kyber.rules.normalize.ranges import or_equalities_to_in_list
+    from batcher.kyber.rules.normalize.disjunctions import or_equalities_to_in_list
 
     node = DS.filter((col("a") == 1) | (col("a") == 2) | (col("a") == 3))._plan
     once = or_equalities_to_in_list(node, None)

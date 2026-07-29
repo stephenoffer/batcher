@@ -10,6 +10,7 @@ The `Sink` protocol itself lives in `io.sink`; this base structurally satisfies 
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
 from batcher.io.base._paths import normalize_path
+from batcher.io.base._transient import with_retry
 from batcher.io.filesystem import FileSystem, resolve_filesystem
 from batcher.io.manifest import WriteManifest, WrittenFile
 
@@ -54,6 +56,12 @@ def _partition_run_starts(ordered: pa.Table, cols: list[str], pc: Any) -> list[i
         changed = differs if changed is None else pc.or_(changed, differs)
     # `changed[i]` compares row i+1 against row i, so a True at i starts a run at i+1.
     return [0, *(i + 1 for i, flag in enumerate(changed.to_pylist()) if flag)]
+
+
+# Write-side retry, mirroring the read path's `_READ_RETRY_*` so a deployment tunes one
+# idea rather than two. See `FileSink.write` for why retrying a write is safe.
+_WRITE_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_WRITE_RETRY_ATTEMPTS", "3")))
+_WRITE_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_WRITE_RETRY_BACKOFF_S", "0.5")))
 
 
 class FileSink(ABC):
@@ -115,6 +123,14 @@ class FileSink(ABC):
         Data's overwrite data-loss (ray#62019). Local writes go via a temp file +
         atomic rename; object stores write directly (a single PUT is already atomic).
 
+        A **transient** failure is retried with jittered backoff, as the read path already
+        does. A fast pipeline feeding a directory write bursts concurrent PUTs at one key
+        prefix, which is what makes a store answer `SlowDown`/503 — a property of the moment,
+        not of the data, that used to kill a job at 99%. Safe here because a failed attempt
+        publishes nothing: the atomic writer discards the partial and the table is still in
+        memory, so the retry writes the same bytes. `write_stream` has no equivalent — its
+        batches are an iterator a retry cannot rewind.
+
         Examples:
             .. doctest::
 
@@ -138,8 +154,12 @@ class FileSink(ABC):
         fs = self._resolve(path)
         if resume and fs.exists(path):
             return WrittenFile(path=path, rows=table.num_rows, bytes=_safe_size(fs, path))
-        with fs.atomic_writer(path) as fh:
-            self._write_file(table, fh)
+
+        def _put() -> None:
+            with fs.atomic_writer(path) as fh:
+                self._write_file(table, fh)
+
+        with_retry(_put, attempts=_WRITE_RETRY_ATTEMPTS, backoff_base_s=_WRITE_RETRY_BACKOFF_S)
         return WrittenFile(path=path, rows=table.num_rows, bytes=_safe_size(fs, path))
 
     def write_stream(

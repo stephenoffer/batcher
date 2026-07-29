@@ -63,6 +63,11 @@ class FrequencyEncoder(Preprocessor):
     A category unseen at fit time encodes as `unknown_value` (0 by default), which is the
     correct answer — it was never seen, so its training frequency is zero.
 
+    **A null takes the same route** and encodes as `unknown_value`, not as null: a missing
+    value is not a category and has no frequency, so it joins the unknown bucket rather than
+    inventing one. Impute first (`SimpleImputer`) if a missing value should carry its own
+    signal, or add a `MissingIndicator` column before this step to keep it visible.
+
     Examples:
         .. doctest::
 
@@ -167,6 +172,11 @@ class RareCategoryEncoder(Preprocessor):
     one-hot column, and is the reason a fitted encoder explodes at serving time on a value
     it has never seen. Bucketing the tail solves all three at once, and the bucket itself
     becomes the natural home for an unknown category.
+
+    **A null lands in the bucket too**, taking `other_value` rather than staying null. That
+    makes a missing value a *present* one from here on, which is what the downstream encoder
+    needs but is worth knowing: add a `MissingIndicator` column before this step if the
+    difference between "rare" and "absent" carries signal for your model.
 
     Examples:
         .. doctest::

@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from batcher._internal.errors import PlanError
 from batcher.ml.converters import _worker_stride
 from batcher.ml.permutation import epoch_permutation
 from batcher.ml.streaming_sampler.ordering import _rank_positions, usable_length
@@ -70,11 +71,11 @@ class ResumableSampler:
     ) -> None:
         """Bind the sampler to a corpus size and this process's place in the world."""
         if num_samples < 0:
-            raise ValueError("num_samples must be non-negative")
+            raise PlanError("num_samples must be non-negative")
         if world_size <= 0:
-            raise ValueError("world_size must be positive")
+            raise PlanError("world_size must be positive")
         if not (0 <= rank < world_size):
-            raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+            raise PlanError(f"rank {rank} out of range for world_size {world_size}")
         self._num_samples = num_samples
         self._world_size = world_size
         self._rank = rank
@@ -235,13 +236,13 @@ class ResumableSampler:
             state: A `state_dict` from a sampler over the same corpus and order.
 
         Raises:
-            ValueError: If `state` describes a different corpus (`num_samples`) or a
+            PlanError: If `state` describes a different corpus (`num_samples`) or a
                 different ordering (`seed`/`shuffle`), which would silently re-shuffle
                 the samples this rank has already trained on.
         """
         for key in ("num_samples", "seed", "shuffle"):
             if key in state and state[key] != getattr(self, f"_{key}"):
-                raise ValueError(
+                raise PlanError(
                     f"cannot resume: state has {key}={state[key]!r} but this sampler "
                     f"has {getattr(self, f'_{key}')!r}; the sample order would differ"
                 )

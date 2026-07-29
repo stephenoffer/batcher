@@ -14,6 +14,7 @@ with a ``pip install 'batcher-engine[protobuf]'`` hint.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import IO, Any
 
 import pyarrow as pa
@@ -92,18 +93,44 @@ class ProtobufSource(FileSource):
         return protarrow.message_type_to_schema(self._message_cls.DESCRIPTOR)
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
+        """Every batch of one protobuf stream, materialized — the `read()` contract."""
+        return list(self._batches_from(fh, projection))
+
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream one protobuf file a morsel at a time rather than decoding it whole.
+
+        `_read_file` batched internally but accumulated every batch before returning, so a
+        large length-delimited stream was fully resident as Arrow before its first batch
+        reached the consumer.
+
+        Streaming is sound here for a reason the neighbouring MessagePack reader does not
+        have: this schema comes from the message **descriptor** (`_read_schema`), not from
+        inferring over the records, so where the morsel boundary falls cannot change a
+        batch's types. MessagePack must see every record before it can type any of them,
+        which is why it materializes on purpose.
+
+        Args:
+            path: The protobuf stream to read.
+            projection: Columns the scan must produce. All columns when omitted.
+
+        Yields:
+            One `RecordBatch` per morsel of messages, in stream order.
+        """
+        with self._open(path) as fh:
+            yield from self._batches_from(fh, projection)
+
+    def _batches_from(self, fh: IO[Any], projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Yield morsel-sized batches of `fh`'s messages — the one loop both paths use."""
         protarrow = _require_protarrow()
         batch_rows = active_config().execution.morsel_rows
-        out: list[pa.RecordBatch] = []
         buffer: list[Any] = []
         for message in _iter_messages(fh, self._message_cls):
             buffer.append(message)
             if len(buffer) >= batch_rows:
-                out.append(self._to_batch(protarrow, buffer, projection))
+                yield self._to_batch(protarrow, buffer, projection)
                 buffer = []
         if buffer:
-            out.append(self._to_batch(protarrow, buffer, projection))
-        return out
+            yield self._to_batch(protarrow, buffer, projection)
 
     def _to_batch(
         self, protarrow: Any, messages: list[Any], projection: list[str] | None

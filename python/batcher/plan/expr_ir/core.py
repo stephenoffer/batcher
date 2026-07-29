@@ -53,6 +53,17 @@ def _wrap(value: IntoExpr) -> Expr:
     # leaves back out; any that reach `to_ir()` elsewhere raise a clear error there.
     if isinstance(value, (Expr, AggExpr)):
         return value  # type: ignore[return-value]
+    # An unterminated CASE builder is the one non-`Expr` that users hand us on purpose, by
+    # forgetting `.otherwise(...)`. Lifting it to a literal produced `unsupported literal
+    # type: CaseBuilder`, which names an internal class and no remedy. Catch it by name to
+    # avoid importing `nodes` (which imports this module).
+    if type(value).__name__ == "CaseBuilder":
+        raise PlanError(
+            "when(...).then(...) is an unfinished CASE builder, not an expression: it needs "
+            "a terminating .otherwise(...). SQL's bare `CASE WHEN ... END` yields NULL, which "
+            "has no literal spelling here — give .otherwise() an explicit sentinel and turn "
+            "it into a null with bt.nullif(expr, sentinel) if that is what you want."
+        )
     return Lit(value)
 
 

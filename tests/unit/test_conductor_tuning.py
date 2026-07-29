@@ -31,7 +31,10 @@ def test_resolve_adaptive_learned_router_cold_and_warm(monkeypatch):
 
     left = bt.from_arrow(pa.table({"k": list(range(20)), "x": list(range(20))}))
     right = bt.from_arrow(pa.table({"k": [1, 2], "w": [9, 8]}))
-    ds = left.join(right, on="k")
+    third = bt.from_arrow(pa.table({"k": [1, 2], "z": [5, 6]}))
+    # Three tables, so the top join has a *breaker-produced* operand whose size is only an
+    # estimate — the precondition for staging to be a candidate at all (see below).
+    ds = left.join(right, on="k").join(third, on="k")
     hub = _hub()
     # Small inputs: the size floor refuses staging outright, before anything learned.
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is False
@@ -43,6 +46,33 @@ def test_resolve_adaptive_learned_router_cold_and_warm(monkeypatch):
         record_adaptive_route(hub, sig, "staged", 10.0)
         record_adaptive_route(hub, sig, "one_shot", 1000.0)
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is True
+
+
+def test_the_staged_arm_is_not_offered_when_it_could_only_lose(monkeypatch):
+    """A route bandit may only range over arms that could win.
+
+    Staging exists to replace a *guessed* operand size with a measured one. When every join
+    operand is already confidently sized, staging measures nothing the optimizer does not
+    already know and can only add its own materialization — so it is withheld, exactly as
+    `sort_merge` is withheld from a join whose build fits memory. Without this, UCB1 keeps
+    giving the arm a turn and re-paying a cost it can never recover: measured on
+    `lineitem ⋈ orders` at TPC-H sf10 (both scans EXACT-sized), the converged one-shot route
+    runs 132 ms and the periodic staged exploration 283-470 ms.
+    """
+    from batcher.api.adaptive import gating, resolve_adaptive
+    from batcher.kyber.learned_tuning import record_adaptive_route
+
+    left = bt.from_arrow(pa.table({"k": list(range(20)), "x": list(range(20))}))
+    right = bt.from_arrow(pa.table({"k": [1, 2], "w": [9, 8]}))
+    ds = left.join(right, on="k")  # both operands are scans: exact sizes, nothing to learn
+    hub = _hub()
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
+    sig = plan_signature(ds._plan)
+    # A history that would otherwise be decisive for staging.
+    for _ in range(4):
+        record_adaptive_route(hub, sig, "staged", 10.0)
+        record_adaptive_route(hub, sig, "one_shot", 1000.0)
+    assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is False
 
 
 def test_the_size_floor_binds_the_learned_router_too(monkeypatch):
@@ -57,7 +87,10 @@ def test_the_size_floor_binds_the_learned_router_too(monkeypatch):
 
     left = bt.from_arrow(pa.table({"k": list(range(20)), "x": list(range(20))}))
     right = bt.from_arrow(pa.table({"k": [1, 2], "w": [9, 8]}))
-    ds = left.join(right, on="k")
+    third = bt.from_arrow(pa.table({"k": [1, 2], "z": [5, 6]}))
+    # Three tables, so staging is a candidate at all and the floor is the only thing under
+    # test here (see `test_the_staged_arm_is_not_offered_when_it_could_only_lose`).
+    ds = left.join(right, on="k").join(third, on="k")
     hub = _hub()
     sig = plan_signature(ds._plan)
     for _ in range(4):

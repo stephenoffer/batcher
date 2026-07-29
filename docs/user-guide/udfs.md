@@ -115,6 +115,26 @@ needs to happen inside the worker. That is the case for anything holding a CUDA 
 engine warns you if a GPU stage gets a bare function, because that is the single most
 expensive mistake in this API. See [inference](../ml/inference.md).
 
+A model class almost never takes zero arguments, so `fn_constructor_args` and
+`fn_constructor_kwargs` supply them. The class is still built once per worker, so this is
+not the same as passing an instance:
+
+```python
+print(ds.map_batches(
+    Splitter,
+    fn_constructor_args=(",",),
+    output_columns=["text", "price", "qty", "parts"],
+).select("parts").to_pydict())
+# {'parts': [2, 1, 3]}
+```
+
+Use `fn_args` and `fn_kwargs` for arguments that vary per call rather than per worker.
+They arrive after the batch, as `fn(batch, *fn_args, **fn_kwargs)`.
+
+If the class holds a resource that must be released, give it a `close` method. Batcher
+calls it when the worker is done with the model, which is where a GPU allocation or an
+HTTP session goes back.
+
 ## batch_format: numpy, pandas, torch
 
 `batch_format` converts around the call only. The engine boundary stays Arrow.
@@ -177,6 +197,114 @@ print(discount(ds).select("price", "discounted").to_pydict())
 ```
 
 `@bt.udf(per_row=True)` wraps a `fn(row) -> row` callback the same way.
+
+A decorated function stays an ordinary Python function. Call it on a batch to test it
+without building a dataset, pass it to `map_batches` by hand, or reuse it inside another
+UDF:
+
+```python
+import pyarrow as pa
+
+print(discount(pa.record_batch({"price": [10.0]})).column("discounted").to_pylist())
+# [9.0]
+```
+
+Use `options` to run the same function at a second scale rather than defining it twice.
+The original is unchanged, so a local smoke test and a cluster run share one definition:
+
+```python
+big = discount.options(batch_size=4096)
+print(big(ds).select("discounted").to_pydict())
+# {'discounted': [9.0, 18.0, 27.0]}
+```
+
+## What your function may return
+
+The default `batch_format="pyarrow"` hands your function a `RecordBatch`. It may return
+any of the following, so a model wrapper does not have to convert its framework's output
+before Batcher sees it:
+
+| Return value | Use it when |
+|---|---|
+| `pyarrow.RecordBatch` or `Table` | The function already works in Arrow. |
+| `{"col": values}` dict | You are building columns from scratch, including NumPy arrays. |
+| `pandas.DataFrame` or `polars.DataFrame` | The transform is easier to write in a frame library. |
+| A list or generator of any of the above | One input batch expands into several output batches. |
+
+The generator form is what a row-expanding stage wants, such as decoding a video into
+frames or fanning one prompt out into several completions. Yield a batch per unit of work
+instead of concatenating everything first:
+
+```python
+def explode_chars(batch):
+    for text in batch.column("text").to_pylist():
+        yield {"ch": list(text)}
+
+
+print(bt.from_pydict({"text": ["ab", "cd"]}).map_batches(explode_chars).to_pydict())
+# {'ch': ['a', 'b', 'c', 'd']}
+```
+
+Returning a list of *row* dicts is rejected, because that is `ds.ml.flat_map`, which
+declares the row-at-a-time cost rather than hiding it.
+
+## map_groups: one call per group
+
+`map_groups` hands your function every row of one group and no row of another. It is the
+Batcher spelling of pandas `groupby().apply()`, Polars `group_by().map_groups()`, and Spark
+`applyInPandas`, and it is what per-entity work needs: a user's session sequence, a device's
+time series, a document's chunks.
+
+```python
+sales = bt.from_pydict({
+    "region": ["west", "east", "west", "east"],
+    "amount": [10.0, 5.0, 7.0, 3.0],
+})
+
+
+def spread(group):  # group is a RecordBatch of one region's rows
+    amounts = group.column("amount").to_pylist()
+    return {
+        "region": [group.column("region")[0].as_py()],
+        "spread": [max(amounts) - min(amounts)],
+    }
+
+
+print(sales.group_by("region")
+      .map_groups(spread, output_columns=["region", "spread"])
+      .sort("region").to_pydict())
+# {'region': ['east', 'west'], 'spread': [2.0, 3.0]}
+```
+
+Pass `batch_format="pandas"` to receive each group as a `DataFrame`, which is the
+`applyInPandas` shape. The conversion happens per group, so the frame holds the group's rows.
+
+:::{warning}
+Do not call `map_batches` straight after `group_by`. It sees whatever batches the engine
+produces, and a group is not confined to one of them, so your function runs on *fragments*
+and returns a wrong answer rather than an error. Measured over 50,000 rows and 20 keys,
+every one of the 20 keys spanned more than one batch.
+:::
+
+Two cases do not need a callback at all. A plain reduction is `.agg(...)`, which runs in
+Rust. Broadcasting a group statistic back onto every row is a window:
+
+```python
+print(sales.window(partition_by=["region"], functions={"total": ("sum", "amount")})
+      .sort("region", "amount").to_pydict()["total"])
+# [8.0, 8.0, 17.0, 17.0]
+```
+
+Prefer both of those when they fit. `map_groups` materializes one group at a time, so a
+single key holding hundreds of millions of rows needs a reduction rather than a callback.
+Row order within a group is not guaranteed either, so sort inside the function when it
+matters.
+
+:::{note}
+`map_groups` builds an aggregation followed by a `map_batches`, so whether
+`collect(distributed=True)` accepts the plan is the same question as for
+`ds.group_by("k").agg(...).map_batches(fn)`. Check it on your plan before relying on it.
+:::
 
 ## Tolerating dirty data
 

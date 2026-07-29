@@ -13,10 +13,11 @@ models it most resembles in `batcher.ml.linear`.
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError
-from batcher.ml._estimator import linear_score, require_fitted
+from batcher._internal.errors import DataWarning, PlanError
+from batcher.ml._estimator import linear_score, require_fitted, require_rows
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -25,6 +26,45 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["GammaRegressor", "PoissonRegressor", "TweedieRegressor"]
+
+# How many times a diverging Fisher-scoring step is halved before the fit gives up. Eight
+# halvings shrink the step to 1/256 of the Newton direction, which is far past the point a
+# genuinely descending step would be found.
+_MAX_STEP_HALVINGS = 8
+
+
+def _safe_step(matrix, rhs, beta, alpha: float):
+    """One Fisher-scoring step, damped so a diverging fit fails loudly instead of returning NaN.
+
+    IRLS under a log link is not globally convergent: with no regularization the linear
+    predictor can grow until ``exp(eta)`` overflows, and every subsequent aggregate is then
+    NaN. Unguarded, the loop burns its whole iteration budget and returns NaN coefficients,
+    which `predict` happily turns into a column of NaN — a wrong answer that never raises.
+
+    Damping the step keeps the ordinary case converging; the explicit non-finite check turns
+    the pathological case into a typed error naming the knob that fixes it.
+    """
+    import numpy as np
+
+    if not (np.all(np.isfinite(matrix)) and np.all(np.isfinite(rhs))):
+        raise PlanError(
+            "GLM fit diverged: the weighted normal equations are no longer finite. The linear "
+            "predictor overflowed `exp`, usually because the target spans many orders of "
+            f"magnitude at alpha={alpha}. Raise `alpha` (1.0 is a safe starting point) or "
+            "rescale the features."
+        )
+    step = np.linalg.solve(matrix + 1e-12 * np.eye(matrix.shape[0]), rhs) - beta
+    for halving in range(_MAX_STEP_HALVINGS + 1):
+        candidate = beta + step / (2.0**halving)
+        # A step is usable only if it stays finite *and* keeps `exp(eta)` in range, which is
+        # what the magnitude bound below stands in for.
+        if np.all(np.isfinite(candidate)) and np.max(np.abs(candidate)) < 700.0:
+            return candidate
+    raise PlanError(
+        "GLM fit diverged: no damped Fisher-scoring step kept the coefficients finite after "
+        f"{_MAX_STEP_HALVINGS} halvings at alpha={alpha}. Raise `alpha` (1.0 is a safe "
+        "starting point) or rescale the features."
+    )
 
 
 class TweedieRegressor:
@@ -60,6 +100,7 @@ class TweedieRegressor:
     __slots__ = (
         "alpha",
         "coef_",
+        "converged_",
         "features",
         "intercept_",
         "max_iter",
@@ -97,6 +138,7 @@ class TweedieRegressor:
         self.coef_: list[float] = []
         self.intercept_: float = 0.0
         self.n_iter_: int = 0
+        self.converged_: bool = False
 
     def _eta(self, coefficients: list[float], intercept: float):
         """The linear predictor expression ``intercept + beta . x``."""
@@ -134,9 +176,11 @@ class TweedieRegressor:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        self.converged_ = False
         terms = [lit(1.0), *[col(name) for name in self.features]]
         m = len(terms)
         n = ds.count()
+        require_rows(self, n, m, because="IRLS needs one row per fitted term")
         penalty = self.alpha * n
         beta = np.zeros(m)
         for iteration in range(self.max_iter):
@@ -158,12 +202,21 @@ class TweedieRegressor:
                     value = float(row.column(f"a{j}_{k}")[0].as_py())
                     matrix[j, k] = matrix[k, j] = value
             matrix[1:, 1:] += penalty * np.eye(m - 1)
-            new_beta = np.linalg.solve(matrix + 1e-12 * np.eye(m), rhs)
+            new_beta = _safe_step(matrix, rhs, beta, self.alpha)
             self.n_iter_ = iteration + 1
             if np.max(np.abs(new_beta - beta)) < self.tol:
                 beta = new_beta
+                self.converged_ = True
                 break
             beta = new_beta
+        if not self.converged_:
+            warnings.warn(
+                f"{type(self).__name__} did not converge in {self.max_iter} iterations at "
+                f"alpha={self.alpha}; the coefficients are the last iterate, not a fitted "
+                "optimum. Raise `max_iter`, raise `alpha`, or rescale the features.",
+                DataWarning,
+                stacklevel=2,
+            )
         self.intercept_ = float(beta[0])
         self.coef_ = [float(c) for c in beta[1:]]
         return self

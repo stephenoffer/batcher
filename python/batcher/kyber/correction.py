@@ -1,4 +1,4 @@
-"""Turning a window of measured q-errors into one cardinality-correction factor.
+"""What a window of measured q-errors means: a correction factor, and whether to trust it.
 
 `learning` collects, per plan signature, the log ratio `log(actual / estimated)` of every
 execution Core has measured. This module answers the question that history poses: given
@@ -17,8 +17,15 @@ actually support, and it clips a single wild run before it can move anything.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
-__all__ = ["correction_factor"]
+from batcher._internal.logging import note_suppressed
+from batcher.config import active_config
+
+if TYPE_CHECKING:
+    from batcher.metadata import MetadataHub
+
+__all__ = ["correction_factor", "estimate_is_reliable"]
 
 # Prior standard deviation of the true log-correction, in nats. `ln 2` says: before seeing
 # any evidence, a signature's structural estimate is expected to be within about a factor of
@@ -103,3 +110,55 @@ def _recency_weights(n: int) -> list[float]:
     """Exponentially decaying weights for `n` oldest-first samples (newest weighs 1.0)."""
     half_life = max(1.0, _HALF_LIFE_FRACTION * n)
     return [0.5 ** ((n - 1 - i) / half_life) for i in range(n)]
+
+
+def estimate_is_reliable(hub: MetadataHub | None, signature: str) -> bool:
+    """Whether this shape's structural estimate has *measurably* held up in past runs.
+
+    Provenance answers "where did this number come from", which is a statement about the
+    estimator's inputs and not about whether it was right. The two diverge, and the gap
+    has a cost: a shape whose operands are estimated to within a few percent of actual can
+    still carry `Provenance.DEFAULT` forever, because nothing on the one-shot path ever
+    records an intermediate operator's measured cardinality against it. A caller that
+    treats the label as evidence then keeps paying for a correction that has nothing left
+    to correct.
+
+    This reads the evidence instead. Core already records, per operator signature, the rows
+    it produced alongside the rows Kyber predicted, and `_q_error_samples` folds those into
+    a bounded window of `log(actual / estimated)`. A signature is *reliable* when it has at
+    least `cardinality_correction_min_samples` observations and **every one of them** sits
+    inside `optimizer.reoptimize_error`.
+
+    The threshold is that knob rather than a new one on purpose. `reoptimize_error` is the
+    q-error at which the adaptive loop re-plans; a history that never crossed it is a
+    history in which stage-boundary re-optimization would never have fired. Asking "would
+    it have fired?" is exactly the question a gate deciding whether to pay for staging
+    should ask.
+
+    The *maximum* is used rather than the mean because the mean is the wrong statistic for
+    a one-sided safety question. Alternating $4\\times$ over- and under-estimates average to
+    1.0 and would read as flawless, while being precisely the shape that a stage boundary
+    exists to correct.
+
+    Best-effort: a cold hub, a missing signature, or any failure yields `False`, which is
+    the unlearned answer and preserves the caller's prior behavior exactly.
+    """
+    if hub is None or not signature:
+        return False
+    try:
+        cfg = active_config().optimizer
+        min_samples = cfg.cardinality_correction_min_samples
+        window = cfg.cardinality_correction_window
+        tolerance = float(cfg.reoptimize_error)
+        if min_samples <= 0 or window <= 0 or tolerance <= 1.0:
+            return False
+        from batcher.kyber.learning import q_error_window
+
+        samples = q_error_window(hub, signature, window)
+        if samples is None or len(samples) < min_samples:
+            return False
+        bound = math.log(tolerance)
+        return all(abs(log_q) <= bound for log_q in samples)
+    except Exception as exc:  # pragma: no cover - a learned read must never break planning
+        note_suppressed("kyber", "read q-error reliability", exc)
+        return False

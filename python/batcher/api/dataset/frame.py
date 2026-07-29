@@ -247,6 +247,34 @@ def _reject_sliding_window_key(alias: str, expr: Expr) -> None:
         )
 
 
+def _multiset_sortable(schema: pa.Schema) -> bool:
+    """Whether sorting by every column is a sound way to compare two relations as multisets.
+
+    `Dataset.equals(ordered=False)` asks whether two results hold the same rows in any
+    order. Sorting both by all columns answers that in compiled Arrow code — but only for
+    types where the sort's ordering and Arrow's equality agree on which values are the
+    same value. Three families where they do not:
+
+    - **Floating point.** Arrow's equality treats ``-0.0 == 0.0`` and ``NaN != NaN``,
+      neither of which the row-wise comparison does, so the two spellings disagree in
+      *both* directions on exactly the ``-0.0``/``NaN`` edge cases the engine is
+      elsewhere careful about.
+    - **Nested types** (list, map). `sort_indices` raises on them outright.
+    - **Dictionary-encoded** columns. `sort_indices` is not implemented for them.
+
+    Anything not provably in the clear falls back to the row-wise comparison, which is
+    slower but is the behavior that shipped.
+    """
+    return all(
+        not (
+            pa.types.is_floating(field.type)
+            or pa.types.is_nested(field.type)
+            or pa.types.is_dictionary(field.type)
+        )
+        for field in schema
+    )
+
+
 class Dataset:
     """A lazy, immutable relation — the fluent entry point to the engine.
 
@@ -1111,11 +1139,19 @@ class Dataset:
         *,
         batch_size: int | None = None,
         input_columns: list[str] | None = None,
+        preserves_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
-        concurrency: int | None = None,
+        concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
+        fn_args: tuple | None = None,
+        fn_kwargs: dict | None = None,
+        fn_constructor_args: tuple | None = None,
+        fn_constructor_kwargs: dict | None = None,
+        accelerator_type: str | None = None,
+        resources: dict[str, float] | None = None,
+        model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
         timeout: float = 0.0,
@@ -1126,7 +1162,9 @@ class Dataset:
     ) -> Dataset:
         """Apply a Python function to each Arrow batch (sugar for `ds.ml.map_batches`).
 
-        Kept top-level for the familiar spelling; see `ds.ml` for the full ML surface.
+        Kept top-level for the familiar spelling, and it now forwards every option
+        `ds.ml.map_batches` accepts, so reaching the accessor is a matter of taste rather
+        than a requirement. See `ds.ml` for the fuller explanation of each.
 
         `num_workers` defaults to ``"auto"`` — the per-batch calls fan across all
         local cores, so a batch transform is parallel by default rather than
@@ -1140,11 +1178,22 @@ class Dataset:
             input_columns: The columns `fn` reads, letting projection pushdown prune the
                 scan to just those; ``None`` keeps every column alive. Omitting one `fn`
                 does read is a correctness bug — it gets pruned out from under it.
+            preserves_columns: The columns `fn` returns unchanged, which lets a later
+                `filter` on them run *below* the UDF so the model scores fewer rows.
+                Naming a column `fn` rewrites changes the result.
             output_columns: The output column names, when `fn` reshapes the schema.
             num_workers: Worker fan-out; ``"auto"`` spreads across local cores.
             num_gpus: GPUs reserved per worker.
-            concurrency: Maximum concurrent workers; ``None`` lets the engine choose.
+            concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: The batch type passed to `fn` (``"pyarrow"`` by default).
+            fn_args: Positional arguments appended to every call: ``fn(batch, *fn_args)``.
+            fn_kwargs: Keyword arguments forwarded to every ``fn(batch, ...)`` call.
+            fn_constructor_args: Positional arguments for a class `fn`'s one-per-worker
+                construction, such as a checkpoint path.
+            fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
+            accelerator_type: Pin actors to a device model (e.g. ``"NVIDIA_A100"``).
+            resources: Custom Ray resources per worker, e.g. ``{"TPU": 4}``.
+            model_memory_gb: The model's footprint, for memory budgeting.
             multiprocessing: Use processes instead of threads for a CPU-bound `fn`.
             max_errored_rows: How many per-row errors to tolerate before failing.
             timeout: Wall-clock ceiling (seconds) for one `fn` call; 0 = no timeout.
@@ -1171,11 +1220,19 @@ class Dataset:
             fn,
             batch_size=batch_size,
             input_columns=input_columns,
+            preserves_columns=preserves_columns,
             output_columns=output_columns,
             num_workers=num_workers,
             num_gpus=num_gpus,
             concurrency=concurrency,
             batch_format=batch_format,
+            fn_args=fn_args,
+            fn_kwargs=fn_kwargs,
+            fn_constructor_args=fn_constructor_args,
+            fn_constructor_kwargs=fn_constructor_kwargs,
+            accelerator_type=accelerator_type,
+            resources=resources,
+            model_memory_gb=model_memory_gb,
             multiprocessing=multiprocessing,
             max_errored_rows=max_errored_rows,
             timeout=timeout,
@@ -2952,6 +3009,16 @@ class Dataset:
             return False
         if ordered:
             return left.equals(right)
+        if left.num_rows != right.num_rows:
+            return False
+        # Two multisets are equal iff sorting both by every column yields identical
+        # relations, and Arrow sorts in compiled code over its own buffers. The row-wise
+        # spelling this replaces (`sorted(map(repr, table.to_pylist()))`) built a Python
+        # dict and a string per row on each side — a per-row touch in the control plane,
+        # and 33x slower on a million rows.
+        if _multiset_sortable(left.schema):
+            keys = [(name, "ascending") for name in left.schema.names]
+            return left.sort_by(keys).equals(right.sort_by(keys))
         return sorted(map(repr, left.to_pylist())) == sorted(map(repr, right.to_pylist()))
 
     # --- interoperability protocols ---------------------------------------------------

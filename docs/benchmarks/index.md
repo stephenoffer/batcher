@@ -32,7 +32,7 @@ Hardware, correctness gating, and the commands to reproduce every number.
 
 ## The short version
 
-Batcher sweeps the classical analytics suites against DuckDB reading the same Arrow, winning 22 of 22 TPC-H, 42 of 43 ClickBench, and 5 of 5 JSON. The same engine carries the modern half of the workload: AI, multimodal, and last-mile training ingest, where it runs real models on 8xT4 with the GPU held above 80% utilization on every family measured.
+Batcher sweeps the classical analytics suites against DuckDB reading the same Arrow, winning 22 of 22 TPC-H, 42 of 43 ClickBench, and 5 of 5 JSON. Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
 | Workload | Measured |
 |---|---|
@@ -59,7 +59,7 @@ Those rows were not all measured on the same machine, because the workload famil
 
 **A control plane that answers what it can without scanning.** `count()` after a transform chain returns in 0.05 ms from Parquet footer statistics and plan-level reasoning. Seven ClickBench queries return in about 0.2 ms for the same reason. Those are excluded from the ranges above, so the headline reflects execution rather than planning.
 
-**A device that stays fed.** Stage-overlapped streaming runs the CPU decode of morsel *k+1* while the GPU forward of morsel *k* is still in flight, which lifted a two-stage ResNet-50 pipeline from 942 to 2,504 img/s and GPU utilization from about 30% to 81%. Session-warm pools then load a model once per session rather than once per job, which is worth about 2x on iterative inference and far more when the model is large.
+**Stage overlap on the GPU path.** Stage-overlapped streaming runs the CPU decode of morsel *k+1* while the GPU forward of morsel *k* is still in flight, which lifted a two-stage ResNet-50 pipeline from 942 to 2,504 img/s and GPU utilization from about 30% to 81%. Session-warm pools then load a model once per session rather than once per job, which is worth about 2x on iterative inference and far more when the model is large.
 
 **Native, in-process I/O.** Reading 20M rows across 64 Parquet files and summing a column takes 72 ms, CSV 98 ms, JSON 302 ms. Files decode concurrently in-process, and Parquet, CSV, and JSON decode all release the GIL.
 

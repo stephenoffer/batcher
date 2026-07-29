@@ -89,6 +89,7 @@ _ASCII = plain_text_fold("ascii", lambda s: ord(s[0]) if s else None)
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_OCTET_LENGTH,
+    expr_matches=(StrFunc,),
 )
 def fold_octet_length_of_literal(
     node: Filter | Project, _ctx: OptimizerContext
@@ -104,6 +105,7 @@ def fold_octet_length_of_literal(
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_BIT_LENGTH,
+    expr_matches=(StrFunc,),
 )
 def fold_bit_length_of_literal(
     node: Filter | Project, _ctx: OptimizerContext
@@ -113,7 +115,13 @@ def fold_bit_length_of_literal(
     return rewrite_node(node, _BIT_LENGTH)
 
 
-@rule(name="fold_ascii_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_ASCII)
+@rule(
+    name="fold_ascii_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_ASCII,
+    expr_matches=(StrFunc,),
+)
 def fold_ascii_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`ascii('abc') -> 97`, the code point of the first character. Declines on the
     empty string, where there is no first character and the engine's answer is not
@@ -132,7 +140,13 @@ _CRC32 = plain_text_fold("crc32", lambda s: zlib.crc32(s.encode()))
 _HEX = plain_text_fold("hex", lambda s: s.encode().hex().upper())
 
 
-@rule(name="fold_md5_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_MD5)
+@rule(
+    name="fold_md5_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_MD5,
+    expr_matches=(StrFunc,),
+)
 def fold_md5_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`md5('abc')` folds to its hex digest. A digest of a constant is a constant, and
     MD5 has exactly one answer for a given byte string -- verified against `hashlib`.
@@ -140,13 +154,25 @@ def fold_md5_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> Logic
     return rewrite_node(node, _MD5)
 
 
-@rule(name="fold_sha1_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_SHA1)
+@rule(
+    name="fold_sha1_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_SHA1,
+    expr_matches=(StrFunc,),
+)
 def fold_sha1_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`sha1('abc')` folds to its hex digest, verified against `hashlib`."""
     return rewrite_node(node, _SHA1)
 
 
-@rule(name="fold_sha256_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_SHA256)
+@rule(
+    name="fold_sha256_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_SHA256,
+    expr_matches=(StrFunc,),
+)
 def fold_sha256_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`sha256('abc')` folds to its hex digest, verified against `hashlib`. The most
     valuable member of the group, since SHA-256 is the most expensive of them per
@@ -154,14 +180,26 @@ def fold_sha256_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> Lo
     return rewrite_node(node, _SHA256)
 
 
-@rule(name="fold_crc32_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_CRC32)
+@rule(
+    name="fold_crc32_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_CRC32,
+    expr_matches=(StrFunc,),
+)
 def fold_crc32_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`crc32('abc') -> 891568578`. CRC-32 is fully specified by its polynomial, so
     `zlib.crc32` and the engine agree by construction -- checked, not assumed."""
     return rewrite_node(node, _CRC32)
 
 
-@rule(name="fold_hex_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_HEX)
+@rule(
+    name="fold_hex_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_HEX,
+    expr_matches=(StrFunc,),
+)
 def fold_hex_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`hex('abc') -> '616263'`, the uppercase hex of the UTF-8 bytes.
 
@@ -211,7 +249,13 @@ _REVERSE = plain_text_fold("reverse", lambda s: s[::-1], ascii_only=True)
 _INITCAP = plain_text_fold("initcap", lambda s: s.title(), ascii_only=True)
 
 
-@rule(name="fold_repeat_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_REPEAT)
+@rule(
+    name="fold_repeat_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_REPEAT,
+    expr_matches=(StrFunc,),
+)
 def fold_repeat_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`repeat('ab', 3) -> 'ababab'`.
 
@@ -223,7 +267,13 @@ def fold_repeat_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> Lo
     return rewrite_node(node, _REPEAT)
 
 
-@rule(name="fold_left_pad_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_LPAD)
+@rule(
+    name="fold_left_pad_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_LPAD,
+    expr_matches=(StrFunc,),
+)
 def fold_left_pad_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`lpad('abc', 5) -> '  abc'`. Width counts characters on both sides, so Python's
     `str.rjust` matches. Restricted to a single-character fill and to ASCII input,
@@ -232,7 +282,11 @@ def fold_left_pad_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> 
 
 
 @rule(
-    name="fold_right_pad_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_RPAD
+    name="fold_right_pad_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_RPAD,
+    expr_matches=(StrFunc,),
 )
 def fold_right_pad_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`rpad('abc', 5) -> 'abc  '`, the `lpad` mirror with the same guards."""
@@ -240,7 +294,11 @@ def fold_right_pad_of_literal(node: Filter | Project, _ctx: OptimizerContext) ->
 
 
 @rule(
-    name="fold_reverse_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_REVERSE
+    name="fold_reverse_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_REVERSE,
+    expr_matches=(StrFunc,),
 )
 def fold_reverse_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`reverse('abc') -> 'cba'`. ASCII-guarded: both engines reverse code points, but
@@ -250,7 +308,11 @@ def fold_reverse_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> L
 
 
 @rule(
-    name="fold_initcap_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_INITCAP
+    name="fold_initcap_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_INITCAP,
+    expr_matches=(StrFunc,),
 )
 def fold_initcap_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`initcap('hello world') -> 'Hello World'`. ASCII-guarded, because title-casing
@@ -278,7 +340,13 @@ _LTRIM = fold("l_trim", _trim(str.lstrip))
 _RTRIM = fold("r_trim", _trim(str.rstrip))
 
 
-@rule(name="fold_trim_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_TRIM)
+@rule(
+    name="fold_trim_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_TRIM,
+    expr_matches=(StrFunc,),
+)
 def fold_trim_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`trim('  ab  ') -> 'ab'`.
 
@@ -291,7 +359,11 @@ def fold_trim_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> Logi
 
 
 @rule(
-    name="fold_left_trim_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_LTRIM
+    name="fold_left_trim_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_LTRIM,
+    expr_matches=(StrFunc,),
 )
 def fold_left_trim_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`l_trim('  ab  ') -> 'ab  '`, with the same two guards as `trim`."""
@@ -303,6 +375,7 @@ def fold_left_trim_of_literal(node: Filter | Project, _ctx: OptimizerContext) ->
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_RTRIM,
+    expr_matches=(StrFunc,),
 )
 def fold_right_trim_of_literal(
     node: Filter | Project, _ctx: OptimizerContext

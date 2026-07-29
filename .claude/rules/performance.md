@@ -7,7 +7,7 @@ the systems we claim to beat.
 
 ## The competitive mandate
 
-We benchmark against DuckDB, Polars, Spark, and Ray Data — not against our own
+We benchmark against DuckDB, Polars, and Spark — not against our own
 last commit alone.
 
 - Run `python benchmarks/run.py` (default 10M rows; pass a row count for other
@@ -21,7 +21,7 @@ last commit alone.
 - For distributed/large-scale changes you can't run locally at PB scale, reason
   about scaling explicitly: does the mergeable algebra keep per-node memory bounded?
   does the shuffle stay credit-controlled? Compare the *approach* to Spark
-  (stage-boundary AQE) and Ray Data (no optimizer).
+  (stage-boundary AQE).
 
 ## How we win (don't undermine these)
 
@@ -64,7 +64,6 @@ last commit alone.
 |-----------|-------------------------------------|-------------------------------------------|
 | DuckDB    | static optimization, single-node    | intra-query adaptive re-opt; distributed  |
 | Spark AQE | adapts only at stage boundaries     | continuous re-opt at pipeline breakers    |
-| Ray Data  | no real optimizer                   | Kyber + Carbonite + learned metadata      |
 | Polars    | single-backend, single-node         | mergeable algebra → distributed; adaptive |
 
 Use these as the bar to clear, and verify the claim with `benchmarks/` before

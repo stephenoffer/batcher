@@ -34,6 +34,7 @@ __all__ = [
     "generation",
     "is_material_change",
     "load_learned_stats",
+    "q_error_window",
     "qualify",
     "record_column_stats",
     "record_execution",
@@ -274,6 +275,16 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
             out[sig] = factor
     _CORRECTION_CACHE[hub] = (hub.version, fingerprint, out)
     return out
+
+
+def q_error_window(hub: MetadataHub, signature: str, window: int) -> deque[float] | None:
+    """One signature's bounded window of `log(actual / estimated)`, or `None` if untracked.
+
+    The narrow read `kyber.correction` needs to judge whether a shape's estimate has held
+    up. Kept here because this module owns the incremental fold; exposed rather than
+    reaching into `_q_error_samples` so the fold's caching contract stays internal.
+    """
+    return _q_error_samples(hub, window).get(signature)
 
 
 def _q_error_samples(hub: MetadataHub, window: int) -> dict[str, deque[float]]:

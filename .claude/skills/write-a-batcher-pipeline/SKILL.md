@@ -286,6 +286,6 @@ measured per-operator rows/time/bytes/spill after a run, `ds.schema`/`ds.columns
   window-functions,udfs,reading-data,writing-data,streaming,best-practices,explain-plans,
   performance,troubleshooting}.md`.
 - Skills: `migrate-from-duckdb-sql` (SQL workloads); `migrate-from-spark`,
-  `migrate-from-polars-or-pandas`, `migrate-from-ray-data`, `migrate-from-daft` (porting an
+  `migrate-from-polars-or-pandas`, `migrate-from-daft` (porting an
   existing script); `run-a-distributed-job`; `optimize-a-slow-query`;
   `debug-a-batcher-query`; `build-an-ml-pipeline` (inference/embeddings/multimodal).

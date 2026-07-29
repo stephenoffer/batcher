@@ -171,3 +171,79 @@ def test_read_does_not_retry_a_corrupt_file(tmp_path, monkeypatch) -> None:
     assert sum(b.num_rows for b in src.read()) == 0
     assert src.corrupt_files(), "the corrupt file is still reported"
     assert len(calls) == 1, "a corrupt file must not be retried"
+
+
+# ---- the write side -------------------------------------------------------
+# Retry covered the read path only. An object store answers a burst of concurrent PUTs at
+# one key prefix with `SlowDown`/503 — which is exactly the shape of a directory write from
+# a fast pipeline — and a throttled PUT killed a job that had already written 99% of its
+# output. Retrying is safe here specifically because a failed attempt publishes nothing: the
+# atomic writer discards the partial and the table is still in memory.
+
+
+def _flaky_sink(failures: int, message: str):
+    """A ParquetSink whose first `failures` writes raise `message`."""
+    from batcher.io.formats.structured.parquet.sink import ParquetSink
+
+    class _Flaky(ParquetSink):
+        attempts = 0
+
+        def _write_file(self, table, fh):
+            type(self).attempts += 1
+            if type(self).attempts <= failures:
+                raise OSError(message)
+            return super()._write_file(table, fh)
+
+    return _Flaky
+
+
+def test_a_throttled_write_is_retried(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_transient.time, "sleep", lambda _s: None)
+    sink = _flaky_sink(2, "SlowDown: please reduce your request rate")()
+    out = str(tmp_path / "part.parquet")
+    written = sink.write(pa.table({"x": [1, 2, 3]}), out)
+    assert written.rows == 3
+    assert type(sink).attempts == 3, "expected two failures then a success"
+    # The retry must have produced real, readable output — not merely stopped raising.
+    assert pq.read_table(out).num_rows == 3
+
+
+def test_a_permanent_write_failure_is_not_retried(tmp_path, monkeypatch) -> None:
+    """Retrying an access-denied write only delays a clear auth failure behind backoffs."""
+    monkeypatch.setattr(_transient.time, "sleep", lambda _s: None)
+    sink = _flaky_sink(99, "AccessDenied: not authorized")()
+    with pytest.raises(OSError, match="AccessDenied"):
+        sink.write(pa.table({"x": [1]}), str(tmp_path / "p.parquet"))
+    assert type(sink).attempts == 1
+
+
+def test_a_write_that_never_recovers_reraises(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_transient.time, "sleep", lambda _s: None)
+    sink = _flaky_sink(99, "503 server error")()
+    with pytest.raises(OSError, match="503"):
+        sink.write(pa.table({"x": [1]}), str(tmp_path / "p.parquet"))
+    assert type(sink).attempts > 1, "a transient failure must have been retried"
+
+
+def test_a_retry_after_a_partial_write_does_not_duplicate_rows(tmp_path, monkeypatch) -> None:
+    """The guides record "write operations and task retries can produce duplicates" as a
+    live failure. Retrying a write is only safe because a failed attempt publishes nothing —
+    so the dangerous case is a write that succeeds in *writing bytes* and then fails, which
+    is exactly what a throttle mid-upload looks like. The atomic writer must discard it.
+    """
+    from batcher.io.formats.structured.parquet.sink import ParquetSink
+
+    monkeypatch.setattr(_transient.time, "sleep", lambda _s: None)
+    attempts = {"n": 0}
+
+    class _PartialThenThrottled(ParquetSink):
+        def _write_file(self, table, fh):
+            attempts["n"] += 1
+            super()._write_file(table, fh)  # bytes really are written...
+            if attempts["n"] == 1:
+                raise OSError("SlowDown: throttled after writing")  # ...then it fails
+
+    out = str(tmp_path / "part.parquet")
+    _PartialThenThrottled().write(pa.table({"x": [1, 2, 3]}), out)
+    assert attempts["n"] == 2, "expected one partial failure then a retry"
+    assert pq.read_table(out).num_rows == 3, "the partial write must not have been published"

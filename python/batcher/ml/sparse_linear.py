@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import linear_score, require_fitted
+from batcher.ml._estimator import linear_score, require_fitted, require_rows
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
@@ -145,6 +145,7 @@ class ElasticNet:
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
         d = len(self.features)
+        require_rows(self, ds.count(), 2, because="its moments divide by n - 1")
         aggregates: dict[str, object] = {
             f"__m{i}": mean(col(name)) for i, name in enumerate(columns)
         }

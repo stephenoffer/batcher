@@ -14,6 +14,7 @@ from collections.abc import Iterable
 
 import pyarrow as pa
 
+from batcher._internal.errors import IOError
 from batcher._internal.paths import open_private, private_dir
 
 __all__ = [
@@ -86,7 +87,10 @@ def distributed_work_dir(prefix: str) -> str:
 def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
     """Write record batches to an Arrow IPC stream file. Returns `path`."""
     if not batches:
-        raise ValueError("write_ipc requires at least one batch (for the schema)")
+        raise IOError(
+            f"cannot write an Arrow IPC shuffle file to {path!r} with no batches: the "
+            "stream needs at least one to take its schema from"
+        )
     with (
         pa.PythonFile(open_private(path), mode="w") as sink,
         pa.ipc.new_stream(sink, batches[0].schema) as writer,

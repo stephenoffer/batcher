@@ -38,7 +38,6 @@ instead of failing. No other engine does this *during* a query.
 | **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **won 22/22** TPC-H and **42/43** ClickBench on the same Arrow |
 | **Polars** | fast, but single-node | the same code runs from one core to a cluster | **12×–81×** on JSON; **7×–33×** on windows and top-N |
 | **Daft** | scales, but plans once | adaptive re-optimization, and a correct q6 | **2.4× faster** cluster-vs-cluster, and Daft's q6 is wrong |
-| **Ray Data** | scales, but no cost-based optimizer | a learned, cost-based optimizer | **22×–2700×** across the operator mix |
 | **Spark** | scales, but heavy on small jobs | runs in-process locally — no cluster to spin up | **5×–33×** on TPC-H |
 
 The speed is measured **correctness-first**: the harness refuses to time a query whose result
@@ -65,25 +64,25 @@ comparison. Cells are **how many times faster Batcher is** (higher = Batcher fas
 value means the competitor is faster, shown as e.g. `0.5× (2× slower)`). Every row is
 correctness-gated against DuckDB:
 
-| operator | vs DuckDB | vs Polars | vs PyArrow | vs Ray Data² | vs Spark² |
-|-------------------------|:--------:|:--------:|:----------:|:-----------:|:--------:|
-| filter → count          | **265×** | **41×**  | **1225×** | **430×**    | **125×** |
-| global sum              | **33×**  | **12×**  | **25×**   | **2700×**   | **197×** |
-| group-by sum (1 key)    | **5.0×** | **2.6×** | **2.0×**  | **306×**    | **28×**  |
-| group-by sum (2 keys)   | **4.3×** | **2.7×** | **2.0×**  | **191×**    | **21×**  |
-| filter → project        | **3.8×** | 0.8× (1.3× slower) | **14×** | **22×** | **20×** |
-| window running `sum()`  | **2.6×** | **6.3×** | n/a¹      | n/a¹        | **17×**  |
-| window `lag()`          | **1.9×** | **25×**  | n/a¹      | n/a¹        | **13×**  |
-| window `rank()`         | **1.4×** | **6.7×** | n/a¹      | n/a¹        | **19×**  |
-| join → group-by         | **1.4×** | 0.9× (1.1× slower) | **3.6×** | **135×** | **25×** |
-| window whole-partition `sum()` | **1.1×** | 1.0× (1.02× slower) | n/a¹ | n/a¹  | —        |
-| sort → top-N (`LIMIT`)  | **1.0×** | **33×**  | **180×**  | **477×**    | **24×**  |
+| operator | vs DuckDB | vs Polars | vs PyArrow | vs Spark² |
+|-------------------------|:--------:|:--------:|:----------:|:--------:|
+| filter → count          | **265×** | **41×**  | **1225×** | **125×** |
+| global sum              | **33×**  | **12×**  | **25×**   | **197×** |
+| group-by sum (1 key)    | **5.0×** | **2.6×** | **2.0×**  | **28×**  |
+| group-by sum (2 keys)   | **4.3×** | **2.7×** | **2.0×**  | **21×**  |
+| filter → project        | **3.8×** | 0.8× (1.3× slower) | **14×** | **20×** |
+| window running `sum()`  | **2.6×** | **6.3×** | n/a¹      | **17×**  |
+| window `lag()`          | **1.9×** | **25×**  | n/a¹      | **13×**  |
+| window `rank()`         | **1.4×** | **6.7×** | n/a¹      | **19×**  |
+| join → group-by         | **1.4×** | 0.9× (1.1× slower) | **3.6×** | **25×** |
+| window whole-partition `sum()` | **1.1×** | 1.0× (1.02× slower) | n/a¹ | —        |
+| sort → top-N (`LIMIT`)  | **1.0×** | **33×**  | **180×**  | **24×**  |
 
 **Batcher wins all 11 against DuckDB, all 7 against PyArrow, and 8 of 11 against Polars.**
 
-¹ PyArrow (Acero) and Ray Data have no window functions. ² The DuckDB, Polars and PyArrow
-columns were re-measured 2026-07-18 on a release build; the Ray Data and Spark columns are from
-the dated runs in [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
+¹ PyArrow (Acero) has no window functions. ² The DuckDB, Polars and PyArrow columns were
+re-measured 2026-07-18 on a release build; the Spark column is from the dated runs in
+[`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
 
 **Three full suites, not just an operator mix.** Every engine reads the identical zero-copy
 Arrow input, so these compare *execution*, not storage formats:
@@ -107,8 +106,8 @@ row. Daft additionally cannot complete q18, q21, or q22.
 reading the same S3 parquet, TPC-H sf10 q6: Batcher **224 ms** vs Daft **536 ms** — **2.4×
 faster, and correct where Daft is not**.
 
-**How it scales, kept honest.** Against Polars, PyArrow, Spark, and Ray Data, Batcher leads at
-every scale we measured. Against DuckDB the story is scale-dependent, and we report it straight:
+**How it scales, kept honest.** Against Polars, PyArrow, and Spark, Batcher leads at every
+scale we measured. Against DuckDB the story is scale-dependent, and we report it straight:
 
 | scale (single node) | Batcher vs DuckDB (same-input execution) |
 |---------------------|-------------------------------------------|
@@ -122,26 +121,24 @@ contract has no compressed form to read), its **vector-at-a-time engine with sel
 edges Batcher's batch-at-a-time kernels as rows grow, and it **streams** where Batcher's model
 materializes each operator's output — which is what OOMs the largest single-node sf100 joins.
 Batcher's answer at that scale is **distribution**: the same mergeable operators shard across a
-cluster (one partition per node, bounded per-node memory), which is the regime it is built for and
-where it beats Ray Data 50–450× (below). Closing the single-node scale gap to DuckDB is honest,
-open work — vectorized kernels, dictionary-aware grouping, and streaming between operators.
+cluster (one partition per node, bounded per-node memory), which is the regime it is built for.
+Closing the single-node scale gap to DuckDB is honest, open work — vectorized kernels,
+dictionary-aware grouping, and streaming between operators.
 
-**Distributed data plane (vs Ray Data).** In-process and native, Batcher pays none of Ray Data's
-per-operation task-scheduling + block/pandas-bridge cost (~300–8000 ms fixed, even on a cluster) —
-**22×–2700× faster** across the operator mix above. Even on Ray Data's *own* streaming
-`map_batches` home turf it leads: `map_batches` transform **2.3×**, row-exploding `flat_map`
-**3.5×**, chained multi-stage map **3.2×**, Parquet read **21×**, `iter_torch_batches`
-training-data ingest **3.0×**.
+**Distributed data plane.** Execution is in-process and native, so a distributed operator costs
+no per-operation task-scheduling hop and no pandas bridge. Bulk Arrow batches move worker to
+worker over Arrow Flight with credit-based flow control, bypassing the Ray object store, and
+streaming `map_batches`, row-exploding `flat_map`, chained multi-stage maps, Parquet reads, and
+`iter_torch_batches` training ingest all run on that same path.
 
-**GPU batch inference (8×T4, vs Ray Data)** — stage-overlap streaming keeps the device fed and
-session-warm pools load the model once per session, not once per job:
+**GPU batch inference (8×T4)** — one of the workload families the same engine runs. Stage-overlap
+streaming and session-warm pools, which load a model once per session rather than once per job,
+are what produce these figures:
 
-| GPU workload | batcher | Ray Data | vs Ray |
-|--------------|--------:|---------:|:------:|
-| **LLM batch inference** (gpt2 generate) | 814 prompt/s | 73 prompt/s | **11.1×** |
-| batch inference (ResNet-50) | 2576 img/s @ 78% util | 1257 @ 41% | **2.05×** |
-| batch embeddings (2048-d vectors) | 2502 img/s @ 80% util | 1267 @ 41% | **1.98×** |
-| zero-config `map_batches(Model, num_gpus=1)` | 2451 img/s @ 82% util | *hard-errors* | Ray refuses |
+- **LLM batch inference** (gpt2 generate) — 814 prompt/s
+- Batch inference (ResNet-50) — 2576 img/s at 78% GPU utilization
+- Batch embeddings (2048-d vectors) — 2502 img/s at 80% GPU utilization
+- Zero-config `map_batches(Model, num_gpus=1)` — 2451 img/s at 82% GPU utilization
 
 Stage-overlap alone lifted a decode → ResNet-50 pipeline from **942 → 2504 img/s** and GPU
 utilization from **~30% → 81%** — same result, the device just stops idling through the CPU decode.

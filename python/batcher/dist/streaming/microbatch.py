@@ -45,6 +45,15 @@ __all__ = ["DistributedRunner"]
 #: *empty* path pays it: an epoch with data is staged immediately.
 _IDLE_POLL_SECONDS = 0.2
 
+#: How long a source's work units stay cached before they are enumerated again.
+#:
+#: `splits()` costs a round trip for most unbounded sources — a Kafka `list_topics`, a Kinesis
+#: `list_shards`, an Event Hubs management call — and the idle loop below asks five times a
+#: second, so a stream with nothing to read spent its whole trigger budget re-asking the
+#: broker how many partitions it has. Partitions change when a topic is rescaled, which is
+#: rare enough to notice within this window and not rare enough to cache forever.
+_SPLIT_REFRESH_SECONDS = 30.0
+
 
 @dataclass(slots=True)
 class _StagedEpoch:
@@ -80,6 +89,7 @@ class DistributedRunner:
         "_sink_writer",
         "_source",
         "_spent",
+        "_split_cache",
         "_workers",
     )
 
@@ -121,6 +131,9 @@ class DistributedRunner:
         self._offsets: dict[str, Any] = {}
         self._sink_writer = _sink_writer(fmt)
         self._spent = False
+        # `(monotonic_deadline, splits)` for a source whose `splits()` is a pure question.
+        # See `_splits`.
+        self._split_cache: tuple[float, list[Any]] | None = None
 
     # --- MicroBatchRunner -------------------------------------------------
     def stage(self, batch_id: int) -> _StagedEpoch | None:
@@ -138,7 +151,7 @@ class DistributedRunner:
         from batcher.io.source import is_bounded
 
         while not self._spent:
-            splits = list(self._source.splits())
+            splits = self._splits()
             epoch = self._fan_out(batch_id, splits) if splits else _StagedEpoch()
             if epoch.input_rows:
                 # A bounded source hands back the *same* splits on every pass, so its
@@ -149,6 +162,27 @@ class DistributedRunner:
                 return None
             time.sleep(_IDLE_POLL_SECONDS)
         return None
+
+    def _splits(self) -> list[Any]:
+        """This epoch's work units, re-enumerated only when that is not merely a question.
+
+        A source whose `splits()` *claims* the work it returns — the incremental file source,
+        whose files become pending the moment they are handed out — must be asked every pass,
+        because asking **is** the discovery. Everything else is answering a question about
+        shape, and for an unbounded source that question costs a round trip to the broker.
+        The idle loop asks five times a second, so a stream with nothing to read spent its
+        whole trigger budget re-asking Kafka how many partitions its topic has.
+        """
+        import time
+
+        if getattr(self._source, "confirm", None) is not None:
+            return list(self._source.splits())
+        now = time.monotonic()
+        if self._split_cache is not None and now < self._split_cache[0]:
+            return self._split_cache[1]
+        splits = list(self._source.splits())
+        self._split_cache = (now + _SPLIT_REFRESH_SECONDS, splits)
+        return splits
 
     def positions(self) -> dict[int, dict]:
         from batcher.io.source import is_checkpointable

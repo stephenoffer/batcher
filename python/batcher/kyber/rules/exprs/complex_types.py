@@ -116,6 +116,7 @@ def _struct_field_of_struct(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_struct_field_of_struct,
+    expr_matches=(MakeStruct, StructField),
 )
 def struct_field_of_make_struct(
     node: Filter | Project, _ctx: OptimizerContext
@@ -146,6 +147,7 @@ def _list_get_of_array(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_list_get_of_array,
+    expr_matches=(Array, ListGet),
 )
 def fold_list_get_of_array(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`[x, y, z][1] -> y`. Indexing a freshly built array with an in-range constant
@@ -172,6 +174,7 @@ def _list_len_of_array(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_list_len_of_array,
+    expr_matches=(Array, ListFunc),
 )
 def fold_list_length_of_array(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`len([x, y, z]) -> 3`. An array literal's length is its arity, known at plan
@@ -222,6 +225,7 @@ IDEMPOTENT_LIST_RULES = [
             _make_idempotent_rule(fn),
             matches=(Filter, Project),
             expr_fn=_idempotent_list(fn),
+            expr_matches=(ListFunc,),
         )
     )
     for fn in sorted(_IDEMPOTENT_LIST_FNS)
@@ -244,6 +248,7 @@ def _reverse_involution(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_reverse_involution,
+    expr_matches=(ListFunc,),
 )
 def list_reverse_involution(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`reverse(reverse(x)) -> x`. Reversal is an involution, so a doubled call is the
@@ -295,6 +300,7 @@ REDUCTION_THROUGH_PERMUTATION_RULES = [
             _make_permutation_rule(reduction, permutation),
             matches=(Filter, Project),
             expr_fn=_reduce_through_permutation(reduction, permutation),
+            expr_matches=(ListFunc,),
         )
     )
     for reduction in sorted(_ORDER_INDEPENDENT_REDUCTIONS)
@@ -318,6 +324,7 @@ def _len_of_arg_sort(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_len_of_arg_sort,
+    expr_matches=(ListFunc,),
 )
 def list_length_of_arg_sort(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`len(arg_sort(x)) -> len(x)`. Sorting *indices* produces one index per element,
@@ -368,6 +375,7 @@ REDUCTION_THROUGH_UNIQUE_RULES = [
             _make_unique_rule(reduction),
             matches=(Filter, Project),
             expr_fn=_reduce_through_unique(reduction),
+            expr_matches=(ListFunc,),
         )
     )
     for reduction in sorted(_DEDUP_INDEPENDENT_REDUCTIONS)
@@ -381,7 +389,11 @@ def _full_slice(expr: Expr) -> Expr:
 
 
 @rule(
-    name="drop_full_list_slice", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_full_slice
+    name="drop_full_list_slice",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_full_slice,
+    expr_matches=(ListSlice,),
 )
 def drop_full_list_slice(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`slice(x, 0)` with no length `-> x`. A slice starting at the head with no bound
@@ -414,6 +426,7 @@ def _slice_of_slice(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_slice_of_slice,
+    expr_matches=(ListSlice,),
 )
 def list_slice_of_slice(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Compose nested slices into one: `slice(slice(x, a, m), b, n)` becomes a single
@@ -443,6 +456,7 @@ def _set_op_of_self(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_set_op_of_self,
+    expr_matches=(ListSet,),
 )
 def array_set_op_of_self(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`array_intersect(x, x)` and `array_union(x, x)` both become `unique(x)`. A set
@@ -470,6 +484,7 @@ def _except_of_self(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_except_of_self,
+    expr_matches=(ListSet,),
 )
 def array_except_of_self_to_empty(
     node: Filter | Project, _ctx: OptimizerContext

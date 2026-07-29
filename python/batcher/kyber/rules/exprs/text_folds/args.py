@@ -107,14 +107,26 @@ _TRANSLATE = fold("translate", _translate)
 _SPLIT_PART = fold("split_part", _split_part)
 
 
-@rule(name="fold_base64_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_BASE64)
+@rule(
+    name="fold_base64_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_BASE64,
+    expr_matches=(StrFunc,),
+)
 def fold_base64_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`base64('abc') -> 'YWJj'`. Base64 is a byte-exact encoding of the UTF-8 bytes with
     one right answer, so no ASCII guard is needed -- verified against Python's `base64`."""
     return rewrite_node(node, _BASE64)
 
 
-@rule(name="fold_right_of_literal", phase=Phase.NORMALIZE, matches=(Filter, Project), expr=_RIGHT)
+@rule(
+    name="fold_right_of_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=_RIGHT,
+    expr_matches=(StrFunc,),
+)
 def fold_right_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`right('abcdef', 3) -> 'def'`. ASCII-guarded: the count is in characters, and a
     negative count has engine-defined behaviour this fold does not reproduce."""
@@ -126,6 +138,7 @@ def fold_right_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> Log
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_POSITION,
+    expr_matches=(StrFunc,),
 )
 def fold_position_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`position('abcdef', 'cd') -> 3`. One-based, and zero when the needle is absent --
@@ -138,6 +151,7 @@ def fold_position_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> 
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_CONTAINS,
+    expr_matches=(StrFunc,),
 )
 def fold_contains_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`contains('abcdef', 'cd') -> TRUE`. A membership test between two constants is a
@@ -150,6 +164,7 @@ def fold_contains_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> 
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_STARTS_WITH,
+    expr_matches=(StrFunc,),
 )
 def fold_starts_with_of_literal(
     node: Filter | Project, _ctx: OptimizerContext
@@ -163,6 +178,7 @@ def fold_starts_with_of_literal(
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_ENDS_WITH,
+    expr_matches=(StrFunc,),
 )
 def fold_ends_with_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`ends_with('abcdef', 'ef') -> TRUE`, the suffix sibling of the `contains` fold."""
@@ -174,6 +190,7 @@ def fold_ends_with_of_literal(node: Filter | Project, _ctx: OptimizerContext) ->
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_TRANSLATE,
+    expr_matches=(StrFunc,),
 )
 def fold_translate_of_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`translate('abc', 'ab', 'xy') -> 'xyc'`. Folded only when the two character sets
@@ -188,6 +205,7 @@ def fold_translate_of_literal(node: Filter | Project, _ctx: OptimizerContext) ->
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_SPLIT_PART,
+    expr_matches=(StrFunc,),
 )
 def fold_split_part_of_literal(
     node: Filter | Project, _ctx: OptimizerContext

@@ -49,6 +49,7 @@ round-trips.
 | `df.assign(c=...)` | `df.with_columns(c=...)` | `ds.with_columns(c=...)` |
 | `df[df.a > 1]` | `df.filter(pl.col("a") > 1)` | `ds.filter(col("a") > 1)` |
 | `df.groupby("k").agg(...)` | `df.group_by("k").agg(...)` | `ds.group_by("k").agg(total=col("v").sum())` |
+| `df.groupby("k").apply(fn)` | `df.group_by("k").map_groups(fn)` | `ds.group_by("k").map_groups(fn)` — `fn` gets one whole group; add `batch_format="pandas"` for a frame |
 | `df.merge(o, on="k")` | `df.join(o, on="k")` | `ds.join(o, on="k", how="inner")` |
 | `df.sort_values("a", ascending=False)` | `df.sort("a", descending=True)` | `ds.sort("a", descending=True)` |
 | `df.drop_duplicates()` | `df.unique()` | `ds.distinct()` |

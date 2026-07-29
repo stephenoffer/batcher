@@ -48,6 +48,24 @@ __all__ = ["wants_resilience", "wrap_resilient"]
 _MAX_BACKOFF_S = 30.0
 
 
+def _backoff(base: float, attempt: int) -> float:
+    """Capped exponential backoff for `attempt`, with equal jitter.
+
+    The workload this exists for is an LLM or vector-DB API, and the failure it exists for
+    is that service rate-limiting. Both mean every worker fails at the same instant, so an
+    undithered ``base * 2**attempt`` marches all of them back to the service together, on
+    exactly the schedule most likely to trip the limit again. Equal jitter — half the delay
+    fixed, half uniform — keeps the growth curve while decorrelating the retries.
+
+    Timing only: a retry's schedule cannot change what a `fn` computes, so this does not
+    touch the determinism the interpreter-as-oracle property rests on.
+    """
+    import random
+
+    delay = min(_MAX_BACKOFF_S, base * (2.0**attempt))
+    return delay / 2.0 + random.random() * (delay / 2.0)
+
+
 def wants_resilience(op: MapBatches) -> bool:
     """Whether `op` asked for any retry/timeout handling (else the raw call is used unchanged)."""
     return op.max_retries > 0 or op.timeout_s > 0.0
@@ -100,7 +118,7 @@ def wrap_resilient(call: Callable[[pa.RecordBatch], Any], op: MapBatches) -> Cal
             except retry_on as exc:
                 if attempt >= max_retries:
                     raise
-                delay = min(_MAX_BACKOFF_S, base * (2.0**attempt))
+                delay = _backoff(base, attempt)
                 _record_retry(fn_name, attempt + 1, max_retries, delay, exc)
                 if delay > 0.0:
                     time.sleep(delay)

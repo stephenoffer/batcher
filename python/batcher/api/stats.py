@@ -97,13 +97,19 @@ class RunStats:
     """Per-operator measurements for one materialized run, with a bottleneck call.
 
     Returned by `Dataset.stats()`. Iterate `ops` for the per-operator detail, read
-    `bottleneck` for the operator that dominated wall time, and `str(stats)` for a
-    formatted table. Times are wall-clock milliseconds measured by the engine.
+    `bottleneck` for the operator that dominated wall time, `findings` for what the engine
+    concluded about the run, and `str(stats)` for a formatted table. Times are wall-clock
+    milliseconds measured by the engine.
     """
 
     ops: tuple[OpStat, ...]
     total_ms: float
     rows: int
+    #: What the engine concluded about this run — a spilling operator, a starved GPU, a
+    #: filter running after the work it should have removed. A table of numbers still has
+    #: to be *read*, and reading it is the skill every performance guide is written to
+    #: teach; these are that reading, done. Empty for a healthy run.
+    findings: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_profile(cls, profile: QueryProfile) -> RunStats:
@@ -113,6 +119,12 @@ class RunStats:
         profile is assembled from whichever path actually ran). On a distributed run the
         driver tree is unmeasured, so the measured `worker_ops` (the map sub-plan) carry
         the per-operator detail — they are included so `stats()` is never empty there.
+
+        The insight rules run here too, against the same profile the dashboard uses, so a
+        user reading `stats()` in a terminal gets the same conclusions as one who opened the
+        web UI. They were previously reachable only through `bt.start_ui()`, which meant the
+        engine knew a run had spilled or starved its GPU and told nobody who had not gone
+        looking.
         """
         measured = [o for o in profile.ops if o.measured] + list(profile.worker_ops)
         parsed = tuple(
@@ -131,7 +143,12 @@ class RunStats:
             )
             for o in measured
         )
-        return cls(ops=parsed, total_ms=profile.total_ms, rows=profile.rows)
+        return cls(
+            ops=parsed,
+            total_ms=profile.total_ms,
+            rows=profile.rows,
+            findings=tuple(_findings(profile)),
+        )
 
     @property
     def bottleneck(self) -> OpStat | None:
@@ -169,10 +186,11 @@ class RunStats:
         return max((o.result_bytes for o in self.ops), default=0)
 
     def summary(self) -> str:
-        """A three-line digest: wall time, rows, memory, and the bottleneck call.
+        """A short digest: wall time, rows, memory, the bottleneck call, and any findings.
 
         What to print when you want the shape of a run without the full per-operator
-        table. `str(stats)` gives the table; this gives the headline.
+        table. `str(stats)` gives the table; this gives the headline. The findings line
+        appears only when there is something to act on, so a healthy run stays three lines.
 
         Examples:
             .. doctest::
@@ -187,14 +205,16 @@ class RunStats:
             A short multi-line summary, ready to print or log.
         """
         spill = f", {self.spill_count} operator(s) spilled" if self.spill_count else ""
-        return "\n".join(
-            [
-                f"wall time: {self.total_ms:.2f} ms across {len(self.ops)} operator(s)",
-                f"rows: {self.rows_in:,} read -> {self.rows_out:,} out"
-                f", peak output {self.peak_memory_bytes / 1e6:.1f} MB{spill}",
-                self.bottleneck_summary(),
-            ]
-        )
+        lines = [
+            f"wall time: {self.total_ms:.2f} ms across {len(self.ops)} operator(s)",
+            f"rows: {self.rows_in:,} read -> {self.rows_out:,} out"
+            f", peak output {self.peak_memory_bytes / 1e6:.1f} MB{spill}",
+            self.bottleneck_summary(),
+        ]
+        actionable = [f for f in self.findings if f.get("severity") in ("critical", "warning")]
+        if actionable:
+            lines.append(f"findings: {'; '.join(str(f.get('title')) for f in actionable)}")
+        return "\n".join(lines)
 
     def to_dict(self) -> dict[str, object]:
         """The whole run as a JSON-encodable dict, totals plus a list of per-operator dicts.
@@ -296,14 +316,26 @@ class RunStats:
 
     def bottleneck_summary(self) -> str:
         """One line naming the dominant operator and whether the run is I/O- or
-        compute-bound — the triage Ray users do by hand from ``ds.stats()`` logs."""
+        compute-bound — the triage Ray users do by hand from ``ds.stats()`` logs.
+
+        The share is against wall time for a sequential run, and against the **total
+        operator time** when the operators overlapped. A pipelined stage chain runs its
+        stages concurrently on their own threads, so their times legitimately sum past the
+        wall clock; dividing by wall time there produced shares like "325%", which reads as
+        a bug rather than as concurrency. Naming which denominator was used keeps the two
+        readings from being confused for each other.
+        """
         b = self.bottleneck
         if b is None:
             return "no operators executed"
-        share = (b.elapsed_ms / self.total_ms * 100.0) if self.total_ms else 0.0
+        busy = sum(o.elapsed_ms for o in self.ops)
+        overlapped = busy > self.total_ms
+        basis = busy if overlapped else self.total_ms
+        share = (b.elapsed_ms / basis * 100.0) if basis else 0.0
+        of = "of operator time (stages overlap)" if overlapped else "of wall time"
         kind = "I/O-bound (read dominates)" if b.kind == "scan" else f"compute-bound ({b.kind})"
         spill = " — SPILLED to disk" if self.spilled else ""
-        return f"bottleneck: {b.kind} (op {b.op_id}), {share:.0f}% of wall time — {kind}{spill}"
+        return f"bottleneck: {b.kind} (op {b.op_id}), {share:.0f}% {of} — {kind}{spill}"
 
     def __str__(self) -> str:
         header = (
@@ -320,4 +352,32 @@ class RunStats:
         lines.append("-" * len(header))
         lines.append(f"total: {self.total_ms:.2f} ms, {self.rows} rows out")
         lines.append(self.bottleneck_summary())
+        # Only warnings and criticals are printed. An `info` finding is context for someone
+        # already investigating, and printing it under every healthy run is how a reader
+        # learns to skip this section — which costs them the one that mattered.
+        actionable = [f for f in self.findings if f.get("severity") in ("critical", "warning")]
+        if actionable:
+            lines.append("")
+            lines.append(f"findings ({len(actionable)}):")
+            for finding in actionable:
+                lines.append(f"  [{finding.get('severity')}] {finding.get('title')}")
+                lines.append(f"      {finding.get('action')}")
         return "\n".join(lines)
+
+
+def _findings(profile: QueryProfile) -> list[dict[str, object]]:
+    """The insight rules' conclusions about `profile`, or `[]` if they cannot run.
+
+    Deriving findings must never be the reason `stats()` fails: they are commentary on a
+    measurement that already succeeded, so any failure inside a rule costs the commentary
+    and nothing else.
+    """
+    try:
+        from batcher.observe.insights import derive_insights
+
+        return derive_insights(profile.to_dict())
+    except Exception as exc:  # pragma: no cover - commentary must not break a measurement
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("api", "derive run findings", exc)
+        return []

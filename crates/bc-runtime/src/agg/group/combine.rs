@@ -26,6 +26,90 @@ use crate::keys::canon_f64;
 /// One merged radix partition: its group-key columns, and per aggregate its state columns.
 type MergedPartition = (Vec<ArrayRef>, Vec<Vec<ArrayRef>>);
 
+/// Copy the rows named by `(part_of[i], row_of[i])` out of `cols` into one flat array.
+///
+/// The whole-column move for a null-free primitive: read the source value, write the
+/// output, no bitmap and no builder. `PrimitiveArray::new(values, None)` is the same array
+/// `interleave` would have produced for null-free inputs.
+fn gather_primitive<T: ArrowPrimitiveType>(
+    cols: &[&dyn Array],
+    part_of: &[u32],
+    row_of: &[u32],
+) -> ArrayRef {
+    use arrow::array::PrimitiveArray;
+    use std::sync::Arc;
+
+    let vals: Vec<&[T::Native]> = cols
+        .iter()
+        .map(|c| c.as_primitive::<T>().values().as_ref())
+        .collect();
+    let mut out: Vec<T::Native> = Vec::with_capacity(part_of.len());
+    out.extend(
+        part_of
+            .iter()
+            .zip(row_of)
+            .map(|(&p, &r)| vals[p as usize][r as usize]),
+    );
+    Arc::new(PrimitiveArray::<T>::new(out.into(), None))
+}
+
+/// Gather one output column, taking the flat typed path when every source permits it.
+///
+/// `interleave` is the general answer — it handles strings, nested types and nulls — but it
+/// wants a materialized `&[(usize, usize)]`, **sixteen bytes of index per output row**, and
+/// builds through `MutableArrayData`. On a high-cardinality combine that index array is the
+/// dominant traffic: ClickBench q32 (`GROUP BY WatchID, ClientIP` over ~10M near-unique
+/// groups) spent 27% of the query inside `interleave_primitive`, moving two key columns and
+/// four state columns that way.
+///
+/// This is the same trade `ops::repartition` already makes on the shuffle side, applied to
+/// the other place that gathers by row address. The `u32` planes are half the index bytes,
+/// and a null-free primitive column copies values directly.
+///
+/// Anything else — a string or binary key, a nested state, any column carrying a null —
+/// falls through to `interleave` unchanged, sharing one lazily built pair vector.
+fn gather(
+    cols: &[&dyn Array],
+    part_of: &[u32],
+    row_of: &[u32],
+    pairs: &mut Option<Vec<(usize, usize)>>,
+) -> Result<ArrayRef, RuntimeError> {
+    macro_rules! fast {
+        ($($dt:pat => $ty:ty),* $(,)?) => {
+            match cols.first().map(|c| c.data_type()) {
+                $(Some($dt) => return Ok(gather_primitive::<$ty>(cols, part_of, row_of)),)*
+                _ => {}
+            }
+        };
+    }
+    // Every source must be the *same* primitive type as the first, since the fast path
+    // downcasts them all to one `T`. Partials of one aggregate share a schema in practice;
+    // checking is cheap and turns a would-be panic into the interleave fallback.
+    let uniform = cols
+        .split_first()
+        .is_some_and(|(h, t)| t.iter().all(|c| c.data_type() == h.data_type()));
+    if uniform && cols.iter().all(|c| c.null_count() == 0) {
+        fast! {
+            DataType::Int8 => Int8Type, DataType::Int16 => Int16Type,
+            DataType::Int32 => Int32Type, DataType::Int64 => Int64Type,
+            DataType::UInt8 => UInt8Type, DataType::UInt16 => UInt16Type,
+            DataType::UInt32 => UInt32Type, DataType::UInt64 => UInt64Type,
+            DataType::Float32 => arrow::datatypes::Float32Type,
+            DataType::Float64 => arrow::datatypes::Float64Type,
+            DataType::Date32 => arrow::datatypes::Date32Type,
+            DataType::Date64 => arrow::datatypes::Date64Type,
+        }
+    }
+    let pairs = pairs.get_or_insert_with(|| {
+        part_of
+            .iter()
+            .zip(row_of)
+            .map(|(&p, &r)| (p as usize, r as usize))
+            .collect()
+    });
+    interleave(cols, pairs).map_err(RuntimeError::from)
+}
+
 /// Parallel `combine` regroup via hash-radix partitioning. Returns the merged group-key
 /// columns and, per aggregate, its merged state columns — identical to the serial
 /// `assign_groups` + `merge_state` path (group *order* differs, which callers treat as
@@ -152,30 +236,34 @@ pub(crate) fn combine_radix_parts(
     let per: Vec<MergedPartition> = buckets
         .par_iter()
         .map(|idx| -> Result<_, RuntimeError> {
-            let pairs: Vec<(usize, usize)> = idx
-                .iter()
-                .map(|&g| {
-                    let p = starts.partition_point(|&s| s <= g) - 1;
-                    (p, (g - starts[p]) as usize)
-                })
-                .collect();
-            let keys_p: Vec<ArrayRef> = (0..n_keys)
-                .map(|k| {
-                    let cols: Vec<&dyn Array> =
-                        parts.iter().map(|p| p.group_columns[k].as_ref()).collect();
-                    interleave(&cols, &pairs)
-                })
-                .collect::<Result<_, _>>()?;
+            // The row addresses, split into two `u32` planes rather than one
+            // `Vec<(usize, usize)>`. See `gather` for why: the pair form is 16 bytes of
+            // index per output row, and this bucket may hold millions.
+            let mut part_of: Vec<u32> = Vec::with_capacity(idx.len());
+            let mut row_of: Vec<u32> = Vec::with_capacity(idx.len());
+            for &g in idx {
+                let p = starts.partition_point(|&s| s <= g) - 1;
+                part_of.push(p as u32);
+                row_of.push(g - starts[p]);
+            }
+            // Built only if some column declines the flat gather, and then shared by all
+            // of them — a string key would otherwise rebuild it per column.
+            let mut pairs: Option<Vec<(usize, usize)>> = None;
+            let mut keys_p: Vec<ArrayRef> = Vec::with_capacity(n_keys);
+            for k in 0..n_keys {
+                let cols: Vec<&dyn Array> =
+                    parts.iter().map(|p| p.group_columns[k].as_ref()).collect();
+                keys_p.push(gather(&cols, &part_of, &row_of, &mut pairs)?);
+            }
             let (local_ids, n_local, group_cols_p) = assign_groups(&keys_p, idx.len())?;
             let mut states_p = Vec::with_capacity(funcs.len());
             for (a, &func) in funcs.iter().enumerate() {
-                let state_p: Vec<ArrayRef> = (0..parts[0].states[a].len())
-                    .map(|c| {
-                        let cols: Vec<&dyn Array> =
-                            parts.iter().map(|p| p.states[a][c].as_ref()).collect();
-                        interleave(&cols, &pairs)
-                    })
-                    .collect::<Result<_, _>>()?;
+                let mut state_p: Vec<ArrayRef> = Vec::with_capacity(parts[0].states[a].len());
+                for c in 0..parts[0].states[a].len() {
+                    let cols: Vec<&dyn Array> =
+                        parts.iter().map(|p| p.states[a][c].as_ref()).collect();
+                    state_p.push(gather(&cols, &part_of, &row_of, &mut pairs)?);
+                }
                 states_p.push(merge_state(func, &state_p, &local_ids, n_local)?);
             }
             Ok((group_cols_p, states_p))

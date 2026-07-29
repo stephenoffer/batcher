@@ -70,6 +70,8 @@ _NOT_OR = _de_morgan("or", "and")
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_NOT_AND,
+    # The rewrite lands on the `Not`; its `Binary` is the operand, reached by recursion.
+    expr_matches=(Not,),
 )
 def de_morgan_not_of_conjunction(
     node: Filter | Project, _ctx: OptimizerContext
@@ -96,6 +98,8 @@ def de_morgan_not_of_conjunction(
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_NOT_OR,
+    # The rewrite lands on the `Not`; its `Binary` is the operand, reached by recursion.
+    expr_matches=(Not,),
 )
 def de_morgan_not_of_disjunction(
     node: Filter | Project, _ctx: OptimizerContext
@@ -121,6 +125,7 @@ def _double_negation(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_double_negation,
+    expr_matches=(Not,),
 )
 def drop_double_negation(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (NOT a) -> a`. Kleene negation is an involution -- it maps `TRUE` to

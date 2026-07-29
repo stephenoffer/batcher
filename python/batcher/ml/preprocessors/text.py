@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.preprocessors.base import Preprocessor, column_arg, columns_arg
 from batcher.plan.expr_ir import array, col
 
 if TYPE_CHECKING:
@@ -145,7 +145,7 @@ class Tokenizer(Preprocessor):
         padding: bool | str = False,
         attention_mask_column: str | None = None,
     ) -> None:
-        self.column = column
+        self.column = column_arg(column, what="Tokenizer")
         self.output_column = output_column or column
         self.max_length = max_length
         self.truncation = truncation

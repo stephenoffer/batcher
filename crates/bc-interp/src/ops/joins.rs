@@ -594,6 +594,52 @@ mod tests {
     use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use bc_ir::{JoinStrategy, JoinType};
 
+    /// The identity short-circuit must be invisible: a side whose index buffer is exactly
+    /// `0..n` returns the source column itself, and that must equal what the gather produces.
+    /// A *prefix* of the identity is not the identity — it selects a subset — so the second
+    /// half pins that the short-circuit declines it rather than returning the full column.
+    #[test]
+    fn an_identity_gather_returns_the_source_column_unchanged() {
+        let rows = 6usize;
+        let ident: Vec<u32> = (0..rows as u32).collect();
+        assert!(is_identity_permutation(
+            &UInt32Array::from(ident.clone()),
+            rows
+        ));
+
+        let left = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())) as ArrayRef],
+        )
+        .expect("batch");
+        let idx = join::JoinIndices {
+            left: UInt32Array::from(ident),
+            right: UInt32Array::from(vec![0u32; rows]),
+        };
+        let out = gather_join_output(
+            &left,
+            &left,
+            &idx,
+            &[JoinOutputCol {
+                side: JoinSide::Left,
+                name: "a".into(),
+                alias: "a".into(),
+            }],
+        )
+        .expect("gather");
+        assert_eq!(out.column(0).as_ref(), left.column(0).as_ref());
+
+        // A shorter buffer selects a subset, so it must not be treated as the identity.
+        assert!(!is_identity_permutation(
+            &UInt32Array::from(vec![0u32, 1, 2]),
+            rows
+        ));
+    }
+
     /// The chunked gather must reproduce the single-shot gather **exactly**, not merely as a
     /// multiset — it is what preserves join output order, and a `LIMIT` above the join turns any
     /// reordering into wrong rows rather than a slow query. Sized past `GATHER_CHUNK_MIN_ROWS`

@@ -272,7 +272,12 @@ def _strip_self_cast(expr: Expr, schema: SchemaRef) -> Expr:
     return expr
 
 
-@rule(name="drop_self_cast_in_projection", phase=Phase.NORMALIZE, matches=(Project,))
+@rule(
+    name="drop_self_cast_in_projection",
+    phase=Phase.NORMALIZE,
+    matches=(Project,),
+    expr_matches=(Cast,),
+)
 def drop_self_cast_in_projection(node: Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a cast of a column to the type it already has, inside a projection.
 
@@ -296,7 +301,9 @@ def drop_self_cast_in_projection(node: Project, _ctx: OptimizerContext) -> Logic
     return dataclasses.replace(node, items=tuple(new_items))
 
 
-@rule(name="drop_self_cast_in_filter", phase=Phase.NORMALIZE, matches=(Filter,))
+@rule(
+    name="drop_self_cast_in_filter", phase=Phase.NORMALIZE, matches=(Filter,), expr_matches=(Cast,)
+)
 def drop_self_cast_in_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a cast of a column to the type it already has, inside a filter predicate.
 
@@ -314,7 +321,9 @@ def drop_self_cast_in_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPla
     return Filter(node.input, new_pred)
 
 
-@rule(name="drop_self_cast_in_sort_key", phase=Phase.NORMALIZE, matches=(Sort,))
+@rule(
+    name="drop_self_cast_in_sort_key", phase=Phase.NORMALIZE, matches=(Sort,), expr_matches=(Cast,)
+)
 def drop_self_cast_in_sort_key(node: Sort, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a cast of a column to the type it already has, inside a sort key.
 

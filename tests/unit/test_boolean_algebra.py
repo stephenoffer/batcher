@@ -6,6 +6,7 @@ import batcher as bt
 from batcher import col
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rules.extra import boolean_algebra as ba
+from batcher.kyber.rules.extra import membership_simplify as ms
 from batcher.plan.expr_ir import Col, InList
 from batcher.plan.expr_ir.constructors import coalesce
 from batcher.plan.logical import Project
@@ -200,22 +201,22 @@ def test_bool_eq_does_not_fire_on_bare_column():
 
 
 def test_single_in_list_becomes_eq():
-    out = ba.single_in_list(_flt(InList(Col("a"), (5,))), None)
+    out = ms.single_in_list(_flt(InList(Col("a"), (5,))), None)
     assert _pred_ir(out)["op"] == "eq"
 
 
 def test_single_in_list_idempotent():
-    once = ba.single_in_list(_flt(InList(Col("a"), (5,))), None)
-    assert ba.single_in_list(once, None) is None
+    once = ms.single_in_list(_flt(InList(Col("a"), (5,))), None)
+    assert ms.single_in_list(once, None) is None
 
 
 def test_dedup_in_list_fires():
-    out = ba.dedup_in_list(_flt(InList(Col("a"), (5, 5, 6, 5))), None)
+    out = ms.dedup_in_list(_flt(InList(Col("a"), (5, 5, 6, 5))), None)
     assert [v["int"] for v in _pred_ir(out)["set"]] == [5, 6]
 
 
 def test_dedup_in_list_does_not_fire_without_duplicates():
-    assert ba.dedup_in_list(_flt(InList(Col("a"), (5, 6, 7))), None) is None
+    assert ms.dedup_in_list(_flt(InList(Col("a"), (5, 6, 7))), None) is None
 
 
 # --- COALESCE flattening ----------------------------------------------------
@@ -223,7 +224,7 @@ def test_dedup_in_list_does_not_fire_without_duplicates():
 
 def test_coalesce_flattens_nested():
     node = _proj(coalesce(col("a"), coalesce(col("x"), bt.lit(0))))
-    out = ba.coalesce_simplify(node, None)
+    out = ms.coalesce_simplify(node, None)
     assert isinstance(out, Project)
     inputs = out.items[0].expr.to_ir()["inputs"]
     assert len(inputs) == 3 and all(i["e"] != "coalesce" for i in inputs)
@@ -231,7 +232,7 @@ def test_coalesce_flattens_nested():
 
 def test_coalesce_dedups_repeated_argument():
     node = _proj(coalesce(col("a"), col("x"), col("a")))
-    out = ba.coalesce_simplify(node, None)
+    out = ms.coalesce_simplify(node, None)
     inputs = out.items[0].expr.to_ir()["inputs"]
     # The repeated `col('a')` is only ever reached when the first one was null, so
     # dropping it moves neither the value nor the type.
@@ -247,24 +248,24 @@ def test_coalesce_does_not_truncate_after_literal():
     `coalesce_drop_nulls_after_first_non_null`. See
     tests/differential/test_diff_kyber3_coalesce_type.py.
     """
-    assert ba.coalesce_simplify(_proj(coalesce(col("a"), bt.lit(9), col("x"))), None) is None
+    assert ms.coalesce_simplify(_proj(coalesce(col("a"), bt.lit(9), col("x"))), None) is None
 
 
 def test_coalesce_unwraps_single():
     # Dedup collapses the arms to one, which then unwraps to the bare expression.
     node = _proj(coalesce(col("a"), col("a")))
-    out = ba.coalesce_simplify(node, None)
+    out = ms.coalesce_simplify(node, None)
     assert out.items[0].expr.to_ir() == {"e": "col", "name": "a"}
 
 
 def test_coalesce_idempotent():
     node = _proj(coalesce(col("a"), coalesce(col("x"), bt.lit(0))))
-    once = ba.coalesce_simplify(node, None)
-    assert ba.coalesce_simplify(once, None) is None
+    once = ms.coalesce_simplify(node, None)
+    assert ms.coalesce_simplify(once, None) is None
 
 
 def test_coalesce_does_not_fire_when_clean():
-    assert ba.coalesce_simplify(_proj(coalesce(col("a"), col("x"))), None) is None
+    assert ms.coalesce_simplify(_proj(coalesce(col("a"), col("x"))), None) is None
 
 
 # --- empty-input sanity -----------------------------------------------------

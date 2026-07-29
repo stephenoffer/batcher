@@ -63,9 +63,8 @@ KNOWN_UNRENDERED: dict[str, str] = {
 
 # Public names that live only in the generated reference, with a reason. Drain toward
 # empty: "the reference lists it" is not the same as "a reader can find it".
-KNOWN_UNTAUGHT: dict[str, str] = {
-    "__version__": "package version string, not an API symbol",
-}
+# Now empty — `examples/operations/environment.py` teaches the last entry.
+KNOWN_UNTAUGHT: dict[str, str] = {}
 
 # `Expr` methods absent from the expression reference page, with a reason. Drain toward
 # empty: the reference is meant to be exhaustive.
@@ -104,7 +103,11 @@ def _teaching_corpus() -> str:
         if section in _NON_TEACHING_SECTIONS:
             continue
         parts.append(page.read_text(encoding="utf-8"))
-    parts.extend(p.read_text(encoding="utf-8") for p in sorted(_EXAMPLES.glob("*.py")))
+    parts.extend(
+        p.read_text(encoding="utf-8")
+        for p in sorted(_EXAMPLES.rglob("*.py"))
+        if "__pycache__" not in p.parts
+    )
     return "\n".join(parts)
 
 

@@ -68,31 +68,26 @@ binary-floating-point tail.)
 
 Correct answer. Now find out what it cost.
 
-## 2. Ask the engine to profile it, and read the refusal
+## 2. Ask the engine to profile it, and read what it cannot tell you
 
-`ds.stats()` runs the query and reports what the engine *measured* per operator. Here it
-refuses:
+`ds.stats()` runs the query and reports what the engine *measured* per operator. A
+`map_batches` stage is measured too, so the bottleneck is named:
 
 ```python
-from batcher._internal.errors import BackendError
-
-try:
-    slow.stats()
-except BackendError as exc:
-    print(type(exc).__name__)
-    print("map_batches" in str(exc))
-# BackendError
+stats = slow.stats()
+print("MapBatches" in [op.kind for op in stats.ops])
 # True
 ```
 
-> `explain(analyze=True)/stats() is not available for map_batches/ML pipelines (the opaque
-> UDF path emits no per-operator metrics); profile the relational portion instead.`
+The row counts and timings are real, for the UDF stage as much as for the relational ones.
+What is missing is the *estimate*: every relational operator carries a planned row count
+next to its measured one, and the UDF carries none.
 
 :::{warning}
-That message is the diagnosis, not an obstacle. A `map_batches` is a Python callback: the
-optimizer cannot see inside it, cannot know what columns it reads, and cannot know what it
-does to the row count. It is a wall in the middle of the plan, and the engine cannot profile
-across it.
+That absence is the diagnosis. A `map_batches` is a Python callback: the optimizer cannot
+see inside it, cannot know what columns it reads, and cannot know what it does to the row
+count. It is a wall in the middle of the plan — the engine can time it, but it cannot plan
+around it.
 :::
 
 Two things follow, and both are costing you time:

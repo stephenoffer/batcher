@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+import batcher.kyber.rules.extra.null_shapes as ns  # importing registers the rules
 import batcher.kyber.rules.extra.nullability as nb  # importing registers the rules
 from batcher import col, lit
 from batcher.kyber.optimizer import Optimizer
@@ -243,7 +244,7 @@ def test_coalesce_truncate_does_not_fire_when_all_args_are_nullable(ds):
 
 
 def test_expand_is_null_of_coalesce(ds):
-    out = nb.expand_is_null_of_coalesce(
+    out = ns.expand_is_null_of_coalesce(
         ds.filter(coalesce(col("y"), col("f")).is_null())._plan, None
     )
     assert _pred(out) == (col("y").is_null() & col("f").is_null()).to_ir()
@@ -251,18 +252,18 @@ def test_expand_is_null_of_coalesce(ds):
 
 def test_expand_is_null_of_coalesce_is_idempotent(ds):
     plan = ds.filter(coalesce(col("y"), col("f")).is_null())._plan
-    once = nb.expand_is_null_of_coalesce(plan, None)
-    assert nb.expand_is_null_of_coalesce(once, None) is None
+    once = ns.expand_is_null_of_coalesce(plan, None)
+    assert ns.expand_is_null_of_coalesce(once, None) is None
 
 
 def test_expand_is_not_null_of_coalesce(ds):
     plan = ds.filter(coalesce(col("y"), col("f")).is_not_null())._plan
-    out = nb.expand_is_not_null_of_coalesce(plan, None)
+    out = ns.expand_is_not_null_of_coalesce(plan, None)
     assert _pred(out) == (col("y").is_not_null() | col("f").is_not_null()).to_ir()
 
 
 def test_expand_does_not_fire_without_a_coalesce(ds):
-    assert nb.expand_is_null_of_coalesce(ds.filter(col("y").is_null())._plan, None) is None
+    assert ns.expand_is_null_of_coalesce(ds.filter(col("y").is_null())._plan, None) is None
 
 
 # --- the null-safe comparison idiom -------------------------------------------
@@ -283,18 +284,18 @@ def test_null_safe_comparison_kept_when_an_operand_is_nullable(ds):
 
 
 def test_not_is_null_becomes_is_not_null(ds):
-    out = nb.canonicalize_not_null_check(ds.filter(~col("y").is_null())._plan, None)
+    out = ns.canonicalize_not_null_check(ds.filter(~col("y").is_null())._plan, None)
     assert _pred(out) == col("y").is_not_null().to_ir()
 
 
 def test_not_is_not_null_becomes_is_null(ds):
-    out = nb.canonicalize_not_null_check(ds.filter(~col("y").is_not_null())._plan, None)
+    out = ns.canonicalize_not_null_check(ds.filter(~col("y").is_not_null())._plan, None)
     assert _pred(out) == col("y").is_null().to_ir()
 
 
 def test_not_canonicalization_is_idempotent(ds):
-    once = nb.canonicalize_not_null_check(ds.filter(~col("y").is_null())._plan, None)
-    assert nb.canonicalize_not_null_check(once, None) is None
+    once = ns.canonicalize_not_null_check(ds.filter(~col("y").is_null())._plan, None)
+    assert ns.canonicalize_not_null_check(once, None) is None
 
 
 # --- COUNT(col) → COUNT(*) -----------------------------------------------------
@@ -302,20 +303,20 @@ def test_not_canonicalization_is_idempotent(ds):
 
 def test_count_of_non_nullable_column_becomes_count_star(ds):
     plan = ds.group_by("y").agg(c=col("x").count())._plan
-    out = nb.count_of_non_nullable_column_to_count_star(plan, None)
+    out = ns.count_of_non_nullable_column_to_count_star(plan, None)
     assert out.aggregates[0].agg.func == "count_star"
     assert out.aggregates[0].agg.input is None
 
 
 def test_count_of_nullable_column_is_left_alone(ds):
     plan = ds.group_by("x").agg(c=col("y").count())._plan
-    assert nb.count_of_non_nullable_column_to_count_star(plan, None) is None
+    assert ns.count_of_non_nullable_column_to_count_star(plan, None) is None
 
 
 def test_count_star_rewrite_is_idempotent(ds):
     plan = ds.group_by("y").agg(c=col("x").count())._plan
-    once = nb.count_of_non_nullable_column_to_count_star(plan, None)
-    assert nb.count_of_non_nullable_column_to_count_star(once, None) is None
+    once = ns.count_of_non_nullable_column_to_count_star(plan, None)
+    assert ns.count_of_non_nullable_column_to_count_star(once, None) is None
 
 
 # --- sort: a null placement on a key that can hold no null ---------------------
@@ -323,20 +324,20 @@ def test_count_star_rewrite_is_idempotent(ds):
 
 def test_null_ordering_reset_on_non_nullable_sort_key(ds):
     plan = Sort(ds._plan, (SortKeySpec(Col("x"), False, True),))
-    out = nb.drop_null_ordering_on_non_nullable_sort_key(plan, None)
+    out = ns.drop_null_ordering_on_non_nullable_sort_key(plan, None)
     assert out.keys[0].nulls_first is False
     assert out.keys[0].descending is False
 
 
 def test_null_ordering_kept_on_nullable_sort_key(ds):
     plan = Sort(ds._plan, (SortKeySpec(Col("y"), False, True),))
-    assert nb.drop_null_ordering_on_non_nullable_sort_key(plan, None) is None
+    assert ns.drop_null_ordering_on_non_nullable_sort_key(plan, None) is None
 
 
 def test_null_ordering_reset_is_idempotent(ds):
     plan = Sort(ds._plan, (SortKeySpec(Col("x"), False, True),))
-    once = nb.drop_null_ordering_on_non_nullable_sort_key(plan, None)
-    assert nb.drop_null_ordering_on_non_nullable_sort_key(once, None) is None
+    once = ns.drop_null_ordering_on_non_nullable_sort_key(plan, None)
+    assert ns.drop_null_ordering_on_non_nullable_sort_key(once, None) is None
 
 
 # --- end to end: the rules fire through the REAL optimizer ---------------------

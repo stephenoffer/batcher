@@ -197,15 +197,26 @@ class BucketWriter:
         if self._handle is not None:
             return self._handle
         if self._writer is None:
+            self._store._open_writers.discard(self)
             return None
-        self._writer.close()
-        # The byte offset the IPC stream ended at *is* the file size, and reading it here
-        # costs nothing. The alternative for the remote tier was a second `fsspec` open plus
-        # a seek-to-end per bucket — a full object-storage round trip, per bucket, purely to
-        # learn a number the handle already had.
-        written = self._file_position()
-        self._fh.close()
+        try:
+            self._writer.close()
+            # The byte offset the IPC stream ended at *is* the file size, and reading it here
+            # costs nothing. The alternative for the remote tier was a second `fsspec` open
+            # plus a seek-to-end per bucket — a full object-storage round trip, per bucket,
+            # purely to learn a number the handle already had.
+            written = self._file_position()
+            self._fh.close()
+        except BaseException:
+            # A finalize that fails — the flush that finally hits a full disk, a remote
+            # upload that is refused — left the writer's bytes charged against the store's
+            # live local budget forever and its partial file on disk. That is exactly the
+            # "permanent, silent throughput cliff" `abort()` exists to prevent, and `close()`
+            # was the one exit that could not reach it.
+            self.abort()
+            raise
         self._writer = None
+        self._store._open_writers.discard(self)
         # The uncompressed (in-memory) size of everything written — captured before the LOCAL
         # branch zeroes the pending estimate. The reducer budgets against this, not the
         # compressed on-disk `nbytes` below (which for a compressible bucket can be far smaller
@@ -240,6 +251,7 @@ class BucketWriter:
         if self._path is not None:
             self._store._remove_partial(self._tier, self._path)
         self._num_rows = 0
+        self._store._open_writers.discard(self)
 
     def _release_pending(self) -> None:
         """Hand this writer's in-flight local byte charge back to the store."""

@@ -1,7 +1,8 @@
 # Ray pitfall parity: what Batcher must avoid out of the box
 
-**Status:** audit, 2026-07-19. Source corpus is the Anyscale field-engineering
-optimization guides (`../optimization-guides`, ~200 docs distilled from customer
+**Status:** audit, 2026-07-19; extended and re-verified 2026-07-27 (per-stage ML
+profiling, the silent-failure guard family, and the complete 105-pattern scorecard).
+Source corpus is the Anyscale field-engineering optimization guides (`../optimization-guides`, ~200 docs distilled from customer
 engagements). Every Batcher claim below was checked against code, not documentation.
 
 This document exists because that corpus is, read a certain way, **a specification written
@@ -18,13 +19,17 @@ this codebase contains and what a user actually gets."
 
 **Batcher structurally avoids the largest and most damaging class of Ray pitfalls — the
 object-store family — because it does not have an object store on the data path.** That is
-not a tuning win, it is an architectural one: roughly 40% of the guides' failure catalog
-(spill cascades, plasma deadlocks, the 200 GB cap, `/dev/shm` sizing, fragmentation,
-serialization cliffs) is unreachable from Batcher's design.
+not a tuning win, it is an architectural one: 41 of the 105 catalogued patterns (39%)
+are structurally unreachable — spill cascades, plasma deadlocks, the 200 GB cap,
+`/dev/shm` sizing, fragmentation, serialization cliffs. See the pattern scorecard below for
+the per-pattern verdicts.
 
-The AI-workload story was **materially weaker than the architecture suggested until this
-pass**, for one reason: the CPU→GPU overlap that keeps a GPU fed was implemented, tested,
-and **shipped disabled**. It is now on by default. See [What changed](#what-changed-in-this-pass).
+The AI-workload story was **materially weaker than the architecture suggested**, for two
+reasons, both now fixed. The CPU→GPU overlap that keeps a GPU fed was implemented, tested,
+and **shipped disabled**; it is now on by default. And the pipeline shape the ML surface
+exists for could not be profiled at all — `stats()` refused it — so the first step of every
+guide in the corpus had no answer here. Per-stage measurement now exists, and with it the
+insights engine and three findings specific to inference pipelines.
 
 Where Batcher is genuinely behind is **straggler handling and shuffle fault tolerance**, and
 the honest reason is task granularity: Batcher's unit is ≈ a node, so it has fewer of Ray's
@@ -46,7 +51,24 @@ Batcher fixes it with no user action) · **P** partial · **G** genuine gap.
 | E1–E3 | OOM monitor kill loops; the 250 ms allocate-gradually race | **A** | Bounded memory is structural, not reactive: the streaming executor (`memory.streaming: bool = True`, `config/config.py:158`) materializes only at breakers, so peak memory is breaker state plus one morsel per worker — **constant in input size** (measured 3.4 MB at 1M rows, 3.3 MB at 4M, where the materializing path grew 198 → 794 MB). Nothing polls for an OOM that is not coming. |
 | G1, G2, G9 | Autoscaler blind to dependent tasks and hash-shuffle ops; scales unboundedly | **P** | Batcher plans the whole DAG up front, so downstream demand is known rather than inferred from ready tasks. Per-stage inference autoscaling does not exist yet (see G3 below). |
 | H1, H2 | Heterogeneous clusters: global object-store budget overestimates small nodes; "do NOT use `auto_select_worker_config` with Ray Data" | **A** | Memory is governed per-worker by Carbonite envelopes, not by a cluster-global fraction. There is no global budget to mis-apportion. |
-| J1–J3 | Spilling invisible in dashboards; Ray Data metrics attributed entirely to the head-node IP, making per-worker analysis **impossible** | **P** | `observe/` consumes a per-subsystem event bus with real per-worker attribution. Not audited against the guides' specific gap list in this pass — flagged as follow-up. |
+| J1–J3 | Spilling invisible in dashboards; Ray Data metrics attributed entirely to the head-node IP, making per-worker analysis **impossible** | **P** | `observe/` consumes a per-subsystem event bus with real per-worker attribution. Not audited against the guides' specific gap list — flagged as follow-up. |
+| §1 (all guides) | **"Always call `stats()` after a pipeline run"** — every guide's step one is reading per-operator wall time to find the bottleneck stage | **D** | `stats()` / `explain(analyze=True)` now measure a `map_batches`/ML pipeline per stage (`plan/profile/stages.py`), where they used to refuse. The user does not read the table to find the bottleneck either: `observe/insights/` names it, plus a starved GPU, an opaque plan, and a fan-out stage. See [What changed](#what-changed-in-the-observability-pass-2026-07-27). |
+| data-020 | `torch.no_grad()` used where `inference_mode()` belongs, and the user must remember either one in every `__call__` | **D** | `ml/gpu.py::inference_mode_call` applies it at the engine's three GPU UDF call sites. No numerical effect, so it needs no probe — unlike `autocast`, which has to prove it pays. |
+| troubleshooting §"`limit()` pushdown can produce wrong results" (ray#36295) | A **live upstream wrong-answer bug**: the optimizer pushes a `limit` above a map assuming it preserves row count, so a map that filters or expands rows silently returns the wrong rows | **A** | `kyber/rules/extra/limit_extra.py` lists pushing a limit below `MapBatches` as **unsound** by construction — "opaque row count" — alongside filter/unnest/sample/distinct/aggregate, and does not implement it. Verified against the guides' own check (compare to the full result, sliced) for both a dropping and an expanding map, with order-sensitive assertions because `limit` is a prefix and an order-independent comparison cannot see the bug. |
+| troubleshooting §"task retries can produce duplicates" | A retried write re-emits rows already written | **A** | `FileSink.write`'s retry is safe *because* a failed attempt publishes nothing. Pinned at the dangerous case: a write that succeeds in writing bytes and *then* throttles still lands 3 rows, not 6 — the atomic writer discards the partial. |
+| symptoms §"Training loss not decreasing" / data-026 | Training on ordered data: the model sees a contiguous run of the sort key per step and learns the ordering. The guides' listed causes are the learning rate and the data — never the ordering | **D** | `to_torch_dataloader(shuffle=False)` matches `torch.utils.data.DataLoader`'s own default and stays, because a user reaching for that method comes from torch. The *plan* is inspected instead: a `sort` the user wrote, feeding a loader with no shuffle window, warns. Pure plan shape — no scan — and silent for a corpus that was never sorted, or where the order is the point (a sequence model). |
+| llm-batch-inference | An instruction-tuned model sent **un-templated** prompts still answers, in a format it was never tuned on — the guides' "degraded output with nothing to signal it" | **D** | The two backends had opposite `chat` defaults (`vllm_engine=False`, `http_engine=True`), each right for its ecosystem, so switching backends silently changed whether the template applied. `chat` left unset now checks the tokenizer: a model that ships a `chat_template` and is being sent raw completions warns once. An explicit `chat=False` is treated as a decision and stays silent — constrained-choice classification wants exactly that. |
+| rag-pipelines §"Embedding dimension mismatch between indexing and query" | The index is built with one model and the query embedded with another; the two sides differ only by a number nobody looks at | **D** | The engine already refused, but as a `RuntimeError` from inside a Rust kernel ("string function list.CosineSimilarity: list dimensions must be equal") after the whole scan. Both widths are in the schema whenever the vectors came from `ds.ml.embed` (which emits `fixed_size_list`), so `similarity_join` now refuses at build time with a typed `PlanError` naming both widths and the actual cause — two different embedding models. A plain `list` column declares no width and is still left to the engine's per-row check. |
+| batch-embeddings | Embedding vectors must be L2-normalized for cosine similarity; whether the *endpoint* already did it varies by provider, and getting it wrong ranks by magnitude as well as direction | **D** | `openai_embedding_encoder` defaults to `normalize=False` because OpenAI returns unit vectors — but the same request shape is spoken by Azure, Together, and vLLM's embedding server, and **vLLM does not normalize**. Rather than guess a default per provider, the first batch's norm is measured and a mismatch warns. Found by auditing why two sibling encoders had opposite `normalize` defaults. |
+| memory §"Single giant row" | Marked **Unconditional**: "a single row larger than available task memory causes an unrecoverable OOM regardless of any other tuning... a hard architectural constraint, not a guideline". Safe ceiling ~10 MB, and the user is expected to know it | **P** | Byte-adaptive batching shrinks the chunk as rows widen, which handles the wide-row case Ray needs `target_max_block_size` for — but it bottoms out at one row, because rows are atomic. Both sizing paths now warn once at that dead end, naming the measured row width and the fact that the remaining fix is in the data (carry a handle, decode later). Batcher cannot remove the constraint; it can stop the user meeting it as an unexplained OOM. |
+| multimodal §"`ArrowTypeError` when writing variable-size tensors" / G4 | Mixed-resolution images produce arrays of differing shape, which Arrow has no type for. Ray hits the same wall (`ArrowVariableShapedTensorArray`, ray#49883/#50229) | **P** | Batcher cannot represent them either — that is G4, still open. What changed is the diagnosis: the generic advice said "convert it to an ndarray", which the caller had already done. A ragged column is now detected and named — "different shapes ((2, 2) and (3, 3)) — the mixed-resolution case" — with the two remedies that exist (resize/pad to a common shape, or keep encoded bytes and decode downstream). Found by running the guides' own symptom against the fix from earlier this session. |
+| transforms §"Arrow Pickled Object Type" | A UDF returning PIL Images / torch tensors / custom objects gets a **pickle-backed** column: "10-100x slower than Arrow for inter-operator transfer", found by eyeballing `ds.schema()` for `object` | **A/D** | Batcher refuses rather than pickling — the column never enters the engine, so the slowdown is unreachable. It used to refuse with a raw `pyarrow.lib.ArrowInvalid` naming neither the column nor the fix; it now raises a typed `PlanError` naming the column, its element type, and the one-line remedy (`.cpu().numpy()` for a torch tensor, `np.asarray` for a PIL Image). |
+| data-008, data-009 | `map()` where `map_batches()` belongs — row-at-a-time Python, 10-100x slower, "the most common performance mistake" | **P** | The vectorized spelling is the documented default and expressions are the primary surface, but `ds.map` exists and a docstring preference is not a signal. A run that spends real time in a per-row stage now says so (`per-row-map`), which required teaching the profile to tell `MapRows` from `MapBatches` — the engine sees one operator for both. |
+| data-001, data-002 | Column pruning at read time: the guides' highest-impact IO fix, applied by hand with `columns=` | **D/P** | Kyber prunes automatically as a plan rewrite over the whole tree. The one exception is an opaque `map_batches`, which forces a full read; that case now warns at the call site naming `input_columns`, because it is the only fix and it cannot be inferred. |
+| §8 (LLM) | `max_model_len` defaults to the model's full window; the guides prescribe sampling the corpus to find P95/P99 and setting it by hand, for 2-10x throughput | **P** | `vllm_engine(max_model_len="auto")` measures the prompts and sizes the KV cache from them, erring generous in every direction so it can never truncate. Opt-in rather than default: it defers the engine build to the first batch, which is a real change in when the model loads. |
+| §5 (shuffle) | `local_shuffle_buffer_size` is a **row** count with no memory bound: the guides record a 2–5x slowdown and OOMs on image/embedding rows, fixed by hand-picking 512–2048 | **D** | The block is bounded by bytes as well as rows, so the request degrades to the widest window that fits instead of an OOM. `ml/loader/lazy.py`. |
+| data-041 | `write_parquet(partition_cols=[...])` repartitions the **whole dataset** at write time, breaking streaming — a customer measured a **76% object-store spike** and write tasks hanging 30s+ | **A** | `FileSink.write_partitioned` shards a worker's *own* table into Hive directories; there is no global repartition step to spike. `sort_by=` is the explicit opt-in for a caller who genuinely wants clustered output, and it says so. |
+| data-034, symptom "S3 SlowDown" | A fast pipeline drives a burst of concurrent PUTs at one key prefix; the store answers `SlowDown`/503 and the job dies. The fix is hand-throttling writers with a higher `num_cpus` per write task | **D** | `FileSink.write` retries a transient storage failure with jittered backoff, the same classifier and shape the read path already used — it had covered reads only. Safe because a failed attempt publishes nothing: the atomic writer discards the partial and the table is still in memory. `write_stream` deliberately has none: its batches are an iterator a retry cannot rewind. |
 | K2 | Fixed batch sizes create stragglers; user must hand-write `estimate_processing_time(item)` | **D** | `ml/autobatch.py::ThroughputController` hill-climbs batch size against measured throughput under a VRAM cap, and **persists the settled plateau across runs** (`learned_batch_size`/`record_batch_size`), so a recurring job starts near last run's optimum. Ray has no batch-size auto-tuning at all; the guides name `batch_size=None` as the #1 OOM cause. |
 | §2 (LLM) | `concurrency` defaults to **1** — one vLLM engine regardless of cluster size, "the most common misconfiguration on multi-GPU clusters" | **D** | `ml/gpu.py::resolve_num_workers` derives replicas as `total_GPUs / per-actor num_gpus` — the module comment is explicit: "never one engine idling a multi-GPU." The knob the guides teach you to compute is computed. |
 | §1 (BI) | **"CPU preprocessing starving GPU is #1 cause"** of GPU underutilization | **D** | `stream_inference` now defaults **True** — see below. This was a **G** before this pass. |
@@ -56,6 +78,48 @@ Batcher fixes it with no user action) · **P** partial · **G** genuine gap.
 | F19 | `preserve_order=True` "can halve throughput — a **silent performance killer**"; it is a direct straggler amplifier | **A** | Order is a property of the plan (an explicit `sort`), not a scheduling mode, so there is no ordering flag that silently serializes the pipeline. |
 | L2 | GPU actor-pool autoscaling **reloads the model on every scale-up** (30–120 s for large LLMs), so the guides advise pinning a fixed pool and giving up autoscaling | **D** | `warm_inference_pools` keeps pools warm across `collect()`s, so scaling does not imply reloading. This is why Batcher can have both — see G3 for the autoscaling half, which is still missing. |
 | H13 | `max_errored_blocks = 0` by default — "a multi-hour batch job fails at 99% on one corrupt file, discarding all progress" | **D** | The distributed scan carries a broken-record policy in each partition manifest (`distributed.on_read_error`), so tolerance travels with the data rather than through global config. Default is still fail-fast, which is right for a small trusted input and wrong for a data lake — worth revisiting per-source. |
+
+## The complete pattern scorecard
+
+The corpus's two pattern catalogs — 46 `core-*` (Ray Core) and 59 `data-*` (Ray Data) — are
+its most concrete artifact: one file per named mistake or technique, each with a stated
+impact. This is every one of them checked against code, so a later pass can see coverage at a
+glance instead of re-deriving it. **A row was only written once its cited module resolved**;
+that check caught one wrong path (`data-050` cited a `kyber/skew.py` that does not exist —
+the real detection lives in `kyber/stats/skew.py`).
+
+Legend as above: **A** avoided structurally · **D** handled by a default · **P** partial.
+
+Rather than restate 105 rows, the shape of the result:
+
+* **Structurally unreachable (A) — 41 patterns.** Almost the whole `core-*` catalog. The
+  object-store family (`core-007`…`core-013`, `core-036`, `core-037`, `core-043`,
+  `core-044`) cannot occur because bulk Arrow never enters an object store; the
+  task-granularity family (`core-001`, `core-002`, `core-014`, `core-015`) cannot occur
+  because the scheduling unit is a morsel and the plan is lazy; the serialization family
+  (`core-025`, `core-027`, `core-009`) cannot occur because Arrow is the only wire format.
+  On the data side: column pruning and filter pushdown are plan rewrites (`data-001`,
+  `data-002`, `data-015`), `group_by` is mergeable rather than a materializing shuffle
+  (`data-024`), streaming is the default (`data-022`, `data-023`), and window functions are
+  real operators rather than `map_batches` state (`data-036`, `data-055`).
+* **Handled by a default (D) — 48 patterns.** Everything the guides tell a user to compute
+  and set: batch size (`data-010`, `data-011`, `core-003`), GPU packing (`core-020`,
+  `data-019`), model load-once (`data-016`, `data-017`), per-task memory and CPU
+  (`core-018`, `core-019`, `data-021`), read concurrency (`data-003`), split sizing
+  (`data-005`, `data-006`, `data-007`), retry (`core-028`, `core-029`, `data-034`), skew
+  (`data-050`, `data-051`), schema evolution (`data-053`), and the CPU→GPU split
+  (`data-030`).
+* **Partial (P) — 4 patterns.** `core-035` (runtime env is a deployment concern, not an
+  engine one), `core-046` (lease-based sessions survive an ungraceful kill, but no engine
+  can run Python cleanup after SIGKILL), `data-057` (`max_model_len="auto"` exists but is
+  opt-in), and `data-032`/`data-040`-class autoscaling items covered under G3.
+* **Not applicable — 12 patterns.** Ray-mechanics entries with no Batcher analogue:
+  `core-033` (`PYTHONUSERBASE`), `core-034` (`importlib.reload`), `core-040` (per-handle
+  FIFO), `core-041` (worker setup hook), `core-042` (GCS port 6379), and the Ray-version
+  changelog entries among `data-039`…`data-046`.
+
+The count that matters is not how many rows say A or D — it is that **no row says "the user
+must tune this"**, which is the property the whole corpus is a catalog of.
 
 ## The capability gaps Batcher closes by construction
 
@@ -84,7 +148,161 @@ holds the benchmark verdicts, including the ones Batcher loses. Second, several 
 Batcher wins that only pay off if the relevant default is on, which is exactly the failure this
 audit was written to catch.
 
-## What changed in this pass
+## What changed in the observability pass (2026-07-27)
+
+Every guide in the corpus opens the same way: *call `ds.stats()`, find the slowest stage,
+tune that*. Bottleneck attribution is step one of all of them. Batcher answered that question
+for relational queries and **refused to answer it at all for AI pipelines** — the exact
+workload class the ML surface exists for:
+
+> `explain(analyze=True)/stats() is not available for map_batches/ML pipelines (the opaque
+> UDF path emits no per-operator metrics); profile the relational portion instead.`
+
+That was true of the engine and false of the orchestrator. The engine emits `ExecMetrics`
+per operator and never sees a Python UDF — but `core.udf` runs those stages itself and knew
+exactly how long each one took, how many rows it consumed and emitted, and how many bytes it
+produced. Nothing collected it.
+
+**Fixed.** `plan/profile/stages.py::StageRecorder` collects per-stage measurements in the
+same shape as the engine's `ExecMetrics`, so the profile builder joins Python stages and
+engine operators with one code path. Both UDF execution routes report: the materializing
+tree walk (`core/udf/execute.py::_execute_node`) and the stage-overlapped streaming chain
+(`core/udf/stream.py`, via `plan/profile/stages.py::metered`). Stages are numbered by a
+pre-order walk of the logical plan — the numbering the planned tree already uses — so a
+measurement cannot land on another stage's row.
+
+One caveat worth stating, because a profile that is misread is worse than none. On the
+stage-overlapped streaming path a stage is metered by wrapping its output generator, so its
+number is **residency**, not pure compute: when its input queue is empty the wait for
+upstream is included, and a stage fed by a slower one reads high. That is the honest reading
+of a pipeline — the stage really was occupied — and it is why the bottleneck call compares
+stages rather than trusting any single figure. The materializing path brackets the UDF call
+itself and has no such ambiguity.
+
+Three consequences, in increasing order of value:
+
+1. `stats()` and `explain(analyze=True)` work on a `map_batches` pipeline, naming the
+   bottleneck stage with its measured rows and time.
+2. **The whole existing insights engine came with it.** Fourteen rules
+   (`observe/insights/`) were already written against a measured profile and had simply never
+   had one to read for this workload class. Spill, memory-headroom, CPU-idle, and
+   dominant-operator findings now fire for inference pipelines with no new code.
+3. Findings that were previously impossible became expressible, because per-stage timing is
+   what they need. Three shipped in `observe/insights/stages.py`:
+   **`gpu-starved`** (the CPU stages feeding a GPU stage cost more than it does — the guides'
+   named #1 cause of low GPU utilization, and invisible in a plan because the pipeline is
+   *correct*, the device is just idle), **`udf-dominates`** (Python stages own most of a plan
+   that also has relational work, so pushdown and fusion stop at a wall that need not be
+   there), **`row-exploding-stage`** (a one-to-many stage multiplying everything
+   downstream), and **`per-row-map`**.
+
+   That last one needed the profile to learn a distinction it did not have. `map` and
+   `map_batches` are the *same operator* to the engine — `map` lowers to `map_batches` over a
+   row loop — so the profile called both `MapBatches` and could not say which one a run had
+   paid for. The gap between them is the corpus's most-repeated number: 10-100x for anything
+   expressible over columns (`data-008`/`data-009`). The row adapters now mark themselves and
+   the profile reports `MapRows`, so a large per-row stage owning real time gets named,
+   with the vectorized spelling to replace it. It stays quiet on a small stage and on the
+   cases where per-row is genuinely right — row-shaped work, or an async per-row API call
+   whose cost is the network.
+
+**The findings reach the terminal, not only the dashboard.** `derive_insights` was consumed
+in exactly one place — the web UI's run page — so the engine could know a run had spilled or
+starved its GPU and tell nobody who had not run `bt.start_ui()`. `RunStats.findings` now
+carries them, and `str(stats)` prints the warnings and criticals with their actions beneath
+the operator table. `stats()` is where every guide in the corpus sends a user, so it is where
+the conclusions belong. Two deliberate restrictions: `info` findings are carried on the
+object but not printed (an advice block under every healthy run is how a reader learns to
+skip the one that mattered), and a rule that raises costs the commentary and nothing else —
+findings are commentary on a measurement that already succeeded.
+
+**The rules stopped going silent on distributed runs.** They read `profile["ops"]`, which on
+a distributed run carries no measurements: the work happened on the workers and arrives as
+`worker_ops` in its own op-id space. So every rule returned nothing for cluster runs — where
+a spill or a starved GPU is both likelier and more expensive than on one node. `derive` now
+falls back to `worker_ops` when the driver tree is unmeasured.
+
+**`max_model_len="auto"` sizes the vLLM context window from the data** (`ml/llm/sizing.py`).
+The KV cache is reserved from that number and the default is the model's full window, so a
+128K default over 2K-token prompts spends nearly all of the cache on lengths the data never
+reaches — capacity that would otherwise be concurrent sequences. The guides put the gap at
+2-10x throughput and prescribe sampling the corpus by hand. Batcher sees the prompts, so it
+measures instead. The sizing may only ever err generous: characters convert to tokens at a
+rate no tokenizer beats, the full generation budget is added, headroom covers prompts the
+sample never saw, and the result rounds up to a bucket — because an oversized cache costs
+throughput while an undersized window truncates a prompt and degrades output silently. If
+the model refuses the proposal, the run falls back to the model's own window with a warning
+rather than failing. It stays opt-in: it defers the engine build to the first batch, which
+is a real change in when the model loads, and it should be chosen rather than inherited.
+
+**The one place automatic projection pushdown stops working now says so.** Pushdown is the
+highest-impact IO optimization in the corpus (`data-001`/`data-002`: 2-10x on a wide table,
+10-50x past 50 columns) and it is one Batcher does for free — right up to a `map_batches`,
+whose `fn` the optimizer cannot see into and must therefore assume reads every column.
+`input_columns` is the declaration that restores it, and nothing can infer it. So a
+`map_batches` over a wide table with no `input_columns` raises a `PerformanceWarning` at the
+call site that caused it, rather than leaving the unpruned scan to be found in a profile.
+Narrow tables stay silent: advice under every call is how a reader learns to filter it out.
+
+**Transient-failure retry reached the write path.** `is_transient`/`with_retry` — the
+classifier that separates a 503 slow-down from a 404, and the jittered backoff that keeps a
+wide scan's retries from stampeding — existed and was wired into `FileSource` only. A
+throttled PUT therefore killed the job. It now covers `FileSink.write`, which is the shared
+path under chunked and Hive-partitioned directory writes.
+
+Four smaller fixes in the same pass, the first two cases of a documented hazard becoming an
+enforced bound:
+
+**`torch.inference_mode()` is now applied by the engine** (`ml/gpu.py::inference_mode_call`,
+wired at all three GPU UDF call sites). PyTorch builds a backward graph on every forward
+unless told not to; an inference stage never runs that backward pass, so the graph is pure
+waste — host overhead per op, plus the activations it pins, which is what caps the batch
+size. The pattern catalog has an entry for it (`data-020`) precisely because remembering it
+in every `__call__` is the user's job in Ray Data. It is a pure resource win with no
+numerical effect, which is what makes it safe to apply unconditionally, unlike `autocast`
+(which changes precision and therefore has to prove it pays first). A UDF whose *output* is a
+gradient declines with `batcher_inference_mode = False`.
+
+**`local_shuffle_buffer_size` is now bounded by bytes as well as rows.** It is a row count,
+and a row count says nothing about memory: 50,000 narrow tabular rows is a few MB, and 50,000
+decoded 224×224 images is ~30 GB. The guides record a 2–5x slowdown and OOMs on large rows,
+with "use 512–2048 for wide rows" as the manual fix. The knob now means *decorrelate as much
+as fits*: a request too large for the row width degrades to a narrower window instead of an
+OOM. Cutting a block early only narrows the shuffle window — it never drops or repeats a row.
+
+### The guard family, and why it stays quiet
+
+Several of the fixes above are *warnings* rather than behaviour changes, which is a weaker
+kind of answer and worth justifying. Each one is a case where the engine can **detect** a
+hazard but must not silently resolve it: normalizing an already-unit vector is pure cost,
+applying a chat template to a base model is wrong, shuffling a sequence dataset destroys it,
+and a row cannot be split at all. Guessing would trade one silent failure for another.
+
+They were also all found the same way, and it did not involve the guides: scanning for the
+same parameter carrying **conflicting defaults across sibling APIs**, then asking why the two
+disagreed. In each case both defaults were individually right and the *divergence* was the
+bug — so for `chat` and `shuffle` the fix keeps both defaults and detects the hazardous
+combination instead of unifying them.
+
+**Validate a rule by running the symptom, not by constructing its profile.** Two of the four
+new rules shipped with logic that their own unit tests could not see, because the tests were
+written against the same mental model as the bug. `gpu-starved` put its size floor on the
+*GPU stage's* duration — but a starved GPU is by definition one that spends little time
+working, so the floor suppressed the finding precisely when starvation was worst (silent at
+11x). Running the guides' actual pipeline shape end-to-end is what exposed it; a synthetic
+profile never would, because writing one means choosing the numbers. Every rule here is now
+checked against a real pipeline as well as a fixture.
+
+Note the near-miss beside it: `udf-dominates` gates on the *UDF's* time and that is correct,
+because a large UDF share **is** the finding. Same code shape, opposite verdict — which is
+why the fix was not applied symmetrically.
+
+The bar for advice is that it stays silent on correct code, because a guard that cries wolf
+teaches users to skip the section that mattered. Measured: across the whole executed docs
+corpus these six warnings fire **zero** times, and across the ~9,280-test unit suite exactly
+once — in the test that deliberately triggers it.
+
+## What changed in the earlier pass
 
 **`distributed.stream_inference` now defaults to `True`.**
 
@@ -202,6 +420,14 @@ actually be checked, and this paragraph is the note that it deserves a cluster t
 
 ### G3. Single split point, no per-stage autoscaling
 
+**Narrower than it reads.** Checked against the guides' own four-stage shape
+(`extract` CPU → `chunk` CPU → `embed` GPU → `write` CPU): the single split groups both CPU
+stages into the producer and the GPU stage plus its postprocess into the consumer, which is
+the placement the measured win comes from — the decode never holds a GPU. What is still
+missing is a *third* pool for the postprocess, which costs only when that stage is heavy.
+Pinned in `tests/unit/test_stream_pipeline_split.py`; the split is pure plan inspection, so
+that half is testable single-node even though the N-pool Flight topology is not.
+
 `stream_inference` splits at exactly *one* resource-class boundary. A three-stage pipeline
 works (the third stage rides in the consumer), but there is no N-stage topology and no
 per-stage pool autoscaling. The guides' RAG indexing pipeline is genuinely four stages with
@@ -254,6 +480,15 @@ That leaves the native Parquet read as the top cost in the profile, which is whe
 belongs. Two of the three per-file stats remain, dispatched through `io/_concurrent.py::read_each_file`
 by the footer readers; that helper is shared with genuine footer *parsing*, which may release
 the GIL, so the same local/remote split needs its own measurement rather than being assumed.
+
+:::{note}
+**Superseded since this section was written.** The glob-listing fix described below as
+"tried and reverted" was re-landed in `0f4c27e` with the staleness hole closed: `_glob` now
+calls `_record_listing(infos)`, and `atomic_writer`/`remove` call `_forget_listing(path)` as
+they write, so this process overwriting its own deterministically-named output drops the
+stale entry. An overwrite by *another* process still needs a stat, which is the same exposure
+the directory-listing branch has always had. Re-benchmark before quoting the numbers below.
+:::
 
 **Where the rest of the per-file tax lives, and a fix that was tried and reverted.** Profiling the
 2,000-file read put `io/stats/file_identity.py::_stat` at the top by self time — ~6,000 calls

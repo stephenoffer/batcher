@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-__all__ = ["argmax_prediction", "linear_score", "require_fitted"]
+__all__ = ["argmax_prediction", "linear_score", "require_fitted", "require_rows"]
 
 
 def require_fitted(estimator: object, state: T | None, method: str = "predict") -> T:
@@ -101,3 +101,29 @@ def argmax_prediction(labels: Sequence[T], score_of: Callable[[T], Expr]) -> Exp
         prediction = when(closer).then(lit(label)).otherwise(prediction)
         best = when(closer).then(score).otherwise(best)
     return prediction
+
+
+def require_rows(estimator: object, rows: int, needed: int, *, because: str) -> None:
+    """Raise unless `rows` is enough to fit, naming the count and why that many are needed.
+
+    Every estimator here fits from aggregates, and an aggregate over an empty relation is
+    null — so `float(None)` raised ``TypeError: float() argument must be a string or a real
+    number, not 'NoneType'`` from inside the solve, a message about a conversion for a
+    dataset that simply had nothing in it. The floor differs by estimator (a covariance needs
+    two rows, an IRLS fit needs one per term), which is why `because` is the caller's to say.
+
+    Args:
+        estimator: The estimator instance, for the class name in the message.
+        rows: How many rows the training set actually has.
+        needed: The minimum this fit requires.
+        because: Why that many, phrased to complete "needs at least N rows because ...".
+
+    Raises:
+        PlanError: If `rows` is below `needed`.
+    """
+    if rows >= needed:
+        return
+    raise PlanError(
+        f"{type(estimator).__name__} cannot fit on {rows} row(s): it needs at least "
+        f"{needed} because {because}. Check the filters upstream of fit()."
+    )

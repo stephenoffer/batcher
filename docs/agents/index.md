@@ -54,7 +54,6 @@ returns the same rows as the original.
 | `migrate-from-spark` | PySpark |
 | `migrate-from-polars-or-pandas` | Polars, pandas, and DataFrame-style code generally |
 | `migrate-from-duckdb-sql` | DuckDB and SQL. Also covers *writing* new SQL against Batcher |
-| `migrate-from-ray-data` | Ray Data |
 | `migrate-from-daft` | Daft, especially multimodal and batch-inference workloads |
 | `migrate-from-a-sql-warehouse` | A SQL warehouse or JDBC extract: Spark JDBC, pandas `read_sql`, SQLAlchemy, DB-API |
 

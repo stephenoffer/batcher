@@ -212,9 +212,9 @@ failure means a mergeability bug, not a slow run (it exits 0 with a skip if Ray 
 `benchmarks/scenarios/dist_bench.py --workers 4` and `benchmarks/cluster/vs_ray_daft.py` are
 the standalone drivers.
 
-Keep claims honest: on the same 16×8 cluster Batcher leads Ray Data by 3–8000× across shapes
-but **loses `filter_count` to Daft at sf10 (0.92×) and sf100 (0.84×)**, and below one GPU's
-memory a single-GPU cuDF run beats the distributed one.
+Keep claims honest: on the same 16×8 cluster Batcher **loses `filter_count` to Daft at sf10
+(0.92×) and sf100 (0.84×)**, and below one GPU's memory a single-GPU cuDF run beats the
+distributed one.
 
 ## See also
 
@@ -224,5 +224,5 @@ memory a single-GPU cuDF run beats the distributed one.
 - `docs/benchmarks/{scaling,vs-spark}.md` — the Spark page is an architectural argument and
   publishes **no** head-to-head timings; do not quote it as a measurement.
 - Skills: `write-a-batcher-pipeline`, `optimize-a-slow-query`, `debug-a-batcher-query`,
-  `build-an-ml-pipeline`, `migrate-from-spark` / `migrate-from-ray-data`, and
+  `build-an-ml-pipeline`, `migrate-from-spark`, and
   `add-distributed-operator` (only if you are changing the engine, not using it).

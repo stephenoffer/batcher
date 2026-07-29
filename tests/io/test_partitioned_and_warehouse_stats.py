@@ -28,9 +28,9 @@ pytestmark = pytest.mark.unit
 def partitioned(tmp_path):
     """A two-partition Parquet tree with a numeric data column."""
     path = str(tmp_path / "ds")
-    bt.from_pydict(
-        {"region": ["us", "us", "eu", "eu"], "amt": [10, 20, 30, 40]}
-    ).write.parquet(path, partition_by=["region"])
+    bt.from_pydict({"region": ["us", "us", "eu", "eu"], "amt": [10, 20, 30, 40]}).write.parquet(
+        path, partition_by=["region"]
+    )
     return path
 
 

@@ -33,6 +33,13 @@ from batcher.kyber.rules.extra import join_extra as _join_extra  # noqa: F401
 from batcher.kyber.rules.extra import limit_extra as _limit_extra  # noqa: F401
 from batcher.kyber.rules.extra import metadata_adaptive as _metadata_adaptive  # noqa: F401
 from batcher.kyber.rules.extra import nullability as _nullability  # noqa: F401
+
+# Registration order is run order: the shape-driven null rules registered directly after
+# the nullability-driven ones when the two shared a module.
+# isort: off
+from batcher.kyber.rules.extra import null_shapes as _null_shapes  # noqa: F401
+
+# isort: on
 from batcher.kyber.rules.extra import predicate_infer as _predicate_infer  # noqa: F401
 from batcher.kyber.rules.extra import projection_scan as _projection_scan  # noqa: F401
 from batcher.kyber.rules.extra import pushdown_gaps as _pushdown_gaps  # noqa: F401
@@ -41,7 +48,19 @@ from batcher.kyber.rules.extra import sargable as _sargable  # noqa: F401
 from batcher.kyber.rules.extra import setops as _setops  # noqa: F401
 from batcher.kyber.rules.extra import setops_extra as _setops_extra  # noqa: F401
 from batcher.kyber.rules.extra import strings as _strings  # noqa: F401
+
+# Registration order is run order: the folding half of the string family registered
+# immediately after the pattern half when the two shared one module, so it is imported
+# here rather than in sorted position.
+# isort: off
+from batcher.kyber.rules.extra import string_folds as _string_folds  # noqa: F401
+
+# isort: on
 from batcher.kyber.rules.extra import temporal_extra as _temporal_extra  # noqa: F401
+
+# Imported immediately after `temporal_extra`: the folding rules were split out of it and
+# must keep registering in the same position, since registration order is run order.
+from batcher.kyber.rules.extra import temporal_folds as _temporal_folds  # noqa: F401
 from batcher.kyber.rules.extra import temporal_sargable as _temporal_sargable  # noqa: F401
 from batcher.kyber.rules.extra import topn_limit as _topn_limit  # noqa: F401
 from batcher.kyber.rules.extra import window_extra as _window_extra  # noqa: F401

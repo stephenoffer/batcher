@@ -19,6 +19,13 @@ from batcher.plan.profile.collect import (
     walk_ir,
     worker_op_profiles,
 )
+from batcher.plan.profile.stages import (
+    StageRecorder,
+    logical_op_ids,
+    logical_preorder,
+    metered,
+    stage_kind,
+)
 from batcher.plan.profile.types import Decision, OpProfile, QueryProfile
 
 __all__ = [
@@ -26,8 +33,13 @@ __all__ = [
     "OpProfile",
     "ProfileCollector",
     "QueryProfile",
+    "StageRecorder",
     "build_op_profiles",
+    "logical_op_ids",
+    "logical_preorder",
     "merge_metric_ops",
+    "metered",
+    "stage_kind",
     "walk_ir",
     "worker_op_profiles",
 ]

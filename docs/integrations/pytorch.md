@@ -15,8 +15,8 @@ device.
 
 The measured stake, on 10 M rows x 32 float features, `batch_size=1024`, `prefetch=2`: 1.76 Mrows/s
 through `iter_torch_batches`, and 1.28 Mrows/s on a 4-rank DDP `streaming_split`
-(`benchmarks/BENCHMARK_RESULTS.md`). Last-mile ingest is where a training job quietly starves
-its GPUs, so measure it rather than assume it.
+(`benchmarks/BENCHMARK_RESULTS.md`). Ingest throughput is easy to assume and cheap to check,
+so measure it against your own data rather than taking either figure on trust.
 
 ## Tensors in
 

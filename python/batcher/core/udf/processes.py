@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pickle
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pyarrow as pa
@@ -231,3 +232,71 @@ def run_map_processes(
         # would otherwise leave one behind per interpreter.
         with contextlib.suppress(OSError):
             os.rmdir(os.path.dirname(paths[0]))
+
+
+#: Serialized-UDF size past which the payload is almost certainly captured *data* rather
+#: than code. Ray warns at the same 10 MB and errors at 100 MB, and the guides are blunt
+#: about what it means: "10MB+ function closure means a bug in your code" — a DataFrame or
+#: a weight tensor caught in a closure and shipped with every dispatch.
+_FAT_CLOSURE_BYTES = 10 << 20
+_FAT_CLOSURE_WARNED = False
+
+
+def warn_if_closure_is_fat(size: int) -> None:
+    """Warn once when a UDF serializes to more than code plausibly should.
+
+    The process path pickles the callable to each child, so whatever the callable *carries*
+    rides along every time. Code is kilobytes; megabytes are data — a lookup table bound in
+    with `functools.partial`, or a callable object holding one on `self`. The remedy is to
+    load it inside a class UDF's `__init__` (once per worker) instead, which is the same
+    shape the GPU model-reload warning already asks for.
+
+    **What it cannot see.** `pickle` serializes a module-level function *by reference*, so a
+    plain `def` that reads a large global pickles to a few bytes and is not flagged — Ray
+    catches that case only because cloudpickle serializes globals by value. A closure over
+    large data is not flagged either, for a blunter reason: it fails to pickle at all, and
+    is rejected before reaching here. So this covers what the process path can actually
+    carry, and is deliberately not extended to a serializer that path does not use.
+
+    The size comes from a pickle that had to happen anyway, so this measures nothing new.
+
+    Args:
+        size: The serialized size of the callable, in bytes.
+    """
+    global _FAT_CLOSURE_WARNED
+    if size < _FAT_CLOSURE_BYTES or _FAT_CLOSURE_WARNED:
+        return
+    _FAT_CLOSURE_WARNED = True
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        f"this map_batches fn serializes to {size / (1 << 20):.0f} MB, which is data "
+        f"captured from the enclosing scope rather than code — and it is shipped with "
+        f"every dispatch. Load it inside a class UDF's __init__ so it is built once per "
+        f"worker, and pass the class instead of the function.",
+        PerformanceWarning,
+        stacklevel=3,
+    )
+
+
+def is_picklable(obj: object) -> bool:
+    """Whether `obj` survives `pickle` — and, for free, whether it is suspiciously large.
+
+    Lives here rather than beside the strategy that calls it because both halves are
+    process-pool facts: only the process path pickles the callable, and the size
+    `warn_if_closure_is_fat` judges comes out of that same dump.
+
+    Args:
+        obj: The callable a process worker would have to receive.
+
+    Returns:
+        True when it pickles.
+    """
+    try:
+        payload = pickle.dumps(obj)
+    except Exception:
+        return False
+    warn_if_closure_is_fat(len(payload))
+    return True

@@ -125,6 +125,19 @@ class QuadraticDiscriminantAnalysis:
         for label in labels:
             subset = ds.filter(col(self.target) == label)
             count = subset.count()
+            if count < 2:
+                # A full per-class covariance divides by `count - 1`, so a class with a single
+                # example produces a NaN matrix and `pinv` then raised
+                # ``LinAlgError: SVD did not converge`` — a solver message for what is really a
+                # rare class. This is the ordinary shape of imbalanced data, so name the class.
+                from batcher._internal.errors import PlanError
+
+                raise PlanError(
+                    f"QuadraticDiscriminantAnalysis needs at least 2 examples per class to "
+                    f"estimate a covariance, but class {label!r} has {count}. Drop or merge the "
+                    f"rare class, or use LinearDiscriminantAnalysis, which pools one covariance "
+                    f"across all classes."
+                )
             means = subset.agg(**{name: mean_(col(name)) for name in self.features}).collect()
             covariance = covariance_matrix(subset, self.features).to_pydict()
             matrix = np.array([covariance[name] for name in self.features], dtype=float).T

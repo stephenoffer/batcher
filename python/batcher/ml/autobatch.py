@@ -103,10 +103,21 @@ class ThroughputController:
         hub: MetadataHub | None = None,
         signature: str | None = None,
     ) -> None:
+        # Typed, and naming the values: these are user-supplied autobatch bounds, and a
+        # message that restates the rule without saying which number broke it makes the
+        # caller re-read their own call to find out.
+        from batcher._internal.errors import PlanError
+
         if min_rows < 1 or max_rows < min_rows:
-            raise ValueError("require 1 <= min_rows <= max_rows")
+            raise PlanError(
+                f"autobatch needs 1 <= min_rows <= max_rows, got min_rows={min_rows}, "
+                f"max_rows={max_rows}"
+            )
         if grow <= 1.0 or not (0.0 < shrink < 1.0):
-            raise ValueError("require grow > 1 and 0 < shrink < 1")
+            raise PlanError(
+                f"autobatch needs grow > 1 and 0 < shrink < 1 (it grows on success and "
+                f"shrinks on OOM), got grow={grow}, shrink={shrink}"
+            )
         self._min = min_rows
         self._max = max_rows
         self._vram_cap = vram_cap

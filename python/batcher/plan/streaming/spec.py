@@ -288,13 +288,24 @@ class OutputMode:
 
 @dataclass(frozen=True, slots=True)
 class StreamingQueryProgress:
-    """Metrics for one completed micro-batch (Spark `StreamingQueryProgress` parity)."""
+    """Metrics for one completed micro-batch (Spark `StreamingQueryProgress` parity).
+
+    ``behind_by_ms`` is how much longer the micro-batch took than the trigger cadence it
+    fires on — the one question a low-latency query needs answered and the one nothing here
+    could answer. Throughput says how fast the batch ran; it cannot say whether that was
+    fast *enough*, because "enough" is the trigger interval and the progress record did not
+    carry it. A query behind by a growing amount is falling behind its source no matter how
+    healthy its rows-per-second looks. ``0.0`` when the batch kept up, and for a trigger
+    with no interval (``once`` / ``available_now`` / ``continuous``), where there is no
+    cadence to be late for.
+    """
 
     batch_id: int
     num_input_rows: int
     num_output_rows: int
     duration_ms: float
     timestamp: float
+    behind_by_ms: float = 0.0
 
     @property
     def input_rows_per_second(self) -> float:
@@ -311,11 +322,33 @@ class StreamingQueryProgress:
         """
         return self.num_output_rows / (self.duration_ms / 1000.0) if self.duration_ms else 0.0
 
+    @property
+    def is_behind(self) -> bool:
+        """Whether this micro-batch overran the trigger cadence it fires on.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.streaming import StreamingQueryProgress
+                >>> p = StreamingQueryProgress(0, 10, 10, 250.0, 0.0, behind_by_ms=150.0)
+                >>> p.is_behind
+                True
+
+        Returns:
+            True when the batch took longer than its trigger interval.
+        """
+        return self.behind_by_ms > 0.0
+
     def __str__(self) -> str:
-        """A one-line human summary: batch id, rows in/out, duration, throughput."""
+        """A one-line human summary: batch id, rows in/out, duration, throughput.
+
+        A batch that overran its trigger says so, because a throughput figure alone reads
+        as healthy right up until the query is hours behind its source.
+        """
+        late = f", {self.behind_by_ms:.0f}ms behind" if self.is_behind else ""
         return (
             f"batch {self.batch_id}: {self.num_input_rows} in -> {self.num_output_rows} out "
-            f"in {self.duration_ms:.0f}ms ({self.input_rows_per_second:.0f} rows/s)"
+            f"in {self.duration_ms:.0f}ms ({self.input_rows_per_second:.0f} rows/s{late})"
         )
 
 
