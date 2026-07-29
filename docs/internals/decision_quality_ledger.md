@@ -260,3 +260,39 @@ columnar source's width estimate genuinely moves.
 | D68 | test | **The matrix was checked against the pre-session commit and 13 of its 27 cells fail there**, which is what makes it worth having rather than a set of assertions true by construction. Two of those (the image and video-frame width cells) fail on *behaviour* — a decoded frame was sized at the 32-byte variable-length prior. The other eleven fail because the API did not exist: there was no `net` axis to be monotone in, and `morsel_target` took no plan to size a cold store from. Both are meaningful and they are not the same thing, so the distinction is recorded rather than reported as thirteen caught regressions. |
 
 | D69 | test | The open item above was verified rather than left as a plausible note. The learned CPU-share override does activate for `Unnest` (`op_stats` records `cpu_utilization` on every explode, `class_ir_tag` maps the family, `load_cpu_utilization` surfaces it) — but only past `_REFRESH_AFTER`, because the first optimize of a process caches an empty map against a cold hub and holds it for 64 version bumps. Twenty-five runs still read `{}`; around sixty refresh it. Worth recording because "a measurement will correct this" reads as immediate and is not. |
+
+---
+
+## Where to continue
+
+The entries above share one shape, and naming it is more useful to the next reader than the
+list: **a decision tuned on `int64` columns, applied unchanged to data three to six orders
+of magnitude wider, failing silently.** The plan is produced, it runs, and it OOMs or spills
+for a reason nothing in the plan explains. Four questions found most of them, and they are
+worth asking of any decision surface not yet covered here:
+
+1. **Is the threshold in rows?** A row count assumes a row width. Every row-only threshold
+   examined so far inverted across the modality range (D25, D37, D59). The fix is never to
+   replace the row term but to take `max(rows-derived, bytes-derived)`, so narrow data is
+   untouched by construction.
+2. **Does the type prior see through the label?** No `pa.types.is_*` predicate sees through
+   an extension type, and every multimodal column in Batcher wears one (D1, D31).
+3. **Does the correction survive going warm?** A fix on the cold path that a learned model
+   routes around applies only until the engine learns something, and every cold-path test
+   stays green while it does (D62). Ask what the *warm* path does.
+4. **Is the same question answered differently by container type?** Containment over a
+   string, a document, and a list is one question and got three answers (D65). So did "how
+   many tasks" (D38) and "how big is this join" (D21).
+
+Concrete work these leave open, in the order their evidence is strongest:
+
+- **Nested statistics need the Rust side first.** `bc-io/src/footer_stats.rs::parquet_column_index`
+  requires a single-part leaf path, so the native walk is flat-only by design and nested
+  footer bounds reach only the Python fallback. A `StructField`-chain resolver feeding
+  selectivity and zone-map pruning is scoped and deliberately unbuilt until then.
+- **The anchored/substring priors are provably inconsistent** and the containment argument
+  says to clamp them, while TPC-H Q14 says the clamp makes the absolute error worse (D36).
+  Settling it needs `benchmarks/run.py`, not reasoning.
+- **Packing density for a row-expanding operator.** With D55 an explode is budgeted at its
+  fan-out, so `n` co-packed explodes are `n x ~100 MB` on a node. The CPU classification has
+  measured support (D69); the memory side is a `bench-dist` question.
