@@ -224,13 +224,31 @@ pub(crate) fn write_ipc_file(
             arrow::ipc::MetadataVersion::V5,
         )
         .map_err(std::io::Error::other)?;
+        // Buffered, because arrow's IPC writer issues a separate `write` per message *and
+        // per buffer within it*: a batch with `k` columns costs on the order of `2k`
+        // syscalls, most of them a few KB of validity/offset data. A spilled bucket of a few
+        // hundred morsels over a dozen columns is thousands of syscalls for bytes that
+        // coalesce into a handful of 1 MiB writes. Unlike the runtime spill store — which
+        // holds one writer per partition and so budgets its buffering in total — this path
+        // writes exactly one file at a time, so a fixed buffer cannot multiply.
+        //
+        // The bytes on disk are identical (the reader mmaps the same file), and the flush
+        // below still runs before the rename that publishes it.
+        let file = std::io::BufWriter::with_capacity(1 << 20, file);
         let mut writer = FileWriter::try_new_with_options(file, &batches[0].schema(), opts)
             .map_err(std::io::Error::other)?;
         for b in batches {
             writer.write(b).map_err(std::io::Error::other)?;
         }
         writer.finish().map_err(std::io::Error::other)?;
-        let mut file = writer.into_inner().map_err(std::io::Error::other)?;
+        // `into_inner` on the `BufWriter` is what surfaces a failed flush of the *buffered*
+        // tail. Dropping it would swallow that error and the rename below would publish a
+        // truncated bucket — the one failure this path must not make silent.
+        let mut file = writer
+            .into_inner()
+            .map_err(std::io::Error::other)?
+            .into_inner()
+            .map_err(std::io::Error::other)?;
         file.flush()?;
     }
     fs::rename(&tmp, path)

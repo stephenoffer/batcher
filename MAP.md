@@ -1960,7 +1960,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `isa.py` | 137 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 67 | The memory ceiling and page geometry this process runs under. |
 | `probes.py` | 55 | The one hook that clears every memoized hardware reading. |
-| `profile.py` | 306 | The machine's identity — one record of what this hardware is, and a key that names it. |
+| `profile.py` | 321 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 107 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
@@ -2207,7 +2207,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `exchange.rs` | 715 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 387 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 105 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
-| `shared.rs` | 411 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
+| `shared.rs` | 429 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 407 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 91 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 184 | TLS configuration for the inter-node Flight shuffle. |

@@ -450,3 +450,37 @@ the properties of *its* buckets decide whether "bounded" is true.
   than hoping a halved file lands there — arrow catches a mid-message cut on its own, and
   only the boundary case needs the count. An intact partition must still read without
   complaint, or the check would be a way to fail every spilling query.
+
+---
+
+## Program 7 — The shuffle store's spill
+
+`bc-transport`'s `PartitionStore` spills published shuffle buckets to disk under a byte cap.
+It writes the Arrow IPC **file** format (footer of per-batch block offsets) rather than the
+stream format, so a truncated file loses its footer and fails to open — it does not have the
+silent-shortening hazard of Program 6. Two other things it shared.
+
+### #27 — Its spill writes are buffered
+
+- **Was:** `FileWriter` straight onto the `File`. Arrow issues a separate write per message
+  and per buffer within it, so a spilled bucket of a few hundred morsels over a dozen columns
+  was thousands of syscalls for bytes that coalesce into a handful of 1 MiB writes.
+- **Now:** a 1 MiB `BufWriter`. A **fixed** size is right here, unlike the runtime store which
+  budgets in total: this path writes exactly one file at a time, so the buffer cannot
+  multiply by a fan-out.
+- **The error path matters more than the buffer:** `into_inner` on the `BufWriter` is what
+  surfaces a failed flush of the buffered tail. Dropping it would swallow that error and the
+  rename that publishes the bucket would publish a **truncated** one — the single failure
+  this path must not make silent.
+
+### #28 — Its memory-release test no longer fails under load
+
+- **Was:** the test measured `/proc/self/statm` deltas. That is process-wide, and `cargo test`
+  runs the binary's tests in parallel threads, so a sibling test allocating during the
+  measurement landed in the delta. It passed alone and failed inside a full-workspace run.
+- **Now:** best of three trials. Not a weakened assertion — the noise can only *inflate* the
+  bounded figure and cause a false failure; it cannot fabricate a pass. A run that observes
+  the expected shape once has observed it.
+- **Why it was worth fixing:** a test that fails only under load is the worst kind. It guards
+  a real property (spilling returns pages to the process, not just to a counter) and teaches
+  people to ignore it.
