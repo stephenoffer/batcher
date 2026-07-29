@@ -260,3 +260,35 @@ under a salt derived from the recursion depth.
 - **Now:** 256 per level. This is not a lower ceiling: four levels at 256 ways is four billion
   sub-partitions, far past any real ratio of state to envelope. It bounds the cost of a single
   level, and the recursion reaches the same per-partition size through more, cheaper levels.
+
+---
+
+## Program 4 — The handoff to the spilling executor must precede the allocation it avoids
+
+The streaming executor's breakers do not spill. When one finds its input over the envelope it
+returns `MemoryBudgetExceeded`, and `bc_py::execute_plan` re-runs the query on the
+materializing executor, which does. That handoff is the mechanism that turns a would-be OOM
+into a spill.
+
+### #18 — Breakers give way *while* draining, not after
+
+- **Was:** `let batches = drain(...)?;` then `check_budget(batch_bytes(&batches))`. The check
+  ran after the allocation it exists to prevent. An input ten times the envelope is ten
+  envelopes of resident memory before a single byte of the check runs — so the process dies
+  at the drain, and the executor that could have spilled is never reached. **In exactly the
+  case the guard exists for, the guard was unreachable.**
+- **Now:** `drain_within_budget` accumulates and checks per morsel, so the held bytes are
+  bounded at roughly the envelope plus one morsel. Applied to `Sort`, `Distinct`,
+  `UNION DISTINCT`, and the deferred-breaker path (`Window`, `Sample`, `AsofJoin`), the last
+  two budgeting each branch or child against what the earlier ones already hold, since the
+  envelope covers all of them at once.
+- **Cost:** the reported `needed` is where the accumulation crossed the line rather than the
+  input's true size. That is deliberate — knowing the exact total means holding the whole
+  thing, which is what is being prevented — and the decision it feeds ("this does not fit,
+  use the executor that spills") is the same either way.
+- **Proof:** `an_over_budget_breaker_gives_way_before_materializing_its_input` in
+  `crates/bc-interp/tests/stream_memory.rs`, measured on live heap by that binary's counting
+  allocator. Refusing a 64 MB input under an 8 MB envelope: **32 MB peak before, under 16 MB
+  after**. The sort's input is a *projection*, not a scan — a scan over already-materialized
+  sources yields zero-copy slices, so collecting them allocates almost nothing and would have
+  hidden the very thing being measured.

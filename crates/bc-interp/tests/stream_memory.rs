@@ -179,3 +179,63 @@ fn peak_memory_streaming_vs_materializing() {
         l
     );
 }
+
+/// A breaker that cannot fit its input must give way to the spilling executor **before** it
+/// has materialized that input, not after.
+///
+/// The streaming sort/distinct/union breakers hold their input, and when it exceeds the
+/// envelope they return `MemoryBudgetExceeded` so the caller re-runs the query on the
+/// executor that spills. That handoff is what turns a would-be OOM into a spill -- but it
+/// only works if it happens before the allocation it is avoiding. Draining the whole input
+/// and checking afterwards inverts it: an input ten times the envelope is ten envelopes of
+/// resident memory before a single byte of the check runs, so the process dies at the drain
+/// and the executor that could have spilled is never reached. The guard was, in exactly the
+/// case it exists for, unreachable.
+///
+/// Measured on live heap rather than argued: the peak while refusing an input many times the
+/// envelope must stay near the envelope.
+#[test]
+fn an_over_budget_breaker_gives_way_before_materializing_its_input() {
+    // The sort's input is *computed*, not scanned. A scan over already-materialized sources
+    // yields zero-copy slices, so collecting them allocates almost nothing and would hide the
+    // very thing being measured; a projection allocates a fresh column per morsel, which is
+    // what a real pipeline feeding a breaker does.
+    let sort: RelOp = serde_json::from_str(
+        r#"{"op":"sort",
+            "input":{"op":"project","input":{"op":"scan","source_id":0},"exprs":[
+                {"expr":{"e":"col","name":"k"},"alias":"k"},
+                {"expr":{"e":"binary","op":"mul","left":{"e":"col","name":"v"},
+                         "right":{"e":"lit","value":{"int":2}}},"alias":"v"}]},
+            "keys":[{"expr":{"e":"col","name":"v"},"descending":false,"nulls_first":false}],
+            "limit":null}"#,
+    )
+    .unwrap();
+
+    // ~4 M rows over 8 payload columns: a few hundred MB, and far more than the envelope.
+    let srcs = vec![facts(4_000_000, 8)];
+    // What the sort would hold: the projection's two i64 columns over every row.
+    let input_bytes: usize = 4_000_000 * 2 * std::mem::size_of::<i64>();
+    let budget = 8 << 20; // 8 MiB
+
+    let base = LIVE.load(Ordering::Relaxed);
+    let mut refused = false;
+    let peak = peak_of(|| {
+        // `black_box` so the result cannot be optimized away.
+        let r = std::hint::black_box(execute_streaming(&sort, &srcs, budget));
+        refused = r.is_err();
+    }) - base;
+
+    assert!(
+        refused,
+        "a {input_bytes}-byte sort under an {budget}-byte envelope must give way, not run"
+    );
+    // Generous headroom: the bail holds up to the budget plus the morsel that crossed it,
+    // plus whatever the scan pipeline holds in flight. The point is that it is bounded by the
+    // *envelope* and not by the input -- an order of magnitude below the input either way.
+    assert!(
+        peak < input_bytes / 4,
+        "refusing a {input_bytes}-byte input under an {budget}-byte envelope peaked at \
+         {peak} bytes -- the whole input was materialized before the budget check ran, so \
+         the handoff to the spilling executor happens after the OOM it exists to prevent"
+    );
+}

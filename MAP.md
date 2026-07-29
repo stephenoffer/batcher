@@ -803,8 +803,8 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
-| `policy.py` | 238 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
-| `sizing.py` | 71 | SELECTION-phase rule — size a GPU inference stage's resources. |
+| `policy.py` | 262 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `sizing.py` | 104 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem
 
@@ -1864,7 +1864,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `infer.py` | 485 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
-| `widths.py` | 219 | Static per-column byte widths derived from a column's Arrow type. |
+| `widths.py` | 220 | Static per-column byte widths derived from a column's Arrow type. |
 
 ### `batcher/metadata/` — 1 · contract
 

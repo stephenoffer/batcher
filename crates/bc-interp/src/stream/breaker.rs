@@ -38,6 +38,50 @@ pub(super) fn drain(stream: Morsels<'_>) -> Result<Vec<RecordBatch>, InterpError
     stream.collect()
 }
 
+/// Pull a stream to exhaustion, **stopping** the moment what has been accumulated exceeds
+/// `budget`.
+///
+/// The breakers below give way to the spilling executor when their input does not fit, which
+/// is what turns a would-be OOM into a spill. That handoff only works if it happens *before*
+/// the allocation it is avoiding. Draining first and checking afterwards inverts it: an input
+/// ten times the envelope is ten envelopes of resident memory before a single byte of the
+/// check runs, so the process dies at the drain and the executor that could have spilled is
+/// never reached. The guard was, in the case it exists for, unreachable.
+///
+/// Checking per morsel bounds the held bytes at roughly `budget` plus one morsel. The
+/// reported `needed` is therefore where the accumulation crossed the line rather than the
+/// input's true size — a lower bound, and deliberately so: knowing the exact total requires
+/// holding the whole thing, which is the thing being prevented. The decision it feeds ("this
+/// does not fit, use the executor that spills") is the same either way.
+///
+/// `budget == 0` is "unbounded", where there is nothing to enforce and no spilling path to
+/// prefer, so this is exactly [`drain`].
+fn drain_within_budget(
+    stream: Morsels<'_>,
+    budget: usize,
+    reason: &'static str,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    if budget == 0 {
+        return drain(stream);
+    }
+    let mut held: u64 = 0;
+    let mut out = Vec::new();
+    for batch in stream {
+        let batch = batch?;
+        held += batch.get_array_memory_size() as u64;
+        if held as usize > budget {
+            // `out` is dropped on the way out, so the bail releases what it accumulated.
+            return Err(InterpError::MemoryBudgetExceeded {
+                needed: held as usize,
+                budget,
+                reason,
+            });
+        }
+        out.push(batch);
+    }
+    Ok(out)
+}
+
 /// [`fold_partial`], with the per-morsel `partial` step spread across `workers`.
 ///
 /// The sequential fold is the right shape when this breaker is *inside* a sharded worker (there
@@ -209,12 +253,16 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
         }
 
         RelOp::Sort { input, keys, limit } => {
-            let batches = drain(build_with(input, ctx)?)?;
+            // A sort genuinely holds its input; over budget, the external (spilling) sort in
+            // the materializing executor is the right tool, so give way to it — and give way
+            // *while draining*, so the input that does not fit is never fully resident.
+            let batches = drain_within_budget(
+                build_with(input, ctx)?,
+                ctx.budget,
+                "the streaming sort does not spill",
+            )?;
             let rows_in = crate::count_rows(&batches);
             let held = crate::batch_bytes(&batches);
-            // A sort genuinely holds its input; over budget, the external (spilling) sort in the
-            // materializing executor is the right tool, so give way to it.
-            ctx.check_budget(held, "the streaming sort does not spill")?;
             let t = Instant::now();
             let out = match limit {
                 // Top-N: reduce each morsel to its local top-k in parallel and merge the narrow
@@ -257,13 +305,16 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
         // Without this a 6M-row DISTINCT ran single-threaded — ~7x DuckDB.
         RelOp::Distinct { input } => {
             let t = Instant::now();
-            let batches = drain(build_with(input, ctx)?)?;
+            let batches = drain_within_budget(
+                build_with(input, ctx)?,
+                ctx.budget,
+                "the streaming distinct does not spill",
+            )?;
             if batches.is_empty() {
                 return exec_deferred_breaker(plan, ctx);
             }
             let rows_in = crate::count_rows(&batches);
             let held = crate::batch_bytes(&batches);
-            ctx.check_budget(held, "the streaming distinct does not spill")?;
             let out = ops::parallel_distinct(&batches)?;
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
@@ -284,8 +335,18 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             let t = Instant::now();
             let inner = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget).with_mats(ctx.mats);
             let mut all = Vec::new();
+            let mut held_so_far: u64 = 0;
             for inp in inputs {
-                all.extend(drain(build_with(inp, inner)?)?);
+                // The envelope covers the whole union, so each branch is drained against
+                // what the previous ones already hold rather than against the full budget.
+                let remaining = ctx.budget.saturating_sub(held_so_far as usize);
+                let branch = drain_within_budget(
+                    build_with(inp, inner)?,
+                    if ctx.budget == 0 { 0 } else { remaining.max(1) },
+                    "the streaming union-distinct does not spill",
+                )?;
+                held_so_far += crate::batch_bytes(&branch);
+                all.extend(branch);
             }
             let all = crate::coerce_union_branches(all)?;
             if all.is_empty() {
@@ -293,7 +354,6 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             }
             let rows_in = crate::count_rows(&all);
             let held = crate::batch_bytes(&all);
-            ctx.check_budget(held, "the streaming union-distinct does not spill")?;
             let out = ops::parallel_distinct(&all)?;
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
@@ -346,11 +406,18 @@ fn exec_deferred_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch>,
     let mut drained: Vec<Vec<RecordBatch>> = Vec::with_capacity(children.len());
     let mut held: u64 = 0;
     for child in &children {
-        let batches = drain(build_with(child, measure)?)?;
+        // Budget against what the earlier children already hold: the oracle will hold all of
+        // them at once, and draining a child that alone exceeds the envelope OOMs before the
+        // check below could hand the query to the executor that spills.
+        let remaining = ctx.budget.saturating_sub(held as usize);
+        let batches = drain_within_budget(
+            build_with(child, measure)?,
+            remaining.max(1),
+            "this streaming breaker does not spill",
+        )?;
         held += crate::batch_bytes(&batches);
         drained.push(batches);
     }
-    ctx.check_budget(held, "this streaming breaker does not spill")?;
 
     // Within budget: run the oracle over the drained inputs, wired in as synthetic scans so the
     // top operator runs exactly once over exactly the rows the oracle would have produced —
