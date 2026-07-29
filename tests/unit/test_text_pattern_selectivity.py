@@ -104,3 +104,53 @@ def test_anchored_predicates_all_agree_with_each_other():
     assert _sel(col("s").str.ends_with("a")) == pytest.approx(anchored)
     assert _sel(col("s").str.like("a%")) == pytest.approx(anchored)
     assert _sel(col("s").str.regexp_matches("^a")) == pytest.approx(anchored)
+
+
+# --- the same containment question, asked of three container types ----------------
+
+
+def test_containment_is_one_family_whatever_the_container():
+    """`str.contains`, `json.contains`, and `list.contains` ask the same question.
+
+    Does this value occur *inside* this composite value? Nothing in a column's statistics
+    answers any of them without element-level histograms, so they share a prior because
+    they share a shape. Two of the three reached no branch at all and took the trailing
+    "no information" default meant for an opaque boolean — estimating ten times as many
+    survivors as the identical predicate over a string, a difference in the *container's
+    type* rather than in the question.
+    """
+    import pyarrow as pa_
+
+    frame = bt.from_arrow(
+        pa_.table(
+            {
+                "s": pa_.array(["a"] * 1000),
+                "p": pa_.array(['{"s":1}'] * 1000),
+                "l": pa_.array([[1, 2]] * 1000),
+            }
+        )
+    )
+    est = CardinalityEstimator(frame._sources)
+    base = est.estimate(frame._plan).rows
+
+    def frac(predicate):
+        return est.estimate(frame.filter(predicate)._plan).rows / base
+
+    expected = _CFG.substring_selectivity
+    assert frac(bt.col("s").str.contains("a")) == pytest.approx(expected)
+    assert frac(bt.col("p").json.contains("1")) == pytest.approx(expected)
+    assert frac(bt.col("l").list.contains(1)) == pytest.approx(expected)
+
+
+def test_a_path_existence_test_keeps_the_no_information_prior():
+    """`json.exists` is a *schema* question, not a value search, and is left alone.
+
+    In a schema-on-read corpus a field someone queries is often present in most documents
+    and sometimes in almost none. That spread is genuinely unknown, so the no-information
+    prior is the honest answer and putting a number there would be inventing one.
+    """
+    frame = bt.from_pydict({"p": ['{"s":1}'] * 1000})
+    est = CardinalityEstimator(frame._sources)
+    base = est.estimate(frame._plan).rows
+    kept = est.estimate(frame.filter(bt.col("p").json.exists("s"))._plan).rows / base
+    assert kept == pytest.approx(_CFG.default_filter_selectivity)

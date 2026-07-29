@@ -151,7 +151,7 @@ batch seed at once, so a stage really holding gigabytes reported one megabyte.
 |---|-----|-------------|
 | D49 | bug | **A struct field's footer bounds were filed under its bare field name, so they merged into any top-level column sharing it.** Parquet stores one column chunk per *leaf*: `ParquetSchema.names` reports each leaf's bare name while `path_in_schema` reports its dotted path, and the Python accumulator keyed by the former. For a flat table the two are the same string — which is why this held — and for a nested one they are not. Measured on a table with a top-level `a` of 1..3 beside a struct `s{a}` of 1000..3000, the Python path reported `a` in **[1, 3000]**. Numeric footer min/max carries `Provenance.EXACT`, and that provenance is exactly what lets Kyber answer `max(a)` from metadata *without reading the data* — so this is a wrong answer, not a loose bound. Now keyed by `path_in_schema`; a flat schema is byte-for-byte unchanged. |
 | D50 | bug | The **two implementations of one statistic disagreed**, which is the failure the module's own docstring says routing both through `_finalize_columns` prevents — but that shared finalization covers provenance and NaN handling, not naming. The native Rust walk keys by the path and reported [1, 3] for the same file the Python walk reported [1, 3000] for. The Python path is the *fallback*, reached whenever the native reader declines (an fsspec backend, a read-through byte cache, a declared `sorting_columns`, or any native failure), so it must be correct on its own. Pinned by `test_the_two_footer_paths_agree`. |
-| D51 | feature | Nested leaves now reach `SourceStatistics.columns` under their real paths (`s.a`, `l.list.element`) instead of colliding or being lost. Nothing consumes them yet — a nested-column zone-map prune is the obvious next use — but they are recorded correctly rather than wrongly. |
+| D51 | feature | Nested leaves now reach `SourceStatistics.columns` under their real paths (`s.a`, `l.list.element`) instead of colliding or being lost. **On the Python path only, and that qualifier matters**: the native Rust walk is flat-only *by design* — `bc-io/src/footer_stats.rs::parquet_column_index` requires a single-part leaf path and skips anything nested — and it is the path a local or object-store read normally takes. So the correct attribution is the whole of D49's fix, while nested statistics as a *capability* still need the Rust side. A consumer for them (a nested-column zone-map prune, the obvious next use) is therefore **not** built here: it would be dead for most reads, which is the speculative-generality trap the contract names. |
 
 ## Keeping the envelope's *consumers* honest about it (`carbonite/memory`, `carbonite/policies/admission.py`)
 
@@ -216,3 +216,26 @@ is visible rather than inherited.
 | D62 | bug | **D24's concurrent-peak walk applied only on a cold store.** `learned_plan_peak` routed the warm path to `LearnedMemoryModel.plan_peak`, which takes a flat `max` over blended operators — the pre-`inputs` reading. So the schedule walk was live only until the hub had learned anything about any operator family, which is to say only until the engine stopped being cold. A correction that silently stops applying once a system is warm is worse than one never written, because every cold-path test covering it stays green. The blend is now applied **per operator** and the schedule walked over the result, so the two are orthogonal: `warm == 2 * cold` under a doubling model *and* still above the largest blended single operator. |
 | D63 | hygiene | `LearnedMemoryModel.plan_peak` is deleted rather than left beside its replacement. It had no production caller after the fix, and it is exactly the flat `max` a future caller would reach for — leaving it is how the bug comes back. The envelope's per-operator sizer is now a seam on the one walk (`_peak(plan, size_of)`), so "how big is this operator" has a single answer whatever is asking. |
 | D64 | test | The test double that stood in for the model implemented only the whole-plan aggregate, which is why the flat reading looked correct. It now implements `blend_peak`, the per-operator primitive, and the reason is stated in it: a model that can only answer for a whole plan forces the walk to be flattened. |
+
+## Containment is one question asked of three container types (`kyber/stats/selectivity`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D65 | fidelity | **`json.contains` and `list.contains` fell to the "no information" prior while `str.contains` got the substring one.** All three ask the same question — does this value occur *inside* this composite value? — and none can be answered from column statistics without element-level histograms, so they share a prior because they share a shape. `json_contains` is a `StrFunc` that simply was not in the family table; `ListContains` reached no dispatch branch at all and took the trailing `default_filter_selectivity`. Both therefore estimated **ten times** as many survivors as the identical predicate over a string — a difference in the *container's type*, not in the question — on exactly the semi-structured data where a bad cardinality is hardest to recover from downstream. |
+| D66 | docs | **`json.exists` is deliberately left at the no-information prior**, and the reason is recorded beside the table rather than left to be re-derived. It asks whether a *path is present*, which is a schema question rather than a value search: in a schema-on-read corpus a field someone queries is often in most documents and sometimes in almost none, and that spread is genuinely unknown. Putting a number there would be inventing one. |
+
+### Closed: two veins that turned out not to be worth building
+
+**Nested-column zone-map pruning.** The consumer was scoped and then *not* built. The
+producer only half exists: `bc-io/src/footer_stats.rs::parquet_column_index` requires a
+single-part leaf path and skips anything nested, so the native walk — the path a local or
+object-store read normally takes — is flat-only **by design**. A `StructField`-chain
+resolver feeding nested statistics into selectivity and pruning would be correct and dead
+for most reads, which is the speculative-generality trap. It becomes worth building the day
+the Rust walk carries nested leaves; until then D49's fix (nested bounds no longer
+*polluting* a top-level column) is the whole of the correct attribution.
+
+**Retuning `broadcast_max_bytes` against sharper widths.** Raised by D46 and closed by it:
+the widths only sharpened on sources that set `content_byte_size`, and TPC-H reads Parquet,
+which does not. There is nothing for the threshold to be re-tuned *against* until a
+columnar source's width estimate genuinely moves.

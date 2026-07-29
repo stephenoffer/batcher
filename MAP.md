@@ -1132,8 +1132,8 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 
 | module | lines | what it is |
 |---|---|---|
-| `combine.py` | 416 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 437 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `combine.py` | 423 | Composing leaf selectivities into a whole-predicate estimate. |
+| `leaves.py` | 450 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 188 | What a text pattern says about how many rows it matches. |
 | `scalars.py` | 249 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
@@ -1194,7 +1194,7 @@ Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
 |---|---|---|
 | `disk.py` | 369 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
 | `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
-| `store.py` | 408 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
+| `store.py` | 451 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 | `writer.py` | 284 | One spill bucket, streamed to whichever tier its first batch can afford. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem

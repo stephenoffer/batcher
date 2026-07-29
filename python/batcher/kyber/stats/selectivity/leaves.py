@@ -56,6 +56,19 @@ _STR_PATTERN_SELECTIVITY = {
     "contains": lambda cfg: cfg.substring_selectivity,
     "starts_with": anchored_selectivity,
     "ends_with": anchored_selectivity,
+    # `json_contains` is the same question asked of a document instead of a string: does
+    # this value occur *inside* this composite value? Nothing in a column's statistics can
+    # answer either without element-level histograms, so they share a prior because they
+    # share a shape. It fell through to `default_filter_selectivity` — the "no information"
+    # prior meant for an opaque boolean — which estimated ten times as many survivors as the
+    # identical predicate over a string, on exactly the semi-structured data where a bad
+    # cardinality is hardest to recover from downstream.
+    "json_contains": lambda cfg: cfg.substring_selectivity,
+    # `json_exists` is deliberately NOT here. It asks whether a *path is present*, which is
+    # a schema question rather than a value search: in a schema-on-read corpus a field
+    # someone queries is often in most documents and sometimes in almost none, and that
+    # spread is genuinely unknown. `default_filter_selectivity` is the honest answer, and
+    # putting a number here would be inventing one.
 }
 
 # Pattern-carrying predicates, each answered by reading its own pattern.

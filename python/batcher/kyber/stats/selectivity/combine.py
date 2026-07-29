@@ -41,6 +41,7 @@ from batcher.plan.expr_ir import (
     InList,
     IsNotNull,
     IsNull,
+    ListContains,
     Lit,
     Not,
     StrFunc,
@@ -124,6 +125,12 @@ def _raw_predicate_selectivity(
         return _in_list_selectivity(expr, ndv, cfg, mcv, bounds)
     if isinstance(expr, StrFunc):
         return _str_func_selectivity(expr, ndv, cfg, mcv)
+    if isinstance(expr, ListContains):
+        # The third container the same containment question is asked of, after a string and
+        # a JSON document. It reached no branch at all and took the trailing "no information"
+        # default, so `list.contains(x)` was estimated to keep ten times as many rows as
+        # `str.contains(x)` — a difference in the *container's type*, not in the question.
+        return cfg.substring_selectivity
     if isinstance(expr, Lit) and isinstance(expr.value, bool):
         # A constant predicate keeps everything or nothing — never the 0.5 "unknown" default.
         # (The folder usually removes these, but a `CASE` arm reaches here as a literal.)
