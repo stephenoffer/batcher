@@ -639,3 +639,26 @@ as slowness rather than as a bug.
   that the count is honest and that the naive sum it replaces was many times larger), two
   distinct dictionaries both counted, a struct-nested dictionary deduplicated, and a
   dictionary-free relation measured `assert_eq!`-identically to the naive sum.
+
+### #38 — The same dictionary over-count, on the Python spill writer
+
+- **Was:** `SpillWriter.write` charged `batch.nbytes` per batch. Batches of a
+  dictionary-encoded column all point at the same values array, and `nbytes` includes that
+  whole dictionary in every one — measured at **256 KB per batch for 16 KB of indices** on a
+  20,000-entry string dictionary, so a bucket of 100 batches was charged ~25 MB for ~1.8 MB of
+  content.
+- **Three decisions run on that figure, and all three go wrong the same way:** the local
+  budget overflows to object storage far earlier than it needs to; `read_reserved` reserves
+  ~14x the memory the read actually takes, squeezing every concurrent query; and the bucket
+  looks over `spill_bucket_max_bytes`, so the re-split recursion fires and pays a full extra
+  write and read to split a bucket that already fitted. **None of them is a wrong answer**,
+  which is exactly why it survived — it only ever shows up as the engine being slow.
+- **Now:** each shared dictionary is charged once per bucket, identified by its first buffer
+  address, walking structs and lists because a dictionary column in a semi-structured or
+  multimodal schema usually sits one level down. The figure now matches what reading the
+  bucket back actually costs, which is what `logical_nbytes` promises: the IPC stream carries
+  the dictionary once and the reader reconstructs one values array shared by every batch.
+- **Proof:** `test_a_shared_dictionary_is_charged_once_per_bucket` (honest charge, naive charge
+  many times larger, and every row still reading back) plus
+  `test_a_bucket_without_dictionaries_is_charged_as_before`, which pins the ordinary case to
+  an exact equality.

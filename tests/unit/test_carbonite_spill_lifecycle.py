@@ -284,3 +284,60 @@ def test_an_intact_bucket_reads_back_without_complaint(tmp_path) -> None:
 
     assert sum(b.num_rows for b in store.read_stream(handle)) == 2000
     assert sum(b.num_rows for b in store.read(handle)) == 2000
+
+
+def test_a_shared_dictionary_is_charged_once_per_bucket(tmp_path) -> None:
+    """A dictionary-encoded column must not be charged its dictionary in every batch.
+
+    Batches of such a column all point at the *same* values array, but `nbytes` includes the
+    whole dictionary in each one -- measured at 256 KB per batch for 16 KB of indices on a
+    20,000-entry string dictionary, so a bucket of 100 batches is charged ~25 MB for ~1.8 MB
+    of content.
+
+    Three decisions run on that figure and all three go wrong the same way: the local budget
+    overflows to object storage far too early, `read_reserved` reserves ~14x the memory the
+    read takes, and the bucket looks over `spill_bucket_max_bytes` so the re-split recursion
+    pays a full extra write and read to split a bucket that already fitted. None is a wrong
+    answer, which is why it survived -- it only shows up as slowness.
+    """
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+    values = pa.array([f"c-{i:06}" for i in range(20_000)], type=pa.string())
+    indices = pa.array([i % 20_000 for i in range(4_096)], type=pa.int32())
+
+    def morsel() -> pa.RecordBatch:
+        return pa.record_batch({"k": pa.DictionaryArray.from_arrays(indices, values)})
+
+    n = 20
+    w = store.writer("dict")
+    for _ in range(n):
+        w.write(morsel())
+    handle = w.close()
+
+    per_batch = morsel().nbytes
+    naive = per_batch * n
+    honest = values.nbytes + indices.nbytes * n
+
+    assert handle is not None
+    assert handle.logical_nbytes <= honest, (
+        f"charged {handle.logical_nbytes} for a bucket whose content is {honest} bytes -- the "
+        f"shared dictionary is still being counted in every batch"
+    )
+    assert naive > handle.logical_nbytes * 5, (
+        f"the naive charge ({naive}) should be many times the deduplicated one "
+        f"({handle.logical_nbytes}); if not, this test no longer measures its shape"
+    )
+    # Every row still reads back, so the cheaper accounting has not changed the data.
+    assert sum(b.num_rows for b in store.read_stream(handle)) == 4_096 * n
+
+
+def test_a_bucket_without_dictionaries_is_charged_as_before(tmp_path) -> None:
+    """The deduplication must not disturb an ordinary bucket -- the common case."""
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+    w = store.writer("plain")
+    batches = [_batch(1000) for _ in range(5)]
+    for b in batches:
+        w.write(b)
+    handle = w.close()
+
+    assert handle is not None
+    assert handle.logical_nbytes == sum(b.nbytes for b in batches)

@@ -1196,7 +1196,7 @@ Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
 | `disk.py` | 369 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
 | `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
 | `store.py` | 451 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
-| `writer.py` | 379 | One spill bucket, streamed to whichever tier its first batch can afford. |
+| `writer.py` | 451 | One spill bucket, streamed to whichever tier its first batch can afford. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem
 

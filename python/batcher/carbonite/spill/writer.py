@@ -54,6 +54,7 @@ class BucketWriter:
         "_num_rows",
         "_path",
         "_pending_bytes",
+        "_seen_dictionaries",
         "_store",
         "_tier",
         "_writer",
@@ -71,6 +72,10 @@ class BucketWriter:
         # the remote tier once the buckets already streaming have exhausted the local budget
         # — the on-close accounting alone cannot see an open bucket's growth (see the store).
         self._pending_bytes = 0
+        # Buffer addresses of dictionaries already charged to this bucket. Batches of a
+        # dictionary-encoded column all point at the *same* values array, but `nbytes`
+        # includes that whole dictionary in every one — see `_charged_bytes`.
+        self._seen_dictionaries: set[int] = set()
         self._num_rows = 0
         # The finalized handle, so `close()` is idempotent. A double close previously
         # re-entered `writer.close()` on a closed stream and, worse, charged the bucket's
@@ -122,15 +127,41 @@ class BucketWriter:
                 self._raise_out_of_space(exc)
             self._writer.write_batch(batch)
         self._num_rows += batch.num_rows
+        charged = self._charged_bytes(batch)
         if self._tier is SpillTier.LOCAL:
             # Charge the batch's (uncompressed, in-memory) size to the store's live local
             # usage as it lands, not just at close. A slight over-estimate vs the compressed
             # on-disk size only makes overflow trigger a touch early — safe (never over-fills
             # the disk), and result-invariant (the remote tier reads back identically).
-            self._pending_bytes += batch.nbytes
-            self._store._local_pending += batch.nbytes
+            self._pending_bytes += charged
+            self._store._local_pending += charged
         else:
-            self._pending_bytes += batch.nbytes
+            self._pending_bytes += charged
+
+    def _charged_bytes(self, batch: pa.RecordBatch) -> int:
+        """`batch.nbytes`, charging each shared dictionary only the first time it appears.
+
+        Batches of a dictionary-encoded column all point at the *same* values array, but
+        `nbytes` includes that whole dictionary in every one. Measured: a 20,000-entry string
+        dictionary reports 256 KB per batch for 16 KB of indices — so a bucket of 100 such
+        batches is charged 25 MB for 1.8 MB of content, a ~14x over-count.
+
+        Three decisions run on this figure, and all three go wrong the same way. The local
+        budget overflows to object storage far earlier than it needs to; `read_reserved`
+        reserves ~14x the memory the read actually takes, squeezing every concurrent query;
+        and the bucket looks over `spill_bucket_max_bytes`, so the re-split recursion fires
+        and pays a full extra write and read to split a bucket that already fitted. None of
+        them is a wrong answer, which is why an over-count here survives — it only ever
+        shows up as the engine being slow.
+
+        The count matches what reading the bucket back costs, which is what `logical_nbytes`
+        promises: the IPC stream carries the dictionary once, and the reader reconstructs one
+        values array shared by every batch.
+        """
+        total = batch.nbytes
+        for column in batch.columns:
+            total -= _recounted_dictionary_bytes(column, self._seen_dictionaries)
+        return max(total, 0)
 
     def _raise_out_of_space(self, exc: OSError) -> None:
         """Turn a space/quota refusal into an error that names the tier and the fix."""
@@ -377,3 +408,44 @@ class BucketWriter:
             self.close()
         else:
             self.abort()
+
+
+def _dictionary_id(values: pa.Array) -> int | None:
+    """An identity for a dictionary's values array: the address of its first real buffer.
+
+    Unambiguous while the arrays being measured are alive, which they are — the caller is
+    charging batches it currently holds. `None` when there is no buffer to identify it by, in
+    which case the caller charges it in full rather than guessing.
+    """
+    for buf in values.buffers():
+        if buf is not None:
+            return buf.address
+    return None
+
+
+def _recounted_dictionary_bytes(array: pa.Array, seen: set[int]) -> int:
+    """Bytes of `array` that `nbytes` counted for a dictionary already charged.
+
+    On a dictionary's first sighting its values are kept and the walk descends *into* them,
+    so a dictionary nested inside another's values is handled too. On a later sighting the
+    whole values array is subtracted — exactly what `nbytes` added for it.
+
+    The walk covers structs and lists, because a dictionary column in a semi-structured or
+    multimodal schema is usually one level down rather than at the top.
+    """
+    if isinstance(array, pa.DictionaryArray):
+        values = array.dictionary
+        ident = _dictionary_id(values)
+        if ident is None:
+            return 0
+        if ident in seen:
+            return values.nbytes
+        seen.add(ident)
+        return _recounted_dictionary_bytes(values, seen)
+    if isinstance(array, pa.StructArray):
+        return sum(
+            _recounted_dictionary_bytes(array.field(i), seen) for i in range(array.type.num_fields)
+        )
+    if isinstance(array, (pa.ListArray, pa.LargeListArray, pa.FixedSizeListArray)):
+        return _recounted_dictionary_bytes(array.values, seen)
+    return 0
