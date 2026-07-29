@@ -208,3 +208,11 @@ utilization of the operator family as soon as one run records it (`_cpu_share` -
 `recommend_num_cpus`), so the loop already corrects it; and moving a scheduling prior is a
 packing-density change that wants `bench-dist`, not an argument. Stated so the interaction
 is visible rather than inherited.
+
+## The correction that switched itself off when warm (`carbonite/memory`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D62 | bug | **D24's concurrent-peak walk applied only on a cold store.** `learned_plan_peak` routed the warm path to `LearnedMemoryModel.plan_peak`, which takes a flat `max` over blended operators — the pre-`inputs` reading. So the schedule walk was live only until the hub had learned anything about any operator family, which is to say only until the engine stopped being cold. A correction that silently stops applying once a system is warm is worse than one never written, because every cold-path test covering it stays green. The blend is now applied **per operator** and the schedule walked over the result, so the two are orthogonal: `warm == 2 * cold` under a doubling model *and* still above the largest blended single operator. |
+| D63 | hygiene | `LearnedMemoryModel.plan_peak` is deleted rather than left beside its replacement. It had no production caller after the fix, and it is exactly the flat `max` a future caller would reach for — leaving it is how the bug comes back. The envelope's per-operator sizer is now a seam on the one walk (`_peak(plan, size_of)`), so "how big is this operator" has a single answer whatever is asking. |
+| D64 | test | The test double that stood in for the model implemented only the whole-plan aggregate, which is why the flat reading looked correct. It now implements `blend_peak`, the per-operator primitive, and the reason is stated in it: a model that can only answer for a whole plan forces the walk to be flattened. |

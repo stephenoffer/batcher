@@ -183,3 +183,35 @@ def test_a_guess_in_any_contributor_keeps_the_verdict_advisory():
     if smallest.op_id not in {o.op_id for o in peak_contributors(mixed)}:
         pytest.skip("the smallest sized operator does not contribute to this plan's peak")
     assert _rests_on_a_guess(mixed, binding) is True
+
+
+def test_a_warm_store_still_gets_the_concurrent_peak():
+    """The correction must not switch itself off once the engine has learned something.
+
+    `learned_plan_peak` used to hand the whole plan to the model's own flat aggregate, so
+    the schedule walk applied *only on a cold store* — that is, only until the first query
+    of any shape had run. A correction that silently stops applying once a system is warm is
+    worse than one never written, because every cold-path test stays green.
+    """
+    from batcher.carbonite.memory.estimator import learned_plan_peak
+
+    class _Doubling:
+        def blend_peak(self, kind, planned):
+            return planned * 2
+
+    a, b, c, d = _fact(50_000), _dim(400), _dim(300), _dim(200)
+    _, plan = _annotate(a.join(b, on="k").join(c.join(d, on="k"), on="k"))
+    cold = peak_operator_bytes(plan)
+    warm = learned_plan_peak(plan, _Doubling())
+    largest_blended = 2 * max(o.bounds.m_max_bytes for o in plan.ops)
+    # The model is honoured...
+    assert warm == 2 * cold
+    # ...and the schedule is still walked, rather than collapsing to a blended `max`.
+    assert warm > largest_blended
+
+
+def test_a_cold_store_is_exactly_the_plan_estimate():
+    from batcher.carbonite.memory.estimator import learned_plan_peak
+
+    _, plan = _annotate(_fact().join(_dim(), on="k"))
+    assert learned_plan_peak(plan, None) == peak_operator_bytes(plan)

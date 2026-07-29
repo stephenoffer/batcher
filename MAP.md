@@ -1153,8 +1153,8 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 264 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `learned.py` | 373 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
+| `estimator.py` | 298 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `learned.py` | 358 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
 | `probe.py` | 341 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |

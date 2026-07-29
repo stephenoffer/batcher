@@ -250,21 +250,6 @@ class LearnedMemoryModel:
         blended = blend(plan_estimate, measured, self._alpha)
         return int(clamp_factor(blended, plan_estimate, self._clamp))
 
-    def plan_peak(self, plan_ops: object) -> int:
-        """The plan's dominant-breaker peak, each op blended toward measured reality.
-
-        `plan_ops` is any iterable of objects exposing `.kind` and `.bounds.m_max_bytes`
-        (a `PhysicalPlan.ops`). Each op's plan estimate is blended by its own family, and
-        the max is taken — the same dominant-breaker rule the plan estimator uses, only
-        sharpened per family. Cold families pass through unchanged, so on a cold store
-        this equals the plan's own dominant breaker exactly.
-        """
-        best = 0
-        for op in plan_ops:  # type: ignore[attr-defined]
-            kind = getattr(op, "kind", "")  # a bare-sized test double has no kind → unlearned
-            best = max(best, self.blend_peak(kind, op.bounds.m_max_bytes))
-        return best
-
 
 def _memory_basis_rows(row: dict) -> float:
     """The row count an operator's peak memory actually scales with.

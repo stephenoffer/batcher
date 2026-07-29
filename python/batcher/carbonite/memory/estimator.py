@@ -100,31 +100,36 @@ def peak_contributors(plan: PhysicalPlan) -> tuple:
     return tuple(sorted(ops, key=lambda op: op.bounds.m_max_bytes, reverse=True))
 
 
-def _peak(plan: PhysicalPlan) -> tuple[int, frozenset[int]]:
-    """`(peak bytes, contributing operator ids)` for `plan`."""
+def _peak(plan: PhysicalPlan, size_of=None) -> tuple[int, frozenset[int]]:
+    """`(peak bytes, contributing operator ids)` for `plan`.
+
+    `size_of` overrides each operator's byte figure — the seam the learned blend uses, so
+    "how big is this operator" has one answer and the schedule walk has one implementation.
+    """
+    size_of = size_of or (lambda op: int(op.bounds.m_max_bytes))
     if not plan.ops:
         return 0, frozenset()
     # `getattr` for the same reason the rest of this module uses it: a bare test double
     # carrying only `bounds` is a supported shape, and an estimator is never the right
     # place to fail a query.
     if not any(getattr(op, "inputs", ()) for op in plan.ops):
-        return _flat_peak(plan)  # no tree to walk — the pre-`inputs` reading, unchanged
+        return _flat_peak(plan, size_of)  # no tree — the pre-`inputs` reading, unchanged
     by_id = {int(op.op_id): op for op in plan.ops}
-    walked = [_subtree_peak(r, by_id, set()) for r in _roots(plan)]
-    return max(walked, default=_flat_peak(plan))
+    walked = [_subtree_peak(r, by_id, set(), size_of) for r in _roots(plan)]
+    return max(walked, default=_flat_peak(plan, size_of))
 
 
-def _flat_peak(plan: PhysicalPlan) -> tuple[int, frozenset[int]]:
+def _flat_peak(plan: PhysicalPlan, size_of) -> tuple[int, frozenset[int]]:
     """The largest single operator and its id — the reading from before the tree existed."""
-    sized = [op for op in plan.ops if op.bounds.m_max_bytes > 0]
+    sized = [op for op in plan.ops if size_of(op) > 0]
     if not sized:
         return 0, frozenset()
-    top = max(sized, key=lambda op: op.bounds.m_max_bytes)
+    top = max(sized, key=size_of)
     # `getattr` for the same reason the rest of this module uses it: a bare double carrying
     # only `bounds` is a supported shape, and it is the shape that reaches this branch —
     # a plan with no `inputs` is exactly a hand-built one. An id nothing can resolve simply
     # yields no contributors, and the caller falls back to the operator it already named.
-    return int(top.bounds.m_max_bytes), frozenset({int(getattr(top, "op_id", -1))})
+    return int(size_of(top)), frozenset({int(getattr(top, "op_id", -1))})
 
 
 def _roots(plan: PhysicalPlan) -> list[int]:
@@ -137,7 +142,7 @@ def _roots(plan: PhysicalPlan) -> list[int]:
     return [int(op.op_id) for op in plan.ops if int(op.op_id) not in consumed]
 
 
-def _subtree_peak(op_id: int, by_id: dict, seen: set[int]) -> tuple[int, frozenset[int]]:
+def _subtree_peak(op_id: int, by_id: dict, seen: set[int], size_of) -> tuple[int, frozenset[int]]:
     """Peak concurrent bytes of the subtree rooted at `op_id`, and who contributes them.
 
     `seen` guards against a cycle. A `PhysicalPlan` is built from an immutable tree so it
@@ -148,9 +153,9 @@ def _subtree_peak(op_id: int, by_id: dict, seen: set[int]) -> tuple[int, frozens
     if op is None or op_id in seen:
         return 0, frozenset()
     seen = seen | {op_id}
-    resident = int(op.bounds.m_max_bytes)
+    resident = int(size_of(op))
     mine = frozenset({op_id}) if resident > 0 else frozenset()
-    children = [_subtree_peak(int(c), by_id, seen) for c in getattr(op, "inputs", ())]
+    children = [_subtree_peak(int(c), by_id, seen, size_of) for c in getattr(op, "inputs", ())]
     if len(children) < 2:
         return max([(resident, mine), *children])
     # A binary breaker holds its build side's state while the probe side runs. Batcher
@@ -170,9 +175,18 @@ def learned_plan_peak(plan: PhysicalPlan, model) -> int:
     agree — a plan admitted against one figure and granted against another is a query
     admitted into a budget it was never given.
 
-    `plan_peak` already folds each operator's plan estimate toward what the family really
-    used (`m_peak_bytes`), and passes cold families through unchanged, so on a cold store
-    this is exactly `peak_operator_bytes`.
+    Each operator's plan estimate is folded toward what its family really used
+    (`LearnedMemoryModel.blend_peak`), and cold families pass through unchanged, so on a
+    cold store this is exactly `peak_operator_bytes`.
+
+    **The blend is applied per operator and the schedule is walked over the result**, rather
+    than by taking the model's own flat `plan_peak`. That distinction is the whole point: a
+    flat `max` over blended operators is the pre-`inputs` reading, so routing the warm path
+    through it would have made the concurrent-peak walk apply *only on a cold store* — that
+    is, only until the engine learns anything, which is exactly when it stops being the
+    normal case. A correction that quietly switches itself off once a system is warm is
+    worse than one that was never written, because the tests that cover the cold path stay
+    green.
 
     Args:
         plan: The annotated physical plan.
@@ -181,7 +195,27 @@ def learned_plan_peak(plan: PhysicalPlan, model) -> int:
     Returns:
         The envelope in bytes; `0` when nothing in the plan could be sized.
     """
-    return model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
+    return _peak(plan, _blender(model))[0]
+
+
+def _blender(model):
+    """A `PhysicalOp -> bytes` sizer that folds the plan estimate toward measured reality.
+
+    `None` when there is no model, which makes every walk use the plan's own estimate.
+    Never raises: a model that cannot size an operator (a bare test double with no `kind`)
+    falls back to the plan estimate rather than failing a query inside a memory guard.
+    """
+    if model is None:
+        return None
+
+    def size_of(op) -> int:
+        planned = int(op.bounds.m_max_bytes)
+        try:
+            return int(model.blend_peak(getattr(op, "kind", ""), planned))
+        except Exception:  # pragma: no cover - a memory guard never raises
+            return planned
+
+    return size_of
 
 
 def binding_operator(plan: PhysicalPlan):
