@@ -35,7 +35,9 @@ mod repartition;
 mod reshape;
 mod sample_sort;
 mod str_sort;
-pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
+pub(crate) use external_sort::{
+    external_merge_sort, external_sort_to_final_store, DEFAULT_RUN_TARGET_BYTES,
+};
 pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, gather_join_output_with, join_batches,
     join_batches_with, join_output_schema, join_top_n, key_indices, map_join_type,

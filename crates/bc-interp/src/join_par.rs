@@ -39,9 +39,14 @@ use crate::par::SpillOptions;
 /// partitioner), so the union of per-bucket joins is the full join for every join
 /// type — the result is the same multiset the in-memory path produces.
 ///
-/// Empty input is handled exactly as the in-memory path: a side with no batches
-/// makes every bucket read empty, which `materialize` reports as `EmptyJoinInput`
-/// (empty joins are shortcut upstream and never reach this spill path).
+/// A bucket that exceeds the envelope on *either* side is recursively re-split before it is
+/// joined (see [`join_bucket`]), so key skew cannot reintroduce the OOM the spill was there
+/// to prevent.
+///
+/// Empty input is handled exactly as the in-memory path: a side with no batches at all
+/// reports `EmptyJoinInput` (empty joins are shortcut upstream and never reach this spill
+/// path). A *bucket* with no rows on one side is ordinary and joins as an empty relation of
+/// that side's schema.
 pub(crate) fn spilling_hash_join_streaming(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
@@ -51,56 +56,269 @@ pub(crate) fn spilling_hash_join_streaming(
     output: &[bc_ir::JoinOutputCol],
     sp: &SpillOptions,
 ) -> Result<(Vec<RecordBatch>, u64), InterpError> {
-    // Enough partitions that each bucket's build side ≈ one budget — sized from the
-    // build batches' total size without materializing them.
+    // Enough partitions that each bucket's build side ≈ one budget — sized from the build
+    // batches' total size without materializing them, then capped (see `MAX_JOIN_FANOUT`).
     let build_bytes: usize = right_batches
         .iter()
         .map(|b| b.get_array_memory_size())
         .sum();
-    let p = build_bytes.div_ceil(sp.memory_budget_bytes.max(1)).max(2);
+    let budget = sp.memory_budget_bytes.max(1);
+    let p = build_bytes.div_ceil(budget).clamp(2, MAX_JOIN_FANOUT);
 
     let mut lstore = DiskSpillStore::with_codec(sp.dir.join("join-left"), p, sp.codec)?;
     let mut rstore = DiskSpillStore::with_codec(sp.dir.join("join-right"), p, sp.codec)?;
     // Stream each input batch through the key-partitioner into its `p` shards; only
     // one input batch and its shards are resident at a time, so neither side is ever
     // fully materialized in memory.
-    partition_batches_to_store(left_batches, left_keys, p, &mut lstore)?;
-    partition_batches_to_store(right_batches, right_keys, p, &mut rstore)?;
+    partition_batches_to_store(left_batches, left_keys, p, 0, &mut lstore)?;
+    partition_batches_to_store(right_batches, right_keys, p, 0, &mut rstore)?;
 
+    // A side with no batches at all is shortcut upstream and never reaches this path, so
+    // both schemas are available (and both are needed: a bucket may receive rows on one
+    // side only, and an outer join still has to emit for it).
+    let ctx = BucketJoin {
+        left_keys,
+        right_keys,
+        join_type,
+        output,
+        budget,
+        codec: sp.codec,
+        dir: &sp.dir,
+        lschema: left_batches
+            .first()
+            .ok_or(InterpError::EmptyJoinInput)?
+            .schema(),
+        rschema: right_batches
+            .first()
+            .ok_or(InterpError::EmptyJoinInput)?
+            .schema(),
+    };
     let mut out = Vec::with_capacity(p);
     for i in 0..p {
-        let lpart = ops::materialize(&lstore.read(i)?)?;
-        let rpart = ops::materialize(&rstore.read(i)?)?;
-        out.push(ops::join_batches(
-            &lpart,
-            &rpart,
-            left_keys,
-            right_keys,
-            join_type,
-            output,
-            bc_ir::JoinStrategy::Hash,
-        )?);
+        join_bucket(&mut lstore, &mut rstore, i, &ctx, 0, &mut out)?;
     }
     // Both sides were streamed to disk; the spill volume is their combined written bytes.
     let spill_bytes = lstore.spilled_bytes() + rstore.spilled_bytes();
     Ok((out, spill_bytes))
 }
 
-/// Hash-partition each input batch by `keys` into `p` shards and append every shard
-/// to its partition in `store` — one batch resident at a time (the bounded-memory
+/// Upper bound on how many ways one level of the grace join fans out.
+///
+/// The bucket count wants to be `build_bytes / budget`, which for a build side three orders
+/// of magnitude over the envelope is thousands of buckets — thousands of open spill files
+/// per side, each receiving shards too small to write efficiently. Capping the fan-out and
+/// re-splitting the buckets that still do not fit (see [`join_bucket`]) reaches the same
+/// per-bucket size with bounded descriptors and full-sized writes, at the cost of re-reading
+/// only the buckets that were actually too big.
+const MAX_JOIN_FANOUT: usize = 256;
+
+/// How many times a bucket that still exceeds the budget may be re-split.
+///
+/// Each level multiplies the effective partition count by up to [`MAX_JOIN_FANOUT`], so
+/// three levels is 16 million buckets — far past any real ratio of build side to envelope.
+/// The bound exists for the case no hash can fix: when a *single* join key's rows exceed the
+/// budget, every re-split sends them all to one sub-bucket again, and without a limit the
+/// recursion would never terminate. At the limit the bucket is joined as-is, which is what
+/// the join did unconditionally before.
+const MAX_JOIN_SPLIT_DEPTH: u32 = 3;
+
+/// The parts of a grace join that do not change as buckets are re-split.
+struct BucketJoin<'a> {
+    left_keys: &'a [String],
+    right_keys: &'a [String],
+    join_type: bc_ir::JoinType,
+    output: &'a [bc_ir::JoinOutputCol],
+    budget: usize,
+    codec: bc_runtime::agg::spill::SpillCodec,
+    dir: &'a std::path::Path,
+    /// Each side's schema, so a bucket that received no rows on that side still joins as an
+    /// empty relation of the right shape. Partitioning writes only non-empty shards — with
+    /// a 256-way fan-out over thousands of morsels, writing the empty ones costs millions of
+    /// IPC messages carrying nothing — so an untouched partition legitimately has no file
+    /// at all, and `materialize`, which derives its schema from the first batch, has nothing
+    /// to derive it from.
+    lschema: arrow::datatypes::SchemaRef,
+    rschema: arrow::datatypes::SchemaRef,
+}
+
+/// Concatenate a bucket's batches, or an empty relation of `schema` when it has none.
+fn materialize_or_empty(
+    batches: &[RecordBatch],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch, InterpError> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+    ops::materialize(batches)
+}
+
+/// Join co-partitioned bucket `i` of the two stores, re-splitting it first if either side
+/// does not fit in the envelope.
+///
+/// The bucket count is sized from the build side's *average* bytes per bucket, so it is only
+/// an average-case fit. Under key skew one bucket holds far more than its share — and both
+/// sides were materialized whole before being joined, so a skewed bucket OOMs at exactly the
+/// point spilling was supposed to have prevented it. This is the failure mode that makes
+/// skewed joins the standard reason a Spark job dies, and the grace *aggregate* already
+/// guards against it by recursively re-partitioning an over-large partition; the join did
+/// not.
+///
+/// Both sides are asked *before* being read, which is the whole point: the decision to split
+/// has to happen without first pulling the partition that provably does not fit into memory.
+/// The probe side counts too, not just the build side — the bucket count is sized from the
+/// build side alone, so a fact table with a hot key can leave a probe bucket orders of
+/// magnitude over the envelope even when every build bucket fits.
+///
+/// A re-split partitions **both** sides with a salt derived from the depth. The salt is a
+/// function of the depth alone, never of the row, so equal keys still co-locate on both
+/// sides and each sub-bucket remains an independent join whose union is the same relation.
+fn join_bucket(
+    lstore: &mut dyn SpillStore,
+    rstore: &mut dyn SpillStore,
+    i: usize,
+    ctx: &BucketJoin<'_>,
+    depth: u32,
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), InterpError> {
+    let lbytes = lstore.partition_bytes(i) as usize;
+    let rbytes = rstore.partition_bytes(i) as usize;
+    if depth < MAX_JOIN_SPLIT_DEPTH && lbytes.max(rbytes) > ctx.budget {
+        return split_and_join_bucket(lstore, rstore, i, ctx, depth, lbytes.max(rbytes), out);
+    }
+    let lpart = materialize_or_empty(&lstore.read(i)?, &ctx.lschema)?;
+    let rpart = materialize_or_empty(&rstore.read(i)?, &ctx.rschema)?;
+    out.push(ops::join_batches(
+        &lpart,
+        &rpart,
+        ctx.left_keys,
+        ctx.right_keys,
+        ctx.join_type,
+        ctx.output,
+        bc_ir::JoinStrategy::Hash,
+    )?);
+    Ok(())
+}
+
+/// Re-partition an over-large bucket on both sides and join the sub-buckets.
+///
+/// Each side is streamed out of its store one batch at a time and straight into a fresh
+/// child store, so the bucket that did not fit is never held whole — the peak is one batch
+/// plus one sub-bucket, which is what the caller's budget was meant to describe all along.
+fn split_and_join_bucket(
+    lstore: &mut dyn SpillStore,
+    rstore: &mut dyn SpillStore,
+    i: usize,
+    ctx: &BucketJoin<'_>,
+    depth: u32,
+    bytes: usize,
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), InterpError> {
+    let sub_p = bytes.div_ceil(ctx.budget).clamp(2, MAX_JOIN_FANOUT);
+    let salt = split_salt(depth + 1);
+    let sub = ctx.dir.join(format!("join-split-{depth}"));
+    let mut lsub = DiskSpillStore::with_codec(sub.join("left"), sub_p, ctx.codec)?;
+    let mut rsub = DiskSpillStore::with_codec(sub.join("right"), sub_p, ctx.codec)?;
+    drain_into_store(
+        lstore,
+        i,
+        &schema_key_indices(&ctx.lschema, ctx.left_keys)?,
+        sub_p,
+        salt,
+        &mut lsub,
+    )?;
+    drain_into_store(
+        rstore,
+        i,
+        &schema_key_indices(&ctx.rschema, ctx.right_keys)?,
+        sub_p,
+        salt,
+        &mut rsub,
+    )?;
+    for j in 0..sub_p {
+        join_bucket(&mut lsub, &mut rsub, j, ctx, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+/// The salt for re-splitting at `depth` — any value that is non-zero (0 means "unsalted",
+/// the cluster-wide assignment) and distinct per level, so successive splits of the same
+/// rows are independent of one another.
+fn split_salt(depth: u32) -> u64 {
+    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(depth as u64 + 1) | 1
+}
+
+/// Indices of the named key columns within a *schema*.
+///
+/// The batch-taking [`ops::key_indices`] cannot be used inside a store `drain`, whose
+/// callback reports the store's own error type. Resolving against the schema once, before
+/// the drain, keeps a missing key column an ordinary plan error instead of something that
+/// has to be smuggled out of a closure — and it is one lookup per side rather than one per
+/// batch.
+fn schema_key_indices(
+    schema: &arrow::datatypes::SchemaRef,
+    names: &[String],
+) -> Result<Vec<usize>, InterpError> {
+    names
+        .iter()
+        .map(|n| {
+            schema
+                .index_of(n)
+                .map_err(|_| InterpError::UnknownJoinColumn(n.clone()))
+        })
+        .collect()
+}
+
+/// Stream partition `i` out of `store` and re-partition it into `dest` by the key columns at
+/// `key_idx`, one batch at a time, never holding the partition whole.
+fn drain_into_store(
+    store: &mut dyn SpillStore,
+    i: usize,
+    key_idx: &[usize],
+    p: usize,
+    salt: u64,
+    dest: &mut DiskSpillStore,
+) -> Result<(), InterpError> {
+    store.drain(i, &mut |b| partition_batch_into(b, key_idx, p, salt, dest))?;
+    Ok(())
+}
+
+/// Hash-partition one batch by the key columns at `key_idx` into `p` salted shards and
+/// append each non-empty shard to `dest`.
+///
+/// Empty shards are skipped. With a 256-way fan-out over thousands of morsels, writing them
+/// would be millions of IPC messages carrying no rows; the cost of skipping is that an
+/// untouched partition has no file, which [`materialize_or_empty`] handles.
+fn partition_batch_into(
+    b: &RecordBatch,
+    key_idx: &[usize],
+    p: usize,
+    salt: u64,
+    dest: &mut DiskSpillStore,
+) -> Result<(), bc_runtime::RuntimeError> {
+    let key_cols: Vec<arrow::array::ArrayRef> =
+        key_idx.iter().map(|&k| b.column(k).clone()).collect();
+    let shards = shuffle::partition_by_key_arrays_salted(b, &key_cols, p, salt)?;
+    for (i, shard) in shards.iter().enumerate() {
+        if shard.num_rows() > 0 {
+            dest.append(i, shard)?;
+        }
+    }
+    Ok(())
+}
+
+/// Hash-partition each input batch by `keys` into `p` shards and append every non-empty
+/// shard to its partition in `store` — one batch resident at a time (the bounded-memory
 /// half of the streaming grace join).
 fn partition_batches_to_store(
     batches: &[RecordBatch],
     keys: &[String],
     p: usize,
+    salt: u64,
     store: &mut DiskSpillStore,
 ) -> Result<(), InterpError> {
     for b in batches {
         let idx = ops::key_indices(b, keys)?;
-        let shards = shuffle::partition_by_keys(b, &idx, p)?;
-        for (i, shard) in shards.iter().enumerate() {
-            store.append(i, shard)?;
-        }
+        partition_batch_into(b, &idx, p, salt, store)?;
     }
     Ok(())
 }

@@ -60,13 +60,36 @@ pub fn partition_by_key_arrays(
     keys: &[ArrayRef],
     num_partitions: usize,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
+    partition_by_key_arrays_salted(batch, keys, num_partitions, 0)
+}
+
+/// [`partition_by_key_arrays`] with an independent re-mix of the key hash.
+///
+/// `salt == 0` is exactly [`partition_by_key_arrays`]. A non-zero salt exists for one
+/// purpose: **re-splitting a bucket that did not fit in memory**. A grace join or aggregate
+/// sizes its bucket count from the average, so a skewed key can still leave one bucket far
+/// over the envelope; re-partitioning that bucket with a salt derived from the recursion
+/// depth spreads the keys inside it across a fresh set of sub-buckets that is independent of
+/// the split that produced it.
+///
+/// The result is still a *co-partitioning*: equal keys land in the same sub-bucket, because
+/// the salt is a function of the depth alone and not of the row. That is what lets both
+/// sides of a join be re-split at the same depth and joined sub-bucket by sub-bucket with
+/// the same result. A salt must never be used for a bucket assignment that crosses machines
+/// — see [`bucket_of_salted`].
+pub fn partition_by_key_arrays_salted(
+    batch: &RecordBatch,
+    keys: &[ArrayRef],
+    num_partitions: usize,
+    salt: u64,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
     assert!(num_partitions >= 1);
     // Single global bucket → no hashing or gather; the Arc-backed batch is returned
     // as-is (a refcount bump, not a copy). Covers the common non-distributed case.
     if num_partitions == 1 {
         return Ok(vec![batch.clone()]);
     }
-    let part_of = bucket_of_rows(keys, batch.num_rows(), num_partitions)?;
+    let part_of = bucket_of_rows_salted(keys, batch.num_rows(), num_partitions, salt)?;
     scatter_into_buckets(batch, &part_of, num_partitions)
 }
 
@@ -87,6 +110,18 @@ pub fn bucket_of_rows(
     rows: usize,
     num_partitions: usize,
 ) -> Result<Vec<u32>, RuntimeError> {
+    bucket_of_rows_salted(keys, rows, num_partitions, 0)
+}
+
+/// [`bucket_of_rows`] with an independent re-mix of the key hash; `salt == 0` is exactly
+/// [`bucket_of_rows`]. See [`partition_by_key_arrays_salted`] for what a salt is for and the
+/// one place it may be used.
+pub fn bucket_of_rows_salted(
+    keys: &[ArrayRef],
+    rows: usize,
+    num_partitions: usize,
+    salt: u64,
+) -> Result<Vec<u32>, RuntimeError> {
     if keys.is_empty() {
         return Ok(vec![0u32; rows]);
     }
@@ -96,7 +131,7 @@ pub fn bucket_of_rows(
     // groups where the single-node oracle returns one (invariant #7). See `crate::keys`.
     let canon = crate::keys::canonicalize_float_keys(keys);
     let keys: &[ArrayRef] = canon.as_deref().unwrap_or(keys);
-    if let Some(part) = partition_int_key(keys, num_partitions) {
+    if let Some(part) = partition_int_key(keys, num_partitions, salt) {
         return Ok(part);
     }
     // Mixed Int64 / string / binary key (null-free): hash each row's raw column values
@@ -108,7 +143,7 @@ pub fn bucket_of_rows(
     // needs. Null-free only: a null slot's arbitrary raw bytes could split two equal
     // null-bearing rows across buckets (fine for a join, where null keys never match, but not
     // for a DISTINCT, where nulls compare equal); a nullable key keeps the `RowConverter`.
-    if let Some(part) = partition_mixed_key(keys, num_partitions) {
+    if let Some(part) = partition_mixed_key(keys, num_partitions, salt) {
         return Ok(part);
     }
     let fields: Vec<SortField> = keys
@@ -120,11 +155,11 @@ pub fn bucket_of_rows(
     Ok(if rows >= PAR_HASH_MIN_ROWS {
         (0..rows)
             .into_par_iter()
-            .map(|i| bucket_of(SEED.hash_one(encoded.row(i)), num_partitions))
+            .map(|i| bucket_of_salted(SEED.hash_one(encoded.row(i)), num_partitions, salt))
             .collect()
     } else {
         (0..rows)
-            .map(|i| bucket_of(SEED.hash_one(encoded.row(i)), num_partitions))
+            .map(|i| bucket_of_salted(SEED.hash_one(encoded.row(i)), num_partitions, salt))
             .collect()
     })
 }
@@ -761,6 +796,33 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
     h
 }
 
+/// [`bucket_of`], re-mixing the hash first when `salt` is non-zero.
+///
+/// A `salt` of 0 is the identity — byte-for-byte the historical assignment — because the
+/// unsalted bucket of a key is a *cluster-wide* contract: both sides of a distributed join
+/// and every reducer must agree on it. Salting is for the strictly local decision of how to
+/// **re-split a bucket that did not fit**, where the only requirement is that the split is
+/// independent of the one that produced the bucket.
+///
+/// Independence is why this re-mixes rather than just choosing a different partition count.
+/// [`bucket_of`] reads the *low* bits at a power-of-two count and the *high* bits otherwise,
+/// so re-partitioning a bucket with a different count can be perfectly correlated with the
+/// split that made it — 100 buckets re-split into 61 maps a contiguous high-bit range onto
+/// about half a bucket, so nearly every row lands together again and the recursion makes no
+/// progress. Re-mixing decorrelates the two levels whatever the counts are.
+#[inline]
+fn bucket_of_salted(hash: u64, num_partitions: usize, salt: u64) -> u32 {
+    if salt == 0 {
+        return bucket_of(hash, num_partitions);
+    }
+    // The same splitmix64-style finalizer `salted_hash` uses, over a full-width salt.
+    let mut h = hash ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    bucket_of(h, num_partitions)
+}
+
 /// Map a key hash to a bucket in `[0, num_partitions)` without a division: a bit
 /// mask when the count is a power of two, else Lemire's multiply-shift over the
 /// hash's high-entropy bits. Deterministic, so equal keys (and both join sides)
@@ -778,7 +840,7 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
 /// path rather than falling back to the `RowConverter`: if it fell back while a null-free key of
 /// the same type hashed raw, the two hashes would disagree on equal *non-null* keys and split them
 /// across buckets — silently dropping inner-join matches (both join sides must take one path).
-fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
+fn partition_int_key(keys: &[ArrayRef], num_partitions: usize, salt: u64) -> Option<Vec<u32>> {
     use arrow::array::Int64Array;
     if keys.is_empty() || !keys.iter().all(|k| k.data_type() == &DataType::Int64) {
         return None;
@@ -790,7 +852,7 @@ fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32
     // took this raw hash, the two hashes would disagree on equal *non-null* keys, splitting them
     // across buckets and silently dropping inner-join matches. Same-typed keys therefore always
     // take one identical path regardless of null presence.
-    let null_bucket = bucket_of(crate::keys::NULL_HASH, num_partitions);
+    let null_bucket = bucket_of_salted(crate::keys::NULL_HASH, num_partitions, salt);
     // Single Int64 key — hash the raw value directly.
     if keys.len() == 1 {
         let arr = keys[0].as_any().downcast_ref::<Int64Array>()?;
@@ -799,7 +861,7 @@ fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32
             if arr.is_null(i) {
                 null_bucket
             } else {
-                bucket_of(SEED.hash_one(vals[i]), num_partitions)
+                bucket_of_salted(SEED.hash_one(vals[i]), num_partitions, salt)
             }
         };
         let n = vals.len();
@@ -828,7 +890,7 @@ fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32
         for c in &cols {
             h.write_i64(c.values()[i]);
         }
-        bucket_of(h.finish(), num_partitions)
+        bucket_of_salted(h.finish(), num_partitions, salt)
     };
     Some(if n >= PAR_HASH_MIN_ROWS {
         (0..n).into_par_iter().map(hashn).collect()
@@ -868,7 +930,7 @@ impl MixedCol<'_> {
 /// the same bucket — the co-partitioning invariant a shuffle/DISTINCT needs. Gated null-free
 /// because a null slot's arbitrary raw value could split two equal null-bearing rows across
 /// buckets, which a DISTINCT (nulls compare equal) must not do.
-fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
+fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize, salt: u64) -> Option<Vec<u32>> {
     if keys.len() < 2 {
         return None;
     }
@@ -890,7 +952,7 @@ fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u
     // rows hash raw — the same null-awareness `partition_int_key` has, so a nullable key never
     // falls back to the `RowConverter` while a null-free key of the same shape hashes raw, which
     // would split equal non-null keys across buckets and drop inner-join matches.
-    let null_bucket = bucket_of(crate::keys::NULL_HASH, num_partitions);
+    let null_bucket = bucket_of_salted(crate::keys::NULL_HASH, num_partitions, salt);
     let any_null = keys.iter().any(|k| k.null_count() != 0);
     let hashn = |i: usize| -> u32 {
         use std::hash::{BuildHasher, Hasher};
@@ -901,7 +963,7 @@ fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u
         for c in &cols {
             c.write(&mut h, i);
         }
-        bucket_of(h.finish(), num_partitions)
+        bucket_of_salted(h.finish(), num_partitions, salt)
     };
     Some(if n >= PAR_HASH_MIN_ROWS {
         (0..n).into_par_iter().map(hashn).collect()
@@ -1360,7 +1422,7 @@ mod tests {
         let key = Arc::new(Int64Array::from(vec![10, 20, 10, 20, 11, 20])) as ArrayRef;
         let keys = vec![flag, key];
         // Fast path must fire (null-free, 2 cols of int+str).
-        let fast = partition_mixed_key(&keys, 8).expect("mixed fast path should apply");
+        let fast = partition_mixed_key(&keys, 8, 0).expect("mixed fast path should apply");
         assert_eq!(fast.len(), 6);
         // Rows 0 and 2 are ("A",10) — identical → same bucket. Rows 1,3,5 are ("N"/"R",20):
         // 1 and 3 are ("N",20) identical; 5 is ("R",20) distinct.
@@ -1388,7 +1450,7 @@ mod tests {
         use arrow::array::StringArray;
         let flag = Arc::new(StringArray::from(vec![Some("A"), None, Some("A"), None])) as ArrayRef;
         let key = Arc::new(Int64Array::from(vec![Some(1), None, Some(1), None])) as ArrayRef;
-        let part = partition_mixed_key(&[flag, key], 8).expect("null-aware fast path applies");
+        let part = partition_mixed_key(&[flag, key], 8, 0).expect("null-aware fast path applies");
         assert_eq!(part.len(), 4);
         // Rows 0 and 2 are ("A",1) → same bucket. Rows 1 and 3 are (null,null) → the null bucket.
         assert_eq!(part[0], part[2], "equal (A,1) rows co-partition");
@@ -1460,5 +1522,95 @@ mod tests {
         assert_eq!(parts.len(), 3);
         let total: usize = parts.iter().map(|p| p.num_rows()).sum();
         assert_eq!(total, 5, "no row may be lost or duplicated");
+    }
+
+    /// A salt of 0 must be the identity. The unsalted bucket of a key is a cluster-wide
+    /// contract — both sides of a distributed join and every reducer agree on it — so the
+    /// salted entry point existing at all must not have moved a single row.
+    #[test]
+    fn salt_zero_is_the_historical_assignment() {
+        let keys: Vec<ArrayRef> =
+            vec![Arc::new(Int64Array::from((0..500_i64).collect::<Vec<_>>()))];
+        for p in [2usize, 16, 64, 100, 257] {
+            let plain = bucket_of_rows(&keys, 500, p).unwrap();
+            let salted = bucket_of_rows_salted(&keys, 500, p, 0).unwrap();
+            assert_eq!(
+                plain, salted,
+                "salt 0 changed the assignment at {p} partitions"
+            );
+        }
+    }
+
+    /// The point of the salt: re-splitting one bucket must actually spread it.
+    ///
+    /// Choosing a different *partition count* is not enough, and that is why this exists.
+    /// `bucket_of` reads the low bits at a power-of-two count and the high bits otherwise,
+    /// so re-partitioning a bucket produced by a high-bit split with another high-bit split
+    /// maps a contiguous hash range onto about one sub-bucket — nearly every row lands
+    /// together again and a recursive split makes no progress at all. Re-mixing the hash
+    /// decorrelates the levels whatever the two counts are.
+    #[test]
+    fn a_salted_resplit_spreads_a_bucket_that_an_unsalted_one_does_not() {
+        let n = 40_000_usize;
+        let all: Vec<i64> = (0..n as i64).collect();
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(all.clone()))];
+        // Level 0: 100 buckets (not a power of two → high-bit multiply-shift).
+        let level0 = bucket_of_rows(&keys, n, 100).unwrap();
+        let bucket0: Vec<i64> = all
+            .iter()
+            .zip(&level0)
+            .filter(|(_, &b)| b == 0)
+            .map(|(&k, _)| k)
+            .collect();
+        assert!(bucket0.len() > 8, "need a populated bucket to re-split");
+        let sub: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(bucket0.clone()))];
+
+        // Re-split that bucket 61 ways with no salt: still a high-bit split of a contiguous
+        // high-bit range, so it collapses.
+        let unsalted = bucket_of_rows_salted(&sub, bucket0.len(), 61, 0).unwrap();
+        let unsalted_distinct: HashSet<u32> = unsalted.iter().copied().collect();
+
+        // The same re-split with a salt spreads across the sub-buckets.
+        let salted = bucket_of_rows_salted(&sub, bucket0.len(), 61, 0x9E37_79B9_7F4A_7C15).unwrap();
+        let salted_distinct: HashSet<u32> = salted.iter().copied().collect();
+
+        assert!(
+            salted_distinct.len() > unsalted_distinct.len(),
+            "a salted re-split must spread further than an unsalted one \
+             (salted hit {} sub-buckets, unsalted {})",
+            salted_distinct.len(),
+            unsalted_distinct.len()
+        );
+        assert!(
+            salted_distinct.len() > 50,
+            "a salted re-split of {} keys into 61 sub-buckets reached only {} of them",
+            bucket0.len(),
+            salted_distinct.len()
+        );
+    }
+
+    /// A salt must not break co-partitioning: it is a function of the recursion depth alone,
+    /// never of the row, so equal keys still land together. That is the whole reason both
+    /// sides of a join can be re-split at the same depth and joined sub-bucket by sub-bucket.
+    #[test]
+    fn equal_keys_still_co_locate_under_a_salt() {
+        // The same key multiset in two different orders, as two different "sides".
+        let a: Vec<i64> = (0..200).map(|i| i % 17).collect();
+        let b: Vec<i64> = (0..200).map(|i| (199 - i) % 17).collect();
+        let ka: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(a.clone()))];
+        let kb: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(b.clone()))];
+        let salt = 0xDEAD_BEEF_CAFE_F00D_u64;
+        let ba = bucket_of_rows_salted(&ka, a.len(), 13, salt).unwrap();
+        let bb = bucket_of_rows_salted(&kb, b.len(), 13, salt).unwrap();
+        let mut of_key = std::collections::HashMap::new();
+        for (k, bucket) in a.iter().zip(&ba) {
+            of_key.insert(*k, *bucket);
+        }
+        for (k, bucket) in b.iter().zip(&bb) {
+            assert_eq!(
+                of_key[k], *bucket,
+                "key {k} landed in different sub-buckets on the two sides under one salt"
+            );
+        }
     }
 }

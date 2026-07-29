@@ -19,10 +19,10 @@ use bc_ir::SortKey;
 use super::sort_batch;
 use crate::error::InterpError;
 
-/// Out-of-core sort: sort each input morsel into a run and spill it (dropping the
-/// input batch as we go), then merge the runs with a **bounded-fan-in, streaming**
-/// k-way merge. Peak memory is O(`sort_merge_fanin` morsels) regardless of input size
-/// — only one batch per run in the active merge group is resident, and the output is
+/// Out-of-core sort: sort the input into `run_target_bytes`-sized runs and spill them
+/// (dropping each input batch as we go), then merge the runs with a **bounded-fan-in,
+/// streaming** k-way merge. Peak memory is O(`sort_merge_fanin` morsels) regardless of input
+/// size: only one batch per run in the active merge group is resident, and the output is
 /// streamed back to disk between passes. The result equals a single in-memory
 /// `sort_batch` over the whole input. Disk spill uses Arrow-IPC [`DiskSpillStore`].
 pub(crate) fn external_merge_sort(
@@ -30,11 +30,19 @@ pub(crate) fn external_merge_sort(
     keys: &[SortKey],
     dir: &std::path::Path,
     sort_merge_fanin: usize,
+    run_target_bytes: u64,
     codec: bc_runtime::agg::spill::SpillCodec,
     cancel: Option<&bc_resource::CancelToken>,
 ) -> Result<(Vec<RecordBatch>, u64), InterpError> {
-    let Some((mut store, spill_bytes)) =
-        external_sort_to_final_store(parts, keys, dir, sort_merge_fanin, codec, cancel)?
+    let Some((mut store, spill_bytes)) = external_sort_to_final_store(
+        parts,
+        keys,
+        dir,
+        sort_merge_fanin,
+        run_target_bytes,
+        codec,
+        cancel,
+    )?
     else {
         return Ok((Vec::new(), 0));
     };
@@ -61,24 +69,45 @@ pub(crate) fn external_sort_to_final_store(
     keys: &[SortKey],
     dir: &std::path::Path,
     sort_merge_fanin: usize,
+    run_target_bytes: u64,
     codec: bc_runtime::agg::spill::SpillCodec,
     cancel: Option<&bc_resource::CancelToken>,
 ) -> Result<Option<(bc_runtime::agg::spill::DiskSpillStore, u64)>, InterpError> {
     use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
 
-    // Pass 0: sort each input morsel into a run and spill it, dropping each input
-    // batch as it is consumed so the sorted runs never co-reside with the full input.
-    let mut store = DiskSpillStore::with_codec(dir.to_path_buf(), parts.len().max(1), codec)
-        .map_err(InterpError::from)?;
+    // Pass 0: sort the input into runs and spill them, dropping each input batch as it is
+    // consumed so the sorted runs never co-reside with the full input.
+    //
+    // Runs are grown to `run_target_bytes` rather than made one-per-morsel, and that is the
+    // dominant cost in a large sort. The merge is multi-pass with fan-in `f`, so it rewrites
+    // the entire dataset ceil(log_f(runs)) times: at a 2 MB morsel a 10 GB sort produces
+    // ~5,000 single-morsel runs and pays four full passes, where 64 MB runs give ~160 and
+    // pay two. Halving the pass count halves the spill I/O, and the input is already
+    // resident here, so coalescing costs only the transient sort scratch for one run.
+    let mut store = DiskSpillStore::with_codec(
+        dir.to_path_buf(),
+        run_slots(&parts, run_target_bytes),
+        codec,
+    )
+    .map_err(InterpError::from)?;
     let mut n_runs = 0usize;
+    let mut group: Vec<RecordBatch> = Vec::new();
+    let mut group_bytes = 0u64;
     for b in parts.into_iter() {
         if b.num_rows() == 0 {
             continue;
         }
-        let run = sort_batch(&b, keys, None)?;
-        store.append(n_runs, &run).map_err(InterpError::from)?;
+        group_bytes += b.get_array_memory_size() as u64;
+        group.push(b);
+        if group_bytes >= run_target_bytes {
+            spill_run(&mut group, keys, &mut store, n_runs)?;
+            n_runs += 1;
+            group_bytes = 0;
+        }
+    }
+    if !group.is_empty() {
+        spill_run(&mut group, keys, &mut store, n_runs)?;
         n_runs += 1;
-        // `b` and `run` drop here — the input morsel's memory is released.
     }
     if n_runs == 0 {
         return Ok(None);
@@ -111,6 +140,10 @@ pub(crate) fn external_sort_to_final_store(
                 }
             }
             stream_merge_group(readers, keys, &mut next, g)?;
+            // Same reason as pass 0: a merge pass fills output group `g` and never returns
+            // to it, so closing here keeps the pass's open descriptors at one output plus
+            // the fan-in's readers, rather than one per group.
+            next.close_partition(g).map_err(InterpError::from)?;
         }
         store = next;
         n_runs = n_groups;
@@ -120,6 +153,58 @@ pub(crate) fn external_sort_to_final_store(
 
 /// A streaming reader over one spilled run's batches.
 type RunReader = arrow::ipc::reader::StreamReader<std::io::BufReader<std::fs::File>>;
+
+/// Default target size of a pass-0 sorted run when the caller has no operator envelope to
+/// derive one from (the quantile/median spill paths).
+///
+/// Deliberately modest: the run is built by concatenating the accumulated morsels and
+/// sorting the result, so the transient scratch is about twice this on top of the still
+/// resident input. 64 MiB is large enough to collapse the run count by one to two orders of
+/// magnitude against per-morsel runs — which is where the merge-pass saving comes from —
+/// and small enough that the scratch is noise next to any envelope big enough to have
+/// spilled in the first place.
+pub(crate) const DEFAULT_RUN_TARGET_BYTES: u64 = 64 << 20;
+
+/// Upper bound on the number of runs pass 0 can produce, used to size the store's partition
+/// vector up front. Exact would require summing every batch's size twice; this over-counts
+/// harmlessly (an unused partition is an unwritten file) and never under-counts, because a
+/// run is only closed once it has reached `run_target_bytes` — except the final partial run,
+/// which the `+ 1` covers.
+fn run_slots(parts: &[RecordBatch], run_target_bytes: u64) -> usize {
+    let total: u64 = parts.iter().map(|b| b.get_array_memory_size() as u64).sum();
+    (total / run_target_bytes.max(1)) as usize + 1
+}
+
+/// Sort the accumulated morsels as one run, append it to `store` as partition `slot`, and
+/// release both the morsels and the run.
+///
+/// The writer is closed as soon as the run is written: pass 0 fills a run once and never
+/// returns to it, so leaving it open would hold one file descriptor per run until the merge
+/// reached it. A sort large enough to spill can have thousands of runs, so that reaches
+/// `EMFILE` on precisely the inputs spilling exists to serve, while the disk is nowhere near
+/// full. Closing here bounds pass 0's open descriptors at one.
+fn spill_run(
+    group: &mut Vec<RecordBatch>,
+    keys: &[SortKey],
+    store: &mut bc_runtime::agg::spill::DiskSpillStore,
+    slot: usize,
+) -> Result<(), InterpError> {
+    use bc_runtime::agg::spill::SpillStore;
+
+    let run = if group.len() == 1 {
+        sort_batch(&group[0], keys, None)?
+    } else {
+        let combined = super::materialize(group)?;
+        // Release the source morsels before sorting, so the run's peak is the concatenated
+        // copy plus its sorted output rather than three copies of the run.
+        group.clear();
+        sort_batch(&combined, keys, None)?
+    };
+    group.clear();
+    store.append(slot, &run).map_err(InterpError::from)?;
+    store.close_partition(slot).map_err(InterpError::from)?;
+    Ok(())
+}
 
 /// Build the key-row converter for a run group from a sample batch, baking each
 /// key's asc/desc/nulls options into the encoding so encoded rows compare in order.
@@ -397,7 +482,7 @@ mod tests {
             std::process::id()
         ));
         let (sorted, _) =
-            external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None, None).unwrap();
+            external_merge_sort(parts, &keys, &dir, 2, 1, SpillCodec::None, None).unwrap();
         assert_eq!(
             seq(std::slice::from_ref(&oracle)),
             seq(&sorted),
@@ -419,6 +504,56 @@ mod tests {
     /// `RowConverter` rejects the `Null` type just as its sort kernels do. The key is coerced
     /// to a constant (all-equal), so the merge orders by the real secondary key `id`, matching
     /// the in-memory oracle row-for-row.
+    /// Coalescing morsels into larger pass-0 runs must not change the result. It is a
+    /// different code path from the one-run-per-morsel case — the morsels are concatenated
+    /// and sorted as a unit — so both the merge-free case (every morsel in one run) and the
+    /// several-runs case are checked against the in-memory oracle row for row.
+    #[test]
+    fn external_sort_run_coalescing_matches_inmemory() {
+        let nan = f64::NAN;
+        let ids: Vec<i64> = (0..12).collect();
+        let fs: Vec<f64> = vec![
+            2.0, nan, -0.0, 5.0, 2.0, 0.0, -3.0, nan, 1.0, 2.0, 0.0, -0.0,
+        ];
+        let whole = fbatch(&ids, &fs);
+        let keys = vec![SortKey {
+            expr: bc_expr::Expr::Col { name: "f".into() },
+            descending: false,
+            nulls_first: false,
+        }];
+        let oracle = super::super::sort_batch(&whole, &keys, None).unwrap();
+        let parts: Vec<RecordBatch> = vec![
+            fbatch(&ids[0..3], &fs[0..3]),
+            fbatch(&ids[3..5], &fs[3..5]),
+            fbatch(&ids[5..8], &fs[5..8]),
+            fbatch(&ids[8..9], &fs[8..9]),
+            fbatch(&ids[9..12], &fs[9..12]),
+        ];
+        // A target far above the whole input folds every morsel into one run, so no merge
+        // pass runs at all; a mid-sized one gives a handful of multi-morsel runs.
+        for target in [u64::from(u32::MAX), 1024] {
+            let dir = std::env::temp_dir().join(format!(
+                "bc_extsort_coalesce_{target}_{}",
+                std::process::id()
+            ));
+            let (sorted, _) = external_merge_sort(
+                parts.clone(),
+                &keys,
+                &dir,
+                2,
+                target,
+                SpillCodec::None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                seq(std::slice::from_ref(&oracle)),
+                seq(&sorted),
+                "coalesced pass-0 runs (target={target}) diverged from the in-memory sort"
+            );
+        }
+    }
+
     #[test]
     fn external_sort_null_typed_leading_key() {
         use arrow::array::NullArray;
@@ -454,7 +589,7 @@ mod tests {
         let parts = vec![mk(&[5, 2, 9]), mk(&[1, 7]), mk(&[3, 8, 4, 6])];
         let dir = std::env::temp_dir().join(format!("bc_extsort_null_{}", std::process::id()));
         let (sorted, _) =
-            external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None, None).unwrap();
+            external_merge_sort(parts, &keys, &dir, 2, 1, SpillCodec::None, None).unwrap();
         let ids: Vec<i64> = sorted
             .iter()
             .flat_map(|b| {

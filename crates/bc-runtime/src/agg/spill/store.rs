@@ -12,7 +12,7 @@
 //! algebra reproduces the global aggregate one partition at a time*.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -99,6 +99,41 @@ impl SpillCodec {
     }
 }
 
+/// Total write-buffer memory one spill store may hold across **all** its partitions.
+///
+/// Arrow's `StreamWriter` issues a separate `write` per IPC message *and per buffer within
+/// it* — a batch with `k` columns costs on the order of `2k` syscalls, each typically a few
+/// KB of validity/offset data. Written straight to a `File` that is one syscall per buffer;
+/// a spill of a few thousand morsels over a dozen columns is hundreds of thousands of
+/// syscalls spent on data that would coalesce into a handful of large writes. Buffering is
+/// invisible to the reader (the IPC bytes are identical), so it is pure throughput.
+///
+/// It is budgeted in total rather than per file because the partition count is not small
+/// and not bounded by the caller: a skewed grace aggregate re-partitions up to 4,096 ways,
+/// so a flat 1 MiB per writer would be 4 GiB of buffers — spill's entire purpose is to *stop*
+/// using memory, and a fixed per-file buffer would have made the store's own overhead scale
+/// with the skew it exists to absorb.
+const SPILL_WRITE_BUF_TOTAL: usize = 32 << 20;
+
+/// Per-partition write buffer, as [`SPILL_WRITE_BUF_TOTAL`] shared among `partitions`.
+///
+/// Clamped below at the 8 KiB `BufWriter` default, so a very wide fan-out is never *worse*
+/// than the unbuffered path it replaced, and above at 1 MiB, because the unit being written
+/// is a morsel: at 16,384 rows a single numeric column already exceeds 128 KiB, and past a
+/// megabyte the syscall saving flattens.
+fn write_buf_capacity(partitions: usize) -> usize {
+    (SPILL_WRITE_BUF_TOTAL / partitions.max(1)).clamp(8 << 10, 1 << 20)
+}
+
+/// Read buffer in front of each spill file (256 KiB).
+///
+/// The mirror of [`write_buf_capacity`] on the read side: the IPC `StreamReader` reads a
+/// length prefix, then a metadata block, then the body, so the default 8 KiB buffer turns a
+/// sequential scan into three syscalls per message plus one per body page. Sized smaller
+/// than the write buffer because a bounded-fan-in merge holds one of these open *per run*
+/// (16 by default), so this is multiplied by the fan-in while the write buffer is not.
+const SPILL_READ_BUF: usize = 256 << 10;
+
 /// A partitioned, append-only store of partial-state batches.
 ///
 /// The aggregator appends routed partials during the spill phase and reads each
@@ -112,6 +147,22 @@ pub trait SpillStore {
     /// Drain every batch previously appended to `partition`. Called once per
     /// partition; a store may free the partition's backing storage afterward.
     fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError>;
+    /// Finish `partition`'s writer, releasing whatever resource holds it open, while
+    /// keeping the data readable.
+    ///
+    /// Append-then-read stores hold a writer open per partition until the partition is
+    /// read back, which is fine when partitions are few and fixed. It is not fine for the
+    /// external sort's pass 0, where a *run* is a partition: it writes each run once and
+    /// never returns to it, so without this it holds one open file per input morsel and
+    /// dies on `EMFILE` long before it runs out of disk — precisely on the large sorts
+    /// spilling exists to serve. Calling this after the last append to a partition bounds
+    /// open descriptors at O(1) instead of O(runs).
+    ///
+    /// Idempotent, and a no-op for a store that holds nothing open (the default).
+    fn close_partition(&mut self, partition: usize) -> Result<(), RuntimeError> {
+        let _ = partition;
+        Ok(())
+    }
     /// Spawn a fresh, independent store of the same kind with `partitions` partitions —
     /// used to recursively re-partition an over-large partition during the merge phase
     /// (a disk store nests a subdirectory; a memory store makes another memory store).
@@ -232,7 +283,7 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct DiskSpillStore {
     dir: PathBuf,
     paths: Vec<PathBuf>,
-    writers: Vec<Option<StreamWriter<File>>>,
+    writers: Vec<Option<StreamWriter<BufWriter<File>>>>,
     codec: SpillCodec,
     /// Resolved on the first append (when the spilled schema is known, which `Auto`
     /// needs to classify) and reused for every partition's writer.
@@ -300,6 +351,45 @@ fn create_private(path: &std::path::Path) -> std::io::Result<File> {
 }
 
 impl DiskSpillStore {
+    /// Create this store's private scratch directory under `root` and return its path.
+    ///
+    /// Uses `create_dir` — which fails if the name already exists — rather than
+    /// `create_dir_all`, and that distinction is the security property. `create_dir_all`
+    /// *succeeds* when the leaf is an attacker-planted symlink into a directory they can
+    /// read: every spilled row (the query's actual data, the same bytes the caller may have
+    /// taken care to encrypt in flight) is then written through it, with the owner-only
+    /// mode applied to a path the attacker still controls. Any node-local user who can
+    /// write the shared spill root can do this, and it leaves no trace in the query.
+    ///
+    /// Failing closed on a name clash would be a reliability regression on its own — pid
+    /// reuse can leave a stale `bc-spill-{pid}-{seq}` from a killed process — so a clash
+    /// advances the counter and retries instead. The counter is process-wide and monotonic,
+    /// so this terminates immediately in practice; the bound is only there so a root that
+    /// rejects every create (a full or read-only filesystem) surfaces its real error rather
+    /// than spinning.
+    fn claim_scratch_dir(root: &std::path::Path) -> Result<PathBuf, RuntimeError> {
+        const ATTEMPTS: usize = 64;
+        let mut last_err = None;
+        for _ in 0..ATTEMPTS {
+            let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = root.join(format!("bc-spill-{}-{seq}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                // Someone (or a previous incarnation of this pid) already holds the name.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "spill scratch directory names exhausted",
+                )
+            })
+            .into())
+    }
+
     /// Create `partitions` empty, **uncompressed** spill files under a private
     /// subdirectory of `root` — the historical path, byte-for-byte unchanged.
     /// Use [`DiskSpillStore::with_codec`] to compress the streams.
@@ -320,9 +410,8 @@ impl DiskSpillStore {
         partitions: usize,
         codec: SpillCodec,
     ) -> Result<Self, RuntimeError> {
-        let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = root.join(format!("bc-spill-{}-{seq}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&root)?;
+        let dir = Self::claim_scratch_dir(&root)?;
         restrict_to_owner(&dir);
         let n = partitions.max(1);
         let paths = (0..n)
@@ -348,14 +437,15 @@ impl DiskSpillStore {
         &mut self,
         partition: usize,
     ) -> Result<Option<StreamReader<BufReader<File>>>, RuntimeError> {
-        if let Some(mut w) = self.writers[partition].take() {
-            w.finish()?;
-        }
+        self.close_partition(partition)?;
         if !self.paths[partition].exists() {
             return Ok(None);
         }
         let file = File::open(&self.paths[partition])?;
-        Ok(Some(StreamReader::try_new(BufReader::new(file), None)?))
+        Ok(Some(StreamReader::try_new(
+            BufReader::with_capacity(SPILL_READ_BUF, file),
+            None,
+        )?))
     }
 }
 
@@ -385,8 +475,9 @@ impl SpillStore for DiskSpillStore {
                 .get_or_insert_with(|| self.codec.write_options(&batch.schema()))
                 .clone();
             let file = create_private(&self.paths[partition])?;
+            let cap = write_buf_capacity(self.paths.len());
             self.writers[partition] = Some(StreamWriter::try_new_with_options(
-                file,
+                BufWriter::with_capacity(cap, file),
                 &batch.schema(),
                 opts,
             )?);
@@ -413,15 +504,29 @@ impl SpillStore for DiskSpillStore {
         skew_of(&self.bytes_per_partition)
     }
 
+    /// Finish (flush + close) the partition's writer so the IPC stream is complete and its
+    /// descriptor is released. Idempotent: a partition already closed, or never written,
+    /// succeeds without doing anything.
+    fn close_partition(&mut self, partition: usize) -> Result<(), RuntimeError> {
+        if let Some(mut w) = self.writers.get_mut(partition).and_then(Option::take) {
+            // `finish` writes the end-of-stream marker and flushes the `BufWriter`, so the
+            // file is complete and readable once this returns.
+            w.finish()?;
+        }
+        Ok(())
+    }
+
     fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError> {
-        // Finish (flush + close) the writer so the IPC stream is complete before
-        // we read it back. A partition with no appends yields nothing.
-        match self.writers[partition].take() {
-            Some(mut w) => w.finish()?,
-            None => return Ok(Vec::new()),
+        // Finish (flush + close) the writer so the IPC stream is complete before we read it
+        // back. A partition with no live writer may still have been written and closed
+        // early (`close_partition`), so existence — not the writer — decides whether there
+        // is anything to read.
+        self.close_partition(partition)?;
+        if !self.paths[partition].exists() {
+            return Ok(Vec::new());
         }
         let file = File::open(&self.paths[partition])?;
-        let reader = StreamReader::try_new(BufReader::new(file), None)?;
+        let reader = StreamReader::try_new(BufReader::with_capacity(SPILL_READ_BUF, file), None)?;
         reader
             .collect::<Result<Vec<_>, _>>()
             .map_err(RuntimeError::from)
@@ -466,5 +571,46 @@ impl Drop for DiskSpillStore {
     fn drop(&mut self) {
         // Best-effort cleanup of the temporary spill directory.
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The write buffering must be a *fixed* budget shared across partitions, not a fixed
+    /// size per partition.
+    ///
+    /// A skewed grace aggregate re-partitions up to 4,096 ways and the grace join fans out
+    /// 256 ways on each of two stores. At a flat 1 MiB per writer that is gigabytes of
+    /// buffers — held by the subsystem whose entire purpose is to *stop* using memory, and
+    /// growing with exactly the skew it exists to absorb. The floor matters as much: a wide
+    /// fan-out must never end up with a smaller buffer than the `BufWriter` default it
+    /// replaced, or the change would be a regression at the wide end.
+    #[test]
+    fn write_buffering_is_a_shared_budget_not_a_per_file_size() {
+        for partitions in [1usize, 2, 16, 64, 256, 1024, 4096, 100_000] {
+            let cap = write_buf_capacity(partitions);
+            assert!(
+                cap >= 8 << 10,
+                "{partitions} partitions got a {cap}-byte buffer, below the BufWriter default"
+            );
+            assert!(
+                cap <= 1 << 20,
+                "{partitions} partitions got an oversized {cap}-byte buffer"
+            );
+        }
+        // Few partitions get the full per-file buffer; many share the budget.
+        assert_eq!(write_buf_capacity(1), 1 << 20);
+        assert_eq!(write_buf_capacity(32), 1 << 20);
+        assert!(write_buf_capacity(4096) < write_buf_capacity(64));
+        // And the total stays bounded wherever the fan-out lands.
+        for partitions in [16usize, 256, 4096] {
+            let total = write_buf_capacity(partitions) * partitions;
+            assert!(
+                total <= SPILL_WRITE_BUF_TOTAL.max(32 << 20),
+                "{partitions} partitions would hold {total} bytes of write buffers"
+            );
+        }
     }
 }

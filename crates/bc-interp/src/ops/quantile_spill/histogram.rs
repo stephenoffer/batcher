@@ -57,6 +57,7 @@ pub(crate) fn bounded_group_histogram(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        crate::ops::external_sort::DEFAULT_RUN_TARGET_BYTES,
         codec,
         None,
     )?

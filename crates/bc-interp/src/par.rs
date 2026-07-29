@@ -1029,11 +1029,23 @@ fn exec(
                             // larger than the working-set budget. The merge phase is
                             // already fan-in bounded, so this caps peak sort memory.
                             let parts = ops::remorselize(parts, opts.morsel_target());
+                            // Grow each pass-0 run to a quarter of the operator's envelope
+                            // (bounded by the default) rather than one run per morsel: the
+                            // merge rewrites the dataset once per pass, so fewer, larger
+                            // runs is directly fewer passes. A quarter leaves room for the
+                            // run's own concat + sort scratch inside the envelope; with no
+                            // envelope, fall back to the module default.
+                            let run_target = opts
+                                .op_budget(op_id)
+                                .map(|b| (b as u64 / 4).max(1 << 20))
+                                .unwrap_or(ops::DEFAULT_RUN_TARGET_BYTES)
+                                .min(ops::DEFAULT_RUN_TARGET_BYTES);
                             let (sorted, vol) = ops::external_merge_sort(
                                 parts,
                                 keys,
                                 &sp.dir.join("sort"),
                                 opts.tuning.sort_merge_fanin,
+                                run_target,
                                 sp.codec,
                                 opts.cancel.as_ref(),
                             )?;
@@ -5148,6 +5160,108 @@ mod tests {
             let spilled =
                 execute_parallel_with(&plan, &[left.clone(), right.clone()], &opts).unwrap();
             assert_eq!(rows(&seq), rows(&spilled), "join type {jt:?} mismatch");
+        }
+    }
+
+    /// A grace join whose buckets are wildly uneven must still equal the sequential oracle.
+    ///
+    /// The bucket count is sized from the build side's *average* bytes per bucket, so under
+    /// key skew one bucket holds far more than its share. Both sides used to be materialized
+    /// whole before being joined, so that bucket OOMs at exactly the point spilling was
+    /// meant to have prevented it — the standard reason a skewed Spark join dies. The fix
+    /// re-splits an over-large bucket with a depth-derived salt, on *both* sides, and this
+    /// pins the property that makes that legal: the union of the sub-bucket joins is the
+    /// same relation, for every join type.
+    ///
+    /// The budget is small but not degenerate, so the split path is chosen by the measured
+    /// partition size rather than by everything trivially exceeding it, and the skew is
+    /// severe enough (one key carrying most rows on both sides) that a re-split cannot
+    /// separate the hot key and the depth limit is reached.
+    #[test]
+    fn spilling_join_with_skewed_buckets_matches_sequential() {
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+
+        let join_plan = |jt: JoinType| RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: jt,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "lk".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+            strategy: JoinStrategy::Hash,
+        };
+
+        // One hot key (7) carries the bulk of both sides; a scattering of cold keys, some
+        // matching and some not, so the outer/semi/anti emissions all differ.
+        let mut lk = Vec::new();
+        let mut lv = Vec::new();
+        for i in 0..600 {
+            lk.push(7);
+            lv.push(i);
+        }
+        for k in 0..40 {
+            lk.push(k);
+            lv.push(1000 + k);
+        }
+        let mut rk = Vec::new();
+        let mut rv = Vec::new();
+        for i in 0..300 {
+            rk.push(7);
+            rv.push(i);
+        }
+        for k in 20..60 {
+            rk.push(k);
+            rv.push(2000 + k);
+        }
+        let left = vec![batch(&lk, &lv)];
+        let right = vec![batch(&rk, &rv)];
+
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let plan = join_plan(jt);
+            let seq = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("bc_join_skew_{}_{:?}", std::process::id(), jt));
+            let opts = ExecOptions {
+                agg_spill: Some(SpillOptions {
+                    // Small enough to spill and to leave the hot bucket over budget, large
+                    // enough that the cold buckets fit and the split is a real decision.
+                    memory_budget_bytes: 4096,
+                    dir,
+                    codec: SpillCodec::None,
+                }),
+                morsel_rows: 64,
+                ..ExecOptions::default()
+            };
+            let spilled =
+                execute_parallel_with(&plan, &[left.clone(), right.clone()], &opts).unwrap();
+            assert_eq!(
+                rows(&seq),
+                rows(&spilled),
+                "skewed grace join diverged from the oracle for join type {jt:?}"
+            );
         }
     }
 

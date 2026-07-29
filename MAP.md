@@ -758,7 +758,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 216 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 271 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
@@ -1144,7 +1144,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 152 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 203 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `learned.py` | 373 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
