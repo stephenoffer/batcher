@@ -29,8 +29,18 @@ __all__ = ["DefaultSchedulingPolicy"]
 # memory grant (`peak // n_tasks`) down to the morsel floor, which is how an un-sized plan
 # ends up asking Ray for a million tasks of one morsel each.
 #
-# 100k is far above any real fan-out (a 10k-core cluster at ten tasks per core) and far
-# below the placeholder, so it can only ever catch the pathological case.
+# 100k is far above any real *narrow-row* fan-out (a 10k-core cluster at ten tasks per core)
+# and far below the placeholder, so it normally only catches the pathological case.
+#
+# **It is no longer unreachable by a legitimate plan.** Since Kyber's desired parallelism
+# became byte-aware (`annotate._desired_parallelism`), a genuinely wide relation asks for
+# tasks in proportion to its bytes: a petabyte of 1080p video frames at 256 MiB per task
+# wants around a million. Clamping there is still the right *default* — a fan-out that large
+# is a shuffle with 10^12 fragments and needs a different plan, not more tasks — but the
+# clamp now costs oversized tasks rather than merely trimming nonsense, so the cap being hit
+# is a signal about the plan and not only about the estimate. Recorded rather than raised:
+# what the ceiling should be on a real fleet is a measurement, and `dist.clamp_workers`
+# reduces the figure to live cluster capacity downstream in any case.
 _MAX_TASK_FANOUT = 100_000
 
 

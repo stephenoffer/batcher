@@ -21,6 +21,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import pyarrow as pa
+
 from batcher.config import CardinalityConfig, active_config
 from batcher.kyber import learning
 from batcher.kyber.learning import (
@@ -75,6 +77,43 @@ _UNKNOWN_INEQUALITY_SELECTIVITY = 1.0 / 3.0
 # Floor for a computed inequality selectivity. Zero would assert the join is *empty*, which
 # a distribution assumption may not do — only a proof may.
 _MIN_INEQUALITY_SELECTIVITY = 1e-6
+
+
+def _static_unnest_fanout(node: Unnest) -> float | None:
+    """Rows per input row an `Unnest` produces, when the *type* proves it.
+
+    A `fixed_size_list` carries its length, so exploding it is an exact fan-out — the same
+    kind of data-independent multiplier `Unpivot` gets from its column count, and the same
+    fact `plan.types.column_bytes` already reads to size the column. This is the embedding
+    and fixed-shape-vector case, and it is common enough in AI pipelines that leaving it to
+    the learning loop means being wrong by the vector's dimension on every cold run.
+
+    `None` for a variable-length list, whose length genuinely is a property of the data.
+
+    Args:
+        node: The explode being estimated.
+
+    Returns:
+        The exact fan-out, or `None` when the type does not prove one.
+    """
+    schema = node.input.available_schema()
+    if schema is None:
+        return None
+    field = next((f for f in schema.arrow if f.name == node.column), None)
+    if field is None:
+        return None
+    dtype = field.type
+    # An extension type is a label on a storage layout, and a fixed-shape tensor's storage
+    # is exactly the fixed-size list this is looking for — the same unwrap `column_bytes`
+    # needs, and for the same reason: no `pa.types.is_*` predicate sees through the label.
+    storage = getattr(dtype, "storage_type", None)
+    if isinstance(storage, pa.DataType):
+        dtype = storage
+    if not pa.types.is_fixed_size_list(dtype):
+        return None
+    # An `outer` explode keeps a row whose list is null, so it can never emit fewer rows
+    # than it read; a zero-length fixed list would otherwise estimate the relation empty.
+    return float(max(1, dtype.list_size)) if node.outer else float(dtype.list_size)
 
 
 def _uniform_p_less(a1: float, b1: float, a2: float, b2: float) -> float:
@@ -330,12 +369,25 @@ class StatsEstimator:
             # The opaque UDF means output columns are unknown.
             return RelStats(self.estimate(node.input).rows, Provenance.DEFAULT)
         if isinstance(node, Unnest):
-            # Explode multiplies rows by the average list length — a property of the data
-            # that no structural rule can know, so the neutral (1x) default here is wrong
-            # by exactly that factor on the first run. `Unnest` is `_CORRECTABLE`, so the
-            # measured fan-out from a previous run is applied by `estimate` on top of this.
+            # Explode multiplies rows by the average list length. For a *variable*-length
+            # list that is a property of the data which no structural rule can know, so the
+            # neutral (1x) default is wrong by exactly that factor on the first run;
+            # `Unnest` is `_CORRECTABLE`, so a measured fan-out from a previous run is
+            # applied by `estimate` on top of this.
+            #
+            # For a **fixed-size list** it is not unknown at all — the length is in the type,
+            # exactly as it is for `Unpivot`'s column count one branch down, and exactly as
+            # `plan.types.column_bytes` reads it to size the column's bytes. That is the
+            # embedding/vector column: exploding a `fixed_size_list<float32, 768>` produces
+            # 768 rows per input row, and estimating it at 1x under-sized every stage below
+            # it by nearly three orders of magnitude on the first run — the run with nothing
+            # learned, and the one that has to be admitted against a real envelope.
             child = self.estimate(node.input)
-            return RelStats(child.rows, Provenance.DEFAULT, col_prop.unnest_columns(node, child))
+            fanout = _static_unnest_fanout(node)
+            rows = child.rows * fanout if fanout is not None else child.rows
+            # A proven fan-out is as exact as its input; a defaulted one is a guess.
+            prov = child.provenance if fanout is not None else Provenance.DEFAULT
+            return RelStats(rows, prov, col_prop.unnest_columns(node, child))
         if isinstance(node, Unpivot):
             # Unpivot emits one row per `on` column — an exact, data-independent fan-out.
             child = self.estimate(node.input)

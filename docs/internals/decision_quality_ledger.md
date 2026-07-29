@@ -70,3 +70,54 @@ on a cluster it is the term that decides the plan.
 | D18 | hygiene | The machine-shaped multipliers (cache residency, spill volume, external-merge passes, sort comparison counts) were private methods on `CostModel`, so the four operators that all build a hash table — `Join`, `Aggregate`, `Distinct`, distinct `Union` — depended on them through the class rather than on a stated rule. Lifted into `cost/terms.py` as one definition each. |
 | D19 | hygiene | A sort's external-merge IO was open-coded arithmetic at its one call site (`passes x state x device factor`), so it could drift from the flat `spill_io` term the hash operators use. Named as `terms.merge_io`. |
 | D20 | robustness | `texput.log`, a stray pdfTeX log tracked at the repository root, failed `lint-structure` — which runs over the whole tree, so it blocked the pre-commit hook for **every** session, not just the one that created it. Removed. |
+
+## The memory envelope, and the plan shape that decides it (`kyber/annotate.py`, `carbonite/memory`)
+
+The envelope is not advisory: admission checks feasibility against it, the spill decision
+reads it, and the distributed per-task memory grant is derived from it. Two errors in it
+were large and pointed in opposite directions.
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D21 | bug | **A hash join was budgeted at its *output* rows, where its resident state is the hash table over its *build* side.** In a star schema those differ by the fan-out ratio: measured on a 100,000-row fact joined to a 100-row dimension, `cost.py` sizes the table at 1,600 bytes and `annotate_ops` handed Carbonite **2,400,000** — 1,500x, on the most common join shape in analytics. So the query was pushed toward spilling and toward a rejected admission for a hash table that fits in a page. The two subsystems now agree by construction (`test_the_join_envelope_agrees_with_the_cost_model`), which matters beyond the arithmetic: a plan *ranked* on one number and *admitted* against another is the Kyber/Carbonite loop coming apart. |
+| D22 | bug | A fused `Sort` + `Limit` was budgeted at the whole relation rather than its `limit`-row heap — the same error one level down, and the entire reason to fuse the two. |
+| D23 | scale | **`PhysicalOp.inputs` was hardcoded empty**, and `carbonite/memory/estimator.py` named the consequence in its own docstring: with no tree, a plan's envelope can only be its largest single breaker. A bushy plan holds several at once (a join's build side stays resident while the probe side runs), and on a four-way bushy join with tables at 18.2 / 9.1 / 9.1 MB the largest-single reading is 18.2 where the concurrent one is 27.4 — a 1.5x under-count, in the direction that over-admits and OOMs. That docstring ended "Populating `inputs` is Kyber's to do"; `annotate_ops` now does it. |
+| D24 | scale | With the tree in hand, `peak_operator_bytes` walks the *schedule* instead of taking a `max`: `peak(join) = max(peak(build), resident(join) + peak(probe))`, `peak(unary) = max(peak(input), resident(node))`. A linear plan is byte-for-byte what it was (a unary breaker's input has finished and released by the time its own state is full), and a plan carrying no `inputs` — every hand-built `PhysicalPlan` and test double — falls back to exactly the previous reading. |
+
+## Morsel sizing for wide rows (`carbonite/policies/morsel.py`)
+
+A morsel is the unit of the streaming working set. Its byte budget was unenforceable on
+precisely the columns that need it.
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D25 | bug | **`MIN_MORSEL_ROWS` (1,024) silently overrode the byte budget it was meant to accompany.** The floor is a narrow-row concern — per-batch overhead — and applied unconditionally it puts the crossover at `morsel_bytes / 1024` = **1,024 bytes per row**, below essentially every unstructured or multimodal column: a 768-dim `float32` embedding overshoots 3x, a 224x224x3 image **147x**, and one 1080p RGB frame **6,000x** (6 GiB against a 1 MiB budget), multiplied again by the in-flight morsel count. The floor is now itself bounded by the byte target, falling to a single row for a value larger than the whole budget — which is the only morsel that exists for it. On narrow rows it is `MIN_MORSEL_ROWS` exactly as before. |
+| D26 | bug | The same inversion was pinned *green* by a test asserting `rows == max(1024, expected)` while its own comment said "cap rows so rows*width stays within morsel_bytes" — so at a 4 KiB width it accepted a 4 MiB morsel against a 1 MiB budget. The assertion now states the property the comment always claimed. |
+| D27 | fidelity | The width cap was read only from the **learned** memory model, which is empty on a cold store — and the first run of a multimodal pipeline is the one with nothing measured and the one that OOMs. The width was knowable the whole time: it is a property of the column types the plan already carries, and it is *exact* for the tensor columns that hold decoded images, audio, and video. A tensor-column plan is now cut to 6 rows per morsel before a single row is read, where it previously used 16,384. |
+| D28 | fidelity | The learned and planned widths are combined by taking the **more binding** cap rather than preferring either. They cover each other's blind spots: the learned width is filed by operator *family* and cannot tell this plan's image scan from an earlier narrow one, while the planned width cannot price a variable-length payload beyond its prior. Taking the smaller is safe in both directions — a morsel only batches data, so an over-tight one costs throughput and an over-loose one costs the process. |
+
+## Cardinality for nested and semi-structured shapes (`kyber/stats/estimator.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D29 | fidelity | **An `Unnest` was estimated at a 1x fan-out on every cold run**, on the stated grounds that average list length is a property of the data. True of a variable-length list; false of a `fixed_size_list`, whose length is in the type — the embedding and fixed-shape-vector column of every AI pipeline, and the same fact `column_bytes` already reads to size the column's bytes. Exploding a `fixed_size_list<float32, 768>` now estimates 768 rows per input row instead of 1, pinned against what the engine actually emits. Variable-length lists still fall to the learning loop, unchanged. |
+| D30 | fidelity | The exact fan-out carries its input's provenance rather than `DEFAULT`. Provenance is the marker admission reads to tell an estimate from a placeholder, so a fan-out read off a type — a proof, not a guess — must not be filed as one. |
+| D31 | fidelity | The fan-out unwraps an extension type to its storage, so a decoded tensor column explodes by its flattened length. Same blind spot as D1: no `pa.types.is_*` predicate sees through an extension label, and every multimodal column in Batcher wears one. |
+
+## Text-pattern selectivity — the filter of unstructured data (`kyber/stats/selectivity/patterns.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D32 | fidelity | **Every regex got the flat substring prior**, which is right for `'error'` and wrong for the anchored patterns Batcher's own public API generates. `is_alpha`, `is_numeric`, `is_alnum`, `is_space`, `is_url`, and `is_email` all lower to an anchored `regexp_matches` (`'^[A-Za-z]+$'` and friends), and none of them scans for a substring — they classify the *whole* value. `regexp_matches` now gets the same pattern reading `LIKE` always had: exact / anchored / substring. |
+| D33 | fidelity | A fully literal, doubly anchored regex (`'^foo$'`) is equality and gets the equality estimate — a measured skew frequency where one exists, else `1/ndv`, which is typically orders of magnitude below any pattern prior. |
+| D34 | robustness | `'[0-9]+\$'` is a search for a price anywhere in the text, not a whole-value match. An escaped `\$` is no longer read as an end anchor, and a bare `'^'` (which constrains nothing) no longer invents selectivity out of a pattern that has none. |
+| D35 | hygiene | `starts_with`, `ends_with`, anchored `LIKE`, and anchored regex are one shape read from four call sites. Named once as `anchored_selectivity`, so they cannot drift apart. |
+| D36 | docs | **A flagged inconsistency, deliberately not "fixed".** An anchored match is a strict subset of the floating one (`'foo%'` implies `'%foo%'`), so `P(anchored) <= P(substring)` holds by construction — and the shipped defaults assert the reverse (0.10 against 0.05). The one-line clamp that restores the containment was tried, and it makes the *absolute* error worse on the query that exercises it: TPC-H Q14's `p_type LIKE 'PROMO%'` really keeps about 20% of `part`, so 0.10 is a 2x under-estimate and the clamped 0.05 is a 4x one. Which prior is mis-tuned is a question for `benchmarks/run.py`, not for a containment argument. Recorded in `anchored_selectivity`'s docstring so it is visible rather than silently inherited. |
+
+## Distributed fan-out for wide rows (`kyber/annotate.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D37 | scale | **A breaker's desired parallelism was `rows / target_rows_per_task` with no width term.** At the shipped four million rows and the flat 64 B/row that target was tuned against, a task holds a sensible 256 MiB — and on anything wider it sizes tasks that cannot exist: 12 GB for a 768-dim embedding column, **602 GB** for a decoded 224x224x3 image, 25 TB for 1080p frames. So a multimodal pipeline was fanned out as though every row were sixteen bytes and each task was asked to hold hundreds of gigabytes. `n_max_parallelism` now takes the larger of the row- and byte-derived counts against `optimizer.target_bytes_per_task`. |
+| D38 | bug | That is not a new rule — it is the rule the rest of the engine already follows. `api/tuning/decisions.py::auto_num_partitions` and `dist/executors/map.py` both take `max(row_parts, byte_parts)`, and `docs/deep-dives/distributed-scheduling.md` documents it as how a stage is sized, naming video frames and embeddings as the reason. Kyber's `n_max_parallelism` — which is what `SchedulingEnvelope.n_tasks` is actually derived from — was the one place still counting only rows, so the two answers to "how many tasks" disagreed on exactly the data the documented one was written for. Pinned by `test_kyber_agrees_with_the_partition_sizer_it_documents`. |
+| D39 | docs | `_MAX_TASK_FANOUT` (100,000) was justified as "far above any real fan-out", which was true while fan-out counted rows. A petabyte of 1080p frames at 256 MiB per task legitimately wants about a million, so hitting the cap is now a signal about the plan rather than only about the estimate. Recorded in the constant's comment rather than raised, because what the ceiling should be on a real fleet is a measurement. |

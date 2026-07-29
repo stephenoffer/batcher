@@ -85,6 +85,91 @@ def _is_fixed_count_sample(node: LogicalPlan) -> bool:
     return isinstance(node, Sample) and node.n is not None
 
 
+def _resident_bytes(node: LogicalPlan, rows: float, width: float, estimator) -> int:
+    """Bytes a materializing operator actually holds — which is not always its output.
+
+    For most breakers the two coincide: an aggregate's state is its groups, a sort's is
+    its rows, a distinct's is its distinct set. **A hash join is the exception, and it is
+    the most common operator in an analytic plan.** Its resident state is the hash table
+    over its *build* side (the right input, by Batcher's convention), while its output is
+    the probe side fanned out by the match rate — and in a star schema those differ by the
+    fan-out ratio, in the direction that over-budgets.
+
+    Measured on a 100,000-row fact joined to a 100-row dimension: the cost model sizes the
+    table at 1,600 bytes and this used to hand Carbonite **2,400,000** — 1,500x. That
+    figure is not advisory. It is what admission checks feasibility against, what the spill
+    decision reads, and what the distributed per-task memory grant is derived from, so the
+    single most common join shape in analytics was systematically pushed toward spilling
+    and toward a rejected admission for a hash table that fits in a cache line's worth of
+    pages. `cost.py` has always had this right (`mem=build_bytes`); the two now agree.
+
+    A **top-N** is the same shape one level down: a fused `Sort` + `Limit` holds a heap of
+    `limit` rows, not the relation, which is the entire reason to fuse them.
+
+    Args:
+        node: The materializing operator.
+        rows: Its estimated output rows.
+        width: Its estimated output row width in bytes.
+        estimator: The shared cardinality estimator, for sizing a join's build side.
+
+    Returns:
+        The operator's resident state in bytes.
+    """
+    from batcher.plan.logical import Join, Sort
+
+    if isinstance(node, Join):
+        build = estimator.estimate(node.right).rows
+        return int(max(0.0, build) * estimator.row_width(node.right, width))
+    if isinstance(node, Sort) and node.limit:
+        return int(min(float(node.limit), rows) * width)
+    return int(rows * width)
+
+
+def _desired_parallelism(in_rows: float, width: float, target_rows: int, target_bytes: int) -> int:
+    """Tasks a breaker wants, from the rows it shuffles **and** how wide they are.
+
+    A row target alone assumes a row width, and the shipped `target_rows_per_task` of four
+    million assumes the flat `row_bytes` of 64 — a sensible 256 MiB per task, and the figure
+    it was plainly tuned for. On anything wider it sizes tasks that cannot exist:
+
+    | column                      | width     | bytes per task at 4M rows |
+    |-----------------------------|-----------|---------------------------|
+    | two `int64` keys            | 16 B      | 64 MB                     |
+    | 768-dim `float32` embedding | 3 KiB     | 12 GB                     |
+    | 224x224x3 `uint8` image     | 147 KiB   | **602 GB**                |
+    | one 1080p RGB frame         | 5.9 MiB   | **25 TB**                 |
+
+    A multimodal pipeline was therefore fanned out as though every row were sixteen bytes,
+    and each of its tasks was asked to hold hundreds of gigabytes — the OOM that arrives at
+    scale rather than in the small test.
+
+    **This is not a new rule, it is the rule the rest of the engine already follows.**
+    `api/tuning/decisions.py::auto_num_partitions` and `dist/executors/map.py` both take the
+    larger of the row- and byte-derived counts against `target_bytes_per_task`, and
+    `docs/deep-dives/distributed-scheduling.md` documents that as how a stage is sized —
+    naming video frames and embeddings as the reason. Kyber's `n_max_parallelism`, which is
+    what `SchedulingEnvelope.n_tasks` is actually derived from, was the one place that still
+    counted only rows. So the two answers to "how many tasks" disagreed on exactly the data
+    the documented one was written for.
+
+    The two demands combine with `max`, never `min`: the byte term can only ask for *more*
+    parallelism, so a relation no wider than the flat default gets exactly the fan-out it
+    got before and no structured plan is re-shaped by this.
+
+    Args:
+        in_rows: Rows the breaker shuffles (its input volume, not its output).
+        width: Estimated bytes per row.
+        target_rows: `optimizer.target_rows_per_task`.
+        target_bytes: `optimizer.target_bytes_per_task`.
+
+    Returns:
+        The desired task count, at least 1.
+    """
+    by_rows = math.ceil(in_rows / max(1, target_rows))
+    by_bytes = math.ceil(in_rows * max(0.0, width) / max(1, target_bytes))
+    return max(1, by_rows, by_bytes)
+
+
 def _cpu_share(
     kind: str, cpu_light: float, cpu_heavy: float, learned_cpu: dict[str, float], config: Config
 ) -> float:
@@ -124,6 +209,7 @@ def annotate_ops(
     morsel_rows = config.execution.morsel_rows
     morsel_bytes = max(1, config.execution.morsel_bytes)
     target_rows = max(1, config.optimizer.target_rows_per_task)
+    target_bytes = max(1, config.optimizer.target_bytes_per_task)
     fc = config.flow_control
     credit_ceiling = max(1, fc.default_credits * fc.credit_ceiling_factor)
     cpu_heavy = config.execution.cpus_per_task
@@ -134,6 +220,21 @@ def annotate_ops(
     ops: list[PhysicalOp] = []
     try:
         nodes = list(walk(plan))
+        # `walk` is pre-order over an immutable tree, so a node's position in it is its
+        # `OpId`. Recording that mapping is what lets `inputs` carry the plan's *shape*
+        # alongside its per-operator numbers.
+        #
+        # It was hardcoded empty, and `carbonite/memory/estimator.py` names the consequence
+        # in its own docstring: with no tree, a plan's envelope can only be the largest
+        # single breaker, and a bushy plan holds more than one at once. On a four-way bushy
+        # join with three hash tables sized 18.2 / 9.1 / 9.1 MB, the honest concurrent
+        # reading is 27.4 MB and the `max` reports 18.2 — a 1.5x under-count, in the
+        # direction that over-admits and OOMs. That docstring ends "Populating `inputs` is
+        # Kyber's to do"; this is that.
+        #
+        # Keyed by `id()` and read within this loop, so no freed node's reused address can
+        # be observed: `nodes` holds a strong reference to every one of them throughout.
+        op_id_of = {id(n): OpId(i) for i, n in enumerate(nodes)}
         for i, node in enumerate(nodes):
             est = estimator.estimate(node)
             rows = est.rows
@@ -147,7 +248,7 @@ def annotate_ops(
             if not known:
                 mem = 0  # unknown size — don't budget (never fail a real query on a guess)
             elif materializes:
-                mem = int(rows * width)  # materialized state
+                mem = _resident_bytes(node, rows, width, estimator)
             else:
                 # streaming: ~one morsel in flight, byte-bounded.
                 mem = min(int(morsel_rows * width), morsel_bytes)
@@ -166,7 +267,7 @@ def annotate_ops(
                 usable = [r for r in child_rows if 0.0 <= r < unknown_rows]
                 in_rows = sum(usable) if len(usable) == len(child_rows) else rows
                 in_rows = in_rows or rows
-                n_par = max(1, math.ceil(in_rows / target_rows))
+                n_par = _desired_parallelism(in_rows, width, target_rows, target_bytes)
                 # A breaker whose shuffle volume is small enough to keep node-local prefers
                 # PACK over SPREAD: co-locating its few workers avoids a cross-node shuffle that
                 # buys nothing. Large shuffles keep SPREAD so the network load distributes; dist
@@ -197,7 +298,7 @@ def annotate_ops(
                         c_cpu_shares=c_cpu,
                         prefers_locality=prefers_local,
                     ),
-                    inputs=(),
+                    inputs=tuple(op_id_of[id(c)] for c in children(node)),
                     properties=PlanProperties(
                         est_rows=rows,
                         # Publish the width the envelope above was sized with, so a consumer

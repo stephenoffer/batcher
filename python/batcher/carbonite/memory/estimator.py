@@ -1,12 +1,13 @@
 """Per-operator memory estimation — what envelope a plan needs to run in memory.
 
-Kyber annotates each physical operator with a `ResourceBounds` carrying its
-estimated peak memory (`m_max_bytes`). Carbonite consumes those: on a linear plan the
-engine materializes one pipeline breaker at a time, so the in-memory footprint is
-dominated by the single largest breaker rather than the sum of all operators.
-`OperatorMemoryEstimator` returns that peak as the envelope the admission check and the
-spill decision reason about. `peak_operator_bytes` records where the linear assumption
-stops holding.
+Kyber annotates each physical operator with a `ResourceBounds` carrying its estimated
+peak memory (`m_max_bytes`) and, since it began populating `PhysicalOp.inputs`, the plan's
+shape. Carbonite consumes both: on a linear plan the engine materializes one pipeline
+breaker at a time, so the footprint is the largest breaker rather than the sum; on a bushy
+plan a join's build side stays resident while the probe side runs, so several are alive at
+once and the largest-single reading under-counts. `peak_operator_bytes` walks the schedule
+that distinguishes them, and `OperatorMemoryEstimator` returns its answer as the envelope
+the admission check and the spill decision reason about.
 
 Everything here is a *rule*, used by more than one caller, and the callers must agree:
 a plan admitted against one envelope and granted another is a query admitted into a
@@ -37,27 +38,81 @@ __all__ = [
 
 
 def peak_operator_bytes(plan: PhysicalPlan) -> int:
-    """The largest per-operator memory estimate in `plan` (0 if none are sized).
+    """The plan's peak in-memory footprint: the most bytes resident at any one moment.
 
-    The dominant breaker bounds a *linear* pipeline's in-memory footprint, and summing
-    operators would double-count memory that is never live at the same time.
+    On a **linear** pipeline that is the dominant breaker, because the engine materializes
+    one at a time and summing them would double-count memory never live together.
 
-    **Where this under-counts, stated because the figure is used as a safety bound.** A
-    bushy plan holds more than one breaker at once: a hash join's build side is resident
-    while the other side runs, so a join of two joins has three hash tables live together
-    and this returns the largest of the three. On a four-way bushy join Kyber sized those
-    three at 18.2 / 9.1 / 9.1 MB, so this reports 18.2 where a top-join-plus-one-subtree
-    reading is 27.4 and all-three-resident is 36.5 — 1.5x to 2x, by arithmetic over the
-    optimizer's own estimates rather than by a runtime measurement.
+    On a **bushy** plan it is not, and the difference is the difference between admitting a
+    query and OOMing it. A hash join's build side stays resident for as long as the probe
+    side runs, so a join of two joins has three hash tables alive at once. With three sized
+    at 18.2 / 9.1 / 9.1 MB, the largest-single reading is 18.2 and the honest concurrent one
+    is 27.4 — a 1.5x under-count, in the one direction a safety bound must not fail.
 
-    Fixing it needs the plan's tree, and `PhysicalOp.inputs` — the field that would carry
-    it — is hardcoded empty in `kyber/annotate.py` and read by nothing. A concurrency-aware
-    rule written against it today silently degenerates to exactly this `max`, which is worse
-    than the honest under-count because it *looks* correct. Populating `inputs` is Kyber's
-    to do; until then the under-count is real, bounded by the plan's breaker count, and
-    covered downstream by the pressure ladder rather than by this estimate.
+    So the walk is now the schedule, not a `max`. For a join, the build side is materialized
+    first (its own subtree peaks and then collapses to the table), and that table is
+    resident while the probe subtree runs:
+
+        peak(join)  = max(peak(build), resident(join) + peak(probe))
+        peak(unary) = max(peak(input), resident(node))
+
+    A unary breaker takes the `max` because its input pipeline has finished and released by
+    the time its own state is full — which is exactly why the linear case is unchanged and
+    every existing linear-plan envelope is byte-for-byte what it was.
+
+    Falls back to the `max` over all operators when `inputs` is empty, which is what a
+    hand-built `PhysicalPlan` (and every test double) carries. That fallback is the previous
+    behavior exactly, so an unwired plan is never *worse* off than before.
+
+    Args:
+        plan: The annotated physical plan.
+
+    Returns:
+        Peak concurrent bytes, `0` when nothing in the plan could be sized.
     """
-    return max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+    if not plan.ops:
+        return 0
+    flat = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+    # `getattr` for the same reason the rest of this module uses it: a bare test double
+    # carrying only `bounds` is a supported shape, and an estimator is never the right
+    # place to fail a query.
+    if not any(getattr(op, "inputs", ()) for op in plan.ops):
+        return flat  # no tree to walk — the pre-`inputs` reading, unchanged
+    by_id = {int(op.op_id): op for op in plan.ops}
+    roots = _roots(plan)
+    return max((_subtree_peak(r, by_id, set()) for r in roots), default=flat)
+
+
+def _roots(plan: PhysicalPlan) -> list[int]:
+    """Operator ids nothing else consumes — the plan's output(s).
+
+    `annotate_ops` walks pre-order from one root, so in practice there is exactly one; the
+    plural is what keeps this honest against a plan shape that has more.
+    """
+    consumed = {int(i) for op in plan.ops for i in getattr(op, "inputs", ())}
+    return [int(op.op_id) for op in plan.ops if int(op.op_id) not in consumed]
+
+
+def _subtree_peak(op_id: int, by_id: dict, seen: set[int]) -> int:
+    """Peak concurrent bytes of the subtree rooted at `op_id`.
+
+    `seen` guards against a cycle. A `PhysicalPlan` is built from an immutable tree so it
+    cannot contain one, but this figure gates admission for every query in the process and
+    an unbounded recursion here would hang the planner rather than mis-size it.
+    """
+    op = by_id.get(op_id)
+    if op is None or op_id in seen:
+        return 0
+    seen = seen | {op_id}
+    resident = int(op.bounds.m_max_bytes)
+    child_peaks = [_subtree_peak(int(c), by_id, seen) for c in getattr(op, "inputs", ())]
+    if len(child_peaks) < 2:
+        return max(resident, *child_peaks) if child_peaks else resident
+    # A binary breaker holds its build side's state while the probe side runs. Batcher
+    # builds on the *right*, which `annotate_ops` records as the second input, so the
+    # first input is the one still streaming underneath the resident table.
+    probe, build = child_peaks[0], max(child_peaks[1:])
+    return max(build, resident + probe)
 
 
 def learned_plan_peak(plan: PhysicalPlan, model) -> int:

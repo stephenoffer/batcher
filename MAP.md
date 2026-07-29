@@ -758,7 +758,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 313 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 317 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
@@ -2010,7 +2010,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `par.rs` | 2845 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
-| `stream/breaker.rs` | 427 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/breaker.rs` | 494 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 279 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 780 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |

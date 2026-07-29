@@ -126,7 +126,7 @@ def test_a_parallelism_only_recommendation_preserves_the_morsel_target(monkeypat
     monkeypatch.setattr(mgr, "effective_core_budget", lambda: 3)
     monkeypatch.setattr(mgr, "available_cpu_count", lambda: 16)
     manager = mgr.ResourceManager()
-    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None: None)
+    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None, plan=None: None)
 
     recommended = manager.recommended_config()
     assert recommended is not None
@@ -144,7 +144,9 @@ def test_both_levers_apply_together(monkeypatch):
     monkeypatch.setattr(mgr, "effective_core_budget", lambda: 4)
     monkeypatch.setattr(mgr, "available_cpu_count", lambda: 32)
     manager = mgr.ResourceManager()
-    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None: (2048, 65536))
+    monkeypatch.setattr(
+        manager, "recommend_morsel_target", lambda families=None, plan=None: (2048, 65536)
+    )
 
     recommended = manager.recommended_config()
     assert recommended is not None
@@ -160,5 +162,5 @@ def test_an_unpressured_uncontended_machine_still_gets_no_config(monkeypatch):
 
     monkeypatch.setattr(mgr, "effective_core_budget", lambda: mgr.available_cpu_count())
     manager = mgr.ResourceManager()
-    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None: None)
+    monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None, plan=None: None)
     assert manager.recommended_config() is None
