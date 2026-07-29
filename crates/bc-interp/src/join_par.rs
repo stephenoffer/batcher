@@ -306,7 +306,12 @@ pub(crate) fn spilling_asof_join(
     let bytes = left
         .get_array_memory_size()
         .max(right.get_array_memory_size());
-    let p = bytes.div_ceil(sp.memory_budget_bytes.max(1)).max(2);
+    // Capped like every other grace fan-out. Uncapped, a side three orders of magnitude over
+    // the envelope asked for thousands of buckets per store — thousands of spill files, each
+    // receiving shards too small to write efficiently — and the bucket that still did not fit
+    // was materialized anyway, which is the failure the fan-out was trying to avoid.
+    let budget = sp.memory_budget_bytes.max(1);
+    let p = grace_bucket_count(bytes, budget);
     let lb = shuffle::partition_by_keys(left, &li, p)?;
     let rb = shuffle::partition_by_keys(right, &ri, p)?;
 
@@ -319,15 +324,88 @@ pub(crate) fn spilling_asof_join(
     drop(lb);
     drop(rb);
 
+    let asof = AsofBuckets {
+        left_on,
+        right_on,
+        left_by,
+        right_by,
+        backward,
+        output,
+        budget,
+        codec: sp.codec,
+        dir: &sp.dir,
+        lschema: left.schema(),
+        rschema: right.schema(),
+    };
     let mut out = Vec::with_capacity(p);
     for i in 0..p {
-        let lpart = ops::materialize(&lstore.read(i)?)?;
-        let rpart = ops::materialize(&rstore.read(i)?)?;
-        out.push(ops::asof_join_batches(
-            &lpart, &rpart, left_on, right_on, left_by, right_by, backward, output,
-        )?);
+        asof_bucket(&mut lstore, &mut rstore, i, &asof, 0, &mut out)?;
     }
     Ok(out)
+}
+
+/// The parts of a spilling ASOF join that do not change as buckets are re-split.
+struct AsofBuckets<'a> {
+    left_on: &'a str,
+    right_on: &'a str,
+    left_by: &'a [String],
+    right_by: &'a [String],
+    backward: bool,
+    output: &'a [bc_ir::JoinOutputCol],
+    budget: usize,
+    codec: bc_runtime::agg::spill::SpillCodec,
+    dir: &'a std::path::Path,
+    lschema: arrow::datatypes::SchemaRef,
+    rschema: arrow::datatypes::SchemaRef,
+}
+
+/// ASOF-join one co-partitioned bucket pair, re-splitting it first if it does not fit.
+///
+/// The same guard the hash join gets, and legal for the same reason with one extra step: a
+/// nearest-`on` match never crosses a `by` group, so re-partitioning **by the `by` keys**
+/// keeps every group whole in one sub-bucket and each sub-pair stays an independent ASOF
+/// join. Ordering within a group is untouched, since the bucket's rows are re-ordered only
+/// across sub-buckets and `asof_join_batches` orders what it is given.
+///
+/// Both sides are measured before either is read: the fan-out is sized from the *larger*
+/// side's total, which says nothing about how any one `by` value is distributed.
+fn asof_bucket(
+    lstore: &mut dyn SpillStore,
+    rstore: &mut dyn SpillStore,
+    i: usize,
+    ctx: &AsofBuckets<'_>,
+    depth: u32,
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), InterpError> {
+    let biggest = (lstore.partition_bytes(i) as usize).max(rstore.partition_bytes(i) as usize);
+    if depth < MAX_GRACE_SPLIT_DEPTH && biggest > ctx.budget {
+        let sub_p = grace_bucket_count(biggest, ctx.budget);
+        let salt = split_salt(depth + 1);
+        let sub = ctx.dir.join(format!("asof-split-{depth}"));
+        let mut lsub = DiskSpillStore::with_codec(sub.join("left"), sub_p, ctx.codec)?;
+        let mut rsub = DiskSpillStore::with_codec(sub.join("right"), sub_p, ctx.codec)?;
+        let lidx = schema_key_indices(&ctx.lschema, ctx.left_by)?;
+        let ridx = schema_key_indices(&ctx.rschema, ctx.right_by)?;
+        drain_repartition(lstore, i, sub_p, salt, &columns_at(&lidx), &mut lsub)?;
+        drain_repartition(rstore, i, sub_p, salt, &columns_at(&ridx), &mut rsub)?;
+        for j in 0..sub_p {
+            asof_bucket(&mut lsub, &mut rsub, j, ctx, depth + 1, out)?;
+        }
+        return Ok(());
+    }
+    let lpart = materialize_or_empty(&lstore.read(i)?, &ctx.lschema)?;
+    let rpart = materialize_or_empty(&rstore.read(i)?, &ctx.rschema)?;
+    out.push(ops::asof_join_batches(
+        &lpart,
+        &rpart,
+        ctx.left_on,
+        ctx.right_on,
+        ctx.left_by,
+        ctx.right_by,
+        ctx.backward,
+        ctx.output,
+    )?);
+    Ok(())
 }
 
 /// Broadcast hash join: the build side is small enough to replicate, so the large

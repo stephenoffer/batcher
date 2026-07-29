@@ -531,3 +531,56 @@ silent-shortening hazard of Program 6. Two other things it shared.
   volume filling after the second, must end as a REMOTE bucket holding all 400 rows with the
   local partial file gone. Paired with `test_a_mid_bucket_fill_still_fails_loudly_with_no_remote_tier`,
   because with nowhere to carry the bucket the query must still fail rather than pretend.
+
+---
+
+## Program 8 — Finishing the sweep: every grace fan-out, and the ASOF join
+
+Programs 3 and 5 capped and skew-guarded the operators I had found. A sweep for the
+*shape* — `div_ceil(budget).max(2)` — found three more sites that had never been capped or
+had drifted away from the thing they claimed to mirror.
+
+### #31 — The spilling ASOF join's fan-out is capped
+
+- **Was:** `bytes.div_ceil(budget).max(2)`, unbounded. A side three orders of magnitude over
+  the envelope asked for thousands of buckets per store, each receiving shards too small to
+  write efficiently — and the bucket that still did not fit was materialized anyway, which is
+  the failure the fan-out was trying to avoid.
+
+### #32 — The spilling ASOF join re-splits a skewed `by`-group bucket
+
+- **Was:** both sides of every bucket pair were materialized whole. The fan-out is sized from
+  the *larger side's total*, which says nothing about how any one `by` value is distributed,
+  so a hot group OOMed the bucket.
+- **Now:** the same measure-then-split guard, and legal here for the hash join's reason plus
+  one more: a nearest-`on` match never crosses a `by` group, so re-partitioning **by the `by`
+  keys** keeps every group whole in one sub-bucket and each sub-pair stays an independent
+  ASOF join. Ordering within a group is untouched — rows move only *between* sub-buckets, and
+  `asof_join_batches` orders what it is given.
+- **Proof:** `spilling_asof_join_with_skewed_by_groups_matches_in_memory` — one `by` group
+  carrying the bulk of both sides, against the in-memory oracle.
+
+### #33 — `mixed_spill`'s constant-state fan-out had drifted from what it mirrors
+
+- Its doc comment said it "mirrors `par::grace_partitions`". That one grew a cap in Program 3;
+  this one did not. Both now route through `grace_bucket_count`, and the reason is stated
+  once rather than copied.
+
+### #34 — The distributed reducer's grace fan-out uses the shared cap
+
+- `reduce_grace_partitions` capped at 4,096 — the same number lowered to 256 in #17, for the
+  same reason: a disk-backed store creates a file per partition, and `combine_finalize_spilling`
+  re-partitions anything still over budget once it sees the true in-memory size.
+
+### #35 — The shm tests no longer collide across processes
+
+- **Was:** the same-node shm root is a **cross-process** namespace, and a peer's directory is
+  named only after its address — which the tests hardcoded (`host_3:55503`). Two test
+  processes of this crate running at once therefore shared directories, and one's
+  `clear_shared` deleted the file the other had just published. Reproduced at roughly **one
+  run in four**, surfacing as an intermittent `NotFound` from `publish_shared` or a fetch that
+  found nothing.
+- **Now:** addresses and planted peer directories embed the pid. **0 failures in 20 runs.**
+- **Why it belongs in this ledger:** a full-workspace build, a second agent's suite, or CI
+  running two jobs on one machine all trigger it, and an intermittently-red transport suite is
+  how a real spill regression gets waved through.

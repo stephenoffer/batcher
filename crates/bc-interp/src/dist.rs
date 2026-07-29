@@ -291,7 +291,7 @@ fn reduce_grace_partitions(paths: &[PathBuf], budget_bytes: usize) -> usize {
         .map(|m| m.len())
         .sum();
     let budget = budget_bytes.max(1) as u64;
-    total.div_ceil(budget).clamp(2, 1 << 12) as usize
+    crate::spill_split::grace_bucket_count(total as usize, budget as usize)
 }
 
 /// Read one Arrow-IPC stream file (a shuffle bucket for this reducer) into its partials.

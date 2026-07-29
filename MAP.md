@@ -168,7 +168,7 @@ The public, fluent, lazy, expression-first API surface.
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
-| `source_stats.py` | 323 | Per-source statistics collection for the conductor. |
+| `source_stats.py` | 330 | Per-source statistics collection for the conductor. |
 | `stats.py` | 383 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 
 ### `batcher/api/adaptive/` — 5 · conductor
@@ -675,7 +675,7 @@ Learned execution-time sizing for the distributed executor (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `sizing.py` | 284 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
+| `sizing.py` | 315 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
 
 ### `batcher/dist/executors/` — 4 · backend
 
@@ -771,13 +771,13 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 175 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
-| `cpu_shares.py` | 173 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
+| `cpu_shares.py` | 187 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 416 | Cross-execution learning — the metadata feedback loop. |
 | `measured_selectivity.py` | 133 | Filter selectivity derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 427 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 65 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 359 | Memoize the optimizer — the same query, planned once. |
+| `plan_cache.py` | 398 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 209 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 186 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 226 | The Kyber rule abstraction — one small, pure unit of optimization. |
@@ -791,7 +791,7 @@ Cost model — what will this plan *cost* to run?
 
 | module | lines | what it is |
 |---|---|---|
-| `model.py` | 410 | The four-axis cost model and its per-operator closed forms. |
+| `model.py` | 437 | The four-axis cost model and its per-operator closed forms. |
 | `shuffle.py` | 279 | The `net` axis — what a plan costs to move across a cluster. |
 | `terms.py` | 184 | The machine-shaped multipliers the per-operator cost forms fold in. |
 
@@ -849,7 +849,7 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 486 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 241 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 367 | The `Optimizer` façade and the module-level entry points. |
+| `facade.py` | 375 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
 
@@ -1690,14 +1690,14 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | module | lines | what it is |
 |---|---|---|
 | `bloom_index.py` | 119 | `BloomIndex` — a data-skipping membership index over a column's values. |
-| `feedback.py` | 205 | Execution feedback contract: Core → Kyber. |
+| `feedback.py` | 273 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
 | `ir_specs.py` | 102 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
 | `ir_tags.py` | 146 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `resource.py` | 230 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 207 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
@@ -1885,7 +1885,7 @@ The neutral type vocabulary and inference for the plan layer.
 |---|---|---|
 | `hardware_scope.py` | 122 | Scoping learned parameters to the machine that measured them. |
 | `hub.py` | 388 | `MetadataHub` — the façade over a `MetadataBackend`. |
-| `io_stats.py` | 113 | Observed per-source I/O throughput — measured on read, captured for prediction. |
+| `io_stats.py` | 242 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 320 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
 | `smoothed.py` | 153 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
 | `source_stats_store.py` | 145 | Persisted source statistics — remember what Batcher wrote, for the next read. |
@@ -1988,7 +1988,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
 | `shuffle.rs` | 572 | Shuffle FFI: partitioners and the concurrent reducer gather. |
-| `sketches.rs` | 553 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
+| `sketches.rs` | 563 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
 | `tracing_init.rs` | 104 | Rust data-plane `tracing` → Python `logging` bridge. |
 
 ### `bc-interp`
@@ -2198,7 +2198,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `kll.rs` | 517 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |
 | `lib.rs` | 81 | `bc-sketches` — mergeable probabilistic sketches for the optimizer. |
 | `reservoir.rs` | 362 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
-| `stats.rs` | 300 | Per-column statistics derived from a single scan. |
+| `stats.rs` | 334 | Per-column statistics derived from a single scan. |
 | `tdigest.rs` | 447 | T-Digest — tail-accurate quantile sketch (Dunning). |
 
 ### `bc-transport`

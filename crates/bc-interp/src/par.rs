@@ -4921,6 +4921,92 @@ mod tests {
     /// Grace ASOF join (forced by a tiny budget → both sides partitioned to disk and
     /// joined one bucket pair at a time) must equal the in-memory ASOF — the
     /// mergeable-spill invariant for the new bounded-memory ASOF path.
+    /// A spilling ASOF join whose `by` groups are wildly uneven must still equal the
+    /// in-memory result.
+    ///
+    /// The fan-out is sized from the *larger side's total*, which says nothing about how any
+    /// one `by` value is distributed — so a hot group leaves a bucket far over the envelope,
+    /// and both sides were materialized whole before joining. Re-splitting is legal here for
+    /// the hash join's reason plus one more: a nearest-`on` match never crosses a `by` group,
+    /// so re-partitioning by the `by` keys keeps every group whole in one sub-bucket and each
+    /// sub-pair stays an independent ASOF join.
+    ///
+    /// The budget is small but not degenerate, so the split is chosen from a measured
+    /// partition size rather than by everything trivially exceeding it.
+    #[test]
+    fn spilling_asof_join_with_skewed_by_groups_matches_in_memory() {
+        use bc_ir::{JoinOutputCol, JoinSide};
+
+        let plan = RelOp::AsofJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_on: "v".into(),
+            right_on: "v".into(),
+            left_by: vec!["k".into()],
+            right_by: vec!["k".into()],
+            backward: true,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "k".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+        };
+
+        // One hot `by` group carrying the bulk of both sides, plus cold ones.
+        let mut lk = Vec::new();
+        let mut lv = Vec::new();
+        for i in 0..400 {
+            lk.push(7);
+            lv.push(i * 2);
+        }
+        for k in 0..30 {
+            lk.push(k);
+            lv.push(1000 + k);
+        }
+        let mut rk = Vec::new();
+        let mut rv = Vec::new();
+        for i in 0..200 {
+            rk.push(7);
+            rv.push(i * 3);
+        }
+        for k in 10..40 {
+            rk.push(k);
+            rv.push(900 + k);
+        }
+        let left = vec![batch(&lk, &lv)];
+        let right = vec![batch(&rk, &rv)];
+        let in_mem = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("bc_asof_skew_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 2048,
+                dir,
+                codec: SpillCodec::None,
+            }),
+            morsel_rows: 64,
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[left, right], &opts).unwrap();
+        assert_eq!(
+            rows(&in_mem),
+            rows(&spilled),
+            "a re-split ASOF bucket diverged from the in-memory join"
+        );
+    }
+
     #[test]
     fn spilling_asof_join_matches_in_memory() {
         use bc_ir::{JoinOutputCol, JoinSide};

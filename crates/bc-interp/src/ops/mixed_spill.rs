@@ -129,8 +129,15 @@ pub(crate) fn try_bounded_mixed_spill(
     Ok(Some(align_and_assemble(results, aggregates.len())?))
 }
 
-/// Grace fan-out for the constant-state sub-aggregate: enough partitions that each
-/// holds ~one budget of per-group accumulator state (mirrors `par::grace_partitions`).
+/// Grace fan-out for the constant-state sub-aggregate: enough partitions that each holds
+/// ~one budget of per-group accumulator state.
+///
+/// Capped through the same `grace_bucket_count` every other grace operator uses. It is
+/// stated once rather than repeated because this one drifted: it mirrored
+/// `par::grace_partitions`, which grew a cap, and an uncapped fan-out here asked for
+/// thousands of spill files each receiving shards too small to write efficiently. A bucket
+/// that is still too large is not left that way — `combine_finalize_spilling` measures it
+/// before reading it and re-partitions it out of core.
 fn cs_partitions(partials: &[agg::Partial], budget_bytes: usize) -> usize {
     let total: usize = partials
         .iter()
@@ -149,7 +156,7 @@ fn cs_partitions(partials: &[agg::Partial], budget_bytes: usize) -> usize {
             g + s
         })
         .sum();
-    total.div_ceil(budget_bytes.max(1)).max(2)
+    crate::spill_split::grace_bucket_count(total, budget_bytes)
 }
 
 /// Merge-align every path's result by group key and reassemble the aggregate columns
