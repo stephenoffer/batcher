@@ -33,6 +33,27 @@ pub enum RuntimeError {
     #[error("range join cannot run on this condition: {reason}")]
     UnsupportedRangeJoin { reason: String },
 
+    /// The spill filesystem ran out of room (or the writer's quota did).
+    ///
+    /// Separated from the generic [`RuntimeError::Io`] because it is the one spill failure a
+    /// user can act on, and because bare "No space left on device" says nothing about
+    /// *which* device: spill scratch defaults to the system temp directory, which on a
+    /// container is often a small overlay or a tmpfs sized well below the query's spill
+    /// volume, while the large volume the user assumed was being used sits elsewhere. The
+    /// path and the volume written so far are what turn that into a decision.
+    #[error(
+        "spill ran out of disk space after writing {written_bytes} bytes to {dir} \
+         (the query needs more spill scratch than that filesystem has). Point \
+         memory.spill_dir at a larger filesystem, set memory.spill_remote_uri to overflow \
+         to object storage, or lower memory.max_memory_bytes so less of the query \
+         materializes at once. Underlying error: {source}"
+    )]
+    SpillOutOfSpace {
+        dir: String,
+        written_bytes: u64,
+        source: std::io::Error,
+    },
+
     #[error("spill i/o error: {0}")]
     Io(#[from] std::io::Error),
 

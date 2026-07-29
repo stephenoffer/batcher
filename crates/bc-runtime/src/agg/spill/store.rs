@@ -298,6 +298,119 @@ pub struct DiskSpillStore {
     bytes_per_partition: Vec<u64>,
 }
 
+/// Spill roots this process has already swept for orphaned scratch, so the sweep costs one
+/// `read_dir` per root rather than one per store.
+static SWEPT_ROOTS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+/// Delete spill scratch left behind by processes that are no longer running.
+///
+/// A store removes its own directory on drop, which covers every ordinary end — success,
+/// error, panic. It does not cover the one that matters most here: **`SIGKILL`**, and the
+/// process most likely to be `SIGKILL`ed is the one spilling, because that is the process
+/// the kernel OOM killer picks. Nothing runs on that path, so the scratch survives, and it
+/// survives on the spill filesystem — so the next query has less room, spills harder, and is
+/// likelier to be killed in turn. Left alone this ratchets a node into a state where every
+/// large query fails for space while the data that filled the disk belongs to no one.
+///
+/// A directory is only removed when the pid embedded in its name is not a live process, so a
+/// concurrently spilling sibling — the case the pid is in the name for — is never touched. A
+/// reused pid makes the check say "alive" and the directory is kept, which is the safe way
+/// to be wrong. Best-effort throughout: this is cleanup, and no failure of it may fail a
+/// query.
+fn sweep_orphaned_scratch(root: &std::path::Path) {
+    {
+        let mut swept = match SWEPT_ROOTS.lock() {
+            Ok(g) => g,
+            // A poisoned lock means another thread panicked mid-sweep. Skipping cleanup is
+            // strictly better than propagating that into a query.
+            Err(_) => return,
+        };
+        if !swept
+            .get_or_insert_with(std::collections::HashSet::new)
+            .insert(root.to_path_buf())
+        {
+            return;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = orphan_pid(name) else {
+            continue;
+        };
+        if !process_is_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// The pid embedded in a `bc-spill-{pid}-{seq}` directory name, or `None` for any other
+/// name — the sweep must never touch a directory it did not create.
+fn orphan_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("bc-spill-")?;
+    let (pid, seq) = rest.split_once('-')?;
+    // Both halves must parse, so a directory merely *starting* with the prefix is skipped.
+    seq.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether `pid` is a live process on this host.
+///
+/// Read from `/proc`, which is exact on Linux — where the OOM killer this exists for lives —
+/// and unavailable elsewhere. Anything that cannot answer says "alive", so a platform
+/// without `/proc` simply never sweeps rather than deleting scratch that is in use.
+fn process_is_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    } else {
+        true
+    }
+}
+
+/// Turn a spill write failure into [`RuntimeError::SpillOutOfSpace`] when the filesystem (or
+/// the quota) is what refused it, and leave every other I/O error alone.
+///
+/// "No space left on device" on its own is close to useless to whoever has to fix it: spill
+/// scratch defaults to the system temp directory, which in a container is routinely a small
+/// overlay or a tmpfs sized far below the query's spill volume while the large volume the
+/// user believes is in use sits somewhere else entirely. Naming the directory and the volume
+/// already written is what makes it actionable.
+fn classify_spill_io(e: std::io::Error, dir: &str, written_bytes: u64) -> RuntimeError {
+    // `StorageFull` is ENOSPC; `QuotaExceeded` is EDQUOT, which is the same situation for a
+    // user on a quota'd filesystem and needs the same answer.
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) {
+        return RuntimeError::SpillOutOfSpace {
+            dir: dir.to_string(),
+            written_bytes,
+            source: e,
+        };
+    }
+    RuntimeError::Io(e)
+}
+
+/// [`classify_spill_io`] for a failure that reached us through arrow.
+///
+/// The IPC writer wraps the underlying `io::Error` in an `ArrowError`, so a full disk arrives
+/// as `ArrowError::IoError` and would otherwise be reported as a generic arrow failure — the
+/// least informative form of the most common spill failure.
+fn classify_spill_arrow(
+    e: arrow::error::ArrowError,
+    dir: &str,
+    written_bytes: u64,
+) -> RuntimeError {
+    if let arrow::error::ArrowError::IoError(_, io) = e {
+        return classify_spill_io(io, dir, written_bytes);
+    }
+    RuntimeError::Arrow(e)
+}
+
 /// Restrict a spill directory to its owner (`0o700` on Unix); best-effort elsewhere.
 ///
 /// Spilled data is the query's *actual rows* — the same bytes the caller may have taken
@@ -411,6 +524,9 @@ impl DiskSpillStore {
         codec: SpillCodec,
     ) -> Result<Self, RuntimeError> {
         std::fs::create_dir_all(&root)?;
+        // Once per root per process, before claiming space on it: reclaim scratch abandoned
+        // by processes the OOM killer took. See `sweep_orphaned_scratch`.
+        sweep_orphaned_scratch(&root);
         let dir = Self::claim_scratch_dir(&root)?;
         restrict_to_owner(&dir);
         let n = partitions.max(1);
@@ -467,6 +583,8 @@ impl SpillStore for DiskSpillStore {
     }
 
     fn append(&mut self, partition: usize, batch: &RecordBatch) -> Result<(), RuntimeError> {
+        let bytes_written = self.bytes_written;
+        let dir = || self.dir.display().to_string();
         if self.writers[partition].is_none() {
             // Resolve write options on the first append, when the schema is known —
             // `Auto` classifies it to pick a codec. Reused for every partition.
@@ -474,7 +592,8 @@ impl SpillStore for DiskSpillStore {
                 .write_options
                 .get_or_insert_with(|| self.codec.write_options(&batch.schema()))
                 .clone();
-            let file = create_private(&self.paths[partition])?;
+            let file = create_private(&self.paths[partition])
+                .map_err(|e| classify_spill_io(e, &dir(), bytes_written))?;
             let cap = write_buf_capacity(self.paths.len());
             self.writers[partition] = Some(StreamWriter::try_new_with_options(
                 BufWriter::with_capacity(cap, file),
@@ -485,7 +604,8 @@ impl SpillStore for DiskSpillStore {
         self.writers[partition]
             .as_mut()
             .expect("writer just created")
-            .write(batch)?;
+            .write(batch)
+            .map_err(|e| classify_spill_arrow(e, &dir(), bytes_written))?;
         // Count the logical volume spilled (in-memory size, codec-independent) so the
         // control plane can size spill scratch from a measured magnitude, not a bool.
         let n = batch.get_array_memory_size() as u64;
@@ -611,6 +731,77 @@ mod tests {
                 total <= SPILL_WRITE_BUF_TOTAL.max(32 << 20),
                 "{partitions} partitions would hold {total} bytes of write buffers"
             );
+        }
+    }
+
+    /// A full spill filesystem must be reported as *that*, not as a generic I/O or arrow
+    /// failure. "No space left on device" alone does not say which device, and spill scratch
+    /// defaults to the system temp directory — routinely a small container overlay rather
+    /// than the large volume the user believes is in use.
+    #[test]
+    fn a_full_spill_filesystem_is_reported_as_such_through_both_error_paths() {
+        let full = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+
+        match classify_spill_io(full(), "/scratch/spill", 4096) {
+            RuntimeError::SpillOutOfSpace {
+                dir, written_bytes, ..
+            } => {
+                assert_eq!(dir, "/scratch/spill");
+                assert_eq!(written_bytes, 4096);
+            }
+            other => panic!("a full disk was reported as {other}"),
+        }
+
+        // The IPC writer wraps it in an `ArrowError`, which is how it actually arrives.
+        let wrapped = arrow::error::ArrowError::IoError("write failed".into(), full());
+        assert!(
+            matches!(
+                classify_spill_arrow(wrapped, "/scratch/spill", 1),
+                RuntimeError::SpillOutOfSpace { .. }
+            ),
+            "a full disk reaching us through arrow was reported as a generic arrow error"
+        );
+
+        // A quota is the same situation for the user and needs the same answer.
+        assert!(matches!(
+            classify_spill_io(
+                std::io::Error::from(std::io::ErrorKind::QuotaExceeded),
+                "/scratch/spill",
+                0
+            ),
+            RuntimeError::SpillOutOfSpace { .. }
+        ));
+
+        // Everything else keeps its own identity.
+        assert!(matches!(
+            classify_spill_io(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                "/scratch/spill",
+                0
+            ),
+            RuntimeError::Io(_)
+        ));
+    }
+
+    /// The orphan sweep deletes directories, so the name it accepts is a safety boundary: it
+    /// must recognize exactly what it creates and nothing that merely resembles it.
+    #[test]
+    fn only_this_stores_own_scratch_names_are_sweepable() {
+        assert_eq!(orphan_pid("bc-spill-1234-0"), Some(1234));
+        assert_eq!(orphan_pid("bc-spill-1-99999"), Some(1));
+
+        for name in [
+            "someone-elses-data",
+            "bc-spill",
+            "bc-spill-",
+            "bc-spill-1234",         // no counter
+            "bc-spill-abc-0",        // pid is not a number
+            "bc-spill-1234-abc",     // counter is not a number
+            "bc-spill-1234-0-extra", // trailing junk
+            "not-bc-spill-1234-0",   // prefix is not at the start
+            "../escape",
+        ] {
+            assert_eq!(orphan_pid(name), None, "{name} would have been swept");
         }
     }
 }

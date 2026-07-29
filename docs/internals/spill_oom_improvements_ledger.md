@@ -101,6 +101,37 @@ the external sort's use (a partition *is* a run, and there are as many runs as m
   several-multi-morsel-runs case must equal the in-memory oracle **row for row**, on a key
   carrying NaN, `-0.0`, and ties.
 
+### #12 — Scratch abandoned by an OOM-killed process is reclaimed
+
+- **Was:** a store removes its own directory on drop, which covers success, error, and
+  panic. It does not cover `SIGKILL` — and the process most likely to be `SIGKILL`ed is the
+  one spilling, because that is the process the kernel OOM killer picks.
+- **Now:** the first time a process touches a spill root it removes `bc-spill-{pid}-{seq}`
+  directories whose pid is no longer a live process. A live pid is left alone, which is what
+  makes it safe for concurrently spilling siblings sharing one root; a reused pid reads as
+  "alive" and the directory is kept, which is the safe way to be wrong.
+- **Why it matters:** the abandoned scratch sits on the *spill filesystem*. The next query
+  has less room, spills harder, and is likelier to be killed in turn — a node ratchets into
+  a state where every large query fails for space while the data that filled the disk
+  belongs to no process at all.
+- **Proof:** `crates/bc-runtime/tests/spill_orphan_sweep.rs`, which asserts as much about
+  what is *not* deleted (a live sibling's scratch, unrelated directories, names that merely
+  resemble the store's own) as about what is.
+
+### #13 — A full spill filesystem says so, and says which one
+
+- **Was:** `RuntimeError::Io("No space left on device")`, or — when it arrived through the
+  IPC writer, which is the usual path — a generic arrow error.
+- **Now:** a distinct `SpillOutOfSpace` naming the directory, the volume already written,
+  and the three settings that change the outcome.
+- **Why it matters:** spill scratch defaults to the system temp directory, which in a
+  container is routinely a small overlay or a tmpfs sized far below the query's spill
+  volume, while the large volume the user believes is in use sits elsewhere. The bare errno
+  gives no way to discover that.
+- **Proof:** `a_full_spill_filesystem_is_reported_as_such_through_both_error_paths` — both
+  the direct `io::Error` path and the arrow-wrapped one, plus `EDQUOT`, and a
+  permission error that must keep its own identity.
+
 ### #7 — The run target is derived from the operator's memory envelope
 
 - **Was:** n/a (runs were one morsel).

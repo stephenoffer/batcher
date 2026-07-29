@@ -281,7 +281,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `run.py` | 488 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 492 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 204 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 219 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
@@ -660,9 +660,9 @@ Subquery handling and decorrelation for the SQL translator.
 |---|---|---|
 | `executor.py` | 1337 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 625 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_join.py` | 370 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
-| `flight_sort.py` | 357 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
-| `flight_window.py` | 173 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
+| `flight_join.py` | 372 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
+| `flight_sort.py` | 359 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
+| `flight_window.py` | 175 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1132 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 187 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
@@ -718,7 +718,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `lifecycle.py` | 466 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
-| `reduce.py` | 183 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
+| `reduce.py` | 241 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `scaling.py` | 500 | Live cluster topology and the autoscaler request lifecycle. |
 | `scheduling.py` | 292 | The metadata-driven scheduling envelope and placement-group machinery. |
 
@@ -1136,7 +1136,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 |---|---|---|
 | `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 372 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 484 | The Carbonite resource manager entry point. |
+| `manager.py` | 488 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1144,7 +1144,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 203 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 207 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `learned.py` | 373 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
@@ -1160,7 +1160,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 484 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
-| `morsel.py` | 115 | How big a morsel should be, given memory pressure and the rows' measured width. |
+| `morsel.py` | 203 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 208 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
@@ -1918,7 +1918,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `accelerators.py` | 396 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
+| `accelerators.py` | 410 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
 | `events.py` | 280 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 274 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 101 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
@@ -2038,10 +2038,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/mod.rs` | 796 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/qsketch.rs` | 87 | APPROX_QUANTILE / APPROX_MEDIAN — bounded-memory quantiles via per-group DDSketch. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
-| `agg/spill/store.rs` | 576 | The two spill stores and the codec that writes them. |
+| `agg/spill/store.rs` | 696 | The two spill stores and the codec that writes them. |
 | `agg/stats.rs` | 399 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 271 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
-| `error.rs` | 41 | The crate's error type: how the stateful runtime structures report failure. |
+| `error.rs` | 62 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather.rs` | 212 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 137 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
