@@ -310,3 +310,20 @@ Concrete work these leave open, in the order their evidence is strongest:
 (`_SORT_MERGE_MEMORY_SHARE`), and `_MIN_AGG_INPUT_ROWS` guards a win that genuinely *is* a
 row count (the rows a semi-join skips), so rows is the right unit there. Recorded because a
 sweep that reports only its hits reads as if nothing else was checked.
+
+### Open — found by question 2, needs a measurement rather than an argument
+
+**Automatic blob offload does not recognize a decoded tensor column.**
+`api/terminal/blob_offload.py` rewrites a `Sort` to carry large payloads around the breaker
+as content-addressed handles, and it triggers on `pa.types.is_large_binary` alone — keyed,
+per its own docstring, to "what media materialization and `download_dataset` produce". A
+decoded `arrow.fixed_shape_tensor` column is neither `large_binary` nor visible through the
+extension label (question 2), so a 224x224x3 frame at **147 KiB per row** rides through the
+sort's buffers and spill files in full, which is larger than most of the blobs the transform
+was written for.
+
+Not widened here. Offload is a *trade* — payload bytes across the breaker against a
+serialize/read-back round trip — and its cost for a tensor column is unmeasured; the shape
+also has no case in `benchmarks/`, so there is nothing to A/B against. Widening the trigger
+first and measuring second is the wrong order for a transform whose whole justification is a
+cost comparison. The arithmetic above is the reason to build that benchmark case.
