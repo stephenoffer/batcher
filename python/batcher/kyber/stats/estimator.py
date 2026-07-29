@@ -1206,11 +1206,44 @@ class StatsEstimator:
             typed = {f.name: column_bytes(f.type) for f in schema.arrow}
         measured = [widths[c] for c in cols if c in widths]
         if not measured and not typed:
-            return default
+            return self._opaque_width(node, default)
         # Neutral per-column filler for a column neither measured nor typed.
         known = measured or list(typed.values())
         avg_known = sum(known) / len(known)
         return sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
+
+    def _opaque_width(self, node: LogicalPlan, default: float) -> float:
+        """Row width for a node whose own schema says nothing — the `map_batches` case.
+
+        A `MapBatches` is executed in Python and never lowered, so it publishes no output
+        schema and its width fell all the way back to the flat `bytes_per_row` constant of
+        64. That is the operator at the centre of every inference pipeline, and the rows
+        flowing through it are the widest in the engine: a decoded 224x224x3 image is 147 KiB,
+        so the estimate was off by three orders of magnitude for the memory envelope, the
+        morsel cap, and the GPU batch seed all at once.
+
+        The input's width is not a guess here. `MapBatches.available_columns` already
+        implements the operator's stated contract — "if `output_columns` is omitted, the
+        input columns are assumed to pass through" — so taking the *input's* width is the
+        same assumption the plan already makes about the same operator, priced instead of
+        counted. A declared `output_columns` means the shape genuinely changed, and there the
+        flat default stands rather than a claim about columns the UDF invented.
+
+        Deliberately **not** implemented by giving `MapBatches` an `available_schema`. That
+        method feeds type inference and expression validation, where asserting the input's
+        *types* survive a UDF that may rewrite them would turn an estimate into a wrong
+        answer. A width only feeds cost and memory, where being closer is strictly better.
+
+        Args:
+            node: The node whose width could not be derived from its own schema.
+            default: The flat per-row constant to fall back to.
+
+        Returns:
+            The input's estimated width for a pass-through `map_batches`, else `default`.
+        """
+        if isinstance(node, MapBatches) and node.output_columns is None:
+            return self.row_width(node.input, default)
+        return default
 
     def _side_ndv(self, keys: tuple[str, ...], side: RelStats) -> float | None:
         """Distinct count of one join side's key *set*, capped at its row count.

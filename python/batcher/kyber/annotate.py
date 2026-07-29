@@ -125,6 +125,42 @@ def _resident_bytes(node: LogicalPlan, rows: float, width: float, estimator) -> 
     return int(rows * width)
 
 
+def _streaming_bytes(node: LogicalPlan, width: float, morsel_rows: int, morsel_bytes: int) -> int:
+    """Bytes a non-materializing operator holds in flight.
+
+    A genuine streaming operator holds about one morsel, and a morsel is byte-bounded
+    (`carbonite.policies.morsel`), so `min(rows x width, morsel_bytes)` is right for it.
+
+    **A `map_batches` carrying an explicit `batch_size` is not that operator.** It re-batches
+    its input to exactly that many rows regardless of the morsel it was handed, so what it
+    holds is `batch_size x width` and the morsel byte cap does not apply. That is the shape
+    of every inference stage: `kyber/gpu/sizing.py` seeds a batch size from the device's VRAM
+    headroom, tens of thousands of rows for a light model, and on a decoded image column
+    those rows are hundreds of kilobytes each. Budgeted at one morsel, a stage really holding
+    gigabytes was reported to Carbonite as holding one megabyte — an under-count in the
+    direction that lets admission accept a query the node cannot run, on precisely the
+    pipeline this engine is built for.
+
+    Only the *input* batch is charged. A UDF's output is arbitrary Python and Batcher cannot
+    size it; claiming a multiple here would be inventing a number inside a memory bound.
+
+    Args:
+        node: The streaming operator.
+        width: Its estimated output row width in bytes.
+        morsel_rows: The configured rows per morsel.
+        morsel_bytes: The configured bytes per morsel.
+
+    Returns:
+        The operator's in-flight bytes.
+    """
+    from batcher.plan.logical import MapBatches
+
+    batch_size = getattr(node, "batch_size", None) if isinstance(node, MapBatches) else None
+    if batch_size:
+        return int(max(1, batch_size) * width)
+    return min(int(morsel_rows * width), morsel_bytes)
+
+
 def _desired_parallelism(in_rows: float, width: float, target_rows: int, target_bytes: int) -> int:
     """Tasks a breaker wants, from the rows it shuffles **and** how wide they are.
 
@@ -251,7 +287,7 @@ def annotate_ops(
                 mem = _resident_bytes(node, rows, width, estimator)
             else:
                 # streaming: ~one morsel in flight, byte-bounded.
-                mem = min(int(morsel_rows * width), morsel_bytes)
+                mem = _streaming_bytes(node, width, morsel_rows, morsel_bytes)
             # Desired parallelism: a breaker wants enough tasks that each handles
             # ~`target_rows` of the data it *shuffles* — its input volume, not its
             # (possibly tiny) grouped output. Streaming ops inherit the pipeline's
