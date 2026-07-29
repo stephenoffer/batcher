@@ -17,7 +17,7 @@ import logging
 
 import pyarrow as pa
 
-from batcher._internal.logging import get_logger, log_kv
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api.adaptive.gating import _estimate_accurate, _estimate_rows
 from batcher.api.adaptive.plan_surgery import lowest_breaker, replace
 from batcher.io.source import InMemorySource, Source
@@ -213,7 +213,18 @@ def _execute_adaptive(
 
     try:
         while True:
-            target = lowest_breaker(plan)
+            # Stage a breaker only when running it *separately* can teach the optimizer
+            # something. A breaker whose output size is already known exactly costs a
+            # materialization and returns a number the planner had: measured over the 22
+            # TPC-H shapes, 17 of 51 staged breakers were in that state, so a third of
+            # the loop's materializations bought nothing. Those now run inline, fused
+            # into whatever subplan is staged above them.
+            #
+            # The exception is a distributed plan the one-shot dispatcher cannot route at
+            # all, where staging is the only execution path rather than an optimization.
+            # There every breaker qualifies, exact or not.
+            structural = distributed and requires_staging(plan)
+            target = lowest_breaker(plan, None if structural else _worth_staging(srcs, hub))
             if target is None:
                 break
             final = target is plan
@@ -395,3 +406,28 @@ def _table(batches, node) -> pa.Table:
     # non-adaptive path would have typed `int64`. Share the one neutral spelling.
     names = node.available_columns()
     return pa.Table.from_batches([], schema=empty_result_schema(node, names))
+
+
+def _worth_staging(srcs: list[Source], hub):
+    """A predicate for `lowest_breaker`: is this breaker's size still worth measuring?
+
+    Staging trades a materialization for a measurement. When the optimizer already knows
+    a breaker's output size exactly, that trade returns nothing, so the breaker is better
+    executed inside a larger fused subplan. Anything less than exact still qualifies: an
+    estimate the loop can correct is the whole reason the loop exists.
+
+    Best-effort. If the estimate cannot be built or read, the breaker qualifies, which is
+    the pre-existing behavior and never loses a measurement the loop would have taken.
+    """
+    from batcher.plan.stats import Provenance
+
+    def accept(node: LogicalPlan) -> bool:
+        try:
+            from batcher.api.adaptive.gating import _build_estimator
+
+            return _build_estimator(srcs, hub).estimate(node).provenance >= Provenance.DEFAULT
+        except Exception as exc:  # pragma: no cover - an estimate must never break staging
+            note_suppressed("api", "read breaker provenance for staging", exc)
+            return True
+
+    return accept

@@ -178,8 +178,8 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 | module | lines | what it is |
 |---|---|---|
 | `gating.py` | 258 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
-| `plan_surgery.py` | 90 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
-| `staging.py` | 397 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
+| `plan_surgery.py` | 99 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
+| `staging.py` | 433 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/dataset/` — 5 · conductor
 
@@ -1462,12 +1462,12 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `autoloader.py` | 295 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 235 | Development streaming sources — `rate` and `socket` (Spark parity). |
 | `eventhubs.py` | 230 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
-| `kafka.py` | 361 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
+| `kafka.py` | 365 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kinesis.py` | 408 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 181 | Google Cloud Pub/Sub broker source — subscription pull batches. |
-| `pulsar.py` | 364 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
+| `pulsar.py` | 374 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
 | `seen_store.py` | 168 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
-| `sinks.py` | 335 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
+| `sinks.py` | 353 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
 ### `batcher/io/formats/streaming/broker/` — 2 · neutral IO
 
@@ -1476,8 +1476,8 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 | module | lines | what it is |
 |---|---|---|
 | `schema.py` | 124 | The fixed broker message schema, the message record, and option redaction. |
-| `source.py` | 331 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
-| `split.py` | 186 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
+| `source.py` | 349 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
+| `split.py` | 188 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
 
 ### `batcher/io/formats/streaming/checkpoint/` — 2 · neutral IO
 

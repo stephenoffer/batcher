@@ -1259,10 +1259,9 @@ durable claim is the $2$--$3.5\times$ range, and what it shows is that putting A
 operators inside a query engine costs nothing against a specialized runtime.
 
 Two honest exceptions. On a single maximally-large compute-bound job both engines
-saturate the same GPU at the same FLOPs and the ratio is near parity. And our own
-image ingest began this work \emph{losing} to Ray Data and Daft at
-$\sim$350\,img/s, because our decode kernels ran serially and the executor sized
-its pool from the batch count; five fixes took it to $\sim$5{,}700\,img/s.
+saturate the same GPU at the same FLOPs, so the ratio is near parity. And our own
+image ingest began this work \emph{losing} to both at $\sim$350\,img/s, because our
+decode kernels ran serially; five fixes took it to $\sim$5{,}700\,img/s.
 
 \paragraph{A note on the harness.} An earlier version of our adapter registered
 each table as a single block, which is Ray Data's unit of parallelism, so a
@@ -1285,16 +1284,19 @@ whose parts are independent and so the most incremental; and a real streaming
 runtime, which \cref{sec:streaming} argues is bounded work on the runtime rather
 than a second engine.
 
-\textbf{The adaptive loop's cost is half-fixed, and we have not re-timed it.} At
-sf10 it used to lose to one-shot planning on 20 of 22 queries, 3{,}889\,ms against
-4{,}669\,ms, for two reasons. One is now closed: the gate read a provenance label
-instead of the measured error history, and firing on 15 of 22 queries that did not
-need it (\cref{sec:provenance}). The other is not: the loop still materializes one
-breaker per stage, so when it does fire it forfeits operator fusion and the
-streaming executor's width. We report the routing count rather than a new suite
-time because the machine these measurements ran on was shared, and at load average
-16--41 the harness swings $\pm$25\%, which is larger than the effect. The
-re-measurement on a quiet box is the open item.
+\textbf{The adaptive loop's cost is largely addressed, and not yet re-timed.} At
+sf10 it lost to one-shot planning on 20 of 22 queries, 3{,}889\,ms against
+4{,}669\,ms, for two reasons and both are now narrowed. The gate read a provenance
+label rather than measured error history, firing on 15 of 22 queries that did not
+need it (\cref{sec:provenance}). And the loop staged the lowest runnable breaker
+unconditionally, including ones whose size the optimizer already knew exactly:
+17 of 51 staged breakers were in that state, so a third of its materializations
+returned a number the planner had. Those now run inline, fused into the subplan
+above them, taking the suite from 51 breaker stages to 42. What remains is that a
+breaker the loop \emph{does} stage forfeits fusion and executor width across that
+cut. We report counts rather than a suite time because the machine was shared and
+the harness swings $\pm$25\% under load, larger than the effect; a count is a
+planner decision, not a duration, so load cannot move it.
 
 \textbf{We are not finer-grained than Spark AQE at the stage clock.} An earlier
 version of our own documentation claimed otherwise. It is stage-boundary
@@ -1307,10 +1309,9 @@ and on the same Arrow input \sys{} wins essentially all of them. The residue is
 compression, zone-map skipping and late materialization: a storage-engine
 program, and it should be costed as one.
 
-\textbf{High-cardinality grouping is the one systematic kernel gap.} It accounts
-for essentially every ClickBench loss and the two remaining TPC-H losses to
-DuckDB. When the group count approaches the row count, per-thread partials stop
-collapsing. One named work item.
+\textbf{High-cardinality grouping is the one systematic kernel gap}, accounting for
+essentially every ClickBench loss and the two remaining TPC-H losses to DuckDB:
+when groups approach rows, per-thread partials stop collapsing.
 
 \textbf{And the operational gaps of \cref{sec:spark}}: a memory-resident shuffle
 with lineage recompute rather than re-fetch, task granularity near one per node,

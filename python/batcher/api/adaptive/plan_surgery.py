@@ -59,13 +59,22 @@ def joins(node: LogicalPlan) -> list[Join]:
     return out
 
 
-def lowest_breaker(node: LogicalPlan):
-    """A breaker whose inputs are all breaker-free (so it can run now)."""
+def lowest_breaker(node: LogicalPlan, accept=None):
+    """A breaker whose inputs are all breaker-free (so it can run now).
+
+    `accept`, when given, filters *which* runnable breaker qualifies. A rejected
+    breaker is not skipped over in the plan; it stays where it is and gets executed
+    inside whatever larger subplan is staged above it, which is the point. Staging a
+    breaker costs a materialization and buys a measurement, so a breaker whose size is
+    already known exactly is worth executing inline, fused with its neighbours, rather
+    than on its own.
+    """
     for child in children(node):
-        found = lowest_breaker(child)
+        found = lowest_breaker(child, accept)
         if found is not None:
             return found
-    if isinstance(node, BREAKERS) and all(is_streamable(c) for c in children(node)):
+    runnable = isinstance(node, BREAKERS) and all(is_streamable(c) for c in children(node))
+    if runnable and (accept is None or accept(node)):
         return node
     return None
 

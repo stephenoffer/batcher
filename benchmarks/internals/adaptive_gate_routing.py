@@ -1,4 +1,7 @@
-"""How many TPC-H shapes the adaptive gate routes to staging, and on what evidence.
+"""What the adaptive loop decides, and on what evidence: routing, then staging.
+
+Two questions, both answered in counts rather than wall time so a shared or loaded
+machine cannot move the numbers.
 
 Counts routing *decisions*, never wall time, so a shared or loaded machine cannot move
 the number. That matters here: the effect this measures is worth about 20% of the sf10
@@ -73,6 +76,42 @@ def _teach(hub: MetadataHub, plan, ratio: float, runs: int = 4) -> None:
                 )
 
 
+def _stage_waste(session) -> tuple[int, int, int]:
+    """Breaker stages a staged run executes, and how many were already sized exactly.
+
+    A breaker whose output size the optimizer already knows exactly costs a
+    materialization and returns a number the planner had. Those are the stages worth
+    not taking.
+    """
+    from batcher.api.adaptive import staging
+    from batcher.plan.stats import Provenance
+
+    counts = {"stages": 0, "exact": 0, "queries": 0}
+    original = staging._run_stage
+
+    def counting(target, srcs, hub, *args, **kwargs):
+        counts["stages"] += 1
+        try:
+            estimate = gate._build_estimator(srcs, hub).estimate(target)
+            if estimate.provenance < Provenance.DEFAULT:
+                counts["exact"] += 1
+        except Exception:
+            pass
+        return original(target, srcs, hub, *args, **kwargs)
+
+    staging._run_stage = counting
+    try:
+        for sql in QUERIES.values():
+            try:
+                session.sql(sql).collect(adaptive=True)
+                counts["queries"] += 1
+            except Exception:
+                continue
+    finally:
+        staging._run_stage = original
+    return counts["queries"], counts["stages"], counts["exact"]
+
+
 def main() -> None:
     con = duckdb.connect()
     con.execute("INSTALL tpch; LOAD tpch;")
@@ -112,6 +151,12 @@ def main() -> None:
     print(f"routed to staging, estimates missed:      {missed}")
     print(f"flipped off by measured accuracy:         {len(flipped)}")
     print(f"  {sorted(flipped)}")
+
+    queries, stages, exact = _stage_waste(session)
+    print()
+    print(f"queries executed adaptively:              {queries}")
+    print(f"breaker stages executed:                  {stages}")
+    print(f"  already exactly sized (measure nothing): {exact}")
 
 
 if __name__ == "__main__":
