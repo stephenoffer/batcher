@@ -48,13 +48,31 @@ pub(crate) fn external_merge_sort(
     };
     // The final run holds the globally sorted result; stream its morsels out.
     let mut out = Vec::new();
+    let mut rows = 0u64;
     if let Some(reader) = store.open_reader(0).map_err(InterpError::from)? {
         for batch in reader {
             let batch = batch?;
+            rows += batch.num_rows() as u64;
             if batch.num_rows() > 0 {
                 out.push(batch);
             }
         }
+    }
+    // `open_reader` streams, so it cannot make the check `read`/`drain` make for themselves —
+    // and a truncated IPC stream reads back as a shorter *valid* one, which here would mean
+    // silently returning a sorted prefix of the relation. Making the same comparison the
+    // store would have made is what keeps that an error rather than a wrong answer.
+    let expected = store.partition_rows(0);
+    if rows < expected {
+        return Err(InterpError::from(
+            bc_runtime::RuntimeError::SpillTruncated {
+                dir: dir.display().to_string(),
+                partition: 0,
+                expected_rows: expected,
+                got_rows: rows,
+                missing: expected - rows,
+            },
+        ));
     }
     Ok((out, spill_bytes))
 }

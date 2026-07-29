@@ -421,3 +421,32 @@ the properties of *its* buckets decide whether "bounded" is true.
   sub-bucket, and a full write and re-read to change nothing. The same defect as #21, in the
   distributed half.
 - **Now:** salted, so the re-partition actually separates keys the shuffle put together.
+
+---
+
+## Program 6 — A truncated spill file must fail, not shorten the answer
+
+### #26 — Spill partitions carry a row count, checked on the way out
+
+- **Was:** nothing verified that a partition read back what was written to it.
+- **The failure this hides:** an Arrow IPC stream truncated **at a message boundary** — the
+  last complete batch present, the end-of-stream marker gone — is byte-for-byte a shorter
+  *valid* stream. The reader returns the batches it finds and reports success. Measured, not
+  argued: five batches of 1,000 rows truncated after the third read back as **3,000 rows with
+  no error at all**. The aggregate, join, or sort then computes a correct answer over the
+  wrong rows.
+- **Now:** `DiskSpillStore` counts rows per partition on append and compares on `read` and
+  `drain`; a short read is `RuntimeError::SpillTruncated`, naming the partition, both counts,
+  and how many rows would have vanished. The external sort makes the same comparison after
+  streaming its final run, which `open_reader` cannot make for it.
+- **Why it matters beyond the obvious:** every way this arises is a way a query returns a
+  wrong answer rather than failing — a filesystem that reported a short write as success, a
+  spill file that outlived the process still writing it, a truncation on a full disk the
+  write path did not observe. It is the exact shape `CLAUDE.md` warns about: passes every
+  gate while being wrong.
+- **Proof:** `crates/bc-runtime/tests/spill_truncation.rs`. The decisive case is
+  `a_cut_at_a_message_boundary_is_caught_by_the_row_count_alone`, which constructs the
+  boundary exactly (a reference file of three batches, minus its 8-byte EOS marker) rather
+  than hoping a halved file lands there — arrow catches a mid-message cut on its own, and
+  only the boundary case needs the count. An intact partition must still read without
+  complaint, or the check would be a way to fail every spilling query.

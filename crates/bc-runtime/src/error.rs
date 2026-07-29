@@ -54,6 +54,32 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
 
+    /// A spill partition read back fewer rows than were written to it.
+    ///
+    /// Its own variant because of *how* this failure presents. An Arrow IPC stream truncated
+    /// at a message boundary — the last complete batch written, the end-of-stream marker
+    /// missing — is indistinguishable from a shorter valid stream: the reader returns the
+    /// batches it finds and reports success. Measured, not assumed: five batches of 1,000
+    /// rows truncated after the third read back as 3,000 rows with no error at all.
+    ///
+    /// Every way that happens is a way a query returns a *wrong answer* rather than failing:
+    /// a filesystem that reported a short write as success, a spill file that outlived the
+    /// process that was still writing it, a truncation on a full disk that the write path
+    /// did not see. Counting rows on the way in and checking them on the way out is what
+    /// turns all of them into an error.
+    #[error(
+        "spill partition {partition} in {dir} read back {got_rows} rows but {expected_rows} \
+         were written — the spill file is truncated or was modified underneath the query. \
+         This would otherwise have silently dropped {missing} rows from the result."
+    )]
+    SpillTruncated {
+        dir: String,
+        partition: usize,
+        expected_rows: u64,
+        got_rows: u64,
+        missing: u64,
+    },
+
     #[error("spill i/o error: {0}")]
     Io(#[from] std::io::Error),
 

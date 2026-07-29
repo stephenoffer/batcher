@@ -291,6 +291,15 @@ pub struct DiskSpillStore {
     /// Running sum of appended batches' in-memory size — the logical spill volume this
     /// store has written. The measured signal Carbonite sizes spill scratch from.
     bytes_written: u64,
+    /// Rows written to each partition — the count `read`/`drain` check what they got against.
+    ///
+    /// An Arrow IPC stream truncated at a message boundary is indistinguishable from a
+    /// shorter valid stream: the reader returns the batches it finds and reports success. So
+    /// the only thing that can tell a complete partition from a truncated one is a count
+    /// taken on the way in. Without it a spill file that lost its tail — a short write a
+    /// filesystem reported as success, a file that outlived the process writing it — makes
+    /// the query return a wrong answer instead of failing.
+    rows_per_partition: Vec<u64>,
     /// Bytes written to each partition, indexed by partition. The spread across these (max
     /// vs mean) is the spill *skew*: an even hash gives ~equal partitions (skew ~1), a hot
     /// key piles one partition many times its share (skew ≫ 1) — the signal that a family's
@@ -540,6 +549,7 @@ impl DiskSpillStore {
             codec,
             write_options: None,
             bytes_written: 0,
+            rows_per_partition: vec![0; n],
             bytes_per_partition: vec![0; n],
         })
     }
@@ -566,6 +576,37 @@ impl DiskSpillStore {
 }
 
 impl DiskSpillStore {
+    /// Rows written to `partition`, so a caller streaming it through
+    /// [`DiskSpillStore::open_reader`] can make the same check `read` and `drain` make.
+    pub fn partition_rows(&self, partition: usize) -> u64 {
+        self.rows_per_partition.get(partition).copied().unwrap_or(0)
+    }
+
+    /// Fail if a partition read back fewer rows than were written to it.
+    ///
+    /// The check exists because the failure it catches is *silent*. An Arrow IPC stream
+    /// truncated at a message boundary — the last complete batch present, the end-of-stream
+    /// marker gone — is byte-for-byte a shorter valid stream, so the reader returns what it
+    /// finds and reports success. The query then produces a wrong answer with nothing
+    /// anywhere saying so.
+    ///
+    /// Only a *short* read is an error. Reading more than was written cannot happen from
+    /// truncation and would mean the count itself is wrong, so it is not worth failing a
+    /// query over.
+    fn verify_rows(&self, partition: usize, got: u64) -> Result<(), RuntimeError> {
+        let expected = self.partition_rows(partition);
+        if got >= expected {
+            return Ok(());
+        }
+        Err(RuntimeError::SpillTruncated {
+            dir: self.dir.display().to_string(),
+            partition,
+            expected_rows: expected,
+            got_rows: got,
+            missing: expected - got,
+        })
+    }
+
     /// This store's private scratch directory — the one removed on drop.
     ///
     /// Named rather than left as a bare field so the merge module's tests can assert the
@@ -613,6 +654,9 @@ impl SpillStore for DiskSpillStore {
         if let Some(slot) = self.bytes_per_partition.get_mut(partition) {
             *slot += n;
         }
+        if let Some(slot) = self.rows_per_partition.get_mut(partition) {
+            *slot += batch.num_rows() as u64;
+        }
         Ok(())
     }
 
@@ -647,9 +691,10 @@ impl SpillStore for DiskSpillStore {
         }
         let file = File::open(&self.paths[partition])?;
         let reader = StreamReader::try_new(BufReader::with_capacity(SPILL_READ_BUF, file), None)?;
-        reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(RuntimeError::from)
+        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+        let got: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        self.verify_rows(partition, got)?;
+        Ok(batches)
     }
     fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError> {
         // Nest the recursive re-partition under this store's private directory (itself
@@ -678,12 +723,17 @@ impl SpillStore for DiskSpillStore {
         sink: &mut dyn FnMut(&RecordBatch) -> Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError> {
         let Some(reader) = self.open_reader(partition)? else {
-            return Ok(());
+            // Nothing was written, so nothing is missing — but a partition that *was* written
+            // and whose file has since vanished must not read as empty.
+            return self.verify_rows(partition, 0);
         };
+        let mut got = 0u64;
         for batch in reader {
-            sink(&batch?)?;
+            let batch = batch?;
+            got += batch.num_rows() as u64;
+            sink(&batch)?;
         }
-        Ok(())
+        self.verify_rows(partition, got)
     }
 }
 
