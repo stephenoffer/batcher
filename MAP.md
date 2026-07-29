@@ -749,7 +749,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 |---|---|---|
 | `join.py` | 302 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 266 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
-| `window.py` | 102 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
+| `window.py` | 162 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
 ### `batcher/dist/streaming/` — 4 · backend
 
