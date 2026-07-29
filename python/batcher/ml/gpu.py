@@ -29,6 +29,7 @@ from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_c
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.metadata.hardware_scope import scoped
+from batcher.metadata.smoothed import load_scalar, record_smoothed_scalar
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -844,33 +845,35 @@ def gpu_feedback_key(plan: LogicalPlan) -> str:
     return "|".join(parts) if parts else "map"
 
 
+# Both learned GPU figures go through `metadata.smoothed`, the neutral one-scalar-per-key
+# helper, rather than the whole-blob read-modify-write they used to do. Three things came
+# with the move, and none of them is cosmetic:
+#
+# * **The cold run stops anchoring the estimate.** The blend weight was the static
+#   `learning_smoothing_alpha` (0.5), under which the *first* observation still holds an
+#   eighth of the value after four runs and never fully washes out. `smoothed` uses
+#   `max(floor, 1/(n+1))` — a running mean while evidence is thin — so the first profiling
+#   run of a model, which is the one most likely to be unrepresentative, is averaged away.
+# * **Concurrent writers stop clobbering each other.** Loading the namespace's whole blob,
+#   editing one key, and writing it all back is a lost update whenever two inference
+#   pipelines record at once, and an autoscaled fleet records constantly. Per-key writes
+#   touch only their own entry.
+# * **Reads stop re-parsing the fleet.** One blob held every pipeline's figure, so reading
+#   one model's utilization parsed them all.
+#
+# Both namespaces stay `scoped` to the hardware fingerprint: a fraction of an A100 says
+# nothing about a T4. An existing whole-blob store keeps answering — the per-key view merges
+# a legacy single-blob value underneath its own entries, so nothing learned is lost.
 def load_gpu_utilization(hub: MetadataHub | None, key: str) -> float | None:
     """The smoothed utilization recorded for `key`, or `None` if unseen."""
-    if hub is None:
-        return None
-    try:
-        return hub.load_params(scoped(_NAMESPACE)).get(key)
-    except Exception as exc:  # pragma: no cover - feedback must never break execution
-        note_suppressed("ml", "load GPU utilization feedback", exc)
-        return None
+    return load_scalar(hub, scoped(_NAMESPACE), key)
 
 
 def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: float | None) -> None:
     """Record a measured utilization for `key`, exp-smoothed across runs. Best-effort."""
-    if hub is None or util_fraction is None:
+    if util_fraction is None:
         return
-    try:
-        stats = hub.load_params(scoped(_NAMESPACE))
-        alpha = active_config().optimizer.learning_smoothing_alpha
-        prior = stats.get(key)
-        stats[key] = (
-            float(util_fraction)
-            if prior is None
-            else alpha * float(util_fraction) + (1.0 - alpha) * float(prior)
-        )
-        hub.save_params(scoped(_NAMESPACE), stats)
-    except Exception as exc:  # pragma: no cover - feedback must never break execution
-        note_suppressed("ml", "persist learned GPU utilization", exc)
+    record_smoothed_scalar(hub, scoped(_NAMESPACE), key, float(util_fraction))
 
 
 _VRAM_NAMESPACE = "ml.gpu.peak_vram"
@@ -882,31 +885,14 @@ def load_gpu_peak_vram(hub: MetadataHub | None, key: str) -> float | None:
     The memory twin of `load_gpu_utilization`: where utilization sizes `num_gpus`, the peak
     VRAM sizes how many inference actors safely pack onto one device (`actors_per_gpu_from_
     learned_vram`) from what a prior run actually consumed, rather than the declared model size."""
-    if hub is None:
-        return None
-    try:
-        return hub.load_params(scoped(_VRAM_NAMESPACE)).get(key)
-    except Exception as exc:  # pragma: no cover - a learned read must never break execution
-        note_suppressed("ml", "load GPU peak-VRAM feedback", exc)
-        return None
+    return load_scalar(hub, scoped(_VRAM_NAMESPACE), key)
 
 
 def record_gpu_peak_vram(hub: MetadataHub | None, key: str, vram_fraction: float | None) -> None:
     """Record a measured peak-VRAM fraction for `key`, exp-smoothed across runs. Best-effort."""
-    if hub is None or vram_fraction is None:
+    if vram_fraction is None:
         return
-    try:
-        stats = hub.load_params(scoped(_VRAM_NAMESPACE))
-        alpha = active_config().optimizer.learning_smoothing_alpha
-        prior = stats.get(key)
-        stats[key] = (
-            float(vram_fraction)
-            if prior is None
-            else alpha * float(vram_fraction) + (1.0 - alpha) * float(prior)
-        )
-        hub.save_params(scoped(_VRAM_NAMESPACE), stats)
-    except Exception as exc:  # pragma: no cover - feedback must never break execution
-        note_suppressed("ml", "persist learned VRAM utilization", exc)
+    record_smoothed_scalar(hub, scoped(_VRAM_NAMESPACE), key, float(vram_fraction))
 
 
 def actors_per_gpu_from_learned_vram(

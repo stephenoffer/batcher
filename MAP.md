@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 942 Python modules across 146 packages and 180 Rust files across 13 crates.
+Covering 944 Python modules across 146 packages and 180 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -342,7 +342,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 807 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
-| `event_log.py` | 396 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 494 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
@@ -398,7 +398,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `feature_scores.py` | 268 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 344 | Generalized linear models fitted by iteratively reweighted least squares. |
-| `gpu.py` | 1177 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
+| `gpu.py` | 1163 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 500 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 374 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
@@ -769,11 +769,12 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `annotate.py` | 402 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 350 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
+| `column_tables.py` | 175 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 173 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 475 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 416 | Cross-execution learning — the metadata feedback loop. |
 | `measured_selectivity.py` | 133 | Filter selectivity derived from what Core measured, per plan signature. |
-| `metadata_answer.py` | 426 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
+| `metadata_answer.py` | 427 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 65 | The optimizer context — shared analysis threaded through every rule. |
 | `plan_cache.py` | 359 | Memoize the optimizer — the same query, planned once. |
@@ -1154,7 +1155,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | module | lines | what it is |
 |---|---|---|
 | `estimator.py` | 298 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `learned.py` | 358 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
+| `learned.py` | 414 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
 | `probe.py` | 341 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
@@ -1883,12 +1884,13 @@ The neutral type vocabulary and inference for the plan layer.
 | module | lines | what it is |
 |---|---|---|
 | `hardware_scope.py` | 122 | Scoping learned parameters to the machine that measured them. |
-| `hub.py` | 469 | `MetadataHub` — the façade over a `MetadataBackend`. |
+| `hub.py` | 388 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 113 | Observed per-source I/O throughput — measured on read, captured for prediction. |
-| `smoothed.py` | 120 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
+| `params.py` | 320 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
+| `smoothed.py` | 153 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
 | `source_stats_store.py` | 145 | Persisted source statistics — remember what Batcher wrote, for the next read. |
 | `store.py` | 122 | The pluggable persistence abstraction behind the MetadataHub. |
-| `views.py` | 125 | The bounded derived views over the feedback history. |
+| `views.py` | 148 | The bounded derived views over the feedback history. |
 
 ### `batcher/metadata/backends/` — 1 · contract
 
@@ -1896,11 +1898,11 @@ MetadataHub persistence backends.
 
 | module | lines | what it is |
 |---|---|---|
-| `in_process.py` | 53 | In-process dict backend — for tests and single-process runs. |
-| `layered.py` | 103 | Layered backend — a fast in-process cache over a durable shared store. |
-| `object_storage.py` | 102 | Object-storage backend — durable, cluster-shared learned statistics. |
-| `redis.py` | 83 | Redis backend — low-latency, cluster-shared learned statistics. |
-| `sqlite.py` | 109 | SQLite backend — the local durable default. |
+| `in_process.py` | 76 | In-process dict backend — for tests and single-process runs. |
+| `layered.py` | 131 | Layered backend — a fast in-process cache over a durable shared store. |
+| `object_storage.py` | 166 | Object-storage backend — durable, cluster-shared learned statistics. |
+| `redis.py` | 127 | Redis backend — low-latency, cluster-shared learned statistics. |
+| `sqlite.py` | 220 | SQLite backend — the local durable default. |
 
 ### `batcher/config/` — 0 · utility
 
@@ -2000,13 +2002,13 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg_par.rs` | 215 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 463 | Distributed-execution primitives. |
 | `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
-| `join_par.rs` | 496 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par.rs` | 574 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `lib.rs` | 696 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 298 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/external_sort.rs` | 428 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
-| `ops/mixed_spill.rs` | 248 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
+| `ops/mixed_spill.rs` | 255 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1141 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 83 | Output-field construction for [`super::project_batch_jit`]. |
@@ -2061,8 +2063,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1320 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
-| `join/range/band.rs` | 221 | The band join: two inequalities that bound **one** right key from both sides. |
-| `join/range/keys.rs` | 444 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
+| `join/range/band.rs` | 250 | The band join: two inequalities that bound **one** right key from both sides. |
+| `join/range/keys.rs` | 456 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
 | `join/range/mod.rs` | 619 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
 | `join/scratch_bench.rs` | 2 | TEMPORARY scratch measurement — not part of the crate's contract. |

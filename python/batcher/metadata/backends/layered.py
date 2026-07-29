@@ -95,9 +95,37 @@ class LayeredBackend:
         self._shared.batch_put(table, items)
         self._cache.batch_put(table, items)
 
-    def refresh(self) -> None:
-        """Drop the local cache so the next read re-pulls the shared store.
+    def delete(self, table: str, keys: list[Key]) -> None:
+        """Drop `keys` from both layers; a layer that cannot delete keeps them.
 
-        Called between runs so this driver picks up statistics other drivers have
-        written since the cache was warmed (cross-driver freshness)."""
-        self._cache = InProcessBackend()
+        Optional beyond the four `MetadataBackend` methods, and forwarded because the hub
+        prunes its unbounded feedback table through exactly this. Without it a layered store
+        — the shape a cluster uses, and therefore the one that accumulates fastest — was the
+        one configuration in which the feedback table grew forever and every driver paid to
+        read all of it before its first plan.
+
+        The cache is cleared of the keys even when the shared store cannot delete them, so
+        the two layers never disagree about a key this process believes is gone.
+        """
+        for layer in (self._shared, self._cache):
+            drop = getattr(layer, "delete", None)
+            if drop is not None:
+                drop(table, keys)
+
+    def refresh(self) -> None:
+        """Drop the local cache's contents so the next read re-pulls the shared store.
+
+        Called between runs so this driver picks up statistics other drivers have written
+        since the cache was warmed (cross-driver freshness).
+
+        The cache is *emptied*, not replaced. Rebinding to a fresh `InProcessBackend` — which
+        is what this used to do — silently discarded a caller-supplied cache on the first
+        refresh, so a deployment that layered over a bounded or shared cache got the default
+        dict from then on, with nothing to indicate the substitution. A cache that offers no
+        `clear` is the one case that still needs a replacement.
+        """
+        clear = getattr(self._cache, "clear", None)
+        if callable(clear):
+            clear()
+        else:  # pragma: no cover - a custom cache with no way to empty it
+            self._cache = InProcessBackend()

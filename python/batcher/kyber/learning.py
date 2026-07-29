@@ -17,6 +17,18 @@ from typing import Any
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.kyber.column_tables import (
+    AVG_BYTES_KEY,
+    CARDINALITY_CORRECTION_KEY,
+    MCV_KEY,
+    NDV_KEY,
+    QUANTILES_KEY,
+    merge_column_table,
+    qualify,
+)
+from batcher.kyber.column_tables import (
+    STATS_NAMESPACE as _NAMESPACE,
+)
 from batcher.kyber.correction import correction_factor
 from batcher.kyber.measured_selectivity import measured_selectivities
 from batcher.kyber.signature import plan_signature
@@ -24,79 +36,15 @@ from batcher.metadata import MetadataHub
 from batcher.plan.logical import LogicalPlan
 
 __all__ = [
-    "AVG_BYTES_KEY",
-    "CARDINALITY_CORRECTION_KEY",
-    "MCV_KEY",
-    "NDV_KEY",
-    "QUANTILES_KEY",
     "bump_generation",
-    "columns_for",
     "generation",
     "is_material_change",
     "load_learned_stats",
     "q_error_window",
-    "qualify",
     "record_column_stats",
     "record_execution",
     "record_selectivity",
 ]
-
-_NAMESPACE = "kyber.stats"
-# Reserved keys inside the stats namespace. Everything else in the namespace is keyed by
-# a plan signature; these hold cross-signature state the `StatsEstimator` reads. They are
-# the schema of the learned store, so they live here (the writer) and are imported by the
-# estimator (the reader) rather than restated as literals on both sides.
-NDV_KEY = "__column_ndv__"  # per-column distinct counts
-QUANTILES_KEY = "__column_quantiles__"  # per-column quantile grids
-AVG_BYTES_KEY = "__column_avg_bytes__"  # per-column average byte widths
-MCV_KEY = "__column_mcv__"  # per-column most-common-values (skew)
-# Derived, not stored: `load_learned_stats` folds the measured q-error history into
-# `{signature: correction_factor}` under this key. See `_cardinality_corrections`.
-CARDINALITY_CORRECTION_KEY = "__cardinality_correction__"
-
-# Column statistics are keyed by **source, then column** — never by column name alone.
-#
-# A bare column name does not identify a column. Two tables both have an `id`, a `key`, a
-# `date`; a flat `{name: stat}` map merges them, so whichever table was measured last
-# silently answers for every other table with a column of that name — process-wide, for
-# every join and group-by estimate that reads it. This repo already learned that lesson on
-# the *row* side (see `StatsEstimator._estimate_uncached`: every `Scan` shares the
-# signature `["scan"]`, so one table's measured 5M rows became a 1,000-row table's
-# estimate, and a pruned MERGE sized its join at 2.4 TB). The column maps had the same
-# defect and this is the qualifier that closes it.
-#
-# The key stays a flat string — `f"{source}\x1f{column}"` — so the stored shape is still
-# `dict[str, value]` and every backend, the generation-bump check, and the merge logic are
-# untouched. `\x1f` (ASCII unit separator) cannot occur in a column name.
-_SOURCE_SEP = "\x1f"
-
-
-def qualify(source_key: str, column: str) -> str:
-    """The store key for `column` **of `source_key`** (see `_SOURCE_SEP`)."""
-    return f"{source_key}{_SOURCE_SEP}{column}"
-
-
-def columns_for(learned: dict[str, Any], stat_key: str, source_key: str | None) -> dict[str, Any]:
-    """The `{column: value}` slice of a learned column map that describes `source_key`.
-
-    Entries written *unqualified* (no separator) are treated as applying to every source.
-    That is the legacy shape — a hub persisted by an older build, or a test that seeds the
-    map directly — and a source-qualified entry always wins over it. Nothing on the live
-    path writes unqualified any more (`record_column_stats` requires a source key), so the
-    fallback is a compatibility shim, not a way back into the collision.
-    """
-    table = learned.get(stat_key) or {}
-    prefix = f"{source_key}{_SOURCE_SEP}" if source_key is not None else None
-    out: dict[str, Any] = {}
-    qualified: dict[str, Any] = {}
-    for key, value in table.items():
-        if _SOURCE_SEP not in key:
-            out[key] = value  # legacy: unqualified, applies to any source
-        elif prefix is not None and key.startswith(prefix):
-            qualified[key[len(prefix) :]] = value
-    out.update(qualified)  # a measurement of *this* source beats a legacy global one
-    return out
-
 
 # Per-hub memo of the derived corrections, keyed weakly so a dropped hub evicts its
 # entry. The value is `(hub.version, fingerprint, corrections)`: valid while the hub has
@@ -451,25 +399,18 @@ def record_column_stats(
         # so a concurrent per-signature record (or another column update) can't
         # clobber it.
         if ndv:
-            col_ndv = dict(hub.get_keyed_param(_NAMESPACE, NDV_KEY) or {})
             fresh = keyed(ndv)
+            existing = hub.get_keyed_param(_NAMESPACE, NDV_KEY) or {}
             # A column measured for the first time can change every join and group-by
             # estimate that reads it — the one column-stat event worth re-planning for.
-            if any(name not in col_ndv for name in fresh):
+            if any(name not in existing for name in fresh):
                 _bump_generation()
-            col_ndv.update(fresh)
-            hub.put_keyed_param(_NAMESPACE, NDV_KEY, col_ndv)
+            merge_column_table(hub, NDV_KEY, fresh, existing)
         if quantiles:
-            col_q = dict(hub.get_keyed_param(_NAMESPACE, QUANTILES_KEY) or {})
-            col_q.update(keyed(quantiles))
-            hub.put_keyed_param(_NAMESPACE, QUANTILES_KEY, col_q)
+            merge_column_table(hub, QUANTILES_KEY, keyed(quantiles))
         if avg_bytes:
-            col_w = dict(hub.get_keyed_param(_NAMESPACE, AVG_BYTES_KEY) or {})
-            col_w.update(keyed(avg_bytes))
-            hub.put_keyed_param(_NAMESPACE, AVG_BYTES_KEY, col_w)
+            merge_column_table(hub, AVG_BYTES_KEY, keyed(avg_bytes))
         if mcv:
-            col_mcv = dict(hub.get_keyed_param(_NAMESPACE, MCV_KEY) or {})
-            col_mcv.update(keyed(mcv))
-            hub.put_keyed_param(_NAMESPACE, MCV_KEY, col_mcv)
+            merge_column_table(hub, MCV_KEY, keyed(mcv))
     except Exception as exc:  # pragma: no cover - learning must never break execution
         note_suppressed("kyber", "persist learned column statistics", exc)

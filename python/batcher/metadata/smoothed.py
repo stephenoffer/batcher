@@ -27,6 +27,7 @@ same distinction for the same reason; this is the neutral-layer twin of it.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
@@ -65,16 +66,36 @@ def load_scalar(hub: MetadataHub | None, namespace: str, key: str) -> float | No
 
 
 def _value_of(stored: object) -> float | None:
-    """The scalar held by a stored record, in either shape."""
+    """The scalar held by a stored record, in either shape, or `None` if it is not usable.
+
+    A non-finite stored value reads as "never recorded". It should not be reachable — the
+    writer refuses to fold one in — but a store outlives the build that wrote it, and every
+    consumer of these scalars divides by them or compares them against a threshold, where a
+    NaN silently fails every comparison and an infinity produces a zero-sized budget. Reading
+    it as absent costs one cold estimate; adopting it costs a wrong decision on every query
+    until the entry is manually deleted.
+    """
     if stored is None:
         return None
-    if isinstance(stored, dict):
-        value = stored.get("value")
-        return None if value is None else float(value)
-    try:
-        return float(stored)  # type: ignore[arg-type]
-    except (TypeError, ValueError):  # pragma: no cover - a foreign blob
+    raw = stored.get("value") if isinstance(stored, dict) else stored
+    if raw is None or isinstance(raw, bool):
         return None
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):  # a foreign blob
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _count_of(stored: object) -> float:
+    """Observations already folded into a stored record; 1.0 when it does not say."""
+    if not isinstance(stored, dict):
+        return 1.0
+    try:
+        count = float(stored.get("n", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return count if math.isfinite(count) else 1.0
 
 
 def record_smoothed_scalar(
@@ -104,15 +125,27 @@ def record_smoothed_scalar(
     """
     if hub is None:
         return
+    # A non-finite observation is dropped rather than folded in. Exponential smoothing is
+    # `prior + step * (value - prior)`, which propagates a NaN or an infinity into the stored
+    # value and, from there, into *every* subsequent update — the entry is poisoned for the
+    # life of the store, and nothing raises. The producers are ratios (bytes over elapsed,
+    # observed over predicted, used over capacity), so a zero denominator or an empty
+    # measurement window is the ordinary way one arises, not an exotic one.
+    if not math.isfinite(value):
+        return
     try:
         floor = (config or active_config()).optimizer.learned_scalar_alpha_floor
         stored = hub.get_keyed_param(namespace, key)
         prior = _value_of(stored)
-        count = float(stored.get("n", 1.0)) if isinstance(stored, dict) else 1.0
         if prior is None:
             smoothed, count = value, 1.0
         else:
-            step = max(floor, 1.0 / (count + 1.0))
+            # `count` decides the step, so a nonsensical stored count is a nonsensical blend
+            # weight: a negative one at -1 divides by zero, and below -1 it flips the step's
+            # sign and moves the estimate *away* from every observation. Clamping to at least
+            # one observation makes the worst case "smooths as if this were the second run".
+            count = max(1.0, _count_of(stored))
+            step = min(1.0, max(floor, 1.0 / (count + 1.0)))
             smoothed = prior + step * (value - prior)
             count += 1.0
         hub.put_keyed_param(namespace, key, {"value": smoothed, "n": count})

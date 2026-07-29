@@ -24,13 +24,13 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.config import CardinalityConfig, active_config
-from batcher.kyber import learning
-from batcher.kyber.learning import (
+from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
     CARDINALITY_CORRECTION_KEY,
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
+    columns_for,
 )
 from batcher.kyber.properties import project_ordering
 from batcher.kyber.stats import columns as col_prop
@@ -1162,10 +1162,10 @@ class StatsEstimator:
         if cached is not None:
             return cached
         key = self._source_key(source_id)
-        ndv = learning.columns_for(self._learned, NDV_KEY, key)
-        quantiles = learning.columns_for(self._learned, QUANTILES_KEY, key)
-        mcv = learning.columns_for(self._learned, MCV_KEY, key)
-        widths = learning.columns_for(self._learned, AVG_BYTES_KEY, key)
+        ndv = columns_for(self._learned, NDV_KEY, key)
+        quantiles = columns_for(self._learned, QUANTILES_KEY, key)
+        mcv = columns_for(self._learned, MCV_KEY, key)
+        widths = columns_for(self._learned, AVG_BYTES_KEY, key)
         cols: dict[str, ColumnStat] = {}
         for name in set(ndv) | set(quantiles) | set(mcv) | set(widths):
             measured = ndv.get(name)
