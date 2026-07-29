@@ -811,7 +811,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
-| `policy.py` | 262 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `policy.py` | 281 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `sizing.py` | 104 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem

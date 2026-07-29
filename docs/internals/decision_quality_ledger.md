@@ -296,3 +296,17 @@ Concrete work these leave open, in the order their evidence is strongest:
 - **Packing density for a row-expanding operator.** With D55 an explode is budgeted at its
   fan-out, so `n` co-packed explodes are `n x ~100 MB` on a node. The CPU classification has
   measured support (D69); the memory side is a `bench-dist` question.
+
+---
+
+## Found by applying the questions above to what was left (`kyber/gpu/policy.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D70 | scale | **The GPU size gate was the D59 inversion again, and question 1 found it.** `gpu_min_rows` (10M) exists because the GPU's fixed overhead — host<->device transfer, kernel launch, the first-touch cuDF import — is amortized only by *work*, and rows proxy for work while a row is the ~64 bytes `optimizer.row_bytes` assumes. At the shipped floor a narrow relation clears the gate at **0.64 GB** of input and a decoded 224x224x3 image column needs **1,505 GB**, so a 100 GB image query — unambiguously GPU-worthy, and the workload the whole GPU path exists for — was refused the GPU for being "too small to amortize the overhead". The byte figure was already in hand: `_estimate` computes `ws_gb` for the memory routing three lines below and the size gate simply did not read it. Cleared by rows **or** bytes now, with the byte floor derived from the same knob and combined with OR, so a narrow query clears exactly the floor it always did. Two relations of the *same row count* now separate on their bytes (`test_the_gpu_size_gate_reads_bytes_as_well_as_rows`). |
+| D71 | test | The `explain()` reason names both floors, so a refusal says which one bound rather than reporting a row count for a decision that is no longer only about rows. |
+
+**Swept and correctly left alone.** `SORT_MERGE_MIN_ROWS` is already ANDed with a byte test
+(`_SORT_MERGE_MEMORY_SHARE`), and `_MIN_AGG_INPUT_ROWS` guards a win that genuinely *is* a
+row count (the rows a semi-join skips), so rows is the right unit there. Recorded because a
+sweep that reports only its hits reads as if nothing else was checked.

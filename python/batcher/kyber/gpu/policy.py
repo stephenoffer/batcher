@@ -128,9 +128,28 @@ def decide_gpu_backend(
     # prefix so `explain()` misreported which threshold was actually used.
     min_rows = dc.gpu_min_rows if learned_min is None else learned_min
     learned = "learned " if learned_min is not None else ""
-    if not force and rows < min_rows:
+    # ...and the same floor in bytes, because a row count assumes a row width.
+    #
+    # The threshold above exists because the GPU's fixed overhead — host<->device transfer,
+    # kernel launch, the first-touch cuDF import — is only amortized by *work*, and rows
+    # proxy for work only while a row is the ~64 bytes `optimizer.row_bytes` assumes. Across
+    # the modality range that proxy inverts: at the shipped 10M rows a narrow relation clears
+    # the gate at 0.64 GB of input, while a decoded 224x224x3 image column needs **1,505 GB**.
+    # So a 100 GB image query — unambiguously GPU-worthy, and the workload this path exists
+    # for — was refused the GPU for being "too small to amortize the overhead".
+    #
+    # The byte figure was already in hand: `_estimate` computes `ws_gb` for the memory
+    # routing below and the size gate simply did not read it. Derived from the same knob
+    # (`min_rows x row_bytes`) rather than added as a third, and combined with OR, so a
+    # narrow query clears exactly the floor it always did.
+    min_gb = min_rows * active_config().optimizer.row_bytes / 1e9
+    if not force and rows < min_rows and ws_gb < min_gb:
         return GpuDecision(
-            False, False, f"{rows} rows < {learned}min_rows={min_rows}: CPU wins on overhead", rows
+            False,
+            False,
+            f"{rows} rows / ~{ws_gb:.2f}GB < {learned}min_rows={min_rows} "
+            f"and min ~{min_gb:.2f}GB: CPU wins on overhead",
+            rows,
         )
 
     one_gpu_gb = max(

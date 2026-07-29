@@ -110,3 +110,60 @@ def test_the_rule_reads_the_width_from_the_plan():
         return _input_row_bytes(staged._plan, ctx)
 
     assert width_of(wide) > width_of(narrow)
+
+
+# --- the size gate that decides whether the GPU is used at all -------------------
+
+
+def _gpu_decision(ds, min_rows: int):
+    """`decide_gpu_backend` under a `gpu_min_rows` floor of `min_rows`, one GPU visible."""
+    import dataclasses
+
+    from batcher.config import active_config, config_context
+    from batcher.kyber.gpu.policy import decide_gpu_backend
+
+    cfg = active_config()
+    scoped = cfg.replace(distributed=dataclasses.replace(cfg.distributed, gpu_min_rows=min_rows))
+    with config_context(scoped):
+        return decide_gpu_backend(ds._plan, ds._sources, None, gpu_count=1)
+
+
+def _tensor_frame(rows: int):
+    arr = pa.FixedShapeTensorArray.from_numpy_ndarray(np.zeros((rows, 224, 224, 3), dtype="uint8"))
+    return bt.from_arrow(pa.table({"t": arr}))
+
+
+def test_the_gpu_size_gate_reads_bytes_as_well_as_rows():
+    """The GPU's fixed overhead is amortized by *work*, and rows proxy for work only while
+    a row is the ~64 bytes `optimizer.row_bytes` assumes.
+
+    At the shipped 10M-row floor a narrow relation clears the gate at 0.64 GB of input while
+    a decoded 224x224x3 image column needs 1,505 GB — so a 100 GB image query, the workload
+    this path exists for, was refused the GPU for being "too small to amortize the overhead".
+    Two relations of the *same row count* must now separate on their bytes.
+    """
+    rows = 1000
+    narrow = bt.from_pydict({"k": list(range(rows))})
+    wide = _tensor_frame(rows)
+    assert _gpu_decision(narrow, 1_000_000).use_gpu is False
+    assert _gpu_decision(wide, 1_000_000).use_gpu is True
+
+
+def test_a_narrow_query_below_both_floors_is_unchanged():
+    """The safety property: nothing that stayed on the CPU may be moved onto the GPU."""
+    ds = bt.from_pydict({"k": list(range(1000))})
+    decision = _gpu_decision(ds, 1_000_000)
+    assert decision.use_gpu is False
+    assert "CPU wins on overhead" in decision.reason
+
+
+def test_the_byte_floor_is_derived_from_the_row_floor():
+    """One knob says how big "big" is, rather than two that can drift apart."""
+    from batcher.config import active_config
+
+    ds = _tensor_frame(64)
+    min_rows = 1_000_000
+    expected_gb = min_rows * active_config().optimizer.row_bytes / 1e9
+    reason = _gpu_decision(ds, min_rows).reason
+    # Far under both floors at 64 rows, so the refusal names both.
+    assert f"{expected_gb:.2f}GB" in reason
