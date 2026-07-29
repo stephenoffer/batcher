@@ -378,8 +378,30 @@ pub fn partition_batches(
     key_indices: &[usize],
     num_partitions: usize,
 ) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
-    let parts =
-        in_worker_pool(|| ops::partition_morsels_by_index(batches, key_indices, num_partitions))??;
+    partition_batches_salted(batches, key_indices, num_partitions, 0)
+}
+
+/// [`partition_batches`] with an independent re-mix of the key hash.
+///
+/// `salt == 0` is exactly [`partition_batches`], which is the cluster-wide bucket
+/// assignment and must not be perturbed. A non-zero salt is for the *local* decision of how
+/// to re-split a bucket that did not fit in memory, where the unsalted hash is not merely a
+/// poor choice but an inert one: bucket assignment reads the low bits at a power-of-two
+/// count, so re-partitioning a 16-way bucket into 8 sub-buckets sends every row to
+/// `bucket & 7` — one sub-bucket, always, at every level of the recursion.
+///
+/// Equal keys still co-locate, because the salt is a function of the recursion depth and
+/// never of the row. That is what keeps each sub-bucket an independent instance of the same
+/// reduce whose union is the same relation.
+pub fn partition_batches_salted(
+    batches: &[RecordBatch],
+    key_indices: &[usize],
+    num_partitions: usize,
+    salt: u64,
+) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
+    let parts = in_worker_pool(|| {
+        ops::partition_morsels_by_index_salted(batches, key_indices, num_partitions, salt)
+    })??;
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 

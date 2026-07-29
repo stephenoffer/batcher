@@ -84,6 +84,30 @@ pub(crate) fn partition_batches(
     Ok(wrap_buckets(parts))
 }
 
+/// [`partition_batches`] with an independent re-mix of the key hash.
+///
+/// `salt == 0` is exactly `partition_batches` — the cluster-wide bucket assignment, which a
+/// shuffle must never perturb. A non-zero salt is for the *local* decision of how to re-split
+/// a spilled bucket that did not fit, where re-using the unsalted hash is not merely a poor
+/// choice but an inert one: bucket assignment reads the low bits at a power-of-two count, so
+/// re-partitioning a 16-way bucket into 8 sub-buckets sends every row to `bucket & 7` — one
+/// sub-bucket, always. Equal keys still co-locate, because the salt depends on the recursion
+/// depth and never on the row.
+#[pyfunction]
+pub(crate) fn partition_batches_salted(
+    batches: Vec<PyArrowType<RecordBatch>>,
+    key_indices: Vec<usize>,
+    num_partitions: usize,
+    salt: u64,
+) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, &key_indices, num_partitions)?;
+    let parts =
+        bc_interp::dist::partition_batches_salted(&batches, &key_indices, num_partitions, salt)
+            .map_err(to_pyerr)?;
+    Ok(wrap_buckets(parts))
+}
+
 /// Range-shuffle batches into `n_buckets` globally-ordered buckets by the leading
 /// sort key at `key_index` and the ascending `boundaries` — the distributed-sort
 /// counterpart of `partition_batches`. Nulls route to the front/back bucket per

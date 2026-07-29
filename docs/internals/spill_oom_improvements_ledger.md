@@ -328,3 +328,47 @@ the properties of *its* buckets decide whether "bounded" is true.
   first". The router has streamed those from the out-of-core bucket pipeline for some time.
 - **Why it matters:** this is the API doc a user reads when deciding whether Batcher can sort
   something bigger than memory. It told them no, and the answer is yes.
+
+### #21 — The aggregate's grace recursion re-partitioned nothing
+
+- **Was:** when a spilled aggregate bucket exceeded `spill_bucket_max_bytes`, the reduce
+  re-partitioned it into `_SUB_BUCKETS = 8` sub-buckets and reduced them one at a time. The
+  parent bucket count is `_fd_safe(num_partitions)` — 16 by default. **Both are powers of
+  two, and bucket assignment reads the low hash bits at a power-of-two count**, so every row
+  in parent bucket `b` re-partitioned to `b & 7`. One sub-bucket, always, at every level.
+  The reduce wrote and re-read the whole over-large bucket three times, changed nothing, and
+  then combined it anyway.
+- **Now:** the re-partition is salted by recursion depth (`partition_batches_salted`, new
+  through the FFI). A salt of 0 is byte-identical to the historical assignment, which is the
+  cluster-wide contract every reducer and both sides of a distributed join agree on; salting
+  is only ever local.
+- **Why nothing caught it:** the result was always correct — a re-partition that moves no
+  rows is still a valid partition — and the only symptom was memory, on exactly the skewed
+  inputs the guard exists for. This is the shape `CLAUDE.md` warns about: a green gate is not
+  a green light.
+- **What it explains:** the comment above `_MAX_SPILL_RECURSION` records a measurement of
+  "86 buckets that reached the floor over budget, peak RSS identical (716 MB either way)" and
+  concludes that lifting the ceiling needs per-group spillable state. That measurement was of
+  a re-partition that moved no rows. The conclusion needs re-testing now that it moves them.
+- **Proof:** `tests/unit/test_spill_resplit_salt.py`. It pins the defect directly —
+  `test_an_unsalted_resplit_of_a_power_of_two_bucket_moves_no_rows` asserts the *old*
+  behavior so it cannot return as an optimization — alongside the salted split reaching all
+  8 sub-buckets, salt-0 identity at four partition counts, and equal keys staying together.
+
+### #22 — `dist/spill.py` became a package along its real seam
+
+- **Why:** the module sat at 498 lines against a 500-line limit, so #21 could not land without
+  crossing it, and `dist/` was simultaneously at its 12-files-per-directory ceiling.
+  Package-izing relieves both.
+- **The seam:** *where the bytes go* (`scratch` — the scratch directory, the tiered store, the
+  open-file cap, the morsel iterator that keeps the input from bounding peak memory, shared
+  with `dist.spill_breakers`) versus *what the operator does with them* (`aggregate` —
+  partition-and-spill aggregation and the `spill_collect` dispatcher).
+- **The bucket reduce stayed with its caller**, deliberately. A test monkeypatches
+  `_reduce_agg_bucket` on its module, and that only works if the caller resolves it there.
+  The test's target was re-pointed at the defining module in the same change — verified, not
+  assumed: patching the package leaves `aggregate._reduce_agg_bucket` untouched, so the trace
+  would have come back empty and the test would have passed **while measuring nothing**.
+  This is the exact hazard `.claude/rules/concurrent-agents.md` names about moved files.
+- **The import path is unchanged.** Everything either half exposes is re-exported, including
+  the underscore-prefixed names other modules and tests reach for.

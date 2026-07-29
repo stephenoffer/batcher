@@ -27,8 +27,13 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-import batcher.dist.spill as spill_mod
+import batcher.dist.spill.aggregate as spill_mod
 from batcher.config import Config, MemoryConfig, config_context
+
+# `spill_mod` is the *defining* module, not the `batcher.dist.spill` package that re-exports
+# it. Patching the package would leave the caller — which resolves `_reduce_agg_bucket` as a
+# module global in `aggregate` — untouched, so the trace below would come back empty and this
+# test would pass while measuring nothing.
 
 pytestmark = pytest.mark.integration
 

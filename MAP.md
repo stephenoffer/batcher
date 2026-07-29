@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 938 Python modules across 145 packages and 179 Rust files across 13 crates.
+Covering 940 Python modules across 146 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -177,7 +177,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 
 | module | lines | what it is |
 |---|---|---|
-| `gating.py` | 258 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
+| `gating.py` | 301 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 99 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
 | `staging.py` | 433 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
@@ -667,7 +667,6 @@ Subquery handling and decorrelation for the SQL translator.
 | `shuffle_io.py` | 187 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
-| `spill.py` | 498 | Single-node out-of-core aggregation via partition-and-spill, plus the spill |
 | `window_stream.py` | 243 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window. |
 
 ### `batcher/dist/adaptive_sizing/` — 4 · backend
@@ -733,6 +732,15 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 | `plan_id.py` | 155 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `source.py` | 170 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
 
+### `batcher/dist/spill/` — 4 · backend
+
+Out-of-core execution on one node: scratch plumbing, and the spilling aggregate.
+
+| module | lines | what it is |
+|---|---|---|
+| `aggregate.py` | 374 | Single-node out-of-core aggregation via partition-and-spill, plus the spill dispatcher. |
+| `scratch.py` | 167 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
+
 ### `batcher/dist/spill_breakers/` — 4 · backend
 
 Out-of-core streaming for the binary/ordering breakers: sort, join, window.
@@ -758,7 +766,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 353 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 396 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
@@ -1114,7 +1122,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 429 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 1531 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 1577 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 208 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1145,7 +1153,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 207 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 264 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `learned.py` | 373 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 317 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 342 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
@@ -1157,7 +1165,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 
 | module | lines | what it is |
 |---|---|---|
-| `admission.py` | 107 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
+| `admission.py` | 134 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 484 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
@@ -1387,7 +1395,7 @@ Multimodal sources — images/audio/video/embeddings as queryable Arrow columns.
 | `blob.py` | 166 | Blob-by-reference: offload large per-row payloads to a content-addressed store. |
 | `embeddings.py` | 219 | Embedding source — vector files (.npy / .parquet) → an Arrow embedding column. |
 | `images.py` | 59 | Image source — list image files + header-only width/height/mode. |
-| `media.py` | 464 | Multimodal media source base — list files, never decode pixels/frames. |
+| `media.py` | 468 | Multimodal media source base — list files, never decode pixels/frames. |
 | `video.py` | 70 | Video source — list video files + header-only fps/frames/width/height/duration. |
 
 ### `batcher/io/formats/nosql/` — 2 · neutral IO
@@ -1544,7 +1552,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 |---|---|---|
 | `binary.py` | 170 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
 | `documents.py` | 142 | Document format — PDF text extraction via `pypdf`, to Arrow. |
-| `text.py` | 217 | Plain-text source — one row per line or one row per whole file. |
+| `text.py` | 230 | Plain-text source — one row per line or one row per whole file. |
 | `warc.py` | 245 | WARC source — web-archive records (ISO 28500) as Arrow rows. |
 
 ### `batcher/io/schema/` — 2 · neutral IO
@@ -1584,7 +1592,7 @@ Splits — independently-readable, picklable slices of a source.
 
 | module | lines | what it is |
 |---|---|---|
-| `columnar_footer.py` | 372 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
+| `columnar_footer.py` | 386 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
 | `file_identity.py` | 142 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
 | `file_skipping.py` | 285 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
 | `free_counts.py` | 75 | Free row counts from file headers — metadata that costs one header read. |
@@ -1687,7 +1695,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `resource.py` | 230 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 146 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 168 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
@@ -1876,7 +1884,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `hub.py` | 469 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 113 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `smoothed.py` | 120 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
-| `source_stats_store.py` | 131 | Persisted source statistics — remember what Batcher wrote, for the next read. |
+| `source_stats_store.py` | 145 | Persisted source statistics — remember what Batcher wrote, for the next read. |
 | `store.py` | 122 | The pluggable persistence abstraction behind the MetadataHub. |
 | `views.py` | 125 | The bounded derived views over the feedback history. |
 
@@ -1947,11 +1955,11 @@ Effective hardware detection — what this process's machine really is and reall
 | module | lines | what it is |
 |---|---|---|
 | `cache.py` | 106 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
-| `cgroup.py` | 237 | cgroup file-format mechanics — the container limits that override what the host reports. |
+| `cgroup.py` | 295 | cgroup file-format mechanics — the container limits that override what the host reports. |
 | `cpu.py` | 163 | The CPU budget this process really has, and how much of it something else is taking. |
 | `isa.py` | 137 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 67 | The memory ceiling and page geometry this process runs under. |
-| `probes.py` | 44 | The one hook that clears every memoized hardware reading. |
+| `probes.py` | 55 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 306 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 107 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
@@ -1971,11 +1979,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 590 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `lib.rs` | 720 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 721 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
-| `shuffle.rs` | 548 | Shuffle FFI: partitioners and the concurrent reducer gather. |
+| `shuffle.rs` | 572 | Shuffle FFI: partitioners and the concurrent reducer gather. |
 | `sketches.rs` | 553 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
 | `tracing_init.rs` | 104 | Rust data-plane `tracing` → Python `logging` bridge. |
 
@@ -1988,7 +1996,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `agg_par.rs` | 215 | The high-cardinality parallel aggregate: partition first, aggregate once. |
-| `dist.rs` | 441 | Distributed-execution primitives. |
+| `dist.rs` | 463 | Distributed-execution primitives. |
 | `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par.rs` | 496 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `lib.rs` | 696 | `bc-interp` — the Tier-0 interpreter. |
@@ -2003,7 +2011,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/quantile_spill/histogram.rs` | 216 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
 | `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
-| `ops/repartition.rs` | 242 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
+| `ops/repartition.rs` | 256 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
