@@ -427,6 +427,59 @@ def test_spill_multikey_sort_matches_in_memory(num_partitions):
     assert spilled.to_pylist() == in_memory.to_pylist()
 
 
+def test_spill_sort_bucket_count_tracks_the_input_not_a_constant(monkeypatch):
+    """The out-of-core sort must size its buckets from the input, not from a constant.
+
+    Each bucket is read back *whole* to be sorted, so a fixed bucket count makes peak
+    memory `input / n_buckets` -- it grows linearly with the input. A sort large enough to
+    need this path is then exactly the sort that OOMs on its first bucket, and the failure
+    looks like an ordinary OOM rather than a misconfigured spill.
+
+    Staging already measures the mapped input, so the count comes from the same envelope the
+    aggregate reduce uses. This asserts the sizing responds to that envelope: shrinking
+    `spill_bucket_max_bytes` must produce strictly more buckets for the same data, and the
+    result must stay identical either way.
+    """
+    import dataclasses
+
+    from batcher.config import active_config, set_config
+    from batcher.dist.spill_breakers import sort as sort_mod
+
+    seen: list[int] = []
+    real = sort_mod._buckets_for_staged
+
+    def spy(stage_handle, hint):
+        n = real(stage_handle, hint)
+        seen.append(n)
+        return n
+
+    monkeypatch.setattr(sort_mod, "_buckets_for_staged", spy)
+
+    factory, schema, table = _sort_dataset()
+    in_memory = bt.from_arrow(table).sort("k").collect()
+
+    def run_with(bucket_max):
+        cfg = active_config()
+        mem = dataclasses.replace(cfg.memory, spill_bucket_max_bytes=bucket_max)
+        set_config(cfg.replace(memory=mem))
+        try:
+            seen.clear()
+            out = bt.from_batches(factory, schema).sort("k").collect(spill=True, num_partitions=1)
+            assert out.column("k").to_pylist() == in_memory.column("k").to_pylist()
+            return seen[0]
+        finally:
+            set_config(cfg)
+
+    coarse = run_with(1 << 30)  # 1 GiB buckets: the data fits in one
+    fine = run_with(4096)  # 4 KiB buckets: many are needed
+
+    assert fine > coarse, (
+        f"the bucket count did not respond to the memory envelope ({coarse} buckets at a "
+        f"1 GiB cap, {fine} at 4 KiB) -- it is still a constant, so peak memory is a fixed "
+        f"fraction of the input rather than a fixed size"
+    )
+
+
 def test_spill_sort_top_n():
     factory, schema, table = _sort_dataset()
     spilled = (

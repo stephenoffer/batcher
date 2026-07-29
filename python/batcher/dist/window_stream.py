@@ -140,7 +140,9 @@ def stream_spilling_global_window(
         )
         # Process buckets in *global sort order* (reversed for descending) so the
         # running offsets accumulate correctly.
-        order = range(n_buckets - 1, -1, -1) if desc else range(n_buckets)
+        # `handles`, not `n_buckets`: `stage_and_partition` sizes the split from the
+        # staged bytes, so the bucket count is decided there.
+        order = range(len(handles) - 1, -1, -1) if desc else range(len(handles))
         prior_rows = 0
         # Per-function running offset accumulators (in global sort order so far).
         dense = {f.alias: 0 for f in window.functions}

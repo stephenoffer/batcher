@@ -292,3 +292,39 @@ into a spill.
   after**. The sort's input is a *projection*, not a scan — a scan over already-materialized
   sources yields zero-copy slices, so collecting them allocates almost nothing and would have
   hidden the very thing being measured.
+
+---
+
+## Program 5 — The out-of-core bucket pipeline (control plane)
+
+`iter_batches` routes a top-level sort, join, or window over bounded sources to
+`dist/spill_breakers`: the input is consumed to disk, then the result is yielded one bounded
+bucket at a time. This is the path that makes a larger-than-memory sort possible at all, so
+the properties of *its* buckets decide whether "bounded" is true.
+
+### #19 — The out-of-core sort sizes its buckets from the input, not from a constant
+
+- **Was:** `n_buckets = _fd_safe(num_partitions)` — a constant 16 by default. Each bucket is
+  read back **whole** to be sorted, so peak memory was `input / 16`: it grew linearly with
+  the input.
+- **Now:** staging already measures the mapped input, so the count is derived from it and
+  `memory.spill_bucket_max_bytes` — the same envelope the aggregate reduce already used. The
+  caller's count becomes a floor (small sorts keep their parallelism) and `_fd_safe` the
+  ceiling (the partition phase holds one writer per non-empty bucket).
+- **Why it matters:** this is the *one* number in an out-of-core sort that must not be a
+  constant. A sort large enough to need this path was exactly the sort that then OOMed on its
+  first bucket — and it looked like an ordinary OOM, not a misconfigured spill.
+- **Still inherent:** a range partition cannot split a single key value across buckets, since
+  equal keys must share one or the concatenation is not sorted. A sort whose key is one hot
+  value is still bounded by that value's rows. That is a property of ordering, not of the
+  sizing.
+- **Proof:** `test_spill_sort_bucket_count_tracks_the_input_not_a_constant` — shrinking the
+  envelope must produce strictly more buckets for the same data, with an identical result.
+  The streaming global window shares `stage_and_partition`, so it is fixed by the same change.
+
+### #20 — `iter_batches` documented a limitation it does not have
+
+- **Was:** the docstring said "Other plans (sort / join / window / multi-source) materialize
+  first". The router has streamed those from the out-of-core bucket pipeline for some time.
+- **Why it matters:** this is the API doc a user reads when deciding whether Batcher can sort
+  something bigger than memory. It told them no, and the answer is yes.

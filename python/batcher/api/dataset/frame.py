@@ -5403,7 +5403,9 @@ class Dataset:
         map_batches over a single source) — and top-level aggregate / distinct /
         top-N over such an input — is consumed one source batch at a time in bounded
         memory, so a larger-than-memory or unbounded source streams incrementally.
-        Other plans (sort / join / window / multi-source) materialize first; if the
+        A top-level sort, join, or window over bounded sources streams too, from the
+        out-of-core bucket pipeline: the input is consumed to disk, then the result is
+        yielded one bounded bucket at a time. Anything else materializes first; if the
         source is unbounded and the plan cannot stream, a `PlanError` is raised
         rather than hanging. `batch_size` rebatches the output.
 
