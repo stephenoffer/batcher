@@ -117,6 +117,28 @@ class SourceStatistics:
     # float value-fact falls back to execution. Never set it unless the bounds were
     # produced by an ordering that ranks NaN highest.
     bounds_include_nan: bool = False
+    # Whether `byte_size` measures the rows' own **content** rather than their stored
+    # encoding — the difference between a figure the width estimator may trust and one it
+    # must not.
+    #
+    # A media, text, or binary listing knows the answer outright: one row *is* one file, so
+    # `byte_size / row_count` is the size of a row, full stop. Nothing in the schema can
+    # supply that — `column_bytes` sees a `binary` column and returns its 36-byte prior,
+    # which for a directory of 200 MB videos is wrong by six orders of magnitude.
+    #
+    # A **columnar** source is the opposite case, and it is why this is opt-in rather than
+    # inferred. A Parquet footer's `total_byte_size` is the encoded, row-group-padded stored
+    # size, which measures something related to but distinct from the materialized Arrow
+    # width — and the per-column type sum is already a good model of that width. Blending
+    # the two there is not a sharpening but a re-tuning, and it was measured as one: taking
+    # the footer figure as a floor on TPC-H sf1 moved the type-derived width from 88 to
+    # 142 B/row and pushed dimension build sides past the broadcast threshold, taking q9
+    # from 55.8 ms to 127.9 (0.84x to 1.60x against DuckDB) with ten other queries slower.
+    # The width was *more accurate* and the plans were worse, because the threshold is tuned
+    # against the estimate. So a columnar connector leaves this False and the width estimator
+    # keeps its type-derived answer; re-tuning the threshold against a sharper width is a
+    # separate, benchmark-driven change.
+    content_byte_size: bool = False
 
     def is_empty(self) -> bool:
         """True iff the source is known to contain zero rows."""

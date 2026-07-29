@@ -120,3 +120,66 @@ def test_an_unwired_plan_falls_back_to_the_previous_reading():
     ops, _ = _annotate(_fact().join(_dim(), on="k"))
     bare = PhysicalPlan(ir={}, output_schema=None, ops=tuple(replace(o, inputs=()) for o in ops))
     assert peak_operator_bytes(bare) == max(o.bounds.m_max_bytes for o in ops)
+
+
+def test_the_peak_names_every_operator_that_contributes_to_it():
+    # `peak_contributors` is what keeps the rest of Carbonite honest about the envelope
+    # having become a *sum*: on a bushy plan it must name both live tables, not just the
+    # larger one.
+    from batcher.carbonite.memory.estimator import peak_contributors
+
+    a, b, c, d = _fact(50_000), _dim(400), _dim(300), _dim(200)
+    _, plan = _annotate(a.join(b, on="k").join(c.join(d, on="k"), on="k"))
+    contributors = peak_contributors(plan)
+    assert len(contributors) > 1
+    assert sum(o.bounds.m_max_bytes for o in contributors) == peak_operator_bytes(plan)
+
+
+def test_a_linear_plan_names_exactly_its_dominant_breaker():
+    from batcher.carbonite.memory.estimator import peak_contributors
+
+    ds = _fact().group_by("k").agg(s=bt.col("x").sum()).sort("s")
+    _, plan = _annotate(ds)
+    contributors = peak_contributors(plan)
+    assert len(contributors) == 1
+    assert contributors[0].bounds.m_max_bytes == peak_operator_bytes(plan)
+
+
+def test_a_guess_in_any_contributor_keeps_the_verdict_advisory():
+    # The admission contract is that a plan sized from a guess may be routed out-of-core
+    # but never *failed*. Once the envelope became a sum, reading only the largest term
+    # would fail a legitimate query on the strength of a smaller guessed one.
+    from dataclasses import replace as dc_replace
+
+    from batcher.carbonite.policies.admission import _rests_on_a_guess
+    from batcher.plan.physical import PhysicalPlan as PP
+    from batcher.plan.stats import Provenance
+
+    ops, _ = _annotate(_fact(50_000).join(_dim(400), on="k").join(_dim(300), on="k"))
+    sized = [o for o in ops if o.bounds.m_max_bytes > 0]
+    if len(sized) < 2:  # pragma: no cover - plan shape without two sized operators
+        pytest.skip("plan has fewer than two sized operators")
+    exact = tuple(
+        dc_replace(o, properties=dc_replace(o.properties, provenance=Provenance.EXACT))
+        for o in ops
+    )
+    all_exact = PP(ir={}, output_schema=None, ops=exact)
+    binding = max(exact, key=lambda o: o.bounds.m_max_bytes)
+    assert _rests_on_a_guess(all_exact, binding) is False
+
+    # Now make the *smallest* contributor a guess: the verdict must go advisory.
+    smallest = min(
+        (o for o in exact if o.bounds.m_max_bytes > 0), key=lambda o: o.bounds.m_max_bytes
+    )
+    guessed = tuple(
+        dc_replace(o, properties=dc_replace(o.properties, provenance=Provenance.DEFAULT))
+        if o.op_id == smallest.op_id
+        else o
+        for o in exact
+    )
+    mixed = PP(ir={}, output_schema=None, ops=guessed)
+    from batcher.carbonite.memory.estimator import peak_contributors
+
+    if smallest.op_id not in {o.op_id for o in peak_contributors(mixed)}:
+        pytest.skip("the smallest sized operator does not contribute to this plan's peak")
+    assert _rests_on_a_guess(mixed, binding) is True

@@ -56,6 +56,17 @@ def _encode(stats: SourceStatistics) -> dict[str, Any]:
         "row_count": stats.row_count,
         "byte_size": stats.byte_size,
         "exact_rows": stats.exact_rows,
+        # The three qualifiers that say how the figures above may be *used*. Each defaults
+        # to the conservative answer, so dropping one from the round trip does not produce a
+        # wrong result — it silently produces a worse plan on every reload, which is harder
+        # to notice: `content_byte_size` decides whether the width estimator may trust
+        # `byte_size` at all (a media corpus reverts to a 36-byte type prior without it),
+        # `bounds_include_nan` decides whether a float `max()` can be answered from bounds
+        # rather than executed, and `row_group_count` is what lets a prune report what it
+        # skipped without reading.
+        "content_byte_size": stats.content_byte_size,
+        "bounds_include_nan": stats.bounds_include_nan,
+        "row_group_count": stats.row_group_count,
         # Physical properties drive redundant-sort removal and partition pruning; without
         # them a Batcher-written footerless source (CSV/JSON) loses its ordering on reload.
         "sorted_by": list(stats.sorted_by),
@@ -101,6 +112,9 @@ def _decode(blob: dict[str, Any]) -> SourceStatistics | None:
             sorted_by=tuple(blob.get("sorted_by", ())),
             partition_keys=tuple(blob.get("partition_keys", ())),
             exact_rows=bool(blob.get("exact_rows", True)),
+            content_byte_size=bool(blob.get("content_byte_size", False)),
+            bounds_include_nan=bool(blob.get("bounds_include_nan", False)),
+            row_group_count=blob.get("row_group_count"),
         )
     except Exception as exc:
         note_suppressed("metadata", "decode source stats", exc)

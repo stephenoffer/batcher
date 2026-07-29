@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.carbonite.memory.estimator import binding_operator, learned_plan_peak
+from batcher.carbonite.memory.estimator import (
+    binding_operator,
+    learned_plan_peak,
+    peak_contributors,
+)
 from batcher.carbonite.memory.pressure import total_memory_bytes
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds
 from batcher.plan.stats import Provenance
@@ -103,5 +107,28 @@ class BudgetingAdmission:
             # Naming the operator is what turns "this query will spill" into something a
             # reader can act on: it says which join/aggregate/sort to reshape.
             binding_op=None if binding is None else f"{binding.kind}#{int(binding.op_id)}",
-            advisory=binding is None or binding.properties.provenance is Provenance.DEFAULT,
+            advisory=_rests_on_a_guess(plan, binding),
         )
+
+
+def _rests_on_a_guess(plan: PhysicalPlan, binding) -> bool:
+    """Whether the envelope this verdict rejects on was derived from a guess.
+
+    Reads **every operator that contributes to the peak**, not just the largest one. On a
+    linear pipeline they are the same operator and this is exactly the previous rule; on a
+    bushy plan the peak is a *sum* over operators alive at the same moment, and a sum of an
+    EXACT term and a guessed one is a guess. Asking only the larger term would fail a
+    legitimate query on the strength of the smaller — which is precisely what the admission
+    contract forbids ("a guess never fails a legitimate query").
+
+    Args:
+        plan: The annotated physical plan.
+        binding: The operator named in the verdict, or `None` when nothing was sized.
+
+    Returns:
+        True when the verdict should route the plan out-of-core without failing it.
+    """
+    if binding is None:
+        return True
+    contributors = peak_contributors(plan) or (binding,)
+    return any(op.properties.provenance is Provenance.DEFAULT for op in contributors)

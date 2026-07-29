@@ -282,6 +282,10 @@ class MediaSource:
             byte_size=sum(sizes) or None,
             columns=columns,
             exact_rows=True,
+            # One row *is* one media file, so `byte_size / row_count` is the size of a row
+            # outright — the only real signal there is, since the schema shows a `binary`
+            # column whose type prior is 36 bytes against a frame of megabytes.
+            content_byte_size=True,
         )
 
     def splits(

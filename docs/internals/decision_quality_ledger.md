@@ -135,3 +135,76 @@ batch seed at once, so a stage really holding gigabytes reported one megabyte.
 | D42 | bug | **A `map_batches` carrying an explicit `batch_size` was budgeted at one morsel.** It re-batches its input to exactly that many rows regardless of the morsel it was handed, so the morsel byte cap does not bound it — and `kyber/gpu/sizing.py` seeds batch sizes of tens of thousands of rows from VRAM headroom. On an image column that is gigabytes reported to Carbonite as one megabyte, an under-count in the direction that admits a query the node cannot run. Measured end to end: an 8,192-row stage over a 224x224x3 column now reports 1.23 GB where it reported 1 MB. Only the *input* batch is charged; a UDF's output is arbitrary Python and claiming a multiple would be a fabricated number inside a memory bound. |
 | D43 | bug | **The GPU batch-size seed charged activations and treated the input tensor as free.** A batch occupies the device twice over, and only the activation prior (a flat 64 KiB/row, described as suiting "typical vision/embedding activations") was budgeted. A decoded image row is 147 KiB *before* a single activation and a 1080p RGB frame is 5.9 MiB, so the seeded batch demanded far more VRAM than the device has: measured on a 24 GB device, a 1080p stage's inputs alone came to ~200 GB. Now `activation + input_row_bytes`, taking the seed from 32,043 rows to 334 for that stage and from 32,043 to 9,719 for images. Charged at the **Arrow** width — a model that upcasts `uint8` to `float32` on device occupies four times this, but that is a property of the user's model rather than of the plan, and inventing a multiplier would put a fabricated number inside a memory bound. |
 | D44 | test | The default (`input_row_bytes=0.0`) reproduces the activation-only budget byte for byte, so every caller without an estimator is unchanged; a narrow numeric row moves the seed by under 1%. |
+
+## The width a source already measured (`plan/source_stats.py`, `kyber/stats/estimator.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D45 | fidelity | **`SourceStatistics.byte_size` was read by three consumers and not by the one that needed it most.** The storage shortcut, the read-cost predictor, and the distributed map sizer all read it; `row_width` — the single number under every byte axis in the engine — did not. `io/formats/multimodal/media.py` reports the exact total size and file count from its listing, so a directory of 200 MB videos is a *measured* 200 MB per row, while `column_bytes` could only offer its 36-byte prior for the `binary` column those bytes land in. Six orders of magnitude, for a figure already in hand. `row_width` now takes it as a floor at a `Scan`. |
+| D46 | perf | **The obvious version of D45 was a blocking regression, and the benchmark is what said so.** Taking *any* source's `byte_size` as a floor moved TPC-H sf1's type-derived width from 88 to 142 B/row — closer to the true 139 — and made the benchmark **worse**: dimension build sides crossed the broadcast threshold and q9 went **55.8 ms to 127.9** (0.84x to 1.60x against DuckDB) with ten other queries slower. A sharper estimate against a threshold tuned for the blunter one is a re-tuning, not an improvement. So the floor is gated on a new `SourceStatistics.content_byte_size`, which a connector sets when `byte_size` measures the rows' own **content** (a media/text listing: one row is one file) rather than their stored encoding (a Parquet footer's row-group-padded `total_byte_size`). Re-measured with the gate: q9 back to 53.9 ms and every query at or below its baseline. Re-tuning `broadcast_max_bytes` against a sharper width is a separate, benchmark-driven change. |
+| D47 | fidelity | `content_byte_size=True` set on the media source (one row per file) and on the text source in both modes (a row is a whole file, or a line whose bytes the total covers). |
+| D48 | bug | **Three `SourceStatistics` qualifiers were dropped by the persisted round trip.** `content_byte_size`, `bounds_include_nan`, and `row_group_count` were encoded by neither `_encode` nor `_decode`, so a cached statistic reloaded with each at its conservative default. None produces a wrong result — which is what makes it hard to notice: a media corpus silently reverts to the 36-byte type prior on every reload, a float `max()` that could be answered from bounds goes back to executing, and a prune loses the ability to report what it skipped. |
+
+## Footer statistics for nested columns (`io/stats/columnar_footer.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D49 | bug | **A struct field's footer bounds were filed under its bare field name, so they merged into any top-level column sharing it.** Parquet stores one column chunk per *leaf*: `ParquetSchema.names` reports each leaf's bare name while `path_in_schema` reports its dotted path, and the Python accumulator keyed by the former. For a flat table the two are the same string — which is why this held — and for a nested one they are not. Measured on a table with a top-level `a` of 1..3 beside a struct `s{a}` of 1000..3000, the Python path reported `a` in **[1, 3000]**. Numeric footer min/max carries `Provenance.EXACT`, and that provenance is exactly what lets Kyber answer `max(a)` from metadata *without reading the data* — so this is a wrong answer, not a loose bound. Now keyed by `path_in_schema`; a flat schema is byte-for-byte unchanged. |
+| D50 | bug | The **two implementations of one statistic disagreed**, which is the failure the module's own docstring says routing both through `_finalize_columns` prevents — but that shared finalization covers provenance and NaN handling, not naming. The native Rust walk keys by the path and reported [1, 3] for the same file the Python walk reported [1, 3000] for. The Python path is the *fallback*, reached whenever the native reader declines (an fsspec backend, a read-through byte cache, a declared `sorting_columns`, or any native failure), so it must be correct on its own. Pinned by `test_the_two_footer_paths_agree`. |
+| D51 | feature | Nested leaves now reach `SourceStatistics.columns` under their real paths (`s.a`, `l.list.element`) instead of colliding or being lost. Nothing consumes them yet — a nested-column zone-map prune is the obvious next use — but they are recorded correctly rather than wrongly. |
+
+## Keeping the envelope's *consumers* honest about it (`carbonite/memory`, `carbonite/policies/admission.py`)
+
+D24 turned the envelope from a `max` into a sum over co-resident operators. That is the
+right figure, and it silently invalidated an assumption downstream.
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D52 | bug | **Admission's "is this a guess?" test read the wrong operator once the envelope became a sum.** The contract is that a plan sized from a guess may be routed out-of-core but must never be *failed*, and it was enforced by reading the provenance of the single largest operator. On a bushy plan the peak is a sum over operators alive at the same moment, and a sum of an EXACT term and a guessed one is a guess — so reading only the larger term would fail a legitimate query on the strength of the smaller. `peak_contributors` now names every operator in the winning combination and the verdict is advisory if *any* of them is `DEFAULT`. On a linear plan the contributor set is the single dominant breaker, so the rule is byte-for-byte the previous one. |
+| D53 | hygiene | The peak walk returns `(bytes, contributing ids)` rather than a bare int, so "how big" and "who" come from one traversal and cannot disagree. The no-`inputs` fallback returns the same pair shape, so a hand-built `PhysicalPlan` still gets exactly the pre-tree reading. |
+| D54 | bug | `binding_operator` promised "the operator whose memory estimate *is* the plan's envelope", and once the envelope became a sum that could be false: the largest single operator can sit in a branch the peak does not come from — a build subtree whose own peak lost to the concurrent reading on the other side — so the message pointed a reader at an operator that is not why their query does not fit. It now names the largest *contributor*, falling back to the largest sized operator when nothing contributes (the pre-tree behavior exactly). |
+
+## The explode's real footprint (`kyber/annotate.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D55 | bug | **A row-*expanding* operator was budgeted at one morsel, and is not byte-bounded.** Measured rather than assumed: exploding 4,000 rows of a `fixed_size_list<float32, 768>` produces a **single output batch of 3,072,000 rows** — 12 MB against a 1 MiB morsel budget, 11.7x it — because the operator emits its whole fan-out for a morsel in one go and nothing re-cuts it. At a full 16,384-row morsel that is ~100 MB from a 1 MB input, budgeted at 65 KB: a 1,536x under-count on the RAG/embedding pipeline shape, in the direction that lets admission accept a query the node cannot run. The fan-out now multiplies the in-flight rows and the morsel byte cap is deliberately not applied — capping there reports the budget rather than the operator. |
+| D56 | test | The measurement the budget rests on is pinned (`test_the_explode_output_really_is_one_unbounded_batch`), so if the engine ever starts re-morselizing an explode the test fails and the estimate is corrected rather than silently drifting from it. A one-to-one explode is unchanged. |
+| D57 | hygiene | The fan-out is read from the estimator's own propagated counts (output rows over input rows), so it is exact wherever the type proves it (D29) and carries any learned correction otherwise — one source of truth rather than a second rule that could drift from the cardinality estimate. |
+| D58 | bug | `Unpivot` has the same shape and the same under-count: 4,000 rows over 20 columns emit one 80,000-row batch. The rule is stated as a property of the operator's **fan-out** rather than of a node type, so it covers `Unnest`, `Unpivot`, and any future expander without a list to keep in sync — while a `Filter`, `Project`, or `Limit`, which cannot expand, keeps the byte cap exactly (pinned by `test_a_row_shrinking_operator_is_still_byte_capped`). |
+
+## Coordination note — the morsel cut has two halves
+
+`carbonite/policies/morsel.py` decides *what* a morsel's row target should be (D25-D28) and
+`io/base/source.py::FileSource._normalize` is where an oversized source batch is actually
+*cut* to it. They compose: `_normalize` reads `active_config().execution.morsel_rows`, and
+the conductor's scoped config (`ResourceManager.recommended_config`) rewrites exactly that
+field from the byte-aware cap. So a source whose reader parses a whole file into one chunk
+is cut to a row count that fits the byte budget rather than to a flat 16,384 rows, which on
+a decoded tensor column is the difference between 900 KB and 2.4 GB per batch.
+
+Recorded because the two halves live in different subsystems and were built independently;
+neither is complete on its own.
+
+## The adaptive gate — a work threshold measured in rows (`api/adaptive/gating.py`)
+
+| # | Cat | Improvement |
+|---|-----|-------------|
+| D59 | scale | **The adaptive re-optimization floor was a pure row count, and its own rationale is about work.** `_ADAPTIVE_MIN_INPUT_ROWS` (20M) exists because staging trades a ~20-40 ms re-plan for a better downstream join choice, which pays only once a mis-estimated plan would cost more than that. Rows proxy for work only while a row is the ~64 bytes `optimizer.row_bytes` assumes, and across the modality range the proxy inverts at **both** ends: 20M rows of two `int64` keys is 320 MB and turned adaptation *on*, while 1M rows of decoded 224x224x3 images is **150 GB** and turned it *off*. The single most expensive query class in the engine was the one class the adaptive loop never ran on. The floor is now cleared by rows **or** bytes. |
+| D60 | scale | The byte floor is derived from the two existing knobs (`min rows x row_bytes`) rather than added as a third, and the two are combined with **OR**, so a narrow query clears exactly the floor it always did and nothing that used the one-shot route is moved off it. The size floor also remains one condition among several — `_adaptive_would_help` still requires a join with a breaker-produced operand whose size is genuinely unknown — so a trivial wide pipeline does not qualify merely by being wide (pinned by `test_a_join_is_still_required`). |
+| D61 | fidelity | The size probe reports `(rows, bytes)` from one walk instead of rows alone, and takes the width from the **scan's** own schema and measurements rather than from a guessed intermediate — the same discipline the row count already followed, extended to the other axis. |
+
+### Open, recorded rather than changed
+
+**`Unnest` is classified CPU-light while now being budgeted at ~100 MB.** `_CPU_LIGHT_KINDS`
+marks an explode as IO/decode-bound so it asks for a fractional `cpu_share_io` and the
+cluster packs several per core. That was defensible while the operator was believed to hold
+one morsel; with D55 it holds its fan-out, so packing `n` of them per core is `n x 100 MB`
+on one node. An explode is also not obviously IO-bound — it is a gather that materializes
+`fanout x` the rows, which is memory-bandwidth work, not waiting.
+
+Not changed here for two reasons. The static prior is *overridden* by the measured CPU
+utilization of the operator family as soon as one run records it (`_cpu_share` ->
+`recommend_num_cpus`), so the loop already corrects it; and moving a scheduling prior is a
+packing-density change that wants `bench-dist`, not an argument. Stated so the interaction
+is visible rather than inherited.

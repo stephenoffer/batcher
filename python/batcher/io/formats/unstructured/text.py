@@ -191,13 +191,26 @@ class TextSource:
             return None
         byte_size = total_file_bytes(self._fs, files)
         if self._mode == "file":
-            return SourceStatistics(row_count=len(files), byte_size=byte_size, exact_rows=True)
+            # One row is one whole file, so the byte total divided by the file count is a
+            # row's size directly — which the `string`/`binary` column's 36-byte type prior
+            # cannot approach for a corpus of documents.
+            return SourceStatistics(
+                row_count=len(files),
+                byte_size=byte_size,
+                exact_rows=True,
+                content_byte_size=True,
+            )
         from batcher.io.stats.row_estimate import estimate_delimited_rows
 
         rows = estimate_delimited_rows(self._fs, files, has_header=False, total_bytes=byte_size)
         if rows is None and byte_size is None:
             return None
-        return SourceStatistics(row_count=rows, byte_size=byte_size, exact_rows=False)
+        # Line mode: a row is a line and the byte total covers every line, so bytes per row
+        # is again the row's own content — just derived from an estimated count rather than
+        # an exact one, which `exact_rows=False` already records.
+        return SourceStatistics(
+            row_count=rows, byte_size=byte_size, exact_rows=False, content_byte_size=True
+        )
 
     def identity(self) -> str:
         # `encoding` decides how bytes become text, so the same path read as utf-8 vs

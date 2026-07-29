@@ -1210,7 +1210,53 @@ class StatsEstimator:
         # Neutral per-column filler for a column neither measured nor typed.
         known = measured or list(typed.values())
         avg_known = sum(known) / len(known)
-        return sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
+        derived = sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
+        return max(derived, self._measured_scan_width(node))
+
+    def _measured_scan_width(self, node: LogicalPlan) -> float:
+        """Bytes per row the *source itself* measured, or `0.0` when it reported none.
+
+        A connector that can answer `byte_size` and `row_count` has already measured the one
+        quantity every type prior is trying to approximate, and nothing read it. That is the
+        whole gap on unstructured and multimodal data: `io/formats/multimodal/media.py`
+        reports the exact total size and file count from its listing — a directory of 200 MB
+        videos is 200 MB per row, measured — while `column_bytes` could only offer the 36 B
+        prior for the `binary` column it lands in. Five to six orders of magnitude, for a
+        number already sitting in `SourceStatistics`.
+
+        Read **only** from a connector that set `content_byte_size`, meaning its `byte_size`
+        measures the rows' own content rather than their stored encoding. That flag is the
+        whole safety argument, and it was earned by measurement rather than assumed: taking
+        a *columnar* footer's `total_byte_size` as a floor as well moved TPC-H sf1's
+        type-derived width from 88 to 142 B/row — closer to the true 139 — and made the
+        benchmark **worse**, pushing dimension build sides past the broadcast threshold and
+        taking q9 from 55.8 ms to 127.9 with ten other queries slower. A sharper estimate
+        against a threshold tuned for the blunter one is a re-tuning, not an improvement.
+        See `SourceStatistics.content_byte_size`.
+
+        Taken as a floor (`max` with the type-derived sum) rather than as the answer, since a
+        media listing's bytes are the *encoded* file and a decoded frame in memory is larger
+        still — conservative in the right direction.
+
+        Only at a `Scan`. Above one the projected columns differ, and the per-column widths
+        propagated on `RelStats` are the right mechanism — attributing a whole relation's
+        bytes to a single narrow projected column would invert the estimate.
+
+        Args:
+            node: The node whose width is being estimated.
+
+        Returns:
+            Measured bytes per row, or `0.0` when the source reported none.
+        """
+        if not isinstance(node, Scan):
+            return 0.0
+        stats = self._stats_for(node.source_id)
+        if stats is None:
+            return 0.0
+        size, rows = stats.byte_size, stats.row_count
+        if not getattr(stats, "content_byte_size", False) or not size or not rows or rows <= 0:
+            return 0.0
+        return float(size) / float(rows)
 
     def _opaque_width(self, node: LogicalPlan, default: float) -> float:
         """Row width for a node whose own schema says nothing — the `map_batches` case.

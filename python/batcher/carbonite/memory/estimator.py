@@ -33,6 +33,7 @@ __all__ = [
     "OperatorMemoryEstimator",
     "binding_operator",
     "learned_plan_peak",
+    "peak_contributors",
     "peak_operator_bytes",
 ]
 
@@ -70,17 +71,60 @@ def peak_operator_bytes(plan: PhysicalPlan) -> int:
     Returns:
         Peak concurrent bytes, `0` when nothing in the plan could be sized.
     """
+    return _peak(plan)[0]
+
+
+def peak_contributors(plan: PhysicalPlan) -> tuple:
+    """The operators whose footprints *add up to* `peak_operator_bytes(plan)`.
+
+    On a linear pipeline this is the single dominant breaker, which is what the envelope
+    always was. On a bushy plan the peak is a **sum** over operators alive at the same
+    moment, and knowing which ones is what keeps the rest of Carbonite honest about it.
+
+    Admission is the caller that needs it. Its contract is that a plan sized from a *guess*
+    may route a query out-of-core but must never fail it, and it enforced that by reading
+    the provenance of the largest single operator. Once the envelope became a sum, that
+    became the wrong operator to ask: a peak of an EXACT 18 MB table plus a guessed 9 MB one
+    is a guess, and reading only the larger term would fail a legitimate query on the
+    strength of the smaller one.
+
+    Args:
+        plan: The annotated physical plan.
+
+    Returns:
+        The contributing `PhysicalOp`s, largest first; empty when nothing is sized.
+    """
+    _, ids = _peak(plan)
+    by_id = {int(getattr(op, "op_id", -1)): op for op in plan.ops}
+    ops = [by_id[i] for i in ids if i in by_id]
+    return tuple(sorted(ops, key=lambda op: op.bounds.m_max_bytes, reverse=True))
+
+
+def _peak(plan: PhysicalPlan) -> tuple[int, frozenset[int]]:
+    """`(peak bytes, contributing operator ids)` for `plan`."""
     if not plan.ops:
-        return 0
-    flat = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+        return 0, frozenset()
     # `getattr` for the same reason the rest of this module uses it: a bare test double
     # carrying only `bounds` is a supported shape, and an estimator is never the right
     # place to fail a query.
     if not any(getattr(op, "inputs", ()) for op in plan.ops):
-        return flat  # no tree to walk — the pre-`inputs` reading, unchanged
+        return _flat_peak(plan)  # no tree to walk — the pre-`inputs` reading, unchanged
     by_id = {int(op.op_id): op for op in plan.ops}
-    roots = _roots(plan)
-    return max((_subtree_peak(r, by_id, set()) for r in roots), default=flat)
+    walked = [_subtree_peak(r, by_id, set()) for r in _roots(plan)]
+    return max(walked, default=_flat_peak(plan))
+
+
+def _flat_peak(plan: PhysicalPlan) -> tuple[int, frozenset[int]]:
+    """The largest single operator and its id — the reading from before the tree existed."""
+    sized = [op for op in plan.ops if op.bounds.m_max_bytes > 0]
+    if not sized:
+        return 0, frozenset()
+    top = max(sized, key=lambda op: op.bounds.m_max_bytes)
+    # `getattr` for the same reason the rest of this module uses it: a bare double carrying
+    # only `bounds` is a supported shape, and it is the shape that reaches this branch —
+    # a plan with no `inputs` is exactly a hand-built one. An id nothing can resolve simply
+    # yields no contributors, and the caller falls back to the operator it already named.
+    return int(top.bounds.m_max_bytes), frozenset({int(getattr(top, "op_id", -1))})
 
 
 def _roots(plan: PhysicalPlan) -> list[int]:
@@ -93,8 +137,8 @@ def _roots(plan: PhysicalPlan) -> list[int]:
     return [int(op.op_id) for op in plan.ops if int(op.op_id) not in consumed]
 
 
-def _subtree_peak(op_id: int, by_id: dict, seen: set[int]) -> int:
-    """Peak concurrent bytes of the subtree rooted at `op_id`.
+def _subtree_peak(op_id: int, by_id: dict, seen: set[int]) -> tuple[int, frozenset[int]]:
+    """Peak concurrent bytes of the subtree rooted at `op_id`, and who contributes them.
 
     `seen` guards against a cycle. A `PhysicalPlan` is built from an immutable tree so it
     cannot contain one, but this figure gates admission for every query in the process and
@@ -102,17 +146,20 @@ def _subtree_peak(op_id: int, by_id: dict, seen: set[int]) -> int:
     """
     op = by_id.get(op_id)
     if op is None or op_id in seen:
-        return 0
+        return 0, frozenset()
     seen = seen | {op_id}
     resident = int(op.bounds.m_max_bytes)
-    child_peaks = [_subtree_peak(int(c), by_id, seen) for c in getattr(op, "inputs", ())]
-    if len(child_peaks) < 2:
-        return max(resident, *child_peaks) if child_peaks else resident
+    mine = frozenset({op_id}) if resident > 0 else frozenset()
+    children = [_subtree_peak(int(c), by_id, seen) for c in getattr(op, "inputs", ())]
+    if len(children) < 2:
+        return max([(resident, mine), *children])
     # A binary breaker holds its build side's state while the probe side runs. Batcher
     # builds on the *right*, which `annotate_ops` records as the second input, so the
     # first input is the one still streaming underneath the resident table.
-    probe, build = child_peaks[0], max(child_peaks[1:])
-    return max(build, resident + probe)
+    probe = children[0]
+    build = max(children[1:])
+    concurrent = (resident + probe[0], mine | probe[1])
+    return max(build, concurrent)
 
 
 def learned_plan_peak(plan: PhysicalPlan, model) -> int:
@@ -138,13 +185,20 @@ def learned_plan_peak(plan: PhysicalPlan, model) -> int:
 
 
 def binding_operator(plan: PhysicalPlan):
-    """The operator whose memory estimate *is* the plan's envelope, or `None`.
+    """The largest operator *contributing to* the plan's envelope, or `None`.
 
-    Every Carbonite memory decision reduces the plan to one number — the dominant
-    breaker — and then reports that number with nothing attached. An operator reading
-    "this query will spill" has no way back from the figure to the operator that produced
-    it, which is the only actionable part: it names which join, aggregate, or sort to
-    reshape.
+    Every Carbonite memory decision reduces the plan to one number — its peak — and then
+    reports that number with nothing attached. An operator reading "this query will spill"
+    has no way back from the figure to the operator that produced it, which is the only
+    actionable part: it names which join, aggregate, or sort to reshape.
+
+    "Contributing to" is load-bearing and was not always true. While the envelope was a
+    plain `max` this was simply the largest sized operator, and the two coincided. Once the
+    envelope became a *sum* over co-resident operators, the largest single operator can sit
+    in a branch the peak does not come from at all — a build subtree whose own peak lost to
+    the concurrent reading on the other side — and naming it would point a reader at an
+    operator that is not why their query does not fit. It falls back to the largest sized
+    operator when nothing contributes, which is the pre-tree behavior exactly.
 
     This is the one implementation of the rule. Three call sites re-derived the `max`
     locally — admission's provenance check, the estimator, the scheduling grant — and
@@ -157,8 +211,11 @@ def binding_operator(plan: PhysicalPlan):
         plan: The annotated physical plan.
 
     Returns:
-        The `PhysicalOp` holding the peak estimate, or `None` when nothing is sized.
+        The `PhysicalOp` to name, or `None` when nothing is sized.
     """
+    contributors = peak_contributors(plan)
+    if contributors:
+        return contributors[0]  # `peak_contributors` returns them largest first
     sized = [op for op in plan.ops if op.bounds.m_max_bytes > 0]
     if not sized:
         return None
