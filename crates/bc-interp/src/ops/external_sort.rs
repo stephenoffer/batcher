@@ -111,11 +111,14 @@ pub(crate) fn external_sort_to_final_store(
     let mut n_runs = 0usize;
     let mut group: Vec<RecordBatch> = Vec::new();
     let mut group_bytes = 0u64;
+    // Rows in, so the merge's rows out can be checked against them (see below).
+    let mut rows_in = 0u64;
     for b in parts.into_iter() {
         if b.num_rows() == 0 {
             continue;
         }
         group_bytes += b.get_array_memory_size() as u64;
+        rows_in += b.num_rows() as u64;
         group.push(b);
         if group_bytes >= run_target_bytes {
             spill_run(&mut group, keys, &mut store, n_runs)?;
@@ -165,6 +168,26 @@ pub(crate) fn external_sort_to_final_store(
         }
         store = next;
         n_runs = n_groups;
+    }
+    // A sort must return every row it was given, and the merge is the only place they could
+    // go missing: each pass writes runs and reads them back, so a spill file that lost its
+    // tail turns into a *sorted prefix* of the relation rather than an error — an IPC stream
+    // truncated at a message boundary reads back as a shorter valid stream. The store already
+    // counts rows per partition, so comparing the final run against the input costs nothing:
+    // no extra I/O, and it covers every merge pass at once. It also catches the merge simply
+    // dropping rows, which no result comparison in a spilling test would notice, because the
+    // spilled path is the only one being run.
+    let rows_out = store.partition_rows(0);
+    if rows_out < rows_in {
+        return Err(InterpError::from(
+            bc_runtime::RuntimeError::SpillTruncated {
+                dir: dir.display().to_string(),
+                partition: 0,
+                expected_rows: rows_in,
+                got_rows: rows_out,
+                missing: rows_in - rows_out,
+            },
+        ));
     }
     Ok(Some((store, spill_bytes)))
 }

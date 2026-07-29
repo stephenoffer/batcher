@@ -584,3 +584,25 @@ had drifted away from the thing they claimed to mirror.
 - **Why it belongs in this ledger:** a full-workspace build, a second agent's suite, or CI
   running two jobs on one machine all trigger it, and an intermittently-red transport suite is
   how a real spill regression gets waved through.
+
+### #36 — The external sort checks that its merge returned every row it was given
+
+- **Was:** the merge passes were unverified. Each pass writes runs and reads them back, so a
+  spill file that lost its tail turns the sort into a **sorted prefix** of the relation rather
+  than an error — an IPC stream truncated at a message boundary reads back as a shorter valid
+  stream (#26).
+- **Now:** pass 0 counts rows in; after the merge loop the final run's row count (which the
+  store already tracks) is compared against it. **No extra I/O**, and it covers every merge
+  pass at once, for the sort and for all five quantile/median/mode/histogram callers that
+  stream the final run themselves.
+- **It also catches a plain bug:** a merge that simply dropped rows. No result comparison in a
+  spilling test would notice, because under a forced spill the spilled path is the *only* path
+  being run — there is no in-memory answer alongside it to disagree with.
+- **Soundness of the bound:** partition 0 of the returned store holds the whole relation in
+  every case — whether pass 0 produced one run (no merge ran) or many (the last pass produced
+  one group). Compared with `<` rather than `!=`, so a hypothetical over-count is not a
+  failure.
+- **Proof:** every existing spilling-sort test now runs this check unconditionally and passes,
+  which is the evidence that it does not false-fire; the negative case is pinned at the store
+  level by `crates/bc-runtime/tests/spill_truncation.rs`, which is the same row-count
+  mechanism.

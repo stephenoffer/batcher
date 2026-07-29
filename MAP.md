@@ -2005,7 +2005,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join_par.rs` | 574 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `lib.rs` | 696 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 298 | Per-operator execution metrics — the measure half of the adaptive loop. |
-| `ops/external_sort.rs` | 428 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
+| `ops/external_sort.rs` | 451 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 255 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
