@@ -125,11 +125,30 @@ def _resident_bytes(node: LogicalPlan, rows: float, width: float, estimator) -> 
     return int(rows * width)
 
 
-def _streaming_bytes(node: LogicalPlan, width: float, morsel_rows: int, morsel_bytes: int) -> int:
+def _streaming_bytes(
+    node: LogicalPlan, width: float, morsel_rows: int, morsel_bytes: int, estimator=None
+) -> int:
     """Bytes a non-materializing operator holds in flight.
 
     A genuine streaming operator holds about one morsel, and a morsel is byte-bounded
     (`carbonite.policies.morsel`), so `min(rows x width, morsel_bytes)` is right for it.
+
+    **A row-*expanding* operator is not byte-bounded, and that was measured rather than
+    assumed.** Exploding 4,000 rows of a `fixed_size_list<float32, 768>` produces a *single*
+    output batch of 3,072,000 rows — 12 MB against a 1 MiB morsel budget, 11.7x it — and an
+    `unpivot` of 4,000 rows over 20 columns produces one batch of 80,000. Both emit a whole
+    morsel's fan-out in one go and nothing re-cuts it. At a full 16,384-row morsel the explode
+    is ~100 MB from a 1 MB input, budgeted at 65 KB. So the fan-out multiplies the in-flight
+    rows and the morsel byte cap does **not** apply: capping there reports the budget rather
+    than the operator.
+
+    Stated as a property of the *fan-out* rather than of a node type, so it covers `Unnest`,
+    `Unpivot`, and any future expander without a list to keep in sync — and so a `Filter`,
+    `Project`, or `Limit`, which cannot expand, is byte-capped exactly as before. The fan-out
+    comes from the estimator's own propagated counts (output rows over input rows), so it is
+    exact wherever the type or the operator proves it (a `fixed_size_list`'s length, an
+    unpivot's column count) and carries any learned correction otherwise — one source of
+    truth rather than a second rule that could drift from the cardinality estimate.
 
     **A `map_batches` carrying an explicit `batch_size` is not that operator.** It re-batches
     its input to exactly that many rows regardless of the morsel it was handed, so what it
@@ -149,6 +168,7 @@ def _streaming_bytes(node: LogicalPlan, width: float, morsel_rows: int, morsel_b
         width: Its estimated output row width in bytes.
         morsel_rows: The configured rows per morsel.
         morsel_bytes: The configured bytes per morsel.
+        estimator: The shared cardinality estimator, for an explode's fan-out.
 
     Returns:
         The operator's in-flight bytes.
@@ -158,7 +178,30 @@ def _streaming_bytes(node: LogicalPlan, width: float, morsel_rows: int, morsel_b
     batch_size = getattr(node, "batch_size", None) if isinstance(node, MapBatches) else None
     if batch_size:
         return int(max(1, batch_size) * width)
+    fanout = _fanout(node, estimator) if estimator is not None else 1.0
+    if fanout > 1.0:
+        return int(morsel_rows * fanout * width)
     return min(int(morsel_rows * width), morsel_bytes)
+
+
+def _fanout(node: LogicalPlan, estimator) -> float:
+    """Output rows per input row for `node`, from the estimator's own propagated counts.
+
+    At least 1.0: an operator the estimator believes *shrinks* its input is not a reason to
+    budget below one morsel (a filter still reads a whole one), and a fan-out of zero would
+    report an operator holding nothing. `1.0` for anything with no single input.
+    """
+    inp = getattr(node, "input", None)
+    if inp is None:
+        return 1.0
+    try:
+        in_rows = estimator.estimate(inp).rows
+        out_rows = estimator.estimate(node).rows
+    except Exception:  # pragma: no cover - budgeting must never break a plan
+        return 1.0
+    if in_rows <= 0 or out_rows <= 0:
+        return 1.0
+    return max(1.0, out_rows / in_rows)
 
 
 def _desired_parallelism(in_rows: float, width: float, target_rows: int, target_bytes: int) -> int:
@@ -287,7 +330,7 @@ def annotate_ops(
                 mem = _resident_bytes(node, rows, width, estimator)
             else:
                 # streaming: ~one morsel in flight, byte-bounded.
-                mem = _streaming_bytes(node, width, morsel_rows, morsel_bytes)
+                mem = _streaming_bytes(node, width, morsel_rows, morsel_bytes, estimator)
             # Desired parallelism: a breaker wants enough tasks that each handles
             # ~`target_rows` of the data it *shuffles* — its input volume, not its
             # (possibly tiny) grouped output. Streaming ops inherit the pipeline's

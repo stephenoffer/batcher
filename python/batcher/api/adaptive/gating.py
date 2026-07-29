@@ -94,14 +94,25 @@ def resolve_adaptive(
 def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     """Whether the query is big enough for stage-by-stage re-optimization to pay at all.
 
-    A join, and total scan rows clearing `_ADAPTIVE_MIN_INPUT_ROWS`. Both read EXACT source
-    row counts, so this separates scales without depending on the guessed operand size the
-    rest of the gate is about.
+    A join, and total scan input clearing either `_ADAPTIVE_MIN_INPUT_ROWS` **or**
+    `_ADAPTIVE_MIN_INPUT_BYTES`. Both read EXACT source row counts, so this separates scales
+    without depending on the guessed operand size the rest of the gate is about; the byte
+    term additionally reads the scan's width, which is a property of the schema and of the
+    source's own measurements rather than of an estimate.
+
+    Args:
+        plan: The logical plan being routed.
+        sources: The plan's bound inputs.
+        hub: The metadata hub, or `None`.
+
+    Returns:
+        Whether the query clears the size floor.
     """
     if not joins(plan):
         return False
     estimator = _build_estimator(sources, hub)
-    return _total_input_rows(plan, estimator) >= _ADAPTIVE_MIN_INPUT_ROWS
+    rows, in_bytes = _total_input_size(plan, estimator)
+    return rows >= _ADAPTIVE_MIN_INPUT_ROWS or in_bytes >= _ADAPTIVE_MIN_INPUT_BYTES
 
 
 def _learned_adaptive_route(plan: LogicalPlan, hub) -> str | None:
@@ -141,19 +152,51 @@ def record_adaptive_route(hub, plan: LogicalPlan, staged: bool, wall_ms: float) 
 # without ever depending on the guessed operand size it is trying to protect against.
 _ADAPTIVE_MIN_INPUT_ROWS = 20_000_000
 
+# ...and the same floor stated in bytes, because a row count assumes a row width.
+#
+# The rationale above is about *work*: re-optimization pays when a mis-estimated plan would
+# cost more than the ~20-40 ms re-plan. Rows are a proxy for work, and the proxy holds only
+# while a row is the ~64 bytes `optimizer.row_bytes` assumes. Across the modality range it
+# inverts at both ends: 20M rows of two `int64` keys is 320 MB, which the row gate turns
+# adaptation ON for, while 1M rows of decoded 224x224x3 images is **150 GB**, which it turns
+# it OFF for. The single most expensive query class in the engine was the one class the
+# adaptive loop never ran on.
+#
+# Derived from the two existing knobs rather than added as a third, so there is one place
+# that says how big "big" is; and the two gates are combined with OR, so a narrow query
+# clears exactly the floor it always did and nothing that used the one-shot route is moved
+# off it. The size floor is also only one of several conditions — `_adaptive_would_help`
+# still requires a join with a breaker-produced operand whose size is genuinely unknown — so
+# a trivial wide pipeline does not qualify merely by being wide.
+_ADAPTIVE_MIN_INPUT_BYTES = 20_000_000 * 64
 
-def _total_input_rows(plan: LogicalPlan, estimator) -> float:
-    """Sum of every `Scan`'s estimated rows — the query's total input size.
 
-    Scan estimates come straight from EXACT source statistics (footer/catalog row
-    counts), so this is a trustworthy size gauge even when downstream operand sizes are
-    only guessed.
+def _total_input_size(plan: LogicalPlan, estimator) -> tuple[float, float]:
+    """`(rows, bytes)` summed over every `Scan` — the query's total input size.
+
+    Scan estimates come straight from EXACT source statistics (footer/catalog row counts),
+    so this is a trustworthy size gauge even when downstream operand sizes are only guessed.
+    The width beside them is the scan's own — its column types, or a width the source
+    measured — and never a guessed intermediate.
+
+    Args:
+        plan: The logical plan.
+        estimator: The shared cardinality estimator.
+
+    Returns:
+        Total input rows and total input bytes.
     """
-    total = 0.0
+    from batcher.config import active_config
+
+    row_bytes = active_config().optimizer.row_bytes
+    rows = 0.0
+    nbytes = 0.0
     for node in walk(plan):
         if isinstance(node, Scan):
-            total += estimator.estimate(node).rows
-    return total
+            scan_rows = estimator.estimate(node).rows
+            rows += scan_rows
+            nbytes += scan_rows * estimator.row_width(node, row_bytes)
+    return rows, nbytes
 
 
 def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:

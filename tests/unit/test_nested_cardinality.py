@@ -84,3 +84,93 @@ def test_the_fanout_scales_with_the_declared_dimension():
     rows_small = CardinalityEstimator(small._sources).estimate(small.explode("e")._plan).rows
     rows_large = CardinalityEstimator(large._sources).estimate(large.explode("e")._plan).rows
     assert rows_large == 96 * rows_small
+
+
+def test_an_explode_is_budgeted_at_its_fanout_not_at_one_morsel():
+    """An `Unnest` emits its whole fan-out for a morsel in one batch, and nothing re-cuts it.
+
+    Measured: exploding 4,000 rows of a `fixed_size_list<float32, 768>` yields a *single*
+    3,072,000-row batch — 12 MB against a 1 MiB morsel budget. Budgeting the operator at one
+    morsel under-counted it by the fan-out, in the direction that lets admission accept a
+    query the node cannot run.
+    """
+    from batcher.config import active_config
+    from batcher.kyber.annotate import annotate_ops
+    from batcher.kyber.cost import CostModel
+
+    cfg = active_config()
+    ds = _embeddings(rows=64, dim=768)
+    est = CardinalityEstimator(ds._sources)
+    ops = annotate_ops(ds.explode("e")._plan, est, cfg, CostModel(est))
+    unnest = next(o for o in ops if o.kind == "Unnest")
+    scan = next(o for o in ops if o.kind == "Scan")
+    # The scan is byte-capped at one morsel; the explode is not, and holds its fan-out.
+    assert scan.bounds.m_max_bytes <= cfg.execution.morsel_bytes
+    assert unnest.bounds.m_max_bytes > 50 * cfg.execution.morsel_bytes
+
+
+def test_a_one_to_one_explode_is_still_one_morsel():
+    """The safety property: a fan-out of 1 must leave the budget exactly where it was."""
+    import pyarrow as pa_
+
+    from batcher.config import active_config
+    from batcher.kyber.annotate import annotate_ops
+    from batcher.kyber.cost import CostModel
+
+    cfg = active_config()
+    values = pa_.array([1.0] * 8)
+    ds = bt.from_arrow(pa_.table({"e": pa_.FixedSizeListArray.from_arrays(values, 1)}))
+    est = CardinalityEstimator(ds._sources)
+    ops = annotate_ops(ds.explode("e")._plan, est, cfg, CostModel(est))
+    unnest = next(o for o in ops if o.kind == "Unnest")
+    assert unnest.bounds.m_max_bytes <= cfg.execution.morsel_bytes
+
+
+def test_the_explode_output_really_is_one_unbounded_batch():
+    """The measurement the budget above rests on, pinned so it cannot silently change.
+
+    If the engine ever starts re-morselizing an explode, this fails and the budget should
+    go back to the byte-capped form — the point is that the estimate tracks the engine.
+    """
+    ds = _embeddings(rows=200, dim=768)
+    sizes = [b.num_rows for b in ds.explode("e").iter_batches()]
+    assert max(sizes) > 16_384
+
+
+def test_an_unpivot_is_budgeted_at_its_column_count():
+    """The same shape through the other expander, and its fan-out is exact.
+
+    Measured: an `unpivot` of 4,000 rows over 20 columns emits one 80,000-row batch. The
+    rule is stated as a property of the *fan-out* rather than of a node type, so it covers
+    both expanders without a list to keep in sync.
+    """
+    import pyarrow as pa_
+
+    from batcher.config import active_config
+    from batcher.kyber.annotate import annotate_ops
+    from batcher.kyber.cost import CostModel
+
+    cfg = active_config()
+    n = 64
+    table = pa_.table(
+        {"id": pa_.array(range(n)), **{f"c{i}": pa_.array([1.0] * n) for i in range(20)}}
+    )
+    ds = bt.from_arrow(table).unpivot(index=["id"], on=[f"c{i}" for i in range(20)])
+    est = CardinalityEstimator(ds._sources)
+    ops = annotate_ops(ds._plan, est, cfg, CostModel(est))
+    up = next(o for o in ops if o.kind == "Unpivot")
+    assert up.bounds.m_max_bytes > cfg.execution.morsel_bytes
+
+
+def test_a_row_shrinking_operator_is_still_byte_capped():
+    """A `Filter` cannot expand, so it must keep the morsel byte cap exactly."""
+    from batcher.config import active_config
+    from batcher.kyber.annotate import annotate_ops
+    from batcher.kyber.cost import CostModel
+
+    cfg = active_config()
+    ds = bt.from_pydict({"x": list(range(1000))})
+    est = CardinalityEstimator(ds._sources)
+    ops = annotate_ops(ds.filter(bt.col("x") > 5)._plan, est, cfg, CostModel(est))
+    for op in ops:
+        assert op.bounds.m_max_bytes <= cfg.execution.morsel_bytes
