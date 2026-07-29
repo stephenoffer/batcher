@@ -87,7 +87,7 @@ pub fn combine_finalize_spilling(
         let known = store.partition_bytes(pi) as usize;
         if budget_bytes > 0 && n_keys > 0 && known > budget_bytes {
             if let Some((group_columns, aggs)) =
-                split_partition_streaming(store, pi, known, n_keys, funcs, budget_bytes)?
+                split_partition_streaming(store, pi, known, n_keys, funcs, budget_bytes, 0)?
             {
                 group_parts.push(group_columns);
                 agg_parts.push(aggs);
@@ -123,6 +123,15 @@ pub fn combine_finalize_spilling(
 /// which is past the point where the raw shape reads.
 type MergedColumns = (Vec<ArrayRef>, Vec<ArrayRef>);
 
+/// How deep the recursive re-partition may go before a partition is combined as it stands.
+///
+/// The backstop for the case no hash can fix: a single group key whose partial state exceeds
+/// the budget re-hashes to one sub-partition however it is salted, so without a cap the
+/// recursion would not terminate. That case is safe to combine directly — a lone key's
+/// constant-size aggregate state is tiny; what is large is the *number* of keys, which
+/// splitting does fix.
+const MAX_MERGE_DEPTH: u32 = 4;
+
 /// The re-partition salt for recursion `depth`. Nonzero and depth-varying, so keys that
 /// collided at one level spread at the next instead of re-colliding identically.
 fn split_salt(depth: u32) -> u64 {
@@ -130,8 +139,16 @@ fn split_salt(depth: u32) -> u64 {
 }
 
 /// Sub-partitions to split `bytes` into so each lands inside `budget`.
+///
+/// Capped at 256 per level rather than 4,096. The split is recursive, so the cap is not a
+/// ceiling on the total: four levels at 256 ways is four billion sub-partitions, far past any
+/// real ratio of state to envelope. What the cap *does* bound is the cost of a single level —
+/// a disk-backed store creates a file per sub-partition, and a 4,096-way split of a partition
+/// that is itself the product of an earlier 4,096-way split writes millions of files holding
+/// a handful of rows each. The recursion reaches the same per-partition size through more,
+/// cheaper levels.
 fn sub_partition_count(bytes: usize, budget: usize) -> usize {
-    bytes.div_ceil(budget.max(1)).clamp(2, 1 << 12)
+    bytes.div_ceil(budget.max(1)).clamp(2, 256)
 }
 
 /// Split a partition known to exceed `budget` **without ever holding it whole**.
@@ -150,9 +167,10 @@ fn split_partition_streaming(
     n_keys: usize,
     funcs: &[AggFunc],
     budget: usize,
+    depth: u32,
 ) -> Result<Option<MergedColumns>, RuntimeError> {
     let sub_p = sub_partition_count(bytes, budget);
-    let salt = split_salt(0);
+    let salt = split_salt(depth);
     // `child` is created before the drain so the shared `&self` borrow ends first; it owns
     // its own storage, so the `&mut self` drain that follows cannot conflict with it.
     let mut child = store.child(sub_p)?;
@@ -162,7 +180,7 @@ fn split_partition_streaming(
         }
         Ok(())
     })?;
-    merge_child_partitions(&mut child, sub_p, n_keys, funcs, budget, 1)
+    merge_child_partitions(&mut child, sub_p, n_keys, funcs, budget, depth + 1)
 }
 
 /// Merge every sub-partition of `child`, concatenating their outputs column by column.
@@ -179,6 +197,22 @@ fn merge_child_partitions(
     let mut group_parts: Vec<Vec<ArrayRef>> = Vec::with_capacity(sub_p);
     let mut agg_parts: Vec<Vec<ArrayRef>> = Vec::with_capacity(sub_p);
     for pi in 0..sub_p {
+        // Ask how big the sub-partition is *before* reading it, exactly as the top level
+        // does. Without this the streaming split covered only depth 0: a sub-partition that
+        // was itself still over budget — which is precisely what severe skew produces, since
+        // one level of re-hashing does not separate a key from itself — was read whole and
+        // only then handed to `merge_partition` to be split again. The bound the module
+        // promises held for the first level and leaked at every level below it.
+        let known = child.partition_bytes(pi) as usize;
+        if budget > 0 && n_keys > 0 && depth < MAX_MERGE_DEPTH && known > budget {
+            if let Some((g, a)) =
+                split_partition_streaming(child.as_mut(), pi, known, n_keys, funcs, budget, depth)?
+            {
+                group_parts.push(g);
+                agg_parts.push(a);
+            }
+            continue;
+        }
         let sub = child.read(pi)?;
         if sub.is_empty() {
             continue;
@@ -218,9 +252,8 @@ fn merge_partition(
     parent: &dyn SpillStore,
     depth: u32,
 ) -> Result<(Vec<ArrayRef>, Vec<ArrayRef>), RuntimeError> {
-    const MAX_DEPTH: u32 = 4;
     let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    if budget == 0 || bytes <= budget || n_keys == 0 || depth >= MAX_DEPTH {
+    if budget == 0 || bytes <= budget || n_keys == 0 || depth >= MAX_MERGE_DEPTH {
         let partials: Vec<Partial> = batches
             .iter()
             .map(|b| unpack_partial(b, n_keys, funcs))
@@ -632,6 +665,101 @@ mod tests {
             store.whole_reads.get(),
             0,
             "nothing should have asked the top-level store for a whole partition",
+        );
+    }
+
+    /// The measure-before-read decision must happen at **every** level of the recursion, not
+    /// only at the top.
+    ///
+    /// The streaming split was added where the top-level merge chooses a partition, and the
+    /// recursive levels kept the older shape: read the sub-partition whole, then let
+    /// `merge_partition` decide it was too big and split it. That is exactly the case severe
+    /// skew produces — one level of re-hashing does not separate a key from itself — so the
+    /// bound the module promises held for the first level and leaked at every level below it.
+    ///
+    /// The discriminator is where the batches come from. A store that is streamed reports a
+    /// `drain`; one that is materialized reports a whole `read`. Before this fix the whole
+    /// run produced exactly **one** drain, at depth 0, however deep the recursion went.
+    #[test]
+    fn every_recursion_level_splits_without_materializing() {
+        /// A counting store whose children keep counting — the reason the earlier version of
+        /// this test could not see the leak is that its `child` handed back a plain store.
+        struct Counting {
+            inner: MemSpillStore,
+            whole_reads: std::rc::Rc<std::cell::Cell<usize>>,
+            drains: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl SpillStore for Counting {
+            fn num_partitions(&self) -> usize {
+                self.inner.num_partitions()
+            }
+            fn append(&mut self, p: usize, b: &RecordBatch) -> Result<(), RuntimeError> {
+                self.inner.append(p, b)
+            }
+            fn read(&mut self, p: usize) -> Result<Vec<RecordBatch>, RuntimeError> {
+                let batches = self.inner.read(p)?;
+                // Only a read that actually yields rows is a materialization; scanning past
+                // the empty sub-partitions a wide split leaves behind is not.
+                if !batches.is_empty() {
+                    self.whole_reads.set(self.whole_reads.get() + 1);
+                }
+                Ok(batches)
+            }
+            fn child(&self, n: usize) -> Result<Box<dyn SpillStore>, RuntimeError> {
+                Ok(Box::new(Counting {
+                    inner: MemSpillStore::new(n),
+                    whole_reads: self.whole_reads.clone(),
+                    drains: self.drains.clone(),
+                }))
+            }
+            fn partition_bytes(&self, p: usize) -> u64 {
+                self.inner.partition_bytes(p)
+            }
+            fn drain(
+                &mut self,
+                p: usize,
+                sink: &mut dyn FnMut(&RecordBatch) -> Result<(), RuntimeError>,
+            ) -> Result<(), RuntimeError> {
+                self.drains.set(self.drains.get() + 1);
+                // Deliberately not `self.read` — that is the path under test.
+                for b in self.inner.read(p)? {
+                    sink(&b)?;
+                }
+                Ok(())
+            }
+        }
+
+        let n = 240usize;
+        let key_strs: Vec<String> = (0..n).map(|i| format!("k{}", i % 31)).collect();
+        let keys: ArrayRef = Arc::new(StringArray::from(
+            key_strs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ));
+        let vals = i64s(&(0..n as i64).collect::<Vec<_>>());
+        let oracle =
+            crate::agg::group_aggregate(std::slice::from_ref(&keys), &calls(&vals), n).unwrap();
+
+        let whole_reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let drains = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut store = Counting {
+            inner: MemSpillStore::new(1),
+            whole_reads: whole_reads.clone(),
+            drains: drains.clone(),
+        };
+        // A 1-byte budget makes every partition over-budget at every level, so the recursion
+        // runs to its depth cap and each level has to make the same decision.
+        let partials = vec![partial(std::slice::from_ref(&keys), &calls(&vals), n).unwrap()];
+        let got = combine_finalize_spilling(partials, &FUNCS, &mut store, 1).unwrap();
+
+        assert_eq!(
+            to_map(&got.group_columns[0], &got.agg_columns),
+            to_map(&oracle.group_columns[0], &oracle.agg_columns),
+            "splitting at depth must not change the result",
+        );
+        assert!(
+            drains.get() > 1,
+            "only {} drain(s): the recursive levels still read their over-budget \
+             sub-partitions whole before deciding to split them",
+            drains.get()
         );
     }
 

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 937 Python modules across 145 packages and 178 Rust files across 13 crates.
+Covering 938 Python modules across 145 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -347,7 +347,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
-| `routing.py` | 172 | The `distributed="auto"` routing decision for terminal operations. |
+| `routing.py` | 174 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
 
@@ -758,7 +758,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 271 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 313 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 353 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
@@ -1114,7 +1114,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 429 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 1446 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 1498 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 208 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1125,7 +1125,8 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 | module | lines | what it is |
 |---|---|---|
 | `combine.py` | 416 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 469 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `leaves.py` | 437 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `patterns.py` | 188 | What a text pattern says about how many rows it matches. |
 | `scalars.py` | 249 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
 ### `batcher/carbonite/` — 3 · subsystem
@@ -1160,8 +1161,8 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `concurrency.py` | 295 | Bounding how many queries run at once, and how wide each one gets. |
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 484 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
-| `morsel.py` | 203 | How big a morsel should be, given memory pressure and the rows' measured width. |
-| `scheduling.py` | 208 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
+| `morsel.py` | 232 | How big a morsel should be, given memory pressure and the rows' measured width. |
+| `scheduling.py` | 218 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
 
@@ -1698,7 +1699,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 5086 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 5087 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 176 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 366 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -1863,7 +1864,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `infer.py` | 485 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 88 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
-| `widths.py` | 207 | Static per-column byte widths derived from a column's Arrow type. |
+| `widths.py` | 219 | Static per-column byte widths derived from a column's Arrow type. |
 
 ### `batcher/metadata/` — 1 · contract
 
@@ -1989,8 +1990,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg_par.rs` | 215 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 441 | Distributed-execution primitives. |
 | `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
-| `join_par.rs` | 538 | Parallel join strategies shared by the multi-core executor (`par`). |
-| `lib.rs` | 695 | `bc-interp` — the Tier-0 interpreter. |
+| `join_par.rs` | 496 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `lib.rs` | 696 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 298 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/external_sort.rs` | 410 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
@@ -2006,8 +2007,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 2842 | The multi-core executor. |
+| `par.rs` | 2845 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
+| `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 427 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/meter.rs` | 279 | Per-operator metrics for the streaming executor. |
@@ -2016,7 +2018,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 158 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 421 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
-| `window_spill.rs` | 72 | Bounded-memory window execution via grace partitioning. |
+| `window_spill.rs` | 146 | Bounded-memory window execution via grace partitioning. |
 
 ### `bc-runtime`
 

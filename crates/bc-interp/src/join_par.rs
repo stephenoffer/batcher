@@ -25,6 +25,9 @@ use std::sync::Arc;
 use crate::error::InterpError;
 use crate::ops;
 use crate::par::SpillOptions;
+use crate::spill_split::{
+    drain_repartition, grace_bucket_count, split_salt, MAX_GRACE_SPLIT_DEPTH,
+};
 
 /// Grace hash join, streamed: the build (right) side exceeds the budget, so
 /// partition both sides by key to disk **one input batch at a time** and join one
@@ -57,13 +60,13 @@ pub(crate) fn spilling_hash_join_streaming(
     sp: &SpillOptions,
 ) -> Result<(Vec<RecordBatch>, u64), InterpError> {
     // Enough partitions that each bucket's build side ≈ one budget — sized from the build
-    // batches' total size without materializing them, then capped (see `MAX_JOIN_FANOUT`).
+    // batches' total size without materializing them, then capped (see `MAX_GRACE_FANOUT`).
     let build_bytes: usize = right_batches
         .iter()
         .map(|b| b.get_array_memory_size())
         .sum();
     let budget = sp.memory_budget_bytes.max(1);
-    let p = build_bytes.div_ceil(budget).clamp(2, MAX_JOIN_FANOUT);
+    let p = grace_bucket_count(build_bytes, budget);
 
     let mut lstore = DiskSpillStore::with_codec(sp.dir.join("join-left"), p, sp.codec)?;
     let mut rstore = DiskSpillStore::with_codec(sp.dir.join("join-right"), p, sp.codec)?;
@@ -101,26 +104,6 @@ pub(crate) fn spilling_hash_join_streaming(
     let spill_bytes = lstore.spilled_bytes() + rstore.spilled_bytes();
     Ok((out, spill_bytes))
 }
-
-/// Upper bound on how many ways one level of the grace join fans out.
-///
-/// The bucket count wants to be `build_bytes / budget`, which for a build side three orders
-/// of magnitude over the envelope is thousands of buckets — thousands of open spill files
-/// per side, each receiving shards too small to write efficiently. Capping the fan-out and
-/// re-splitting the buckets that still do not fit (see [`join_bucket`]) reaches the same
-/// per-bucket size with bounded descriptors and full-sized writes, at the cost of re-reading
-/// only the buckets that were actually too big.
-const MAX_JOIN_FANOUT: usize = 256;
-
-/// How many times a bucket that still exceeds the budget may be re-split.
-///
-/// Each level multiplies the effective partition count by up to [`MAX_JOIN_FANOUT`], so
-/// three levels is 16 million buckets — far past any real ratio of build side to envelope.
-/// The bound exists for the case no hash can fix: when a *single* join key's rows exceed the
-/// budget, every re-split sends them all to one sub-bucket again, and without a limit the
-/// recursion would never terminate. At the limit the bucket is joined as-is, which is what
-/// the join did unconditionally before.
-const MAX_JOIN_SPLIT_DEPTH: u32 = 3;
 
 /// The parts of a grace join that do not change as buckets are re-split.
 struct BucketJoin<'a> {
@@ -182,7 +165,7 @@ fn join_bucket(
 ) -> Result<(), InterpError> {
     let lbytes = lstore.partition_bytes(i) as usize;
     let rbytes = rstore.partition_bytes(i) as usize;
-    if depth < MAX_JOIN_SPLIT_DEPTH && lbytes.max(rbytes) > ctx.budget {
+    if depth < MAX_GRACE_SPLIT_DEPTH && lbytes.max(rbytes) > ctx.budget {
         return split_and_join_bucket(lstore, rstore, i, ctx, depth, lbytes.max(rbytes), out);
     }
     let lpart = materialize_or_empty(&lstore.read(i)?, &ctx.lschema)?;
@@ -213,38 +196,19 @@ fn split_and_join_bucket(
     bytes: usize,
     out: &mut Vec<RecordBatch>,
 ) -> Result<(), InterpError> {
-    let sub_p = bytes.div_ceil(ctx.budget).clamp(2, MAX_JOIN_FANOUT);
+    let sub_p = grace_bucket_count(bytes, ctx.budget);
     let salt = split_salt(depth + 1);
     let sub = ctx.dir.join(format!("join-split-{depth}"));
     let mut lsub = DiskSpillStore::with_codec(sub.join("left"), sub_p, ctx.codec)?;
     let mut rsub = DiskSpillStore::with_codec(sub.join("right"), sub_p, ctx.codec)?;
-    drain_into_store(
-        lstore,
-        i,
-        &schema_key_indices(&ctx.lschema, ctx.left_keys)?,
-        sub_p,
-        salt,
-        &mut lsub,
-    )?;
-    drain_into_store(
-        rstore,
-        i,
-        &schema_key_indices(&ctx.rschema, ctx.right_keys)?,
-        sub_p,
-        salt,
-        &mut rsub,
-    )?;
+    let lidx = schema_key_indices(&ctx.lschema, ctx.left_keys)?;
+    let ridx = schema_key_indices(&ctx.rschema, ctx.right_keys)?;
+    drain_repartition(lstore, i, sub_p, salt, &columns_at(&lidx), &mut lsub)?;
+    drain_repartition(rstore, i, sub_p, salt, &columns_at(&ridx), &mut rsub)?;
     for j in 0..sub_p {
         join_bucket(&mut lsub, &mut rsub, j, ctx, depth + 1, out)?;
     }
     Ok(())
-}
-
-/// The salt for re-splitting at `depth` — any value that is non-zero (0 means "unsalted",
-/// the cluster-wide assignment) and distinct per level, so successive splits of the same
-/// rows are independent of one another.
-fn split_salt(depth: u32) -> u64 {
-    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(depth as u64 + 1) | 1
 }
 
 /// Indices of the named key columns within a *schema*.
@@ -268,18 +232,12 @@ fn schema_key_indices(
         .collect()
 }
 
-/// Stream partition `i` out of `store` and re-partition it into `dest` by the key columns at
-/// `key_idx`, one batch at a time, never holding the partition whole.
-fn drain_into_store(
-    store: &mut dyn SpillStore,
-    i: usize,
+/// A key extractor that takes the columns at `key_idx` — the join's key form, as the shape
+/// [`drain_repartition`] takes.
+fn columns_at(
     key_idx: &[usize],
-    p: usize,
-    salt: u64,
-    dest: &mut DiskSpillStore,
-) -> Result<(), InterpError> {
-    store.drain(i, &mut |b| partition_batch_into(b, key_idx, p, salt, dest))?;
-    Ok(())
+) -> impl Fn(&RecordBatch) -> Result<Vec<arrow::array::ArrayRef>, InterpError> + '_ {
+    move |b: &RecordBatch| Ok(key_idx.iter().map(|&k| b.column(k).clone()).collect())
 }
 
 /// Hash-partition one batch by the key columns at `key_idx` into `p` salted shards and

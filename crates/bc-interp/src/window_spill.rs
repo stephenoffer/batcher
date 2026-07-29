@@ -18,6 +18,9 @@ use bc_runtime::shuffle;
 use crate::batch_bytes;
 use crate::error::InterpError;
 use crate::ops;
+use crate::spill_split::{
+    drain_repartition, grace_bucket_count, split_salt, MAX_GRACE_SPLIT_DEPTH,
+};
 
 /// Run a window operator under a memory envelope by grace-partitioning on the
 /// `PARTITION BY` keys. Caller guarantees `partition_keys` is non-empty (a single
@@ -33,16 +36,16 @@ pub(crate) fn window_spilling(
     dir: &Path,
     codec: SpillCodec,
 ) -> Result<(Vec<RecordBatch>, u64), InterpError> {
-    let p = (batch_bytes(parts) as usize)
-        .div_ceil(budget_bytes.max(1))
-        .max(2);
+    let p = grace_bucket_count(batch_bytes(parts) as usize, budget_bytes);
     let mut store = DiskSpillStore::with_codec(dir.join("window"), p, codec)?;
-    for batch in parts {
-        let keys: Vec<ArrayRef> = partition_keys
+    let keys_of = |batch: &RecordBatch| -> Result<Vec<ArrayRef>, InterpError> {
+        partition_keys
             .iter()
-            .map(|e| e.eval(batch))
-            .collect::<Result<_, _>>()?;
-        for (i, bucket) in shuffle::partition_by_key_arrays(batch, &keys, p)?
+            .map(|e| e.eval(batch).map_err(InterpError::from))
+            .collect()
+    };
+    for batch in parts {
+        for (i, bucket) in shuffle::partition_by_key_arrays(batch, &keys_of(batch)?, p)?
             .iter()
             .enumerate()
         {
@@ -52,22 +55,93 @@ pub(crate) fn window_spilling(
         }
     }
     let spill_bytes = store.spilled_bytes(); // measured volume routed to disk
+    let ctx = WindowBuckets {
+        partition_keys,
+        order_keys,
+        functions,
+        rank_limit,
+        budget_bytes,
+        codec,
+        dir,
+        keys_of: &keys_of,
+    };
     let mut out = Vec::with_capacity(p);
     for i in 0..p {
-        let bucket = store.read(i)?;
-        if bucket.is_empty() {
-            continue;
-        }
-        let combined = ops::materialize(&bucket)?;
-        out.push(ops::window_batch(
-            &combined,
-            partition_keys,
-            order_keys,
-            functions,
-            rank_limit,
-        )?);
+        window_bucket(&mut store, i, &ctx, 0, &mut out)?;
     }
     Ok((out, spill_bytes))
+}
+
+/// The parts of a spilling window that do not change as buckets are re-split.
+struct WindowBuckets<'a> {
+    partition_keys: &'a [bc_expr::Expr],
+    order_keys: &'a [bc_ir::SortKey],
+    functions: &'a [bc_ir::WindowFunc],
+    rank_limit: Option<usize>,
+    budget_bytes: usize,
+    codec: SpillCodec,
+    dir: &'a Path,
+    keys_of: &'a dyn Fn(&RecordBatch) -> Result<Vec<ArrayRef>, InterpError>,
+}
+
+/// Run the window kernel over bucket `i`, re-splitting it first if it does not fit.
+///
+/// The bucket count is sized from the input's *average* bytes per bucket, so a skewed
+/// `PARTITION BY` leaves one bucket far over the envelope — and the kernel needs its bucket
+/// materialized, so that bucket OOMs at exactly the point spilling was meant to prevent it.
+/// Asking the store for the bucket's size *before* reading it is what allows the split to
+/// happen without first pulling in the thing that does not fit.
+///
+/// A re-split re-partitions by the **same** `PARTITION BY` keys under a depth-derived salt,
+/// so every window partition still lands whole in one sub-bucket. That is the correctness
+/// condition here and it is stronger than the join's: a window partition split across two
+/// buckets would produce two independent rankings, not merely a slower join.
+///
+/// It also means the split cannot help a *single* hot key — its rows re-hash together
+/// however they are salted. The depth bound is what makes that terminate; past it the bucket
+/// is run as-is. What the split does fix is the common case the fan-out cap creates: a
+/// bucket holding many distinct partitions, too large only in aggregate.
+fn window_bucket(
+    store: &mut dyn SpillStore,
+    i: usize,
+    ctx: &WindowBuckets<'_>,
+    depth: u32,
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), InterpError> {
+    let bytes = store.partition_bytes(i) as usize;
+    if depth < MAX_GRACE_SPLIT_DEPTH && bytes > ctx.budget_bytes {
+        let sub_p = grace_bucket_count(bytes, ctx.budget_bytes);
+        let mut sub = DiskSpillStore::with_codec(
+            ctx.dir.join(format!("window-split-{depth}")),
+            sub_p,
+            ctx.codec,
+        )?;
+        drain_repartition(
+            store,
+            i,
+            sub_p,
+            split_salt(depth + 1),
+            ctx.keys_of,
+            &mut sub,
+        )?;
+        for j in 0..sub_p {
+            window_bucket(&mut sub, j, ctx, depth + 1, out)?;
+        }
+        return Ok(());
+    }
+    let bucket = store.read(i)?;
+    if bucket.is_empty() {
+        return Ok(());
+    }
+    let combined = ops::materialize(&bucket)?;
+    out.push(ops::window_batch(
+        &combined,
+        ctx.partition_keys,
+        ctx.order_keys,
+        ctx.functions,
+        ctx.rank_limit,
+    )?);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -107,6 +181,80 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// A spilling window whose buckets are wildly uneven must still equal the in-memory
+    /// kernel, and the re-split must keep every window partition whole.
+    ///
+    /// The bucket count is sized from the input's *average* bytes per bucket, so a skewed
+    /// `PARTITION BY` leaves one bucket far over the envelope — and the kernel materializes
+    /// its bucket, so that is an OOM at exactly the point spilling was meant to prevent one.
+    /// Re-splitting is the fix, and it is more delicate here than for a join: a window
+    /// partition landing in two sub-buckets would produce two independent rankings rather
+    /// than merely a slower operator. Salting the *same* partition keys is what prevents
+    /// that, and `row_number` is the assertion, because it is the function that cannot
+    /// survive a split partition.
+    #[test]
+    fn window_spill_skewed_partitions_match_in_memory() {
+        // One hot key carrying most rows, plus a spread of cold ones — so the buckets are
+        // uneven, some sub-buckets hold several distinct partitions, and the hot key exercises
+        // the case no salt can separate.
+        let mut ks: Vec<f64> = Vec::new();
+        let mut vs: Vec<i64> = Vec::new();
+        for i in 0..400 {
+            ks.push(7.0);
+            vs.push(i);
+        }
+        for k in 0..60 {
+            for r in 0..3 {
+                ks.push(k as f64);
+                vs.push(1000 + k * 10 + r);
+            }
+        }
+        // Split into several morsels so a partition's rows arrive spread across runs.
+        let parts: Vec<RecordBatch> = ks
+            .chunks(64)
+            .zip(vs.chunks(64))
+            .map(|(k, v)| fbatch(k, v))
+            .collect();
+        let whole = crate::ops::materialize(&parts).unwrap();
+
+        let pk = vec![bc_expr::Expr::Col { name: "k".into() }];
+        let ok = vec![SortKey {
+            expr: bc_expr::Expr::Col { name: "v".into() },
+            descending: false,
+            nulls_first: false,
+        }];
+        let funcs = vec![
+            WindowFunc {
+                func: WindowFn::RowNumber,
+                input: None,
+                offset: 1,
+                frame: None,
+                alias: "rn".into(),
+            },
+            WindowFunc {
+                func: WindowFn::Sum,
+                input: Some(bc_expr::Expr::Col { name: "v".into() }),
+                offset: 1,
+                frame: None,
+                alias: "s".into(),
+            },
+        ];
+
+        let oracle = crate::ops::window_batch(&whole, &pk, &ok, &funcs, None).unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_winspill_skew_{}", std::process::id()));
+        // Small but not degenerate: the cold buckets fit and the hot one does not, so the
+        // split is a real decision taken on a measured size.
+        let (spilled, _) =
+            window_spilling(&parts, &pk, &ok, &funcs, None, 2048, &dir, SpillCodec::None).unwrap();
+
+        assert_eq!(
+            rows(std::slice::from_ref(&oracle)),
+            rows(&spilled),
+            "a re-split window bucket diverged from the in-memory kernel — a partition was \
+             split across sub-buckets and ranked twice"
+        );
     }
 
     /// A `PARTITION BY <float>` window over a key holding `-0.0`, `0.0` and NaN must give

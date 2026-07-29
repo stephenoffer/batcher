@@ -28,6 +28,7 @@ pub mod metrics;
 mod ops;
 pub mod par;
 mod rusage;
+mod spill_split;
 pub mod stream;
 mod window_spill;
 

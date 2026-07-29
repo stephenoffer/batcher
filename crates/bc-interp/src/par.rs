@@ -2743,9 +2743,12 @@ fn partial_state_bytes(partials: &[agg::Partial]) -> usize {
 /// Grace fan-out: enough hash partitions that each holds roughly one budget's
 /// worth of state. At least 2 (spilling with 1 partition saves no memory).
 fn grace_partitions(partials: &[agg::Partial], budget_bytes: usize) -> usize {
-    let total = partial_state_bytes(partials);
-    let budget = budget_bytes.max(1);
-    total.div_ceil(budget).max(2)
+    // Capped like every other grace operator's fan-out. Uncapped, an aggregate whose state
+    // is three orders of magnitude over the envelope asked for thousands of spill files,
+    // each receiving shards too small to write efficiently. A bucket that is still too large
+    // is not left that way: `combine_finalize_spilling` measures it before reading it and
+    // re-partitions it out of core, which is the bounded path anyway.
+    crate::spill_split::grace_bucket_count(partial_state_bytes(partials), budget_bytes)
 }
 
 /// Grace hash join: partition both sides by join key into `P` disk-backed
