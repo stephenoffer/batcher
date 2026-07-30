@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.core.gpu_plan.backend import DfBackend, Unsupported
+from batcher.core.gpu_plan.backend import DfBackend
 from batcher.core.gpu_plan.eligibility import JOIN_HOW
 from batcher.core.gpu_plan.ops import apply_op, distinct_rows, fold_zero
 
@@ -23,8 +23,10 @@ __all__ = [
     "execute_cudf_union",
     "run_chain",
     "run_join",
+    "run_join_frames",
     "run_ops",
     "run_union",
+    "run_union_frames",
 ]
 
 _LEFT = "L__"
@@ -89,16 +91,39 @@ def run_join(left_t, right_t, left_ops, right_ops, join_ir: dict, ops: list[dict
     the join's `output` spec then selects by side and aliases, reproducing the exact columns
     and order the CPU engine would produce.
     """
-    left = run_chain(left_t, left_ops, be)
-    right = run_chain(right_t, right_ops, be)
+    return run_join_frames(
+        be.from_arrow(left_t), be.from_arrow(right_t), left_ops, right_ops, join_ir, ops, be
+    )
+
+
+def run_join_frames(left, right, left_ops, right_ops, join_ir: dict, ops: list[dict], be):
+    """`run_join` for inputs already on the backend — a side the device read for itself.
+
+    The two inputs are different relations, so one may arrive from the device reader and the
+    other from the host one without the mismatch that matters. Within a single shard the two
+    readers' schemas have to agree because the pieces are concatenated; across the two sides of
+    a join there is nothing to concatenate, and each side is only required to be itself.
+
+    Args:
+        left: The left input, already a frame on `be`.
+        right: The right input, already a frame on `be`.
+        left_ops: The left input chain's operator IR.
+        right_ops: The right input chain's operator IR.
+        join_ir: The join node's IR.
+        ops: The operator chain above the join.
+        be: The dataframe backend to compute on.
+
+    Returns:
+        The join's result, as a frame on `be`.
+    """
+    left = run_ops(left, left_ops, be)
+    right = run_ops(right, right_ops, be)
     how = JOIN_HOW[join_ir["join_type"]]
     if how in ("semi", "anti"):
         out = _semi_join(left, right, join_ir, be, keep=how == "semi")
     else:
         out = _equi_join(left, right, join_ir, how, be)
-    for op in ops:
-        out = apply_op(out, op, be)
-    return out
+    return run_ops(out, ops, be)
 
 
 def _equi_join(left, right, join_ir: dict, how: str, be: DfBackend):
@@ -158,20 +183,59 @@ def _semi_join(left, right, join_ir: dict, be: DfBackend, *, keep: bool):
     """
     lkeys = join_ir["left_keys"]
     rkeys = join_ir["right_keys"]
-    if len(lkeys) != 1:
-        # A composite key needs a tuple-valued membership test, which neither backend offers
-        # without materializing a joint key column of an inferred type.
-        raise Unsupported("semi/anti join on a composite key")
-    # Folded on both sides: `isin` compares by hash, so a left `0.0` would not find a right
-    # `-0.0` — the same two-zeros split the group key and DISTINCT have, arriving through a
-    # third door.
-    probe = fold_zero(left[lkeys[0]], be)
-    member = probe.isin(fold_zero(right[rkeys[0]], be))
-    mask = member.fillna(False) & ~probe.isna()
+    mask = (
+        _member_of(left, right, lkeys[0], rkeys[0], be)
+        if len(lkeys) == 1
+        else _member_of_tuple(left, right, lkeys, rkeys, be)
+    )
     out = left[mask if keep else ~mask].reset_index(drop=True)
     return out.rename(columns={o["name"]: o["alias"] for o in join_ir["output"]})[
         [o["alias"] for o in join_ir["output"]]
     ]
+
+
+def _member_of(left, right, lkey: str, rkey: str, be: DfBackend):
+    """Membership on a single key, as a mask over the left rows.
+
+    Folded on both sides: `isin` compares by hash, so a left `0.0` would not find a right
+    `-0.0` — the same two-zeros split the group key and DISTINCT have, arriving through a third
+    door. Nullness is then subtracted, because `isin` treats a null as an ordinary value and
+    finds it.
+    """
+    probe = fold_zero(left[lkey], be)
+    return probe.isin(fold_zero(right[rkey], be)).fillna(False) & ~probe.isna()
+
+
+def _member_of_tuple(left, right, lkeys: list[str], rkeys: list[str], be: DfBackend):
+    """Membership on a composite key, as a mask over the left rows.
+
+    `isin` tests one column, so a multi-column key needs a different mechanism: merge the left
+    key tuples against the *deduplicated* right ones and ask which found a partner. Deduplicating
+    is what makes this a membership test rather than a join — without it a left row would come
+    back once per matching right row, which is the fan-out a semi join exists to avoid.
+
+    The left row's position is carried through the merge and sorted back afterwards. A merge
+    does not promise to preserve the left frame's order, and on the host backend it happens to,
+    which is the shape of bug that passes every test here and reorders on the device.
+
+    A star-schema anti-join on `(date, store)` is the reason this is worth having at all: the
+    whole plan used to go to the CPU engine over the key having two columns.
+    """
+    pos = "__bt_pos"
+    probe = be.lib.DataFrame({f"__bt_k{i}": fold_zero(left[k], be) for i, k in enumerate(lkeys)})
+    key_names = list(probe.columns)
+    probe[_NULL_KEY] = _null_key_marker(probe, key_names, side=0)
+    probe[pos] = range(len(left))
+    keys = be.lib.DataFrame({f"__bt_k{i}": fold_zero(right[k], be) for i, k in enumerate(rkeys)})
+    keys[_NULL_KEY] = _null_key_marker(keys, key_names, side=1)
+    present = "__bt_present"
+    keys = keys.drop_duplicates()
+    keys[present] = 1
+    merged = probe.merge(keys, on=[*key_names, _NULL_KEY], how="left").sort_values(pos)
+    # `notna` rather than a filled boolean: an unmatched row's marker is missing, which *is*
+    # the answer, and filling it first would ask the library to pick a dtype for a column that
+    # only ever holds one value and a hole.
+    return merged[present].notna().reset_index(drop=True)
 
 
 def execute_cudf_join(
@@ -201,14 +265,33 @@ def execute_cudf_join(
 
 def run_union(tables: list, input_ops: list[list[dict]], distinct: bool, ops, be: DfBackend):
     """Replay each input's chain, concatenate them, optionally deduplicate, then run `ops`."""
-    frames = [run_chain(t, o, be) for t, o in zip(tables, input_ops, strict=True)]
-    out = be.concat(frames)
+    return run_union_frames([be.from_arrow(t) for t in tables], input_ops, distinct, ops, be)
+
+
+def run_union_frames(frames: list, input_ops: list[list[dict]], distinct: bool, ops, be):
+    """`run_union` for inputs already on the backend — inputs the device read for itself.
+
+    A union *does* concatenate its inputs, so the schemas here must agree — but that is a
+    property of the relations being unioned, which the plan already required, not of which
+    reader produced them. Each input is separately either device-readable or not, and the
+    device reader declines rather than approximating, so a mixed set still concatenates.
+
+    Args:
+        frames: The inputs, already frames on `be`.
+        input_ops: Each input chain's operator IR, positionally matching `frames`.
+        distinct: Whether the union deduplicates.
+        ops: The operator chain above the union.
+        be: The dataframe backend to compute on.
+
+    Returns:
+        The union's result, as a frame on `be`.
+    """
+    reduced = [run_ops(f, o, be) for f, o in zip(frames, input_ops, strict=True)]
+    out = be.concat(reduced)
     if distinct:
         # The same fold DISTINCT needs: a UNION deduplicates rows, so it decides identity.
         out = distinct_rows(out, be)
-    for op in ops:
-        out = apply_op(out, op, be)
-    return out
+    return run_ops(out, ops, be)
 
 
 def execute_cudf_union(

@@ -374,3 +374,58 @@ def test_a_float_to_integer_cast_still_rounds(be):
     table = pa.table({"f": [1.5, 2.5, -1.5, None]})
     got, expected = _run(lambda ds: ds.select(i=col("f").cast("int64")), table, be)
     assert got.column("i").to_pylist() == expected.column("i").to_pylist()
+
+
+# --- a semi/anti join whose key has more than one column ------------------------------
+
+STAR_FACT = pa.table(
+    {
+        "d": [1, 2, 3, None, 4, 5],
+        "s": ["a", "b", "a", "c", None, "z"],
+        "f": [0.0, 1.0, -0.0, 2.0, 3.0, 4.0],
+        "l": [1, 2, 3, 4, 5, 6],
+    }
+)
+STAR_DIM = pa.table(
+    {
+        # `(1, "a")` twice: the right side has duplicates, which a membership test must not
+        # turn into duplicated left rows.
+        "d": [1, 1, 3, None, 5],
+        "s": ["a", "a", "a", "c", "z"],
+        "f": [-0.0, -0.0, 0.0, 2.0, 9.0],
+        "r": [10, 11, 30, 40, 50],
+    }
+)
+
+
+def _run_join_on(how, on, left, right, be):
+    from batcher.core.gpu_plan import gpu_join_spec
+    from batcher.core.gpu_plan.execute import run_join
+
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on=on, how=how)
+    spec = gpu_join_spec(ds._plan)
+    assert spec is not None, "join should be GPU-translatable"
+    (_ls, lops), (_rs, rops), join_ir, ops = spec
+    got = be.to_arrow(run_join(left, right, lops, rops, join_ir, ops, be))
+    expected = ds.collect()
+    return got.select(expected.column_names), expected
+
+
+@pytest.mark.parametrize("how", ["semi", "anti"])
+@pytest.mark.parametrize("on", [["d", "s"], ["d", "s", "f"]])
+def test_a_composite_key_semi_or_anti_join_runs_on_the_device(be, how, on):
+    """A star-schema anti-join on `(date, store)` used to send the whole plan to the CPU.
+
+    Compared row-for-row: a merge does not promise to preserve the left frame's order, and on
+    the host backend it happens to — which is the shape of bug that passes here and reorders
+    on the device. The position is carried through the merge and sorted back for that reason.
+    """
+    got, expected = _run_join_on(how, on, STAR_FACT, STAR_DIM, be)
+    assert _rows(got) == _rows(expected)
+
+
+@pytest.mark.parametrize("how", ["semi", "anti"])
+def test_a_composite_key_does_not_fan_out_on_a_duplicated_right_side(be, how):
+    """`(1, "a")` appears twice on the right; a semi join must still emit one left row."""
+    got, _ = _run_join_on(how, ["d", "s"], STAR_FACT, STAR_DIM, be)
+    assert got.num_rows <= STAR_FACT.num_rows
