@@ -118,6 +118,31 @@ usually clears it. Do not:
 The same applies to `MAP.md`: it goes stale the moment any session adds a module, so
 regenerate it *inside* the retry loop rather than before it.
 
+## A retry loop must own its message and its path list
+
+The contention above makes a retry loop around `git commit` the standard fix, and it has now
+produced two malformed commits here. Both failed the same way: the loop re-read a message file
+and a path list that had been *edited underneath it* between attempts, so what eventually
+landed was neither the message the author wrote nor the files they meant.
+
+One of the two lost its subject line entirely and committed with a paragraph of body text as
+the summary; the other committed against a stale path list and carried two unrelated changes
+together. Neither is recoverable once another session commits on top, because rewriting shared
+history in this tree is worse than the defect.
+
+Three rules keep the loop honest:
+
+- **Snapshot the message before the loop starts** (`cp msg.txt msg.lock`) and point `-F` at the
+  copy. A `cat >>` that appends to the live file mid-run, or a `pkill` that truncates it, then
+  cannot reach the commit.
+- **Freeze the path list too.** Editing the script a running loop is reading is how a path that
+  no longer exists (or one that now belongs to another session) ends up in `--only`.
+- **Never `pkill` your own loop by a pattern that can match the shell running it.** That is what
+  truncated the message file here: the kill landed mid-heredoc.
+
+And verify after: `git log -1 --format=%s | wc -c`. A subject over ~72 characters means the
+message did not survive.
+
 ## Prove "pre-existing", never assume it
 
 Reporting another agent's in-flight breakage as "pre-existing and unrelated" is the
