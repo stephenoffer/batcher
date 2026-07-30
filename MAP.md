@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 978 Python modules across 151 packages and 179 Rust files across 13 crates.
+Covering 979 Python modules across 151 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -750,7 +750,8 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 153 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `tasks.py` | 123 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `dispatch.py` | 129 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `tasks.py` | 161 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
 

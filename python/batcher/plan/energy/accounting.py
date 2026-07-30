@@ -38,6 +38,9 @@ class StageEnergy:
         joules: Energy attributed to the stage, IT load only.
         rows: Rows the stage emitted, `0` when not counted.
         tokens: Tokens the stage generated, `0` for a non-generative stage.
+        measured: Whether `joules` came from a device power reading rather than from the
+            datasheet model. A cost figure that cannot be told apart from an estimate is
+            worth less than either, so the distinction travels with the record.
     """
 
     stage: str
@@ -48,6 +51,7 @@ class StageEnergy:
     joules: float = 0.0
     rows: int = 0
     tokens: int = 0
+    measured: bool = False
 
     @property
     def rows_per_joule(self) -> float | None:
@@ -132,6 +136,11 @@ class EnergyLedger:
         """Total rows emitted across every recorded stage."""
         return sum(s.rows for s in self.stages)
 
+    @property
+    def measured_joules(self) -> float:
+        """Energy that came from a device reading rather than the datasheet model."""
+        return sum(s.joules for s in self.stages if s.measured)
+
     def by_device(self) -> dict[str, float]:
         """Energy grouped by accelerator model.
 
@@ -179,8 +188,9 @@ class EnergyLedger:
         """A flat, JSON-safe roll-up for logs, metrics sinks, and the dashboard.
 
         Returns:
-            Total energy, idle energy and fraction, row and token counts, and the two
-            efficiency ratios (omitted when undefined rather than reported as zero).
+            Total energy, idle energy and fraction, the share of it that was measured
+            rather than modelled, row and token counts, and the two efficiency ratios
+            (omitted when undefined rather than reported as zero).
         """
         out: dict[str, float] = {
             "joules": self.total_joules,
@@ -190,6 +200,8 @@ class EnergyLedger:
             "tokens": float(self.total_tokens),
             "stages": float(len(self.stages)),
         }
+        if self.total_joules > 0:
+            out["measured_fraction"] = self.measured_joules / self.total_joules
         tpj, rpj = self.tokens_per_joule(), self.rows_per_joule()
         if tpj is not None:
             out["tokens_per_joule"] = tpj

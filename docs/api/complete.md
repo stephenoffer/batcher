@@ -65,6 +65,8 @@ register SQL functions or sessions.
    engine_version
    versions
    show_versions
+   accelerators
+   show_accelerators
    start_ui
    stop_ui
    ui_url

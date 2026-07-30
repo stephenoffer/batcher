@@ -8,8 +8,10 @@ metrics sink.
 Two reporting rules the rest of `observe` also follows, restated because they matter more here
 than elsewhere. **An unknown figure is omitted, never zero** — a run whose device model this
 build does not recognize should report no energy rather than 0 J, because a zero in a cost
-report is a claim and an omission is not. And **efficiency is work per joule**, so a stage that
-emitted nothing has no efficiency figure rather than an infinite one.
+report is a claim and an omission is not. For the same reason the total says whether it was
+measured from device readings or modelled from datasheets, since an estimate presented as a
+measurement is the one error a cost report cannot recover from. And **efficiency is work per
+joule**, so a stage that emitted nothing has no efficiency figure rather than an infinite one.
 
 Neutral, like the rest of `observe`: it reads the ledger and the device telemetry, and imports
 no subsystem.
@@ -63,7 +65,9 @@ def format_energy_report(ledger: EnergyLedger, grid: GridProfile | None = None) 
 
     total = ledger.total_joules
     rows.append("")
-    rows.append(f"total {_si(total)} across {len(ledger.stages)} stage(s)")
+    measured = ledger.measured_joules / total if total > 0 else 0.0
+    basis = "measured" if measured >= 0.999 else f"{measured:.0%} measured, rest modelled"
+    rows.append(f"total {_si(total)} across {len(ledger.stages)} stage(s) ({basis})")
     if total > 0:
         idle_share = f"{ledger.idle_fraction():.0%}"
         rows.append(f"idle  {_si(ledger.total_idle_joules)} ({idle_share} of total)")

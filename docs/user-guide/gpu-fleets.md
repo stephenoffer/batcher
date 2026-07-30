@@ -29,6 +29,29 @@ print(spec.memory_gib, spec.tdp_watts, spec.nvlink_domain, spec.mig_slices)
 # 80 700.0 8 7
 ```
 
+## See what the fleet looks like
+
+`bt.accelerators()` reports what this process and its cluster can see: the local devices with
+their nameplate figures and any live readings, the cluster's shape, and the power envelope.
+`bt.show_accelerators()` prints the same thing for a human. Keys are present only when their
+source could answer, so a CPU-only host reports a backend and an empty device list rather than
+a page of zeros.
+
+```python
+import batcher as bt
+
+report = bt.accelerators()
+print(report["backend"] in {"cuda", "rocm", "xpu", "mps", "tpu", "neuron", "hpu", "cpu"})
+# True
+print(isinstance(report["devices"], list))
+# True
+```
+
+On a GPU node the device rows carry the live draw, SM utilization, temperature, and any clamp
+the driver has applied. A `fleet` key appears when Ray is up and the cluster has accelerator
+nodes, with the widest coherent NVLink domain and how many racks and power zones the fleet
+spans.
+
 ## Budget the power a job may draw
 
 A rack is provisioned in watts before it is provisioned in slots. Sixteen 700 W devices need
