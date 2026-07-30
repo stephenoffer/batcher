@@ -47,6 +47,23 @@ def _read(descriptor: dict):
     return pa.Table.from_batches(batches) if batches else None
 
 
+def _frame(descriptor: dict, be: DfBackend):
+    """One descriptor's rows as a frame on `be`, or `None` when it holds no rows.
+
+    The device reads for itself where it can, which skips a CPU Parquet decode and a transfer
+    across the bus; where it cannot, the host reader runs and the table is converted. The two
+    produce the same rows by construction — the device path declines rather than approximating
+    — so which one ran is a question of speed, and every caller can ignore the difference.
+    """
+    from batcher.dist.gpu.device_read import read_descriptor_on_device
+
+    frame = read_descriptor_on_device(descriptor, be)
+    if frame is not None:
+        return frame if len(frame) else None
+    table = _read(descriptor)
+    return None if table is None else be.from_arrow(table)
+
+
 def _device() -> DfBackend:
     """The cuDF backend, imported here so a driver with no RAPIDS can still import this module.
 
@@ -58,10 +75,16 @@ def _device() -> DfBackend:
     """
     import cudf
 
-    from batcher.carbonite.accel import prepare_device_memory
+    from batcher.carbonite.accel import bind_host_threads_to_device, prepare_device_memory
     from batcher.core.gpu_plan import DfBackend
 
     prepare_device_memory()
+    # The worker's *host* half — the reader, the decoder, the staging buffer — belongs on the
+    # cores next to the device it feeds. Left alone on a two-socket node, half the workers land
+    # across the inter-socket link and pay for it twice per batch, at full device utilization
+    # and with nothing in the timings to say so. Refuses itself where the mapping is unreadable
+    # or the local core set is too small to decode in.
+    bind_host_threads_to_device()
     return DfBackend(cudf)
 
 
@@ -80,14 +103,10 @@ def run_shard_chain(descriptor: dict, ops: list[dict], be: DfBackend):
     Returns `None` for an empty shard, which the driver drops rather than concatenating an
     empty table of possibly-different schema into the partials.
     """
-    from batcher.core.gpu_plan.execute import run_chain, run_ops
-    from batcher.dist.gpu.device_read import read_descriptor_on_device
+    from batcher.core.gpu_plan.execute import run_ops
 
-    frame = read_descriptor_on_device(descriptor, be)
-    if frame is not None:
-        return be.to_arrow(run_ops(frame, ops, be)) if len(frame) else None
-    table = _read(descriptor)
-    return None if table is None else be.to_arrow(run_chain(table, ops, be))
+    frame = _frame(descriptor, be)
+    return None if frame is None else be.to_arrow(run_ops(frame, ops, be))
 
 
 def gpu_shard_partial(descriptor: dict, ops: list[dict]):
@@ -106,15 +125,20 @@ def run_shard_join(
 ):
     """Read both join inputs and run the join on `be` — the body of the GPU join task.
 
+    Each side is read on the device where it can be, independently of the other: the two are
+    different relations, so one arriving from the device reader and the other from the host one
+    costs nothing. A broadcast join's small build side is usually the one that cannot.
+
     Returns `None` when either side is empty, which the caller reads as "nothing to join" and
     handles rather than concatenating an empty table of unknown schema.
     """
-    from batcher.core.gpu_plan.execute import run_join
+    from batcher.core.gpu_plan.execute import run_join_frames
 
-    left, right = _read(left_desc), _read(right_desc)
+    left = _frame(left_desc, be)
+    right = _frame(right_desc, be)
     if left is None or right is None:
         return None
-    return be.to_arrow(run_join(left, right, left_ops, right_ops, join_ir, ops, be))
+    return be.to_arrow(run_join_frames(left, right, left_ops, right_ops, join_ir, ops, be))
 
 
 def run_shard_union(
@@ -125,15 +149,15 @@ def run_shard_union(
     Returns `None` when every input was empty, which the caller handles rather than
     concatenating tables of unknown schema.
     """
-    from batcher.core.gpu_plan.execute import run_union
+    from batcher.core.gpu_plan.execute import run_union_frames
 
-    read = [(_read(d), o) for d, o in zip(descriptors, input_ops, strict=True)]
-    present = [(t, o) for t, o in read if t is not None]
+    read = [(_frame(d, be), o) for d, o in zip(descriptors, input_ops, strict=True)]
+    present = [(f, o) for f, o in read if f is not None]
     if not present:
         return None
-    tables = [t for t, _ in present]
+    frames = [f for f, _ in present]
     chains = [o for _, o in present]
-    return be.to_arrow(run_union(tables, chains, distinct, ops, be))
+    return be.to_arrow(run_union_frames(frames, chains, distinct, ops, be))
 
 
 def gpu_union_task(

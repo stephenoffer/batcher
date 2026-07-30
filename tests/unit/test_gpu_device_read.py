@@ -181,3 +181,81 @@ def test_the_expected_names_come_from_the_split_when_nothing_was_projected():
     from batcher.dist.gpu.device_read import _expected_names
 
     assert _expected_names({"splits": [_row_group()]}, None) == PLAIN.names
+
+
+# --- the reader every task body shares ------------------------------------------------
+
+
+def _batches(*rows):
+    return [pa.record_batch({"k": list(rows), "v": [float(r) for r in rows]})]
+
+
+def test_the_shared_reader_falls_back_to_the_host_and_returns_a_frame(host_backend):
+    """A batch-list descriptor is not device-readable, so the host reader produces the frame."""
+    from batcher.dist.gpu.tasks import _frame
+
+    frame = _frame({"batches": _batches(1, 2, 3)}, host_backend)
+    assert frame is not None
+    assert len(frame) == 3
+
+
+def test_the_shared_reader_reports_an_empty_shard_as_none(host_backend):
+    """The driver drops an empty shard rather than concatenating a schema it cannot trust."""
+    from batcher.dist.gpu.tasks import _frame
+
+    assert _frame({"batches": []}, host_backend) is None
+
+
+def test_a_join_task_body_runs_on_frames(host_backend):
+    """The join reads each side independently, so one may come from each reader."""
+    import batcher as bt
+    from batcher.core.gpu_plan import gpu_join_spec
+    from batcher.dist.gpu.tasks import run_shard_join
+
+    left = pa.table({"k": [1, 2, 3], "l": [10, 20, 30]})
+    right = pa.table({"k": [2, 3, 4], "r": [200, 300, 400]})
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how="inner")
+    (_ls, lops), (_rs, rops), join_ir, ops = gpu_join_spec(ds._plan)
+
+    got = run_shard_join(
+        {"batches": left.to_batches()},
+        {"batches": right.to_batches()},
+        lops,
+        rops,
+        join_ir,
+        ops,
+        host_backend,
+    )
+    expected = ds.collect()
+    assert sorted(map(repr, got.select(expected.column_names).to_pylist())) == sorted(
+        map(repr, expected.to_pylist())
+    )
+
+
+def test_a_union_task_body_runs_on_frames(host_backend):
+    import batcher as bt
+    from batcher.core.gpu_plan import gpu_union_spec
+    from batcher.dist.gpu.tasks import run_shard_union
+
+    a = pa.table({"x": [1, 2]})
+    b = pa.table({"x": [2, 3]})
+    ds = bt.from_arrow(a).union(bt.from_arrow(b), distinct=True)
+    inputs, distinct, ops = gpu_union_spec(ds._plan)
+
+    got = run_shard_union(
+        [{"batches": a.to_batches()}, {"batches": b.to_batches()}],
+        [o for _, o in inputs],
+        distinct,
+        ops,
+        host_backend,
+    )
+    expected = ds.collect()
+    assert sorted(map(repr, got.select(expected.column_names).to_pylist())) == sorted(
+        map(repr, expected.to_pylist())
+    )
+
+
+def test_a_union_of_only_empty_inputs_is_none(host_backend):
+    from batcher.dist.gpu.tasks import run_shard_union
+
+    assert run_shard_union([{"batches": []}], [[]], False, [], host_backend) is None
