@@ -136,8 +136,9 @@ def tagged_fields(**fields: IntoExpr) -> Expr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"q": ["Why?"], "doc": ["Because."]})
             >>> blocks = bt.tagged_fields(question=bt.col("q"), context=bt.col("doc"))
-            >>> ds.select(p=blocks).to_pydict()
-            {'p': ['<question>Why?</question>\n<context>Because.</context>']}
+            >>> print(ds.select(p=blocks).to_pydict()["p"][0])
+            <question>Why?</question>
+            <context>Because.</context>
     """
     if not fields:
         raise PlanError("tagged_fields: at least one field is required")

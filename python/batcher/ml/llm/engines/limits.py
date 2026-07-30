@@ -57,7 +57,8 @@ class RateLimiter:
 
             >>> from batcher.ml.llm.engines.limits import RateLimiter
             >>> limiter = RateLimiter(requests_per_minute=600)
-            >>> limiter.acquire(estimated_tokens=10)  # returns immediately, bucket is full
+            >>> limiter.acquire(estimated_tokens=10)  # seconds waited; the bucket starts full
+            0.0
     """
 
     def __init__(

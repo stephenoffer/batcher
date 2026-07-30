@@ -467,7 +467,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 |---|---|---|
 | `anthropic.py` | 243 | The Anthropic Messages API backend — batch generation against a hosted Claude model. |
 | `base.py` | 53 | LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends. |
-| `limits.py` | 232 | Client-side rate limiting for a hosted LLM endpoint. |
+| `limits.py` | 233 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 339 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 217 | How many GPUs one LLM engine replica needs, and what that choice costs. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
@@ -1971,7 +1971,7 @@ Prompt construction and context budgeting, as row-wise expressions.
 
 | module | lines | what it is |
 |---|---|---|
-| `assembly.py` | 262 | Assembling a prompt from row columns — templates, tags, chat formats, retrieved context. |
+| `assembly.py` | 263 | Assembling a prompt from row columns — templates, tags, chat formats, retrieved context. |
 | `budget.py` | 218 | Fitting an assembled prompt into a context window, without a tokenizer. |
 | `chat.py` | 256 | Reading a conversation column — the shape a chat log and an SFT dataset both arrive in. |
 
