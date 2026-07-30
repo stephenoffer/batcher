@@ -44,8 +44,12 @@ from batcher.kyber.rules.extra import predicate_infer as _predicate_infer  # noq
 
 # Registered directly after `predicate_infer`: the same statistics-free reasoning over a
 # Filter's conjunction, from arithmetic invariants rather than from sibling bounds --
-# registration order is run order, and the two answer the same question.
+# registration order is run order, and the two answer the same question. Sorted position would
+# put it *before* `predicate_infer`, so the ordering is pinned rather than alphabetical.
+# isort: off
 from batcher.kyber.rules.extra import predicate_impossible as _predicate_impossible  # noqa: F401
+
+# isort: on
 from batcher.kyber.rules.extra import projection_scan as _projection_scan  # noqa: F401
 from batcher.kyber.rules.extra import pushdown_gaps as _pushdown_gaps  # noqa: F401
 from batcher.kyber.rules.extra import runtime_filters as _runtime_filters  # noqa: F401
