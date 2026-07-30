@@ -163,6 +163,51 @@ to a device that is not one under-allocates silently. And the transfer veto step
 fleet has measured its own GPU/CPU crossover: a veto is a *removal*, so a model carrying a
 CPU-bandwidth constant must not disable a path that this hardware had been winning with.
 
+## The device runtime, and what a sweep of the translator found
+
+A later pass went at the two things a fleet-aware control plane still could not do: allocate
+device memory deliberately, and trust the answers the device produced.
+
+`carbonite/accel/allocator.py` is the allocator a GPU worker computes on. Unconfigured, RAPIDS
+asks the CUDA driver for every intermediate column and a driver allocation synchronizes the
+device, so a translated chain over a hundred shards makes thousands of them. The pool is sized
+from `VramPool.usable_bytes` rather than from device capacity, so the allocator and the
+admission check cannot disagree about how much of a device is this worker's; a device that
+cannot report its memory gets no pool rather than one sized from a guess. `spill_to_host` turns
+a class of hard OOM into a slowdown, and with `statistics` on, an overflowing shard is
+subdivided by the factor its own high-water mark clears rather than halved repeatedly.
+
+Reading moved to the device too (`io/splits/device.py`, `dist/gpu/device_read.py`): a worker
+that can read its own Parquet skips a CPU decode and a trip across the bus. It is gated on
+types both readers agree on, declines when a predicate was pushed (a device read cannot skip
+row groups, so it would move more bytes than the read it replaced), is all-or-nothing per
+shard, and compares the column order it produced against the one the host path would have.
+
+The union fan-out (`dist/gpu/union.py`) closed the last shape pinned to one device. `UNION
+DISTINCT` deliberately keeps the single-device path: slice-wise dedup is exact only while
+nothing reduces above it, and a hash shuffle on the whole row is the CPU path's job.
+
+**A sweep of the translator against the CPU engine found ten wrong answers**, each on a path
+already advertised as supported and each green under every gate. Recorded here because the
+pattern is more useful than the list: every one was a dataframe library's *default* differing
+from SQL, never a missing feature.
+
+| What | The library's default | The engine |
+|---|---|---|
+| A null join key, in all six join types | matches another null | matches nothing |
+| A float group key, DISTINCT, semi/anti membership, `UNION DISTINCT` | `-0.0` and `0.0` hash apart | one value |
+| `all`/`any` over an all-null group | the fold's identity | null |
+| A keyless aggregate over an empty frame | no rows | one row |
+| `str.contains` | a regular expression | a literal substring |
+| `DATE - DATE` | a duration | a count of days |
+| Narrow integer and float columns | the source's own width | widened at the FFI boundary |
+| `abs` of an integer | widened to double | stays integer |
+
+Two were failures `CLAUDE.md` already records by name. The float-to-string cast was declined
+rather than fixed: the two implementations disagree about whether an integral value keeps its
+`.0`, what the sign of zero prints as, and whether `NaN` becomes the string `"nan"` or a null,
+and none of those is the more correct answer.
+
 ## What this program did **not** do
 
 Named explicitly, because the absence of each is a real limit and not an oversight:

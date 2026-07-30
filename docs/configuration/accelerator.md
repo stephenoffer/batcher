@@ -7,7 +7,7 @@ inference stages are sized against their KV cache.
 
 Every default is inert. A deployment that sets none of these places work exactly as it did
 before, which is what makes each control safe to turn on one at a time.
-{doc}`../user-guide/gpu-fleets` is the task-oriented walkthrough; this page is the field
+{doc}`/user-guide/operate/gpu-fleets` is the task-oriented walkthrough; this page is the field
 reference.
 
 ## Placement and sizing
@@ -84,6 +84,52 @@ print(cfg.accelerator.memory.allocator)
 # pool
 ```
 
+## Device memory
+
+These fields decide how a GPU worker's device memory is allocated, and what happens when it
+runs out. They are separate from `vram_headroom` above, which decides how much of the device
+Batcher considers its own: this section decides how the allocations inside that budget are
+served.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `allocator` | `"default"` | Allocator strategy: `default`, `pool`, `async`, or `managed`. |
+| `pool_initial_fraction` | `0.5` | Fraction of the device's reservable memory the pool reserves at startup. |
+| `pool_max_fraction` | `1.0` | Fraction the pool may grow to. Below `1.0` leaves the remainder to a co-tenant. |
+| `spill_to_host` | `False` | Let cuDF move columns to host memory rather than fail when the device fills. |
+| `statistics` | `False` | Track allocation counts and the device high-water mark. |
+
+These fields are the {py:class}`DeviceMemoryConfig <batcher.config.DeviceMemoryConfig>`
+dataclass.
+
+Unconfigured, RAPIDS asks the CUDA driver for every intermediate column a query produces, and
+a driver allocation is a synchronizing call. A translated chain of a dozen operators over a
+hundred shards makes thousands of them, so `allocator="pool"` is the setting with the largest
+constant-factor effect on GPU query time. It is off by default because a pool reserves memory
+that a co-tenant on the same device can then no longer see.
+
+The pool is sized from what Carbonite says is reservable, which is the device's capacity less
+`vram_headroom` and less whatever another process already holds. A device that cannot report
+its memory gets no pool at all rather than one sized from a guess.
+
+`managed` backs the pool with unified memory, so a working set larger than the device migrates
+over the bus instead of failing. `async` uses the driver's own stream-ordered pool where the
+installed RMM offers one.
+
+Turn on `spill_to_host` where a shard occasionally misjudges its size: it turns a class of hard
+out-of-memory into a slowdown. With `statistics` on, a shard that does overflow is subdivided
+by the factor its own high-water mark says will clear it, rather than being halved repeatedly.
+
+```python
+from batcher import Config
+from batcher.config import AcceleratorConfig, DeviceMemoryConfig
+
+memory = DeviceMemoryConfig(allocator="pool", pool_max_fraction=0.8, spill_to_host=True)
+cfg = Config().replace(accelerator=AcceleratorConfig(memory=memory))
+print(cfg.accelerator.memory.allocator)
+# pool
+```
+
 ## Device health
 
 | Field | Default | Meaning |
@@ -100,8 +146,8 @@ errors is quarantined outright. Absent telemetry never quarantines anything.
 
 ## See also
 
-- {doc}`../user-guide/gpu-fleets`: the same controls in the order you would adopt them.
+- {doc}`/user-guide/operate/gpu-fleets`: the same controls in the order you would adopt them.
 - {doc}`options`: every other configuration section.
 - {doc}`environment`: the `BATCHER_ACCELERATOR_*` spelling of these fields.
-- {doc}`../api/governance`: data residency, the placement constraint that pairs with these.
-- {doc}`../ml/gpu`: choosing devices and batch sizes from the pipeline side.
+- {doc}`/api/operations/governance`: data residency, the placement constraint that pairs with these.
+- {doc}`/ml/inference/gpu`: choosing devices and batch sizes from the pipeline side.
