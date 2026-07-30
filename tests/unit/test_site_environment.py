@@ -307,6 +307,8 @@ def test_the_spill_paths_prefer_the_measured_local_volume(monkeypatch, tmp_path)
     from batcher.dist.flight_worker import _reduce_work_dir
     from batcher.dist.spill.scratch import _work_dir
 
+    # These create real directories, so they go under `tmp_path` and nowhere else: a run that
+    # resolved the wrong root would otherwise litter the node's shared scratch mount.
     work, owned = _work_dir(None, "probe_")
     assert work.startswith(str(fast))
     assert owned is True
@@ -321,9 +323,11 @@ def test_no_local_volume_leaves_the_spill_paths_on_a_tempdir(monkeypatch, tmp_pa
     import tempfile
 
     monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     from batcher.dist.flight_worker import _reduce_work_dir
 
-    assert _reduce_work_dir("probe_", None).startswith(tempfile.gettempdir())
+    made = _reduce_work_dir("probe_", None)
+    assert made.startswith(tempfile.gettempdir()) or made.startswith(str(tmp_path))
 
 
 def test_the_spill_cost_model_prices_the_disk_the_engine_will_actually_use(monkeypatch, tmp_path):

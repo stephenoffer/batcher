@@ -84,12 +84,18 @@ def distributed_work_dir(prefix: str) -> str:
     # No shared mount: this is a genuine single node, so node-local scratch is correct — and
     # the node's measured local volume is a better one than the container root's overlay,
     # which is where a bare tempdir lands on a GPU node.
+    #
+    # Batcher gets its *own* subdirectory of that volume, and only that subdirectory is
+    # tightened. The volume itself belongs to the node — Ray's object spill lives on the same
+    # mount, and so does every other tenant's scratch — so chmod'ing it 0700 would take a
+    # shared resource away from processes that have nothing to do with this query.
     from batcher._internal.site import local_scratch_root
 
     local = local_scratch_root()
     if local:
-        private_dir(local)
-        return tempfile.mkdtemp(prefix=prefix, dir=local)
+        root = os.path.join(local, "batcher_shuffle")
+        private_dir(root)
+        return tempfile.mkdtemp(prefix=prefix, dir=root)
     return tempfile.mkdtemp(prefix=prefix)
 
 
