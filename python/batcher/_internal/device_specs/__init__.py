@@ -36,7 +36,6 @@ zero from every scalar accessor, so a caller falls back to whatever default it h
 from __future__ import annotations
 
 from batcher._internal.device_specs.accessors import (
-    device_arithmetic_intensity,
     device_fp8_tflops,
     device_generation,
     device_half_tflops,
@@ -50,8 +49,6 @@ from batcher._internal.device_specs.accessors import (
     device_spec,
     device_tdp_watts,
     device_tflops_per_watt,
-    device_vendor,
-    devices_by_generation,
     host_transfer_seconds,
     known_device_names,
     rank_devices_by_efficiency,
@@ -61,7 +58,6 @@ from batcher._internal.device_specs.table import DeviceSpec
 
 __all__ = [
     "DeviceSpec",
-    "device_arithmetic_intensity",
     "device_fp8_tflops",
     "device_generation",
     "device_half_tflops",
@@ -75,8 +71,6 @@ __all__ = [
     "device_spec",
     "device_tdp_watts",
     "device_tflops_per_watt",
-    "device_vendor",
-    "devices_by_generation",
     "host_transfer_seconds",
     "known_device_names",
     "rank_devices_by_efficiency",

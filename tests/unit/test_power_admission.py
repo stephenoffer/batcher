@@ -14,8 +14,6 @@ from batcher._internal.device_specs import (
     device_fp8_tflops,
     device_generation,
     device_spec,
-    device_vendor,
-    devices_by_generation,
 )
 from batcher.carbonite.accel import devices_within_budget, validate_fleet_power
 from batcher.config import AcceleratorConfig, Config, EnergyConfig, config_context
@@ -150,17 +148,13 @@ def test_fp8_is_reported_only_where_the_unit_exists() -> None:
     assert device_fp8_tflops("MADE_UP") == 0.0
 
 
-def test_vendor_and_generation_are_reported_or_empty() -> None:
-    assert device_vendor("NVIDIA_H100") == "nvidia"
+def test_the_generation_is_reported_or_empty() -> None:
+    # The key learned statistics fall back to: parts of one generation share a capability set.
     assert device_generation("NVIDIA_H200") == "hopper"
-    assert device_vendor("MADE_UP") == ""
+    assert device_generation("NVIDIA_H100") == "hopper"
+    assert device_generation("NVIDIA_A100_80G") == "ampere"
+    assert device_generation("MADE_UP") == ""
     assert device_generation(None) == ""
-
-
-def test_a_generation_groups_the_parts_that_share_a_capability_set() -> None:
-    hopper = devices_by_generation("Hopper")
-    assert set(hopper) == {"NVIDIA_H100", "NVIDIA_H200"}
-    assert devices_by_generation("made-up") == ()
 
 
 def test_the_added_ampere_and_cdna_parts_are_consistent() -> None:

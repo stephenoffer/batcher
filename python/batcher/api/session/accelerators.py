@@ -41,6 +41,14 @@ def _device_rows() -> list[dict]:
         if spec is not None:
             row["tdp_watts"] = spec.tdp_watts
             row["nvlink_domain"] = spec.nvlink_domain
+            # The two links, because "why is this stage slow" is usually one of them: the host
+            # link decides whether the data can arrive fast enough to be worth a device, and
+            # the fabric decides how wide a collective can go before it leaves the fast path.
+            if spec.host_link:
+                row["host_link"] = spec.host_link
+                row["host_link_gbps"] = spec.host_link_gbps
+            if spec.nvlink_gbps:
+                row["nvlink_gbps"] = spec.nvlink_gbps
         reading = live.get(index)
         if reading is not None:
             row["power_watts"] = round(reading.power_watts, 1)
@@ -66,7 +74,10 @@ def accelerators() -> dict:
         row per local device, carrying nameplate figures and any live readings), `fleet` (the
         cluster's shape when Ray is up: device and node counts, the widest coherent NVLink
         domain, the device models present, and how many racks and power zones they span), and
-        `power` (the configured budget and, where telemetry is available, the measured draw).
+        `power` (the configured budget, the measured draw where telemetry is available, and
+        the full-load draw per power zone). A device row carries its host link and fabric
+        bandwidth where the model is recognized, which is what makes a transfer-bound stage
+        diagnosable from the report alone.
 
     Examples:
         .. doctest::

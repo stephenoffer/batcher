@@ -10,7 +10,6 @@ from __future__ import annotations
 from batcher._internal.device_specs.table import SPECS, DeviceSpec
 
 __all__ = [
-    "device_arithmetic_intensity",
     "device_fp8_tflops",
     "device_generation",
     "device_half_tflops",
@@ -24,8 +23,6 @@ __all__ = [
     "device_spec",
     "device_tdp_watts",
     "device_tflops_per_watt",
-    "device_vendor",
-    "devices_by_generation",
     "host_transfer_seconds",
     "known_device_names",
     "rank_devices_by_efficiency",
@@ -175,26 +172,6 @@ def device_tflops_per_watt(accelerator_type: str | None) -> float:
     return spec.half_tflops / spec.tdp_watts
 
 
-def device_arithmetic_intensity(accelerator_type: str | None) -> float:
-    """FLOPs per byte of memory traffic at which the device stops being bandwidth-bound.
-
-    The ridge point of the device's roofline: a kernel below it is limited by HBM and gains
-    nothing from a faster tensor core, which is exactly the case for the scan, filter, and
-    shuffle shapes a data engine runs. Comparing a stage's intensity against this number is
-    how the optimizer decides a stage is not worth a device.
-
-    Args:
-        accelerator_type: A Ray accelerator-type name.
-
-    Returns:
-        FLOPs per byte at the roofline ridge, `0.0` when either figure is unknown.
-    """
-    spec = device_spec(accelerator_type)
-    if spec is None or spec.memory_bandwidth_gbps <= 0 or spec.half_tflops <= 0:
-        return 0.0
-    return spec.half_tflops * 1e12 / (spec.memory_bandwidth_gbps * 1e9)
-
-
 def rank_devices_by_efficiency(names: list[str] | tuple[str, ...]) -> list[str]:
     """Recognized device names ordered most to least TFLOP/s per watt.
 
@@ -229,19 +206,6 @@ def device_fp8_tflops(accelerator_type: str | None) -> float:
     return _field(accelerator_type, "fp8_tflops")
 
 
-def device_vendor(accelerator_type: str | None) -> str:
-    """The device's vendor (`nvidia`, `amd`, `intel`, `google`), or `""` when unrecognized.
-
-    Args:
-        accelerator_type: A Ray accelerator-type name.
-
-    Returns:
-        The vendor name, lowercase.
-    """
-    spec = device_spec(accelerator_type)
-    return spec.vendor if spec is not None else ""
-
-
 def device_generation(accelerator_type: str | None) -> str:
     """The device's architecture family, or `""` when unrecognized.
 
@@ -257,19 +221,6 @@ def device_generation(accelerator_type: str | None) -> str:
     """
     spec = device_spec(accelerator_type)
     return spec.generation if spec is not None else ""
-
-
-def devices_by_generation(generation: str) -> tuple[str, ...]:
-    """Every recognized device model in one architecture family, in table order.
-
-    Args:
-        generation: A generation name, matched case-insensitively.
-
-    Returns:
-        The model names, empty when the generation is not recognized.
-    """
-    want = generation.lower()
-    return tuple(name for name, spec in SPECS.items() if spec.generation == want)
 
 
 def _tokens(name: str) -> list[str]:

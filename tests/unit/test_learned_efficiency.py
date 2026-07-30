@@ -198,3 +198,26 @@ def test_a_scope_without_a_meter_is_inert() -> None:
     with energy_scope() as ledger:
         pass
     assert ledger.total_joules == 0.0
+
+
+def test_a_new_part_inherits_what_its_generation_measured() -> None:
+    # An H100 and an H200 differ in memory and bandwidth but share an instruction set and an
+    # FP8 unit, so a measurement from one transfers. An Ampere measurement does not.
+    hub = _hub()
+    _teach(hub, "NVIDIA_H100", 42.0)
+    assert learned_work_per_joule(hub, "NVIDIA_H200") == pytest.approx(42.0)
+    assert learned_work_per_joule(hub, "NVIDIA_A100_80G") is None
+
+
+def test_the_device_bucket_still_wins_over_its_generation() -> None:
+    hub = _hub()
+    _teach(hub, "NVIDIA_H100", 42.0)
+    _teach(hub, "NVIDIA_H200", 61.0)
+    assert learned_work_per_joule(hub, "NVIDIA_H200") == pytest.approx(61.0)
+    assert learned_work_per_joule(hub, "NVIDIA_H100") == pytest.approx(42.0)
+
+
+def test_an_unrecognized_device_has_no_generation_to_inherit_from() -> None:
+    hub = _hub()
+    _teach(hub, "NVIDIA_H100", 42.0)
+    assert learned_work_per_joule(hub, "MADE_UP") is None

@@ -82,7 +82,7 @@ def select_device_class(
         A device model name to pin to, or `None` when nothing fits, nothing is known, or every
         candidate fits (in which case a pin would only constrain placement).
     """
-    from batcher._internal.device_specs import device_spec, device_tflops_per_watt
+    from batcher._internal.device_specs import device_spec, rank_devices_by_efficiency
 
     if model_gib <= 0 or not candidates:
         return None
@@ -100,8 +100,12 @@ def select_device_class(
         measured = {n: learned_work_per_joule(hub, n) for n in fitting}
         if all(v is not None for v in measured.values()) and measured:
             return max(measured, key=lambda n: (measured[n], n))
-        ranked = sorted(fitting, key=lambda n: (-device_tflops_per_watt(n), n))
-        return ranked[0]
+        # The one efficiency ordering, rather than a second sort that could disagree with it.
+        # Devices with no published power figure are unrankable and drop out; if that leaves
+        # nothing, the size ordering below is the honest fallback.
+        ranked = rank_devices_by_efficiency(sorted(fitting))
+        if ranked:
+            return ranked[0]
     return min(fitting, key=lambda n: (fitting[n], n))
 
 
@@ -203,6 +207,7 @@ def device_energy_advice(
     cpu_gbps: float = 20.0,
     achieved_fraction: float = 1.0,
     resident: bool = False,
+    precision: str = "half",
 ) -> EnergyAdvice:
     """Judge a stage's device move on time *and* energy, with the host copy charged for.
 
@@ -232,12 +237,17 @@ def device_energy_advice(
             verdict instead of an optimistic one.
         resident: The data is already in device memory — a stage fed by another GPU stage, or
             a model already loaded. Skips the copy, which is usually the whole argument.
+        precision: `"half"` or `"fp8"`. A quantized stage runs on the FP8 unit, which is twice
+            the rate on the generations that have one and absent on those that do not — so
+            asking for it where it does not exist falls back to the half-precision figure
+            rather than inventing a rate.
 
     Returns:
         The advice. With an unrecognized device every ratio is `0.0` and `worth_it` is True,
         preserving whatever decision the caller would have made without an energy opinion.
     """
     from batcher._internal.device_specs import (
+        device_fp8_tflops,
         device_half_tflops,
         device_memory_bandwidth_gbps,
         device_tdp_watts,
@@ -260,6 +270,8 @@ def device_energy_advice(
 
     memory_seconds = bytes_per_row / (bandwidth * 1e9 * reach)
     tflops = device_half_tflops(accelerator_type)
+    if precision == "fp8":
+        tflops = device_fp8_tflops(accelerator_type) or tflops
     compute_seconds = flops_per_row / (tflops * 1e12 * reach) if tflops > 0 else 0.0
     kernel_seconds = max(memory_seconds, compute_seconds)
     shape = "compute-bound" if compute_seconds > memory_seconds else "bandwidth-bound"
@@ -320,18 +332,26 @@ def record_measured_efficiency(
     """
     if hub is None or not accelerator_type or joules <= 0 or work <= 0:
         return
+    from batcher._internal.device_specs import device_generation
+
+    generation = device_generation(accelerator_type)
+    keys = [f"{accelerator_type}:{kind}"]
+    if generation:
+        # Also folded into the generation's bucket, so a part this fleet has not run yet
+        # inherits what its siblings measured rather than starting cold.
+        keys.append(f"gen:{generation}:{kind}")
     try:
-        key = f"{accelerator_type}:{kind}"
-        bucket = hub.get_keyed_param(scoped(_EFFICIENCY_NS), key) or {}
-        hub.put_keyed_param(
-            scoped(_EFFICIENCY_NS),
-            key,
-            {
-                "joules": float(bucket.get("joules", 0.0)) + float(joules),
-                "work": float(bucket.get("work", 0.0)) + float(work),
-                "n": int(bucket.get("n", 0)) + 1,
-            },
-        )
+        for key in keys:
+            bucket = hub.get_keyed_param(scoped(_EFFICIENCY_NS), key) or {}
+            hub.put_keyed_param(
+                scoped(_EFFICIENCY_NS),
+                key,
+                {
+                    "joules": float(bucket.get("joules", 0.0)) + float(joules),
+                    "work": float(bucket.get("work", 0.0)) + float(work),
+                    "n": int(bucket.get("n", 0)) + 1,
+                },
+            )
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "record measured efficiency", exc)
 
@@ -359,13 +379,24 @@ def learned_work_per_joule(
     """
     if hub is None or not accelerator_type:
         return None
-    try:
-        bucket = hub.get_keyed_param(scoped(_EFFICIENCY_NS), f"{accelerator_type}:{kind}") or {}
-    except Exception as exc:  # pragma: no cover
-        note_suppressed("kyber", "read measured efficiency", exc)
-        return None
-    joules = float(bucket.get("joules", 0.0))
-    work = float(bucket.get("work", 0.0))
-    if int(bucket.get("n", 0)) < _MIN_SAMPLES or joules <= 0 or work <= 0:
-        return None
-    return work / joules
+    from batcher._internal.device_specs import device_generation
+
+    # The device's own samples first, then its generation's. An H100 and an H200 differ in
+    # memory and bandwidth but share an instruction set and an FP8 unit, so a measurement from
+    # one transfers to the other in a way an Ampere measurement does not — which is what makes
+    # a newly added part usable immediately instead of cold for its first thousand runs.
+    keys = [f"{accelerator_type}:{kind}"]
+    generation = device_generation(accelerator_type)
+    if generation:
+        keys.append(f"gen:{generation}:{kind}")
+    for key in keys:
+        try:
+            bucket = hub.get_keyed_param(scoped(_EFFICIENCY_NS), key) or {}
+        except Exception as exc:  # pragma: no cover
+            note_suppressed("kyber", "read measured efficiency", exc)
+            return None
+        joules = float(bucket.get("joules", 0.0))
+        work = float(bucket.get("work", 0.0))
+        if int(bucket.get("n", 0)) >= _MIN_SAMPLES and joules > 0 and work > 0:
+            return work / joules
+    return None

@@ -90,6 +90,9 @@ def test_rows_are_built_from_inventory_and_telemetry(monkeypatch) -> None:
     row = accel_mod._device_rows()[0]
     assert row["memory_gib"] == 80.0
     assert row["tdp_watts"] == 700.0, "nameplate figures come from the device table"
+    assert row["host_link"] == "pcie5", "why a stage is transfer-bound, from the report alone"
+    assert row["host_link_gbps"] == 50.0
+    assert row["nvlink_gbps"] == 900.0
     assert row["power_watts"] == 512.0
     assert row["throttled"] == ["power"]
     assert row["ecc_uncorrected"] == 2

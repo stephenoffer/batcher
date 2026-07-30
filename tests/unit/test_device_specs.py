@@ -13,7 +13,6 @@ import pytest
 
 from batcher._internal.accelerators import accelerator_memory_bytes
 from batcher._internal.device_specs import (
-    device_arithmetic_intensity,
     device_half_tflops,
     device_idle_watts,
     device_memory_bandwidth_gbps,
@@ -64,7 +63,6 @@ def test_unknown_device_reports_unknown_not_a_default() -> None:
         assert device_nvlink_gbps(probe) == 0.0
         assert device_mig_slices(probe) == 0
         assert device_tflops_per_watt(probe) == 0.0
-        assert device_arithmetic_intensity(probe) == 0.0
 
 
 def test_name_lookup_is_case_insensitive() -> None:
@@ -91,14 +89,6 @@ def test_efficiency_ranking_drops_the_unrankable() -> None:
 def test_efficiency_ranking_orders_newer_parts_ahead() -> None:
     ranked = rank_devices_by_efficiency(["NVIDIA_TESLA_V100", "NVIDIA_H100", "NVIDIA_A100_80G"])
     assert ranked == ["NVIDIA_H100", "NVIDIA_A100_80G", "NVIDIA_TESLA_V100"]
-
-
-def test_arithmetic_intensity_is_the_roofline_ridge() -> None:
-    # An H100 needs hundreds of FLOPs per byte before it stops being bandwidth-bound, which is
-    # why a scan-shaped stage gains nothing from it. The exact value follows from the table.
-    ridge = device_arithmetic_intensity("NVIDIA_H100")
-    assert ridge == pytest.approx(989e12 / 3350e9)
-    assert ridge > 100, "a modern tensor part is compute-rich and bandwidth-poor"
 
 
 def test_nvlink_domain_distinguishes_fabric_from_pcie() -> None:

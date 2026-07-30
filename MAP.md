@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1009 Python modules across 157 packages and 185 Rust files across 13 crates.
+Covering 1009 Python modules across 157 packages and 186 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -302,7 +302,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
-| `accelerators.py` | 231 | Accelerator reporting (`accelerators`, `show_accelerators`). |
+| `accelerators.py` | 242 | Accelerator reporting (`accelerators`, `show_accelerators`). |
 | `admin.py` | 223 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -2188,7 +2188,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 399 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 271 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 88 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather.rs` | 212 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
+| `gather.rs` | 243 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 137 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
@@ -2259,9 +2259,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/in_list.rs` | 249 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 795 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 127 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
+| `eval/list_ops/gather.rs` | 76 | `list.gather` — reorder or select from a list by a second list of indices. |
 | `eval/list_ops/jaccard_str.rs` | 72 | `list.jaccard` over string element types. |
 | `eval/list_ops/list_hof.rs` | 85 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
-| `eval/list_ops/list_reduce.rs` | 161 | Per-row, list-returning numeric transforms for `eval/list.rs` (`normalize`, `softmax`, `arg_sort`, `cum_sum`, `diff`). |
+| `eval/list_ops/list_reduce.rs` | 239 | Per-row numeric transforms over a `List` row for `eval/list.rs` (`normalize`, `softmax`, `log_softmax`, `arg_sort`, `cum_sum`, `diff`, `entropy`). |
 | `eval/list_ops/list_reshape.rs` | 62 | Reshaping `List`-column operations that change nesting depth — currently `flatten` (`List<List<T>>` → `List<T>`). |
 | `eval/list_ops/list_set.rs` | 175 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
