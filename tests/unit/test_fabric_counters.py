@@ -185,3 +185,95 @@ def test_a_failing_probe_never_breaks_the_stats(monkeypatch):
     stats = shuffle.stats()
     assert "fetches" in stats
     assert "fabric_gbps_observed" not in stats
+
+
+# --- The machine class a learned parameter is filed under -----------------------------------
+
+
+def test_a_node_without_a_fabric_keeps_the_fingerprint_it_had(monkeypatch):
+    # Adding a field to the key would otherwise discard every coefficient every existing
+    # deployment had learned, which is the cost the fingerprint's own docstring weighs.
+    from batcher._internal.hardware import profile
+
+    monkeypatch.setattr(profile, "_fabric_class", lambda: "")
+    base = profile.HardwareProfile(logical_cpus=8, vendor="x", model="y")
+    assert base.fabric_class == ""
+    with_field = profile.HardwareProfile(logical_cpus=8, vendor="x", model="y", fabric_class="")
+    assert base.fingerprint() == with_field.fingerprint()
+
+
+def test_two_nodes_that_differ_only_in_fabric_are_different_machine_classes():
+    # They converge on shuffle windows and spill thresholds an order of magnitude apart;
+    # blending them is exactly what this key exists to prevent.
+    from batcher._internal.hardware.profile import HardwareProfile
+
+    ethernet = HardwareProfile(logical_cpus=96, vendor="x", model="y", fabric_class="ethernet-32g")
+    infiniband = HardwareProfile(
+        logical_cpus=96, vendor="x", model="y", fabric_class="infiniband-2048g"
+    )
+    assert ethernet.fingerprint() != infiniband.fingerprint()
+    assert (
+        ethernet.fingerprint()
+        != HardwareProfile(logical_cpus=96, vendor="x", model="y").fingerprint()
+    )
+
+
+def _ports(*specs):
+    from batcher._internal.hardware.fabric.rdma import RdmaDevice
+
+    return tuple(
+        RdmaDevice(f"mlx5_{i}", 1, link_layer=layer, rate_gbps=rate, state="ACTIVE")
+        for i, (layer, rate) in enumerate(specs)
+    )
+
+
+def test_a_port_going_down_does_not_change_the_machine_class(monkeypatch):
+    # Keyed on the per-port rate, not the aggregate: a node with one of eight links down is
+    # the same hardware, and re-learning every coefficient over a condition the health path
+    # already reports — and an operator is about to fix — is pure loss.
+    from batcher._internal.hardware import profile
+
+    eight = _ports(*[("InfiniBand", 400.0)] * 8)
+    seven = _ports(*[("InfiniBand", 400.0)] * 7)
+    monkeypatch.setattr("batcher._internal.hardware.fabric.active_rdma_devices", lambda: eight)
+    full = profile._fabric_class()
+    monkeypatch.setattr("batcher._internal.hardware.fabric.active_rdma_devices", lambda: seven)
+    assert profile._fabric_class() == full
+    assert full == "infiniband-512g"
+
+
+def test_genuinely_different_fabrics_are_different_classes(monkeypatch):
+    from batcher._internal.hardware import profile
+
+    seen = set()
+    for layer, rate in (("Ethernet", 25.0), ("Ethernet", 100.0), ("InfiniBand", 400.0)):
+        monkeypatch.setattr(
+            "batcher._internal.hardware.fabric.active_rdma_devices",
+            lambda ll=layer, r=rate: _ports((ll, r)),
+        )
+        seen.add(profile._fabric_class())
+    assert len(seen) == 3
+
+
+def test_no_fabric_means_no_bucket(monkeypatch):
+    from batcher._internal.hardware import profile
+
+    monkeypatch.setattr("batcher._internal.hardware.fabric.active_rdma_devices", lambda: ())
+    assert profile._fabric_class() == ""
+    # A port that is up but publishes no rate still means "this node has a fabric".
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.active_rdma_devices",
+        lambda: _ports(("InfiniBand", 0.0)),
+    )
+    assert profile._fabric_class() == "rdma-unrated"
+
+
+def test_the_fingerprint_describes_the_disk_the_engine_spills_to(monkeypatch, tmp_path):
+    # The tempdir describes the container's overlay while the spill lands on the node's NVMe,
+    # which merged two machine classes that behave nothing alike.
+    from batcher._internal.hardware import profile
+
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: "/ephemeral")
+    assert profile._scratch_dir() == "/ephemeral"
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    assert profile._scratch_dir() not in ("", "/ephemeral")
