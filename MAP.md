@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1011 Python modules across 157 packages and 186 Rust files across 13 crates.
+Covering 1012 Python modules across 157 packages and 186 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -443,6 +443,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
 | `columns.py` | 182 | Building the columns a generation appends, from what the engine reported. |
 | `generate.py` | 428 | LLM batch generation — the columnar half of offline text generation. |
+| `judge.py` | 368 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 184 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
 | `requests.py` | 290 | Turning a `RecordBatch` into the per-row requests an engine receives. |
 | `sizing.py` | 299 | Sizing an LLM engine from the workload instead of from the model's maximum. |
@@ -1301,9 +1302,9 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `backend.py` | 161 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 229 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
-| `exprs.py` | 338 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
+| `exprs.py` | 346 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 198 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
-| `scalar_fns.py` | 308 | The named scalar-function families: math, two-argument math, strings, and dates. |
+| `scalar_fns.py` | 320 | The named scalar-function families: math, two-argument math, strings, and dates. |
 | `windows.py` | 385 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
 ### `batcher/core/streaming/` — 3 · subsystem
@@ -2292,7 +2293,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 618 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1677 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1696 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 136 | String functions whose input is a **number**, not a string. |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |

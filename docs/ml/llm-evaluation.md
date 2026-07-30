@@ -239,6 +239,74 @@ For safety, `bt.email_rate`, `bt.phone_rate`, and `bt.pii_rate` flag leaked cont
 `bt.ssn_like_rate` and `bt.credit_card_like_rate` catch structured identifiers, and
 `bt.contains_any_rate` is a configurable blocklist monitor over a list of terms.
 
+## Grading with a judge model
+
+Everything above compares surface forms. That cannot tell a correct paraphrase from a wrong
+answer, and for open-ended output that is most of what you need to know. The usual answer is to
+ask a stronger model, and the usual implementation is a Python loop over examples with a
+hand-rolled parser for whatever the judge wrote back.
+
+`batcher.ml` has the three judge shapes as batch UDFs over the same `Engine` contract
+generation uses, so a judged eval is one scan with the answers already parsed into a column.
+Any callable from prompts to completions is an engine, which is why the examples here use a
+stub rather than a GPU.
+
+`llm_score_udf` grades against a rubric on a numeric scale. The answer is parsed as a leading
+number and range-checked, so a judge that wrote prose or answered off-scale yields null instead
+of poisoning the mean. Out-of-range is nulled rather than clamped on purpose: a judge answering
+8 on a 1-5 scale has not understood the rubric, and recording that as a 5 turns a
+misunderstanding into a strong positive.
+
+```python
+import batcher as bt
+from batcher.ml import llm_score_udf
+
+judge = lambda: (lambda prompts: ["4"] * len(prompts))
+graded = bt.from_pydict({"answer": ["Paris is the capital of France."]}).ml.map_batches(
+    llm_score_udf(judge, template="Rate this answer 1-5 for accuracy:\n{answer}"),
+    output_columns=["answer", "score"],
+)
+print(graded.agg(mean_score=bt.col("score").mean()).to_pydict())
+# {'mean_score': [4.0]}
+```
+
+Declaring the appended column through `output_columns` is what lets the plan above the stage
+filter or aggregate on it. A UDF's output is opaque to the planner, so an undeclared column
+exists in the data and not in the schema.
+
+`llm_pairwise_udf` is the shape to prefer when comparing two systems. A judge is far more
+consistent choosing between two answers than assigning either an absolute number, and its
+position bias is measurable where an absolute score's bias is not. Each row is judged twice
+with the two responses exchanged, and a row whose verdict flips is recorded as a tie, because
+position rather than quality decided it. That doubles the judging cost and is the difference
+between a win rate and a measurement of the judge.
+
+```python
+from batcher.ml import llm_pairwise_udf
+
+biased = lambda: (lambda prompts: ["A"] * len(prompts))  # always prefers the first
+compared = bt.from_pydict({"base": ["one"], "tuned": ["two"]}).ml.map_batches(
+    llm_pairwise_udf(
+        biased,
+        template="Which answer is better?\nFirst: {base}\nSecond: {tuned}",
+        a_column="base",
+        b_column="tuned",
+    )
+)
+print(compared.to_pydict()["winner"])
+# ['TIE']
+```
+
+`llm_verify_udf` asks a yes/no question and appends a boolean, which is the column a
+data-quality gate wants: is this grounded in its context, does it follow the instruction, is it
+safe to ship. An unusable verdict is null rather than False, so a confused judge does not look
+like a failing dataset.
+
+A judge is a model, so it is wrong sometimes and its errors correlate with what it is judging:
+it prefers longer answers, answers that look like its own, and whichever option came first.
+Calibrate against human labels on a sample before trusting a number, and read a judged score as
+a comparison between runs rather than as ground truth.
+
 ## Monitoring the text the model was given
 
 The metrics above score what a model produced. An LLM application also reads text it did not

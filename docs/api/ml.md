@@ -173,6 +173,21 @@ for {py:obj}`http_engine <batcher.ml.http_engine>` or
 .. autodata:: EngineFactory
 ```
 
+### Model-graded evaluation
+
+Score generations with a judge model. Each is a load-once class UDF over the same `Engine`
+contract, appending one parsed column rather than a string you still have to interpret.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   llm_score_udf
+   llm_pairwise_udf
+   llm_verify_udf
+```
+
 ### Model serving
 
 Call a model that lives in another process or on another host. Each client turns a
@@ -312,4 +327,4 @@ The `batcher.ml` surface is large enough to be split by what you are doing:
 - {doc}`GPU scheduling <../ml/gpu>`: how `num_gpus` and `concurrency` map to actors.
 - {doc}`Tabular models <../ml/tabular-models>`: scoring XGBoost, LightGBM, and scikit-learn.
 - {doc}`Evaluation <../ml/evaluation>`: metrics, per-segment scoring, diagnostic tables.
-- {doc}`Statistics and drift <../ml/statistics-and-drift>`: feature screening and monitoring.
+- {doc}`Statistics and drift <../ml/statistics-and-drift>`: feature screening and monitoring.- {doc}`../cookbook/ml/index`: 16 runnable recipes across the `batcher.ml` surface.
