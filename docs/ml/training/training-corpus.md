@@ -87,6 +87,20 @@ The per-rule numbers don't sum to `all`, because a bad document usually fails se
 once. A null document fails everything, since a row the filter can't read isn't a row to train
 on.
 
+When the filter removes something it should have kept, `bt.ml.quality_flags` answers the next
+question. It appends one boolean per rule, true where the document passes, plus `passes_all` —
+so a dropped row explains itself instead of having to be re-derived by hand.
+
+```python
+from batcher.ml import quality_flags
+
+flagged = quality_flags(docs, "text", QualityThresholds(min_words=3))
+print(flagged.select("min_words", "digit_ratio", "passes_all").to_pydict())
+```
+
+The flags are the same expressions the filter uses, so they always agree with it, and it stays a
+projection: one scan whether you read one flag or all of them.
+
 :::{warning}
 `max_non_ascii_ratio` defaults to `1.0`, which disables that rule. Lowering it is a crude
 language gate for a corpus meant to be English, and applying it to a multilingual corpus deletes

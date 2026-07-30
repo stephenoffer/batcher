@@ -19,6 +19,7 @@ from batcher.ml.corpus import (
     mix_corpora,
     padding_waste,
     quality_filter,
+    quality_flags,
     quality_report,
 )
 from batcher.ml.discriminant import (
@@ -265,6 +266,7 @@ __all__ = [
     "partial_dependence",
     "permutation_importance",
     "quality_filter",
+    "quality_flags",
     "quality_report",
     "rank_index_batches",
     "run_pipeline",

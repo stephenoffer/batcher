@@ -186,6 +186,7 @@ evaluation data that leaked into a web-scale corpus. See {doc}`/ml/training/trai
    mix_corpora
    MixtureReport
    quality_filter
+   quality_flags
    quality_report
    QualityThresholds
    decontaminate

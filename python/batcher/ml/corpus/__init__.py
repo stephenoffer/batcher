@@ -18,7 +18,12 @@ whole rather than a pass over materialized rows.
 from __future__ import annotations
 
 from batcher.ml.corpus.decontamination import contamination_rate, decontaminate
-from batcher.ml.corpus.filtering import QualityThresholds, quality_filter, quality_report
+from batcher.ml.corpus.filtering import (
+    QualityThresholds,
+    quality_filter,
+    quality_flags,
+    quality_report,
+)
 from batcher.ml.corpus.mixing import MixtureReport, mix_corpora
 from batcher.ml.corpus.ordering import length_grouped_order, padding_waste
 
@@ -31,5 +36,6 @@ __all__ = [
     "mix_corpora",
     "padding_waste",
     "quality_filter",
+    "quality_flags",
     "quality_report",
 ]

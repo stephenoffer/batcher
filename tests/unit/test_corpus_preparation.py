@@ -18,6 +18,7 @@ from batcher.ml import (
     decontaminate,
     mix_corpora,
     quality_filter,
+    quality_flags,
     quality_report,
 )
 
@@ -273,3 +274,39 @@ def test_an_empty_corpus_has_no_contamination():
     train = bt.from_pydict({"text": ["x"]}).filter(bt.col("text") == bt.lit("nothing"))
     evals = bt.from_pydict({"text": _EVAL})
     assert contamination_rate(train, "text", evals, n=4) == 0.0
+
+
+def test_quality_flags_explains_which_rule_dropped_a_document():
+    """`quality_filter` deletes and `quality_report` counts; neither says why *this* row went."""
+    docs = bt.from_pydict({"text": _DOCS})
+    flagged = quality_flags(docs, "text", QualityThresholds(min_words=3))
+    got = flagged.select("min_words", "digit_ratio", "passes_all").to_pydict()
+    # The prose row passes everything; the digit row fails only the digit rule.
+    assert got["passes_all"] == [True, False, False]
+    assert got["digit_ratio"] == [True, True, False]
+    assert got["min_words"] == [True, False, True]
+
+
+def test_the_flags_agree_with_the_filter_row_for_row():
+    """A flag that disagreed with the filter would be worse than no flag at all."""
+    docs = bt.from_pydict({"text": _DOCS, "id": [0, 1, 2]})
+    thresholds = QualityThresholds(min_words=3)
+    kept = set(quality_filter(docs, "text", thresholds).to_pydict()["id"])
+    flagged = quality_flags(docs, "text", thresholds).to_pydict()
+    passing = {i for i, ok in zip(flagged["id"], flagged["passes_all"], strict=True) if ok}
+    assert kept == passing
+
+
+def test_flagging_keeps_the_original_columns():
+    docs = bt.from_pydict({"text": _DOCS, "id": [0, 1, 2]})
+    flagged = quality_flags(docs, "text", QualityThresholds(min_words=3))
+    assert flagged.columns[:2] == ["text", "id"]
+    assert "passes_all" in flagged.columns
+
+
+def test_a_null_document_fails_every_flag():
+    """A row the rules cannot read is not a row to train on, and the flags have to say so."""
+    docs = bt.from_pydict({"text": [None, _DOCS[0]]})
+    got = quality_flags(docs, "text", QualityThresholds(min_words=3)).to_pydict()
+    assert got["passes_all"] == [False, True]
+    assert got["min_words"] == [False, True]

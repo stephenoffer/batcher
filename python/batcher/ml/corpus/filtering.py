@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir.core import Expr
 
-__all__ = ["QualityThresholds", "quality_filter", "quality_report"]
+__all__ = ["QualityThresholds", "quality_filter", "quality_flags", "quality_report"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,3 +240,54 @@ def _require_column(ds: Dataset, column: str) -> None:
         raise ColumnNotFoundError(
             unknown_message("column", column, ds.columns, hint="Pass an existing text column.")
         )
+
+
+def quality_flags(
+    ds: Dataset,
+    column: str,
+    thresholds: QualityThresholds | None = None,
+) -> Dataset:
+    """Add one boolean column per quality rule, so a dropped document can be explained.
+
+    `quality_filter` deletes rows and `quality_report` counts them; neither says why *this*
+    document went. That is the question you have as soon as the filter removes something it
+    should have kept, and without a per-row answer the only way to find out is to re-derive the
+    rules by hand.
+
+    Each appended column is named for its rule and is true where the document **passes**, so a
+    failing document is the one with a false in it. A null document fails every rule, matching
+    the filter.
+
+    The columns are the same expressions the filter uses, so a row's flags always agree with
+    whether the filter kept it. Nothing is materialized — this is a projection, so it costs one
+    scan whether you read one flag or all of them.
+
+    Args:
+        ds: The dataset to annotate.
+        column: The text column to judge.
+        thresholds: The bounds to apply. Defaults to prose thresholds.
+
+    Returns:
+        A new dataset with one boolean column per rule appended, plus ``passes_all``.
+
+    Raises:
+        ColumnNotFoundError: If `column` is not in the dataset.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml import QualityThresholds, quality_flags
+            >>> docs = bt.from_pydict({"text": ["1234 5678 9012 3456"]})
+            >>> flagged = quality_flags(docs, "text", QualityThresholds(min_words=3))
+            >>> flagged.select("digit_ratio", "passes_all").to_pydict()
+            {'digit_ratio': [False], 'passes_all': [False]}
+    """
+    from batcher.plan.expr_ir.constructors import lit
+
+    _require_column(ds, column)
+    thresholds = thresholds or QualityThresholds()
+    rules = _rules(column, thresholds)
+    columns = {name: rule.fill_null(lit(False)) for name, rule in rules.items()}
+    columns["passes_all"] = _all_of(rules)
+    return ds.with_columns(**columns)

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1044 Python modules across 164 packages and 189 Rust files across 13 crates.
+Covering 1045 Python modules across 164 packages and 189 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -302,7 +302,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
-| `accelerators.py` | 462 | Accelerator reporting (`accelerators`, `show_accelerators`). |
+| `accelerators.py` | 482 | Accelerator reporting (`accelerators`, `show_accelerators`). |
 | `admin.py` | 223 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -421,7 +421,7 @@ Preparing a training corpus: mixing sources, filtering junk, removing eval leaka
 | module | lines | what it is |
 |---|---|---|
 | `decontamination.py` | 180 | Removing evaluation data from a training corpus. |
-| `filtering.py` | 242 | Heuristic quality filtering for a web-scale text corpus. |
+| `filtering.py` | 293 | Heuristic quality filtering for a web-scale text corpus. |
 | `mixing.py` | 238 | Sampling several corpora into one training mixture, at declared weights. |
 | `ordering.py` | 196 | Ordering a corpus so a training batch is not mostly padding. |
 
@@ -736,7 +736,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 146 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 144 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 373 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 383 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 471 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
@@ -842,7 +842,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `registry.py` | 186 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 226 | The Kyber rule abstraction — one small, pure unit of optimization. |
 | `signature.py` | 158 | Structural plan signatures. |
-| `storage_cost.py` | 85 | What spilling costs on *this* machine's storage. |
+| `storage_cost.py` | 66 | What spilling costs on *this* machine's storage. |
 | `streaming.py` | 194 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
 
 ### `batcher/kyber/cost/` — 3 · subsystem
@@ -1260,8 +1260,8 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `flow_control.py` | 485 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 232 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 261 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_advice.py` | 263 | Whether a query goes out of core, and what shape its spilled state takes. |
-| `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
+| `spill_advice.py` | 290 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_shape.py` | 176 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
 
@@ -1292,11 +1292,12 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 
 | module | lines | what it is |
 |---|---|---|
+| `fabric_usage.py` | 79 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
 | `locality.py` | 117 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `placement.py` | 106 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 448 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 446 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `session.py` | 452 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
 ### `batcher/core/` — 3 · subsystem
@@ -1400,7 +1401,7 @@ Credential verification: turning a presented credential into a verified `Princip
 |---|---|---|
 | `_backend.py` | 500 | The `pyarrow.fs`-backed filesystem façade every IO source and sink talks to. |
 | `_concurrent.py` | 80 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
-| `_file_cache.py` | 137 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
+| `_file_cache.py` | 177 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 177 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 270 | Format auto-detection for the generic `read(path, format=None)` entry point. |
@@ -1723,7 +1724,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 | `energy.py` | 251 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `metrics.py` | 389 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
-| `system.py` | 185 | The host and engine the queries are running on — the dashboard's hardware panel. |
+| `system.py` | 228 | The host and engine the queries are running on — the dashboard's hardware panel. |
 | `theme.py` | 144 | Terminal capability detection, the color ramp, and the glyph set — the console's look. |
 
 ### `batcher/observe/analytics/` — 2 · neutral sinks
@@ -2065,7 +2066,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 275 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2416 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2423 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 200 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
@@ -2132,7 +2133,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `nvml.py` | 385 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
 | `probes.py` | 70 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 321 | The machine's identity — one record of what this hardware is, and a key that names it. |
-| `storage.py` | 107 | The block device behind a directory — what spilling to it will actually cost. |
+| `storage.py` | 155 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
 ### `batcher/_internal/hardware/engine/` — 0 · utility
@@ -2151,8 +2152,8 @@ The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 | module | lines | what it is |
 |---|---|---|
 | `counters.py` | 228 | What an RDMA port has actually carried, and what it got wrong doing it. |
-| `device_links.py` | 216 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
-| `nvlink.py` | 259 | NVLink, per link and per device — whether the fast path between devices is actually up. |
+| `device_links.py` | 264 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
+| `nvlink.py` | 264 | NVLink, per link and per device — whether the fast path between devices is actually up. |
 | `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |
 | `rdma.py` | 370 | InfiniBand and RoCE NICs — the wire a cross-node shuffle actually runs on. |
 
@@ -2163,7 +2164,7 @@ How a GPU is failing, as distinct from how busy it is.
 | module | lines | what it is |
 |---|---|---|
 | `counters.py` | 213 | The per-device fault counters NVML publishes — memory rows, retired pages, PCIe replays. |
-| `modes.py` | 203 | Device settings that cost throughput or correctness without ever raising anything. |
+| `modes.py` | 235 | Device settings that cost throughput or correctness without ever raising anything. |
 | `xid.py` | 253 | Xid errors — the driver's own account of what went wrong with a device. |
 
 ### `batcher/_internal/site/` — 0 · utility
@@ -2345,7 +2346,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/list_set.rs` | 188 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 28 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
-| `eval/list_ops/multiset.rs` | 138 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
+| `eval/list_ops/multiset.rs` | 136 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 194 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 475 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
@@ -2461,7 +2462,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `row_filter.rs` | 349 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `store.rs` | 170 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
+| `store.rs` | 231 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`
 
