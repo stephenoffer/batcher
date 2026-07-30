@@ -18,6 +18,7 @@ from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
 
 __all__ = [
+    "embedding_dim_drift",
     "mean_angular_distance",
     "mean_cosine_distance",
     "mean_cosine_similarity",
@@ -293,3 +294,47 @@ def mean_hamming_distance(left: IntoExpr, right: IntoExpr) -> Expr:
             2.0
     """
     return _as_column(left).list.hamming_distance(_as_column(right)).mean()
+
+
+def embedding_dim_drift(column: IntoExpr, expected: int) -> Expr:
+    """The fraction of vectors whose dimension is not `expected` — the index-corruption check.
+
+    A vector index is built for one dimension. A column that mixes two is not a degraded index,
+    it is a broken one: the mismatched rows either fail to insert or are silently dropped, and
+    the queries that should have matched them return the next-nearest thing with a
+    confident-looking distance. Nothing else in a pipeline notices, because both dimensions are
+    valid embeddings.
+
+    It happens for one reason above all others — a re-embed with a different model, or a mixed
+    read across a corpus embedded in two passes. Run this on ingest, before the index build.
+
+    A null row counts as wrong. A failed encode leaves a null where a vector should be, and it
+    cannot enter the index any more than a mis-sized one can.
+
+    Args:
+        column: The embedding column, a list of numbers per row.
+        expected: The dimension every vector must have.
+
+    Returns:
+        The wrong-dimension rate over the corpus, in ``[0, 1]``.
+
+    Raises:
+        PlanError: If `expected` is less than 1.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"v": [[1.0, 2.0, 3.0], [1.0, 2.0], [0.0, 1.0, 0.0]]})
+            >>> round(ds.agg(d=bt.embedding_dim_drift("v", 3)).to_pydict()["d"][0], 4)
+            0.3333
+    """
+    from batcher._internal.errors import PlanError
+
+    if expected < 1:
+        raise PlanError(f"embedding_dim_drift: expected must be at least 1, got {expected}")
+    dims = _as_column(column).list.len()
+    # A null row counts as wrong, not as missing. A failed encode leaves a null where a vector
+    # should be, and it cannot go into the index any more than a mis-sized one can — letting the
+    # null fall out of the numerator would report a clean corpus for a column of failures.
+    return count_if((dims != lit(expected)).fill_null(lit(True))) / count_if(lit(True))

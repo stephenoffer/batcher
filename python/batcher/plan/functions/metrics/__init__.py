@@ -50,6 +50,7 @@ from batcher.plan.functions.metrics.model.diagnostic import (
     prevalence_threshold,
 )
 from batcher.plan.functions.metrics.model.embedding import (
+    embedding_dim_drift,
     mean_angular_distance,
     mean_cosine_distance,
     mean_cosine_similarity,
@@ -266,6 +267,7 @@ __all__ = [
     "double_space_rate",
     "duplicate_context_rate",
     "email_rate",
+    "embedding_dim_drift",
     "emoji_rate",
     "empty_generation_rate",
     "empty_or_whitespace_rate",
