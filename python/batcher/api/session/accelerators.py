@@ -120,7 +120,10 @@ def accelerators() -> dict:
         diagnosable from the report alone. On a GPU cloud two more keys appear: `site` (the
         provider, instance type, region, scheduler, and the local scratch volume in force) and
         `fabric` (RDMA port state and aggregate rate, and NVLink link counts). Both are omitted
-        where nothing could be read, so the report stays the same size on a laptop.
+        where nothing could be read, so the report stays the same size on a laptop. On a live
+        Ray cluster with accelerator nodes, `fleet` also carries `health`: one short probe per
+        GPU node, since NVML and the kernel log each answer only about the host they run on, so
+        a fleet's sick node is invisible from the driver otherwise.
 
     Examples:
         .. doctest::
@@ -143,6 +146,7 @@ def accelerators() -> dict:
 
     fleet = topology_summary()
     if fleet.get("gpu_nodes"):
+        _add_fleet_health(fleet)
         report["fleet"] = fleet
 
     energy = active_config().accelerator.energy
@@ -161,6 +165,42 @@ def accelerators() -> dict:
             power["by_zone_watts"] = zones
     report["power"] = power
     return report
+
+
+def _add_fleet_health(fleet: dict) -> None:
+    """Add the per-node device health of an accelerator fleet, when there is one to ask.
+
+    This is the only part of the report that leaves the driver: NVML, the kernel log, and
+    `/sys` each answer about the host they run on, so a fleet's sick node cannot be seen from
+    here without asking it. One short task per accelerator node, bounded by the probe timeout,
+    and skipped entirely off a cluster — which makes it a cost this report pays only when it
+    is the question being asked.
+
+    Nodes that answered clean contribute a count; the ones that did not are listed, because
+    "which node do I drain" is the reason to run this.
+    """
+    from batcher.dist.executors.ray_runtime.hardware_probe import (
+        cluster_device_health,
+        unhealthy_nodes,
+    )
+
+    records = cluster_device_health()
+    if not records:
+        return
+    fleet["health"] = {
+        "nodes_probed": len(records),
+        "unhealthy": [
+            {
+                "node_id": r["node_id"],
+                "quarantined": r.get("quarantined", []),
+                "degraded": r.get("degraded", []),
+                "reset_pending": r.get("reset_pending", []),
+                "degraded_links": r.get("degraded_links", []),
+                "reasons": r.get("reasons", []),
+            }
+            for r in unhealthy_nodes(records)
+        ],
+    }
 
 
 def _show_silent_faults(devices: list[dict]) -> None:
@@ -288,6 +328,13 @@ def show_accelerators() -> None:
         )
         if fleet["racks"] or fleet["power_zones"]:
             print(f"       {fleet['racks']} rack(s), {fleet['power_zones']} power zone(s)")
+        health = fleet.get("health")
+        if health:
+            unhealthy = health["unhealthy"]
+            print(f"       health: {len(unhealthy)} of {health['nodes_probed']} node(s) degraded")
+            for node in unhealthy:
+                reasons = ", ".join(node["reasons"]) or "degraded link"
+                print(f"       node {node['node_id'][:12]}: {reasons}")
     power = report["power"]
     if power:
         parts = [

@@ -26,9 +26,11 @@ from __future__ import annotations
 from batcher._internal.logging import get_logger, note_suppressed
 
 __all__ = [
+    "cluster_device_health",
     "cluster_hardware_profiles",
     "cluster_is_heterogeneous",
     "cluster_l3_cache_bytes",
+    "unhealthy_nodes",
     "warn_once_if_fleet_is_mixed",
 ]
 
@@ -206,4 +208,113 @@ def warn_once_if_fleet_is_mixed() -> None:
     get_logger("dist").info(
         "cluster mixes machine classes; learned costs, memory models and batch sizes are kept "
         "per hardware fingerprint, so each node shape converges on its own share of the runs"
+    )
+
+
+# --- Fleet device health ------------------------------------------------------------------
+#
+# Separate from the hardware profiles above in two ways that matter. It probes *every*
+# accelerator node rather than one representative of each shape, because a fault is a property
+# of one board and not of an instance type — sampling would report the fleet healthy on the
+# strength of its healthy nodes. And it is never cached: the whole value is that a device that
+# faulted a minute ago is seen now.
+
+
+def _device_health_on_this_worker() -> dict:
+    """Run on a GPU worker: that node's device verdicts and interconnect state.
+
+    Everything here is invisible from the driver. NVML answers only about the host it runs on,
+    the kernel log only about that host's driver, and `/sys` only about that host's wires — so
+    on a fleet the difference between "no device is sick" and "no device that the driver can
+    see is sick" is the difference between a report and a guess.
+    """
+    from batcher._internal.hardware.fabric import degraded_device_links, nvlink_summary
+    from batcher._internal.hardware.faults import xid_readable
+    from batcher.carbonite.accel import assess_fleet, device_reset_candidates
+
+    verdicts = assess_fleet()
+    return {
+        "devices": len(verdicts),
+        "quarantined": [v.uuid or v.device_index for v in verdicts if not v.schedulable],
+        "degraded": [v.uuid or v.device_index for v in verdicts if v.state == "degraded"],
+        "reasons": sorted({r for v in verdicts for r in v.reasons}),
+        "reset_pending": list(device_reset_candidates()),
+        "degraded_links": [link.address for link in degraded_device_links()],
+        "nvlink": nvlink_summary(),
+        "xid_readable": xid_readable(),
+    }
+
+
+def cluster_device_health() -> tuple[dict, ...]:
+    """One device-health record per accelerator node, read live.
+
+    The fleet-wide view of the faults that do not fail a job. A node whose NVLink is down, whose
+    host link renegotiated, or which holds a device the driver has condemned keeps accepting
+    work and returning correct answers at a fraction of the rate — and on a hundred-node fleet
+    nobody finds it by reading timings.
+
+    Returns:
+        One record per GPU node that answered, each carrying the node id, its device verdicts
+        and reasons, its degraded links, and its NVLink summary. Empty when Ray is down, when
+        the cluster has no accelerator nodes, or when no worker answered inside the timeout —
+        a slow node must not stall the caller, and an unanswered probe is reported as absence
+        rather than as health.
+    """
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return ()
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        nodes = [
+            n
+            for n in ray.nodes()
+            if n.get("Alive", True) and float((n.get("Resources") or {}).get("GPU", 0.0)) > 0
+        ]
+        if not nodes:
+            return ()
+        probe = ray.remote(num_cpus=0)(_device_health_on_this_worker)
+        refs = {
+            probe.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(n["NodeID"], soft=False)
+            ).remote(): n["NodeID"]
+            for n in nodes
+            if n.get("NodeID")
+        }
+        ready, _ = ray.wait(list(refs), num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
+        out = []
+        for ref in ready:
+            record = ray.get(ref)
+            if isinstance(record, dict):
+                out.append({"node_id": refs[ref], **record})
+        return tuple(out)
+    except Exception as exc:
+        note_suppressed("dist", "probe the fleet's device health", exc)
+        return ()
+
+
+def unhealthy_nodes(records: tuple[dict, ...] | None = None) -> tuple[dict, ...]:
+    """The nodes holding a device that should not be scheduled, or one running degraded.
+
+    The list an operator drains. Ordered as the probe returned them, which is node order.
+
+    Args:
+        records: Health records, or `None` to probe the fleet.
+
+    Returns:
+        The subset with a quarantined device, a degraded device, a pending reset, a degraded
+        host link, or a partially-down NVLink fabric. Empty on a healthy fleet *and* on one
+        that could not be probed; `cluster_device_health()` returning nothing is what
+        distinguishes them.
+    """
+    probed = cluster_device_health() if records is None else records
+    return tuple(
+        r
+        for r in probed
+        if r.get("quarantined")
+        or r.get("degraded")
+        or r.get("reset_pending")
+        or r.get("degraded_links")
+        or (r.get("nvlink") or {}).get("degraded_devices")
     )

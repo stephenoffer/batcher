@@ -59,8 +59,12 @@ SPILL_DEVICE_FACTOR_DEFAULT = 1.0
 def spill_device_factor() -> float:
     """How much a spilled byte costs on this machine's spill device, relative to local flash.
 
-    Read from the device backing the configured spill directory, falling back to the system
-    temporary directory when none is configured — which is where the engine spills.
+    Read from the device backing the directory the engine will actually spill to, which is
+    the same three-step resolution the spill paths themselves use: the configured
+    `spill_dir`, else the node's measured local scratch volume, else a system tempdir. Asking
+    only the first and last of those would price a spill against the container's overlay while
+    it lands on the node's NVMe — a factor of ten in the wrong direction on exactly the
+    machines where an out-of-core plan is worth ranking carefully.
 
     Cheap enough for the planning path: `device_class` memoizes per resolved directory, so this
     costs one `stat` the first time a process plans a spilling query and a dict lookup after.
@@ -75,5 +79,7 @@ def spill_device_factor() -> float:
     Returns:
         The cost multiplier for spilled bytes, at least 1.0.
     """
-    spill_dir = active_config().memory.spill_dir or tempfile.gettempdir()
+    from batcher._internal.site import local_scratch_root
+
+    spill_dir = active_config().memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
     return SPILL_DEVICE_FACTOR.get(device_class(spill_dir), SPILL_DEVICE_FACTOR_DEFAULT)

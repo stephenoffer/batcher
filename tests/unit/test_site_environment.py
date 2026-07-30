@@ -324,3 +324,21 @@ def test_no_local_volume_leaves_the_spill_paths_on_a_tempdir(monkeypatch, tmp_pa
     from batcher.dist.flight_worker import _reduce_work_dir
 
     assert _reduce_work_dir("probe_", None).startswith(tempfile.gettempdir())
+
+
+def test_the_spill_cost_model_prices_the_disk_the_engine_will_actually_use(monkeypatch, tmp_path):
+    # The drift this closes: the spill paths resolve to the node's measured NVMe, so a cost
+    # model still asking the tempdir prices the container's overlay — a factor of ten in the
+    # wrong direction on exactly the machines where an out-of-core plan needs ranking.
+    from batcher.kyber import storage_cost
+
+    seen: list[str] = []
+    monkeypatch.setattr(storage_cost, "device_class", lambda path: seen.append(path) or "network")
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: "/ephemeral")
+    assert storage_cost.spill_device_factor() == storage_cost.SPILL_DEVICE_FACTOR["network"]
+    assert seen == ["/ephemeral"]
+    # And with no local volume it falls back to the tempdir, as before.
+    seen.clear()
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    storage_cost.spill_device_factor()
+    assert seen and seen[0] != "/ephemeral"
