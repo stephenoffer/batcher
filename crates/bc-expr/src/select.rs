@@ -264,8 +264,10 @@ impl ConjunctOrder {
             .map(|i| (i, self.rank(i, conjuncts[i])))
             .collect();
         // A total order over finite, non-NaN ranks; ties keep index order, so an
-        // unmeasured predicate stays in the order it was written.
-        ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        // unmeasured predicate stays in the order it was written. Being a total order over
+        // distinct indices is also what makes the *unstable* sort deterministic here, so it
+        // needs no stable merge sort and no scratch allocation.
+        ranked.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         ranked.into_iter().map(|(i, _)| i).collect()
     }
 

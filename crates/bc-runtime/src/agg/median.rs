@@ -316,7 +316,12 @@ pub(crate) fn finalize_top_k(state: &ArrayRef, k: usize) -> Result<ArrayRef, Run
             .collect();
         // Descending by count, then ascending by the encoded value: the row encoding is
         // order-preserving, so comparing its bytes is comparing the values themselves.
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        //
+        // `sort_unstable_by` is safe here and not merely faster: the entries come from a map
+        // keyed by those very bytes, so no two compare equal and the comparator is already a
+        // total order. That makes the unstable sort deterministic, and it skips the `n/2`
+        // scratch buffer the stable merge sort allocates.
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for (_, _, idx) in ranked.into_iter().take(k) {
             keep.push(idx);
         }
