@@ -412,10 +412,17 @@ class _DtNamespace:
         return self.strftime(format)
 
     def date(self) -> Expr:
-        """Truncate to the date (midnight) — the Polars ``dt.date`` spelling of ``truncate('day')``.
+        """Extract the calendar date — the Polars ``dt.date`` spelling of ``CAST(ts AS DATE)``.
+
+        The result is a ``date``, not a midnight timestamp. This method was previously an
+        alias for ``truncate('day')``, which returns a ``timestamp`` at 00:00:00. Both Polars'
+        ``dt.date`` and DuckDB's ``CAST(ts AS DATE)`` / ``date(ts)`` return a date, and a
+        midnight timestamp does not compare equal to a date column, so the old spelling
+        silently failed the join or filter a user reached for it to write. Use
+        :meth:`truncate` when a timestamp at midnight is what you want.
 
         Returns:
-            A new Timestamp expression at 00:00:00 of the same day.
+            A new Date expression holding the calendar date.
 
         Examples:
             .. doctest::
@@ -424,9 +431,9 @@ class _DtNamespace:
                 >>> import datetime as dt
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
                 >>> ds.select(r=bt.col("d").dt.date()).to_pydict()
-                {'r': [datetime.datetime(2024, 2, 15, 0, 0)]}
+                {'r': [datetime.date(2024, 2, 15)]}
         """
-        return self.truncate("day")
+        return self._e.cast("date")
 
     def month_start(self) -> Expr:
         """First day of the month at midnight — ``truncate('month')`` (Polars ``month_start``).

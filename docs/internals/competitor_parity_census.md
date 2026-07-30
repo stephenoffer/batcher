@@ -927,13 +927,19 @@ worth remembering the next time a reference engine will not run.
 Ordered by measured value, from the same censuses and a capability probe of the DataFrame
 surface.
 
-1. **`.dt.date()` returns a midnight `TIMESTAMP`, not a `DATE`.** It is written as an
-   alias for `truncate('day')` and documented as returning a timestamp, but it is named
-   after Polars' `dt.date` and both Polars and DuckDB (`CAST(ts AS DATE)`, `date(ts)`)
-   return a `DATE`. Batcher's own `cast('date')` already does. A user who reaches for the
-   method the reference engines name gets a type that will not compare against a date
-   column. Found by the Polars census; `last_day(DATE)`, the earlier entry here, has since
-   been fixed and now returns `date32` for both `DATE` and `TIMESTAMP` inputs.
+1. ~~**`.dt.date()` returns a midnight `TIMESTAMP`, not a `DATE`.**~~ **Closed.** It was an
+   alias for `truncate('day')`; it is now `cast('date')`, so it returns `date32` and matches
+   both Polars' `dt.date` and DuckDB's `CAST(ts AS DATE)` / `date(ts)`. Pinned by
+   `test_dt_date_returns_a_date_not_a_midnight_timestamp`, which asserts the value against
+   DuckDB *and* the type explicitly. `truncate('day')` remains for callers who do want a
+   midnight timestamp, and the docstring now points at it.
+
+   **One claim in this entry was wrong and is retracted:** "a type that will not compare
+   against a date column". It was checked against the old implementation rather than
+   inferred, and Batcher coerces timestamp against date, so `ts.dt.date() == d` selected the
+   same rows before and after. The defect was real but narrower than recorded — the returned
+   type and the schema, not a silently-empty filter. A regression test written to the
+   original claim would have passed against the bug.
 2. **The window aggregates entries 152-160 did not take.** `median`, `quantile` and
    `mode` need an order-statistic structure for their running form; `arg_min`/`arg_max`
    and the two-input aggregates need a second input, which `WindowCall` has nowhere to
