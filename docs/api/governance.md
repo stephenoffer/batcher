@@ -211,6 +211,10 @@ print(verdict.message())
 # dataset 's3://eu-customers/orders' may not be processed in region 'us-east-1': permitted in eu-north-1 (GDPR Art. 44)
 ```
 
+Install the catalog once with `set_residency`, and the scheduler consults it through
+`active_residency` when placing accelerator work. A deployment that installs nothing keeps an
+empty `off` catalog, which permits everything.
+
 A job reading several datasets may run only where all of them may, so
 `permitted_regions` returns the intersection and `filter_regions` narrows a scheduler's
 candidate list in preference order. An empty intersection is a real answer: the job has to be
@@ -225,6 +229,10 @@ split, not placed.
 
 .. autoclass:: ResidencyVerdict
    :members:
+
+.. autofunction:: active_residency
+
+.. autofunction:: set_residency
 
 .. autodata:: RESIDENCY_MODES
 ```

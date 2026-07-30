@@ -48,7 +48,8 @@ Nineteen new modules, 4,521 lines, 165 public functions, classes, and properties
 
 | Layer | Module | What it answers |
 |---|---|---|
-| 0 | `_internal/device_specs.py` | 31 device models x power, bandwidth, TFLOPS, fabric width, MIG |
+| 0 | `_internal/device_specs/` | 31 device models x power, bandwidth, TFLOPS, fabric width, MIG, host link |
+| 0 | `_internal/hardware/mig.py` | the published MIG profile families, per slice count |
 | 0 | `_internal/hardware/nvml.py` | live draw, utilization, memory, ECC, throttle reasons |
 | 1 | `plan/energy/{power,carbon,accounting}.py` | the power model, `GridProfile`, the mergeable `EnergyLedger` |
 | 0 | `config/accelerator.py` | 23 tunables: budget, price, intensity, PUE, health, KV cache |
@@ -99,6 +100,41 @@ Documentation: `docs/user-guide/gpu-fleets.md` (the walkthrough),
 `docs/configuration/accelerator.md` (the field reference), a data-residency section in
 `docs/api/governance.md`, and a GPU-fleet section in the `run-a-distributed-job` skill.
 
+## The integration audit, and what it found
+
+The program's own defect, found by auditing it rather than by a gate: **fourteen of eighteen
+new entry points and four configuration flags had no production caller.** A device table
+nothing reads is documentation, and `python/batcher/CLAUDE.md` names that failure explicitly
+("no config flag with no current caller"). The pass that closed it:
+
+| Was orphaned | Now called by |
+|---|---|
+| `select_device_class` | `dist`'s `recommend_accelerator_type`, which duplicated it and now delegates |
+| MIG profiles | Kyber's packing fraction (`prefer_mig`), via a layer-0 move so no boundary is crossed |
+| `schedulable_device_count` | Carbonite's GPU grant (`health.enabled`) |
+| `validate_fleet_power` | the grant clamp itself, so the number and the counter-offer are one figure |
+| `device_energy_advice` | `decide_gpu_backend`, which now refuses a device the copy would lose |
+| `VramPool` | inference sizing, against free rather than nominal device memory |
+| `rank_nodes_by_efficiency`, `devices_within_power_budget`, `permitted_nodes` | `plan_collective`, where the constraints compose |
+| `power_zone_load` | `bt.accelerators()`, per zone, because a breaker is a zone's not a fleet's |
+| `EnergyLedger.merge` | nested energy scopes |
+| `carbon_intensity`, `pue`, `region`, `renewable_fraction` | `configured_grid`, one source for cost and carbon |
+| `telemetry_interval_s` | the meter, which reuses a reading rather than hammering NVML per batch |
+| `spill_tier` | **deleted** — no honest caller, so it is gone rather than kept as decoration |
+
+Two findings worth naming separately. `select_device_class` and `recommend_accelerator_type`
+were the *same decision implemented twice* across a layer boundary, which is the failure mode
+the independence contract makes most likely; the live topology now supplies candidates and the
+policy makes the choice. And `device_energy_advice` had a real bug: it charged the CPU path
+only its memory bandwidth, so a compute-heavy row looked free there and the verdict said an
+inference stage was not worth a GPU — exactly backwards.
+
+The renderers (`format_energy_report`, `format_fleet_efficiency`, `energy_metrics`,
+`format_device_table`) have no internal caller by design: their caller is the user, and the bar
+they are held to instead is documented, rendered by Sphinx, and taught with an executed
+example. `plan_collective`, `residency_report`, and `merge_ledgers` meet that bar too, but
+their *scheduler-side* call sites are not wired — see the register below.
+
 ## What this program did **not** do
 
 Named explicitly, because the absence of each is a real limit and not an oversight:
@@ -115,9 +151,19 @@ Named explicitly, because the absence of each is a real limit and not an oversig
   device and by work kind; two very different pipelines on the same device share a bucket and
   average toward each other. Keying by plan signature as the cardinality learner does is the
   obvious next step.
-- **No admission-path integration for power.** `validate_fleet_power` returns a verdict, but
-  `CarboniteManager.validate` still budgets memory only: the physical plan does not carry the
-  device model and count a power check needs, and adding that is a contract change.
+- **No admission-path integration for power.** `validate_fleet_power` now computes the
+  scheduling grant's clamp, but `CarboniteManager.validate` still budgets memory only: the
+  physical plan does not carry the device model and count a plan-level power check needs.
+- **Three scheduler call sites are unwired**, and blocked rather than forgotten:
+  `plan_collective` (bundles), `residency_report`/`permitted_nodes` (node filtering), and
+  `merge_ledgers` (folding worker ledgers) all belong in
+  `dist/executors/ray_runtime/scheduling.py` and the `dist/gpu/` task path, which another
+  session held under active edit throughout. Each is reachable, tested, and taught; none is
+  yet consulted by the distributed executor itself.
+- **The cluster hardware profile does not yet carry the device model.** `HardwareProfile`
+  gained the field and `local()` populates it, but `cluster_hardware_profile()` lives in the
+  same contested file, so on a distributed run the model-specific decisions (MIG packing, the
+  transfer veto) see `""` and fall back to their prior behavior.
 - **Device figures are unverified against hardware.** They are datasheet values. A wrong row
   produces a wrong ratio, not a wrong result, but it is worth checking a model against
   `nvidia-smi` before trusting a placement decision that turns on it.

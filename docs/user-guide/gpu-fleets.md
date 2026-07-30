@@ -180,6 +180,32 @@ varies by hour, by season, and by supply contract, so a shipped default would lo
 authoritative and be wrong for your site. Leave `gco2e_per_kwh` at zero and Batcher reports no
 emissions rather than an invented figure.
 
+### Comparing devices, and exporting the numbers
+
+On a mixed fleet the useful question is not what the run cost but which hardware was cheaper to
+run it on, which a total cannot answer:
+
+```python
+from batcher.observe import energy_metrics, format_fleet_efficiency
+from batcher.plan.energy import EnergyLedger, StageEnergy
+
+mixed = EnergyLedger()
+mixed.record(StageEnergy("A#1", "NVIDIA_H100", 8, 10.0, 0.9, joules=1000.0, tokens=90_000))
+mixed.record(StageEnergy("A#2", "NVIDIA_TESLA_V100", 8, 10.0, 0.9, joules=1000.0, tokens=20_000))
+print(format_fleet_efficiency(mixed).splitlines()[0].startswith("NVIDIA_H100"))
+# True
+```
+
+`energy_metrics` renders the same ledger as flat `energy.*` rows for a metrics sink, alongside
+whatever you already scrape. Undefined figures are absent rather than zero, so a scrape never
+records an efficiency nobody measured:
+
+```python
+rows = energy_metrics(mixed)
+print(rows["energy.device.NVIDIA_H100"], "tokens_per_joule" in "".join(rows))
+# 1000.0 True
+```
+
 ## Keep a multi-device stage on the fast interconnect
 
 Eight devices inside one NVLink domain exchange at hundreds of gigabytes per second. The same
@@ -204,6 +230,25 @@ data moves work for a reason that is not there.
 
 When a stage needs more devices than any single domain holds, Batcher still places it, and says
 so in the decision log rather than pretending the collective stayed local.
+
+`plan_collective` is where those constraints compose, and it is worth calling directly when you
+are sizing a fleet rather than running on one. It applies residency, the per-zone power budget,
+and the efficiency order before the fabric preference, because each of them can remove a node
+the fabric would otherwise have chosen:
+
+```python
+from batcher.dist.executors.ray_runtime.fabric import GpuNodeTopology, plan_collective
+
+fleet = (
+    GpuNodeTopology("a", 8, "NVIDIA_H100", rack="r1", fabric="ib0"),
+    GpuNodeTopology("b", 8, "NVIDIA_H100", rack="r1", fabric="ib0"),
+)
+print(plan_collective(8, fleet).strategy, plan_collective(16, fleet).spans_fabric)
+# STRICT_PACK True
+```
+
+A fleet that no node survives is reported as such rather than as an unreadable topology: those
+are different failures, and only one of them is a labelling problem.
 
 ## Partition a device instead of holding it
 
@@ -353,6 +398,19 @@ in any single region, so the job has to be split.
 
 An unregistered dataset is unrestricted. Batcher never infers a region from a bucket name or an
 endpoint, because guessing a legal fact is wrong in whichever direction it errs.
+
+Install the catalog once, at startup, with `bt.governance.set_residency`. The scheduler reads
+it through `active_residency`, so a rule applies to every stage rather than only the ones that
+remembered to pass it:
+
+```python
+from batcher.governance import ResidencyCatalog, active_residency, set_residency
+
+previous = set_residency(ResidencyCatalog(mode="advisory"))
+print(active_residency().mode)
+# advisory
+_ = set_residency(previous)
+```
 
 On a cluster, the catalog reaches the scheduler through
 `batcher.dist.executors.ray_runtime.fabric.permitted_nodes`, which keeps only the accelerator

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1008 Python modules across 157 packages and 185 Rust files across 13 crates.
+Covering 1009 Python modules across 157 packages and 185 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -723,6 +723,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `reduce.py` | 264 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `scaling.py` | 464 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 392 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `trace.py` | 104 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
 
