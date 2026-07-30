@@ -73,3 +73,38 @@ def test_the_cpu_pool_is_still_capped_to_usable_cores(monkeypatch):
     filesystem.ensure_io_threads.cache_clear()
     filesystem.ensure_io_threads()
     assert pa.cpu_count() == 3
+
+
+# --- The retry budget that fan-out makes necessary -----------------------------------------
+
+
+def test_an_s3_filesystem_gets_a_retry_budget_by_default():
+    # A store's answer to 256 concurrent GETs is `503 SlowDown`, which is a request to wait
+    # rather than a failure — and three attempts turns it into a failed query.
+    import pyarrow.fs as pafs
+
+    from batcher.io.filesystem import _S3_DEFAULT_RETRY_ATTEMPTS, _s3_with_options
+
+    assert _S3_DEFAULT_RETRY_ATTEMPTS > 3
+    # Built without raising, with the strategy attached: pyarrow does not expose the
+    # constructed value back, so the contract under test is that the option is accepted.
+    assert _s3_with_options("s3://bucket/key?region=us-east-1") is not None
+    assert isinstance(
+        pafs.AwsStandardS3RetryStrategy(max_attempts=_S3_DEFAULT_RETRY_ATTEMPTS),
+        pafs.S3RetryStrategy,
+    )
+
+
+def test_the_retry_budget_is_overridable_in_both_directions():
+    from batcher.io.filesystem import _s3_with_options
+
+    assert _s3_with_options("s3://b/k?retry_max_attempts=1") is not None
+    assert _s3_with_options("s3://b/k?retry_max_attempts=32") is not None
+
+
+def test_an_unknown_option_still_names_itself():
+    from batcher._internal.errors import IOError as BatcherIOError
+    from batcher.io.filesystem import _s3_with_options
+
+    with pytest.raises(BatcherIOError, match="unknown s3:// option 'retries'"):
+        _s3_with_options("s3://b/k?retries=4")

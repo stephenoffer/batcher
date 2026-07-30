@@ -299,6 +299,17 @@ def _split_authority(uri: str) -> tuple[str, str]:
 #: outside this set is rejected by name so a typo is not silently ignored by the builder.
 _S3_BOOL_OPTS = ("anonymous", "force_virtual_addressing", "background_writes")
 _S3_INT_OPTS = ("connect_timeout", "request_timeout")
+
+#: Attempts a throttled S3 request gets before the read fails. pyarrow's default is three,
+#: chosen against a client opening a handful of connections; this engine opens as many as the
+#: machine can drive — up to 256 concurrent GETs on a dense node — and a store's answer to that
+#: is `503 SlowDown`, which is not a failure but a request to wait. Three attempts turns a
+#: throttle into a failed query on exactly the scans worth running on such a machine.
+#:
+#: Raised rather than made unbounded: a store that is genuinely down should still fail the
+#: query rather than retry it for minutes. `retry_max_attempts` in the URI overrides it, in
+#: both directions.
+_S3_DEFAULT_RETRY_ATTEMPTS = 8
 _S3_STR_OPTS = (
     "access_key",
     "secret_key",
@@ -319,13 +330,19 @@ def _s3_with_options(uri: str) -> FileSystem:
     (``force_virtual_addressing=false``), a plain-HTTP endpoint, explicit keys, or a
     longer timeout — none of which `from_uri` accepts. An unknown option is an error
     naming the option, because `S3FileSystem` would otherwise ignore it silently and the
-    user would debug a connection that quietly used none of their settings."""
+    user would debug a connection that quietly used none of their settings.
+
+    Every filesystem built here also gets a retry budget sized for the fan-out this engine
+    actually opens (`_S3_DEFAULT_RETRY_ATTEMPTS`), overridable with ``retry_max_attempts``."""
     from urllib.parse import parse_qsl, urlsplit
 
     parts = urlsplit(uri)
     opts: dict[str, object] = {}
+    attempts = _S3_DEFAULT_RETRY_ATTEMPTS
     for key, value in parse_qsl(parts.query):
-        if key in _S3_BOOL_OPTS:
+        if key == "retry_max_attempts":
+            attempts = max(1, int(value))
+        elif key in _S3_BOOL_OPTS:
             opts[key] = value.strip().lower() in ("1", "true", "yes", "on")
         elif key in _S3_INT_OPTS:
             opts[key] = int(value)
@@ -333,9 +350,10 @@ def _s3_with_options(uri: str) -> FileSystem:
             opts[key] = value
         else:
             raise IOError(
-                f"unknown s3:// option {key!r}. Supported: "
+                f"unknown s3:// option {key!r}. Supported: retry_max_attempts, "
                 f"{', '.join(sorted(_S3_BOOL_OPTS + _S3_INT_OPTS + _S3_STR_OPTS))}"
             )
+    opts["retry_strategy"] = pafs.AwsStandardS3RetryStrategy(max_attempts=attempts)
     try:
         fs = pafs.S3FileSystem(**opts)  # type: ignore[arg-type]
     except (ValueError, OSError, pa.ArrowInvalid) as exc:
