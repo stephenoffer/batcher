@@ -12,6 +12,8 @@ pub(crate) mod image;
 pub(crate) mod mel;
 pub(crate) mod video;
 
+mod speech;
+
 pub(crate) use audio::eval_audio;
 pub(crate) use image::eval_image;
 pub(crate) use video::eval_video;

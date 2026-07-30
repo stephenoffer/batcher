@@ -10,6 +10,15 @@ from __future__ import annotations
 
 from batcher.ml.cluster import KMeans, NearestCentroid
 from batcher.ml.converters import to_numpy_batches, to_tf_dataset, to_torch_iterable
+from batcher.ml.corpus import (
+    MixtureReport,
+    QualityThresholds,
+    contamination_rate,
+    decontaminate,
+    mix_corpora,
+    quality_filter,
+    quality_report,
+)
 from batcher.ml.discriminant import (
     LinearDiscriminantAnalysis,
     QuadraticDiscriminantAnalysis,
@@ -110,6 +119,7 @@ from batcher.ml.preprocessors import (
     save,
     to_dict,
 )
+from batcher.ml.retrieval import mmr_rerank_udf
 from batcher.ml.sampling import (
     balanced_sample,
     class_counts,
@@ -178,6 +188,7 @@ __all__ = [
     "MaxAbsScaler",
     "MinMaxScaler",
     "MissingIndicator",
+    "MixtureReport",
     "MultiHotEncoder",
     "MultiLabelBinarizer",
     "MultinomialNB",
@@ -191,6 +202,7 @@ __all__ = [
     "PowerTransformer",
     "Preprocessor",
     "QuadraticDiscriminantAnalysis",
+    "QualityThresholds",
     "QuantileTransformer",
     "RankTransformer",
     "RareCategoryEncoder",
@@ -218,9 +230,11 @@ __all__ = [
     "build_vector_index",
     "class_counts",
     "class_weights",
+    "contamination_rate",
     "count_outliers",
     "cross_val_predict",
     "cross_val_score",
+    "decontaminate",
     "embed",
     "epoch_order",
     "epoch_permutation",
@@ -238,12 +252,16 @@ __all__ = [
     "llm_verify_udf",
     "load",
     "mahalanobis_distance",
+    "mix_corpora",
+    "mmr_rerank_udf",
     "openai_embedding_encoder",
     "outlier_bounds",
     "oversample",
     "pack_sequences",
     "partial_dependence",
     "permutation_importance",
+    "quality_filter",
+    "quality_report",
     "rank_index_batches",
     "run_pipeline",
     "sample_weights",

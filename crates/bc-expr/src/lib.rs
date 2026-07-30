@@ -169,6 +169,9 @@ pub enum Expr {
         /// `Mfcc` only: number of cepstral coefficients to keep.
         #[serde(default)]
         n_mfcc: Option<i64>,
+        /// `TrimSilence` only: the silence floor in dBFS (negative), defaulting to -40.
+        #[serde(default)]
+        threshold_db: Option<i64>,
     },
 
     /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
@@ -471,6 +474,19 @@ pub enum Math2Func {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFunc {
+    /// `brightness()` → the mean luma of the image, normalized to `[0, 1]` (→ Float64).
+    /// The blank-image detector: a placeholder tile, a blown-out scan, and the grey box a CDN
+    /// serves for a missing asset all sit at an extreme, while a photograph of anything lands
+    /// in the middle. Measured on a downsampled luma plane, so the cost is independent of the
+    /// source resolution. Null/undecodable → null.
+    Brightness,
+    /// `sharpness()` → the variance of the Laplacian of the luma plane, normalized to
+    /// `[0, 1]` (→ Float64). The standard focus measure: a sharp image has strong second
+    /// derivatives at its edges, a blurred or empty one has almost none. Downsampled first,
+    /// deliberately — full-resolution sensor noise reads as detail and makes a blurry large
+    /// photograph score like a sharp one. It measures *detail*, not quality: a brick wall
+    /// outscores a portrait. Null/undecodable → null.
+    Sharpness,
     Decode,
     ToTensor,
     /// `to_grayscale(width, height)` → decode, resize to `(width, height)`, and convert to a
@@ -584,6 +600,21 @@ pub enum AudioFunc {
     /// `mel_scale="htk"`, `center=True`, `pad_mode="reflect"`) — the log/normalization step
     /// varies by model, so it is applied downstream, not baked in. Null/undecodable → null.
     MelSpectrogram,
+    /// `trim_silence(threshold_db)` → the decoded waveform with leading and trailing samples
+    /// below the threshold removed, as a mono `List<Float32>`. dBFS relative to full scale;
+    /// -40 (1% of full scale) is the conventional default. Only the *ends* are trimmed —
+    /// interior pauses carry the timing an acoustic model reads. A clip quiet throughout
+    /// trims to an empty list, which is what makes a silent-recording filter expressible.
+    TrimSilence,
+    /// `peak_normalize()` → the decoded waveform scaled so its loudest sample sits at full
+    /// scale, as a mono `List<Float32>`. The level-matching step before batching clips from
+    /// different sources. Peak, not loudness (LUFS): it equalizes the maximum, not the
+    /// perceived level. An all-zero clip is returned unchanged rather than divided by zero.
+    PeakNormalize,
+    /// `zero_crossing_rate()` → the fraction of adjacent sample pairs that change sign, as
+    /// Float64. The classic voiced/unvoiced descriptor: a vowel crosses zero rarely, a
+    /// fricative constantly. A clip shorter than two samples yields null.
+    ZeroCrossingRate,
     /// `mfcc(rate, n_fft, hop_length, n_mels, n_mfcc)` → the Mel-Frequency Cepstral
     /// Coefficients, the classic compact speech feature: mel power spectrogram →
     /// `AmplitudeToDB` → orthonormal DCT-II, keeping the first `n_mfcc` coefficients.

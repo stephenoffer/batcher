@@ -39,11 +39,12 @@ pub(crate) fn eval_audio(
     hop: Option<i64>,
     n_mels: Option<i64>,
     n_mfcc: Option<i64>,
+    threshold_db: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
     let mel = MelParams::resolve(func, rate, n_fft, hop, n_mels, n_mfcc)?;
     match arr.data_type() {
-        DataType::Binary => eval_audio_sized::<i32>(func, arr, rate, mel),
-        DataType::LargeBinary => eval_audio_sized::<i64>(func, arr, rate, mel),
+        DataType::Binary => eval_audio_sized::<i32>(func, arr, rate, mel, threshold_db),
+        DataType::LargeBinary => eval_audio_sized::<i64>(func, arr, rate, mel, threshold_db),
         other => Err(ExprError::ExpectedBinary {
             func: format!("{func:?}"),
             got: other.to_string(),
@@ -119,6 +120,7 @@ fn eval_audio_sized<O: OffsetSizeTrait>(
     arr: &ArrayRef,
     rate: Option<i64>,
     mel: Option<MelParams>,
+    threshold_db: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
     let bytes = arr
         .as_any()
@@ -134,6 +136,9 @@ fn eval_audio_sized<O: OffsetSizeTrait>(
         // `resolve` guaranteed `Some` for these variants.
         AudioFunc::MelSpectrogram => mel_spectrogram_col(bytes, mel.expect("mel params")),
         AudioFunc::Mfcc => mfcc_col(bytes, mel.expect("mfcc params")),
+        AudioFunc::TrimSilence => super::speech::trim_silence(bytes, threshold_db),
+        AudioFunc::PeakNormalize => super::speech::peak_normalize(bytes),
+        AudioFunc::ZeroCrossingRate => super::speech::zero_crossing_rate(bytes),
     }
 }
 
@@ -186,7 +191,7 @@ fn mfcc_col<O: OffsetSizeTrait>(
 /// Assemble per-row `Vec<f32>` (or `None`) into a `List<Float32>` column. Shared by the
 /// spectral ops; a batch of equal-length clips gives every row the same length, which the
 /// projection layer can tag as a fixed-shape tensor.
-fn build_f32_list_column(rows: Vec<Option<Vec<f32>>>) -> ArrayRef {
+pub(super) fn build_f32_list_column(rows: Vec<Option<Vec<f32>>>) -> ArrayRef {
     let mut builder = ListBuilder::new(Float32Builder::new());
     for row in rows {
         match row {
@@ -203,14 +208,14 @@ fn build_f32_list_column(rows: Vec<Option<Vec<f32>>>) -> ArrayRef {
 }
 
 /// A decoded mono signal: sample rate (Hz) and the channel-averaged f32 samples.
-struct Decoded {
-    sample_rate: u32,
-    channels: usize,
-    samples: Vec<f32>,
+pub(super) struct Decoded {
+    pub(super) sample_rate: u32,
+    pub(super) channels: usize,
+    pub(super) samples: Vec<f32>,
 }
 
 /// Decode WAV/FLAC bytes to a mono f32 signal; `None` on any failure.
-fn decode_pcm(data: &[u8]) -> Option<Decoded> {
+pub(super) fn decode_pcm(data: &[u8]) -> Option<Decoded> {
     let mss = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
     let probed = symphonia::default::get_probe()
         .format(
@@ -406,7 +411,7 @@ mod tests {
     /// `eval_audio` for the non-mel ops, which ignore the mel params — keeps their tests
     /// readable at three arguments.
     fn ea(func: AudioFunc, arr: &ArrayRef, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
-        eval_audio(func, arr, rate, None, None, None, None)
+        eval_audio(func, arr, rate, None, None, None, None, None)
     }
 
     /// Build a minimal mono 16-bit PCM WAV from `samples` at `sample_rate`.

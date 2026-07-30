@@ -206,9 +206,19 @@ impl Expr {
                 hop_length,
                 n_mels,
                 n_mfcc,
+                threshold_db,
             } => {
                 let arr = input.eval(batch)?;
-                eval_audio(*func, &arr, *rate, *n_fft, *hop_length, *n_mels, *n_mfcc)
+                eval_audio(
+                    *func,
+                    &arr,
+                    *rate,
+                    *n_fft,
+                    *hop_length,
+                    *n_mels,
+                    *n_mfcc,
+                    *threshold_db,
+                )
             }
             Expr::Video { func, input } => {
                 let arr = input.eval(batch)?;
