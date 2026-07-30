@@ -765,3 +765,86 @@ def test_spill_empty_group_by_matches_in_memory():
     )
     assert spilled.num_rows == 0
     assert spilled.column_names == ["k", "s", "n"]
+
+
+def test_spill_groups_by_a_dictionary_key_whose_dictionaries_differ_per_morsel():
+    """Morsels encoding the same logical values with *different* dictionaries must group
+    together under spill.
+
+    This is the normal shape, not a corner: every Parquet row group carries its own
+    dictionary, so index 0 means one string in the first morsel and another in the second.
+    Spilling routes rows to buckets by a hash of the group key, and if that hash saw the
+    *indices* rather than the decoded values, the same logical key would land in two buckets
+    and be finalized as two groups -- a wrong answer with no error, on the encoding that
+    exists for exactly this kind of column.
+
+    Arrow's row encoding dereferences the dictionary, so it is correct today. The test exists
+    because the partitioner has raw-hash fast paths for Int64 and for mixed string/binary
+    keys, added for throughput, and a future one for dictionaries would break this silently:
+    the result stays correct for as long as every morsel happens to share a dictionary, which
+    is what a hand-built test fixture usually does.
+    """
+    forward = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 0, 1], type=pa.int32()), pa.array(["x", "y"], type=pa.string())
+    )
+    reversed_ = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 1, 0], type=pa.int32()), pa.array(["y", "x"], type=pa.string())
+    )
+    b1 = pa.record_batch({"k": forward, "v": pa.array([1, 2, 3, 4], type=pa.int64())})
+    b2 = pa.record_batch({"k": reversed_, "v": pa.array([10, 20, 30, 40], type=pa.int64())})
+    assert b1.column("k").to_pylist() == ["x", "y", "x", "y"]
+    assert b2.column("k").to_pylist() == ["y", "x", "x", "y"]
+    batches = [b1, b2]
+
+    in_memory = (
+        bt.from_arrow(pa.Table.from_batches(batches))
+        .group_by("k")
+        .agg(sv=bt.col("v").sum())
+        .collect()
+    )
+    spilled = (
+        bt.from_batches(lambda: iter(batches), b1.schema)
+        .group_by("k")
+        .agg(sv=bt.col("v").sum())
+        .collect(spill=True, num_partitions=4)
+    )
+
+    assert len(in_memory) == 2, "the fixture should produce two groups"
+    assert _norm(spilled) == _norm(in_memory), (
+        "a dictionary-encoded group key was split across spill buckets: the partitioner "
+        "hashed the indices rather than the decoded values, so the same logical key landed "
+        "in two buckets and was finalized twice"
+    )
+
+
+def test_spill_groups_by_decimal_and_timestamp_keys():
+    """Grace spilling must work for the key types a warehouse workload actually uses.
+
+    Decimal and timezone-aware timestamp keys take the partitioner's general row-encoding
+    path rather than either raw-hash fast path, so they are the types most likely to be
+    missed when a new fast path is added -- and a key type that cannot be partitioned is a
+    query that fails only once it grows large enough to spill.
+    """
+    from decimal import Decimal
+
+    n = 2000
+    decimals = pa.array(
+        [Decimal(f"{(i % 13) + 0.25:.2f}") for i in range(n)], type=pa.decimal128(10, 2)
+    )
+    stamps = pa.array(
+        [1_700_000_000 + (i % 7) * 86_400 for i in range(n)],
+        type=pa.timestamp("s", tz="UTC"),
+    )
+    table = pa.table({"d": decimals, "t": stamps, "v": pa.array(range(n), type=pa.int64())})
+    batches = table.to_batches(max_chunksize=100)
+
+    for key, expected in (("d", 13), ("t", 7)):
+        in_memory = bt.from_arrow(table).group_by(key).agg(sv=bt.col("v").sum()).collect()
+        spilled = (
+            bt.from_batches(lambda: iter(batches), batches[0].schema)
+            .group_by(key)
+            .agg(sv=bt.col("v").sum())
+            .collect(spill=True, num_partitions=8)
+        )
+        assert len(in_memory) == expected, f"{key}: fixture should give {expected} groups"
+        assert _norm(spilled) == _norm(in_memory), f"{key}: spilled result differs"
