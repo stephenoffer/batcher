@@ -48,7 +48,7 @@ def sharded_gpu_aggregate(
         no shardable reducer, an unreadable cluster — so the caller can use the single-device
         dispatch or the CPU engine instead.
     """
-    from batcher.core.gpu_plan.mergeable import shard_plan
+    from batcher.plan.distribution import shard_plan
 
     split = shard_plan(ops)
     if split is None:

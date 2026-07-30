@@ -17,7 +17,9 @@ hand it out, so a fan-out over a hundred shards moves no bulk data through the o
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from batcher.plan.distribution import nest_ops
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan import DfBackend
@@ -28,31 +30,9 @@ __all__ = [
     "gpu_shard_partial",
     "gpu_task_options",
     "gpu_task_runtime_env",
-    "nest_ops",
     "run_shard_chain",
     "run_shard_join",
 ]
-
-
-def nest_ops(ops: list[dict], source_id: int = 0) -> dict:
-    """The operator chain as one nested `RelOp` IR document over a scan.
-
-    The translator carries a chain bottom-up as a flat list, which is the convenient shape for
-    replaying it; the engine wants the nested form. Rebuilding it here is what lets the CPU
-    fallback run *the same chain* the device would have — including the partial aggregate the
-    mergeable decomposition produced — rather than an approximation of it.
-
-    Args:
-        ops: The bottom-up operator IR chain.
-        source_id: The scan's source index within the task's input list.
-
-    Returns:
-        A nested `RelOp` IR document whose leaf is a `scan`.
-    """
-    node: dict[str, Any] = {"op": "scan", "source_id": source_id}
-    for op in ops:
-        node = {**op, "input": node}
-    return node
 
 
 def _read(descriptor: dict):

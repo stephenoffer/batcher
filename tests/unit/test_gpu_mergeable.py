@@ -22,7 +22,7 @@ import batcher as bt
 from batcher import col
 from batcher.core.gpu_plan import DfBackend, gpu_plan_ops
 from batcher.core.gpu_plan.execute import run_chain
-from batcher.core.gpu_plan.mergeable import decompose
+from batcher.plan.distribution import decompose
 
 pytestmark = pytest.mark.unit
 
@@ -181,7 +181,7 @@ def test_partial_stage_is_smaller_than_its_input():
 
 def _fold_split(table: pa.Table, ops: list[dict], shard_count: int, be) -> pa.Table:
     """Run `shard_ops` per shard, then `merge_ops + tail_ops` once — the distributed shape."""
-    from batcher.core.gpu_plan.mergeable import shard_plan
+    from batcher.plan.distribution import shard_plan
 
     split = shard_plan(ops)
     assert split is not None, "this chain should be shardable"
@@ -239,7 +239,7 @@ def test_only_row_local_operators_run_below_the_cut():
     is a confidently wrong number. Cutting at the sort makes the aggregate part of the tail,
     which runs once on the merged top-N.
     """
-    from batcher.core.gpu_plan.mergeable import shard_plan
+    from batcher.plan.distribution import shard_plan
 
     ds = (
         bt.from_arrow(_table())
@@ -256,7 +256,7 @@ def test_only_row_local_operators_run_below_the_cut():
 
 def test_a_map_only_chain_has_nothing_to_fold():
     """No reducer means no fan-out: the result is every input row, so folding buys nothing."""
-    from batcher.core.gpu_plan.mergeable import shard_plan
+    from batcher.plan.distribution import shard_plan
 
     ds = bt.from_arrow(_table()).filter(col("v") > 5.0).with_columns(w=col("v") * 2.0)
     assert shard_plan(gpu_plan_ops(ds._plan)[1]) is None
@@ -264,7 +264,7 @@ def test_a_map_only_chain_has_nothing_to_fold():
 
 def test_a_limit_with_an_offset_does_not_shard():
     """A shard's rows 10..20 are not the global rows 10..20."""
-    from batcher.core.gpu_plan.mergeable import shard_plan
+    from batcher.plan.distribution import shard_plan
 
     ds = bt.from_arrow(_table()).sort("v").limit(5, offset=10)
     assert shard_plan(gpu_plan_ops(ds._plan)[1]) is None

@@ -21,7 +21,8 @@ import pytest
 import batcher as bt
 from batcher import col
 from batcher.core.gpu_plan import DfBackend, gpu_join_spec, gpu_plan_ops
-from batcher.dist.gpu.tasks import nest_ops, run_shard_chain, run_shard_join
+from batcher.dist.gpu.tasks import run_shard_chain, run_shard_join
+from batcher.plan.distribution import nest_ops
 
 pytestmark = pytest.mark.unit
 

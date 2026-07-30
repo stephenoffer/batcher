@@ -181,12 +181,16 @@ def test_packing_falls_back_to_the_local_device_off_cluster(monkeypatch):
 
 def test_routing_fits_on_one_real_gpu_where_the_t4_fallback_would_shard():
     """The end-to-end consequence: the same working set is a single dispatch on the cluster's
-    real device and a sharded (or refused) query against the driver's assumed one."""
+    real device and a sharded query against the driver's assumed one."""
     import batcher as bt
     from batcher.kyber.gpu.policy import decide_gpu_backend
 
     rows = 200_000  # ~3.2 MB of int64 pairs — small in absolute terms, but the point is the
     q = bt.from_pydict({"k": list(range(rows)), "v": list(range(rows))})  # *ratio* to the budget
+    # A group-by, so the plan HAS a mergeable reducer to shard on. Sharding is not a property
+    # of the data alone: a plan with nothing to fold cannot be split across devices however
+    # small the budget is, so a bare scan would test the budget against the wrong ladder rung.
+    q = q.group_by("k").agg(s=bt.col("v").sum())
     plan, sources = q._plan, q._sources
     # The device the cluster really has vs a budget below the working set. Real VRAM figures
     # would need a multi-GB fixture to separate; the routing ladder is the same either way.
@@ -194,3 +198,42 @@ def test_routing_fits_on_one_real_gpu_where_the_t4_fallback_would_shard():
     small = decide_gpu_backend(plan, sources, gpu_count=8, force=True, gpu_memory_gb=0.001)
     assert big.use_gpu and not big.distributed  # fits one device
     assert small.distributed  # the same data must shard against a tiny device
+
+
+def test_a_plan_with_nothing_to_fold_is_not_sharded_across_devices():
+    """Sharding needs a mergeable reducer, not just data too big for one device.
+
+    A plan with no reducer produces every input row, so splitting it across devices computes
+    the same rows in more places and still cannot fit one device to return them. Routing it to
+    a fan-out promised a scale-out that does not exist, and the single dispatch underneath it
+    would OOM and fall back anyway; the spillable CPU engine is the honest destination, and the
+    reason says so.
+    """
+    import batcher as bt
+    from batcher.kyber.gpu.policy import decide_gpu_backend
+
+    rows = 200_000
+    q = bt.from_pydict({"k": list(range(rows)), "v": list(range(rows))})
+    tiny = decide_gpu_backend(q._plan, q._sources, gpu_count=8, force=True, gpu_memory_gb=0.001)
+    assert not tiny.use_gpu and not tiny.distributed
+    assert "no mergeable reducer" in tiny.reason
+    # ...and with room on one device it is a perfectly ordinary single dispatch.
+    roomy = decide_gpu_backend(q._plan, q._sources, gpu_count=8, force=True, gpu_memory_gb=80.0)
+    assert roomy.use_gpu and not roomy.distributed
+
+
+def test_a_reducing_chain_is_sized_by_what_it_processes_not_what_it_returns():
+    """`group_by().agg().sort().limit(10)` processes the scan, and returns ten rows.
+
+    Estimating the OUTPUT put every such query below the small-input threshold and refused it
+    the GPU on the grounds that ten rows do not amortize a kernel launch — with a scan of any
+    size underneath it. The estimate has to descend past the whole run of reducing operators,
+    not just the top one.
+    """
+    import batcher as bt
+    from batcher.kyber.gpu.policy import _estimate
+
+    rows = 200_000
+    q = bt.from_pydict({"k": list(range(rows)), "v": list(range(rows))})
+    deep = q.group_by("k").agg(s=bt.col("v").sum()).sort("s").limit(10)
+    assert _estimate(deep._plan, deep._sources, None)[0] == rows

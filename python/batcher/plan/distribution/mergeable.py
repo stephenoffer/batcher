@@ -1,9 +1,15 @@
-"""Split a translated chain into a per-shard stage and a merge stage, in the plan IR.
+"""Split a chain of operators into a per-shard stage and a merge stage, in the plan IR.
 
-This is what lets the GPU backend use more than one device. Each device runs the chain's
-reducing prefix over the shard it read itself, and the small results are folded once — the
-same mergeable algebra the CPU engine's distributed path uses, so the multi-device result is
-identical to the single-device one by construction rather than by testing.
+This is the mergeable algebra stated at the level of the wire contract: `partial -> combine ->
+finalize` for an aggregate, and the shard/merge pair for the other reducers. Each shard runs
+the chain's reducing prefix over the rows it holds, and the small results are folded once, so a
+distributed result is identical to a single-node one by construction rather than by testing.
+
+It lives in `plan` because two layers need it and they cannot import each other. `dist`
+*executes* the split (fanning shards across GPUs); `kyber` *decides* on it (a plan that shards
+is bounded by its shard size, not by one device's memory, which changes where the optimizer
+routes it). Stating the algebra twice is the one way those two could ever disagree, and a
+disagreement here is a wrong answer rather than a slow one.
 
 Everything here is expressed as **more plan IR**, not as a second set of kernels: a partial
 aggregate and its combine are both `aggregate` nodes, a finalize is a `project`, and a sharded
@@ -27,9 +33,11 @@ gets a plausible wrong answer:
 
 from __future__ import annotations
 
+from typing import Any
+
 from batcher.plan.ir_tags import Op
 
-__all__ = ["decompose", "shard_plan"]
+__all__ = ["ROW_LOCAL_OPS", "decompose", "flatten_ops", "nest_ops", "shard_plan"]
 
 #: Operators whose output for a row depends only on that row, so a shard can run them over the
 #: rows it holds and get the same answer it would have as part of the whole.
@@ -187,3 +195,48 @@ def _plan_one(spec: dict, slot: int):
             },
         )
     return None
+
+
+def nest_ops(ops: list[dict], source_id: int = 0) -> dict:
+    """A flat bottom-up operator chain as one nested `RelOp` IR document over a scan.
+
+    A chain is convenient to *rewrite* as a list and required to be *nested* to run, so both
+    shapes exist and one function converts each way. The pair matters beyond convenience: the
+    CPU substitute for a lost GPU shard is the same chain handed to the engine, so a drift
+    between the two forms would have the substitute answer a different question.
+
+    Args:
+        ops: The bottom-up operator IR chain.
+        source_id: The scan's source index within the executing task's input list.
+
+    Returns:
+        A nested `RelOp` IR document whose leaf is a `scan`.
+    """
+    node: dict[str, Any] = {"op": Op.SCAN, "source_id": source_id}
+    for op in ops:
+        node = {**op, "input": node}
+    return node
+
+
+def flatten_ops(ir: dict) -> list[dict] | None:
+    """A nested single-source `RelOp` document as a flat bottom-up chain, or `None`.
+
+    `None` when the document is not a linear chain over one scan — a join or a union has two
+    inputs, so there is no single list of operators it is equivalent to.
+
+    Args:
+        ir: A nested `RelOp` IR document.
+
+    Returns:
+        The bottom-up operator chain, or `None` when the document branches.
+    """
+    ops: list[dict] = []
+    node = ir
+    while node.get("op") != Op.SCAN:
+        child = node.get("input")
+        if not isinstance(child, dict):
+            return None
+        ops.append({k: v for k, v in node.items() if k != "input"})
+        node = child
+    ops.reverse()
+    return ops

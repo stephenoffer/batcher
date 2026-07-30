@@ -10,13 +10,12 @@ from __future__ import annotations
 
 from batcher.dist.gpu.aggregate import sharded_gpu_aggregate
 from batcher.dist.gpu.dispatch import gpu_chain_on_worker, gpu_join_on_worker
-from batcher.dist.gpu.tasks import gpu_task_options, gpu_task_runtime_env, nest_ops
+from batcher.dist.gpu.tasks import gpu_task_options, gpu_task_runtime_env
 
 __all__ = [
     "gpu_chain_on_worker",
     "gpu_join_on_worker",
     "gpu_task_options",
     "gpu_task_runtime_env",
-    "nest_ops",
     "sharded_gpu_aggregate",
 ]

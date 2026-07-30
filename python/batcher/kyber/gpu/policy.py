@@ -56,18 +56,26 @@ def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None)
     """`(rows, working_set_gb)` for the volume the GPU actually processes, or `(None, None)` when
     the size is unknown (an estimator failure or an unbounded source).
 
-    For a *reducing* top operator (a group-by aggregate or a distinct) the plan's OUTPUT
-    cardinality is the group/distinct count — a handful of rows — which massively understates the
-    work and the memory: the GPU reads and reduces the whole INPUT. So we estimate the input to a
-    reducing top node, not its output. A map-shaped plan (filter/project) already has
-    output ≈ processed, so it estimates the plan directly."""
+    For a *reducing* operator the plan's OUTPUT cardinality massively understates the work and
+    the memory: the GPU reads and reduces the whole INPUT. So the estimate descends past every
+    reducing node to the first one whose output is what it processes.
+
+    Descending past a **run** of them, rather than only the top node, is what makes the common
+    analytical shape estimable at all: `group_by().agg().sort().limit(10)` has a `Limit` on top,
+    whose output cardinality is ten. Estimating that put every such query below the small-input
+    threshold and refused it the GPU on the grounds that ten rows do not amortize a kernel
+    launch — while the scan underneath it was a billion rows. A map-shaped plan (filter/project)
+    already has output ~ processed, so it estimates directly."""
     from batcher.kyber import load_learned_stats
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.plan.logical import Aggregate, Distinct
+    from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 
     target = plan
-    if isinstance(plan, (Aggregate, Distinct)) and getattr(plan, "input", None) is not None:
-        target = plan.input
+    while isinstance(target, (Aggregate, Distinct, Limit, Sort)):
+        below = getattr(target, "input", None)
+        if below is None:
+            break
+        target = below
     try:
         learned = load_learned_stats(hub) if hub is not None else None
         est = CardinalityEstimator(sources=sources, learned=learned)
@@ -158,13 +166,57 @@ def decide_gpu_backend(
     )
     if ws_gb <= one_gpu_gb:
         return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows)
-    if ws_gb <= one_gpu_gb * gpu_count:
+    shardable = _is_shardable(plan)
+    if ws_gb <= one_gpu_gb * gpu_count and shardable:
         return GpuDecision(
             True, True, f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs", rows
         )
-    return GpuDecision(
-        False, False, f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs: CPU engine (spillable)", rows
-    )
+    # Beyond the cluster's *aggregate* VRAM the question is no longer how much memory the
+    # cluster has at once, but how small a shard can be made. A plan with a mergeable reducer
+    # oversubscribes shards past the device count and pipelines them, so what has to fit a
+    # device is one shard, not the working set — and each shard reduces to one row per group
+    # before anything is folded. Refusing those outright meant the fan-out built for exactly
+    # this case could never be reached: the rule turned "too big for one pass" into "too big
+    # for the GPU at all".
+    #
+    # A plan with NO mergeable reducer genuinely does need the whole set resident, so it still
+    # goes to the (spillable) CPU engine.
+    shards = gpu_count * max(1, int(dc.gpu_shard_oversubscribe))
+    if shardable and ws_gb / shards <= one_gpu_gb:
+        return GpuDecision(
+            True,
+            True,
+            f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs, but shards to "
+            f"~{ws_gb / shards:.2f}GB across {shards}",
+            rows,
+        )
+    # Not shardable, and larger than one device. A single dispatch is the only accelerated form
+    # available and it does not fit, so it would OOM and fall back anyway; the CPU engine spills
+    # and is the honest destination. Reported as such rather than attempted and abandoned.
+    why = "exceeds all" if ws_gb > one_gpu_gb * gpu_count else "exceeds one"
+    reason = "no mergeable reducer to shard on" if not shardable else "CPU engine (spillable)"
+    return GpuDecision(False, False, f"~{ws_gb:.1f}GB {why} GPU: {reason}", rows)
+
+
+def _is_shardable(plan: LogicalPlan) -> bool:
+    """Whether `plan` has a mergeable reducer, so its per-device memory is the shard's.
+
+    Answered from the plan's own IR through the shared algebra in `plan.mergeable`, rather
+    than re-derived here: the optimizer routing a plan to the fan-out and the backend building
+    the fan-out must agree about which plans have one, and two statements of that rule are the
+    one way they could ever disagree.
+
+    Never raises: a plan that cannot be lowered (a `map_batches` UDF) simply is not shardable.
+    """
+    from batcher._internal.logging import note_suppressed
+    from batcher.plan.distribution import flatten_ops, shard_plan
+
+    try:
+        ops = flatten_ops(plan.to_ir())
+        return ops is not None and shard_plan(ops) is not None
+    except Exception as exc:  # pragma: no cover - routing must never break a plan
+        note_suppressed("kyber", "test the plan for a mergeable reducer", exc)
+        return False
 
 
 @dataclass(frozen=True, slots=True)
