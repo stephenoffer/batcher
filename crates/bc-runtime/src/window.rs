@@ -683,18 +683,12 @@ fn try_ordered_partitions_packed(
 
 /// The order-preserving leading 8 bytes of an encoded row, as a `u64`.
 ///
-/// arrow's row format is byte-lexicographic, so the big-endian `u64` of a row's first 8 bytes
-/// orders identically to the row's leading bytes; carrying this inline with the row index
-/// (see the sort in [`ordered_partitions_by_global_sort`]) resolves almost every comparison
-/// in-register, without dereferencing the full (wider, randomly accessed) Rows buffer. Rows
-/// shorter than 8 bytes are zero-padded — correct, since a shorter row is lexicographically
-/// smaller and the full-row tie-break handles the pad-equal case.
-fn row_prefix(d: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    let n = d.len().min(8);
-    buf[..n].copy_from_slice(&d[..n]);
-    u64::from_be_bytes(buf)
-}
+/// This crate found the technique — carrying the prefix inline with the row index (see the
+/// sort in [`ordered_partitions_by_global_sort`]) resolves almost every comparison in-register
+/// instead of dereferencing the wider, randomly accessed `Rows` buffer, which was the whole
+/// window cost. `bc-arrow`'s multi-key row sort now uses the same trick, so the definition
+/// lives there, in the lowest crate both can see, rather than in two places.
+use bc_arrow::row_sort::row_prefix;
 
 /// `row_number`: 1..n in order, unique per row. Scattered to original positions.
 fn row_number(ordered: &[Vec<usize>], num_rows: usize) -> ArrayRef {
