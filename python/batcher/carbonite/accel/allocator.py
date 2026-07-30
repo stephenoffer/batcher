@@ -305,7 +305,17 @@ def _visible_device_usable_bytes(headroom: float) -> int:
     devices = gpu_inventory()
     if not devices:
         return 0
-    pool = VramPool(capacity_bytes=int(devices[0].get("memory_bytes", 0) or 0), headroom=headroom)
+    # Under MPS this process shares one device with its co-tenants, and they all start at
+    # once against an empty device: without a declared share each would plan for the whole of
+    # it and they would fail together. `mps_client_share` is `1.0` off MPS and wherever the
+    # tenancy is unpublished, which is the sizing this pool has always done.
+    from batcher.carbonite.accel.affinity import mps_client_share
+
+    pool = VramPool(
+        capacity_bytes=int(devices[0].get("memory_bytes", 0) or 0),
+        headroom=headroom,
+        share=mps_client_share(),
+    )
     if not pool.capacity_bytes:
         return 0
     for telemetry in device_telemetry()[:1]:

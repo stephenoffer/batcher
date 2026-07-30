@@ -28,8 +28,10 @@ def _device_rows() -> list[dict]:
     """Per-device rows: nameplate figures for what is attached, live readings where available."""
     from batcher._internal.device_specs import device_spec, resolve_device_name
     from batcher._internal.hardware import device_telemetry, gpu_inventory
+    from batcher._internal.hardware.faults import device_faults
 
     live = {d.index: d for d in device_telemetry()}
+    faults = {f.index: f for f in device_faults()}
     rows: list[dict] = []
     for index, device in enumerate(gpu_inventory()):
         name = str(device.get("name") or "")
@@ -58,8 +60,46 @@ def _device_rows() -> list[dict]:
                 row["throttled"] = list(reading.throttle_reasons)
             if reading.ecc_uncorrected:
                 row["ecc_uncorrected"] = reading.ecc_uncorrected
+        _add_measured_link(row, index)
+        _add_faults(row, faults.get(index))
         rows.append(row)
     return rows
+
+
+def _add_measured_link(row: dict, index: int) -> None:
+    """Add what the device's host link *negotiated*, where it differs from the nameplate.
+
+    The nameplate `host_link` above says what the model ships with. This says what this board
+    came up at, and only when the two disagree — a link at full capability adds nothing a
+    reader needs, while one at half width is the whole explanation for a transfer-bound stage
+    that used to be fast.
+    """
+    from batcher._internal.hardware.fabric.device_links import device_pcie_links
+
+    links = device_pcie_links()
+    if index >= len(links):
+        return
+    link = links[index]
+    if link.numa_node >= 0:
+        # Which socket the device hangs off: the host half of its pipeline belongs there too.
+        row["numa_node"] = link.numa_node
+    if link.degraded:
+        row["link_degraded"] = f"gen{link.gen} x{link.width} of gen{link.max_gen} x{link.max_width}"
+        row["link_efficiency"] = round(link.degradation_ratio, 3)
+
+
+def _add_faults(row: dict, faults) -> None:
+    """Add the memory-fault counters that predict a device failing, where any are non-zero."""
+    if faults is None or not faults.readable:
+        return
+    if faults.remap_failure:
+        row["remap_failure"] = True
+    if faults.needs_reset:
+        row["reset_pending"] = True
+    if faults.remapped_uncorrectable:
+        row["remapped_uncorrectable"] = faults.remapped_uncorrectable
+    if faults.pcie_replay:
+        row["pcie_replay"] = faults.pcie_replay
 
 
 def accelerators() -> dict:
@@ -77,7 +117,10 @@ def accelerators() -> dict:
         `power` (the configured budget, the measured draw where telemetry is available, and
         the full-load draw per power zone). A device row carries its host link and fabric
         bandwidth where the model is recognized, which is what makes a transfer-bound stage
-        diagnosable from the report alone.
+        diagnosable from the report alone. On a GPU cloud two more keys appear: `site` (the
+        provider, instance type, region, scheduler, and the local scratch volume in force) and
+        `fabric` (RDMA port state and aggregate rate, and NVLink link counts). Both are omitted
+        where nothing could be read, so the report stays the same size on a laptop.
 
     Examples:
         .. doctest::
@@ -93,6 +136,8 @@ def accelerators() -> dict:
     from batcher.config import active_config
 
     report: dict = {"backend": accelerator_backend(), "devices": _device_rows()}
+    _add_site(report)
+    _add_fabric(report)
 
     from batcher.dist.executors.ray_runtime.fabric import topology_summary
 
@@ -116,6 +161,67 @@ def accelerators() -> dict:
             power["by_zone_watts"] = zones
     report["power"] = power
     return report
+
+
+def _show_silent_faults(devices: list[dict]) -> None:
+    """Call out, by device, the conditions that cost throughput without costing correctness.
+
+    The same treatment thermal clamping and ECC already get, for the two faults that are just
+    as invisible from a job's own timings: a host link that renegotiated low, and memory that
+    has repaired itself as far as it can. Neither fails a query, neither appears in a profile,
+    and both are worth a line in a report someone pastes into a bug.
+    """
+    for row in devices:
+        if row.get("link_degraded"):
+            print(
+                f"gpu {row['index']}  host link at {row['link_degraded']} "
+                f"({row['link_efficiency']:.0%} of nameplate bandwidth)"
+            )
+        if row.get("remap_failure"):
+            print(f"gpu {row['index']}  memory row remapping has FAILED: device needs replacing")
+        elif row.get("reset_pending"):
+            print(f"gpu {row['index']}  memory repair pending: schedule a device reset")
+
+
+def _add_site(report: dict) -> None:
+    """Add where this process is running, when the environment says anything at all.
+
+    Omitted entirely on a laptop and in CI, where every field would be empty: a report that
+    prints "provider: unknown, scheduler: none" has told the reader nothing and cost them a
+    line. On a GPU cloud it is the first thing that explains a default — which mount the spill
+    went to, which node list a job was given.
+    """
+    from batcher._internal.site import scheduler_kind, site_profile, site_summary
+
+    if not (site_profile().known or scheduler_kind() != "none"):
+        return
+    site = site_summary()
+    from batcher._internal.site import local_scratch_root
+
+    scratch = local_scratch_root()
+    if scratch:
+        site["scratch_dir"] = scratch
+    report["site"] = site
+
+
+def _add_fabric(report: dict) -> None:
+    """Add the node's interconnect, when there is one to report.
+
+    Two facts a cross-node stage is bounded by and nothing else in this report carries: what
+    the NICs actually sustain, and whether the device fabric is up. Both are omitted on a node
+    with neither, which is every machine without RDMA hardware.
+    """
+    from batcher._internal.hardware.fabric import nvlink_summary, rdma_summary
+
+    fabric: dict = {}
+    rdma = rdma_summary()
+    if rdma["ports"]:
+        fabric["rdma"] = rdma
+    nvlink = nvlink_summary()
+    if nvlink["links"]:
+        fabric["nvlink"] = nvlink
+    if fabric:
+        report["fabric"] = fabric
 
 
 def show_accelerators() -> None:
@@ -147,6 +253,32 @@ def show_accelerators() -> None:
         for row in devices:
             if "power_watts" not in row:
                 print(f"gpu {row['index']}  {row['name']}  (no live telemetry)")
+        _show_silent_faults(devices)
+    site = report.get("site")
+    if site:
+        line = f"site: {site['provider']}"
+        if site.get("instance_type"):
+            line += f" {site['instance_type']}"
+        if site.get("region"):
+            line += f" in {site['region']}"
+        print(f"{line}, scheduled by {site['scheduler']}")
+        if site.get("scratch_dir"):
+            print(f"      local scratch {site['scratch_dir']}")
+    fabric = report.get("fabric")
+    if fabric:
+        rdma = fabric.get("rdma")
+        if rdma:
+            layers = ", ".join(f"{n} x {k}" for k, n in sorted(rdma["link_layers"].items()))
+            print(
+                f"fabric: {rdma['active_ports']}/{rdma['ports']} RDMA port(s) up "
+                f"({rdma['bandwidth_gbps']:.0f} Gb/s, {layers or 'unreported'})"
+            )
+        nvlink = fabric.get("nvlink")
+        if nvlink:
+            print(
+                f"        NVLink {nvlink['active_links']}/{nvlink['links']} link(s) up "
+                f"across {nvlink['devices']} device(s)"
+            )
     fleet = report.get("fleet")
     if fleet:
         models = ", ".join(fleet["device_models"]) or "unlabelled"

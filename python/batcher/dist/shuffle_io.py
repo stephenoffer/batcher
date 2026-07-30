@@ -16,6 +16,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import IOError
 from batcher._internal.paths import open_private, private_dir
+from batcher._internal.site import local_scratch_root
 
 __all__ = [
     "distributed_work_dir",
@@ -81,6 +82,13 @@ def distributed_work_dir(prefix: str) -> str:
         # directory 0700; this closes the parent, which nothing else does.
         private_dir(root)
         return tempfile.mkdtemp(prefix=prefix, dir=root)
+    # No shared mount: this is a genuine single node, so node-local scratch is correct — and
+    # the node's measured local volume is a better one than the container root's overlay,
+    # which is where a bare tempdir lands on a GPU node.
+    local = local_scratch_root()
+    if local:
+        private_dir(local)
+        return tempfile.mkdtemp(prefix=prefix, dir=local)
     return tempfile.mkdtemp(prefix=prefix)
 
 

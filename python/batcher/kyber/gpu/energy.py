@@ -168,7 +168,11 @@ class EnergyAdvice:
         speedup: Expected throughput ratio against the CPU path, `0.0` when unknown.
         power_ratio: Device draw against the CPU path's draw, `0.0` when unknown.
         energy_ratio: Expected device energy against CPU energy for the same work; below
-            `1.0` means the device is the cheaper machine to run.
+            `1.0` means the device is the cheaper machine to run. The CPU side of that ratio
+            is a *constant* — one server's draw and vector throughput — not a measurement of
+            the machine in hand, so treat this as a comparison between candidate devices
+            rather than as a figure to bill against. The measured counterpart is
+            `learned_work_per_joule`, and it takes precedence wherever it exists.
         transfer_share: Fraction of the device's time spent moving bytes across the host link
             rather than computing. Above roughly a half the stage is a copy with a kernel
             attached, and no faster device fixes it — the fix is to keep the data resident or
@@ -193,9 +197,11 @@ _CPU_PATH_WATTS = 400.0
 #: two-socket server reaches with AVX-512. Used only as the denominator of a ratio.
 _CPU_PATH_TFLOPS = 2.0
 
-#: Fraction of the input a relational stage typically returns, used to charge the result's trip
-#: back across the host link. Aggregates and filters return far less than they read, which is
-#: why charging a full round trip would over-penalize exactly the shapes a device is good at.
+#: Default fraction of the input a stage returns, used to charge the result's trip back across
+#: the host link. 0.1 describes the *reducing* shapes this decision actually routes — group-by
+#: aggregates, distinct, top-N — where the output is a group count rather than a row count.
+#: It is wrong by an order of magnitude for a projection, which returns what it reads, so a
+#: caller with a non-reducing shape passes its own figure rather than inheriting this one.
 _RESULT_FRACTION = 0.1
 
 
@@ -208,6 +214,8 @@ def device_energy_advice(
     achieved_fraction: float = 1.0,
     resident: bool = False,
     precision: str = "half",
+    link_efficiency: float = 1.0,
+    result_fraction: float = _RESULT_FRACTION,
 ) -> EnergyAdvice:
     """Judge a stage's device move on time *and* energy, with the host copy charged for.
 
@@ -241,6 +249,14 @@ def device_energy_advice(
             the rate on the generations that have one and absent on those that do not — so
             asking for it where it does not exist falls back to the half-precision figure
             rather than inventing a rate.
+        result_fraction: Bytes returned per byte read. The default describes the reducing
+            shapes this decision routes; a projection returns roughly what it reads and should
+            pass `1.0`, which doubles the copy and moves the verdict accordingly.
+        link_efficiency: Fraction of its nameplate host link the device's *measured* PCIe link
+            actually negotiated, in (0, 1]. A card that came up at x8 gen4 against a x16 gen5
+            slot passes `0.25`, and the copy term grows fourfold — which is the honest figure
+            and is exactly the shape of node where a device decision goes wrong unnoticed.
+            `1.0`, the default, is the nameplate assumption every caller made before.
 
     Returns:
         The advice. With an unrecognized device every ratio is `0.0` and `worth_it` is True,
@@ -278,10 +294,13 @@ def device_energy_advice(
 
     transfer_seconds = 0.0
     if not resident:
-        transfer_seconds = host_transfer_seconds(bytes_per_row, accelerator_type)
-        transfer_seconds += host_transfer_seconds(
-            bytes_per_row * _RESULT_FRACTION, accelerator_type
-        )
+        # A measured link below nameplate stretches the copy by exactly its reciprocal: the
+        # bytes are unchanged and the wire is narrower. Clamped into (0, 1] so a nonsensical
+        # ratio cannot divide by zero or make the copy free.
+        link = min(1.0, max(1e-3, link_efficiency))
+        transfer_seconds = host_transfer_seconds(bytes_per_row, accelerator_type) / link
+        returned = bytes_per_row * max(0.0, result_fraction)
+        transfer_seconds += host_transfer_seconds(returned, accelerator_type) / link
     device_seconds = kernel_seconds + transfer_seconds
 
     speedup = cpu_seconds / device_seconds if device_seconds > 0 else 0.0

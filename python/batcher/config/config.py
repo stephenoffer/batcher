@@ -1060,6 +1060,21 @@ class DistributedConfig:
     #       error can't be attributed to one split, is bypassed for the per-split reader),
     #       so one bad file never discards its healthy siblings in the same partition.
     on_read_error: str = "error"
+    # Advertise each worker's *fabric* address for the shuffle instead of the address Ray
+    # knows it by. Off by default, and worth turning on for exactly one shape of cluster: a
+    # GPU node whose Ray IP is its management Ethernet while its InfiniBand ports — two orders
+    # of magnitude faster — carry nothing, because nothing addresses them. With it on, each
+    # worker resolves its own active fabric interface's IPv4 address and advertises that, which
+    # is the same fix `BATCHER_ADVERTISE_HOST` performs by hand except that it needs setting
+    # once for the cluster rather than once per node.
+    #
+    # Off by default because it can only be verified per deployment: the fabric address has to
+    # be routable *between workers*, and a fleet where some nodes have IPoIB configured and
+    # others do not would advertise addresses half its peers cannot dial. A worker that finds
+    # no fabric address keeps its Ray address, so a partially-configured fleet degrades one
+    # node at a time rather than failing the shuffle; `BATCHER_ADVERTISE_HOST` still wins over
+    # both, because a node that names its own address has already settled the question.
+    prefer_fabric_interface: bool = False
     # Ray-level task/actor fault tolerance — the *first* line of defense, beneath the
     # shuffle recompute loop above. A transient task failure (a flaky node, a dropped
     # connection) is retried by Ray itself before the heavier app-level recompute

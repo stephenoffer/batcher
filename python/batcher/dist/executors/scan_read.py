@@ -18,6 +18,7 @@ they live here as the single source of truth.
 from __future__ import annotations
 
 import collections
+import functools
 import os
 import threading
 from inspect import signature
@@ -120,7 +121,28 @@ def _default_scan_cache_cap() -> int:
     return int(total * frac / _scan_cache_siblings())
 
 
-_SCAN_CACHE_CAP = int(os.environ.get("BATCHER_SCAN_CACHE_BYTES", str(_default_scan_cache_cap())))
+@functools.lru_cache(maxsize=1)
+def _scan_cache_cap() -> int:
+    """The per-process scan-cache ceiling, resolved on first use rather than on import.
+
+    Computed lazily for one reason: `_scan_cache_siblings` asks Ray how many CPUs this node
+    has, and doing that at module scope meant *importing Ray* — 0.44 s and a heavyweight
+    dependency — inside every purely local query, which reaches this module through the
+    partition planner and never touches a cluster.
+    `tests/unit/test_cold_start_imports.py` exists to catch exactly that, and a module-level
+    constant is how it comes back: the import moves from a call site someone would notice to
+    one nobody reads.
+
+    Memoized, so the answer is still computed once per process and every reader after the
+    first pays a dictionary lookup.
+
+    Returns:
+        The cache ceiling in bytes, from `BATCHER_SCAN_CACHE_BYTES` when set.
+    """
+    override = os.environ.get("BATCHER_SCAN_CACHE_BYTES")
+    return int(override) if override else _default_scan_cache_cap()
+
+
 _SCAN_CACHE: collections.OrderedDict = collections.OrderedDict()  # key -> (bytes, [batches])
 _SCAN_CACHE_BYTES = 0
 _SCAN_CACHE_LOCK = threading.Lock()
@@ -224,14 +246,14 @@ def scan_cache_stats() -> dict[str, int | float]:
 
 def _scan_cache_put(key, batches, nbytes) -> None:
     global _SCAN_CACHE_BYTES
-    if nbytes > _SCAN_CACHE_CAP:
+    if nbytes > _scan_cache_cap():
         return
     with _SCAN_CACHE_LOCK:
         if key in _SCAN_CACHE:
             return
         _SCAN_CACHE[key] = (nbytes, batches)
         _SCAN_CACHE_BYTES += nbytes
-        while _SCAN_CACHE_BYTES > _SCAN_CACHE_CAP and _SCAN_CACHE:
+        while _scan_cache_cap() < _SCAN_CACHE_BYTES and _SCAN_CACHE:
             _evk, (evb, _ev) = _SCAN_CACHE.popitem(last=False)  # evict least-recently-used
             _SCAN_CACHE_BYTES -= evb
 
@@ -251,7 +273,7 @@ def _read_split_batches(splits, projection, predicate, on_read_error="error"):
     Under ``on_read_error="skip"`` the read bypasses the cache and the coalesced bulk
     scans for the per-split reader, so an unreadable split is skipped in isolation without
     poisoning a cache entry (see `_read_split_batches_uncached`)."""
-    if on_read_error == "skip" or not (_SCAN_CACHE_CAP > 0 and splits and _all_rowgroup(splits)):
+    if on_read_error == "skip" or not (_scan_cache_cap() > 0 and splits and _all_rowgroup(splits)):
         yield from _read_split_batches_uncached(splits, projection, predicate, on_read_error)
         return
     key = _scan_cache_key(splits, projection, predicate)
@@ -270,7 +292,7 @@ def _read_split_batches(splits, projection, predicate, on_read_error="error"):
         if acc is not None:
             acc.append(batch)
             acc_bytes += retained_bytes(batch)
-            if acc_bytes > _SCAN_CACHE_CAP:
+            if acc_bytes > _scan_cache_cap():
                 acc = None  # too large to cache; keep streaming
     if acc is not None:
         _scan_cache_put(key, acc, acc_bytes)

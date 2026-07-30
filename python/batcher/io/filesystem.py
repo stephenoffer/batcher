@@ -56,14 +56,38 @@ _OBJECT_STORE_SCHEMES = frozenset(
 _SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs", "wasbs": "wasb"}
 
 
+#: IO threads per usable core, and the band the result is clamped into. An IO thread spends
+#: almost all of its life blocked on a socket, so the right count tracks how much the *link*
+#: can carry rather than how much the CPU can compute — which is why it is deliberately an
+#: oversubscription of cores and not a share of them. The floor keeps the previous behavior on
+#: a small container; the ceiling stops a 192-core GPU node from opening connections faster
+#: than any object store will accept them.
+_IO_THREADS_PER_CORE = 4
+_IO_THREADS_FLOOR = 32
+_IO_THREADS_CEILING = 256
+
+
 @functools.cache
 def ensure_io_threads() -> None:
     """Lift pyarrow's IO thread pool above its 8-thread default, once per process.
 
     A wide object-store read is otherwise throttled to ~8 concurrent GETs, so a
     many-small-files scan can't saturate the link. Idempotent/cached; a no-op if the pool
-    is already wider. `BATCHER_IO_THREADS` overrides the target (default 32)."""
-    target = max(8, int(os.environ.get("BATCHER_IO_THREADS", "32")))
+    is already wider. `BATCHER_IO_THREADS` overrides the target.
+
+    The target scales with the cores this process may use rather than sitting at a constant.
+    A dense GPU node reads from object storage over a link two orders of magnitude faster than
+    the small VM the old constant was chosen on, and 32 concurrent GETs leave most of it idle
+    — while the same 32 on a four-core container are more connections than it can service.
+    Both are the same mistake, made in opposite directions by one number."""
+    from batcher._internal.hardware import available_cpu_count
+
+    override = os.environ.get("BATCHER_IO_THREADS")
+    if override:
+        target = max(8, int(override))
+    else:
+        scaled = _IO_THREADS_PER_CORE * available_cpu_count()
+        target = max(_IO_THREADS_FLOOR, min(_IO_THREADS_CEILING, scaled))
     if pa.io_thread_count() < target:
         pa.set_io_thread_count(target)
     cap_arrow_cpu_threads()

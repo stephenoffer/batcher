@@ -110,6 +110,16 @@ class DeviceHealthConfig:
     #: requires `pynvml` on every worker; with it off, every device is assumed healthy, which
     #: is the behavior the scheduler already had.
     enabled: bool = False
+    #: Take a device out of rotation when its memory row remapping has *failed*. On by
+    #: default, and for a stronger reason than the ECC rule above: a remap failure means the
+    #: spare rows are exhausted, so unlike a thermal clamp there is no state the device
+    #: recovers to and no reset that repairs it.
+    quarantine_on_remap_failure: bool = True
+    #: Stop scheduling onto a device that is holding a memory repair until its next reset.
+    #: Off by default: such a device is still returning correct results, and draining it
+    #: mid-run costs more than waiting for a boundary. Turn it on where a run is long enough
+    #: that "the next boundary" is hours away.
+    drain_on_reset_pending: bool = False
 
 
 #: Device allocator strategies. `default` is one driver allocation per request (CUDA's own,
@@ -174,6 +184,16 @@ class AcceleratorConfig:
     #: enough, and report it when it does not. On by default: the alternative is an
     #: all-reduce that silently leaves the fast path.
     fabric_aware_placement: bool = True
+    #: The node's aggregate RDMA fabric rate in gigabits per second, for a deployment where
+    #: `/sys/class/infiniband` is not visible in the container. `0.0` measures it, and reports
+    #: nothing when it cannot — which keeps the cost model's default `net` weight rather than
+    #: inventing a NIC. Set this on a Kubernetes fleet whose pods do not mount the host's
+    #: `/sys`, where the fabric is real and simply unreadable from inside.
+    fabric_gbps: float = 0.0
+    #: Pin a GPU worker's host-side threads to the CPUs on its device's NUMA node. On by
+    #: default and self-limiting: it does nothing where the kernel publishes no mapping and
+    #: refuses itself where the local core set is too small to decode in.
+    bind_host_to_device_numa: bool = True
     #: Prefer a MIG partition over a whole device when a model fits one. On by default — a
     #: partition gives memory and fault isolation that fractional scheduling does not.
     prefer_mig: bool = True

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 __all__ = [
     "local_device_name",
+    "measured_link_class",
     "minimum_tensor_parallel_size",
     "nvlink_class",
     "warn_about_tensor_parallelism",
@@ -111,13 +112,17 @@ def warn_about_tensor_parallelism(
 ) -> None:
     """Say once when the declared TP degree looks wrong for this model and this hardware.
 
-    Two distinct mistakes, with opposite fixes:
+    Three distinct mistakes, with different fixes:
 
     * **Too low** — the weights cannot fit the group at all, so the engine will OOM on
       load. Better said before the model download than after it.
     * **Too high for the interconnect** — TP>=2 on a PCIe-only card costs a measured
       30-50% throughput. Sometimes unavoidable (the model must fit); worth knowing either
       way, because the same setting on an NVLink card is nearly free.
+    * **The interconnect is not what the card says** — an SXM board whose NVLink is down is
+      a PCIe card that every nameplate check calls an NVLink one. It is the same throughput
+      loss with none of the visibility, and unlike the two above it is a node fault rather
+      than a setting, so the fix is to drain the node instead of changing the degree.
 
     Nothing is changed: the degree stays exactly what the caller asked for. The penalty is
     hardware-specific and unmeasurable from here, so this is advice, not a decision.
@@ -141,6 +146,14 @@ def warn_about_tensor_parallelism(
             f"{(vram_gb or 0) * max(1, declared):.0f} GB of VRAM to live in. It will very "
             f"likely fail to load; tensor_parallel_size={needed} is the smallest group that "
             f"fits."
+        )
+    elif declared >= 2 and link == "nvlink" and measured_link_class() == "pcie":
+        message = (
+            f"tensor_parallel_size={declared} on {device_name}, whose NVLink fabric is "
+            f"reported DOWN on this node. The card supports NVLink, so the group looks free "
+            f"on paper; with the links down every forward all-reduces over PCIe instead, at "
+            f"a fraction of the rate. This is a node fault, not a setting: check "
+            f"`bt.accelerators()['fabric']` and drain the node if the links do not come back."
         )
     elif declared >= 2 and link == "pcie":
         message = (
@@ -176,3 +189,29 @@ def local_device_name() -> str | None:
         return str(torch.cuda.get_device_name(0))
     except Exception:  # pragma: no cover - no driver, no device, or an older torch
         return None
+
+
+def measured_link_class() -> str:
+    """What this node's device fabric is *doing*, as opposed to what its cards support.
+
+    `nvlink_class` reads a model name, which says what the hardware can do. This reads the
+    links, which says what they are doing — and the two differ on exactly the node where it
+    matters: a board whose NVLink has dropped still reports an NVLink-capable model, so every
+    nameplate check clears it while its collectives run over PCIe.
+
+    Returns:
+        `"nvlink"` when every device with a fabric has all of its links up, `"pcie"` when
+        devices report links and none are up, and `"unknown"` when the driver publishes
+        nothing — including on a node whose cards have no NVLink at all, where "down" would
+        be a misleading way to say "absent".
+    """
+    from batcher._internal.hardware.fabric import nvlink_status
+
+    records = [status for status in nvlink_status() if status.links > 0]
+    if not records:
+        return "unknown"
+    if all(status.active_links == status.links for status in records):
+        return "nvlink"
+    # Partially down counts as `"pcie"`, not as a third state: a collective is bounded by the
+    # slowest pair in its group, so one device off the fabric costs the group the fabric.
+    return "pcie"

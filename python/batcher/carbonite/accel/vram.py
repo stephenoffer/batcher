@@ -27,6 +27,7 @@ Three things it does that a bare `torch.cuda.mem_get_info` check cannot:
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from batcher._internal.errors import ResourceError
@@ -67,11 +68,18 @@ class VramPool:
         external_bytes: Per-device bytes already resident to processes outside this pool,
             typically measured from `DeviceTelemetry.memory_used_bytes`. Reservations are made
             against capacity minus this.
+        share: Fraction of each device this pool may plan for, in (0, 1]. `1.0` — the default
+            — is a device this process has to itself. A declared share is what covers the case
+            `external_bytes` cannot: co-tenants that start *together*, each measuring an empty
+            device, each sizing to all of it, and each discovering the conflict as a
+            simultaneous out-of-memory error. Measurement can only see a tenant that has
+            already allocated.
     """
 
     capacity_bytes: int
     device_count: int = 1
     headroom: float = DEFAULT_HEADROOM
+    share: float = 1.0
     external_bytes: dict[int, int] = field(default_factory=dict)
     _held: dict[int, int] = field(default_factory=dict, repr=False)
     _peak: dict[int, int] = field(default_factory=dict, repr=False)
@@ -86,7 +94,8 @@ class VramPool:
         Returns:
             Reservable bytes, `0` when the device is already oversubscribed by other processes.
         """
-        budget = int(self.capacity_bytes * (1.0 - min(0.9, max(0.0, self.headroom))))
+        share = min(1.0, max(0.0, self.share))
+        budget = int(self.capacity_bytes * share * (1.0 - min(0.9, max(0.0, self.headroom))))
         return max(0, budget - self.external_bytes.get(device, 0))
 
     def held_bytes(self, device: int = 0) -> int:
@@ -113,13 +122,29 @@ class VramPool:
         """
         return nbytes <= self.available_bytes(device)
 
-    def best_device(self) -> int:
+    def best_device(self, exclude: Sequence[int] | None = None) -> int:
         """The governed device with the most reservable memory right now.
 
         Ties break on the lowest index so placement is deterministic, which keeps a repeated
         run reproducible rather than drifting with dictionary order.
+
+        Args:
+            exclude: Device indices to skip — the ones Carbonite's health verdicts have
+                quarantined. Free memory is the wrong sole criterion on a fleet with a sick
+                device in it: a board that has fallen off the bus or exhausted its spare
+                memory rows reports *all* of its memory free, which makes it the most
+                attractive placement on the node and the only one guaranteed to fail.
+
+        Returns:
+            The chosen device index. When every device is excluded the exclusion is ignored
+            and the emptiest device wins, because refusing to place work at all is a worse
+            answer than placing it on the least-bad option and letting the reservation fail
+            with a reason.
         """
-        return min(range(max(1, self.device_count)), key=lambda d: (-self.available_bytes(d), d))
+        devices = range(max(1, self.device_count))
+        skip = set(exclude or ())
+        eligible = [d for d in devices if d not in skip] or list(devices)
+        return min(eligible, key=lambda d: (-self.available_bytes(d), d))
 
     def reserve(
         self, nbytes: int, *, device: int | None = None, owner: str = ""

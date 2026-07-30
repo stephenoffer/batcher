@@ -4,7 +4,7 @@ Carbonite protects a run from the resources it does not have. On a GPU fleet the
 those is device memory — 80 GiB with no swap behind it and a failure mode that kills a worker
 rather than degrading it — and the second scarcest is a healthy device.
 
-Six modules, one question each:
+Seven modules, one question each:
 
 * `vram` — device memory as a pool: reserve, release, headroom, and what another tenant is
   already holding, which is the binding figure when sizing an inference stage on a shared
@@ -17,6 +17,8 @@ Six modules, one question each:
 * `health` — turning live telemetry into a schedule/derate/quarantine verdict.
 * `power` — the deployment's power envelope as an admission decision, with a device-count
   counter-offer rather than a refusal.
+* `affinity` — putting a device's host-side work on the cores next to it, and noticing when
+  the device is shared with another process rather than this one's alone.
 
 Nothing here allocates device memory or touches a tensor: these are the control-plane
 decisions, and the framework doing the allocating carries them out.
@@ -24,6 +26,14 @@ decisions, and the framework doing the allocating carries them out.
 
 from __future__ import annotations
 
+from batcher.carbonite.accel.affinity import (
+    MIN_BOUND_CPUS,
+    bind_host_threads_to_device,
+    device_affinity_summary,
+    feeder_cpus_for_device,
+    mps_active,
+    mps_client_share,
+)
 from batcher.carbonite.accel.allocator import (
     MIN_POOL_BYTES,
     AllocatorPlan,
@@ -37,10 +47,14 @@ from batcher.carbonite.accel.health import (
     HealthThresholds,
     HealthVerdict,
     assess_device,
+    assess_faults,
     assess_fleet,
     configured_thresholds,
+    device_reset_candidates,
+    fault_reasons,
     schedulable_device_count,
     schedulable_devices,
+    xid_verdicts,
 )
 from batcher.carbonite.accel.kv_cache import (
     KvCacheBudget,
@@ -64,6 +78,7 @@ from batcher.carbonite.accel.vram import DEFAULT_HEADROOM, VramPool, VramReserva
 
 __all__ = [
     "DEFAULT_HEADROOM",
+    "MIN_BOUND_CPUS",
     "MIN_POOL_BYTES",
     "AllocatorPlan",
     "HealthThresholds",
@@ -74,17 +89,25 @@ __all__ = [
     "VramPool",
     "VramReservation",
     "assess_device",
+    "assess_faults",
     "assess_fleet",
+    "bind_host_threads_to_device",
     "configure_device_memory",
     "configured_thresholds",
+    "device_affinity_summary",
     "device_allocator_state",
+    "device_reset_candidates",
     "devices_within_budget",
+    "fault_reasons",
+    "feeder_cpus_for_device",
     "kv_bytes_per_token",
     "kv_cache_bytes",
     "max_concurrent_sequences",
     "mig_plan",
     "mig_profiles",
     "mig_supported",
+    "mps_active",
+    "mps_client_share",
     "plan_allocator",
     "prepare_device_memory",
     "reset_device_allocator",
@@ -92,4 +115,5 @@ __all__ = [
     "schedulable_devices",
     "smallest_profile_for",
     "validate_fleet_power",
+    "xid_verdicts",
 ]

@@ -66,6 +66,7 @@ def read_descriptor_on_device(descriptor: dict, be: DfBackend):
     if specs is None:
         return None
     projection = descriptor.get("projection")
+    _publish_transfer_path(specs)
     try:
         frame = _read_parquet(specs, projection)
     except Exception as exc:
@@ -84,6 +85,37 @@ def _specs(descriptor: dict):
     if not splits or descriptor.get("predicate") is not None:
         return None
     return device_read_specs(splits, descriptor.get("projection"))
+
+
+def _publish_transfer_path(specs: list) -> None:
+    """Report whether these files reach the device by DMA or through a host bounce buffer.
+
+    A device-native read is two wins stacked: the decode happens on the device, and — only
+    when GPUDirect Storage applies — the bytes travel storage-to-device without the host
+    touching them. The second one silently does not happen on a container overlay, on a FUSE
+    -mounted object store, and in an image without the cuFile library, and the read then adds
+    a host copy to a path whose whole argument was avoiding one. Nothing about the result
+    changes either way, which is exactly why it needs to be visible: a scan that is half its
+    expected rate looks identical to one that is not.
+
+    Best-effort and skipped entirely when nothing is listening, so an unobserved run pays
+    neither the mount-table read nor the library probe.
+    """
+    from batcher._internal import events
+
+    if not events.listening():
+        return
+    try:
+        from batcher.io.splits.gds import gds_summary
+
+        events.publish(
+            events.GPU,
+            name="device_read",
+            event="transfer_path",
+            **gds_summary(tuple(spec.path for spec in specs)),
+        )
+    except Exception as exc:  # pragma: no cover - observability must never fail a read
+        note_suppressed("dist", "report the gpu read's transfer path", exc)
 
 
 def _read_parquet(specs: list, projection: list[str] | None):
@@ -124,4 +156,3 @@ def _expected_names(descriptor: dict, projection: list[str] | None) -> list[str]
         return list(projection)
     splits = descriptor.get("splits")
     return list(splits[0].schema().names) if splits else None
-
