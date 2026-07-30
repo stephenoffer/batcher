@@ -177,3 +177,28 @@ def test_the_rule_reads_the_aggregate_s_own_input() -> None:
         f"a filtered aggregate was budgeted at {narrowed:,}, no less than the "
         f"{unfiltered:,} of the unfiltered one -- the rule is reading past its own input"
     )
+
+
+def test_distinct_takes_the_same_rule_as_an_aggregate() -> None:
+    """`DISTINCT` *is* an all-columns group-by, run by the same `partial -> combine` path over
+    the same per-morsel tables, so it holds the same live partial state.
+
+    Measured on a 24 M-row `distinct(k)` under a 537 MB envelope: budgeted at its 2 M distinct
+    rows (16 MB) it stayed on the in-memory path and peaked at 1.6 GB.
+    """
+    rng = np.random.default_rng(0)
+    table = pa.table({"k": rng.integers(0, ROWS // 2, ROWS).astype("int64")})
+    ds = bt.from_arrow(table).select("k").distinct()
+
+    cfg = active_config()
+    est = CardinalityEstimator(sources=ds._sources)
+    width = est.row_width(ds._plan, cfg.optimizer.row_bytes)
+    mr = cfg.execution.morsel_rows
+    distinct_rows = float(ROWS // 2)
+
+    resident = _resident_bytes(ds._plan, distinct_rows, width, est, mr)
+    assert resident >= ROWS * width * 0.9, (
+        f"a {distinct_rows:,.0f}-value DISTINCT over {ROWS:,} rows was budgeted at "
+        f"{resident:,} bytes, below the ~{ROWS * width:,.0f} its live per-morsel partials "
+        f"hold — DISTINCT is an all-columns group-by and needs the same rule"
+    )

@@ -281,7 +281,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `run.py` | 492 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 494 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 204 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 272 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
@@ -768,7 +768,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 452 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 458 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 350 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 175 | The learned per-column statistics tables — their schema, their keys, and their bound. |
@@ -1148,7 +1148,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 |---|---|---|
 | `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 372 | The result cache — a memory-bounded LRU of materialized query results. |
-| `manager.py` | 488 | The Carbonite resource manager entry point. |
+| `manager.py` | 496 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1174,7 +1174,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `flow_control.py` | 485 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 232 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `scheduling.py` | 218 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_advice.py` | 228 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_advice.py` | 263 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
@@ -2065,10 +2065,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1320 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
-| `join/range/band.rs` | 240 | The band join: two inequalities that bound **one** right key from both sides. |
-| `join/range/keys.rs` | 456 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
+| `join/range/band.rs` | 299 | The band join: two inequalities that bound **one** right key from both sides. |
+| `join/range/keys.rs` | 638 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
-| `join/range/mod.rs` | 619 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/mod.rs` | 669 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
 | `join/scratch_bench.rs` | 2 | TEMPORARY scratch measurement — not part of the crate's contract. |
 | `join/sort_merge.rs` | 180 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 243 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |

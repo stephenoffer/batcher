@@ -119,14 +119,14 @@ def _resident_bytes(
     Returns:
         The operator's resident state in bytes.
     """
-    from batcher.plan.logical import Aggregate, Join, Sort
+    from batcher.plan.logical import Aggregate, Distinct, Join, Sort
 
     if isinstance(node, Join):
         build = estimator.estimate(node.right).rows
         return int(max(0.0, build) * estimator.row_width(node.right, width))
     if isinstance(node, Sort) and node.limit:
         return int(min(float(node.limit), rows) * width)
-    if isinstance(node, Aggregate):
+    if isinstance(node, (Aggregate, Distinct)):
         return _aggregate_resident_bytes(node, rows, width, estimator, morsel_rows)
     return int(rows * width)
 
@@ -134,7 +134,13 @@ def _resident_bytes(
 def _aggregate_resident_bytes(
     node: LogicalPlan, rows: float, width: float, estimator, morsel_rows: int
 ) -> int:
-    """An aggregate's resident state, which is **not** its groups when grouping is wide.
+    """An aggregate's (or `DISTINCT`'s) resident state, which is **not** its groups when the
+    key is wide.
+
+    `DISTINCT` takes the same rule because it *is* an all-columns group-by, run by the same
+    `partial -> combine` path over the same per-morsel tables. Measured on a 24 M-row
+    `distinct(k)` under a 537 MB envelope: budgeted at its 2 M distinct rows (16 MB) it stayed
+    in memory and peaked at 1.6 GB.
 
     The parallel aggregate is `partial -> combine -> finalize`: every morsel builds its own
     group table and all of them are live when `combine` merges them. So what it holds is the

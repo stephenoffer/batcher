@@ -143,6 +143,41 @@ class SpillAdvisor:
         """
         return input_bytes > 0 and input_bytes > self.hard_budget()
 
+    def resident_total_exceeds_budget(self, input_bytes: int, plan: PhysicalPlan) -> bool:
+        """Whether the resident input **plus** the plan's peak operator state overflows the
+        envelope.
+
+        `input_exceeds_budget` and `should_spill` are two halves of one total, and each was
+        compared against the whole budget on its own. Nothing summed them — yet on the
+        in-memory path they are *concurrent*, not alternatives: the sources are resolved to
+        Arrow batches before the engine starts and stay resident for the whole execution,
+        while the breaker builds its state on top of them. A query whose input is 70% of the
+        envelope and whose breaker is 70% of it passes both checks and needs 140%.
+
+        Measured on a 24 M-row group-by under a 537 MB envelope: input 384 MB, live partial
+        state 384 MB, neither over the budget alone, both over it together — and the query
+        stayed on the in-memory path and peaked at 2.4 GB.
+
+        Summing is the right reading of the in-memory path specifically, and the double-count
+        worry does not apply: `peak_bytes` is an operator's *working set*, so a sort's peak is
+        its output and an aggregate's is its partials, in both cases memory that lives
+        alongside the input rather than replacing it.
+
+        A `0` input stays "no evidence" rather than "fits", as it is for
+        `input_exceeds_budget`: an unsizable source must not be read as a small one. The other
+        signals (`should_spill`, live pressure) still apply in that case.
+
+        Args:
+            input_bytes: Metadata-only estimate of the resident input, or `0` for unknown.
+            plan: The physical plan about to run.
+
+        Returns:
+            True when the two together do not fit, so the query should go out of core.
+        """
+        if input_bytes <= 0:
+            return False
+        return input_bytes + max(0, self.peak_bytes(plan)) > self.hard_budget()
+
     def partitions(self, plan: PhysicalPlan) -> int | None:
         """Out-of-core buckets to shard `plan`'s spilled state into, or ``None``.
 
