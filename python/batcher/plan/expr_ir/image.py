@@ -407,6 +407,72 @@ class _ImageNamespace:
         """
         return ImageFunc("dhash", self._e)
 
+    def brightness(self) -> ImageFunc:
+        """The image's mean luma, normalized to ``[0, 1]`` (→ Float64).
+
+        The blank-image detector for a scraped corpus. A placeholder tile, a blown-out scan,
+        and the grey box a CDN serves for a missing asset all decode perfectly and teach a
+        model nothing; each sits at an extreme of this scale while a photograph of anything
+        lands in the middle. Filtering both ends removes a class of row nothing upstream
+        catches.
+
+        Measured on a downsampled luma plane, so the cost per image does not depend on its
+        resolution — a corpus mixing thumbnails and 50-megapixel scans is not dominated by the
+        scans.
+
+        Returns:
+            An expression evaluating to a Float64 in ``[0, 1]``; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> 0.0 <= ds.select(b=bt.col("img").image.brightness()).to_pydict()["b"][0] <= 1.0
+                True
+
+                >>> # Drop the blank and blown-out ends of a corpus.
+                >>> usable = (bt.col("img").image.brightness() > 0.05) & (
+                ...     bt.col("img").image.brightness() < 0.95
+                ... )
+        """
+        return ImageFunc("brightness", self._e)
+
+    def sharpness(self) -> ImageFunc:
+        """The variance of the image's Laplacian, normalized to ``[0, 1]`` (→ Float64).
+
+        The standard focus measure, and the way to find the blurred tail of an image corpus. A
+        sharp image has strong second derivatives at its edges and so a high variance; a
+        blurred or empty one has almost none.
+
+        Values are small in absolute terms — a well-focused photograph lands around 0.01 to
+        0.05 — so choose the threshold from a histogram of your own images rather than from a
+        remembered number. It measures *detail*, not quality: a brick wall outscores a
+        portrait, and a noisy image outscores a clean one. Use it to find the blurred tail, not
+        to rank images against each other.
+
+        The image is downsampled before measuring, deliberately: at full resolution sensor
+        noise reads as high-frequency detail and a blurry large photograph scores like a sharp
+        one, which is the failure mode of a naive Laplacian variance.
+
+        Returns:
+            An expression evaluating to a Float64 in ``[0, 1]``; null for null or undecodable
+            input, and for an image too small to have an interior pixel.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> # A 1x1 image has no interior pixel, so it has no second derivative.
+                >>> ds.select(s=bt.col("img").image.sharpness()).to_pydict()["s"]
+                [None]
+        """
+        return ImageFunc("sharpness", self._e)
+
     def resize(self, width: int, height: int) -> ImageFunc:
         """Resize the image and re-encode it as PNG bytes.
 
