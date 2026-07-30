@@ -1,0 +1,107 @@
+"""The datacenter device table: internally consistent, conservative, and honest about gaps.
+
+`device_specs` is read by placement, power budgeting, and the roofline check, so a wrong or
+inconsistent row propagates into decisions nothing downstream can second-guess. These pin the
+properties that hold across every row rather than restating individual datasheet figures: the
+table stays the single source of device memory, unknown devices report unknown instead of a
+default, and the derived ratios refuse to divide by an absent figure.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from batcher._internal.accelerators import accelerator_memory_bytes
+from batcher._internal.device_specs import (
+    device_arithmetic_intensity,
+    device_half_tflops,
+    device_idle_watts,
+    device_memory_bandwidth_gbps,
+    device_mig_slices,
+    device_nvlink_domain,
+    device_nvlink_gbps,
+    device_spec,
+    device_tdp_watts,
+    device_tflops_per_watt,
+    known_device_names,
+    rank_devices_by_efficiency,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def test_every_row_is_internally_consistent() -> None:
+    for name in known_device_names():
+        spec = device_spec(name)
+        assert spec is not None
+        assert spec.memory_gib > 0, f"{name}: memory is the one figure that must be known"
+        assert spec.memory_bandwidth_gbps > 0, name
+        assert spec.idle_watts <= spec.tdp_watts, f"{name}: idle above TDP is impossible"
+        assert spec.nvlink_domain >= 1, f"{name}: a device is always in a domain of at least itself"
+        assert spec.mig_slices >= 0
+        assert spec.vendor in {"nvidia", "amd", "intel", "google"}, name
+
+
+def test_fp8_only_on_generations_that_have_an_fp8_unit() -> None:
+    # An FP8 figure on a pre-Hopper part would silently double its planned throughput.
+    for name in known_device_names():
+        spec = device_spec(name)
+        assert spec is not None
+        if spec.fp8_tflops > 0:
+            assert spec.generation in {"hopper", "blackwell", "ada", "cdna3"}, name
+            assert spec.fp8_tflops >= spec.half_tflops, f"{name}: FP8 is never slower than BF16"
+
+
+def test_unknown_device_reports_unknown_not_a_default() -> None:
+    for probe in (None, "", "NVIDIA_MADE_UP_9000"):
+        assert device_spec(probe) is None
+        assert device_tdp_watts(probe) == 0.0
+        assert device_idle_watts(probe) == 0.0
+        assert device_memory_bandwidth_gbps(probe) == 0.0
+        assert device_half_tflops(probe) == 0.0
+        assert device_nvlink_domain(probe) == 0
+        assert device_nvlink_gbps(probe) == 0.0
+        assert device_mig_slices(probe) == 0
+        assert device_tflops_per_watt(probe) == 0.0
+        assert device_arithmetic_intensity(probe) == 0.0
+
+
+def test_name_lookup_is_case_insensitive() -> None:
+    assert device_spec("nvidia_h100") == device_spec("NVIDIA_H100")
+
+
+def test_accelerator_memory_reads_this_table() -> None:
+    # One source of truth: the memory accessor in `accelerators` must agree row for row,
+    # because two tables of the same fact drift apart in the direction nobody is looking.
+    for name in known_device_names():
+        spec = device_spec(name)
+        assert spec is not None
+        assert accelerator_memory_bytes(name) == spec.memory_gib * (1 << 30)
+
+
+def test_efficiency_ranking_drops_the_unrankable() -> None:
+    ranked = rank_devices_by_efficiency(["NVIDIA_H100", "NVIDIA_TESLA_K80", "MADE_UP", "TPU-V4"])
+    assert "MADE_UP" not in ranked, "an unknown device has no position, so it gets none"
+    assert "TPU-V4" not in ranked, "no published power figure means no efficiency figure"
+    assert "NVIDIA_TESLA_K80" not in ranked, "a part with no tensor path has no half-precision rate"
+    assert ranked == ["NVIDIA_H100"]
+
+
+def test_efficiency_ranking_orders_newer_parts_ahead() -> None:
+    ranked = rank_devices_by_efficiency(["NVIDIA_TESLA_V100", "NVIDIA_H100", "NVIDIA_A100_80G"])
+    assert ranked == ["NVIDIA_H100", "NVIDIA_A100_80G", "NVIDIA_TESLA_V100"]
+
+
+def test_arithmetic_intensity_is_the_roofline_ridge() -> None:
+    # An H100 needs hundreds of FLOPs per byte before it stops being bandwidth-bound, which is
+    # why a scan-shaped stage gains nothing from it. The exact value follows from the table.
+    ridge = device_arithmetic_intensity("NVIDIA_H100")
+    assert ridge == pytest.approx(989e12 / 3350e9)
+    assert ridge > 100, "a modern tensor part is compute-rich and bandwidth-poor"
+
+
+def test_nvlink_domain_distinguishes_fabric_from_pcie() -> None:
+    assert device_nvlink_domain("NVIDIA_L40S") == 1, "PCIe-only: no coherent fabric"
+    assert device_nvlink_gbps("NVIDIA_L40S") == 0.0
+    assert device_nvlink_domain("NVIDIA_H100") == 8
+    assert device_nvlink_domain("NVIDIA_GB200") == 72, "rack-scale NVLink domain"

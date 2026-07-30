@@ -104,50 +104,16 @@ def is_accelerator_node(node_class: dict) -> bool:
     return node_class.get("gpus", 0.0) > 0 or node_class.get("accelerators", 0.0) > 0
 
 
-#: Nameplate device memory per `ray.util.accelerators` model name, in GiB. Keys are
-#: uppercased at lookup, so Ray's inconsistent casing (`NVIDIA_TESLA_T4` beside
-#: `AMD_Instinct_MI300X`) resolves either way. Where one name covers several memory
-#: configurations the smallest shipping variant is recorded — see the module docstring.
-_DEVICE_MEMORY_GIB: dict[str, int] = {
-    # NVIDIA datacenter
-    "NVIDIA_TESLA_K80": 12,
-    "NVIDIA_TESLA_P4": 8,
-    "NVIDIA_TESLA_P100": 16,
-    "NVIDIA_TESLA_V100": 16,  # also ships 32 GB
-    "NVIDIA_TESLA_T4": 16,
-    "NVIDIA_A10": 24,
-    "NVIDIA_A10G": 24,
-    "NVIDIA_L4": 24,
-    "NVIDIA_L40S": 48,
-    "NVIDIA_A100": 40,  # also ships 80 GB — see the explicit variants below
-    "NVIDIA_A100_40G": 40,
-    "NVIDIA_A100_80G": 80,
-    "NVIDIA_H100": 80,
-    "NVIDIA_H200": 141,
-    "NVIDIA_B200": 180,
-    # AMD Instinct
-    "AMD_INSTINCT_MI210": 64,
-    "AMD_INSTINCT_MI250X": 128,
-    "AMD_INSTINCT_MI300X": 192,
-    # Intel Data Center GPU Max
-    "INTEL_MAX_1100": 48,
-    "INTEL_MAX_1550": 128,
-    # Google Cloud TPU — HBM per chip (the unit Ray's `TPU` resource counts). Version names
-    # are determinate, unlike the vendor-generic labels below, so their memory is knowable.
-    "TPU-V2": 8,
-    "TPU-V3": 16,
-    "TPU-V4": 32,
-    "TPU-V5E": 16,
-    "TPU-V5LITEPOD": 16,  # Ray's name for the v5e generation
-    "TPU-V5P": 95,
-    "TPU-V6E": 32,  # Trillium
-    #
-    # Deliberately absent: AWS Neuron (`aws-neuron-core`) and Intel Gaudi (`Intel-GAUDI`).
-    # Ray exposes each generation under ONE label — `aws-neuron-core` covers inf2 (32 GB/chip)
-    # and trn1/trn2 (32/96 GB) alike, `Intel-GAUDI` covers Gaudi2 (96 GB) and Gaudi3 (128 GB) —
-    # so the label does not determine the memory. Per this module's contract an ambiguous name
-    # returns `0` ("unknown") rather than a fabricated figure, which is safer than guessing wrong.
-}
+#: Device memory lives in `device_specs.py`, which records it beside the rest of a model's
+#: nameplate figures (power, bandwidth, fabric width, partitionability). It is read from
+#: there rather than kept a second time here: two tables of the same fact drift, and the one
+#: that drifts is always the one a given caller does not happen to use.
+#:
+#: Deliberately absent from that table: AWS Neuron (`aws-neuron-core`) and Intel Gaudi
+#: (`Intel-GAUDI`). Ray exposes each generation under ONE label — `aws-neuron-core` covers
+#: inf2 (32 GB/chip) and trn1/trn2 (32/96 GB) alike, `Intel-GAUDI` covers Gaudi2 (96 GB) and
+#: Gaudi3 (128 GB) — so the label does not determine the memory. Per this module's contract an
+#: ambiguous name returns `0` ("unknown") rather than a fabricated figure.
 
 
 def binding_gpu_memory_bytes(classes: list[dict]) -> int:
@@ -189,9 +155,10 @@ def accelerator_memory_bytes(accelerator_type: str | None) -> int:
     Returns:
         Total device memory in bytes, or `0` if the model is not recognized.
     """
-    if not accelerator_type:
-        return 0
-    return _DEVICE_MEMORY_GIB.get(accelerator_type.upper(), 0) * _GIB
+    from batcher._internal.device_specs import device_spec
+
+    spec = device_spec(accelerator_type)
+    return spec.memory_gib * _GIB if spec is not None else 0
 
 
 # Device nodes of accelerators that are not NVIDIA GPUs: Google TPU (`/dev/accel*`, and

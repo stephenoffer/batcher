@@ -1,0 +1,254 @@
+"""Live device telemetry through NVML — what a GPU is *doing*, not what it is.
+
+`device_specs` says what a device model can do; this says what one particular device is doing
+right now: how much power it is drawing, how hot it is, how busy its SMs are, how much of its
+memory is resident, whether the driver is clamping its clocks, and whether its memory has
+reported an uncorrectable error. That is the same source `nvidia-smi` and DCGM read, and it is
+the only way a control plane learns any of it — Ray reports a device *count* and nothing else.
+
+Four things this feeds, none of which can be answered without it:
+
+* **Energy accounting.** `plan.energy` models power from a datasheet; a real board runs below
+  its limit most of the time. A measured draw turns an estimate into a figure worth billing.
+* **Utilization-driven sizing.** A device at 20% SM utilization is starved by the pipeline
+  feeding it, and the fix (deeper prefetch, bigger batches) is not the one a device at 95%
+  needs. Autobatching that cannot see utilization is tuning blind.
+* **Health.** Uncorrectable ECC errors and thermal clamping are how a device fails in a
+  datacenter: not by disappearing, but by silently running at a third of its rate or by
+  corrupting a tensor. Both are readable here, and neither is visible from a task's own timings.
+* **Real free memory.** The memory another process on the same device already holds is invisible
+  to a CUDA allocator's own accounting, and it is the difference between a model that loads and
+  one that OOMs on a shared device.
+
+**Every entry point degrades to empty rather than raising.** NVML is absent on a CPU-only node,
+absent inside a container that did not mount the driver, and present-but-refusing for some
+queries on consumer parts and inside MIG instances. A telemetry source that can fail a query is
+worse than no telemetry, so unavailability, permission errors, and per-field failures all read
+as "not reported" and callers keep whatever default they had.
+"""
+
+from __future__ import annotations
+
+import functools
+from dataclasses import dataclass
+
+__all__ = [
+    "DeviceTelemetry",
+    "device_telemetry",
+    "nvml_available",
+    "reset_nvml_probe",
+    "throttled_devices",
+    "total_power_watts",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceTelemetry:
+    """One device's live readings; every field is `0`/empty when NVML did not report it.
+
+    Attributes:
+        index: NVML device index on this host.
+        uuid: Stable device UUID, the only identifier that survives a reindex and the key
+            health history should be recorded against.
+        name: Device name as the driver reports it (`"NVIDIA H100 80GB HBM3"`).
+        power_watts: Instantaneous board draw.
+        power_limit_watts: Enforced power limit, which a datacenter may set well below TDP.
+        temperature_c: GPU core temperature.
+        sm_utilization: Fraction of the sample period the SMs were busy, in [0, 1]. This is a
+            *duty cycle*, not occupancy — a kernel using one SM reads as fully busy — so it is
+            a starvation signal, not an efficiency one.
+        memory_utilization: Fraction of the sample period memory was being read or written.
+        memory_used_bytes: Device memory resident across every process on the device.
+        memory_total_bytes: Total device memory.
+        ecc_uncorrected: Lifetime uncorrectable ECC error count; anything above zero means the
+            device has already corrupted data.
+        throttle_reasons: Active clock-clamping reasons (`"thermal"`, `"power"`, `"hw_slowdown"`,
+            `"sw_thermal"`, `"sync_boost"`), empty when the device is running unclamped.
+        graphics_clock_mhz: Current graphics clock.
+    """
+
+    index: int
+    uuid: str = ""
+    name: str = ""
+    power_watts: float = 0.0
+    power_limit_watts: float = 0.0
+    temperature_c: float = 0.0
+    sm_utilization: float = 0.0
+    memory_utilization: float = 0.0
+    memory_used_bytes: int = 0
+    memory_total_bytes: int = 0
+    ecc_uncorrected: int = 0
+    throttle_reasons: tuple[str, ...] = ()
+    graphics_clock_mhz: int = 0
+
+    @property
+    def memory_free_bytes(self) -> int:
+        """Device memory not resident to any process, `0` when memory was not reported."""
+        return max(0, self.memory_total_bytes - self.memory_used_bytes)
+
+    @property
+    def power_headroom_watts(self) -> float:
+        """Watts between the current draw and the enforced limit; `0.0` when either is unknown.
+
+        A device consistently at zero headroom is power-limited, which caps its clocks: adding
+        work to it buys nothing, and the useful move is another device or a higher limit.
+        """
+        if self.power_limit_watts <= 0 or self.power_watts <= 0:
+            return 0.0
+        return max(0.0, self.power_limit_watts - self.power_watts)
+
+    @property
+    def throttled(self) -> bool:
+        """Whether the driver is currently clamping this device's clocks for any reason."""
+        return bool(self.throttle_reasons)
+
+
+#: NVML throttle-reason bits, as `(attribute name on pynvml, reported label)`. Read by name
+#: rather than by literal value so a pynvml release that renumbers them cannot silently
+#: mislabel a reason, and an unknown name is skipped instead of raising.
+_THROTTLE_BITS = (
+    ("nvmlClocksThrottleReasonSwPowerCap", "power"),
+    ("nvmlClocksThrottleReasonHwPowerBrakeSlowdown", "power"),
+    ("nvmlClocksThrottleReasonSwThermalSlowdown", "sw_thermal"),
+    ("nvmlClocksThrottleReasonHwThermalSlowdown", "thermal"),
+    ("nvmlClocksThrottleReasonHwSlowdown", "hw_slowdown"),
+    ("nvmlClocksThrottleReasonSyncBoost", "sync_boost"),
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _nvml():
+    """The initialized `pynvml` module, or `None` when it is unusable on this host.
+
+    Memoized because `nvmlInit` is a driver handshake and the answer cannot change within a
+    process: a driver that was absent at first call is absent for the run.
+    """
+    try:
+        import pynvml
+    except ImportError:
+        return None
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        return None  # driver absent, unmounted in the container, or refusing to initialize
+    return pynvml
+
+
+def nvml_available() -> bool:
+    """Whether live device telemetry can be read on this host.
+
+    Returns:
+        True when NVML initialized; False on a CPU-only host, without the driver mounted, or
+        without `pynvml` installed.
+    """
+    return _nvml() is not None
+
+
+def reset_nvml_probe() -> None:
+    """Forget the memoized NVML handshake so the next call re-initializes.
+
+    The hook a test faking `pynvml` needs; there is nothing else in a running process that can
+    change the answer.
+    """
+    _nvml.cache_clear()
+
+
+def _read(fn, default):
+    """Call one NVML getter, mapping any failure to `default`.
+
+    NVML refuses individual queries per device and per driver version — power draw on some
+    consumer parts, ECC counts with ECC disabled, utilization inside a MIG instance — so a
+    per-field guard is what keeps one unsupported reading from erasing the whole record.
+    """
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _throttle_reasons(nv, handle) -> tuple[str, ...]:
+    """Active clock-clamping reasons for one device, deduplicated and ordered stably."""
+    bits = _read(lambda: nv.nvmlDeviceGetCurrentClocksThrottleReasons(handle), 0)
+    if not bits:
+        return ()
+    out: list[str] = []
+    for attr, label in _THROTTLE_BITS:
+        mask = getattr(nv, attr, None)
+        if mask is not None and bits & mask and label not in out:
+            out.append(label)
+    return tuple(out)
+
+
+def _decode(value) -> str:
+    """NVML returns `bytes` on some versions and `str` on others; normalize to `str`."""
+    return value.decode() if isinstance(value, bytes) else str(value or "")
+
+
+def device_telemetry() -> tuple[DeviceTelemetry, ...]:
+    """Live readings for every device on this host, in NVML index order.
+
+    Not memoized — every field is a live reading, and a cached utilization figure is worse than
+    none. Costs one NVML call per field per device (tens of microseconds each), so it is fine
+    on a per-stage or per-second cadence and wrong on a per-batch one.
+
+    Returns:
+        One record per device, or an empty tuple when telemetry is unavailable.
+    """
+    nv = _nvml()
+    if nv is None:
+        return ()
+    count = _read(nv.nvmlDeviceGetCount, 0)
+    out: list[DeviceTelemetry] = []
+    for index in range(count):
+        handle = _read(lambda i=index: nv.nvmlDeviceGetHandleByIndex(i), None)
+        if handle is None:
+            continue
+        util = _read(lambda h=handle: nv.nvmlDeviceGetUtilizationRates(h), None)
+        mem = _read(lambda h=handle: nv.nvmlDeviceGetMemoryInfo(h), None)
+        out.append(
+            DeviceTelemetry(
+                index=index,
+                uuid=_decode(_read(lambda h=handle: nv.nvmlDeviceGetUUID(h), "")),
+                name=_decode(_read(lambda h=handle: nv.nvmlDeviceGetName(h), "")),
+                power_watts=_read(lambda h=handle: nv.nvmlDeviceGetPowerUsage(h), 0) / 1000.0,
+                power_limit_watts=(
+                    _read(lambda h=handle: nv.nvmlDeviceGetEnforcedPowerLimit(h), 0) / 1000.0
+                ),
+                temperature_c=float(_read(lambda h=handle: nv.nvmlDeviceGetTemperature(h, 0), 0)),
+                sm_utilization=(getattr(util, "gpu", 0) or 0) / 100.0,
+                memory_utilization=(getattr(util, "memory", 0) or 0) / 100.0,
+                memory_used_bytes=int(getattr(mem, "used", 0) or 0),
+                memory_total_bytes=int(getattr(mem, "total", 0) or 0),
+                ecc_uncorrected=int(
+                    _read(lambda h=handle: nv.nvmlDeviceGetTotalEccErrors(h, 1, 0), 0) or 0
+                ),
+                throttle_reasons=_throttle_reasons(nv, handle),
+                graphics_clock_mhz=int(_read(lambda h=handle: nv.nvmlDeviceGetClockInfo(h, 0), 0)),
+            )
+        )
+    return tuple(out)
+
+
+def total_power_watts() -> float:
+    """Sum of every local device's instantaneous draw, or `0.0` when unreadable.
+
+    The measured counterpart of `plan.energy.fleet_power_watts`: what a node is actually
+    pulling, against what its hardware was budgeted to pull.
+
+    Returns:
+        Watts across all local devices.
+    """
+    return sum(d.power_watts for d in device_telemetry())
+
+
+def throttled_devices() -> tuple[DeviceTelemetry, ...]:
+    """Devices whose clocks the driver is currently clamping.
+
+    A throttled device is the failure mode that looks like a performance regression: the job
+    still completes and still returns the right answer, at a fraction of the rate, and nothing
+    in the job's own timings says why.
+
+    Returns:
+        The throttled subset of `device_telemetry`, empty when none or when unreadable.
+    """
+    return tuple(d for d in device_telemetry() if d.throttled)

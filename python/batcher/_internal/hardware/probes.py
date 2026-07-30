@@ -11,7 +11,7 @@ re-export list.
 from __future__ import annotations
 
 from batcher._internal.accelerators import reset_accelerator_probes
-from batcher._internal.hardware import cache, cgroup, isa, memory, profile, storage, topology
+from batcher._internal.hardware import cache, cgroup, isa, memory, nvml, profile, storage, topology
 
 __all__ = ["reset_hardware_probes"]
 
@@ -36,6 +36,8 @@ _MEMOIZED = (
     (isa, ("_cpuinfo_fields", "cpu_features", "cpu_vendor", "cpu_model_name")),
     (topology, ("numa_node_count", "cpus_per_numa_node", "physical_core_count")),
     (storage, ("device_class",)),
+    # The NVML handshake, not a reading: telemetry itself is deliberately never cached.
+    (nvml, ("_nvml",)),
 )
 
 

@@ -1,0 +1,224 @@
+"""Placing accelerator work on the fleet: gang bundles, power zones, and efficiency order.
+
+`topology` says what the fleet looks like; this decides where a stage goes. Three decisions,
+each of which a topology-blind scheduler gets wrong in a way that shows up as a performance
+mystery rather than an error:
+
+* **A collective must not span a fabric.** A tensor-parallel stage of eight devices placed
+  four-and-four across hosts runs its all-reduce over the network at a fraction of the NVLink
+  rate. The fix is a strict-pack bundle inside one domain, and a deliberate, *reported*
+  decision when the world size is wider than any domain the fleet has.
+* **A power zone has a budget.** Filling every slot in a rack whose busway cannot power them
+  either trips a breaker or, more commonly, causes every device in the rack to be clamped —
+  which reads as the whole rack getting slower for no visible reason.
+* **A heterogeneous fleet has an order.** When several device models can host a stage, the
+  most efficient one that fits should get it, because on a power-constrained fleet throughput
+  per watt is what converts to throughput per rack.
+
+Every function degrades to the pre-existing behavior on an unreadable or unlabelled topology:
+no bundles, no preference, no cap. A placement hint that fires on missing data is worse than
+no hint, because it moves work for a reason that is not there.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from batcher.dist.executors.ray_runtime.fabric.topology import (
+    GpuNodeTopology,
+    domain_groups,
+    gpu_node_topology,
+    largest_local_domain,
+)
+
+__all__ = [
+    "CollectivePlacement",
+    "devices_within_power_budget",
+    "plan_collective",
+    "power_zone_load",
+    "rank_nodes_by_efficiency",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CollectivePlacement:
+    """Where a multi-device collective stage should run.
+
+    Attributes:
+        world_size: Devices the stage needs.
+        bundles: Ray placement-group bundles, one per node, as `{"GPU": n, "CPU": c}`.
+        strategy: Ray placement strategy — `STRICT_PACK` when the collective fits one node's
+            fabric, `PACK` when it must span nodes but should stay as close as possible.
+        spans_fabric: Whether the collective is wider than any single coherent domain, so its
+            all-reduce leaves the fast path.
+        node_ids: Nodes the bundles target, empty when the topology could not be read.
+        reason: One line for the decision log.
+    """
+
+    world_size: int
+    bundles: tuple[dict[str, float], ...] = ()
+    strategy: str = "PACK"
+    spans_fabric: bool = False
+    node_ids: tuple[str, ...] = ()
+    reason: str = ""
+
+
+def plan_collective(
+    world_size: int,
+    nodes: tuple[GpuNodeTopology, ...] | None = None,
+    *,
+    cpus_per_device: float = 1.0,
+) -> CollectivePlacement:
+    """Lay a collective of `world_size` devices out, staying inside one fabric where it fits.
+
+    Args:
+        world_size: Devices the collective needs.
+        nodes: Topology records, or `None` to read them live.
+        cpus_per_device: Host cores to co-schedule per device, for the feeding pipeline.
+
+    Returns:
+        The placement. With an unreadable topology the bundles are empty and the strategy is
+        the existing `PACK` default, so the caller schedules exactly as it did before.
+    """
+    want = max(1, world_size)
+    records = gpu_node_topology() if nodes is None else nodes
+    if not records:
+        return CollectivePlacement(
+            world_size=want, reason="topology unreadable: scheduling without a placement hint"
+        )
+
+    # Prefer a single node whose coherent domain already holds the whole collective.
+    for node in sorted(records, key=lambda n: (-n.local_domain, n.node_id)):
+        if node.local_domain >= want:
+            return CollectivePlacement(
+                world_size=want,
+                bundles=({"GPU": float(want), "CPU": cpus_per_device * want},),
+                strategy="STRICT_PACK",
+                spans_fabric=False,
+                node_ids=(node.node_id,),
+                reason=(
+                    f"fits one {node.accelerator_type or 'GPU'} fabric domain "
+                    f"of {node.local_domain}"
+                ),
+            )
+
+    # Otherwise fill the largest fabric group first, so the split is across the fewest tiers.
+    bundles: list[dict[str, float]] = []
+    ids: list[str] = []
+    remaining = want
+    for group in domain_groups(records).values():
+        for node in sorted(group, key=lambda n: (-n.gpus, n.node_id)):
+            if remaining <= 0:
+                break
+            take = min(node.gpus, remaining)
+            bundles.append({"GPU": float(take), "CPU": cpus_per_device * take})
+            ids.append(node.node_id)
+            remaining -= take
+        if remaining <= 0:
+            break
+    widest = largest_local_domain(records)
+    if remaining > 0:
+        return CollectivePlacement(
+            world_size=want,
+            bundles=tuple(bundles),
+            strategy="PACK",
+            spans_fabric=True,
+            node_ids=tuple(ids),
+            reason=(
+                f"fleet has {want - remaining} of {want} devices: "
+                "the collective will wait on capacity"
+            ),
+        )
+    return CollectivePlacement(
+        world_size=want,
+        bundles=tuple(bundles),
+        strategy="PACK",
+        spans_fabric=True,
+        node_ids=tuple(ids),
+        reason=(
+            f"world size {want} exceeds the widest fabric domain ({widest}): "
+            f"the collective spans {len(bundles)} nodes and its all-reduce leaves the fast path"
+        ),
+    )
+
+
+def power_zone_load(
+    nodes: tuple[GpuNodeTopology, ...] | None = None,
+    utilization: float = 1.0,
+) -> dict[str, float]:
+    """Estimated full-load draw per power zone, in watts.
+
+    What a rack-level budget is checked against. Nodes with no `batcher.io/power-zone` label are
+    grouped under `""`, which a caller should read as "unattributed" rather than as one zone.
+
+    Args:
+        nodes: Topology records, or `None` to read them live.
+        utilization: Utilization the devices are assumed to run at.
+
+    Returns:
+        Power zone to watts, including each device's host share. Zones whose device models are
+        unrecognized contribute `0.0`, making every figure a lower bound.
+    """
+    from batcher.plan.energy.power import device_power_watts
+
+    records = gpu_node_topology() if nodes is None else nodes
+    out: dict[str, float] = {}
+    for node in records:
+        watts = device_power_watts(node.accelerator_type, utilization, include_host=True)
+        out[node.power_zone] = out.get(node.power_zone, 0.0) + watts * node.gpus
+    return out
+
+
+def devices_within_power_budget(
+    budget_watts: float,
+    accelerator_type: str | None,
+    already_drawn_watts: float = 0.0,
+    *,
+    utilization: float = 1.0,
+) -> int:
+    """Devices of one model a zone can still power, given what it is already drawing.
+
+    Args:
+        budget_watts: The zone's budget; `<= 0` means unbudgeted.
+        accelerator_type: Device model to add.
+        already_drawn_watts: Draw the zone is already committed to.
+        utilization: Utilization the new devices are assumed to run at.
+
+    Returns:
+        Devices that fit, `-1` for "no opinion" when the budget is unset or the device model is
+        unrecognized — the same unbounded sentinel `plan.energy` uses, so a caller cannot
+        mistake "no limit" for "no room".
+    """
+    from batcher.plan.energy.power import max_concurrent_devices
+
+    if budget_watts <= 0:
+        return -1
+    return max_concurrent_devices(
+        budget_watts - max(0.0, already_drawn_watts), accelerator_type, utilization
+    )
+
+
+def rank_nodes_by_efficiency(
+    nodes: tuple[GpuNodeTopology, ...] | None = None,
+) -> tuple[GpuNodeTopology, ...]:
+    """Accelerator nodes ordered by throughput per watt, most efficient first.
+
+    Nodes whose device model has no published efficiency figure keep their relative order at
+    the end of the list rather than being dropped: unlike a ranking of device *models*, a
+    ranking of nodes must stay total, because every node is still a placement candidate.
+
+    Args:
+        nodes: Topology records, or `None` to read them live.
+
+    Returns:
+        The same nodes, reordered.
+    """
+    from batcher._internal.device_specs import device_tflops_per_watt
+
+    records = gpu_node_topology() if nodes is None else nodes
+    return tuple(
+        sorted(
+            records,
+            key=lambda n: (-device_tflops_per_watt(n.accelerator_type), n.node_id),
+        )
+    )

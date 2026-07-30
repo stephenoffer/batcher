@@ -54,6 +54,12 @@ from batcher._internal.hardware.memory import (
     machine_memory_bytes,
     page_size_bytes,
 )
+from batcher._internal.hardware.nvml import (
+    DeviceTelemetry,
+    device_telemetry,
+    nvml_available,
+    total_power_watts,
+)
 from batcher._internal.hardware.probes import reset_hardware_probes
 from batcher._internal.hardware.profile import HardwareProfile, fingerprint, hardware_profile
 from batcher._internal.hardware.storage import (
@@ -67,6 +73,7 @@ from batcher._internal.hardware.topology import (
 
 __all__ = [
     "INFERENCE_INFLIGHT_DEPTH_MAX",
+    "DeviceTelemetry",
     "HardwareProfile",
     "accelerator_backend",
     "available_cpu_count",
@@ -80,6 +87,7 @@ __all__ = [
     "cpu_vendor",
     "cpus_per_numa_node",
     "device_class",
+    "device_telemetry",
     "fingerprint",
     "gpu_devices_absent",
     "gpu_inventory",
@@ -87,10 +95,12 @@ __all__ = [
     "l3_cache_bytes",
     "machine_memory_bytes",
     "numa_node_count",
+    "nvml_available",
     "page_size_bytes",
     "physical_core_count",
     "process_start_method_context",
     "read_cgroup_bytes",
     "reset_hardware_probes",
     "simd_width_bits",
+    "total_power_watts",
 ]
