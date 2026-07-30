@@ -27,8 +27,26 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     strategy:
+      # One target's failure must not cancel the other. While the aarch64 cross build was
+      # broken it failed ~2 minutes in and cancelled x86_64 every single time, so across two
+      # months of red runs the x86_64 wheel was never once observed to build or fail on its
+      # own merits. A cancelled job is not evidence about the job it was cancelled for.
+      fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            # glibc 2.17 (manylinux2014). Builds natively, so the widest floor costs nothing.
+            manylinux: auto
+          - target: aarch64
+            # glibc 2.28 (manylinux_2_28), NOT `auto`, and this arch needs it: `ring` — pulled
+            # in transitively by `bc-io`'s object_store TLS stack — compiles its own ARM
+            # assembly, and since 0.17 that assembly will not build against the GCC-4.8-era
+            # sysroot in the manylinux2014 *cross* image, failing with "ARM assembler must
+            # define __ARM_ARCH". Upstream declines to support sysroots that old and names
+            # manylinux_2_28 as the supported target (PyO3/maturin-action#222,
+            # briansmith/ring#1789). That floor is RHEL 8+, Debian 10+, Ubuntu 18.10+ — every
+            # distro shipping a Python this package supports (>=3.10) clears it.
+            manylinux: "2_28"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,7 +57,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}

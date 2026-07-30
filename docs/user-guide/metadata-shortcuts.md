@@ -343,9 +343,15 @@ approx.frequency("country", "US")
 approx.histogram("amount", 4)  # equal-probability buckets from a KLL grid
 ```
 
-`is_measured` is the introspection that explains the rest: these sketches are written by the
+`is_measured` is the introspection that explains the rest. These sketches are written by the
 executor when a query runs, so a column nobody has read has nothing measured. Run the query
 once and the second run answers for free.
+
+Read it as the coarse question "is anything recorded for this column", because a distinct
+count, a quantile grid, a top-values map, and a plain column width all count. An in-memory
+source already knows a column's width, so `is_measured` reads `True` there while the
+distinct-count sketch is still absent. Test the value you are about to use rather than the
+column as a whole.
 
 If you need an approximate quantile *now*, use the `Dataset` terminals `ds.approx_median`,
 `ds.approx_quantile`, and `ds.approx_n_unique`. They consult the same learned sketches first

@@ -41,9 +41,7 @@ def test_unsupported_token_rate() -> None:
 
 def test_fully_grounded_rate() -> None:
     # row1 fully grounded; row2 {cat,flew} has unsupported {flew} -> not grounded; rate 0.5
-    ds = bt.from_pydict(
-        {"a": ["the cat sat", "the cat flew"], "c": ["the cat sat on the mat"] * 2}
-    )
+    ds = bt.from_pydict({"a": ["the cat sat", "the cat flew"], "c": ["the cat sat on the mat"] * 2})
     got = ds.agg(f=rt.fully_grounded_rate("a", "c")).to_pydict()["f"][0]
     assert got == pytest.approx(0.5)
 

@@ -84,9 +84,7 @@ def test_invalid_n_raises() -> None:
 
 
 def test_char_ngram_metrics_compose_with_group_by() -> None:
-    ds = bt.from_pydict(
-        {"lang": ["en", "en"], "p": ["cat", "dog"], "r": ["cat", "dig"]}
-    )
+    ds = bt.from_pydict({"lang": ["en", "en"], "p": ["cat", "dog"], "r": ["cat", "dig"]})
     out = ds.group_by("lang").agg(f=bt.char_ngram_f1("p", "r", n=2)).to_pydict()
     assert out["lang"] == ["en"]
     assert len(out["f"]) == 1

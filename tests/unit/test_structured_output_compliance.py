@@ -21,19 +21,19 @@ def _rate(expr, rows: list[str]) -> float:
 
 def test_valid_json_rate_is_strict_whole_output() -> None:
     # Object and array parse; prose-wrapped and plain text do not.
-    rows = ['{"a": 1}', "[1, 2, 3]", "here: {\"a\": 1}", "not json"]
+    rows = ['{"a": 1}', "[1, 2, 3]", 'here: {"a": 1}', "not json"]
     assert _rate(bt.valid_json_rate("o"), rows) == pytest.approx(0.5)
 
 
 def test_json_present_rate_is_lenient_extraction() -> None:
     # An object is recoverable from the first two; an array has no object; prose has none.
-    rows = ['{"a": 1}', "here: {\"a\": 1}", "[1, 2, 3]", "not json"]
+    rows = ['{"a": 1}', 'here: {"a": 1}', "[1, 2, 3]", "not json"]
     assert _rate(bt.json_present_rate("o"), rows) == pytest.approx(0.5)
 
 
 def test_strict_is_at_most_lenient_for_objects() -> None:
     # A prose-wrapped object fails strict but passes lenient, so lenient >= strict here.
-    rows = ['{"a": 1}', "sure, here: {\"b\": 2}"]
+    rows = ['{"a": 1}', 'sure, here: {"b": 2}']
     strict = _rate(bt.valid_json_rate("o"), rows)
     lenient = _rate(bt.json_present_rate("o"), rows)
     assert strict == pytest.approx(0.5)
@@ -72,9 +72,7 @@ def test_boxed_answer_rate_ignores_empty_box() -> None:
 
 
 def test_compliance_metrics_compose_with_group_by() -> None:
-    ds = bt.from_pydict(
-        {"model": ["a", "a", "b"], "o": ['{"x": 1}', "bad", '{"y": 2}']}
-    )
+    ds = bt.from_pydict({"model": ["a", "a", "b"], "o": ['{"x": 1}', "bad", '{"y": 2}']})
     out = ds.group_by("model").agg(v=bt.valid_json_rate("o")).sort("model").to_pydict()
     assert out["model"] == ["a", "b"]
     assert out["v"] == pytest.approx([0.5, 1.0])

@@ -21,9 +21,7 @@ def _fake_decode(data, num_frames, height, width, seek=False):
 
 def test_error_column_flags_only_decode_failures(monkeypatch):
     monkeypatch.setattr(video, "_decode_video_bytes", _fake_decode)
-    ds = bt.from_arrow(
-        pa.table({"bytes": pa.array([b"good", b"bad", None], type=pa.binary())})
-    )
+    ds = bt.from_arrow(pa.table({"bytes": pa.array([b"good", b"bad", None], type=pa.binary())}))
     out = video.video_dataset(
         ds, size=(2, 2), num_frames=1, error_column="decode_failed"
     ).to_pydict()

@@ -12,9 +12,9 @@
 //!
 //! ```text
 //!      rows   materializing    streaming
-//!   1000000       198.4 MB       3.4 MB   (58x)
-//!   2000000       396.7 MB       3.3 MB   (119x)
-//!   4000000       793.5 MB       3.3 MB   (238x)
+//!   1000000       221.3 MB       1.0 MB   (233x)
+//!   2000000       442.5 MB       1.0 MB   (464x)
+//!   4000000       854.5 MB       1.0 MB   (891x)
 //! ```
 //!
 //! The ratio is not the point — the *shape* is. Materializing grows linearly with the input;
@@ -27,9 +27,29 @@
 //! whichever executor happened to run first.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Only one test in this binary may measure at a time.
+///
+/// `LIVE`/`PEAK` are process-global, and `cargo test` runs a binary's tests concurrently on
+/// separate threads — so two measurements in flight at once corrupt each other in both
+/// directions: the other test's multi-hundred-MB setup allocations inflate this one's
+/// high-water mark, and its re-seed of `PEAK` can drop the mark *below* this test's baseline.
+/// That second effect made `PEAK - base` underflow and panic with "attempt to subtract with
+/// overflow". It surfaced only on a 4-core CI runner, because the interleaving on a many-core
+/// dev box happens to keep the two tests apart. Every test here holds this for its whole body.
+static MEASURING: Mutex<()> = Mutex::new(());
+
+/// Take the measurement lock, ignoring poisoning.
+///
+/// A panic in one test must not turn every other test in the file into a confusing poison
+/// error that hides the original failure.
+fn measuring() -> std::sync::MutexGuard<'static, ()> {
+    MEASURING.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Track;
 unsafe impl GlobalAlloc for Track {
@@ -127,14 +147,23 @@ fn deep_plan(wide: usize) -> RelOp {
     serde_json::from_str(&json).unwrap()
 }
 
-fn peak_of(f: impl FnOnce()) -> usize {
-    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+/// Peak *additional* live heap while `f` runs.
+///
+/// The baseline and the high-water seed are the SAME `LIVE` reading, deliberately. Sampling
+/// them separately — a `LIVE` load for the baseline, then a second one to seed `PEAK` — lets a
+/// free land in between, leaving `PEAK` below the baseline and making the subtraction
+/// underflow. Seeding `PEAK` with the baseline makes it total instead: `fetch_max` can only
+/// ever raise the mark above the seed.
+fn peak_delta(f: impl FnOnce()) -> usize {
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
     f();
-    PEAK.load(Ordering::Relaxed)
+    PEAK.load(Ordering::Relaxed) - base
 }
 
 #[test]
 fn peak_memory_streaming_vs_materializing() {
+    let _measuring = measuring();
     let wide = 8;
     let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
     println!("\n  3 inner joins → aggregate (the q3/q4/q5 shape), {wide} payload cols\n");
@@ -145,13 +174,12 @@ fn peak_memory_streaming_vs_materializing() {
     for n in [1_000_000i64, 2_000_000, 4_000_000] {
         let srcs = vec![facts(n, wide), dim("a"), dim("b"), dim("c")];
         let p = deep_plan(wide);
-        let base = LIVE.load(Ordering::Relaxed);
-        let mat = peak_of(|| {
+        let mat = peak_delta(|| {
             std::hint::black_box(execute(&p, &srcs).unwrap());
-        }) - base;
-        let stream = peak_of(|| {
+        });
+        let stream = peak_delta(|| {
             std::hint::black_box(execute_streaming(&p, &srcs, 0).unwrap());
-        }) - base;
+        });
         println!(
             "  {:>8}   {:>9.1} MB   {:>7.1} MB   ({:.0}x)",
             n,
@@ -196,6 +224,7 @@ fn peak_memory_streaming_vs_materializing() {
 /// envelope must stay near the envelope.
 #[test]
 fn an_over_budget_breaker_gives_way_before_materializing_its_input() {
+    let _measuring = measuring();
     // The sort's input is *computed*, not scanned. A scan over already-materialized sources
     // yields zero-copy slices, so collecting them allocates almost nothing and would hide the
     // very thing being measured; a projection allocates a fresh column per morsel, which is
@@ -217,13 +246,12 @@ fn an_over_budget_breaker_gives_way_before_materializing_its_input() {
     let input_bytes: usize = 4_000_000 * 2 * std::mem::size_of::<i64>();
     let budget = 8 << 20; // 8 MiB
 
-    let base = LIVE.load(Ordering::Relaxed);
     let mut refused = false;
-    let peak = peak_of(|| {
+    let peak = peak_delta(|| {
         // `black_box` so the result cannot be optimized away.
         let r = std::hint::black_box(execute_streaming(&sort, &srcs, budget));
         refused = r.is_err();
-    }) - base;
+    });
 
     assert!(
         refused,

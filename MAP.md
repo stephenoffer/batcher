@@ -255,7 +255,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 188 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 155 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1443 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 1242 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 1257 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -1571,7 +1571,7 @@ Source connectors — the façade over the source implementation modules.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 184 | The `Source` protocol — the contract every connector satisfies. |
-| `inmemory.py` | 530 | `InMemorySource` — a relation already materialized as Arrow record batches. |
+| `inmemory.py` | 540 | `InMemorySource` — a relation already materialized as Arrow record batches. |
 | `inmemory_aggregates.py` | 170 | Exact aggregate answers over an immutable in-memory Arrow relation. |
 | `inmemory_stats.py` | 362 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 186 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |

@@ -233,9 +233,11 @@ callable for PyArrow (Acero):
 @agg.case("op-groupby-sum")
 def groupby_sum(ctx):
     sql = "SELECT l_returnflag, SUM(l_quantity) AS s FROM lineitem GROUP BY l_returnflag"
+
     def pyarrow(t):  # native Acero
         a = t.group_by("l_returnflag").aggregate([("l_quantity", "sum")])
         return pa.table({"l_returnflag": a["l_returnflag"], "s": a["l_quantity_sum"]})
+
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)
 ```
 
