@@ -1,7 +1,7 @@
 # Migrating to Batcher
 
-This section maps the operations you know from pandas, Polars, and PySpark onto their
-Batcher equivalents, and shows how to prove the port is correct.
+This section maps the operations you know from pandas, Polars, PySpark, DuckDB, and Daft
+onto their Batcher equivalents, and shows how to prove the port is correct.
 
 Batcher's surface is deliberately close to the libraries you already know, so most of
 your vocabulary carries over. Absorb one concept before anything else: a `Dataset` is
@@ -12,29 +12,48 @@ is the Polars `LazyFrame` model rather than the eager pandas one.
 
 ## Coming from
 
-Each card names the single shift that matters most from that system.
+Each card names the single shift that matters most from that system, and links to the
+page to read first. The translation tables below are shared across all five, because the
+mapping is organized by what you are porting rather than by where it came from.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
 :::{grid-item-card} {octicon}`table;1.1em` pandas
+:link: transforming
+:link-type: doc
 The one shift is eager to *lazy*. Operations build a plan and run on a terminal
 call. `assign`, `groupby`, and `merge` become `with_columns`, `group_by().agg()`, and `join`.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` Polars
+:link: transforming
+:link-type: doc
 You already know the `LazyFrame` model. Expressions, `group_by().agg()`, `.over(...)`,
 and the typed accessors carry over almost verbatim.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` PySpark
+:link: transforming
+:link-type: doc
 No `SparkSession` and no cluster to start, because it runs in-process. The DataFrame
 verbs carry over, and so do the save modes and `MERGE INTO`.
 :::
 
 :::{grid-item-card} {octicon}`database;1.1em` DuckDB and SQL
+:link: ../user-guide/sql
+:link-type: doc
 The query itself often ports unchanged. `bt.sql(...)` builds the same plan the
-DataFrame verbs build, so you can mix the two. See {doc}`../user-guide/sql`.
+DataFrame verbs build, so you can mix the two.
+:::
+
+:::{grid-item-card} {octicon}`file-media;1.1em` Daft
+:link: ml-pipelines
+:link-type: doc
+Both engines are lazy, so that model ports unchanged. The shift is the UDF contract:
+`@daft.udf` becomes `@bt.udf`, and declaring `input_columns` wrong is a correctness bug
+rather than a slow query, because an undeclared column can be pruned out from under the
+function.
 :::
 ::::
 

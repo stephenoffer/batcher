@@ -282,9 +282,12 @@ of an exploding `flat_map` is therefore planned as if it explodes not at all.
 
 And the thing every estimator shares: it is a prediction. What makes it survivable is that
 the engine measures the truth at every pipeline breaker and re-plans on it. See
-[Adaptive re-optimization](adaptive-reoptimization.md).
+{doc}`Adaptive re-optimization <adaptive-reoptimization>`.
 
 ## Code map
+
+Each estimate described above has one owning file. Start here when you want to see how
+a number is actually derived:
 
 | Concern | File |
 |---|---|
@@ -298,13 +301,13 @@ the engine measures the truth at every pipeline breaker and re-plans on it. See
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): Kyber's lane, where it decides and never executes or measures
-- [Kyber optimizer](../internals/kyber.md): the passes these estimates feed
+- {doc}`Architecture <../architecture/index>`: Kyber's lane, where it decides and never executes or measures
+- {doc}`Kyber optimizer <../internals/kyber>`: the passes these estimates feed
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the sketch error bounds, derived
-- [Reading a plan](../user-guide/explain-plans.md): the `est≈` and provenance tags in the tree
-- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md): what to do when an estimate is badly wrong
-- [TPC-H benchmarks](../benchmarks/tpch.md): q5 and q9, the two queries this page keeps naming
-- [Cost model](cost-model.md): what consumes these row counts
-- [Adaptive re-optimization](adaptive-reoptimization.md): measuring the truth at a breaker
-- [Learned metadata](learned-metadata.md): where the NDVs and corrections are stored
+- {doc}`Reading a plan <../user-guide/explain-plans>`: the `est≈` and provenance tags in the tree
+- {doc}`Optimizing a slow query <../tutorials/optimizing-a-slow-query>`: what to do when an estimate is badly wrong
+- {doc}`TPC-H benchmarks <../benchmarks/tpch>`: q5 and q9, the two queries this page keeps naming
+- {doc}`Cost model <cost-model>`: what consumes these row counts
+- {doc}`Adaptive re-optimization <adaptive-reoptimization>`: measuring the truth at a breaker
+- {doc}`Learned metadata <learned-metadata>`: where the NDVs and corrections are stored
 :::

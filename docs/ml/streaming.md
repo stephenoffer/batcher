@@ -60,7 +60,7 @@ print(first.column("x").to_pylist())
 ```
 
 For learned feature statistics such as standardization, encoding, or imputation, fit a
-[preprocessor](preprocessors/index.md) on the training split and `transform` the stream. The
+{doc}`preprocessor <preprocessors/index>` on the training split and `transform` the stream. The
 fit is one mergeable pass, and the transform stays inside the engine. Neither touches the
 training hot path.
 
@@ -109,7 +109,7 @@ for batch in ds.ml.iter_torch_batches(
     train_step(batch["features"], batch["label"])
 ```
 
-See [PyTorch integration](pytorch.md) for the device-transfer, prefetch, collate, and
+See {doc}`PyTorch integration <pytorch>` for the device-transfer, prefetch, collate, and
 zero-copy options in full, along with a runnable in-memory example.
 
 ## Distributed and resumable training
@@ -273,10 +273,10 @@ state from a different corpus or seed raises rather than silently reshuffling sa
 the model has already trained on. And because the global order does not depend on
 `world_size`, a state may be restored onto a differently sized cluster.
 
-## Next steps
+## See also
 
-- [PyTorch integration](pytorch.md): feed Arrow batches to a `DataLoader`, device
+- {doc}`PyTorch integration <pytorch>`: feed Arrow batches to a `DataLoader`, device
   transfer, and DDP and FSDP.
-- [Preprocessors](preprocessors/index.md): fit feature transforms before the stream.
-- [Inference](inference.md): batch prediction and embeddings.
-- [GPU scheduling](gpu.md): run transforms on GPU workers.
+- {doc}`Preprocessors <preprocessors/index>`: fit feature transforms before the stream.
+- {doc}`Inference <inference>`: batch prediction and embeddings.
+- {doc}`GPU scheduling <gpu>`: run transforms on GPU workers.

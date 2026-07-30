@@ -231,6 +231,74 @@ def test_spill_join_matches_in_memory(how):
     assert _norm(spilled) == _norm(in_memory)
 
 
+@pytest.mark.parametrize("how", ["inner", "left", "right"])
+def test_spill_join_resplits_a_skewed_bucket_pair(monkeypatch, how):
+    """A skewed join key must re-split rather than materialize the hot bucket pair.
+
+    The bucket count is a constant, so under key skew one pair holds far more than its share
+    -- and both sides were read whole before the join, so a skewed pair OOMs at exactly the
+    point spilling was meant to have prevented it. This is the standard reason a skewed Spark
+    join dies.
+
+    Asserted for the outer joins too, not just inner: the union of the sub-pair joins is only
+    the same relation if unmatched-row emission is per-pair correct, which is the subtle part.
+    """
+    import dataclasses
+
+    from batcher.config import active_config, set_config
+    from batcher.dist.spill_breakers import join as join_mod
+
+    depths: list[int] = []
+    real = join_mod._join_bucket_pair
+
+    def traced(*args):
+        depths.append(args[-1])
+        yield from real(*args)
+
+    monkeypatch.setattr(join_mod, "_join_bucket_pair", traced)
+
+    # One hot key on both sides, plus cold keys that match only partially.
+    lk = [7] * 3000 + list(range(50))
+    lv = list(range(len(lk)))
+    rk = [7] * 40 + list(range(25, 75))
+    rv = list(range(len(rk)))
+    left = [
+        pa.record_batch(
+            {
+                "k": pa.array(lk[i : i + 500], type=pa.int64()),
+                "lv": pa.array(lv[i : i + 500], type=pa.int64()),
+            }
+        )
+        for i in range(0, len(lk), 500)
+    ]
+    right = [
+        pa.record_batch({"k": pa.array(rk, type=pa.int64()), "rv": pa.array(rv, type=pa.int64())})
+    ]
+    lt, rt = pa.Table.from_batches(left), pa.Table.from_batches(right)
+
+    in_memory = bt.from_arrow(lt).join(bt.from_arrow(rt), on="k", how=how).collect()
+
+    cfg = active_config()
+    mem = dataclasses.replace(cfg.memory, spill_bucket_max_bytes=4096)
+    set_config(cfg.replace(memory=mem))
+    try:
+        spilled = (
+            bt.from_batches(lambda: iter(left), left[0].schema)
+            .join(bt.from_batches(lambda: iter(right), right[0].schema), on="k", how=how)
+            .collect(spill=True, num_partitions=4)
+        )
+    finally:
+        set_config(cfg)
+
+    assert max(depths) > 0, (
+        "no bucket pair was re-split even though one key carries 3,000 of 3,050 left rows "
+        "against a 4 KiB per-bucket envelope -- the hot pair was read whole"
+    )
+    assert _norm(spilled) == _norm(in_memory), (
+        f"a re-split bucket pair diverged from the in-memory join ({how})"
+    )
+
+
 @pytest.mark.parametrize("num_partitions", [1, 8, 64])
 def test_spill_join_partition_invariant(num_partitions):
     lf, ls, rf, rs, lt, rt = _join_datasets()
@@ -427,6 +495,59 @@ def test_spill_multikey_sort_matches_in_memory(num_partitions):
     assert spilled.to_pylist() == in_memory.to_pylist()
 
 
+def test_spill_sort_bucket_count_tracks_the_input_not_a_constant(monkeypatch):
+    """The out-of-core sort must size its buckets from the input, not from a constant.
+
+    Each bucket is read back *whole* to be sorted, so a fixed bucket count makes peak
+    memory `input / n_buckets` -- it grows linearly with the input. A sort large enough to
+    need this path is then exactly the sort that OOMs on its first bucket, and the failure
+    looks like an ordinary OOM rather than a misconfigured spill.
+
+    Staging already measures the mapped input, so the count comes from the same envelope the
+    aggregate reduce uses. This asserts the sizing responds to that envelope: shrinking
+    `spill_bucket_max_bytes` must produce strictly more buckets for the same data, and the
+    result must stay identical either way.
+    """
+    import dataclasses
+
+    from batcher.config import active_config, set_config
+    from batcher.dist.spill_breakers import sort as sort_mod
+
+    seen: list[int] = []
+    real = sort_mod._buckets_for_staged
+
+    def spy(stage_handle, hint):
+        n = real(stage_handle, hint)
+        seen.append(n)
+        return n
+
+    monkeypatch.setattr(sort_mod, "_buckets_for_staged", spy)
+
+    factory, schema, table = _sort_dataset()
+    in_memory = bt.from_arrow(table).sort("k").collect()
+
+    def run_with(bucket_max):
+        cfg = active_config()
+        mem = dataclasses.replace(cfg.memory, spill_bucket_max_bytes=bucket_max)
+        set_config(cfg.replace(memory=mem))
+        try:
+            seen.clear()
+            out = bt.from_batches(factory, schema).sort("k").collect(spill=True, num_partitions=1)
+            assert out.column("k").to_pylist() == in_memory.column("k").to_pylist()
+            return seen[0]
+        finally:
+            set_config(cfg)
+
+    coarse = run_with(1 << 30)  # 1 GiB buckets: the data fits in one
+    fine = run_with(4096)  # 4 KiB buckets: many are needed
+
+    assert fine > coarse, (
+        f"the bucket count did not respond to the memory envelope ({coarse} buckets at a "
+        f"1 GiB cap, {fine} at 4 KiB) -- it is still a constant, so peak memory is a fixed "
+        f"fraction of the input rather than a fixed size"
+    )
+
+
 def test_spill_sort_top_n():
     factory, schema, table = _sort_dataset()
     spilled = (
@@ -466,6 +587,70 @@ def test_spill_global_window_matches_in_memory(descending, num_partitions):
     assert _norm(spilled) == _norm(in_memory)
 
 
+def test_spill_partitioned_window_resplits_a_skewed_bucket(monkeypatch):
+    """A skewed PARTITION BY must re-split rather than materialize the hot bucket.
+
+    The bucket count is a constant, so a skewed PARTITION BY leaves one bucket far over the
+    envelope -- and the window kernel needs its bucket materialized, so that is an OOM at
+    exactly the point spilling was meant to prevent one.
+
+    The correctness bar here is stricter than a join's: a window partition landing in two
+    sub-buckets would be *ranked twice*, not merely joined more slowly. So this asserts both
+    that the split engaged (a bucket was processed below depth 0) and that `row_number` still
+    matches the in-memory kernel -- row_number being exactly the function a split partition
+    cannot survive.
+    """
+    import dataclasses
+
+    from batcher.config import active_config, set_config
+    from batcher.dist.spill_breakers import window as win_mod
+
+    depths: list[int] = []
+    real = win_mod._window_bucket
+
+    def traced(nat, store, handle, win_json, cfg_json, pk_indices, depth):
+        depths.append(depth)
+        yield from real(nat, store, handle, win_json, cfg_json, pk_indices, depth)
+
+    monkeypatch.setattr(win_mod, "_window_bucket", traced)
+
+    # One hot key carrying most rows, plus many cold ones.
+    keys = ["hot"] * 4000 + [f"k{i}" for i in range(200)]
+    vals = list(range(len(keys)))
+    batches = [
+        pa.record_batch({"k": pa.array(keys[i : i + 500]), "v": pa.array(vals[i : i + 500])})
+        for i in range(0, len(keys), 500)
+    ]
+    schema = batches[0].schema
+    table = pa.Table.from_batches(batches)
+
+    def q(ds):
+        return ds.window(
+            partition_by=["k"], order_by=[("v", False)], functions={"rn": "row_number"}
+        )
+
+    in_memory = q(bt.from_arrow(table)).collect()
+
+    cfg = active_config()
+    mem = dataclasses.replace(cfg.memory, spill_bucket_max_bytes=8192)
+    set_config(cfg.replace(memory=mem))
+    try:
+        spilled = q(bt.from_batches(lambda: iter(batches), schema)).collect(
+            spill=True, num_partitions=4
+        )
+    finally:
+        set_config(cfg)
+
+    assert max(depths) > 0, (
+        "no window bucket was re-split even though one holds 4,000 of 4,200 rows against an "
+        "8 KiB per-bucket envelope -- the hot bucket was materialized whole"
+    )
+    assert _norm(spilled) == _norm(in_memory), (
+        "a re-split window bucket diverged from the in-memory kernel: a partition was split "
+        "across sub-buckets and ranked twice"
+    )
+
+
 def test_spill_global_window_streams_via_iter_batches():
     # iter_batches() over a global window streams the same bounded-memory pipeline.
     factory, schema, table = _sort_dataset()
@@ -492,9 +677,7 @@ def test_spill_global_window_avg_matches_in_memory(descending, num_partitions):
             functions={"a": ("avg", "v"), "s": ("sum", "v"), "c": ("count", "v"), "rk": "rank"},
         )
 
-    spilled = q(bt.from_batches(factory, schema)).collect(
-        spill=True, num_partitions=num_partitions
-    )
+    spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=num_partitions)
     in_memory = q(bt.from_arrow(table)).collect()
     assert spilled.column_names == in_memory.column_names
     assert _norm(spilled) == _norm(in_memory)
@@ -530,9 +713,7 @@ def test_spill_global_window_first_value_matches_in_memory(descending, num_parti
     def q(ds):
         return ds.window(order_by=[("k", descending)], functions={"fv": ("first_value", "v")})
 
-    spilled = q(bt.from_batches(factory, schema)).collect(
-        spill=True, num_partitions=num_partitions
-    )
+    spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=num_partitions)
     in_memory = q(bt.from_arrow(table)).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -584,3 +765,86 @@ def test_spill_empty_group_by_matches_in_memory():
     )
     assert spilled.num_rows == 0
     assert spilled.column_names == ["k", "s", "n"]
+
+
+def test_spill_groups_by_a_dictionary_key_whose_dictionaries_differ_per_morsel():
+    """Morsels encoding the same logical values with *different* dictionaries must group
+    together under spill.
+
+    This is the normal shape, not a corner: every Parquet row group carries its own
+    dictionary, so index 0 means one string in the first morsel and another in the second.
+    Spilling routes rows to buckets by a hash of the group key, and if that hash saw the
+    *indices* rather than the decoded values, the same logical key would land in two buckets
+    and be finalized as two groups -- a wrong answer with no error, on the encoding that
+    exists for exactly this kind of column.
+
+    Arrow's row encoding dereferences the dictionary, so it is correct today. The test exists
+    because the partitioner has raw-hash fast paths for Int64 and for mixed string/binary
+    keys, added for throughput, and a future one for dictionaries would break this silently:
+    the result stays correct for as long as every morsel happens to share a dictionary, which
+    is what a hand-built test fixture usually does.
+    """
+    forward = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 0, 1], type=pa.int32()), pa.array(["x", "y"], type=pa.string())
+    )
+    reversed_ = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 1, 0], type=pa.int32()), pa.array(["y", "x"], type=pa.string())
+    )
+    b1 = pa.record_batch({"k": forward, "v": pa.array([1, 2, 3, 4], type=pa.int64())})
+    b2 = pa.record_batch({"k": reversed_, "v": pa.array([10, 20, 30, 40], type=pa.int64())})
+    assert b1.column("k").to_pylist() == ["x", "y", "x", "y"]
+    assert b2.column("k").to_pylist() == ["y", "x", "x", "y"]
+    batches = [b1, b2]
+
+    in_memory = (
+        bt.from_arrow(pa.Table.from_batches(batches))
+        .group_by("k")
+        .agg(sv=bt.col("v").sum())
+        .collect()
+    )
+    spilled = (
+        bt.from_batches(lambda: iter(batches), b1.schema)
+        .group_by("k")
+        .agg(sv=bt.col("v").sum())
+        .collect(spill=True, num_partitions=4)
+    )
+
+    assert len(in_memory) == 2, "the fixture should produce two groups"
+    assert _norm(spilled) == _norm(in_memory), (
+        "a dictionary-encoded group key was split across spill buckets: the partitioner "
+        "hashed the indices rather than the decoded values, so the same logical key landed "
+        "in two buckets and was finalized twice"
+    )
+
+
+def test_spill_groups_by_decimal_and_timestamp_keys():
+    """Grace spilling must work for the key types a warehouse workload actually uses.
+
+    Decimal and timezone-aware timestamp keys take the partitioner's general row-encoding
+    path rather than either raw-hash fast path, so they are the types most likely to be
+    missed when a new fast path is added -- and a key type that cannot be partitioned is a
+    query that fails only once it grows large enough to spill.
+    """
+    from decimal import Decimal
+
+    n = 2000
+    decimals = pa.array(
+        [Decimal(f"{(i % 13) + 0.25:.2f}") for i in range(n)], type=pa.decimal128(10, 2)
+    )
+    stamps = pa.array(
+        [1_700_000_000 + (i % 7) * 86_400 for i in range(n)],
+        type=pa.timestamp("s", tz="UTC"),
+    )
+    table = pa.table({"d": decimals, "t": stamps, "v": pa.array(range(n), type=pa.int64())})
+    batches = table.to_batches(max_chunksize=100)
+
+    for key, expected in (("d", 13), ("t", 7)):
+        in_memory = bt.from_arrow(table).group_by(key).agg(sv=bt.col("v").sum()).collect()
+        spilled = (
+            bt.from_batches(lambda: iter(batches), batches[0].schema)
+            .group_by(key)
+            .agg(sv=bt.col("v").sum())
+            .collect(spill=True, num_partitions=8)
+        )
+        assert len(in_memory) == expected, f"{key}: fixture should give {expected} groups"
+        assert _norm(spilled) == _norm(in_memory), f"{key}: spilled result differs"

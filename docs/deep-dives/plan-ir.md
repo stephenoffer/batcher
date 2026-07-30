@@ -199,6 +199,9 @@ cannot drift apart.
 
 ## Where the code lives
 
+Each piece of the IR has one home. These are the files to open when a tag, a literal, or a
+config field is not behaving as this page describes:
+
 | Piece | File |
 |---|---|
 | `RelOp` + physical hints | `crates/bc-ir/src/lib.rs` |
@@ -212,13 +215,13 @@ cannot drift apart.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why the control plane and the data plane meet at a document
-- [Execution engine](../internals/execution.md): what happens to the `RelOp` tree after it lands
-- [Kyber](../internals/kyber.md): the passes that set the physical hints above
-- [Reading a plan](../user-guide/explain-plans.md): the same tree, rendered for humans
-- [Performance](../user-guide/performance.md): what to do when the plan is not the one you wanted
-- [TPC-H benchmarks](../benchmarks/tpch.md): the query shapes these hints are tuned against
-- [Query lifecycle](query-lifecycle.md): where the document is produced and consumed
-- [Expression evaluation](expression-evaluation.md): what the engine does with an `Expr`
-- [Join algorithms](join-algorithms.md): what the `strategy` hint actually selects
+- {doc}`Architecture <../architecture/index>`: why the control plane and the data plane meet at a document
+- {doc}`Execution engine <../internals/execution>`: what happens to the `RelOp` tree after it lands
+- {doc}`Kyber <../internals/kyber>`: the passes that set the physical hints above
+- {doc}`Reading a plan <../user-guide/explain-plans>`: the same tree, rendered for humans
+- {doc}`Performance <../user-guide/performance>`: what to do when the plan is not the one you wanted
+- {doc}`TPC-H benchmarks <../benchmarks/tpch>`: the query shapes these hints are tuned against
+- {doc}`Query lifecycle <query-lifecycle>`: where the document is produced and consumed
+- {doc}`Expression evaluation <expression-evaluation>`: what the engine does with an `Expr`
+- {doc}`Join algorithms <join-algorithms>`: what the `strategy` hint actually selects
 :::

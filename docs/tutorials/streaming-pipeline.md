@@ -264,13 +264,13 @@ The SQL `OVER` family, on bounded and unbounded data alike.
 
 ## See also
 
-- [Kafka integration](../integrations/kafka.md): the source the generator stands in for.
-- [Windowed aggregation](../examples/streaming/windowed-aggregation.md) and
-  [exactly-once sink](../examples/streaming/exactly-once-sink.md): the recipes for steps 4
+- {doc}`Kafka integration <../integrations/kafka>`: the source the generator stands in for.
+- {doc}`Windowed aggregation <../examples/streaming/windowed-aggregation>` and
+  {doc}`exactly-once sink <../examples/streaming/exactly-once-sink>`: the recipes for steps 4
   through 6.
-- [Late data and watermarks](../examples/streaming/late-data-watermarks.md): what happens to
+- {doc}`Late data and watermarks <../examples/streaming/late-data-watermarks>`: what happens to
   a row that arrives after its window closed.
-- [Deduplication](../examples/data-engineering/deduplication.md): the bounded-memory dedup,
+- {doc}`Deduplication <../examples/data-engineering/deduplication>`: the bounded-memory dedup,
   in the batch case.
-- [Fault tolerance](../architecture/fault-tolerance.md): what a checkpoint actually
+- {doc}`Fault tolerance <../architecture/fault-tolerance>`: what a checkpoint actually
   guarantees.

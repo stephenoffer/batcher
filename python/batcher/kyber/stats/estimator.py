@@ -21,14 +21,16 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import pyarrow as pa
+
 from batcher.config import CardinalityConfig, active_config
-from batcher.kyber import learning
-from batcher.kyber.learning import (
+from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
     CARDINALITY_CORRECTION_KEY,
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
+    columns_for,
 )
 from batcher.kyber.properties import project_ordering
 from batcher.kyber.stats import columns as col_prop
@@ -75,6 +77,43 @@ _UNKNOWN_INEQUALITY_SELECTIVITY = 1.0 / 3.0
 # Floor for a computed inequality selectivity. Zero would assert the join is *empty*, which
 # a distribution assumption may not do — only a proof may.
 _MIN_INEQUALITY_SELECTIVITY = 1e-6
+
+
+def _static_unnest_fanout(node: Unnest) -> float | None:
+    """Rows per input row an `Unnest` produces, when the *type* proves it.
+
+    A `fixed_size_list` carries its length, so exploding it is an exact fan-out — the same
+    kind of data-independent multiplier `Unpivot` gets from its column count, and the same
+    fact `plan.types.column_bytes` already reads to size the column. This is the embedding
+    and fixed-shape-vector case, and it is common enough in AI pipelines that leaving it to
+    the learning loop means being wrong by the vector's dimension on every cold run.
+
+    `None` for a variable-length list, whose length genuinely is a property of the data.
+
+    Args:
+        node: The explode being estimated.
+
+    Returns:
+        The exact fan-out, or `None` when the type does not prove one.
+    """
+    schema = node.input.available_schema()
+    if schema is None:
+        return None
+    field = next((f for f in schema.arrow if f.name == node.column), None)
+    if field is None:
+        return None
+    dtype = field.type
+    # An extension type is a label on a storage layout, and a fixed-shape tensor's storage
+    # is exactly the fixed-size list this is looking for — the same unwrap `column_bytes`
+    # needs, and for the same reason: no `pa.types.is_*` predicate sees through the label.
+    storage = getattr(dtype, "storage_type", None)
+    if isinstance(storage, pa.DataType):
+        dtype = storage
+    if not pa.types.is_fixed_size_list(dtype):
+        return None
+    # An `outer` explode keeps a row whose list is null, so it can never emit fewer rows
+    # than it read; a zero-length fixed list would otherwise estimate the relation empty.
+    return float(max(1, dtype.list_size)) if node.outer else float(dtype.list_size)
 
 
 def _uniform_p_less(a1: float, b1: float, a2: float, b2: float) -> float:
@@ -330,12 +369,25 @@ class StatsEstimator:
             # The opaque UDF means output columns are unknown.
             return RelStats(self.estimate(node.input).rows, Provenance.DEFAULT)
         if isinstance(node, Unnest):
-            # Explode multiplies rows by the average list length — a property of the data
-            # that no structural rule can know, so the neutral (1x) default here is wrong
-            # by exactly that factor on the first run. `Unnest` is `_CORRECTABLE`, so the
-            # measured fan-out from a previous run is applied by `estimate` on top of this.
+            # Explode multiplies rows by the average list length. For a *variable*-length
+            # list that is a property of the data which no structural rule can know, so the
+            # neutral (1x) default is wrong by exactly that factor on the first run;
+            # `Unnest` is `_CORRECTABLE`, so a measured fan-out from a previous run is
+            # applied by `estimate` on top of this.
+            #
+            # For a **fixed-size list** it is not unknown at all — the length is in the type,
+            # exactly as it is for `Unpivot`'s column count one branch down, and exactly as
+            # `plan.types.column_bytes` reads it to size the column's bytes. That is the
+            # embedding/vector column: exploding a `fixed_size_list<float32, 768>` produces
+            # 768 rows per input row, and estimating it at 1x under-sized every stage below
+            # it by nearly three orders of magnitude on the first run — the run with nothing
+            # learned, and the one that has to be admitted against a real envelope.
             child = self.estimate(node.input)
-            return RelStats(child.rows, Provenance.DEFAULT, col_prop.unnest_columns(node, child))
+            fanout = _static_unnest_fanout(node)
+            rows = child.rows * fanout if fanout is not None else child.rows
+            # A proven fan-out is as exact as its input; a defaulted one is a guess.
+            prov = child.provenance if fanout is not None else Provenance.DEFAULT
+            return RelStats(rows, prov, col_prop.unnest_columns(node, child))
         if isinstance(node, Unpivot):
             # Unpivot emits one row per `on` column — an exact, data-independent fan-out.
             child = self.estimate(node.input)
@@ -1110,10 +1162,10 @@ class StatsEstimator:
         if cached is not None:
             return cached
         key = self._source_key(source_id)
-        ndv = learning.columns_for(self._learned, NDV_KEY, key)
-        quantiles = learning.columns_for(self._learned, QUANTILES_KEY, key)
-        mcv = learning.columns_for(self._learned, MCV_KEY, key)
-        widths = learning.columns_for(self._learned, AVG_BYTES_KEY, key)
+        ndv = columns_for(self._learned, NDV_KEY, key)
+        quantiles = columns_for(self._learned, QUANTILES_KEY, key)
+        mcv = columns_for(self._learned, MCV_KEY, key)
+        widths = columns_for(self._learned, AVG_BYTES_KEY, key)
         cols: dict[str, ColumnStat] = {}
         for name in set(ndv) | set(quantiles) | set(mcv) | set(widths):
             measured = ndv.get(name)
@@ -1154,11 +1206,90 @@ class StatsEstimator:
             typed = {f.name: column_bytes(f.type) for f in schema.arrow}
         measured = [widths[c] for c in cols if c in widths]
         if not measured and not typed:
-            return default
+            return self._opaque_width(node, default)
         # Neutral per-column filler for a column neither measured nor typed.
         known = measured or list(typed.values())
         avg_known = sum(known) / len(known)
-        return sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
+        derived = sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
+        return max(derived, self._measured_scan_width(node))
+
+    def _measured_scan_width(self, node: LogicalPlan) -> float:
+        """Bytes per row the *source itself* measured, or `0.0` when it reported none.
+
+        A connector that can answer `byte_size` and `row_count` has already measured the one
+        quantity every type prior is trying to approximate, and nothing read it. That is the
+        whole gap on unstructured and multimodal data: `io/formats/multimodal/media.py`
+        reports the exact total size and file count from its listing — a directory of 200 MB
+        videos is 200 MB per row, measured — while `column_bytes` could only offer the 36 B
+        prior for the `binary` column it lands in. Five to six orders of magnitude, for a
+        number already sitting in `SourceStatistics`.
+
+        Read **only** from a connector that set `content_byte_size`, meaning its `byte_size`
+        measures the rows' own content rather than their stored encoding. That flag is the
+        whole safety argument, and it was earned by measurement rather than assumed: taking
+        a *columnar* footer's `total_byte_size` as a floor as well moved TPC-H sf1's
+        type-derived width from 88 to 142 B/row — closer to the true 139 — and made the
+        benchmark **worse**, pushing dimension build sides past the broadcast threshold and
+        taking q9 from 55.8 ms to 127.9 with ten other queries slower. A sharper estimate
+        against a threshold tuned for the blunter one is a re-tuning, not an improvement.
+        See `SourceStatistics.content_byte_size`.
+
+        Taken as a floor (`max` with the type-derived sum) rather than as the answer, since a
+        media listing's bytes are the *encoded* file and a decoded frame in memory is larger
+        still — conservative in the right direction.
+
+        Only at a `Scan`. Above one the projected columns differ, and the per-column widths
+        propagated on `RelStats` are the right mechanism — attributing a whole relation's
+        bytes to a single narrow projected column would invert the estimate.
+
+        Args:
+            node: The node whose width is being estimated.
+
+        Returns:
+            Measured bytes per row, or `0.0` when the source reported none.
+        """
+        if not isinstance(node, Scan):
+            return 0.0
+        stats = self._stats_for(node.source_id)
+        if stats is None:
+            return 0.0
+        size, rows = stats.byte_size, stats.row_count
+        if not getattr(stats, "content_byte_size", False) or not size or not rows or rows <= 0:
+            return 0.0
+        return float(size) / float(rows)
+
+    def _opaque_width(self, node: LogicalPlan, default: float) -> float:
+        """Row width for a node whose own schema says nothing — the `map_batches` case.
+
+        A `MapBatches` is executed in Python and never lowered, so it publishes no output
+        schema and its width fell all the way back to the flat `bytes_per_row` constant of
+        64. That is the operator at the centre of every inference pipeline, and the rows
+        flowing through it are the widest in the engine: a decoded 224x224x3 image is 147 KiB,
+        so the estimate was off by three orders of magnitude for the memory envelope, the
+        morsel cap, and the GPU batch seed all at once.
+
+        The input's width is not a guess here. `MapBatches.available_columns` already
+        implements the operator's stated contract — "if `output_columns` is omitted, the
+        input columns are assumed to pass through" — so taking the *input's* width is the
+        same assumption the plan already makes about the same operator, priced instead of
+        counted. A declared `output_columns` means the shape genuinely changed, and there the
+        flat default stands rather than a claim about columns the UDF invented.
+
+        Deliberately **not** implemented by giving `MapBatches` an `available_schema`. That
+        method feeds type inference and expression validation, where asserting the input's
+        *types* survive a UDF that may rewrite them would turn an estimate into a wrong
+        answer. A width only feeds cost and memory, where being closer is strictly better.
+
+        Args:
+            node: The node whose width could not be derived from its own schema.
+            default: The flat per-row constant to fall back to.
+
+        Returns:
+            The input's estimated width for a pass-through `map_batches`, else `default`.
+        """
+        if isinstance(node, MapBatches) and node.output_columns is None:
+            return self.row_width(node.input, default)
+        return default
 
     def _side_ndv(self, keys: tuple[str, ...], side: RelStats) -> float | None:
         """Distinct count of one join side's key *set*, capped at its row count.

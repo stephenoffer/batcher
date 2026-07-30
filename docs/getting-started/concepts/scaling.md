@@ -37,3 +37,10 @@ flag. The plan and the result don't change.
 # docs: skip
 counts.collect(distributed=True)   # same plan, many machines, identical result
 ```
+
+
+## See also
+
+- {doc}`../../user-guide/performance`: measuring and tuning before reaching for more machines.
+- {doc}`../../deep-dives/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
+- {doc}`../../integrations/ray`: running the distributed path on a real cluster.

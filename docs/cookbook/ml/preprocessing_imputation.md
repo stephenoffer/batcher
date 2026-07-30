@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/preprocessing_imputation.py
 ```
+
+## See also
+
+- {doc}`preprocessing_encoding`: turning categories into numbers, and picking the encoder by cardinality.
+- {doc}`preprocessing_scaling`: scaling numeric features, and why the choice of scaler matters.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

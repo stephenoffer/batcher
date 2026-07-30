@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/numeric_math.py
 ```
+
+## See also
+
+- {doc}`nulls_and_casting`: nulls and type casting: the two places a pipeline quietly changes its answer.
+- {doc}`sorting_and_ranking`: sorting and ranking, including the edge cases that hide bugs.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

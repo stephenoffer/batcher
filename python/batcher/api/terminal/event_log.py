@@ -362,11 +362,13 @@ def _query_id(seq: int) -> str:
     return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{seq:06d}"
 
 
-# Directories already `mkdir`-ed this process. The path is still resolved every call (cheap
-# string work, and it correctly tracks a changed `event_log_dir` / `BATCHER_HOME`), but the
-# `mkdir` syscall — a fixed per-query cost on the default-on event-log path — is issued only
-# the first time a given resolved directory is seen.
-_CREATED_DIRS: set[str] = set()
+# Resolved directories, keyed by the two inputs that determine one. Both the `mkdir`
+# syscall and the resolution itself are memoized: the event log is on by default, so this
+# runs on every query, and `expanduser` is not the free string work it looks like — it can
+# consult the password database, and it measured 31 us per query, ~2% of the whole fixed
+# per-query cost. Keying on `(configured, BATCHER_HOME)` keeps the property the per-call
+# resolution was there for: change either and the next query resolves afresh.
+_RESOLVED_DIRS: dict[tuple[str, str | None], Path] = {}
 
 
 def _resolve_dir(configured: str) -> Path:
@@ -375,15 +377,17 @@ def _resolve_dir(configured: str) -> Path:
     Private because an event-log document is not metadata: it carries the whole plan,
     including literal predicate constants, so a `WHERE ssn = '...'` ends up on disk in it.
     """
+    home = os.environ.get("BATCHER_HOME")
+    key = (configured, home)
+    cached = _RESOLVED_DIRS.get(key)
+    if cached is not None:
+        return cached
     if configured:
         path = Path(configured)
     else:
-        base = os.environ.get("BATCHER_HOME") or os.path.join(os.path.expanduser("~"), ".batcher")
-        path = Path(base) / "logs"
-    key = str(path)
-    if key not in _CREATED_DIRS:
-        private_dir(path)
-        _CREATED_DIRS.add(key)
+        path = Path(home or os.path.join(os.path.expanduser("~"), ".batcher")) / "logs"
+    private_dir(path)
+    _RESOLVED_DIRS[key] = path
     return path
 
 

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_hashing.py
 ```
+
+## See also
+
+- {doc}`strings_extraction`: pulling entities and leading fragments out of free text.
+- {doc}`strings_padding`: string padding and trimming: fixed-width keys and cleaning stray whitespace.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

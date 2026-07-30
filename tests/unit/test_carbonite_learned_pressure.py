@@ -109,17 +109,23 @@ def _seed_width(hub: MetadataHub, kind: str, bytes_per_row: float, *, n: int = 3
 
 def test_morsel_rows_capped_by_learned_width():
     hub = _hub()
-    # Rows measured 4x wider than assumed → cap rows so rows*width stays within morsel_bytes.
-    _seed_width(hub, "aggregate", bytes_per_row=_ROW_BYTES * 64)
+    # Rows measured 64x wider than assumed → cap rows so rows*width stays within morsel_bytes.
+    width = _ROW_BYTES * 64
+    _seed_width(hub, "aggregate", bytes_per_row=width)
     rm = ResourceManager(hub=hub)
     target = rm.recommend_morsel_target()
     assert target is not None
     rows, nbytes = target
     exec_cfg = active_config().execution
-    expected = int(exec_cfg.morsel_bytes / (_ROW_BYTES * 64))
-    assert rows == max(1024, expected)
+    expected = int(exec_cfg.morsel_bytes / width)
+    assert rows == expected
     assert rows < exec_cfg.morsel_rows  # genuinely tightened
     assert nbytes == exec_cfg.morsel_bytes  # byte budget unchanged (unpressured)
+    # The property this test exists to prove, which its own comment stated and its
+    # assertion did not: the resulting morsel is inside the byte budget. It previously
+    # asserted `max(1024, expected)`, so at this width it accepted 1,024 rows x 4 KiB =
+    # 4 MiB against a 1 MiB budget — the flat row floor overriding the bound it accompanies.
+    assert rows * width <= exec_cfg.morsel_bytes
 
 
 def test_morsel_unchanged_on_cold_store():

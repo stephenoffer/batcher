@@ -47,3 +47,10 @@ bt.col("email").str.lower()           # string ops
 bt.col("signup_ts").dt.year()         # datetime parts
 bt.col("tags").list.contains("ai")    # list / array ops
 ```
+
+
+## See also
+
+- {doc}`../../user-guide/expressions`: the full expression surface, with nulls and casting.
+- {doc}`../../user-guide/expression-accessors`: the `.str`, `.dt`, `.list`, and `.json` namespaces.
+- {doc}`../../api/expressions`: every `Expr` method in one reference.

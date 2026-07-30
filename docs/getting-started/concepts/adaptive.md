@@ -45,3 +45,10 @@ print(plan.stats().rows)   # rows the query actually produced
 
 `explain()` shows the plan Kyber chose, without running it. `stats()` shows what
 actually happened.
+
+
+## See also
+
+- {doc}`lazy`: why nothing runs until a terminal call, which is what makes re-planning possible.
+- {doc}`../../user-guide/explain-plans`: reading the plan and the measured numbers behind it.
+- {doc}`../../deep-dives/adaptive-reoptimization`: the re-planning loop, breaker by breaker.

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/statistics/robust_dispersion.py
 ```
+
+## See also
+
+- {doc}`quantiles_and_histograms`: quantiles, histograms, and the exact-versus-approximate trade.
+- {doc}`summary_statistics`: summary aggregates beyond mean and stddev.
+- {doc}`../../ml/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`../../api/ml-statistics`: the reference for every statistical function.

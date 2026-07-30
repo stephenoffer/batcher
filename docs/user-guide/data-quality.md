@@ -174,12 +174,12 @@ print(evolved.to_pydict())
 # {'id': [1, 2, 3], 'amount': [10, 20, 30], 'region': [None, None, 'us']}
 ```
 
-## Next steps
+## See also
 
-- [Reading data](reading-data.md): ingest files, and reconcile the schemas that
+- {doc}`Reading data <reading-data>`: ingest files, and reconcile the schemas that
   drifted between them.
-- [Transformations](transformations.md): cleanse and reshape what survived the checks.
-- [Aggregations](aggregations.md): summarize it.
-- [Dataset API](../api/dataset.md): the full reference for `ds.dq` and `distinct`.
-- [Agent skills](../agents/index.md): `validate-data-quality`, on choosing between
+- {doc}`Transformations <transformations>`: cleanse and reshape what survived the checks.
+- {doc}`Aggregations <aggregations>`: summarize it.
+- {doc}`Dataset API <../api/dataset>`: the full reference for `ds.dq` and `distinct`.
+- {doc}`Agent skills <../agents/index>`: `validate-data-quality`, on choosing between
   fail, drop, and quarantine, and profiling before you write the checks.

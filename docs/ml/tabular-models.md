@@ -2,7 +2,7 @@
 
 This page describes how to run a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model over a Batcher `Dataset`.
 
-Tabular models are the ones most production ML actually runs, and they have a different shape from a language model: the input is dozens of numeric columns rather than one text column, the model is megabytes rather than gigabytes, and the bottleneck is feeding the model rather than the model itself. `ds.ml.predict` is the entry point built for that shape.
+Tabular models are the ones most production ML actually runs, and they have a different shape from a language model. The input is dozens of numeric columns rather than one text column, the model is megabytes rather than gigabytes, and the bottleneck is feeding the model rather than the model itself. `ds.ml.predict` is the entry point built for that shape.
 
 ## How it works
 
@@ -44,7 +44,7 @@ print(high_risk.count())
 
 | `method` | What you get | Available on |
 |---|---|---|
-| `"predict"` | The model's natural output — a label, or a value for a regressor. | all |
+| `"predict"` | The model's natural output: a label, or a value for a regressor. | all |
 | `"predict_proba"` | Class probabilities, one column per class. | classifiers |
 | `"raw"` | The untransformed margin or decision function. | all |
 | `"leaf"` | The leaf index each tree routed the row to. | boosters |
@@ -104,7 +104,7 @@ scored.write_parquet("s3://bucket/scored/", distributed=True)
 
 `batch_size` matters more here than for a GPU model: a tabular model's per-call overhead is fixed and small, so larger batches amortize it, and 100,000 rows of 50 float32 features is only 20 MB.
 
-`threads` caps the model's own thread pool inside one worker. Leave it unset and Batcher sizes it to the cores the worker may actually use — a booster's own default is the *host* core count, so several co-located workers otherwise each grab every core and thrash.
+`threads` caps the model's own thread pool inside one worker. Leave it unset and Batcher sizes it to the cores the worker may actually use. A booster's own default is the *host* core count, so several co-located workers would otherwise each grab every core and thrash.
 
 ## A linear baseline for free
 
@@ -120,15 +120,15 @@ print(round(model.coef_[0], 1), round(model.intercept_, 1))
 # 2.0 1.0
 ```
 
-`Ridge(alpha=...)` adds an L2 penalty that stabilizes the fit when features are collinear — the case where ordinary least squares is unreliable. Encode categorical columns to numbers first, as for every other model here.
+`Ridge(alpha=...)` adds an L2 penalty that stabilizes the fit when features are collinear, which is the case where ordinary least squares is unreliable. Encode categorical columns to numbers first, as for every other model here.
 
-Where ridge shrinks every coefficient, `batcher.ml.sparse_linear.Lasso` and `ElasticNet` drive the irrelevant ones to *exactly* zero, so the fit selects features as it trains — the tool for a wide, correlated table. Their coordinate descent needs only the centered Gram matrix and the feature-target covariances (one scan), and because the objective is strictly convex the coefficients match scikit-learn's.
+Where ridge shrinks every coefficient, `batcher.ml.sparse_linear.Lasso` and `ElasticNet` drive the irrelevant ones to *exactly* zero, so the fit selects features as it trains. That makes them the tool for a wide, correlated table. Their coordinate descent needs only the centered Gram matrix and the feature-target covariances (one scan), and because the objective is strictly convex the coefficients match scikit-learn's.
 
-For a count target — events, arrivals, claim frequencies — `batcher.ml.glm.PoissonRegressor` fits a log-link generalized linear model by the same IRLS Newton steps, keeping the predicted rate positive where least squares would predict a negative count. It matches scikit-learn's `PoissonRegressor` across penalty strengths. For a positive, right-skewed *amount* — a claim size, a duration, a spend — `GammaRegressor` is the matching GLM, with a variance that grows with the mean. `TweedieRegressor` is the general form these two specialize: a `power` between 1 and 2 fits the compound distribution of a target that is exactly zero for many rows and positive for the rest, such as an insurance pure premium.
+For a count target such as events, arrivals, or claim frequencies, `batcher.ml.glm.PoissonRegressor` fits a log-link generalized linear model by the same IRLS Newton steps, keeping the predicted rate positive where least squares would predict a negative count. It matches scikit-learn's `PoissonRegressor` across penalty strengths. For a positive, right-skewed *amount* such as a claim size, a duration, or a spend, `GammaRegressor` is the matching GLM, with a variance that grows with the mean. `TweedieRegressor` is the general form these two specialize: a `power` between 1 and 2 fits the compound distribution of a target that is exactly zero for many rows and positive for the rest, such as an insurance pure premium.
 
-For classification, `RidgeClassifier` casts it as regression on one-vs-rest targets (a closed-form single-scan fit), while `LogisticRegression` fits the probabilistic model by iteratively reweighted least squares — each Newton step is one scan — and reproduces scikit-learn's unpenalized coefficients. `predict_proba` appends the positive-class probability; `predict` thresholds it to a 0/1 label.
+For classification, `RidgeClassifier` casts it as regression on one-vs-rest targets (a closed-form single-scan fit), while `LogisticRegression` fits the probabilistic model by iteratively reweighted least squares, one scan per Newton step, and reproduces scikit-learn's unpenalized coefficients. `predict_proba` appends the positive-class probability, and `predict` thresholds it to a 0/1 label.
 
-`batcher.ml.naive_bayes.GaussianNB` is the even cheaper baseline: its whole fit — a per-class prior, mean, and variance — is a single `group_by(target)` aggregate, and it reproduces scikit-learn's predictions. Naive by assumption, but a strong instant baseline in high dimensions. `MultinomialNB` and `BernoulliNB` are the count-feature and binary-feature variants (the text-classification workhorses), fitted the same way from grouped sums.
+`batcher.ml.naive_bayes.GaussianNB` is the even cheaper baseline. Its whole fit, a per-class prior, mean, and variance, is a single `group_by(target)` aggregate, and it reproduces scikit-learn's predictions. It is naive by assumption but a strong instant baseline in high dimensions. `MultinomialNB` and `BernoulliNB` are the count-feature and binary-feature variants that do the text-classification work, fitted the same way from grouped sums.
 
 When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: `LinearDiscriminantAnalysis` shares one covariance across classes for a stable linear boundary, and `QuadraticDiscriminantAnalysis` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
 
@@ -165,7 +165,8 @@ Under `distributed=True` a preempted worker's partition is recomputed, so scorin
 
 ## See also
 
-- {doc}`evaluation` — score the predictions you just produced, per segment, in one pass.
-- {doc}`preprocessors/index` — the fit/transform steps that produce the feature columns.
-- {doc}`statistics-and-drift` — check that today's features still look like the training ones.
-- {doc}`inference` — the deep-learning and HuggingFace path.
+- {doc}`evaluation`: score the predictions you just produced, per segment, in one pass.
+- {doc}`preprocessors/index`: the fit and transform steps that produce the feature columns.
+- {doc}`statistics-and-drift`: check that today's features still look like the training ones.
+- {doc}`inference`: the deep-learning and HuggingFace path.
+- {doc}`../cookbook/ml/index`: short runnable recipes for each model family.

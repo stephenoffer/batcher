@@ -7,7 +7,7 @@ query did. Every knob lives on one frozen `Config`, applied process-wide with
 `set_config` or scoped to a block with `config_context`.
 
 This page is about making *your* query faster. For how Batcher compares against DuckDB,
-Polars, and Daft, see the [benchmarks](../benchmarks/index.md), which carry the
+Polars, and Daft, see the {doc}`benchmarks <../benchmarks/index>`, which carry the
 methodology behind every figure.
 
 ## Setup
@@ -65,8 +65,8 @@ print(hot.group_by("region").agg(total=bt.col("amount").sum()).sort("region").to
 Every terminal operation pays a fixed control-plane cost before the engine touches
 data: building the plan, optimizing it, deciding a memory envelope, and reporting what
 happened. On a query over millions of rows this is invisible. On a workload made of
-thousands of *small* queries — an interactive session, a serving endpoint, a test suite —
-it is the whole bill, so it is worth knowing what is amortized for you and what you can
+thousands of *small* queries, such as an interactive session, a serving endpoint, or a test
+suite, it is the whole bill, so it is worth knowing what is amortized for you and what you can
 switch off.
 
 Two things are already reused across calls, and you get them without asking:
@@ -109,8 +109,8 @@ with config_context(quiet):
 # 6
 ```
 
-Or, more simply, set `BATCHER_OBSERVABILITY_EVENT_LOG=false` in the environment before
-the process starts. Turning it off changes no result — only whether the profile is
+Or set `BATCHER_OBSERVABILITY_EVENT_LOG=false` in the environment before
+the process starts. Turning it off changes no result, only whether the profile is
 archived to disk.
 
 ## Morsel-driven execution
@@ -346,17 +346,17 @@ Reach for these in order. Most workloads need none of them.
 - A query slower than expected: `explain()` to check the plan, then `stats()` to find the
   operator that dominated wall time.
 - A cluster shuffle under memory pressure: the credit-based backpressure in `flow_control`
-  and `distributed`. See [Fault tolerance](../architecture/fault-tolerance.md).
+  and `distributed`. See {doc}`Fault tolerance <../architecture/fault-tolerance>`.
 
 Every field, with its default and meaning, is in
-[Configuration options](../configuration/options.md).
+{doc}`Configuration options <../configuration/options>`.
 
-## Next steps
+## See also
 
-- [Benchmarks](../benchmarks/index.md): the measured results, and how to reproduce them.
-- [Configuration options](../configuration/options.md): the full `Config` reference.
-- [Fault tolerance](../architecture/fault-tolerance.md): how a distributed query
+- {doc}`Benchmarks <../benchmarks/index>`: the measured results, and how to reproduce them.
+- {doc}`Configuration options <../configuration/options>`: the full `Config` reference.
+- {doc}`Fault tolerance <../architecture/fault-tolerance>`: how a distributed query
   survives task, worker, and node failures.
-- [Aggregations](aggregations.md): the breakers that spill and re-optimize.
-- [Agent skills](../agents/index.md): `optimize-a-slow-query` covers the measure-first
+- {doc}`Aggregations <aggregations>`: the breakers that spill and re-optimize.
+- {doc}`Agent skills <../agents/index>`: `optimize-a-slow-query` covers the measure-first
   methodology and the ordered fix checklist.

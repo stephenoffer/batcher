@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/operations/memory_and_caching.py
 ```
+
+## See also
+
+- {doc}`inspecting_a_query`: reading a plan, timing a query, and checking what the engine actually ran.
+- {doc}`observability`: watching a query run: verbosity, logging, and execution statistics.
+- {doc}`../../user-guide/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`../../user-guide/observability`: what the engine records about a run, and where.

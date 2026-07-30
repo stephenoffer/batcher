@@ -170,9 +170,9 @@ result = ds.group_by("region").agg(total=bt.col("amount").sum()).collect(
 )
 ```
 
-## Next steps
+## See also
 
-- [Reading data](reading-data.md) and [Writing data](writing-data.md): the full reader
+- {doc}`Reading data <reading-data>` and {doc}`Writing data <writing-data>`: the full reader
   and writer surface.
-- [Lakehouse](lakehouse.md): Delta, Iceberg, and Hudi tables on object storage.
-- [IO API](../api/io.md): the `bt.read` / `ds.write` reference.
+- {doc}`Lakehouse <lakehouse>`: Delta, Iceberg, and Hudi tables on object storage.
+- {doc}`IO API <../api/io>`: the `bt.read` / `ds.write` reference.

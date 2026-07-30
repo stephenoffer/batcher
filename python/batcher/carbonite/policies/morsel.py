@@ -7,10 +7,15 @@ the static `(morsel_rows, morsel_bytes)` pair is a guess about data it has never
 
 - **Pressure.** As the engine's envelope fills, a smaller morsel keeps the streaming
   working set tighter, so the query stays in memory longer before it must spill.
-- **Measured row width.** A row-count target assumes a row width. A workload whose rows
-  proved far wider than assumed (embeddings, blobs, large strings) fills a `morsel_rows`
-  batch to many times `morsel_bytes`, so its true working set is bounded only once the
-  *count* is capped by the measured width.
+- **Row width.** A row-count target assumes a row width, and the default pair assumes 64
+  bytes. A workload whose rows are far wider — embeddings, blobs, large strings, and above
+  all the decoded image, audio, and video tensors of a multimodal pipeline — fills a
+  `morsel_rows` batch to many times `morsel_bytes`, so its true working set is bounded only
+  once the *count* is capped by the width. Both widths are consulted, and the more binding
+  wins: the **measured** one from the learned model, which is the only signal that can see
+  a variable-length payload's real size, and the **planned** one from the plan's own
+  schema, which is exact for a tensor column and, unlike a measurement, exists on the first
+  run — the run with nothing learned yet, and the one that OOMs.
 
 Split out of `ResourceManager` because it is arithmetic over a pressure level and a learned
 width with no reference to the manager's state, and because keeping it there pushed that
@@ -36,6 +41,8 @@ __all__ = [
     "PRESSURE_FACTORS",
     "learned_row_cap",
     "morsel_target",
+    "planned_row_cap",
+    "row_floor",
 ]
 
 # How far to shrink the morsel target at each pressure level (adaptive morsel sizing).
@@ -49,6 +56,50 @@ PRESSURE_FACTORS = {
 }
 MIN_MORSEL_ROWS = 1024  # floor: a morsel never shrinks below a cache-efficient batch
 MIN_MORSEL_BYTES = 64 * 1024  # 64 KiB floor (companion byte bound)
+
+
+def row_floor(byte_target: int, width: float) -> int:
+    """The smallest row count a morsel may be cut to, for rows of `width` bytes.
+
+    `MIN_MORSEL_ROWS` exists so a morsel never degrades into a batch too small to amortize
+    per-batch overhead — a **narrow-row** concern, and on narrow rows it is exactly right.
+    Applied unconditionally it silently overrides the byte bound it was meant to accompany,
+    and the default targets put that crossover at **1,024 bytes per row**
+    (`morsel_bytes / MIN_MORSEL_ROWS`), which is below essentially every unstructured or
+    multimodal column in the engine:
+
+    | column                          | width     | morsel at the flat floor    |
+    |---------------------------------|-----------|-----------------------------|
+    | 768-dim `float32` embedding     | 3 KiB     | 3 MiB — 3x the budget       |
+    | 224x224x3 `uint8` image         | 147 KiB   | 147 MiB — **147x**          |
+    | one 1080p RGB video frame       | 5.9 MiB   | 6 GiB — **6,000x**          |
+
+    So the floor is itself bounded by the byte target: never demand more rows than fit in
+    the budget. On narrow rows the byte term is the larger of the two and the floor is
+    `MIN_MORSEL_ROWS` exactly as before; on wide rows it falls away, down to one row, which
+    is the correct morsel for a frame that is larger than the whole budget on its own.
+
+    Args:
+        byte_target: The morsel's byte budget.
+        width: Estimated or measured bytes per row.
+
+    Returns:
+        The row floor, at least 1.
+    """
+    if width <= 0:
+        return MIN_MORSEL_ROWS
+    return max(1, min(MIN_MORSEL_ROWS, int(byte_target / width)))
+
+
+def _cap_for_width(config: Config, width: float | None) -> int | None:
+    """Row cap keeping `width`-byte rows inside the byte budget, or `None` if not binding."""
+    if width is None or width <= 0:
+        return None
+    byte_target = config.execution.morsel_bytes
+    cap = int(byte_target / width)
+    if cap >= config.execution.morsel_rows:
+        return None  # the width is no wider than assumed — nothing to tighten
+    return max(row_floor(byte_target, width), cap)
 
 
 def learned_row_cap(
@@ -73,13 +124,52 @@ def learned_row_cap(
     """
     if model is None:
         return None
-    width = model.max_bytes_per_row(families)
-    if width is None or width <= 0:
-        return None
-    cap = int(config.execution.morsel_bytes / width)
-    if cap >= config.execution.morsel_rows:
-        return None  # learned width is no wider than assumed — nothing to tighten
-    return max(MIN_MORSEL_ROWS, cap)
+    return _cap_for_width(config, model.max_bytes_per_row(families))
+
+
+def planned_row_cap(config: Config, plan: object) -> int | None:
+    """Row cap from the width the plan's **schema** implies.
+
+    The companion to `learned_row_cap`, and the one that exists on the *first* run. A
+    learned width only exists after a query of this shape has already run, and the first run
+    of a multimodal pipeline is precisely the one with nothing measured and the one that
+    OOMs. The width was knowable the whole time: it is a property of the column types, which
+    the plan carries before a single row is read, and it is **exact** for the tensor columns
+    that carry decoded images, audio, and video. A cold store was throwing that away and
+    cutting a morsel by a row count that assumes 64 B/row.
+
+    It is also keyed better than the learned width, which is filed by operator *family* and
+    so cannot tell this plan's image scan from an earlier narrow one. `morsel_target` takes
+    whichever of the two binds harder rather than preferring either.
+
+    Takes the **widest** stage in the plan, because a morsel flowing through it must fit the
+    widest one, not the average. Reads only the neutral `plan` layer, so Carbonite consults
+    the schema without importing Kyber.
+
+    Args:
+        config: The active config, for the byte and row targets.
+        plan: The logical plan about to run.
+
+    Returns:
+        The row cap, or `None` when no node carries a schema or the implied width is no
+        wider than the configured target already assumes.
+    """
+    from batcher.plan.types import schema_row_bytes
+    from batcher.plan.visitor import walk
+
+    widest = 0.0
+    for node in walk(plan):
+        schema = getattr(node, "available_schema", None)
+        resolved = schema() if callable(schema) else None
+        arrow = getattr(resolved, "arrow", None)
+        if arrow is not None:
+            widest = max(widest, schema_row_bytes(arrow))
+    return _cap_for_width(config, widest) if widest > 0.0 else None
+
+
+def _planned(config: Config, plan: object | None) -> int | None:
+    """`planned_row_cap` for an optional plan — `None` when the caller supplied none."""
+    return planned_row_cap(config, plan) if plan is not None else None
 
 
 def morsel_target(
@@ -87,8 +177,9 @@ def morsel_target(
     level: PressureLevel,
     model: LearnedMemoryModel | None = None,
     families: Iterable[str] | None = None,
+    plan: object | None = None,
 ) -> tuple[int, int] | None:
-    """The per-morsel ``(rows, bytes)`` target for this pressure level and learned width.
+    """The per-morsel ``(rows, bytes)`` target for this pressure level and row width.
 
     Args:
         config: The active config, carrying the configured target.
@@ -97,6 +188,9 @@ def morsel_target(
             that owns the de-escalation average's sampling cadence.
         model: The learned memory model, or `None`.
         families: The plan's operator kinds, narrowing the learned width to this plan.
+        plan: The logical plan about to run, whose schema sizes the morsel on a cold
+            store. Measured width wins wherever there is one; this only covers the first
+            run, which is the one that has no measurement and OOMs.
 
     Returns:
         The recommended `(rows, bytes)`, or `None` to keep the configured target — the
@@ -104,12 +198,35 @@ def morsel_target(
     """
     ex = config.execution
     factor = PRESSURE_FACTORS.get(level, 1.0)
-    rows = int(ex.morsel_rows * factor)
     nbytes = int(ex.morsel_bytes * factor)
-    cap = learned_row_cap(config, model, families)
+    # Pressure shrinks the row target but never past the cache-efficient batch: that floor
+    # is about per-batch overhead, which pressure does not change.
+    rows = max(MIN_MORSEL_ROWS, int(ex.morsel_rows * factor))
+    # The two width signals cover each other's blind spots, so the morsel takes whichever
+    # is more binding rather than preferring one outright:
+    #
+    #   - the **learned** width is a real measurement, but it is keyed by operator *family*
+    #     ("Scan", "Aggregate"), which cannot tell this plan's image scan from yesterday's
+    #     narrow one. It is the only signal that catches a wide *variable-length* payload,
+    #     whose true width no schema can state.
+    #   - the **planned** width is keyed by this plan's own schema and is *exact* for the
+    #     fixed-width and tensor columns that carry multimodal data — and it exists on the
+    #     first run, which is the one with no measurement and the one that OOMs.
+    #
+    # Taking the smaller cap is safe in both directions: a morsel only batches data, so an
+    # over-tight one costs some throughput while an over-loose one costs the process.
+    caps = [
+        c
+        for c in (learned_row_cap(config, model, families), _planned(config, plan))
+        if c is not None
+    ]
+    cap = min(caps) if caps else None
+    # A width cap carries its own width-aware floor (`row_floor`), which is what lets it
+    # take the count below `MIN_MORSEL_ROWS` — down to a single row for a video frame
+    # wider than the whole budget — rather than being overridden by it.
     if cap is not None:
         rows = min(rows, cap)
     # Keep the configured target (fast path) only when neither lever moved anything.
     if factor >= 1.0 and rows >= ex.morsel_rows:
         return None
-    return max(MIN_MORSEL_ROWS, rows), max(MIN_MORSEL_BYTES, nbytes)
+    return max(1, rows), max(MIN_MORSEL_BYTES, nbytes)

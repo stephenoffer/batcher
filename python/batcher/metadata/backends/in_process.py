@@ -27,7 +27,20 @@ class InProcessBackend:
         self._tables.setdefault(table, {})[key] = value
 
     def scan(self, table: str, prefix: Key = ()) -> Iterator[tuple[Key, bytes]]:
-        for key, value in self._tables.get(table, {}).items():
+        """Every `(key, value)` under `prefix`, from a snapshot taken when the scan starts.
+
+        The snapshot is the point. This is a generator over a live dict, and the hub's callers
+        consume it lazily — a view load parses each row as it arrives — while `record` is
+        writing to the same table from another pipeline and `_prune_op_stats` is deleting from
+        it. Yielding straight out of `dict.items()` therefore raises `RuntimeError: dictionary
+        changed size during iteration` in whichever query happened to be reading, which is not
+        a metadata failure the caller is prepared for: the hub's `record` swallows exceptions,
+        but a *read* raises into planning.
+
+        Copying the item list is O(entries) in pointers and happens at most once per view per
+        process, against a table whose reads are rare and whose writes are frequent.
+        """
+        for key, value in list(self._tables.get(table, {}).items()):
             if key[: len(prefix)] == prefix:
                 yield key, value
 
@@ -51,3 +64,13 @@ class InProcessBackend:
             return
         for key in keys:
             rows.pop(key, None)
+
+    def clear(self) -> None:
+        """Drop everything stored, keeping this object's identity.
+
+        What `LayeredBackend.refresh` needs. Rebinding to a fresh backend would work for
+        the default cache and quietly discard a *caller-supplied* one, replacing it with a
+        plain dict — so a cache with a size bound, an eviction policy, or shared state
+        silently stops being used after the first refresh.
+        """
+        self._tables.clear()

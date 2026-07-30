@@ -12,14 +12,17 @@ from typing import IO, Any
 
 from batcher.plan.source_stats import SourceStatistics
 
-__all__ = ["npy_header_rows", "numpy_statistics"]
+__all__ = ["npy_header_rows", "npy_header_shape_dtype", "numpy_statistics"]
 
 
-def npy_header_rows(fh: IO[Any]) -> int | None:
-    """Leading-axis length from a ``.npy`` header, without loading the array.
+def npy_header_shape_dtype(fh: IO[Any]) -> tuple[tuple[int, ...], Any] | None:
+    """The array's full ``(shape, dtype)`` from a ``.npy`` header, loading no data.
 
-    Returns None for ``.npz`` archives (multiple arrays, no single shape here) or
-    if the header can't be parsed. The file position is left after the header.
+    The header carries everything needed to *type* the file, not only to count it — so a
+    reader can answer `schema()` from it instead of decoding the array and throwing the
+    values away. Returns None for a ``.npz`` archive (a zip of several arrays, with no
+    single header here) or an unparseable header. The file position is left after the
+    header either way, so a caller that falls back must reposition.
     """
     try:
         from numpy.lib import format as npfmt
@@ -30,9 +33,22 @@ def npy_header_rows(fh: IO[Any]) -> int | None:
         reader = {1: npfmt.read_array_header_1_0, 2: npfmt.read_array_header_2_0}.get(major)
         if reader is None:
             return None
-        shape, _fortran, _dtype = reader(fh)
+        shape, _fortran, dtype = reader(fh)
     except Exception:
         return None
+    return tuple(int(d) for d in shape), dtype
+
+
+def npy_header_rows(fh: IO[Any]) -> int | None:
+    """Leading-axis length from a ``.npy`` header, without loading the array.
+
+    Returns None for ``.npz`` archives (multiple arrays, no single shape here) or
+    if the header can't be parsed. The file position is left after the header.
+    """
+    header = npy_header_shape_dtype(fh)
+    if header is None:
+        return None
+    shape, _dtype = header
     return int(shape[0]) if shape else 0
 
 

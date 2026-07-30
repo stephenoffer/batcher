@@ -114,6 +114,14 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
     demand (no `column_bounds`). A resident source computes the exact row count (cheap) and
     the min/max of only the requested columns, skipping the O(rows) pass over every other
     column that the plan's predicates never read.
+
+    What is narrowed away is the **bounds pass**, not the column. Every other column still
+    reports the facts Arrow already knows — its null count and its average width — because
+    those are buffer-field reads, not a scan. Narrowing them away too meant a plan whose
+    predicates name no columns at all, a `group_by` or a plain scan, received no column
+    statistics whatsoever and priced every row from a type prior: a `group_by` over a column
+    of 2 KB documents was sized at the 36-byte string prior, 56x under, while the identical
+    source under a `filter` reported the true width.
     """
     if not getattr(source, "resident", False):
         return None
@@ -134,6 +142,12 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
         stat = column_bounds(name)
         if stat is not None:
             columns[name] = stat
+    cheap_stat = getattr(source, "column_cheap_stat", None)
+    if callable(cheap_stat):
+        for name in have - columns.keys():
+            stat = cheap_stat(name)
+            if stat is not None:
+                columns[name] = stat
     return SourceStatistics(row_count=rc, columns=columns)
 
 
@@ -207,8 +221,15 @@ def _cache_key(source: Source, identity: str) -> str | None:
 
 
 def _source_identity(source: Source) -> str:
-    identity_fn = getattr(source, "identity", None)
-    return identity_fn() if callable(identity_fn) else ""
+    """A source's identity, through the neutral spelling every layer shares.
+
+    Kyber reads back what this writes (a learned read throughput is keyed on it) and the two
+    cannot import each other, so the definition lives in `plan` and both call it. Two
+    spellings of a key is a store that silently never hits.
+    """
+    from batcher.plan.source_stats import source_identity
+
+    return source_identity(source)
 
 
 def _value_bearing_columns_to_redact(table: str, columns: list[str]) -> set[str]:

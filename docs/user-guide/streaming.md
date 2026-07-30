@@ -125,8 +125,8 @@ A `Trigger` sets the cadence (Spark parity):
 - `bt.Trigger.processing_time("5 seconds")` fires a micro-batch on a wall-clock
   interval. This is the default streaming cadence.
 - `bt.Trigger.once()` processes one micro-batch of available data, then stops.
-- `bt.Trigger.available_now()` drains all currently-available data, then stops. It is
-  the incremental-batch / backfill trigger.
+- `bt.Trigger.available_now()` drains every record available when it starts, then stops.
+  It is the incremental-batch and backfill trigger.
 - `bt.Trigger.continuous("1 second")` is the lowest-latency option: micro-batches run
   back-to-back with no inter-batch delay, committing a checkpoint epoch on the
   interval. Stateless pipelines only.

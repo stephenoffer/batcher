@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/lists_vectors.py
 ```
+
+## See also
+
+- {doc}`lists_transforms`: transforming inside a list column, without exploding it first.
+- {doc}`nulls_and_casting`: nulls and type casting: the two places a pipeline quietly changes its answer.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

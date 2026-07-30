@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.mathx import clamp
 from batcher.carbonite.memory.pressure import total_memory_bytes
 from batcher.config import Config, active_config
 from batcher.metadata.smoothed import load_scalar, record_smoothed_scalar
@@ -453,7 +454,7 @@ class AIMDFlowControl:
         return max(reno, min(cubic, self._ceiling))
 
     def _clamp(self, w: float) -> int:
-        return int(max(self._floor, min(self._ceiling, w)))
+        return int(clamp(w, self._floor, self._ceiling))
 
 
 def load_shuffle_window(hub: MetadataHub | None, signature: str) -> int | None:

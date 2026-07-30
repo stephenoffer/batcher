@@ -204,10 +204,10 @@ and 2 MB/s out, per TU). Exceeding egress gets you `ServerBusyError`, not a slow
 
 ## See also
 
-- [Kafka](kafka.md): the protocol-compatible path, and the payload-decoding example.
-- [Streaming](../user-guide/streaming.md): triggers, watermarks, dedup, checkpointing.
-- [Exactly-once sink](../examples/streaming/exactly-once-sink.md): the idempotent sink that
+- {doc}`Kafka <kafka>`: the protocol-compatible path, and the payload-decoding example.
+- {doc}`Streaming <../user-guide/streaming>`: triggers, watermarks, dedup, checkpointing.
+- {doc}`Exactly-once sink <../examples/streaming/exactly-once-sink>`: the idempotent sink that
   option 2 above leans on.
-- [Custom connectors](../user-guide/custom-connectors.md): the `Source`/`Split` protocol.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Pulsar](pulsar.md): the other broker whose checkpoint does not drive a seek.
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the `Source`/`Split` protocol.
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Pulsar <pulsar>`: the other broker whose checkpoint does not drive a seek.

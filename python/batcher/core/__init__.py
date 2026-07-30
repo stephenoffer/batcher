@@ -9,7 +9,10 @@ Responsibility boundary (enforced by the layer-import contract):
     Kyber learns from — but never imports `kyber` or `carbonite`.
 
 The bootstrap executor calls the Tier-0 interpreter through `batcher._native`;
-the morsel scheduler, JIT tiers, and `bc-adapt` control loop land behind this seam.
+the morsel scheduler and JIT tiers land behind this seam. The stage-boundary
+re-optimization loop does not: it lives in `api/adaptive/`, because re-planning
+between stages means re-running Kyber, which Core may not import. There is no
+`bc-adapt` crate.
 """
 
 from __future__ import annotations

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/regression_errors.py
 ```
+
+## See also
+
+- {doc}`probabilistic_losses`: losses that score a probability or a margin rather than a hard label.
+- {doc}`text_diversity`: degeneracy detection: repetition, truncation, refusal, and empty output.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

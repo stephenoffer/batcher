@@ -2,10 +2,17 @@
 
 This page reports Batcher's TPC-H results against DuckDB, Daft, and Polars, and explains where the remaining gap comes from.
 
-TPC-H shows both sides of the engine. Against DuckDB reading the same Arrow, which is the like-for-like execution comparison, Batcher wins all 22 queries. Against DuckDB on its own compressed store, where DuckDB never pays an ingest and decompresses as it scans, DuckDB wins 15 of 22. Both columns are below, because they answer different questions.
+TPC-H shows both sides of the engine. Against DuckDB reading the same Arrow, which is the like-for-like execution comparison, Batcher wins the suite at both scales measured. Against DuckDB on its own compressed store, where DuckDB never pays an ingest and decompresses as it scans, DuckDB is still ahead. Both columns are below, because they answer different questions.
 
-All 22 queries, scale factor 1 (`lineitem` = 6,001,215 rows), single node, 16 cores, 30 GB,
-release build, measured 2026-07-18.
+Two runs are published, and they are not interchangeable:
+
+| Run | Scale | Hardware | Measured |
+|---|---|---|---|
+| Per-query detail | sf1 (`lineitem` = 6,001,215 rows) | 16 cores, 30 GB | 2026-07-18 |
+| Suite standing | sf10 | 96 cores | 2026-07-27 |
+
+The sf10 run is the more demanding of the two and the more recent, so it leads. The sf1 run is
+kept because it is the only one published query by query.
 
 ## Correctness first
 
@@ -35,10 +42,41 @@ official sf1 answer, `123141078.2283`. Batcher returns exactly that. This page p
 attributed the error to `interval '1' year`, which was wrong.
 :::
 
-## Where the suite stands
+## At scale factor 10
+
+![Diverging bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22. Batcher is 2.08x behind DuckDB on its own native store, winning 4 of 22.](../_static/diagrams/tpch_sf10.svg)
+
+At sf10 on 96 cores, correctness-gated with all 22 queries reporting `OK`, the suite total is
+**4,453 ms**, down from 4,993 ms earlier in the same session. The three comparisons:
+
+| Against | Suite ratio | Queries won |
+|---|---|---|
+| DuckDB on the same Arrow (`duckdb_arrow`) | **1.89x faster** | **21 of 22**; q9 is 1.01x, a tie |
+| Polars | **2.26x faster** | 17 of 22 |
+| DuckDB on its native store | 2.08x behind | 4 of 22 (q11, q15, q16, q22) |
+
+The single query that moved most is q5, the worst in the suite, which went from 8.81x to 3.95x
+of DuckDB's native store once the optimizer was given a distinct-count estimate before it chose
+the join order. Its peak resident memory is the result that matters more than the timing: q5 no
+longer takes the process past 110 GB.
+
+:::{warning}
+Treat the sf10 totals as indicative rather than exact. The box was shared with other work
+during the run, and at load average 16 to 41 a repeated run of the same build swings about
+25% (the same build measured 4,992 ms and 4,411 ms an hour apart). Per-query results quoted
+here were reproduced at least twice, and anything that moved by less than 2x was taken from a
+run at load average under 5.
+:::
+
+The gap to DuckDB's native store is real and is not all storage. q1 and q6 are essentially
+scans and sit at 1.47x and 1.52x, which is about what reading compressed pages instead of raw
+Arrow buys. q21 (3.18x), q9 (3.79x), q7 (3.19x), q2 (3.11x) and q5 (3.95x) are several times
+that, and that part is engine work rather than format.
+
+## Where the suite stands at scale factor 1
 
 **Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
-wins all 22 queries**, by 1.1x to 7.1x. That is the comparison Batcher's Arrow-only contract makes fair. q21 runs too, because correlated subqueries are supported, so all 22 are comparable.
+wins all 22 queries at sf1**, by 1.1x to 7.1x. That is the comparison Batcher's Arrow-only contract makes fair. q21 runs too, because correlated subqueries are supported, so all 22 are comparable.
 
 :::{note}
 **Against DuckDB on its own native compressed store, DuckDB is faster on 15 of 22**, geometric
@@ -48,8 +86,9 @@ q3 2.6x, q21 2.4x).
 :::
 
 :::{dropdown} Per-query ratios vs DuckDB
-All 22 queries, measured 2026-07-18 on a release build, correctness-gated. The ratio is
-`batcher / duckdb`, so **below 1.0 means Batcher is faster**.
+All 22 queries at **scale factor 1**, measured 2026-07-18 on a release build,
+correctness-gated. The ratio is `batcher / duckdb`, so **below 1.0 means Batcher is faster**.
+The sf10 standing above is a separate, later run on different hardware.
 
 | Query | vs DuckDB-on-Arrow<br>(same input) | vs native DuckDB<br>(its own store) |
 |---|---:|---:|
@@ -157,8 +196,9 @@ no longer flying blind.
 ## Reproduce
 
 ```bash
-python benchmarks/run.py --benchmark tpch --tier single --scale 1  # vs DuckDB / Polars
-python benchmarks/run.py --benchmark tpch --engines batcher,daft   # vs Daft
+python benchmarks/run.py --benchmark tpch --tier single --scale 1   # sf1, vs DuckDB / Polars
+python benchmarks/run.py --benchmark tpch --tier single --scale 10  # sf10, the suite standing
+python benchmarks/run.py --benchmark tpch --engines batcher,daft    # vs Daft
 ```
 
 ## See also

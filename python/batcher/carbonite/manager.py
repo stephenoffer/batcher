@@ -242,7 +242,7 @@ class ResourceManager:
         )
 
     def recommend_morsel_target(
-        self, families: Iterable[str] | None = None
+        self, families: Iterable[str] | None = None, plan: object | None = None
     ) -> tuple[int, int] | None:
         """Scale the per-morsel ``(rows, bytes)`` target down under memory pressure.
 
@@ -264,7 +264,9 @@ class ResourceManager:
         """
         # `classify()`, a pure read: the AIMD round is the one component that *samples* the
         # monitor (advancing its de-escalation average). Sizing a morsel must not.
-        return morsel_target(self._config, self._pressure.classify(), self._mem_model, families)
+        return morsel_target(
+            self._config, self._pressure.classify(), self._mem_model, families, plan
+        )
 
     def recommend_parallelism(self) -> int | None:
         """Cores to fan out across when the machine is measurably oversubscribed, else `None`.
@@ -288,13 +290,15 @@ class ResourceManager:
         budget = effective_core_budget()
         return budget if budget < available_cpu_count() else None
 
-    def recommended_config(self, families: Iterable[str] | None = None) -> Config | None:
+    def recommended_config(
+        self, families: Iterable[str] | None = None, plan: object | None = None
+    ) -> Config | None:
         """A `Config` with the pressure-scaled morsel target and contention-scaled fan-out,
         or ``None`` to keep the current one. The conductor activates it for the execution
         scope so the adaptation reaches both the in-process engine and the shipped worker
         config. `families` (the plan's operator kinds) narrows the learned width to this
         plan's own data."""
-        target = self.recommend_morsel_target(families)
+        target = self.recommend_morsel_target(families, plan)
         parallelism = self.recommend_parallelism()
         if target is None and parallelism is None:
             return None

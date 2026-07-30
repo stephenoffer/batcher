@@ -50,8 +50,9 @@ _W = 2
 #: `BASE` cut into four uneven pieces (4, 1, 7 and 3 rows) and repeated six times: 24 record
 #: batches, 90 rows.
 #:
-#: Every shape in `INPUTS` is a single batch, so a distributed run over one of them partitions
-#: a source that arrives whole. This one arrives as many uneven batches carrying duplicate keys,
+#: `INPUTS` reaches many batches only by *volume* — its `multibatch` shape is `BASE` repeated
+#: past the 16,384-row morsel, so the batches it splits into are uniform and morsel-aligned.
+#: This one is small and arrives as many *uneven* batches carrying duplicate keys,
 #: which is what makes the map side split a group *across* batches before the shuffle ever sees
 #: it — the arrangement under the "group split across reducers" class of bug. The uneven lengths
 #: matter: equal-sized batches align every group to a boundary the same way, so they cannot
@@ -59,7 +60,10 @@ _W = 2
 _SLICES = [BASE.slice(0, 4), BASE.slice(4, 1), BASE.slice(5, 7), BASE.slice(12, 3)]
 MULTIBATCH = pa.Table.from_batches([batch for piece in _SLICES * 6 for batch in piece.to_batches()])
 
-#: Every edge-case shape plus the multi-batch one.
+#: Every edge-case shape, with the uneven-batch arrangement above replacing `INPUTS`' own
+#: volume-driven `multibatch`: at two workers it is the batch *boundaries* that decide which
+#: rows a mapper groups together, and uneven ones are what catch an off-by-one there. The
+#: morsel-crossing shape stays covered single-node by `test_diff_operator_matrix.py`.
 SHAPES = {**INPUTS, "multibatch": MULTIBATCH}
 
 #: A hot key: every row in one group, so one reducer takes the whole relation and the others

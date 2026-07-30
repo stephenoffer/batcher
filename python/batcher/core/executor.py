@@ -5,9 +5,12 @@ handing the lowered IR to the native engine, then transcribes the native
 engine's per-operator `ExecMetrics` into `OperatorFeedback` for the MetadataHub.
 Core *measures* — it does not optimize: it faithfully reports what the data plane
 observed (rows in/out, time, peak bytes, spill, backend), keyed by the same
-pre-order operator id Kyber assigns in `annotate_ops`. The morsel scheduler, JIT
-tier-up, and the `bc-adapt` re-optimization loop replace the single
-`execute_plan_metered` call without changing this interface.
+pre-order operator id Kyber assigns in `annotate_ops`. The morsel scheduler and
+JIT tier-up replace the single `execute_plan_metered` call without changing this
+interface. Re-optimization is **not** one of them: the stage-boundary loop lives
+in `api/adaptive/`, in the control plane, because it re-runs Kyber between
+stages. There is no `bc-adapt` crate and the Rust side has no adaptivity of its
+own; earlier revisions of this docstring said otherwise.
 """
 
 from __future__ import annotations

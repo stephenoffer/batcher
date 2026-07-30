@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/text_pii_safety.py
 ```
+
+## See also
+
+- {doc}`text_overlap`: comparing a generated answer against a reference, without a model.
+- {doc}`text_quality`: corpus hygiene rates: what fraction of a text column looks broken.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

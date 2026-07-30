@@ -128,9 +128,28 @@ def decide_gpu_backend(
     # prefix so `explain()` misreported which threshold was actually used.
     min_rows = dc.gpu_min_rows if learned_min is None else learned_min
     learned = "learned " if learned_min is not None else ""
-    if not force and rows < min_rows:
+    # ...and the same floor in bytes, because a row count assumes a row width.
+    #
+    # The threshold above exists because the GPU's fixed overhead — host<->device transfer,
+    # kernel launch, the first-touch cuDF import — is only amortized by *work*, and rows
+    # proxy for work only while a row is the ~64 bytes `optimizer.row_bytes` assumes. Across
+    # the modality range that proxy inverts: at the shipped 10M rows a narrow relation clears
+    # the gate at 0.64 GB of input, while a decoded 224x224x3 image column needs **1,505 GB**.
+    # So a 100 GB image query — unambiguously GPU-worthy, and the workload this path exists
+    # for — was refused the GPU for being "too small to amortize the overhead".
+    #
+    # The byte figure was already in hand: `_estimate` computes `ws_gb` for the memory
+    # routing below and the size gate simply did not read it. Derived from the same knob
+    # (`min_rows x row_bytes`) rather than added as a third, and combined with OR, so a
+    # narrow query clears exactly the floor it always did.
+    min_gb = min_rows * active_config().optimizer.row_bytes / 1e9
+    if not force and rows < min_rows and ws_gb < min_gb:
         return GpuDecision(
-            False, False, f"{rows} rows < {learned}min_rows={min_rows}: CPU wins on overhead", rows
+            False,
+            False,
+            f"{rows} rows / ~{ws_gb:.2f}GB < {learned}min_rows={min_rows} "
+            f"and min ~{min_gb:.2f}GB: CPU wins on overhead",
+            rows,
         )
 
     one_gpu_gb = max(
@@ -165,6 +184,7 @@ def decide_gpu_map_params(
     gpu_memory_gb: float | None = None,
     *,
     assign_num_gpus: bool = True,
+    input_row_bytes: float = 0.0,
 ) -> GpuMapParams:
     """Size a GPU inference stage from the model's memory footprint vs one GPU's memory.
 
@@ -189,7 +209,12 @@ def decide_gpu_map_params(
     fractional GPU request on such a stage asks for a device the cluster hasn't got, and on a
     GPU-less accelerator fleet that pends forever — while the batch size is still seeded from the
     device's memory (`gpu_memory_gb`, here the accelerator's HBM). Cross-chip packing is the
-    user's resource count, not a `num_gpus` fraction, so the seed budgets against one device."""
+    user's resource count, not a `num_gpus` fraction, so the seed budgets against one device.
+
+    `input_row_bytes` is the estimated Arrow width of one input row, which the batch seed
+    charges alongside the activation prior because both are resident on the device at once.
+    `0.0` — the default, and what a caller with no estimator passes — reproduces the previous
+    activation-only budget exactly."""
     dc = active_config().distributed
     gpu_gb = max(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
@@ -229,8 +254,26 @@ def decide_gpu_map_params(
         # `max(..., 1)` clamp below already guarantees a legal batch size, which is all the
         # floor was there for.
         headroom_gb = max(gpu_gb * budget_devices * cap - model_memory_gb, 0.0)
+        # A batch occupies the device twice over: the **input rows** themselves, and the
+        # activations the forward pass derives from them. Only the second was charged, at a
+        # flat `gpu_activation_bytes_per_row` (64 KiB) described as suiting "typical
+        # vision/embedding activations" — and the input was treated as free.
+        #
+        # That is a rounding error on a numeric feature row and the whole budget on the data
+        # this rule exists for. A decoded 224x224x3 `uint8` image is 147 KiB per row before a
+        # single activation, so the input tensor alone is more than twice what the seed
+        # budgets; one 1080p RGB frame is 5.9 MiB, 95x it. The seeded batch then asks the
+        # device for several times the VRAM it has, which is an OOM on the first dispatch
+        # rather than a slow start the `ThroughputController` could recover from.
+        #
+        # Charged at the **Arrow** width, which is what Batcher can actually know. A model
+        # that upcasts `uint8` pixels to `float32` on device occupies four times this; that is
+        # a property of the user's model rather than of the plan, and inventing a multiplier
+        # for it would put a fabricated number inside a memory bound. The controller's
+        # measured VRAM feedback is what closes the rest.
         act = max(dc.gpu_activation_bytes_per_row, 1)
-        out_bs = int(min(max(headroom_gb * 1e9 / act, 1), 65_536))
+        per_row = act + max(0.0, input_row_bytes)
+        out_bs = int(min(max(headroom_gb * 1e9 / per_row, 1), 65_536))
     return GpuMapParams(
         out_gpus,
         out_bs,

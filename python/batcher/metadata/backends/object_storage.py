@@ -12,6 +12,7 @@ object names. One object per key keeps concurrent writers from clobbering each o
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 from collections.abc import Iterator
 
@@ -19,6 +20,11 @@ from batcher._internal.errors import MissingDependencyError
 from batcher.metadata.store import Key, decode_key, encode_key, require_uri
 
 __all__ = ["ObjectStorageBackend"]
+
+# Objects fetched per concurrent `cat`. Large enough that the round-trip latency of a scan is
+# amortized across a batch, small enough that a scan of a large table does not hold the whole
+# table in memory before yielding its first row.
+_FETCH_CHUNK = 512
 
 
 def _encode_name(key: Key) -> str:
@@ -79,12 +85,27 @@ class ObjectStorageBackend:
         self._fs.pipe_file(path, value)
 
     def scan(self, table: str, prefix: Key = ()) -> Iterator[tuple[Key, bytes]]:
+        """Every `(key, value)` under `prefix`, fetched in concurrent batches.
+
+        One object per key is what gives this store its per-key write granularity, and it is
+        also what makes a naive scan pathological: the feedback table holds tens of thousands
+        of entries, so reading it one `cat_file` at a time is tens of thousands of *sequential*
+        round-trips to object storage before the first plan of a process. Against S3 at a
+        realistic 30 ms per GET that is a cold start measured in minutes.
+
+        `fs.cat` issues a batch concurrently, and the batching is chunked rather than
+        whole-table so memory stays bounded and the caller starts receiving rows before the
+        last object has landed. Objects that vanish mid-scan — another driver pruning the
+        feedback table at the same time — are omitted rather than raised: this is a read of
+        learned statistics, and one missing row is not worth failing a query over.
+        """
         directory = self._dir(table)
         try:
             names = self._fs.ls(directory, detail=False)
         except FileNotFoundError:
             return
         plen = len(prefix)
+        wanted: list[tuple[str, Key]] = []
         for path in names:
             base = path.rstrip("/").rsplit("/", 1)[-1]
             try:
@@ -92,11 +113,54 @@ class ObjectStorageBackend:
             except (ValueError, json.JSONDecodeError):
                 continue  # a stray non-batcher object; skip rather than fail planning
             if key[:plen] == prefix:
-                yield key, self._fs.cat_file(path)
+                wanted.append((path, key))
+        for start in range(0, len(wanted), _FETCH_CHUNK):
+            chunk = wanted[start : start + _FETCH_CHUNK]
+            blobs = self._cat([path for path, _key in chunk])
+            for path, key in chunk:
+                value = blobs.get(path)
+                if isinstance(value, bytes):
+                    yield key, value
+
+    def _cat(self, paths: list[str]) -> dict[str, object]:
+        """`{path: bytes}` for `paths`, concurrently, tolerating objects that have gone.
+
+        `on_error="omit"` is the desired semantics but not universally implemented, so a
+        filesystem that rejects it falls back to one request per object rather than failing.
+        """
+        try:
+            return dict(self._fs.cat(paths, on_error="omit"))
+        except TypeError:  # pragma: no cover - a filesystem with a narrower `cat`
+            out: dict[str, object] = {}
+            for path in paths:
+                try:
+                    out[path] = self._fs.cat_file(path)
+                except FileNotFoundError:
+                    continue
+            return out
 
     def batch_put(self, table: str, items: list[tuple[Key, bytes]]) -> None:
         if not items:
             return
         self._fs.makedirs(self._dir(table), exist_ok=True)
-        for key, value in items:
-            self._fs.pipe_file(self._path(table, key), value)
+        mapping = {self._path(table, key): value for key, value in items}
+        try:
+            self._fs.pipe(mapping)  # concurrent where the filesystem is async
+        except (TypeError, NotImplementedError):  # pragma: no cover - a narrower filesystem
+            for path, value in mapping.items():
+                self._fs.pipe_file(path, value)
+
+    def delete(self, table: str, keys: list[Key]) -> None:
+        """Drop `keys` from `table`; absent objects are ignored.
+
+        Optional beyond the four `MetadataBackend` methods. Offered because this is the store
+        a whole cluster shares, so it accumulates feedback fastest — and the hub's prune, the
+        one thing that keeps a scan of it from growing without bound, is a no-op against a
+        backend that cannot delete.
+        """
+        if not keys:
+            return
+        paths = [self._path(table, key) for key in keys]
+        # Already pruned by another driver is the expected concurrent outcome, not an error.
+        with contextlib.suppress(FileNotFoundError):
+            self._fs.rm(paths)

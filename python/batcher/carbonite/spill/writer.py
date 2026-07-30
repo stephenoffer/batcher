@@ -54,6 +54,7 @@ class BucketWriter:
         "_num_rows",
         "_path",
         "_pending_bytes",
+        "_seen_dictionaries",
         "_store",
         "_tier",
         "_writer",
@@ -71,6 +72,10 @@ class BucketWriter:
         # the remote tier once the buckets already streaming have exhausted the local budget
         # — the on-close accounting alone cannot see an open bucket's growth (see the store).
         self._pending_bytes = 0
+        # Buffer addresses of dictionaries already charged to this bucket. Batches of a
+        # dictionary-encoded column all point at the *same* values array, but `nbytes`
+        # includes that whole dictionary in every one — see `_charged_bytes`.
+        self._seen_dictionaries: set[int] = set()
         self._num_rows = 0
         # The finalized handle, so `close()` is idempotent. A double close previously
         # re-entered `writer.close()` on a closed stream and, worse, charged the bucket's
@@ -112,22 +117,51 @@ class BucketWriter:
         except OSError as exc:
             # A full scratch disk otherwise surfaces as a bare `OSError: [Errno 28]` from
             # deep inside the Arrow writer, which names neither the spill tier nor the way
-            # out. It cannot be recovered in place — the batches already streamed to this
-            # bucket are not retained, so failing over to the remote tier mid-stream would
-            # silently drop them — so the honest move is to fail with the fix in the message.
-            if disk.is_out_of_space(exc):
+            # out. With a remote tier configured the bucket can be carried over to it
+            # instead of failing the query (see `_failover_to_remote`); without one — or if
+            # the carry-over cannot account for every row — the honest move is to fail with
+            # the fix in the message.
+            if not disk.is_out_of_space(exc):
+                raise
+            if not self._failover_to_remote(batch.schema):
                 self._raise_out_of_space(exc)
-            raise
+            self._writer.write_batch(batch)
         self._num_rows += batch.num_rows
+        charged = self._charged_bytes(batch)
         if self._tier is SpillTier.LOCAL:
             # Charge the batch's (uncompressed, in-memory) size to the store's live local
             # usage as it lands, not just at close. A slight over-estimate vs the compressed
             # on-disk size only makes overflow trigger a touch early — safe (never over-fills
             # the disk), and result-invariant (the remote tier reads back identically).
-            self._pending_bytes += batch.nbytes
-            self._store._local_pending += batch.nbytes
+            self._pending_bytes += charged
+            self._store._local_pending += charged
         else:
-            self._pending_bytes += batch.nbytes
+            self._pending_bytes += charged
+
+    def _charged_bytes(self, batch: pa.RecordBatch) -> int:
+        """`batch.nbytes`, charging each shared dictionary only the first time it appears.
+
+        Batches of a dictionary-encoded column all point at the *same* values array, but
+        `nbytes` includes that whole dictionary in every one. Measured: a 20,000-entry string
+        dictionary reports 256 KB per batch for 16 KB of indices — so a bucket of 100 such
+        batches is charged 25 MB for 1.8 MB of content, a ~14x over-count.
+
+        Three decisions run on this figure, and all three go wrong the same way. The local
+        budget overflows to object storage far earlier than it needs to; `read_reserved`
+        reserves ~14x the memory the read actually takes, squeezing every concurrent query;
+        and the bucket looks over `spill_bucket_max_bytes`, so the re-split recursion fires
+        and pays a full extra write and read to split a bucket that already fitted. None of
+        them is a wrong answer, which is why an over-count here survives — it only ever
+        shows up as the engine being slow.
+
+        The count matches what reading the bucket back costs, which is what `logical_nbytes`
+        promises: the IPC stream carries the dictionary once, and the reader reconstructs one
+        values array shared by every batch.
+        """
+        total = batch.nbytes
+        for column in batch.columns:
+            total -= _recounted_dictionary_bytes(column, self._seen_dictionaries)
+        return max(total, 0)
 
     def _raise_out_of_space(self, exc: OSError) -> None:
         """Turn a space/quota refusal into an error that names the tier and the fix."""
@@ -184,6 +218,98 @@ class BucketWriter:
         self._writer = pa.ipc.new_stream(
             self._fh, schema, options=disk.ipc_options(store._compression)
         )
+
+    def _failover_to_remote(self, schema: pa.Schema) -> bool:
+        """Carry a bucket whose local volume filled mid-stream over to the remote tier.
+
+        `_open` picks a tier per bucket by re-measuring free disk, which handles a volume
+        that is *already* low. It cannot handle one that fills **during** a bucket, and that
+        is the case at scale: a bucket is a whole partition, so a 16-way spill of a terabyte
+        writes ~60 GB per bucket, and the check at open is a single sample taken before any
+        of it was written. `memory.spill_remote_uri` is documented to keep an out-of-core
+        query alive when local disk fills, and until now it only did so at bucket boundaries.
+
+        Recovery is possible because the batches already streamed are **on disk**, not
+        discarded — they are read back and re-written to the remote tier **one at a time**,
+        so the carry-over is bounded by a single batch and does not undo the spilling it is
+        rescuing. The local stream is abandoned rather than finished: writing its
+        end-of-stream marker would need the disk that just refused.
+
+        Returns `False` — leaving the caller to fail with the actionable error — when there
+        is no remote tier, or when the rows recovered do not match the rows this writer
+        knows it wrote. That second condition is the important one: a partial carry-over
+        would turn a loud out-of-space failure into a silently short bucket, which is
+        strictly worse than the failure it replaces.
+
+        Args:
+            schema: The bucket's schema, for the remote stream.
+
+        Returns:
+            Whether the bucket now has a live remote writer ready for the failed batch.
+        """
+        store = self._store
+        if self._tier is not SpillTier.LOCAL or store._remote_uri is None:
+            return False
+        local_path = self._path
+        expected_rows = self._num_rows
+
+        # Abandon, do not finish: `close()` would flush and write the EOS marker, which
+        # needs the disk that just refused.
+        for closeable in (self._writer, self._fh):
+            if closeable is not None:
+                with contextlib.suppress(Exception):
+                    closeable.close()
+        self._writer = None
+        self._fh = None
+        # Hand the local byte charge back — the file is about to be deleted — while keeping
+        # `_pending_bytes` as this bucket's running *logical* size, which `close()` reports
+        # as `logical_nbytes`. Switching the tier below also stops `_release_pending` from
+        # subtracting the same bytes a second time.
+        store._local_pending -= self._pending_bytes
+
+        self._open_remote(store, schema)
+        recovered = self._copy_stream_to_current(local_path)
+        if recovered != expected_rows:
+            # Cannot prove the whole bucket came across. Undo the half-made remote bucket and
+            # let the caller raise, rather than continue with a bucket that is short.
+            for closeable in (self._writer, self._fh):
+                if closeable is not None:
+                    with contextlib.suppress(Exception):
+                        closeable.close()
+            self._writer = None
+            self._fh = None
+            store._remove_partial(SpillTier.REMOTE, self._path)
+            self._tier, self._path = SpillTier.LOCAL, local_path
+            store._local_pending += self._pending_bytes
+            return False
+
+        with contextlib.suppress(OSError):
+            os.unlink(local_path)
+        return True
+
+    def _copy_stream_to_current(self, path: str) -> int:
+        """Re-write every complete batch in the local IPC stream at `path` into the writer
+        now open, one batch at a time, and return the rows carried over.
+
+        The file may end mid-message, because the write that filled the disk was partway
+        through one. Everything before that point is intact, so the read is allowed to stop
+        there — but only the *read* is: a failure of the re-write propagates, because that is
+        the remote tier refusing and not something to absorb.
+        """
+        rows = 0
+        with open(path, "rb") as fh:
+            batches = iter(pa.ipc.open_stream(fh))
+            while True:
+                try:
+                    batch = next(batches)
+                except StopIteration:
+                    break
+                except Exception:
+                    # The partial tail message the failed write left behind.
+                    break
+                self._writer.write_batch(batch)
+                rows += batch.num_rows
+        return rows
 
     def close(self) -> SpillHandle | None:
         """Finalize the bucket. Returns its handle, or `None` if it got no rows.
@@ -282,3 +408,44 @@ class BucketWriter:
             self.close()
         else:
             self.abort()
+
+
+def _dictionary_id(values: pa.Array) -> int | None:
+    """An identity for a dictionary's values array: the address of its first real buffer.
+
+    Unambiguous while the arrays being measured are alive, which they are — the caller is
+    charging batches it currently holds. `None` when there is no buffer to identify it by, in
+    which case the caller charges it in full rather than guessing.
+    """
+    for buf in values.buffers():
+        if buf is not None:
+            return buf.address
+    return None
+
+
+def _recounted_dictionary_bytes(array: pa.Array, seen: set[int]) -> int:
+    """Bytes of `array` that `nbytes` counted for a dictionary already charged.
+
+    On a dictionary's first sighting its values are kept and the walk descends *into* them,
+    so a dictionary nested inside another's values is handled too. On a later sighting the
+    whole values array is subtracted — exactly what `nbytes` added for it.
+
+    The walk covers structs and lists, because a dictionary column in a semi-structured or
+    multimodal schema is usually one level down rather than at the top.
+    """
+    if isinstance(array, pa.DictionaryArray):
+        values = array.dictionary
+        ident = _dictionary_id(values)
+        if ident is None:
+            return 0
+        if ident in seen:
+            return values.nbytes
+        seen.add(ident)
+        return _recounted_dictionary_bytes(values, seen)
+    if isinstance(array, pa.StructArray):
+        return sum(
+            _recounted_dictionary_bytes(array.field(i), seen) for i in range(array.type.num_fields)
+        )
+    if isinstance(array, (pa.ListArray, pa.LargeListArray, pa.FixedSizeListArray)):
+        return _recounted_dictionary_bytes(array.values, seen)
+    return 0

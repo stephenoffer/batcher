@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/lists_set_operations.py
 ```
+
+## See also
+
+- {doc}`lists_basics`: list columns: indexing, slicing, joining, and flattening.
+- {doc}`lists_transforms`: transforming inside a list column, without exploding it first.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

@@ -185,15 +185,15 @@ distributed *batch* job over the landed bronze table instead.
 
 ## See also
 
-- [Batch inference](../../ml/inference.md): the same `map_batches`/`ml.infer` surface,
+- {doc}`Batch inference <../../ml/inference>`: the same `map_batches`/`ml.infer` surface,
   bounded.
-- [ML for streaming](../../ml/streaming.md): the model-over-a-stream surface in full.
-- [GPU pipelines](../../ml/gpu.md): actor pools, `concurrency`, and accelerator placement.
-- [Kafka to the lake](kafka-etl.md): landing the raw events this job scores.
-- [Exactly-once sinks](exactly-once-sink.md): what the Delta write above actually guarantees.
-- [LLM batch scoring](../ml/llm-batch-scoring.md): the same stage, run over the landed table
+- {doc}`ML for streaming <../../ml/streaming>`: the model-over-a-stream surface in full.
+- {doc}`GPU pipelines <../../ml/gpu>`: actor pools, `concurrency`, and accelerator placement.
+- {doc}`Kafka to the lake <kafka-etl>`: landing the raw events this job scores.
+- {doc}`Exactly-once sinks <exactly-once-sink>`: what the Delta write above actually guarantees.
+- {doc}`LLM batch scoring <../ml/llm-batch-scoring>`: the same stage, run over the landed table
   as a distributed batch.
-- [Streaming](../../user-guide/streaming.md): triggers, checkpoints, and `recent_progress()`.
-- [ML API reference](../../api/ml.md): `ds.ml.infer`, `map_batches`, `max_errored_rows`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): what a warm, resident model is worth.
-- [GPU execution](../../deep-dives/gpu-execution.md): the pool the model lives in.
+- {doc}`Streaming <../../user-guide/streaming>`: triggers, checkpoints, and `recent_progress()`.
+- {doc}`ML API reference <../../api/ml>`: `ds.ml.infer`, `map_batches`, `max_errored_rows`.
+- {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: what a warm, resident model is worth.
+- {doc}`GPU execution <../../deep-dives/gpu-execution>`: the pool the model lives in.

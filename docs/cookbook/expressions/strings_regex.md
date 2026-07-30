@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_regex.py
 ```
+
+## See also
+
+- {doc}`strings_ratios`: character-class ratios: cheap quality signals for a text corpus.
+- {doc}`strings_search`: string search: substring tests, multi-pattern tests, and match counting.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

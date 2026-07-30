@@ -1,7 +1,7 @@
 # Feature engineering with preprocessors
 
 Build a **model-ready feature matrix** from a raw table with Batcher's
-scikit-learn-style [preprocessors](../ml/preprocessors/index.md). You impute missing
+scikit-learn-style {doc}`preprocessors <../ml/preprocessors/index>`. You impute missing
 values, scale the numerics, encode a categorical, bin a continuous column, and compose
 the lot with `Chain`, fitting every step on the training split and replaying it on the
 test split with the *same* learned statistics. That last discipline is what keeps a
@@ -332,12 +332,12 @@ The training-loop side: device transfer, prefetch, zero-copy.
 
 ## See also
 
-- [Expressions](../user-guide/expressions.md): the same feature work said as column math,
+- {doc}`Expressions <../user-guide/expressions>`: the same feature work said as column math,
   which is what these objects lower to.
-- [Aggregations](../user-guide/aggregations.md): the mergeable pass every `fit` runs.
-- [Mergeable algebra](../deep-dives/mergeable-algebra.md): why a `fit` gives the same answer
+- {doc}`Aggregations <../user-guide/aggregations>`: the mergeable pass every `fit` runs.
+- {doc}`Mergeable algebra <../deep-dives/mergeable-algebra>`: why a `fit` gives the same answer
   on one core and on a cluster.
-- [ML API reference](../api/ml.md): the full `Preprocessor` surface.
-- [Feature pipeline recipe](../examples/ml/feature-pipeline.md) and
-  [train/test split recipe](../examples/ml/train-test-split.md): the short versions.
+- {doc}`ML API reference <../api/ml>`: the full `Preprocessor` surface.
+- {doc}`Feature pipeline recipe <../examples/ml/feature-pipeline>` and
+  {doc}`train/test split recipe <../examples/ml/train-test-split>`: the short versions.
 - `examples/preprocessors.py`: this workflow as a runnable, asserted script.

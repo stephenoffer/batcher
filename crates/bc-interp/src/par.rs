@@ -1029,11 +1029,23 @@ fn exec(
                             // larger than the working-set budget. The merge phase is
                             // already fan-in bounded, so this caps peak sort memory.
                             let parts = ops::remorselize(parts, opts.morsel_target());
+                            // Grow each pass-0 run to a quarter of the operator's envelope
+                            // (bounded by the default) rather than one run per morsel: the
+                            // merge rewrites the dataset once per pass, so fewer, larger
+                            // runs is directly fewer passes. A quarter leaves room for the
+                            // run's own concat + sort scratch inside the envelope; with no
+                            // envelope, fall back to the module default.
+                            let run_target = opts
+                                .op_budget(op_id)
+                                .map(|b| (b as u64 / 4).max(1 << 20))
+                                .unwrap_or(ops::DEFAULT_RUN_TARGET_BYTES)
+                                .min(ops::DEFAULT_RUN_TARGET_BYTES);
                             let (sorted, vol) = ops::external_merge_sort(
                                 parts,
                                 keys,
                                 &sp.dir.join("sort"),
                                 opts.tuning.sort_merge_fanin,
+                                run_target,
                                 sp.codec,
                                 opts.cancel.as_ref(),
                             )?;
@@ -2731,9 +2743,12 @@ fn partial_state_bytes(partials: &[agg::Partial]) -> usize {
 /// Grace fan-out: enough hash partitions that each holds roughly one budget's
 /// worth of state. At least 2 (spilling with 1 partition saves no memory).
 fn grace_partitions(partials: &[agg::Partial], budget_bytes: usize) -> usize {
-    let total = partial_state_bytes(partials);
-    let budget = budget_bytes.max(1);
-    total.div_ceil(budget).max(2)
+    // Capped like every other grace operator's fan-out. Uncapped, an aggregate whose state
+    // is three orders of magnitude over the envelope asked for thousands of spill files,
+    // each receiving shards too small to write efficiently. A bucket that is still too large
+    // is not left that way: `combine_finalize_spilling` measures it before reading it and
+    // re-partitions it out of core, which is the bounded path anyway.
+    crate::spill_split::grace_bucket_count(partial_state_bytes(partials), budget_bytes)
 }
 
 /// Grace hash join: partition both sides by join key into `P` disk-backed
@@ -4906,6 +4921,92 @@ mod tests {
     /// Grace ASOF join (forced by a tiny budget → both sides partitioned to disk and
     /// joined one bucket pair at a time) must equal the in-memory ASOF — the
     /// mergeable-spill invariant for the new bounded-memory ASOF path.
+    /// A spilling ASOF join whose `by` groups are wildly uneven must still equal the
+    /// in-memory result.
+    ///
+    /// The fan-out is sized from the *larger side's total*, which says nothing about how any
+    /// one `by` value is distributed — so a hot group leaves a bucket far over the envelope,
+    /// and both sides were materialized whole before joining. Re-splitting is legal here for
+    /// the hash join's reason plus one more: a nearest-`on` match never crosses a `by` group,
+    /// so re-partitioning by the `by` keys keeps every group whole in one sub-bucket and each
+    /// sub-pair stays an independent ASOF join.
+    ///
+    /// The budget is small but not degenerate, so the split is chosen from a measured
+    /// partition size rather than by everything trivially exceeding it.
+    #[test]
+    fn spilling_asof_join_with_skewed_by_groups_matches_in_memory() {
+        use bc_ir::{JoinOutputCol, JoinSide};
+
+        let plan = RelOp::AsofJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_on: "v".into(),
+            right_on: "v".into(),
+            left_by: vec!["k".into()],
+            right_by: vec!["k".into()],
+            backward: true,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "k".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+        };
+
+        // One hot `by` group carrying the bulk of both sides, plus cold ones.
+        let mut lk = Vec::new();
+        let mut lv = Vec::new();
+        for i in 0..400 {
+            lk.push(7);
+            lv.push(i * 2);
+        }
+        for k in 0..30 {
+            lk.push(k);
+            lv.push(1000 + k);
+        }
+        let mut rk = Vec::new();
+        let mut rv = Vec::new();
+        for i in 0..200 {
+            rk.push(7);
+            rv.push(i * 3);
+        }
+        for k in 10..40 {
+            rk.push(k);
+            rv.push(900 + k);
+        }
+        let left = vec![batch(&lk, &lv)];
+        let right = vec![batch(&rk, &rv)];
+        let in_mem = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("bc_asof_skew_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 2048,
+                dir,
+                codec: SpillCodec::None,
+            }),
+            morsel_rows: 64,
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[left, right], &opts).unwrap();
+        assert_eq!(
+            rows(&in_mem),
+            rows(&spilled),
+            "a re-split ASOF bucket diverged from the in-memory join"
+        );
+    }
+
     #[test]
     fn spilling_asof_join_matches_in_memory() {
         use bc_ir::{JoinOutputCol, JoinSide};
@@ -5148,6 +5249,108 @@ mod tests {
             let spilled =
                 execute_parallel_with(&plan, &[left.clone(), right.clone()], &opts).unwrap();
             assert_eq!(rows(&seq), rows(&spilled), "join type {jt:?} mismatch");
+        }
+    }
+
+    /// A grace join whose buckets are wildly uneven must still equal the sequential oracle.
+    ///
+    /// The bucket count is sized from the build side's *average* bytes per bucket, so under
+    /// key skew one bucket holds far more than its share. Both sides used to be materialized
+    /// whole before being joined, so that bucket OOMs at exactly the point spilling was
+    /// meant to have prevented it — the standard reason a skewed Spark join dies. The fix
+    /// re-splits an over-large bucket with a depth-derived salt, on *both* sides, and this
+    /// pins the property that makes that legal: the union of the sub-bucket joins is the
+    /// same relation, for every join type.
+    ///
+    /// The budget is small but not degenerate, so the split path is chosen by the measured
+    /// partition size rather than by everything trivially exceeding it, and the skew is
+    /// severe enough (one key carrying most rows on both sides) that a re-split cannot
+    /// separate the hot key and the depth limit is reached.
+    #[test]
+    fn spilling_join_with_skewed_buckets_matches_sequential() {
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+
+        let join_plan = |jt: JoinType| RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: jt,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "lk".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+            strategy: JoinStrategy::Hash,
+        };
+
+        // One hot key (7) carries the bulk of both sides; a scattering of cold keys, some
+        // matching and some not, so the outer/semi/anti emissions all differ.
+        let mut lk = Vec::new();
+        let mut lv = Vec::new();
+        for i in 0..600 {
+            lk.push(7);
+            lv.push(i);
+        }
+        for k in 0..40 {
+            lk.push(k);
+            lv.push(1000 + k);
+        }
+        let mut rk = Vec::new();
+        let mut rv = Vec::new();
+        for i in 0..300 {
+            rk.push(7);
+            rv.push(i);
+        }
+        for k in 20..60 {
+            rk.push(k);
+            rv.push(2000 + k);
+        }
+        let left = vec![batch(&lk, &lv)];
+        let right = vec![batch(&rk, &rv)];
+
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let plan = join_plan(jt);
+            let seq = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("bc_join_skew_{}_{:?}", std::process::id(), jt));
+            let opts = ExecOptions {
+                agg_spill: Some(SpillOptions {
+                    // Small enough to spill and to leave the hot bucket over budget, large
+                    // enough that the cold buckets fit and the split is a real decision.
+                    memory_budget_bytes: 4096,
+                    dir,
+                    codec: SpillCodec::None,
+                }),
+                morsel_rows: 64,
+                ..ExecOptions::default()
+            };
+            let spilled =
+                execute_parallel_with(&plan, &[left.clone(), right.clone()], &opts).unwrap();
+            assert_eq!(
+                rows(&seq),
+                rows(&spilled),
+                "skewed grace join diverged from the oracle for join type {jt:?}"
+            );
         }
     }
 

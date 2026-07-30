@@ -51,8 +51,9 @@ list.** Read the site before you touch it.
 | `near-duplicate` | cross-file bodies ≥85% identical | the copy that drifted one line, invisible to `lint_duplication` |
 | `stub` | a documented function with a do-nothing body, excluding `-> X \| None` (a documented "unknown" default) | a docstring promising what the body does not do |
 | `swallowed-error` | a handler that *declares itself* best-effort and leaves no trace; a comment-less `pass`; a broad `except` over a large `try` | the first is the real one — the learned-stats loop dying with every gate green |
-| `vacuous-test` | a `test_*` with no assertion anywhere in its call graph | passes as long as nothing raises |
-| `order-blind-test` | a test that sorts, then asserts order-independently | `high` = both sides order, mechanically fixable; `medium` = read it, an ordered assertion may be wrong |
+| `vacuous-test` | a `test_*` with no assertion anywhere in its call graph, that never calls anything at statement level either | binds results and discards them |
+| `vacuous-assertion` | `assert True`, `assert len(x) >= 0`, `assert k == k` | reads as coverage, checks nothing |
+| `order-blind-test` | a `sort`/`top_k`/`bottom_k` result compared with `assert_same` or a bare `assert_tables_equal` | the comparison sorts both sides, so it cannot see a sort bug |
 | `production` | `print` outside a display function, `assert` on a public function's argument, mutable defaults | ships to a user as-is |
 | `suppression` | `# noqa`, `# type: ignore`, `#[allow(...)]` | a gate that was silenced instead of satisfied; watch the count |
 
@@ -115,6 +116,18 @@ dead. Keying on the syntax alone reported 190 sites, ~150 of them legitimate. Al
 is not silence (inside a loop it means "skip this entry" — all 16 sites were legitimate), and
 a handler that reads its bound exception is not silent either, because threading it into a
 reason string the caller logs carries it just as well.
+
+The three test-quality detectors were then rewritten from regex-over-source to AST, because
+the calibrations above had driven the count down without fixing the *kind* of error: the
+remaining 23 findings were still all false. The regexes read `.sort(` inside a string literal
+as a sort (flagging the detector's own test file), and a `warnings.simplefilter("error")`
+block — how every "...stays silent" test here is written, and a real negative assertion — as
+a test that asserts nothing. Reading the parse tree removed all 23. That precision is what
+promoted these three from a report to a **gate**: `just lint-tests` now fails the build on
+them, over the same `tools/audit/testing.py` this report reads, and
+`tests/unit/test_lint_tests.py` feeds each rule a violation it must catch and each historical
+false positive it must not. A detector calibrated to zero can be a gate; one that cannot be
+is still a report.
 
 `order-blind-test` reported 32; 30 were false and 2 were real. The 30 were the detector
 treating *inner* ordering as result ordering — an `order_by=` **keyword** picks which row an

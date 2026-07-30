@@ -177,14 +177,14 @@ Ten rows: five unordered pairs, each in both directions.
 ## See also
 
 :::{seealso}
-- [Top k per group](top-k-per-group.md): keep the best three partners per item rather than
+- {doc}`Top k per group <top-k-per-group>`: keep the best three partners per item rather than
   the global leaderboard.
-- [Geospatial binning](geospatial-binning.md): the other recipe whose whole difficulty is
+- {doc}`Geospatial binning <geospatial-binning>`: the other recipe whose whole difficulty is
   choosing a key that groups.
-- [Joins](../../user-guide/joins.md): the join engine, and what a self-join costs.
-- [Distinct and dedup](../../user-guide/distinct-and-dedup.md): duplicate line items in a
+- {doc}`Joins <../../user-guide/joins>`: the join engine, and what a self-join costs.
+- {doc}`Distinct and dedup <../../user-guide/distinct-and-dedup>`: duplicate line items in a
   basket will inflate every count on this page, so dedupe `(order_id, item)` first.
-- [Join algorithms](../../deep-dives/join-algorithms.md): how the build side and the
+- {doc}`Join algorithms <../../deep-dives/join-algorithms>`: how the build side and the
   pushed-down predicate keep the quadratic bounded.
-- [Expressions API](../../api/expressions.md): `lit`, `n_unique`, `count().over(...)`.
+- {doc}`Expressions API <../../api/expressions>`: `lit`, `n_unique`, `count().over(...)`.
 :::

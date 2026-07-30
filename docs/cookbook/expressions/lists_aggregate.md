@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/lists_aggregate.py
 ```
+
+## See also
+
+- {doc}`json_columns`: reading JSON held in a string column, without parsing it in Python.
+- {doc}`lists_basics`: list columns: indexing, slicing, joining, and flattening.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

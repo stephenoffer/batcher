@@ -99,7 +99,7 @@ amortizes.
 :::{note}
 All three produce the same relation. Only the data movement differs, so a wrong pick is slow
 rather than wrong. That is what makes the strategy safe for Kyber to learn (see
-[Learned metadata](learned-metadata.md)) rather than something a user must get right.
+{doc}`Learned metadata <learned-metadata>`) rather than something a user must get right.
 :::
 
 ::::{tab-set}
@@ -271,14 +271,14 @@ weak axis. Single-node join parallelism is.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why there is one join and not a distributed second one
-- [Execution engine](../internals/execution.md): the operator around these primitives
-- [Kyber](../internals/kyber.md): the pass that picks the strategy and the build side
-- [Joins](../user-guide/joins.md): the API, and how to help the planner
-- [Reading a plan](../user-guide/explain-plans.md): the decisions block above, explained
-- [vs DuckDB](../benchmarks/vs-duckdb.md): the multi-join gap this page opens with
-- [TPC-H benchmarks](../benchmarks/tpch.md): q5, q7, q8, q17 in context
-- [Morsel parallelism](morsel-parallelism.md): the shuffle-into-buckets schedule
-- [Mergeable algebra](mergeable-algebra.md): why per-partition joins union to the whole join
-- [Spilling](spilling.md): the grace hash join, when the build side doesn't fit
+- {doc}`Architecture <../architecture/index>`: why there is one join and not a distributed second one
+- {doc}`Execution engine <../internals/execution>`: the operator around these primitives
+- {doc}`Kyber <../internals/kyber>`: the pass that picks the strategy and the build side
+- {doc}`Joins <../user-guide/joins>`: the API, and how to help the planner
+- {doc}`Reading a plan <../user-guide/explain-plans>`: the decisions block above, explained
+- {doc}`vs DuckDB <../benchmarks/vs-duckdb>`: the multi-join gap this page opens with
+- {doc}`TPC-H benchmarks <../benchmarks/tpch>`: q5, q7, q8, q17 in context
+- {doc}`Morsel parallelism <morsel-parallelism>`: the shuffle-into-buckets schedule
+- {doc}`Mergeable algebra <mergeable-algebra>`: why per-partition joins union to the whole join
+- {doc}`Spilling <spilling>`: the grace hash join, when the build side doesn't fit
 :::

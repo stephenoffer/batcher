@@ -160,14 +160,14 @@ on. Sketch when you want a *number*.
 
 ## See also
 
-- [Aggregations](aggregations.md): the exact and approximate aggregate families.
-- [Filtering](filtering.md): predicates, which is how a stratum is defined.
-- [Preprocessors](../ml/preprocessors/index.md): fitting feature statistics on the train split
+- {doc}`Aggregations <aggregations>`: the exact and approximate aggregate families.
+- {doc}`Filtering <filtering>`: predicates, which is how a stratum is defined.
+- {doc}`Preprocessors <../ml/preprocessors/index>`: fitting feature statistics on the train split
   only.
-- [Cardinality estimation](../deep-dives/cardinality-estimation.md): the sketches behind
+- {doc}`Cardinality estimation <../deep-dives/cardinality-estimation>`: the sketches behind
   `approx_n_unique`, and the error bounds they hold to.
-- [Train/test split recipe](../examples/ml/train-test-split.md): the leak-free split on a
+- {doc}`Train/test split recipe <../examples/ml/train-test-split>`: the leak-free split on a
   real feature table.
-- [A/B testing](../examples/analytics/ab-testing.md): hash-bucketed assignment, the same
+- {doc}`A/B testing <../examples/analytics/ab-testing>`: hash-bucketed assignment, the same
   machinery pointed at an experiment.
-- [Dataset API](../api/dataset.md): the `sample` and `with_random` reference.
+- {doc}`Dataset API <../api/dataset>`: the `sample` and `with_random` reference.

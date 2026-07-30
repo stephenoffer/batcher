@@ -7,19 +7,19 @@ batch.
 
 ## Reading order
 
-1. [Getting started](../getting-started/index.md): install and run a first query.
-1. [Your first pipeline](../tutorials/first-pipeline.md): the data flow a model
+1. {doc}`Getting started <../getting-started/index>`: install and run a first query.
+1. {doc}`Your first pipeline <../tutorials/first-pipeline>`: the data flow a model
    plugs into.
-1. [Batch inference](../tutorials/batch-inference.md): the `.ml.map_batches`
+1. {doc}`Batch inference <../tutorials/batch-inference>`: the `.ml.map_batches`
    pattern.
-1. [Feature engineering](../tutorials/feature-engineering.md): build a model-ready
+1. {doc}`Feature engineering <../tutorials/feature-engineering>`: build a model-ready
    feature matrix with fit/transform preprocessors.
-1. [ML overview](../ml/index.md): the accessor and its operations.
-1. [Inference](../ml/inference.md): `ds.ml.infer` and `ds.ml.embed`.
-1. [GPU execution](../ml/gpu.md): reserving and sharing GPUs.
-1. [PyTorch integration](../ml/pytorch.md).
-1. [Streaming](../ml/streaming.md): processing batches as a stream.
-1. [ML API reference](../api/ml.md).
+1. {doc}`ML overview <../ml/index>`: the accessor and its operations.
+1. {doc}`Inference <../ml/inference>`: `ds.ml.infer` and `ds.ml.embed`.
+1. {doc}`GPU execution <../ml/gpu>`: reserving and sharing GPUs.
+1. {doc}`PyTorch integration <../ml/pytorch>`.
+1. {doc}`Streaming <../ml/streaming>`: processing batches as a stream.
+1. {doc}`ML API reference <../api/ml>`.
 
 ## Example: map a function over batches
 
@@ -77,13 +77,13 @@ class Embedder:
 - `streaming_pipeline.py` sketches the shape of a streaming inference pipeline. It
   needs a broker to run.
 
-See also the [performance guide](../user-guide/performance.md) for caching feature
-tables, and the [GPU guide](../ml/gpu.md) for accelerator placement.
+See also the {doc}`performance guide <../user-guide/performance>` for caching feature
+tables, and the {doc}`GPU guide <../ml/gpu>` for accelerator placement.
 
 
 ## Recipes and deeper reading
 
-The [ML cookbook](../examples/ml/index.md) covers the applied path: embeddings, batch
+The {doc}`ML cookbook <../examples/ml/index>` covers the applied path: embeddings, batch
 scoring, RAG indexes, feature pipelines, and the train/test leak you get for free from a
 naive random split.
 
@@ -116,7 +116,14 @@ Why the device idles, and what stage-overlap does about it.
 ::::
 
 :::{seealso}
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): ten workload families, measured.
-- [PyTorch](../integrations/pytorch.md) and [Hugging Face](../integrations/huggingface.md).
-- [Tensor columns](../deep-dives/tensor-columns.md): how an image becomes a column.
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: ten workload families, measured.
+- {doc}`PyTorch <../integrations/pytorch>` and {doc}`Hugging Face <../integrations/huggingface>`.
+- {doc}`Tensor columns <../deep-dives/tensor-columns>`: how an image becomes a column.
 :::
+
+
+## See also
+
+- {doc}`data-scientist`: the analysis path that feeds this one.
+- {doc}`platform-engineer`: sizing, scheduling, and observability for the jobs you build.
+- {doc}`../examples/ml/index`: runnable versions of the pipelines above.

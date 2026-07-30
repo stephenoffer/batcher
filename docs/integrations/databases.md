@@ -11,7 +11,7 @@ This page covers reading and writing any SQL database from a standard connection
 | **Pushdown** | Projection and predicate, both folded into the submitted SQL |
 | **Credentials** | `password="env:VAR"` or `"file:/path"`, resolved on the worker |
 
-The warehouse-specific pages cover the connectors that are not URI-routed: [Snowflake](snowflake.md), [BigQuery](bigquery.md), and [Databricks](databricks.md).
+The warehouse-specific pages cover the connectors that are not URI-routed: {doc}`Snowflake <snowflake>`, {doc}`BigQuery <bigquery>`, and {doc}`Databricks <databricks>`.
 
 ## Which backend serves which scheme
 
@@ -391,8 +391,8 @@ A scheme Batcher cannot route raises a `BackendError` listing the ones it can. F
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md) and [Writing data](../user-guide/writing-data.md): the reader and writer surface, splits, and pushdown.
-- [Snowflake](snowflake.md), [BigQuery](bigquery.md), and [Databricks](databricks.md): the warehouse connectors with their own read paths.
-- [MongoDB](mongodb.md) and [Elasticsearch](elasticsearch.md): the non-relational stores.
-- [Custom connectors](../user-guide/custom-connectors.md): the protocol, for a system not listed.
-- [I/O API](../api/io.md): the reference.
+- {doc}`Reading data <../user-guide/reading-data>` and {doc}`Writing data <../user-guide/writing-data>`: the reader and writer surface, splits, and pushdown.
+- {doc}`Snowflake <snowflake>`, {doc}`BigQuery <bigquery>`, and {doc}`Databricks <databricks>`: the warehouse connectors with their own read paths.
+- {doc}`MongoDB <mongodb>` and {doc}`Elasticsearch <elasticsearch>`: the non-relational stores.
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the protocol, for a system not listed.
+- {doc}`I/O API <../api/io>`: the reference.

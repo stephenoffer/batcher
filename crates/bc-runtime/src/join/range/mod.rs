@@ -13,16 +13,22 @@
 //! whether the curve stays flat past a million rows, and it is the difference between this
 //! implementation and DuckDB's, which removes the term outright by pruning block *pairs*.
 //!
-//! Two algorithms, picked by how many inequalities the condition has:
+//! Three algorithms, picked by the *shape* of the condition rather than only its arity:
 //!
 //! - **One inequality** — sort the right side once; for each left row the matching right
 //!   rows are a *contiguous suffix* found by binary search, so the pairs are emitted
 //!   directly with no per-pair predicate evaluation.
-//! - **Two inequalities** — IEJoin (Khayyat et al., *Lightning Fast and Space Efficient
-//!   Inequality Joins*, VLDB 2015), the algorithm DuckDB's `PhysicalIEJoin` implements.
-//!   Sort the union of both sides on each axis, sweep the second axis marking right rows
-//!   in a bit array indexed by first-axis rank, and read each left row's matches off as
-//!   the set bits in a suffix of that array.
+//! - **Two inequalities bounding one shared right key** (a *band*: `L.a <= R.y AND R.y <=
+//!   L.b`) — see [`band`]. The matches are a contiguous *slice* of one sorted array, and
+//!   both of its bounds are monotone in the left key, so neither the union sort nor the
+//!   mark array is needed. This is the common real-world shape (interval containment,
+//!   temporal overlap, `BETWEEN` against a computed pair) and it is 1.6x the general path.
+//! - **Two inequalities, general** — IEJoin (Khayyat et al., *Lightning Fast and Space
+//!   Efficient Inequality Joins*, VLDB 2015), the algorithm DuckDB's `PhysicalIEJoin`
+//!   implements. Sort the union of both sides on each axis, sweep the second axis marking
+//!   right rows in a bit array indexed by first-axis rank, and read each left row's matches
+//!   off as the set bits in a suffix of that array. The mark-scan term described above is
+//!   this path's, and only this path's — the band does not pay it at all.
 //!
 //! Both produce the same [`JoinIndices`](super::JoinIndices) relation the hash join does,
 //! so every join type falls out of the same index-pair shape and the caller's gather is
@@ -60,6 +66,7 @@ use rayon::prelude::*;
 use super::{null_mask, IndexBuf, JoinIndices, JoinType};
 use crate::error::RuntimeError;
 
+mod band;
 mod keys;
 mod marks;
 
@@ -89,6 +96,15 @@ impl RangeOp {
     /// what lets one binary search serve every case.
     fn axis1_descending(self) -> bool {
         matches!(self, RangeOp::Gt | RangeOp::Ge)
+    }
+
+    /// Whether this operator bounds the **right** key from below.
+    ///
+    /// Orientation is `left OP right`, so `<`/`<=` place the left key beneath the right one
+    /// — a lower bound on the right key — and `>`/`>=` place it above. [`band`] uses this to
+    /// tell a two-sided band from two conditions facing the same way.
+    fn lower_bounds_right(self) -> bool {
+        matches!(self, RangeOp::Lt | RangeOp::Le)
     }
 
     /// Sort sense for the **second** axis, the opposite of [`Self::axis1_descending`].
@@ -305,6 +321,10 @@ pub fn range_join_indices(
 
     if ops.len() == 1 {
         single_condition(left_keys, right_keys, ops[0], &lmap, &rmap, &mut out)?;
+    } else if let Some(sides) = band::bounds(right_keys, ops) {
+        // Both conditions bound ONE right key, so the matches are a contiguous slice of it
+        // sorted once — no union sort, no second axis, no mark array. See `band`.
+        band::run(left_keys, right_keys, ops, sides, &lmap, &rmap, &mut out)?;
     } else {
         two_conditions(left_keys, right_keys, ops, &lmap, &rmap, &mut out)?;
     }
@@ -783,6 +803,172 @@ mod tests {
         }
     }
 
+    /// The band shape — `L.a OP R.y` and `L.b OP R.y` over the **same** right array — against
+    /// the cross-product oracle, across every operator pair, join type, and null pattern.
+    ///
+    /// The pre-existing two-inequality test cannot reach this path: it builds two *different*
+    /// right arrays, so `band::bounds` declines and IEJoin runs. Passing one `ArrayRef` twice
+    /// is what a real `r.y BETWEEN l.a AND l.b` lowers to, because `columns_by_name` hands out
+    /// `Arc` clones of one column.
+    #[test]
+    fn a_band_over_one_right_key_matches_the_cross_product_oracle() {
+        let mut rng = Rng(0x243F_6A88_85A3_08D3);
+        for trial in 0..40 {
+            let nl = 1 + (rng.next() % 25) as usize;
+            let nr = 1 + (rng.next() % 25) as usize;
+            let mk = |rng: &mut Rng, n: usize, nullmod: u64| -> Vec<Option<i64>> {
+                (0..n)
+                    .map(|_| {
+                        let v = rng.next();
+                        (v % nullmod != 0).then(|| (v % 14) as i64 - 7)
+                    })
+                    .collect()
+            };
+            let la = mk(&mut rng, nl, 8);
+            let lb = mk(&mut rng, nl, 11);
+            let ry = mk(&mut rng, nr, 9);
+            // ONE array, cloned — this is what makes `Arc::ptr_eq` hold and the band fire.
+            let ry_arr = arr(&ry);
+            for op1 in OPS {
+                for op2 in OPS {
+                    for jt in TYPES {
+                        let got = range_join_indices(
+                            &[arr(&la), arr(&lb)],
+                            &[ry_arr.clone(), ry_arr.clone()],
+                            &[op1, op2],
+                            jt,
+                        )
+                        .expect("join runs");
+                        assert_eq!(
+                            actual(&got),
+                            brute(&la, &ry, &[op1, op2], Some(&lb), Some(&ry), jt),
+                            "trial {trial} ops {op1:?}/{op2:?} join {jt:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The band path and IEJoin must agree **on the same input**, not merely each against the
+    /// oracle. Handing the identical data as one shared array (band) and as two equal-valued
+    /// arrays (IEJoin) is the only way to compare the two algorithms directly, and it is what
+    /// would catch a band that is self-consistently wrong.
+    #[test]
+    fn the_band_path_agrees_with_iejoin_on_the_same_data() {
+        let mut rng = Rng(0xB7E1_5162_8AED_2A6A);
+        for _ in 0..25 {
+            let (nl, nr) = (
+                1 + (rng.next() % 30) as usize,
+                1 + (rng.next() % 30) as usize,
+            );
+            let mk = |rng: &mut Rng, n: usize| -> Vec<Option<i64>> {
+                (0..n)
+                    .map(|_| {
+                        let v = rng.next();
+                        (v % 7 != 0).then(|| (v % 20) as i64 - 10)
+                    })
+                    .collect()
+            };
+            let la = mk(&mut rng, nl);
+            let lb = mk(&mut rng, nl);
+            let ry = mk(&mut rng, nr);
+            let shared = arr(&ry);
+            for op1 in OPS {
+                for op2 in OPS {
+                    for jt in TYPES {
+                        // Same Arc twice -> band (when the ops face opposite ways).
+                        let band = range_join_indices(
+                            &[arr(&la), arr(&lb)],
+                            &[shared.clone(), shared.clone()],
+                            &[op1, op2],
+                            jt,
+                        )
+                        .expect("band runs");
+                        // Two separately-built arrays of the same values -> IEJoin.
+                        let ie = range_join_indices(
+                            &[arr(&la), arr(&lb)],
+                            &[arr(&ry), arr(&ry)],
+                            &[op1, op2],
+                            jt,
+                        )
+                        .expect("iejoin runs");
+                        assert_eq!(
+                            actual(&band),
+                            actual(&ie),
+                            "band vs IEJoin disagree: ops {op1:?}/{op2:?} join {jt:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detection must decline everything it cannot prove is a band, because a false positive
+    /// would slice an order the second bound does not index.
+    #[test]
+    fn band_detection_declines_what_is_not_a_band() {
+        let y = arr(&[Some(1i64), Some(2), Some(3)]);
+        let z = arr(&[Some(1i64), Some(2), Some(3)]);
+        // Opposite-facing ops over one shared key: this IS a band.
+        assert_eq!(
+            band::bounds(&[y.clone(), y.clone()], &[RangeOp::Le, RangeOp::Ge]),
+            Some((0, 1))
+        );
+        assert_eq!(
+            band::bounds(&[y.clone(), y.clone()], &[RangeOp::Gt, RangeOp::Lt]),
+            Some((1, 0))
+        );
+        // Same values, different arrays: not provably one key, so decline.
+        assert_eq!(
+            band::bounds(&[y.clone(), z], &[RangeOp::Le, RangeOp::Ge]),
+            None
+        );
+        // One shared key but both conditions face the same way: not a band.
+        assert_eq!(
+            band::bounds(&[y.clone(), y.clone()], &[RangeOp::Le, RangeOp::Lt]),
+            None
+        );
+        assert_eq!(
+            band::bounds(&[y.clone(), y.clone()], &[RangeOp::Ge, RangeOp::Gt]),
+            None
+        );
+    }
+
+    /// Floats reach the band through `canonicalize_float_keys`, which rebuilds the arrays —
+    /// so the shared-`Arc` test can fail on them and IEJoin runs instead. Either way the
+    /// answer must obey the engine's total float order, so pin the answer, not the route.
+    #[test]
+    fn a_float_band_follows_the_engines_total_order() {
+        let la = vec![Some(-0.0f64), Some(1.0), Some(f64::NAN)];
+        let lb = vec![Some(2.0f64), Some(3.0), Some(f64::NAN)];
+        let ry = vec![Some(0.0f64), Some(2.0), Some(f64::NAN)];
+        let f = |v: &[Option<f64>]| -> ArrayRef {
+            std::sync::Arc::new(arrow::array::Float64Array::from(v.to_vec())) as ArrayRef
+        };
+        let shared = f(&ry);
+        let got = range_join_indices(
+            &[f(&la), f(&lb)],
+            &[shared.clone(), shared.clone()],
+            &[RangeOp::Le, RangeOp::Ge],
+            JoinType::Inner,
+        )
+        .expect("join runs");
+        // -0.0 <= 0.0 <= 2.0 and 1.0 <= 2.0 <= 3.0; NaN equals NaN under the total order,
+        // so the NaN row's band [NaN, NaN] contains the NaN right row.
+        let mut pairs = actual(&got);
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(0), Some(0)),
+                (Some(0), Some(1)),
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+            ]
+        );
+    }
+
     #[test]
     fn interval_containment_is_output_sensitive() {
         // The shape the ceiling was measured on: points against [lo, hi) intervals. What
@@ -1036,6 +1222,138 @@ mod tests {
                 no_out,
                 whole,
                 total.left.len()
+            );
+        }
+    }
+
+    /// What the band path is worth against the IEJoin it replaces, on identical data.
+    ///
+    /// ```text
+    /// cargo test -p bc-runtime --release --lib report_band_vs_iejoin -- --ignored --nocapture
+    /// ```
+    ///
+    /// Same rows, same predicate, same answer — the only difference is whether the two
+    /// conditions are handed the right key as one shared `ArrayRef` (band) or as two
+    /// equal-valued arrays (IEJoin). Equality of the two answers is asserted here too, so a
+    /// speed number can never be reported for a path that stopped agreeing.
+    /// Where the band path's own time goes: encode, sorts, merges, emission.
+    ///
+    /// ```text
+    /// cargo test -p bc-runtime --release --lib report_band_phases -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing study, not an assertion"]
+    fn report_band_phases() {
+        use super::keys::AxisKeys;
+        use std::time::Instant;
+
+        for n in [2_000_000usize, 5_000_000] {
+            let mut rng = Rng(0x51ED_270B_6989_1A0D);
+            let span = 50 * n as u64;
+            let lo: Vec<Option<i64>> = (0..n).map(|_| Some((rng.next() % span) as i64)).collect();
+            let hi: Vec<Option<i64>> = lo.iter().map(|v| Some(v.unwrap() + 20)).collect();
+            let ry: Vec<Option<i64>> = (0..n).map(|_| Some((rng.next() % span) as i64)).collect();
+            let (la, lb, shared) = (arr(&lo), arr(&hi), arr(&ry));
+            let lmap: Vec<u32> = (0..n as u32).collect();
+            let rmap: Vec<u32> = (0..n as u32).collect();
+            let (nl, un) = (n, 2 * n);
+
+            let t = Instant::now();
+            let k_lo = AxisKeys::build(&la, &shared, false, &lmap, &rmap).unwrap();
+            let _k_hi = AxisKeys::build(&lb, &shared, false, &lmap, &rmap).unwrap();
+            let encode = t.elapsed();
+
+            let t = Instant::now();
+            let order = k_lo.sorted_right(un, nl, &lmap, &rmap);
+            let sort_r = t.elapsed();
+
+            let t = Instant::now();
+            let sl = k_lo.sorted_left(nl, &lmap, &rmap);
+            let sort_l = t.elapsed();
+
+            let t = Instant::now();
+            let mut at = vec![0u32; nl];
+            let mut p = 0usize;
+            for &e in &sl {
+                while p < order.len()
+                    && k_lo.cmp(order[p], e, nl, &lmap, &rmap) == std::cmp::Ordering::Less
+                {
+                    p += 1;
+                }
+                at[e as usize] = p as u32;
+            }
+            let merge = t.elapsed();
+
+            let t = Instant::now();
+            let whole = range_join_indices(
+                &[la.clone(), lb.clone()],
+                &[shared.clone(), shared.clone()],
+                &[RangeOp::Le, RangeOp::Ge],
+                JoinType::Inner,
+            )
+            .unwrap();
+            let total = t.elapsed();
+
+            println!(
+                "n={n:>9} encode={:>7.1?} sort_right={:>7.1?} sort_left={:>7.1?} \
+                 merge1={:>7.1?} whole={:>7.1?} pairs={}",
+                encode,
+                sort_r,
+                sort_l,
+                merge,
+                total,
+                whole.left.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "timing study, not an assertion"]
+    fn report_band_vs_iejoin() {
+        use std::time::Instant;
+
+        for n in [500_000usize, 2_000_000, 5_000_000] {
+            let mut rng = Rng(0x51ED_270B_6989_1A0D);
+            // Keys spread far wider than the band, so the answer stays sparse and the
+            // measurement is the algorithm rather than the gather.
+            let span = 50 * n as u64;
+            let lo: Vec<Option<i64>> = (0..n).map(|_| Some((rng.next() % span) as i64)).collect();
+            let hi: Vec<Option<i64>> = lo.iter().map(|v| Some(v.unwrap() + 20)).collect();
+            let ry: Vec<Option<i64>> = (0..n).map(|_| Some((rng.next() % span) as i64)).collect();
+            let ops = [RangeOp::Le, RangeOp::Ge];
+
+            let shared = arr(&ry);
+            let t = Instant::now();
+            let band = range_join_indices(
+                &[arr(&lo), arr(&hi)],
+                &[shared.clone(), shared.clone()],
+                &ops,
+                JoinType::Inner,
+            )
+            .unwrap();
+            let band_ms = t.elapsed();
+
+            let t = Instant::now();
+            let ie = range_join_indices(
+                &[arr(&lo), arr(&hi)],
+                &[arr(&ry), arr(&ry)],
+                &ops,
+                JoinType::Inner,
+            )
+            .unwrap();
+            let ie_ms = t.elapsed();
+
+            assert_eq!(
+                actual(&band),
+                actual(&ie),
+                "band and IEJoin disagree at n={n}; the timings below would be meaningless"
+            );
+            println!(
+                "n={n:>9}  band={:>8.1?}  iejoin={:>8.1?}  speedup={:>5.2}x  out_rows={}",
+                band_ms,
+                ie_ms,
+                ie_ms.as_secs_f64() / band_ms.as_secs_f64(),
+                band.left.len()
             );
         }
     }

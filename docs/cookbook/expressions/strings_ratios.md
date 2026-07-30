@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_ratios.py
 ```
+
+## See also
+
+- {doc}`strings_predicates`: boolean text predicates: the screen in front of an expensive stage.
+- {doc}`strings_regex`: regular expressions over a column: extract, replace, and count.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

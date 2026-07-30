@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/text_retrieval.py
 ```
+
+## See also
+
+- {doc}`text_quality`: corpus hygiene rates: what fraction of a text column looks broken.
+- {doc}`text_tone_and_script`: tone and writing-system rates: style drift and language mix.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

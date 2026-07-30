@@ -342,3 +342,62 @@ def test_an_empty_epoch_reports_the_offset_it_started_from(monkeypatch):
     split = BrokerSplit(format_name="idle_broker", topic="t", partition=0, poll_size=2)
     assert split.read_epoch(41) == ([], 41)
     _EPOCH_READERS.clear()
+
+
+# --------------------------------------------------------------------------
+# A poll is bounded by bytes as well as by count.
+# --------------------------------------------------------------------------
+class _FatRec(_Rec):
+    """A record that reports its payload size the way `confluent_kafka.Message` does."""
+
+    def __init__(self, offset: int, size: int) -> None:
+        super().__init__(offset)
+        self._size = size
+        self.value_calls = 0
+
+    def len(self):
+        return self._size
+
+    def value(self):
+        self.value_calls += 1
+        return b"x" * self._size
+
+
+def test_a_poll_stops_on_the_byte_budget_even_with_count_left():
+    """`poll_size` bounds a batch by count, and a count says nothing about memory when a
+    message can be a megabyte: 16,384 of them is a 16 GiB micro-batch, and the Arrow
+    `binary` builder's 32-bit offsets fail outright past 2 GiB."""
+    mib = 1 << 20
+    consumer = _FakeConsumer(
+        [[_FatRec(0, mib)], [_FatRec(i, mib) for i in range(1, 5)], [_FatRec(9, mib)]]
+    )
+    src = _source(consumer, poll_size=16_384, poll_timeout=0.5)
+    src.poll_bytes = 4 * mib
+
+    messages = src._poll()
+
+    # First record (1 MiB) plus one drain pass of four; the budget is spent, so the third
+    # pass — which the count alone would have taken — never happens.
+    assert len(messages) == 5
+    assert len(consumer.calls) == 2
+
+
+def test_the_count_still_bounds_a_poll_of_small_messages():
+    """The byte bound is a ceiling, not a replacement: a topic of small messages must still
+    fill its `poll_size` exactly as before."""
+    consumer = _FakeConsumer([[_Rec(0)], [_Rec(1), _Rec(2)], []])
+    src = _source(consumer, poll_size=100, poll_timeout=0.5)
+    assert len(src._poll()) == 3
+    assert [n for n, _t in consumer.calls] == [1, 99, 97]
+
+
+def test_measuring_a_poll_does_not_copy_its_payloads():
+    """`Message.len()` is a size librdkafka already knows; `value()` copies the payload into
+    a Python `bytes`. Measuring with `value()` would copy the whole batch a second time —
+    on exactly the megabyte-message topics this bound exists for."""
+    recs = [_FatRec(0, 1 << 20)]
+    consumer = _FakeConsumer([recs, []])
+    src = _source(consumer, poll_size=10, poll_timeout=0.5)
+    src._poll()
+    # One copy, in `_decode`, which has to keep the bytes. None for the measurement.
+    assert recs[0].value_calls == 1

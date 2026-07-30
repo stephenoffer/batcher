@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/probabilistic_losses.py
 ```
+
+## See also
+
+- {doc}`embeddings`: corpus-level embedding metrics: monitoring a vector column in aggregate.
+- {doc}`regression_errors`: regression error metrics: absolute, squared, percentage, and robust.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

@@ -85,7 +85,7 @@ helpful permissions message.
 A `Source` divides into `Split`s, and a split is the unit of read parallelism. On the direct path
 the splits are Delta's splits: one per data file (or row-group range), taken from the transaction
 log. That is real parallelism across a whole cluster, and it is the same machinery
-[`bt.read.delta`](delta-lake.md) uses.
+{doc}``bt.read.delta` <delta-lake>` uses.
 
 The transaction log also gives you file skipping. A predicate that Kyber can push is threaded into
 the Delta source, which compares it against the per-file min/max statistics in the log and never
@@ -154,7 +154,7 @@ Databricks query would not. Check before you trust a reconciliation.
 :::
 
 Unity can front Iceberg and foreign tables. The direct path assumes Delta and will fail on those; use
-the warehouse fallback, or [`bt.read.iceberg`](iceberg.md) with the appropriate catalog.
+the warehouse fallback, or {doc}``bt.read.iceberg` <iceberg>` with the appropriate catalog.
 
 `BackendError: failed to vend Unity Catalog credentials` is almost always the missing
 `EXTERNAL USE SCHEMA` privilege, an expired token, or a workspace URL with a trailing path. The
@@ -172,10 +172,10 @@ wrapped exception carries the real reason.
 
 ## See also
 
-- [Delta Lake](delta-lake.md): the format underneath, and the writer.
-- [Lakehouse](../user-guide/lakehouse.md): time travel, merges, maintenance.
-- [Cloud storage](../user-guide/cloud-storage.md): credentials and object-store paths.
-- [Incremental ingest](../examples/data-engineering/incremental-ingest.md): reading a Unity
+- {doc}`Delta Lake <delta-lake>`: the format underneath, and the writer.
+- {doc}`Lakehouse <../user-guide/lakehouse>`: time travel, merges, maintenance.
+- {doc}`Cloud storage <../user-guide/cloud-storage>`: credentials and object-store paths.
+- {doc}`Incremental ingest <../examples/data-engineering/incremental-ingest>`: reading a Unity
   table's new partitions on a schedule.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Iceberg](iceberg.md): for the Unity tables the direct path will not open.
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Iceberg <iceberg>`: for the Unity tables the direct path will not open.

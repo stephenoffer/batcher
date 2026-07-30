@@ -8,9 +8,6 @@ How it works:
 
 * it LISTs the directory with :func:`resolve_filesystem` (so local and cloud
   paths work unchanged);
-* a **lexical fast-path** narrows the listing to files ordering after the maximum
-  already-seen name — useful when files are written under monotonically
-  increasing names (timestamps, sequence ids);
 * a durable :class:`~batcher.io.formats.streaming.seen_store.SeenStore` (stdlib SQLite, no extra
   dependency) dedups across passes and process restarts;
 * new files are read by delegating to the registered file reader for ``format``
@@ -145,21 +142,26 @@ class IncrementalFileSource:
             store, self._store_obj = self._store_obj, None
             store.close()
 
-    def _list_candidates(self, store: SeenStore) -> list[str]:
-        """List directory files, applying the lexical fast-path against `store`.
+    def _list_candidates(self) -> list[str]:
+        """List the directory. Every listed file is a candidate; the store decides.
 
-        ``expand`` returns a sorted list; keeping only names strictly greater than
-        the max-seen name skips re-listing the (lexically earlier) processed
-        prefix when files are written under increasing names.
+        This used to keep only the names sorting **after** the greatest already-seen name,
+        on the theory that files arrive under monotonically increasing names. When they do
+        not, that filter is silent, permanent data loss: a file whose name sorts earlier
+        than one already processed is never offered to `unseen()` and so is never ingested,
+        with no error and nothing in the store to show it was skipped. The names real
+        writers produce are exactly the wrong shape for it — Spark and Flink emit
+        ``part-00000-<uuid>.parquet``, so after the first file roughly half of every later
+        arrival sorted below the maximum and vanished.
+
+        Dropping the filter costs almost nothing now that `unseen` is an index probe over
+        the candidates rather than a scan of the whole table: the listing itself is
+        unchanged, and the probe is O(candidates), not O(files ever seen).
         """
         try:
-            files = self._fs.expand(self._path, suffix=self._suffix)
+            return self._fs.expand(self._path, suffix=self._suffix)
         except IOError:
             return []  # empty / not-yet-populated directory is not an error here.
-        max_seen = store.max_seen()
-        if max_seen is None:
-            return files
-        return [f for f in files if f > max_seen]
 
     def discover(self) -> list[str]:
         """Return the new (unseen, not-yet-pending) files for the current pass.
@@ -169,7 +171,7 @@ class IncrementalFileSource:
         then a restart re-offers them (see the module docstring).
         """
         store = self._store()
-        candidates = self._list_candidates(store)
+        candidates = self._list_candidates()
         held = set(self._pending)
         new_files = [f for f in store.unseen(candidates) if f not in held]
         if self._max_files is not None:

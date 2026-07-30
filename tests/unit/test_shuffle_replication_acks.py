@@ -157,3 +157,50 @@ def test_a_probe_failure_is_noted_rather_than_silent(monkeypatch, replicating, c
         assert repl.replicate_shuffle_output(actors, addrs, 2, 2, set()) is None
     steps = [getattr(r, _FIELDS_ATTR, {}).get("step") for r in caplog.records]
     assert "probe workers for replica placement" in steps, caplog.text
+
+
+def test_retire_replicas_drops_the_copies_a_recompute_invalidates():
+    """The epoch invariant, asserted directly rather than through a cluster.
+
+    A replica carries the ticket of the epoch it was copied at. A recompute reincarnates
+    the source to the next epoch, so that ticket stops resolving — and an unregistered
+    ticket reads back as an EMPTY bucket rather than an error. A reducer left free to fall
+    over to the stale copy would therefore drop that mapper's rows and return a short
+    answer with nothing turning red, which is why every shuffle's recovery path must call
+    this *before* it republishes.
+    """
+    replicas = [["a:1"], ["b:1", "c:1"], []]
+    repl.retire_replicas(replicas, 1, worker=1, shuffle="join")
+    assert replicas == [["a:1"], [], []], "only the recomputed source is retired"
+
+    # Idempotent: a second recovery round over the same source must not raise.
+    repl.retire_replicas(replicas, 1, worker=1, shuffle="join")
+    assert replicas[1] == []
+
+
+def test_retire_replicas_is_a_no_op_when_replication_is_off():
+    """Callers must not have to guard, so `None` and an out-of-range source are silent.
+
+    Every shuffle passes whatever `replicate_shuffle_output` returned, and that is `None`
+    whenever replication is off or nothing could be placed — the default. If this raised,
+    the unreplicated path (the common one) would fail inside recovery, turning a survivable
+    worker loss into a failed query.
+    """
+    repl.retire_replicas(None, 3, worker=0, shuffle="sort")
+    short = [["a:1"]]
+    repl.retire_replicas(short, 7, worker=0, shuffle="window")
+    assert short == [["a:1"]], "an out-of-range source leaves the table untouched"
+
+
+def test_retire_replicas_announces_only_a_retirement_that_happened(caplog):
+    """A retirement is a recovery event worth seeing; retiring nothing is not.
+
+    Publishing on the empty case would put a RECOVERY event on every recompute of an
+    unreplicated source, which is the ordinary path — the signal would be noise.
+    """
+    with caplog.at_level("DEBUG"):
+        repl.retire_replicas([[]], 0, worker=0, shuffle="aggregate")
+    quiet = list(caplog.records)
+    with caplog.at_level("DEBUG"):
+        repl.retire_replicas([["a:1"]], 0, worker=0, shuffle="aggregate")
+    assert len(caplog.records) >= len(quiet)

@@ -114,7 +114,7 @@ take `batch_size`, `num_gpus`, `concurrency`, and `output_columns`.
 
 `model_memory_gb` is the better lever most of the time. State the model's footprint and
 eight workers will not each load a 20 GB model into a 64 GB box. See
-[GPU scheduling](gpu.md).
+{doc}`GPU scheduling <gpu>`.
 
 `batch_size` should be the model's batch size, not the file's. Too small a `batch_size`
 leaves the GPU launching kernels on tiny inputs. Too large and the activations do not
@@ -203,17 +203,17 @@ thousand rows, not on a billion.
 
 ## See also
 
-- [Inference](inference.md): the model-as-callable contract and the batch formats.
-- [GPU scheduling](gpu.md): `num_gpus`, `concurrency`, and actor autoscaling.
-- [Model serving patterns](model-serving-patterns.md): calling a model that lives in
+- {doc}`Inference <inference>`: the model-as-callable contract and the batch formats.
+- {doc}`GPU scheduling <gpu>`: `num_gpus`, `concurrency`, and actor autoscaling.
+- {doc}`Model serving patterns <model-serving-patterns>`: calling a model that lives in
   another process.
-- [Multimodal](multimodal.md): scoring images, audio, and video.
-- [GPU execution](../deep-dives/gpu-execution.md): what an actor pool actually is, and
+- {doc}`Multimodal <multimodal>`: scoring images, audio, and video.
+- {doc}`GPU execution <../deep-dives/gpu-execution>`: what an actor pool actually is, and
   what keeps the device fed.
-- [Batch inference tutorial](../tutorials/batch-inference.md): this job, built up from
+- {doc}`Batch inference tutorial <../tutorials/batch-inference>`: this job, built up from
   nothing.
-- [Image classification](../examples/ml/image-classification.md) and
-  [LLM batch scoring](../examples/ml/llm-batch-scoring.md): the same shape, two models.
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): the throughput this path reaches.
-- [UDFs](../user-guide/udfs.md): `max_errored_rows`, `output_columns`, and the rest of
+- {doc}`Image classification <../examples/ml/image-classification>` and
+  {doc}`LLM batch scoring <../examples/ml/llm-batch-scoring>`: the same shape, two models.
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the throughput this path reaches.
+- {doc}`UDFs <../user-guide/udfs>`: `max_errored_rows`, `output_columns`, and the rest of
   the batch-function contract.

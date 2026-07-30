@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/text_diversity.py
 ```
+
+## See also
+
+- {doc}`regression_errors`: regression error metrics: absolute, squared, percentage, and robust.
+- {doc}`text_formatting`: did the model obey the output format you asked for?
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

@@ -377,3 +377,5 @@ after a transform chain returns in 0.05 ms because nothing is scanned.
 - {doc}`reading-data`: where footer statistics come from, per format.
 - {doc}`lakehouse`: manifest-level statistics on Delta, Iceberg, and Hudi tables.
 - {doc}`../api/dataset`: the `ds.meta` reference, namespace by namespace.
+- {doc}`../internals/execution`: the exact-or-fall-back rule that decides when a
+  statistic is allowed to answer a terminal.

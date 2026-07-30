@@ -5,3 +5,10 @@ myst-parser>=2.0.0
 furo>=2024.0.0
 sphinx-design>=0.6
 sphinx-copybutton>=0.5
+
+# Not a Sphinx extension, and not a runtime dependency of the engine either: 14 modules
+# under `batcher/ml/` annotate `np.ndarray`, and sphinx-autodoc-typehints imports a hint's
+# own module to resolve it. Without numpy installed that import fails and the build emits
+# "Failed guarded type import" warnings, which `-W` turns into a failed Pages deploy.
+# pyarrow no longer pulls numpy in transitively, so name it here rather than relying on it.
+numpy

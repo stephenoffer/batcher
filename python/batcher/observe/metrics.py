@@ -255,9 +255,9 @@ def metrics_snapshot() -> dict[str, Any]:
 
     The top-level keys are ``uptime_seconds``, ``queries`` (counts plus a duration
     histogram), ``rows``, ``bytes``, ``spills``, ``operators`` (per operator kind), ``logs``
-    (records per level), and — for a distributed or batch-inference job — ``partitions``,
-    ``skipped`` (dropped rows under ``on_read_error="skip"``), ``inference`` (batches, rows,
-    and latency), and ``gpu`` (peak plus per-device utilization and VRAM).
+    (records per level), and ``recovery``. A distributed or batch-inference job adds
+    ``partitions``, ``skipped`` (dropped rows under ``on_read_error="skip"``), ``inference``
+    (batches, rows, and latency), and ``gpu`` (peak plus per-device utilization and VRAM).
 
     Examples:
         .. doctest::
@@ -266,7 +266,7 @@ def metrics_snapshot() -> dict[str, Any]:
             >>> snap = metrics_snapshot()
             >>> sorted(snap)  # doctest: +NORMALIZE_WHITESPACE
             ['bytes', 'gpu', 'inference', 'logs', 'operators', 'partitions', 'queries',
-             'rows', 'skipped', 'spills', 'uptime_seconds']
+             'recovery', 'rows', 'skipped', 'spills', 'uptime_seconds']
             >>> snap["queries"]["total"] >= 0
             True
 

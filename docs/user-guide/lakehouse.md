@@ -355,10 +355,10 @@ A distributed write is **one** transaction: workers produce files, the driver co
 once. The write is atomic, so a reader never sees half of it, and the log records one
 version per logical write, not one per worker.
 
-## Next steps
+## See also
 
-- [Data quality](data-quality.md): validate and quarantine before you commit.
-- [Writing data](writing-data.md): save modes, partitioning, atomic writes.
-- [I/O API](../api/io.md): the full `read`/`write` reference.
-- [Agent skills](../agents/index.md): `manage-a-lakehouse-table` is this page as a
+- {doc}`Data quality <data-quality>`: validate and quarantine before you commit.
+- {doc}`Writing data <writing-data>`: save modes, partitioning, atomic writes.
+- {doc}`I/O API <../api/io>`: the full `read`/`write` reference.
+- {doc}`Agent skills <../agents/index>`: `manage-a-lakehouse-table` is this page as a
   procedure for a coding agent, covering merge, SCD, CDC, backfill, and compaction.

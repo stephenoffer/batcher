@@ -117,7 +117,7 @@ an aggregate works for `sum` and `count` and falls apart the moment somebody ask
 right.
 :::
 
-See [partition backfill](partition-backfill.md) for the mechanics of the replace.
+See {doc}`partition backfill <partition-backfill>` for the mechanics of the replace.
 
 ## The streaming side: watermarks
 
@@ -209,12 +209,12 @@ as long as everyone knows why.
 
 ## See also
 
-- [Partition backfill](partition-backfill.md): the atomic replace that `rebuild` leans on.
-- [Deduplication](deduplication.md): late rows are often duplicate rows too.
-- [CDC pipeline](cdc-pipeline.md): out-of-order changes, sequenced rather than windowed.
-- [Streaming](../../user-guide/streaming.md): triggers, output modes, and the streaming
+- {doc}`Partition backfill <partition-backfill>`: the atomic replace that `rebuild` leans on.
+- {doc}`Deduplication <deduplication>`: late rows are often duplicate rows too.
+- {doc}`CDC pipeline <cdc-pipeline>`: out-of-order changes, sequenced rather than windowed.
+- {doc}`Streaming <../../user-guide/streaming>`: triggers, output modes, and the streaming
   query handle.
-- [Lakehouse tables](../../user-guide/lakehouse.md): the raw table the rebuild reads from.
-- [Kafka](../../integrations/kafka.md): the stream the stragglers arrive on.
-- [Dataset API](../../api/dataset.md): `with_watermark`, `window`, `group_by`.
+- {doc}`Lakehouse tables <../../user-guide/lakehouse>`: the raw table the rebuild reads from.
+- {doc}`Kafka <../../integrations/kafka>`: the stream the stragglers arrive on.
+- {doc}`Dataset API <../../api/dataset>`: `with_watermark`, `window`, `group_by`.
 

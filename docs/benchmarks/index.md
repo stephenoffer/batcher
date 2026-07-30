@@ -32,11 +32,12 @@ Hardware, correctness gating, and the commands to reproduce every number.
 
 ## The short version
 
-Batcher sweeps the classical analytics suites against DuckDB reading the same Arrow, winning 22 of 22 TPC-H, 42 of 43 ClickBench, and 5 of 5 JSON. Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
+Batcher leads the classical analytics suites against DuckDB reading the same Arrow: 22 of 22 TPC-H at scale factor 1, 21 of 22 at scale factor 10, 42 of 43 ClickBench, and 5 of 5 JSON. Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
 | Workload | Measured |
 |---|---|
-| **TPC-H**, all 22 queries | vs DuckDB on the same Arrow: **won 22 of 22** |
+| **TPC-H sf1**, all 22 queries | vs DuckDB on the same Arrow: **won 22 of 22** |
+| **TPC-H sf10**, all 22 queries | vs DuckDB on the same Arrow: **won 21 of 22**, **1.89x** on the suite; vs Polars **2.26x** |
 | **ClickBench**, 43 queries | vs DuckDB on the same Arrow: **won 42 of 43**, 43/43 correct |
 | **Semi-structured JSON**, 5 queries | **3.6x to 12.5x** DuckDB, **11x to 100x** Polars |
 | **Operator mix**, 11 kernels | vs DuckDB on the same Arrow: **won 10 of 11** |
@@ -67,7 +68,7 @@ Those rows were not all measured on the same machine, because the workload famil
 
 Publishing only the wins would make this page marketing rather than measurement. Two comparisons run the other way, both understood and both tracked.
 
-**DuckDB's native store on join-heavy SQL.** At scale factor 1 on 16 cores, against DuckDB's own compressed format rather than shared Arrow, DuckDB is faster on 15 of 22 queries with a geometric mean of about 1.40x. DuckDB decompresses its own format as it scans and never pays an Arrow ingest, which is an advantage Batcher's Arrow-only contract trades away deliberately: the same operators that read that Arrow also run distributed, stream, and carry tensors. On the like-for-like Arrow comparison those same queries are 2x to 5x wins.
+**DuckDB's native store on join-heavy SQL.** At scale factor 1 on 16 cores, against DuckDB's own compressed format rather than shared Arrow, DuckDB is faster on 15 of 22 queries with a geometric mean of about 1.40x. At scale factor 10 on 96 cores the suite is 2.08x behind that same native store, with Batcher winning 4 of 22. DuckDB decompresses its own format as it scans and never pays an Arrow ingest, which is an advantage Batcher's Arrow-only contract trades away deliberately: the same operators that read that Arrow also run distributed, stream, and carry tensors. On the like-for-like Arrow comparison those same queries are 2x to 5x wins.
 
 **Daft on join-heavy queries and tight per-batch UDFs.** Daft leads on the multi-join TPC-H shapes and by roughly 2x on a per-batch Python UDF. The cause is single-node parallelism that plateaus after about 8 of 16 cores, and it is a runtime-parallelism and kernel-efficiency effort rather than a tuning knob. It is the top open lever in `benchmarks/BENCHMARK_RESULTS.md`.
 

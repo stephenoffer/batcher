@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/linear_models.py
 ```
+
+## See also
+
+- {doc}`imbalance_and_sampling`: class imbalance: measure it, then resample or reweight.
+- {doc}`model_selection`: cross-validation, learning curves, and feature importance -- all in the engine.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

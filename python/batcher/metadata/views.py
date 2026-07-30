@@ -32,8 +32,7 @@ from batcher.metadata.hardware_scope import measured_here
 __all__ = [
     "PER_KIND_MAX",
     "SIGNED_HISTORY_MAX",
-    "bucket_by_kind",
-    "chronological_signed",
+    "build_views",
     "trimmed",
 ]
 
@@ -52,6 +51,46 @@ PER_KIND_MAX = 4096
 _TRIM_SLACK = 2
 
 
+# How many decode failures one load reports before it stops logging. A store that is
+# wholesale unreadable would otherwise emit one warning per row, which buries the first
+# (and only informative) one under tens of thousands of duplicates.
+_DECODE_WARN_LIMIT = 3
+
+
+def _rows(scanned: Iterable[tuple[Any, bytes]]) -> Iterable[tuple[Any, dict[str, Any]]]:
+    """Decode a backend scan into `(key, row)` pairs, **skipping** what will not decode.
+
+    The isolation is per row, and that is the whole point. The view builders used to wrap their
+    entire loop in one `try`, so a single unparseable entry — a truncated write, a row from a
+    build with a different shape, a value another process was mid-write on — did not cost that
+    row, it cost *every row after it*. For the signed history that meant returning `[]`, i.e.
+    "this session has measured nothing", which silently disables cardinality correction and
+    cost calibration wholesale rather than degrading them by one observation.
+
+    A non-dict value is skipped too: JSON's scalars parse without error, and a bare `null` or
+    `7` would otherwise reach `row.get` as an `AttributeError` deeper in the caller.
+
+    Args:
+        scanned: `(key, value)` pairs from a backend scan.
+
+    Yields:
+        `(key, row)` for every entry that decoded to a JSON object.
+    """
+    failures = 0
+    for key, value in scanned:
+        try:
+            row = json.loads(value)
+        except Exception:
+            failures += 1
+            if failures <= _DECODE_WARN_LIMIT:
+                _log.warning("skipped an undecodable op_stats row at key %r", key, exc_info=True)
+            continue
+        if isinstance(row, dict):
+            yield key, row
+    if failures > _DECODE_WARN_LIMIT:
+        _log.warning("skipped %d further undecodable op_stats rows", failures - _DECODE_WARN_LIMIT)
+
+
 def trimmed(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
     """`rows` bounded to its newest `cap` entries, trimming only past the slack factor.
 
@@ -67,59 +106,43 @@ def trimmed(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
     return rows
 
 
-def bucket_by_kind(scanned: Iterable[tuple[Any, bytes]]) -> dict[str, list[dict[str, Any]]]:
-    """Bucket this machine's feedback rows by operator `kind`, bounded per bucket.
+def build_views(
+    scanned: Iterable[tuple[Any, bytes]],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Both views from **one** pass over the backend scan.
 
-    Filtered by `measured_here`: everything fitted from this view is in machine units, and a
-    row from another node describes hardware the next query will not run on. A malformed row
-    is skipped rather than raised — a corrupt entry must not break planning.
+    The two views are read together — Kyber calibrates cost from the by-kind buckets and
+    corrects cardinality from the signed history on the same optimize — but each used to load
+    itself, so the first query of a session scanned the `op_stats` table twice and ran
+    `json.loads` over every stored row twice. The parse is the expensive half (a persisted
+    store holds tens of thousands of rows), and it produces the same objects both times.
+
+    The two filters stay exactly as they were, and the difference between them is load-bearing:
+    the by-kind buckets keep only rows measured on **this machine class**, because everything
+    fitted from them is in machine units, while the signed history keeps rows from anywhere,
+    because cardinality is a property of the data. A row can therefore land in both, one, or
+    neither. Rows that land in both are *shared*, not copied — every consumer of these views
+    reads them, so aliasing costs nothing and halves the memory a long history occupies.
 
     Args:
         scanned: `(key, value)` pairs from a backend scan of the `op_stats` table.
 
     Returns:
-        Operator kind to its rows from this machine class, oldest first.
+        `(by_kind, signed)` — the bucketed machine-scoped view and the chronological
+        signature-carrying view, each bounded exactly as its single-view builder bounds it.
     """
     buckets: dict[str, list[dict[str, Any]]] = {}
-    try:
-        for _key, value in scanned:
-            row = json.loads(value)
-            if not measured_here(row):
-                continue
+    ordered: list[tuple[int, dict[str, Any]]] = []
+    for key, row in _rows(scanned):
+        if measured_here(row):
             buckets.setdefault(row.get("kind", ""), []).append(row)
-    except Exception:  # pragma: no cover - calibration must not break planning
-        _log.warning("could not scan op_stats", exc_info=True)
+        if row.get("signature"):
+            try:
+                seq = int(key[1]) if len(key) > 1 else 0
+            except (TypeError, ValueError):
+                seq = 0
+            ordered.append((seq, row))
     for bucket in buckets.values():
         trimmed(bucket, PER_KIND_MAX)
-    return buckets
-
-
-def chronological_signed(scanned: Iterable[tuple[Any, bytes]]) -> list[dict[str, Any]]:
-    """Signature-carrying feedback rows, oldest first, bounded to the newest window.
-
-    Deliberately **not** filtered by machine: this feeds cardinality correction, and a filter's
-    selectivity or a join's fan-out is a property of the data, identical wherever it runs.
-    Restricting it would fragment the statistics that take longest to collect for no gain.
-
-    Rows without a signature are excluded, notably those a distributed worker reports for its
-    sub-plan — their `op_id`s address their own space and correlate with nothing on the driver.
-
-    Args:
-        scanned: `(key, value)` pairs from a backend scan of the `op_stats` table.
-
-    Returns:
-        The newest `SIGNED_HISTORY_MAX` signature-carrying rows, oldest first.
-    """
-    ordered: list[tuple[int, dict[str, Any]]] = []
-    try:
-        for key, value in scanned:
-            row = json.loads(value)
-            if not row.get("signature"):
-                continue
-            seq = int(key[1]) if len(key) > 1 else 0
-            ordered.append((seq, row))
-    except Exception:  # pragma: no cover - learning must not break planning
-        _log.warning("could not scan op_stats", exc_info=True)
-        return []
     ordered.sort(key=lambda pair: pair[0])
-    return [row for _seq, row in ordered[-SIGNED_HISTORY_MAX:]]
+    return buckets, [row for _seq, row in ordered[-SIGNED_HISTORY_MAX:]]

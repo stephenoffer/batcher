@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/lists_transforms.py
 ```
+
+## See also
+
+- {doc}`lists_set_operations`: treating two list columns as sets: union, intersection, difference, overlap.
+- {doc}`lists_vectors`: embedding vectors as list columns: similarity, distance, and normalization.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

@@ -47,6 +47,7 @@ from batcher.plan.expr_ir import (
     nullif,
     when,
 )
+from batcher.plan.functions.scalar import nanvl
 
 
 def _scalar(tr, node) -> Expr:
@@ -143,6 +144,10 @@ def _scalar(tr, node) -> Expr:
         return _coalesce(tr, node)
     if isinstance(node, exp.Nullif):
         return nullif(tr._scalar(node.this), tr._scalar(node.expression))
+    # sqlglot parses `nanvl` into a *typed* node, so the Anonymous fallback table that
+    # also lists it (`anonymous.py`) is never consulted for this spelling.
+    if isinstance(node, exp.Nanvl):
+        return nanvl(tr._scalar(node.this), tr._scalar(node.expression))
     if isinstance(node, exp.Greatest):
         return greatest(*_scalar_args(tr, node))
     if isinstance(node, exp.Least):

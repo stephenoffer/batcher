@@ -170,10 +170,10 @@ recovery story; there is no rollback.
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md): sources, splits, pushdown.
-- [Writing data](../user-guide/writing-data.md): sinks, modes, and idempotent re-runs.
-- [Feature pipeline](../examples/ml/feature-pipeline.md): the shape that ends in an upsert to
+- {doc}`Reading data <../user-guide/reading-data>`: sources, splits, pushdown.
+- {doc}`Writing data <../user-guide/writing-data>`: sinks, modes, and idempotent re-runs.
+- {doc}`Feature pipeline <../examples/ml/feature-pipeline>`: the shape that ends in an upsert to
   a serving collection.
-- [Custom connectors](../user-guide/custom-connectors.md): the `Source`/`Sink`/`Split` protocol.
-- [I/O API](../api/io.md): the full reader/writer reference.
-- [Elasticsearch](elasticsearch.md): the other document store, read-only.
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the `Source`/`Sink`/`Split` protocol.
+- {doc}`I/O API <../api/io>`: the full reader/writer reference.
+- {doc}`Elasticsearch <elasticsearch>`: the other document store, read-only.

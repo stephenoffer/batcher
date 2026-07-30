@@ -113,6 +113,14 @@ lint-duplication:
 lint-guardrails:
     python tools/lint_guardrails.py
 
+# Tests that cannot fail: an ordered result compared order-independently, an assertion that
+# is true by construction, a test that asserts nothing at all. A green gate is not a green
+# light — every gate passed while a spilled `descending` sort returned unsorted data, because
+# the test that should have caught it compared the result as a multiset. Unlike `audit-health`
+# this IS a gate: the rules are AST-based and calibrated to zero findings on this tree.
+lint-tests:
+    python tools/lint_tests.py
+
 # Codebase-health report: dead code, near-duplicates, swallowed errors, do-nothing bodies,
 # tests that cannot fail, and ordered results asserted order-independently. A *report*, not a
 # gate — every detector is a heuristic, so the output is triage. Drives the

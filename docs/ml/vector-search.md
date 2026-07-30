@@ -194,6 +194,9 @@ one enormous candidate bucket.
 
 ## Which one
 
+Brute force and an ANN index answer the same question at different scales. Match your
+corpus size and query pattern to a row:
+
 | Situation | Reach for |
 | --- | --- |
 | Candidates already narrowed by a filter, or a reranking pass | `.list.cosine_distance` + `top_k` |
@@ -203,14 +206,14 @@ one enormous candidate bucket.
 
 ## See also
 
-- [Embeddings](embeddings.md): producing and normalizing the vectors.
-- [RAG](rag.md): retrieval feeding a generation step.
-- [Expressions API](../api/expressions.md): the full `.list` vector method set.
-- [Expression evaluation](../deep-dives/expression-evaluation.md): why a vector distance
+- {doc}`Embeddings <embeddings>`: producing and normalizing the vectors.
+- {doc}`RAG <rag>`: retrieval feeding a generation step.
+- {doc}`Expressions API <../api/expressions>`: the full `.list` vector method set.
+- {doc}`Expression evaluation <../deep-dives/expression-evaluation>`: why a vector distance
   is one more vectorized expression, and what that buys.
-- [Sort internals](../deep-dives/sort-internals.md): the bounded heap behind `top_k`.
-- [RAG index recipe](../examples/ml/rag-index.md): building and querying the index.
-- [Distinct and dedup](../user-guide/distinct-and-dedup.md): the exact and near-duplicate
+- {doc}`Sort internals <../deep-dives/sort-internals>`: the bounded heap behind `top_k`.
+- {doc}`RAG index recipe <../examples/ml/rag-index>`: building and querying the index.
+- {doc}`Distinct and dedup <../user-guide/distinct-and-dedup>`: the exact and near-duplicate
   tools the last row of that table points at.
-- [ML API](../api/ml.md): the `build_vector_index`, `vector_search`, and
+- {doc}`ML API <../api/ml>`: the `build_vector_index`, `vector_search`, and
   `similarity_join` reference.

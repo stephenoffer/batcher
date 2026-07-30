@@ -56,10 +56,10 @@ def orderable(facts: Facts, column: str) -> ColumnFacts | None:
     so they pass straight through and answer from metadata as they always did.
 
     NOTE: the second and third refusals are conservative *because* the engine's float
-    comparisons currently disagree with DuckDB (`WHERE f = 0.0` misses `-0.0`; `WHERE f > 1`
-    matches NaN — see `docs/internals/bug_hunt_ledger.md`). Declining is sound under either
-    semantics: it costs a scan, never an answer. If the engine's comparisons are moved to
-    IEEE, these refusals can be revisited — but not before.
+    comparisons disagree with DuckDB (`WHERE f = 0.0` misses `-0.0`; `WHERE f > 1` matches
+    NaN). Declining is sound under either semantics: it costs a scan, never an answer. If
+    the engine's comparisons are moved to IEEE, these refusals can be revisited — but not
+    before.
     """
     col = facts.col(column)
     if not col.is_float:

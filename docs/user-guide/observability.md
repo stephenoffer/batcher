@@ -222,14 +222,14 @@ The dashboard is a drill-down: every pipeline, then one pipeline, then one run.
 
 ### What a pipeline is
 
-A *pipeline* is every run of one plan shape. Its identity is the *plan signature* — the
+A *pipeline* is every run of one plan shape. Its identity is the *plan signature*, the
 same fingerprint Kyber keys learned statistics on, so "the dashboard's pipeline" and "the
 thing the optimizer learned about" are the same thing. Two runs over different data share a
 pipeline; a structurally different query starts a new one.
 
 Each pipeline has an **id** (that signature, shown as `#` and the first characters, copyable
-in full) and a **name**. Until you name it, the name is generated from the plan shape —
-`Read → Filter → Join → Group` — which is more telling than the raw operator tag. Click the
+in full) and a **name**. Until you name it, the name is generated from the plan shape, as in
+`Read → Filter → Join → Group`, which is more telling than the raw operator tag. Click the
 pencil on a lane, or on the pipeline page heading, to give it a real name such as `nightly
 rollup`, and a note beside it.
 
@@ -255,7 +255,7 @@ useful number when a query is slow for a reason the plan did not predict.
   rendering is the thing under suspicion.
 
 **Findings** carries what the engine concluded: the per-run insights, the optimizer and
-resource-manager decisions, and any **adaptive re-optimization** — the points where the
+resource-manager decisions, and any **adaptive re-optimization**, meaning the points where the
 engine had counted the rows rather than estimated them and re-planned what was left.
 
 **Live** is the forward-looking page, for work measured in minutes rather than
@@ -274,7 +274,7 @@ each operator took, not when it began.
 ```
 
 New to the dashboard, or arriving from another engine? The **Learn** page maps the panel
-you already know — a Spark UI tab, an Airflow view, a DuckDB `EXPLAIN` — to its
+you already know, such as a Spark UI tab, an Airflow view, or a DuckDB `EXPLAIN`, to its
 equivalent here.
 
 `start_ui` is idempotent. Calling it again returns the URL of the dashboard already
@@ -422,6 +422,6 @@ span emit and no extra measurement.
 
 ## See also
 
-- [Explain plans](explain-plans.md): reading a plan before you run it.
-- [Performance](performance.md): turning what you saw here into a faster query.
-- [Troubleshooting](troubleshooting.md): symptom-first debugging.
+- {doc}`Explain plans <explain-plans>`: reading a plan before you run it.
+- {doc}`Performance <performance>`: turning what you saw here into a faster query.
+- {doc}`Troubleshooting <troubleshooting>`: symptom-first debugging.

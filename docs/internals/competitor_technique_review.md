@@ -284,8 +284,7 @@ not run. Full numbers in `competitive_architecture.md` ceiling 7.
 attributes, sweep with a bit array, `O(n log n)`. That is the general answer and it is a
 substantial operator.
 
-**Landed as `RelOp::RangeJoin`** — see `engine_improvements_ledger.md` entry 9 and
-`competitive_architecture.md` ceiling 7. The IEJoin option below was taken over the binned one:
+**Landed as `RelOp::RangeJoin`** — see `competitive_architecture.md` ceiling 7. The IEJoin option below was taken over the binned one:
 the binned rewrite turns on a bucket width `W` nobody could choose safely at plan time, and a
 badly chosen `W` is a pessimization rather than a win.
 
@@ -340,7 +339,7 @@ mistake for a gap:
 ## Backlog, in dependency order
 
 0. ~~A range-join algorithm (item 8).~~ **Landed** — the largest gap the review turned up, and
-   the one it recorded rather than half-built. See `engine_improvements_ledger.md` entry 9.
+   the one it recorded rather than half-built.
 1. Online adaptive conjunct reordering (item 3). Smallest remaining win, and it completes
    the mechanism item 1 started.
 2. `StringView` adoption (item 2), with dictionary survival (item 6) alongside it, since

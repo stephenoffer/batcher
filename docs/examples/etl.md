@@ -75,12 +75,12 @@ Only the endpoints change when the data grows. Read with
 `collect(distributed=True)` to spread the work across a cluster. The transform in
 between is untouched.
 
-## Next steps
+## See also
 
-- [Data quality](../user-guide/data-quality.md): turn the cleaning step into an
+- {doc}`Data quality <../user-guide/data-quality>`: turn the cleaning step into an
   enforced contract, so a bad row is quarantined or fails the job instead of
   slipping through.
-- [Lakehouse tables](../user-guide/lakehouse.md): write to Delta with merge/upsert
+- {doc}`Lakehouse tables <../user-guide/lakehouse>`: write to Delta with merge/upsert
   and slowly-changing dimensions instead of plain Parquet.
-- [Performance and memory](../user-guide/performance.md): cache and spill as the
+- {doc}`Performance and memory <../user-guide/performance>`: cache and spill as the
   data grows.

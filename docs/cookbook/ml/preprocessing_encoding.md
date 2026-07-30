@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/preprocessing_encoding.py
 ```
+
+## See also
+
+- {doc}`preprocessing_chain`: chaining preprocessors into one fitted pipeline.
+- {doc}`preprocessing_imputation`: filling missing values, and keeping the fact that they were missing.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

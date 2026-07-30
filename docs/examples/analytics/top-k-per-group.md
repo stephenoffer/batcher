@@ -180,13 +180,13 @@ Reach for the window when k > 1. Reach for `arg_max` when k = 1 and the groups a
 ## See also
 
 :::{seealso}
-- [Window functions](../../user-guide/window-functions.md): ranking, frames, `ntile`.
-- [Basket analysis](basket-analysis.md): ranking pairs by lift instead of rows by revenue.
-- [Cohort analysis](cohort-analysis.md): the other use of `partition_by` without a sort,
+- {doc}`Window functions <../../user-guide/window-functions>`: ranking, frames, `ntile`.
+- {doc}`Basket analysis <basket-analysis>`: ranking pairs by lift instead of rows by revenue.
+- {doc}`Cohort analysis <cohort-analysis>`: the other use of `partition_by` without a sort,
   where the window labels rather than ranks.
-- [Sorting](../../user-guide/sorting.md): what `sort` costs, and when it spills.
-- [Window internals](../../deep-dives/window-internals.md): why the partitioned sort beats
+- {doc}`Sorting <../../user-guide/sorting>`: what `sort` costs, and when it spills.
+- {doc}`Window internals <../../deep-dives/window-internals>`: why the partitioned sort beats
   the global one.
-- [Sort internals](../../deep-dives/sort-internals.md): the heap that `top_k` fuses into.
-- [Expressions API](../../api/expressions.md): `row_number`, `rank`, `dense_rank`, `arg_max`.
+- {doc}`Sort internals <../../deep-dives/sort-internals>`: the heap that `top_k` fuses into.
+- {doc}`Expressions API <../../api/expressions>`: `row_number`, `rank`, `dense_rank`, `arg_max`.
 :::

@@ -309,17 +309,17 @@ The same trick applies to a custom source over an object store: yield handles fr
 
 ## See also
 
-- [Reading data](reading-data.md): the built-in readers and what each one takes.
-- [Writing data](writing-data.md): partitioned, compacted, and distributed writes.
-- [Cloud storage](cloud-storage.md): the filesystem layer your source resolves through.
-- [IO API](../api/io.md): the full `batcher.io` reference.
-- [Morsel parallelism](../deep-dives/morsel-parallelism.md): what a worker does with the
+- {doc}`Reading data <reading-data>`: the built-in readers and what each one takes.
+- {doc}`Writing data <writing-data>`: partitioned, compacted, and distributed writes.
+- {doc}`Cloud storage <cloud-storage>`: the filesystem layer your source resolves through.
+- {doc}`IO API <../api/io>`: the full `batcher.io` reference.
+- {doc}`Morsel parallelism <../deep-dives/morsel-parallelism>`: what a worker does with the
   split you handed it.
-- [Distributed scheduling](../deep-dives/distributed-scheduling.md): how splits become
+- {doc}`Distributed scheduling <../deep-dives/distributed-scheduling>`: how splits become
   tasks, and why they carry locators rather than data.
-- [Incremental ingest](../examples/data-engineering/incremental-ingest.md): a source read
+- {doc}`Incremental ingest <../examples/data-engineering/incremental-ingest>`: a source read
   repeatedly, without re-reading what it already saw.
-- [Multimodal ingest benchmark](../benchmarks/multimodal-ingest.md): the reference-row
+- {doc}`Multimodal ingest benchmark <../benchmarks/multimodal-ingest>`: the reference-row
   pattern measured against the alternatives.
-- [Agent skills](../agents/index.md): `add-an-io-format-or-connector`, the ordered
+- {doc}`Agent skills <../agents/index>`: `add-an-io-format-or-connector`, the ordered
   procedure and the tests a new connector must carry.

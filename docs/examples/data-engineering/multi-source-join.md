@@ -227,13 +227,13 @@ from a bad guess still paid for the start.
 
 ## See also
 
-- [Quality gates](quality-gates.md): `foreign_key` as a pre-join contract.
-- [Slowly changing dimensions](slowly-changing-dimensions.md): joining to the version of
+- {doc}`Quality gates <quality-gates>`: `foreign_key` as a pre-join contract.
+- {doc}`Slowly changing dimensions <slowly-changing-dimensions>`: joining to the version of
   the dimension that was current at the time.
-- [Schema evolution](schema-evolution.md): where the key's type quietly changed.
-- [Joins](../../user-guide/joins.md): every join type and their semantics.
-- [Custom connectors](../../user-guide/custom-connectors.md): reading the source that has
+- {doc}`Schema evolution <schema-evolution>`: where the key's type quietly changed.
+- {doc}`Joins <../../user-guide/joins>`: every join type and their semantics.
+- {doc}`Custom connectors <../../user-guide/custom-connectors>`: reading the source that has
   no reader yet.
-- [Explain plans](../../user-guide/explain-plans.md): reading what the optimizer decided.
-- [Join algorithms](../../deep-dives/join-algorithms.md): how the build side is chosen.
-- [Dataset API](../../api/dataset.md): `join`, `join_asof`, `cast`, `distinct`.
+- {doc}`Explain plans <../../user-guide/explain-plans>`: reading what the optimizer decided.
+- {doc}`Join algorithms <../../deep-dives/join-algorithms>`: how the build side is chosen.
+- {doc}`Dataset API <../../api/dataset>`: `join`, `join_asof`, `cast`, `distinct`.

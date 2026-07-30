@@ -44,8 +44,10 @@ __all__ = [
     "ipc_options",
     "is_out_of_space",
     "read_free_disk_bytes",
+    "read_total_disk_bytes",
     "remote_ipc_options",
     "reset_disk_sampling",
+    "total_disk_bytes",
 ]
 
 
@@ -103,15 +105,26 @@ FREE_DISK_TTL_SECONDS = 0.1
 # would only add a hash lookup and an unbounded key set for no hit-rate gain.
 _free_cache: tuple[str, float, int | None] | None = None
 
+# The same, for the volume's *capacity*. It needs its own slot rather than riding along with
+# the free reading because the two are asked for by different callers at different rates —
+# and because without it the TTL cache above was being routed around: `disk_pressure` reads
+# the free bytes through the cache and then takes `total` twice with raw `shutil.disk_usage`
+# calls (once directly, once inside `disk_floor_bytes`). The store consults the pressure once
+# per bucket open, so a 4,096-way partitioned spill made 8,192 uncached `statvfs` calls —
+# more than the storm the cache was added to stop, for a number that moves even less than
+# free space does.
+_total_cache: tuple[str, float, int | None] | None = None
+
 
 def reset_disk_sampling() -> None:
-    """Drop the cached free-space reading, so the next call re-measures.
+    """Drop the cached volume readings, so the next call re-measures.
 
     For tests that patch the underlying `shutil.disk_usage` and need the change observed
     immediately rather than up to one TTL window later.
     """
-    global _free_cache
+    global _free_cache, _total_cache
     _free_cache = None
+    _total_cache = None
 
 
 def read_free_disk_bytes(path: str) -> int | None:
@@ -149,6 +162,41 @@ def free_disk_bytes(path: str) -> int | None:
     return value
 
 
+def read_total_disk_bytes(path: str) -> int | None:
+    """One uncached reading of the capacity of the filesystem holding `path`.
+
+    Args:
+        path: Any path on the volume of interest.
+
+    Returns:
+        Total bytes, or `None` when the volume cannot be stat'd.
+    """
+    try:
+        return shutil.disk_usage(path).total
+    except OSError:  # pragma: no cover - unstat-able volume
+        return None
+
+
+def total_disk_bytes(path: str) -> int | None:
+    """Capacity of the filesystem holding `path`, TTL-cached like the free reading.
+
+    Args:
+        path: Any path on the volume of interest.
+
+    Returns:
+        Total bytes, or `None` if the volume can't be stat'd.
+    """
+    global _total_cache
+
+    now = time.monotonic()
+    cached = _total_cache
+    if cached is not None and cached[0] == path and now < cached[1]:
+        return cached[2]
+    value = read_total_disk_bytes(path)
+    _total_cache = (path, now + FREE_DISK_TTL_SECONDS, value)
+    return value
+
+
 def disk_floor_bytes(path: str) -> int:
     """The free-space floor below which the local tier counts as exhausted.
 
@@ -162,9 +210,8 @@ def disk_floor_bytes(path: str) -> int:
         The floor in bytes (never below one MiB, so a pathologically small volume still
         gets *some* headroom rather than zero).
     """
-    try:
-        total = shutil.disk_usage(path).total
-    except OSError:  # pragma: no cover - unstat-able volume: keep the fixed reserve
+    total = total_disk_bytes(path)
+    if total is None:  # pragma: no cover - unstat-able volume: keep the fixed reserve
         return DISK_FLOOR_BYTES
     share = int(total * _DISK_FLOOR_CAPACITY_FRACTION)
     return max(1 << 20, min(DISK_FLOOR_BYTES, share))
@@ -211,9 +258,8 @@ def disk_pressure(path: str) -> DiskPressure:
         return DiskPressure.NORMAL
     if free < disk_floor_bytes(path):
         return DiskPressure.FULL
-    try:
-        total = shutil.disk_usage(path).total
-    except OSError:  # pragma: no cover - stat'd for free but not for total
+    total = total_disk_bytes(path)
+    if total is None:  # pragma: no cover - stat'd for free but not for total
         return DiskPressure.NORMAL
     if total > 0 and free < total * _ELEVATED_FREE_FRACTION:
         return DiskPressure.ELEVATED

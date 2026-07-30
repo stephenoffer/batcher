@@ -115,6 +115,9 @@ print(sorted(set(joined.to_pydict()["label"])))
 
 ## Which generator to reach for
 
+The right generator depends on how many rows you need and how much realism the data has to
+carry. Match your case to a row:
+
 | You want | Use |
 |---|---|
 | A handful of rows with exact values | A literal dict, as in the first section |
@@ -156,7 +159,7 @@ Now make a 200,000-row query tell you why it is slow.
 
 ## See also
 
-- [Joins](../user-guide/joins.md): the operator the last section sets up.
-- [Writing data](../user-guide/writing-data.md): turning a generated dataset into files.
-- [Data quality](../user-guide/data-quality.md): validating a corpus, synthetic or not.
-- [Dataset API](../api/dataset.md): `from_pydict`, `join`, and the rest.
+- {doc}`Joins <../user-guide/joins>`: the operator the last section sets up.
+- {doc}`Writing data <../user-guide/writing-data>`: turning a generated dataset into files.
+- {doc}`Data quality <../user-guide/data-quality>`: validating a corpus, synthetic or not.
+- {doc}`Dataset API <../api/dataset>`: `from_pydict`, `join`, and the rest.

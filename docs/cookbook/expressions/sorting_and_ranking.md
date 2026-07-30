@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/sorting_and_ranking.py
 ```
+
+## See also
+
+- {doc}`numeric_math`: arithmetic and math functions on numeric columns.
+- {doc}`strings_case`: string case: normalizing capitalization before you compare or group.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

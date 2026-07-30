@@ -121,9 +121,11 @@ class InMemorySource:
     """
 
     __slots__ = (
+        "__weakref__",  # lets `plan.source_stats` key statistics per instance, not by `id()`
         "_batches",
         "_bounds_cache",
         "_cache",
+        "_cheap_cache",
         "_identity",
         "_mean_cache",
         "_ndv_cache",
@@ -179,6 +181,7 @@ class InMemorySource:
         self._stats: object | None = None
         self._ndv_cache: dict[str, int | None] = {}
         self._mean_cache: dict[str, float | None] = {}
+        self._cheap_cache: dict[str, object] = {}
         self._sum_cache: dict[str, float | int | None] = {}
         self._valuecount_cache: dict[tuple[str, str, object], int | None] = {}
         self._bounds_cache: dict[str, object] = {}
@@ -223,9 +226,9 @@ class InMemorySource:
             The exact distinct count, or None for a type it cannot count.
         """
         if name not in self._ndv_cache:
-            from batcher.io.source import inmemory_stats
+            from batcher.io.source import inmemory_aggregates
 
-            self._ndv_cache[name] = inmemory_stats.column_ndv(self._build_column, name)
+            self._ndv_cache[name] = inmemory_aggregates.column_ndv(self._build_column, name)
         return self._ndv_cache[name]
 
     def column_mean(self, name: str) -> float | None:
@@ -247,9 +250,9 @@ class InMemorySource:
             The exact mean, or None for a non-numeric or all-null column.
         """
         if name not in self._mean_cache:
-            from batcher.io.source import inmemory_stats
+            from batcher.io.source import inmemory_aggregates
 
-            self._mean_cache[name] = inmemory_stats.column_mean(self._build_column, name)
+            self._mean_cache[name] = inmemory_aggregates.column_mean(self._build_column, name)
         return self._mean_cache[name]
 
     def column_sum(self, name: str) -> float | int | None:
@@ -271,9 +274,9 @@ class InMemorySource:
             The exact sum, or None when it is not exactly representable.
         """
         if name not in self._sum_cache:
-            from batcher.io.source import inmemory_stats
+            from batcher.io.source import inmemory_aggregates
 
-            self._sum_cache[name] = inmemory_stats.column_sum(self._build_column, name)
+            self._sum_cache[name] = inmemory_aggregates.column_sum(self._build_column, name)
         return self._sum_cache[name]
 
     def column_bounds(self, name: str):
@@ -297,17 +300,44 @@ class InMemorySource:
             name: The column to bound.
 
         Returns:
-            The column's exact min/max/null-count, or None for a non-ordered /
-            all-null column (exactly as `statistics()` skips it).
+            The column's exact min/max/null-count; for a column with no trustworthy bounds
+            (a string, a nested type, an all-null column) an exact **null count** alone;
+            `None` only when nothing exact is derivable.
+
+            That fallback is the same one `statistics()` applies, and sharing one rule
+            (`inmemory_stats.column_stat`) is the point: this method used to return `None`
+            for those columns while claiming to match `statistics()`, and it is the form the
+            conductor actually calls — every real query narrows to the columns its
+            predicates name. So the exact null count was thrown away with the bounds it sat
+            beside, on precisely the column types most tables are made of.
         """
         if name not in self._bounds_cache:
             from batcher.io.source import inmemory_stats
 
             field = self._schema.field(name)
-            self._bounds_cache[name] = inmemory_stats.column_bounds(
+            self._bounds_cache[name] = inmemory_stats.column_stat(
                 self._build_column, field.type, name
             )
         return self._bounds_cache[name]
+
+    def column_cheap_stat(self, name: str):
+        """`name`'s null count and average width — the facts that cost O(1), no bounds pass.
+
+        What the conductor asks for on a column whose *bounds* no predicate needs. See
+        `inmemory_stats.column_cheap_stat`: the narrowing exists to skip an O(rows) pass, and
+        the width is a buffer-field read that was being skipped with it.
+
+        Args:
+            name: The column to describe.
+
+        Returns:
+            A bounds-free `ColumnStat`, or `None` when neither fact is derivable.
+        """
+        if name not in self._cheap_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._cheap_cache[name] = inmemory_stats.column_cheap_stat(self._build_column, name)
+        return self._cheap_cache[name]
 
     def column_predicate_count(self, op: str, name: str, value: object) -> int | None:
         """EXACT surviving count of ``name <op> value`` (nulls excluded), cached per key.
@@ -335,9 +365,9 @@ class InMemorySource:
         """
         key = (op, name, value)
         if key not in self._valuecount_cache:
-            from batcher.io.source import inmemory_stats
+            from batcher.io.source import inmemory_aggregates
 
-            self._valuecount_cache[key] = inmemory_stats.column_predicate_count(
+            self._valuecount_cache[key] = inmemory_aggregates.column_predicate_count(
                 self._build_column, op, name, value
             )
         return self._valuecount_cache[key]

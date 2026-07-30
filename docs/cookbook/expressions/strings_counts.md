@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_counts.py
 ```
+
+## See also
+
+- {doc}`strings_cleaning`: cleaning scraped text: strip markup, URLs, emails, and stray punctuation.
+- {doc}`strings_extraction`: pulling entities and leading fragments out of free text.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

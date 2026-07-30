@@ -41,6 +41,9 @@ tensor column.
 
 ## Adapters
 
+One adapter exists per serving backend, and each takes the input and output column names
+so the batch maps onto the server's tensor signature:
+
 | Adapter | Backend |
 | --- | --- |
 | `triton_client(url, model, *, input_columns, output_columns, protocol="http", model_version="")` | NVIDIA Triton over HTTP or gRPC (`protocol="grpc"`), sending binary tensors. Needs `batcher-engine[triton]`. |
@@ -197,7 +200,7 @@ deployment = serve_deployment(
 serve.run(deployment.bind())
 ```
 
-## Next steps
+## See also
 
-- [Inference](inference.md): in-process batch inference and the `.ml` accessor.
-- [GPU scheduling](gpu.md): `num_gpus` and `concurrency` for GPU stages.
+- {doc}`Inference <inference>`: in-process batch inference and the `.ml` accessor.
+- {doc}`GPU scheduling <gpu>`: `num_gpus` and `concurrency` for GPU stages.

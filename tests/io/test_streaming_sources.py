@@ -43,19 +43,18 @@ def test_seen_store_unseen_preserves_order_and_dedups(tmp_path):
     store.close()
 
 
-def test_seen_store_max_seen_and_persistence(tmp_path):
+def test_seen_store_persists_across_a_restart(tmp_path):
     path = str(tmp_path / "seen.sqlite")
     store = SeenStore(path)
-    assert store.max_seen() is None
+    assert store.unseen(["a.parquet", "c.parquet"]) == ["a.parquet", "c.parquet"]
     store.mark("a.parquet", size=1, mtime=1.0)
     store.mark("c.parquet", size=1, mtime=1.0)
-    assert store.max_seen() == "c.parquet"
     store.close()
 
     # Reopen: state is durable across "process restarts".
     reopened = SeenStore(path)
     assert reopened.seen("a.parquet") is True
-    assert reopened.max_seen() == "c.parquet"
+    assert reopened.unseen(["a.parquet", "c.parquet", "b.parquet"]) == ["b.parquet"]
     reopened.close()
 
 
@@ -83,7 +82,7 @@ def test_seen_store_mark_many_matches_repeated_mark(tmp_path):
 def test_seen_store_mark_many_empty_is_noop(tmp_path):
     store = SeenStore(str(tmp_path / "seen.sqlite"))
     store.mark_many([])  # must not raise or open a transaction
-    assert store.max_seen() is None
+    assert store.unseen(["a.parquet"]) == ["a.parquet"]
     store.close()
 
 
@@ -127,6 +126,30 @@ def test_incremental_file_source_exactly_once_discovery(tmp_path):
 
     # And once more: nothing new again.
     assert _rows(make_source()) == []
+
+
+def test_a_file_whose_name_sorts_below_an_already_seen_one_is_still_ingested(tmp_path):
+    """Discovery once kept only names sorting *after* the greatest already-seen name.
+
+    That is silent, permanent data loss for every writer whose names are not monotonic —
+    and `part-00000-<uuid>.parquet`, what Spark and Flink emit, is exactly that shape: once
+    one file is processed, roughly half of every later arrival sorts below the maximum. The
+    file is never offered to the store, so nothing records that it was skipped.
+    """
+    data_dir = tmp_path / "incoming"
+    data_dir.mkdir()
+    state_dir = tmp_path / "state"
+
+    def make_source():
+        return IncrementalFileSource(str(data_dir), "parquet", state_dir=str(state_dir))
+
+    _write_parquet(data_dir / "part-z.parquet", pa.table({"id": [1]}))
+    assert sorted(r["id"] for r in _rows(make_source())) == [1]
+
+    # Arrives second, sorts first. The old lexical filter dropped it forever.
+    _write_parquet(data_dir / "part-a.parquet", pa.table({"id": [2]}))
+    assert sorted(r["id"] for r in _rows(make_source())) == [2]
+    assert _rows(make_source()) == []  # and it is remembered, so exactly once
 
 
 def test_incremental_file_source_max_files_per_trigger_backpressures(tmp_path):

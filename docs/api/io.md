@@ -1,6 +1,6 @@
 # Reading and writing
 
-This page lists every reader and writer, then the connector types behind them. For the transformations that sit between a read and a write, see [Dataset](dataset.md).
+This page lists every reader and writer, then the connector types behind them. For the transformations that sit between a read and a write, see {doc}`Dataset <dataset>`.
 
 Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy `Dataset`. Writers hang off `ds.write` and are terminal, so they execute the plan and return a `WriteManifest`. {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path, and the dedicated readers below are explicit. Some connectors need an optional dependency. The "Extra" column gives the install name for `pip install 'batcher-engine[<extra>]'`.
 
@@ -70,7 +70,7 @@ Each of these splits the keyspace so the collection reads in parallel:
 
 ### Streaming
 
-These return an unbounded `Dataset`. See [streaming](../user-guide/streaming.md) for triggers and checkpoints.
+These return an unbounded `Dataset`. See {doc}`streaming <../user-guide/streaming>` for triggers and checkpoints.
 
 | Reader | Reads |
 | --- | --- |
@@ -129,7 +129,7 @@ These commit through the table's transaction log rather than writing loose files
 clauses {py:obj}`source_col <batcher.source_col>` and
 {py:obj}`target_col <batcher.target_col>` name the two sides of the match: the incoming
 row and the row already in the table. See the
-[lakehouse guide](../user-guide/lakehouse.md) for worked upserts.
+{doc}`lakehouse guide <../user-guide/lakehouse>` for worked upserts.
 
 ```{eval-rst}
 .. currentmodule:: batcher
@@ -153,7 +153,7 @@ These load the result into an external system:
 
 Everything above is built from the same four types, exported from `batcher.io`. You only
 need them to add a format the engine doesn't ship. See
-[extending Batcher](../internals/extending.md) for the walkthrough.
+{doc}`extending Batcher <../internals/extending>` for the walkthrough.
 
 ```python
 from batcher.io import Source, Sink, Split, SOURCES
@@ -259,8 +259,8 @@ list of files it produced. That's what makes a write auditable and a failed run 
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md) and [Writing data](../user-guide/writing-data.md):
+- {doc}`Reading data <../user-guide/reading-data>` and {doc}`Writing data <../user-guide/writing-data>`:
   the guided tour of these readers and writers.
-- [Cloud storage](../user-guide/cloud-storage.md): credentials and object-store paths.
-- [Lakehouse](../user-guide/lakehouse.md): Delta, Iceberg, and Hudi tables.
-- [Extending Batcher](../internals/extending.md): adding your own source or sink.
+- {doc}`Cloud storage <../user-guide/cloud-storage>`: credentials and object-store paths.
+- {doc}`Lakehouse <../user-guide/lakehouse>`: Delta, Iceberg, and Hudi tables.
+- {doc}`Extending Batcher <../internals/extending>`: adding your own source or sink.

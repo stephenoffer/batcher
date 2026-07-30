@@ -151,7 +151,7 @@ The partition column is not in the payload (it lives in the directory name, and
 so a concurrent reader can catch it mid-swap. It also only replaces the part files it
 writes, so if the old partition had more parts than the new one, the leftovers are still
 there and still readable. `repartition(num_files=1)` above keeps that from biting, and
-`bt.compact` (see [file compaction](file-compaction.md)) cleans up after a write that did
+`bt.compact` (see {doc}`file compaction <file-compaction>`) cleans up after a write that did
 not.
 
 If a backfill can run against a table while anyone is reading it, use Delta and take the
@@ -202,12 +202,12 @@ predicate and the source cannot drift apart, which is the mistake that deletes t
 
 ## See also
 
-- [Late-arriving data](late-arriving-data.md): why the day needed rebuilding in the
+- {doc}`Late-arriving data <late-arriving-data>`: why the day needed rebuilding in the
   first place.
-- [Slowly changing dimensions](slowly-changing-dimensions.md): when history is the
+- {doc}`Slowly changing dimensions <slowly-changing-dimensions>`: when history is the
   point, not the obstacle.
-- [File compaction](file-compaction.md): cleaning up the parts a partial rewrite leaves.
-- [Lakehouse tables](../../user-guide/lakehouse.md): commits, versions, time travel.
-- [Writing data](../../user-guide/writing-data.md): `replace_where`, `merge_on`, `mode`.
-- [Delta Lake](../../integrations/delta-lake.md): what makes the commit atomic.
-- [IO API reference](../../api/io.md): the sink arguments in full.
+- {doc}`File compaction <file-compaction>`: cleaning up the parts a partial rewrite leaves.
+- {doc}`Lakehouse tables <../../user-guide/lakehouse>`: commits, versions, time travel.
+- {doc}`Writing data <../../user-guide/writing-data>`: `replace_where`, `merge_on`, `mode`.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: what makes the commit atomic.
+- {doc}`IO API reference <../../api/io>`: the sink arguments in full.

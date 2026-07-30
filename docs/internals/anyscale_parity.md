@@ -84,8 +84,8 @@ Drawn from the hub, restricted to what is evidenced:
 1. Ray Data head-to-head on a **current** Ray release, on a real cluster, with the corpus and
    fingerprint recorded. The existing margin should be re-confirmed rather than re-quoted.
 2. The resilience matrix under Ray actor death at N workers. Blocked here: Ray task execution
-   does not work in this sandbox (`AI_WORKLOAD_LEDGER.md` carries a four-line reproducer —
-   `ray.init` succeeds, a bare `@ray.remote def add(a, b)` times out at 60 s).
+   does not work in this sandbox — `ray.init` succeeds, and a bare `@ray.remote def add(a, b)`
+   then times out at 60 s.
 3. Whether Batcher-on-Ray inherits a scheduling pathology at scale that a single-node run cannot
    show.
 

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/meta_schema.py
 ```
+
+## See also
+
+- {doc}`meta_predicates`: cheap yes/no questions about the data, and the column-check shorthands.
+- {doc}`null_handling`: dataset-level null handling: dropping, filling, and counting missing values.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

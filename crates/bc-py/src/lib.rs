@@ -686,6 +686,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::combine_finalize_spilling, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::partition_batches_salted, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::range_partition_batches, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::salted_partition_batches, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::gather_combine, m)?)?;

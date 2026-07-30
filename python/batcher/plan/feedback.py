@@ -8,8 +8,10 @@ plans. Writes are non-blocking and must never raise into the hot path — a
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from statistics import median
+from typing import Any, Protocol, runtime_checkable
 
 from batcher._internal.hardware import fingerprint
 from batcher.plan.ids import OpId
@@ -18,6 +20,7 @@ __all__ = [
     "FeedbackSink",
     "OperatorFeedback",
     "cpu_utilization",
+    "oversubscribed",
     "preemption_rate",
 ]
 
@@ -28,6 +31,14 @@ __all__ = [
 # and the rate rises by an order of magnitude. The threshold sits between those regimes rather
 # than at either edge, so a busy-but-uncontended run is not misread as contended.
 CONTENDED_PREEMPTIONS_PER_CORE_SECOND = 200.0
+
+# Major page faults per core-second above which the box is judged to be paging against the
+# query rather than warming up. A major fault is a disk read, so a handful over a whole
+# operator is the ordinary first-touch of a mapped file and says nothing; a sustained rate is
+# the working set not fitting, and the fix for that is fewer concurrent tasks per node, never
+# more. The threshold is deliberately low in absolute terms — even a few disk faults per
+# core-second is milliseconds of stall per second — but non-zero, so first-touch never trips it.
+PAGING_FAULTS_PER_CORE_SECOND = 5.0
 
 
 def cpu_utilization(
@@ -203,3 +214,60 @@ class FeedbackSink(Protocol):
     """Anything that can absorb operator feedback (the MetadataHub, a test spy)."""
 
     def record(self, feedback: OperatorFeedback) -> None: ...
+
+
+def oversubscribed(rows: Iterable[Mapping[str, Any]]) -> bool:
+    """Whether a family's measured history says the *box* was oversubscribed, not the family idle.
+
+    This is the disambiguator the CPU-share loops need and did not have. They size a per-task
+    `num_cpus` from measured `cpu_utilization`, shrinking the reservation when a family's cores
+    sat idle — which is right for an IO- or GPU-bound family and exactly backwards for a
+    contended one. Both read as low utilization, and they have opposite fixes.
+
+    Getting it backwards is not merely a missed improvement, it is a loop that feeds itself:
+    contention lowers utilization, the lower utilization shrinks the reservation, the smaller
+    reservation lets the scheduler pack more tasks onto the same cores, and that raises
+    contention again. Nothing in the measurement can break the cycle, because every step of it
+    looks like a family that needed fewer cores.
+
+    Two independent measurements say "the box, not the family", and either is sufficient:
+
+    * **Preemption.** An involuntary context switch is the scheduler taking a CPU away, which
+      happens only when another runnable thread wants it. The *median* rate is used rather than
+      the mean, so one contended run inside an otherwise clear history does not latch the
+      family — and the maximum is not used for the same reason.
+    * **Major faults.** A page fault served from disk means memory the operator believed it
+      held was being fetched back from storage. Packing more tasks per node brings more memory
+      with them, so this is the one condition under which the shrink is unambiguously wrong. A
+      single such fault in a whole history is noise (a first-touch of a mapped file), so this
+      asks for a material rate rather than a nonzero count.
+
+    Args:
+        rows: Stored feedback rows for one operator family.
+
+    Returns:
+        `True` when the family's low utilization is explained by contention for the machine.
+        `False` when nothing was measured, which keeps every caller's prior behavior.
+    """
+    rates: list[float] = []
+    faulting_core_seconds = 0.0
+    faults = 0.0
+    for row in rows:
+        elapsed_ms = float(row.get("t_op_ms", 0.0) or 0.0)
+        threads = int(row.get("threads", 0) or 0)
+        core_seconds = (elapsed_ms / 1000.0) * max(0, threads)
+        if core_seconds <= 0.0:
+            continue  # an older engine that reported no thread count: no evidence either way
+        rates.append(
+            preemption_rate(int(row.get("invol_ctx_switches", 0) or 0), elapsed_ms, threads)
+        )
+        faults += float(row.get("major_faults", 0) or 0)
+        faulting_core_seconds += core_seconds
+    if not rates:
+        return False
+    if median(rates) > CONTENDED_PREEMPTIONS_PER_CORE_SECOND:
+        return True
+    return (
+        faulting_core_seconds > 0.0
+        and faults / faulting_core_seconds > PAGING_FAULTS_PER_CORE_SECOND
+    )

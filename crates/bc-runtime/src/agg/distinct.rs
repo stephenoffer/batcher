@@ -347,21 +347,41 @@ fn distinct_pairs_to_list(
 
 /// Bucket `values` into a `List` column by their `group_ids` (each in
 /// `0..num_groups`), preserving stable order within each group.
+///
+/// A counting sort, not a vector of vectors. The obvious shape — `vec![Vec::new();
+/// num_groups]`, push each row into its group's vector, concatenate — costs one heap
+/// allocation *per group* and grows each of them geometrically. That is invisible on the
+/// low-cardinality aggregate this started life on (`count(distinct x) GROUP BY region`, a
+/// handful of groups) and dominates the high-cardinality one: a 6 M-row
+/// `count(distinct u) GROUP BY k` over a near-unique key ends with ~3.8 M groups, so the
+/// bookkeeping allocated 3.8 M vectors and chased 3.8 M pointers to concatenate them.
+///
+/// The histogram → prefix-sum → scatter below is the same CSR shape [`par_dedup_pairs`]
+/// already uses, in two flat allocations that do not depend on the group count for their
+/// *number*. It is **bit-identical** to the vector-of-vectors: `offsets` is still the
+/// running per-group count, and scattering rows in ascending `i` through a per-group cursor
+/// leaves each group's slice holding its rows in ascending `i` — exactly what pushing into
+/// that group's vector produced. Both the group order and the within-group order are the
+/// same, so callers that depend on stable order (the median/quantile path) are unaffected.
 pub(crate) fn bucket_values_into_list(
     group_ids: &Int64Array,
     values: &ArrayRef,
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_groups];
-    for i in 0..group_ids.len() {
-        buckets[group_ids.value(i) as usize].push(i as u32);
+    let groups = group_ids.values();
+    let mut offsets: Vec<i32> = vec![0; num_groups + 1];
+    for &g in groups.iter() {
+        offsets[g as usize + 1] += 1;
     }
-    let mut order: Vec<u32> = Vec::with_capacity(values.len());
-    let mut offsets: Vec<i32> = Vec::with_capacity(num_groups + 1);
-    offsets.push(0);
-    for bucket in &buckets {
-        order.extend_from_slice(bucket);
-        offsets.push(order.len() as i32);
+    for b in 0..num_groups {
+        offsets[b + 1] += offsets[b];
+    }
+    let mut cursor: Vec<i32> = offsets[..num_groups].to_vec();
+    let mut order: Vec<u32> = vec![0; groups.len()];
+    for (i, &g) in groups.iter().enumerate() {
+        let b = g as usize;
+        order[cursor[b] as usize] = i as u32;
+        cursor[b] += 1;
     }
     let ordered = take(values.as_ref(), &UInt32Array::from(order), None)?;
     let field = Arc::new(Field::new("item", values.data_type().clone(), true));
@@ -543,6 +563,74 @@ mod dense_tests {
             "parallel path emitted a duplicate pair"
         );
         assert_eq!(got, want, "parallel distinct set differs from serial");
+    }
+
+    /// The counting sort in `bucket_values_into_list` must reproduce the vector-of-vectors
+    /// it replaced **exactly** — same group order, same order within a group. Within-group
+    /// order is not free to change: the median/quantile path buckets through this helper
+    /// too, and `COUNT(DISTINCT)`'s own offsets are the answer it finalizes. The reference
+    /// here is the old implementation, kept verbatim as the oracle.
+    #[test]
+    fn bucketing_matches_the_vector_of_vectors_it_replaced() {
+        fn reference(
+            group_ids: &Int64Array,
+            n_values: usize,
+            num_groups: usize,
+        ) -> (Vec<u32>, Vec<i32>) {
+            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_groups];
+            for i in 0..group_ids.len() {
+                buckets[group_ids.value(i) as usize].push(i as u32);
+            }
+            let mut order: Vec<u32> = Vec::with_capacity(n_values);
+            let mut offsets: Vec<i32> = vec![0];
+            for bucket in &buckets {
+                order.extend_from_slice(bucket);
+                offsets.push(order.len() as i32);
+            }
+            (order, offsets)
+        }
+
+        let mut s: u64 = 4242;
+        // Include an empty group set, a single group, and a near-unique key — the shape the
+        // counting sort exists for — plus groups that receive no rows at all.
+        for (n, num_groups) in [
+            (0usize, 0usize),
+            (0, 5),
+            (1, 1),
+            (37, 4),
+            (5_000, 4_997),
+            (20_000, 64),
+        ] {
+            let mut gv: Vec<i64> = Vec::with_capacity(n);
+            for _ in 0..n {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                gv.push(if num_groups == 0 {
+                    0
+                } else {
+                    ((s >> 33) as usize % num_groups) as i64
+                });
+            }
+            let groups = Int64Array::from(gv);
+            let values: ArrayRef = Arc::new(Int64Array::from(
+                (0..n).map(|i| (i as i64) * 7).collect::<Vec<_>>(),
+            ));
+            let (want_order, want_offsets) = reference(&groups, n, num_groups);
+
+            let list = super::bucket_values_into_list(&groups, &values, num_groups).unwrap();
+            let list = list.as_list::<i32>();
+            assert_eq!(
+                list.value_offsets(),
+                &want_offsets[..],
+                "offsets differ (n={n}, groups={num_groups})"
+            );
+            // The gathered child must equal the reference gather through `want_order`.
+            let want_child = take(values.as_ref(), &UInt32Array::from(want_order), None).unwrap();
+            assert_eq!(
+                list.values().as_ref(),
+                want_child.as_ref(),
+                "bucketed values differ (n={n}, groups={num_groups})"
+            );
+        }
     }
 }
 

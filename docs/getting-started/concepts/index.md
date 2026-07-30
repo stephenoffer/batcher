@@ -35,11 +35,11 @@ The optimizer re-plans mid-query on measured row counts, not static guesses.
 
 ## Where to go next
 
-- [Reading data](../../user-guide/reading-data.md): every way to get a dataset.
-- [Transformations](../../user-guide/transformations.md),
-  [Aggregations](../../user-guide/aggregations.md),
-  [Joins](../../user-guide/joins.md),
-  [Window functions](../../user-guide/window-functions.md).
+- {doc}`Reading data <../../user-guide/reading-data>`: every way to get a dataset.
+- {doc}`Transformations <../../user-guide/transformations>`,
+  {doc}`Aggregations <../../user-guide/aggregations>`,
+  {doc}`Joins <../../user-guide/joins>`,
+  {doc}`Window functions <../../user-guide/window-functions>`.
 
 ## See also
 

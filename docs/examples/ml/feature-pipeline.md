@@ -32,7 +32,7 @@ print(train.count(), test.count())
 `key="user_id"` hashes the identifier rather than the whole row. That is what keeps a row
 in the same split after you recompute a feature. Hash every column (the default) and changing
 one derived value re-throws every row into a different part, quietly invalidating the
-comparison you were about to make. See [train/test split](train-test-split.md) for
+comparison you were about to make. See {doc}`train/test split <train-test-split>` for
 what else that decision buys.
 :::
 
@@ -135,7 +135,7 @@ training runs, not by the features:
 | `batcher.ml.to_torch_iterable(...)` | a torch iterable over any batch iterator | you already have a batch iterator and want to keep it |
 
 The full map, including the two ways to shard a stream wrongly, is in
-[data loaders](../../ml/data-loaders.md).
+{doc}`data loaders <../../ml/data-loaders>`.
 
 ## Derived features belong in expressions
 
@@ -179,15 +179,15 @@ above the largest training value lands in the top bin instead of inventing a fif
 
 ## See also
 
-- [Preprocessors](../../ml/preprocessors/index.md): every estimator, and what each `fit` learns.
-- [Data loaders](../../ml/data-loaders.md): the loader table above, in full.
-- [PyTorch](../../ml/pytorch.md) and the
-  [PyTorch integration](../../integrations/pytorch.md): the training loop on the other end.
-- [Train/test split](train-test-split.md): hash splits, group leakage, and time-based cuts.
-- [Recommender features](recommender-features.md): aggregate and window features over an
+- {doc}`Preprocessors <../../ml/preprocessors/index>`: every estimator, and what each `fit` learns.
+- {doc}`Data loaders <../../ml/data-loaders>`: the loader table above, in full.
+- {doc}`PyTorch <../../ml/pytorch>` and the
+  {doc}`PyTorch integration <../../integrations/pytorch>`: the training loop on the other end.
+- {doc}`Train/test split <train-test-split>`: hash splits, group leakage, and time-based cuts.
+- {doc}`Recommender features <recommender-features>`: aggregate and window features over an
   event log.
-- [ML API reference](../../api/ml.md): `Chain`, the estimators, and the loaders.
-- [Training-ingest benchmarks](../../benchmarks/ai-and-gpu.md): what `iter_torch_batches`
+- {doc}`ML API reference <../../api/ml>`: `Chain`, the estimators, and the loaders.
+- {doc}`Training-ingest benchmarks <../../benchmarks/ai-and-gpu>`: what `iter_torch_batches`
   sustains, and against what.
-- [Tensor columns](../../deep-dives/tensor-columns.md): why a feature vector travels with its
+- {doc}`Tensor columns <../../deep-dives/tensor-columns>`: why a feature vector travels with its
   shape.

@@ -66,10 +66,16 @@ class _DoublingModel:
 
     Blunt on purpose. A site that ignores the model reports half of what a site that
     honours it does, which no shared-constant test would catch.
+
+    It implements `blend_peak`, the *per-operator* primitive, and deliberately not a
+    whole-plan aggregate. The envelope is a walk over the plan's schedule, so a model that
+    could only answer for a whole plan would have to flatten that walk to a `max` — which is
+    the pre-`inputs` reading, and taking it on the warm path would have switched the
+    concurrent-peak correction off for every store that had learned anything.
     """
 
-    def plan_peak(self, ops) -> int:
-        return max((op.bounds.m_max_bytes * 2 for op in ops), default=0)
+    def blend_peak(self, kind: str, planned: int) -> int:
+        return planned * 2
 
 
 # --- the rule itself ----------------------------------------------------------

@@ -278,12 +278,12 @@ Where the embedding and generation throughput comes from.
 
 ## See also
 
-- [Batch inference](batch-inference.md): the `.ml` accessor, in full.
-- [RAG guide](../ml/rag.md) and [embeddings](../ml/embeddings.md): the production shape of
+- {doc}`Batch inference <batch-inference>`: the `.ml` accessor, in full.
+- {doc}`RAG guide <../ml/rag>` and {doc}`embeddings <../ml/embeddings>`: the production shape of
   each half.
-- [RAG index recipe](../examples/ml/rag-index.md) and
-  [text embeddings recipe](../examples/ml/text-embeddings.md): the short versions.
-- [Expressions](../user-guide/expressions.md): `.str.chunk`, `.list.cosine_similarity`, and
+- {doc}`RAG index recipe <../examples/ml/rag-index>` and
+  {doc}`text embeddings recipe <../examples/ml/text-embeddings>`: the short versions.
+- {doc}`Expressions <../user-guide/expressions>`: `.str.chunk`, `.list.cosine_similarity`, and
   the rest of the column language this page leans on.
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): the warm pool and the stage overlap
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the warm pool and the stage overlap
   behind both halves.

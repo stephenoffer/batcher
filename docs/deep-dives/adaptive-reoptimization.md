@@ -10,13 +10,15 @@ Batcher's answer is to execute the plan one *pipeline breaker* at a time. A brea
 
 Re-planning mid-query isn't unique to Batcher, and the honest comparison is narrower than it first looks.
 
+![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](../_static/diagrams/adaptive_positioning.svg)
+
 | System | When it re-plans |
 |---|---|
 | DuckDB | Never. It optimizes once and runs that plan. |
 | Spark AQE | At stage boundaries, meaning only where a shuffle already forced a materialization. |
 | Batcher | At pipeline breakers, the same granularity as Spark AQE, and on a single node as well as on a cluster. |
 
-Batcher's loop is stage-boundary adaptation. It isn't finer-grained than Spark AQE, and the module that implements it says so in its own first line. What Batcher adds over Spark is that the loop runs single-node too, and that it sits alongside a sketch-backed cross-query learned-stats loop that neither DuckDB nor Spark has. See [Learned metadata](learned-metadata.md) for that second half.
+Batcher's loop is stage-boundary adaptation. It isn't finer-grained than Spark AQE, and the module that implements it says so in its own first line. What Batcher adds over Spark is that the loop runs single-node too, and that it sits alongside a sketch-backed cross-query learned-stats loop that neither DuckDB nor Spark has. See {doc}`Learned metadata <learned-metadata>` for that second half.
 
 ## Pipeline breakers
 
@@ -168,6 +170,9 @@ A stage carrying `map_batches` is opaque to the IR, so the whole-plan Kyber opti
 
 ## Code map
 
+Each concern below maps to the one file that owns it, so you can read the mechanism
+this page describes in the source:
+
 | Concern | File |
 |---|---|
 | The stage loop, splicing, intermediate cleanup | `python/batcher/api/adaptive/staging.py` |
@@ -182,14 +187,14 @@ A stage carrying `map_batches` is opaque to the IR, so the whole-plan Kyber opti
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the contract loop this closes, where Core measures and Kyber decides
-- [Kyber optimizer](../internals/kyber.md): the pass pipeline that runs at each stage
+- {doc}`Architecture <../architecture/index>`: the contract loop this closes, where Core measures and Kyber decides
+- {doc}`Kyber optimizer <../internals/kyber>`: the pass pipeline that runs at each stage
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the regret and stability arguments
-- [Adaptive execution](../getting-started/concepts/adaptive.md): the same idea, without the code
-- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md): using this in anger
-- [Reading a plan](../user-guide/explain-plans.md): the `analyze=True` output above
-- [TPC-H benchmarks](../benchmarks/tpch.md): the join shapes where re-planning pays
-- [Cardinality estimation](cardinality-estimation.md): where the estimate under test comes from
-- [Learned metadata](learned-metadata.md): the across-query half of the loop
-- [Cost model](cost-model.md): what a corrected cardinality feeds into
+- {doc}`Adaptive execution <../getting-started/concepts/adaptive>`: the same idea, without the code
+- {doc}`Optimizing a slow query <../tutorials/optimizing-a-slow-query>`: using this in anger
+- {doc}`Reading a plan <../user-guide/explain-plans>`: the `analyze=True` output above
+- {doc}`TPC-H benchmarks <../benchmarks/tpch>`: the join shapes where re-planning pays
+- {doc}`Cardinality estimation <cardinality-estimation>`: where the estimate under test comes from
+- {doc}`Learned metadata <learned-metadata>`: the across-query half of the loop
+- {doc}`Cost model <cost-model>`: what a corrected cardinality feeds into
 :::

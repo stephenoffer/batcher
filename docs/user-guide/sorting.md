@@ -204,14 +204,14 @@ ds.sort("team", "score").repartition(by="team").write("out/")
 
 ## See also
 
-- [Filtering](filtering.md): cut rows before you order them.
-- [Window functions](window-functions.md): `row_number`/`rank` over an ordered
+- {doc}`Filtering <filtering>`: cut rows before you order them.
+- {doc}`Window functions <window-functions>`: `row_number`/`rank` over an ordered
   partition, which is the right tool for "top n per group".
-- [Performance](performance.md): the spill path and the memory budget.
-- [Sort internals](../deep-dives/sort-internals.md): the run generation and k-way merge
+- {doc}`Performance <performance>`: the spill path and the memory budget.
+- {doc}`Sort internals <../deep-dives/sort-internals>`: the run generation and k-way merge
   that make the spilled result identical to the in-memory one.
-- [Dataset API](../api/dataset.md): the `sort`, `top_k`, and `limit` reference.
-- [Top k per group](../examples/analytics/top-k-per-group.md): the window recipe, worked
+- {doc}`Dataset API <../api/dataset>`: the `sort`, `top_k`, and `limit` reference.
+- {doc}`Top k per group <../examples/analytics/top-k-per-group>`: the window recipe, worked
   end to end.
-- [DuckDB comparison](../benchmarks/vs-duckdb.md): where sort stands against the
+- {doc}`DuckDB comparison <../benchmarks/vs-duckdb>`: where sort stands against the
   single-node bar.

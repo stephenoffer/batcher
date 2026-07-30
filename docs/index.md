@@ -13,10 +13,38 @@
   <p class="bt-hero-cta">
     <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
     <a class="bt-btn" href="getting-started/quickstart.html">Quickstart</a>
+    <a class="bt-btn" href="benchmarks/index.html">See the numbers</a>
     <a class="bt-btn" href="https://github.com/stephenoffer/batcher">GitHub</a>
   </p>
 </div>
+
+<div class="bt-stats">
+  <div class="bt-stat">
+    <span class="bt-stat-value">1.89&times;</span>
+    <span class="bt-stat-label">faster than DuckDB on the same Arrow</span>
+    <span class="bt-stat-src">TPC-H sf10, 96 cores, 21 of 22 queries won</span>
+  </div>
+  <div class="bt-stat">
+    <span class="bt-stat-value">42 / 43</span>
+    <span class="bt-stat-label">ClickBench queries won</span>
+    <span class="bt-stat-src">vs DuckDB on the same Arrow, 43 of 43 correct</span>
+  </div>
+  <div class="bt-stat">
+    <span class="bt-stat-value">81%</span>
+    <span class="bt-stat-label">sustained GPU utilization</span>
+    <span class="bt-stat-src">ResNet-50 batch inference, 8&times;T4, 2,504 img/s</span>
+  </div>
+  <div class="bt-stat">
+    <span class="bt-stat-value">0.05 ms</span>
+    <span class="bt-stat-label">to answer <code>count()</code> after a transform chain</span>
+    <span class="bt-stat-src">read from footer statistics, no scan</span>
+  </div>
+</div>
 ```
+
+Every figure above is correctness-gated: the harness refuses to record a timing for a query
+whose result does not match the oracle. {doc}`benchmarks/index` has the methodology, the
+hardware, and the comparisons that run the other way.
 
 Data work has splintered into a tool per job. One for SQL, another for DataFrames, a
 third for streaming, more again for images and models. Every one of them is a system to
@@ -51,32 +79,68 @@ Batcher answers all three at once. The same code runs from a laptop to a cluster
 engine covers SQL and DataFrames and ML, and the plan re-tunes itself while it runs. You
 build the pipeline once, and it keeps working as the data grows.
 
-## Any data, any workload
+## Everything it does
 
-The same engine reads a Parquet table, a folder of images, or a Kafka stream, and the
-same pipeline can clean it, query it, or feed it to a model.
+One engine, one API, one plan. These are the capability families, each linked to the guide
+that covers it.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} {octicon}`table;1.1em` Structured
-Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi), filtered and
-joined and aggregated with SQL or DataFrames.
+:::{grid-item-card} {octicon}`table;1.1em` Read anything
+:link: user-guide/reading-data
+:link-type: doc
+Parquet, CSV, JSON, Arrow, ORC, Avro. Text, logs, and documents. Images, audio, and video.
+Databases and warehouses over JDBC. Kafka, Kinesis, Pulsar, and Pub/Sub.
 :::
 
-:::{grid-item-card} {octicon}`file;1.1em` Unstructured
-Text, logs, and documents read whole or by the line, then parsed into clean columns
-at scale.
+:::{grid-item-card} {octicon}`pencil;1.1em` Query and transform
+:link: user-guide/index
+:link-type: doc
+Filter, project, join, aggregate, window, pivot, sort, sample, and explode, in SQL or
+DataFrame form. Typed accessors for strings, dates, lists, structs, and JSON.
 :::
 
-:::{grid-item-card} {octicon}`image;1.1em` Multimodal
-Images, audio, and video decoded straight into tensors, so one pipeline can clean a
-table and feed a model.
+:::{grid-item-card} {octicon}`stack;1.1em` Lakehouse tables
+:link: user-guide/lakehouse
+:link-type: doc
+Delta, Iceberg, and Hudi with transactional writes, `MERGE INTO` upserts, change feeds,
+time travel, schema evolution, and compaction.
 :::
 
-:::{grid-item-card} {octicon}`search;1.1em` Vectors & embeddings
-First-class list and tensor columns with the vector ops behind embeddings, similarity
-search, and RAG.
+:::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
+:link: user-guide/streaming
+:link-type: doc
+Unbounded sources, triggers, watermarks and late data, windowed and stateful aggregation,
+stream joins, checkpointing, and exactly-once sinks.
+:::
+
+:::{grid-item-card} {octicon}`beaker;1.1em` Models and inference
+:link: ml/index
+:link-type: doc
+Batch inference on GPU, LLM scoring, embeddings and vector search, RAG, tabular models,
+preprocessors, and zero-copy loaders for PyTorch training.
+:::
+
+:::{grid-item-card} {octicon}`image;1.1em` Multimodal and vectors
+:link: ml/multimodal
+:link-type: doc
+Images, audio, and video decoded straight into tensor columns, with first-class list and
+tensor types and the vector ops behind similarity search.
+:::
+
+:::{grid-item-card} {octicon}`shield-check;1.1em` Quality and governance
+:link: user-guide/data-quality
+:link-type: doc
+Data-quality contracts that fail, drop, or quarantine bad rows. Column masking and
+row-level security applied as a plan rewrite, plus column-level lineage.
+:::
+
+:::{grid-item-card} {octicon}`graph;1.1em` Scale and operate
+:link: user-guide/performance
+:link-type: doc
+Out-of-core spill, caching, a Ray-backed distributed path, explain plans, a live progress
+UI, and metrics. The same code from a laptop to a cluster.
 :::
 ::::
 
@@ -140,125 +204,19 @@ Expressions carry typed accessors for every column kind (`.str`, `.dt`, `.list`,
 `.struct`), so the column language stays the same whether you reach for it from a
 DataFrame, from SQL, or inside a stream.
 
-## Explore the capabilities
-
-::::{grid} 1 2 3 3
-:gutter: 3
-
-:::{grid-item-card} {octicon}`rocket;1.1em` Getting started
-:link: getting-started/index
-:link-type: doc
-Install and run your first pipeline.
-:::
-
-:::{grid-item-card} {octicon}`download;1.1em` Reading data
-:link: user-guide/reading-data
-:link-type: doc
-Files, object storage, databases, and streams.
-:::
-
-:::{grid-item-card} {octicon}`pencil;1.1em` Transformations
-:link: user-guide/transformations
-:link-type: doc
-Select, derive, reshape, and explode columns.
-:::
-
-:::{grid-item-card} {octicon}`filter;1.1em` Filtering
-:link: user-guide/filtering
-:link-type: doc
-Predicates, null handling, and sampling.
-:::
-
-:::{grid-item-card} {octicon}`graph;1.1em` Aggregations
-:link: user-guide/aggregations
-:link-type: doc
-Group, summarize, pivot, and roll up.
-:::
-
-:::{grid-item-card} {octicon}`git-merge;1.1em` Joins
-:link: user-guide/joins
-:link-type: doc
-Inner, outer, semi, anti, and as-of joins.
-:::
-
-:::{grid-item-card} {octicon}`versions;1.1em` Window functions
-:link: user-guide/window-functions
-:link-type: doc
-Ranking, running totals, lag and lead.
-:::
-
-:::{grid-item-card} {octicon}`code;1.1em` Expressions
-:link: user-guide/expressions
-:link-type: doc
-The composable column language and its accessors.
-:::
-
-:::{grid-item-card} {octicon}`database;1.1em` SQL
-:link: user-guide/sql
-:link-type: doc
-Full SQL that lowers to the same engine.
-:::
-
-:::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
-:link: user-guide/streaming
-:link-type: doc
-Watermarks, windows, and exactly-once output.
-:::
-
-:::{grid-item-card} {octicon}`beaker;1.1em` Machine learning
-:link: ml/index
-:link-type: doc
-Batch inference, embeddings, and training data.
-:::
-
-:::{grid-item-card} {octicon}`cloud;1.1em` Cloud & lakehouse
-:link: user-guide/cloud-storage
-:link-type: doc
-S3, GCS, Azure, and Delta / Iceberg / Hudi.
-:::
-
-:::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from pandas / Polars / Spark / SQL
-:link: migration/index
-:link-type: doc
-Translate the API you already know, side by side.
-:::
-
-:::{grid-item-card} {octicon}`meter;1.1em` Benchmarks
-:link: benchmarks/index
-:link-type: doc
-Correctness-gated numbers across every workload, with the methodology behind each one.
-:::
-
-:::{grid-item-card} {octicon}`book;1.1em` Recipes
-:link: examples/index
-:link-type: doc
-Four cookbooks: data engineering, analytics, ML, and streaming.
-:::
-
-:::{grid-item-card} {octicon}`plug;1.1em` Integrations
-:link: integrations/index
-:link-type: doc
-Kafka, Snowflake, BigQuery, Delta, Iceberg, Ray, PyTorch, and the rest of your stack.
-:::
-
-:::{grid-item-card} {octicon}`telescope;1.1em` Deep dives
-:link: deep-dives/index
-:link-type: doc
-How the engine actually works, one mechanism at a time.
-:::
-::::
-
 ## It tunes itself
 
 You don't size batches, pick join strategies, or guess partition counts. Batcher
 re-optimizes at stage boundaries on measured cardinalities, the same mechanism and the same
-granularity as Spark AQE, but available single-node too. It stays off for queries under 20M
-input rows, so most queries never reach it.
+granularity as Spark AQE, but available single-node too. It engages only on a joined query
+whose scan input clears 20M rows or roughly 1.3 GB, so most small queries never reach it.
+
+![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](_static/diagrams/adaptive_positioning.svg)
 
 The half that has no equivalent in DuckDB or Spark is what happens *between* runs. A
 sketch-backed learned-stats and bandit loop records what each query actually did, so the
-plan improves the more often you run it. The {doc}`architecture/index` covers both halves,
-and {doc}`deep-dives/adaptive-reoptimization` covers where each one stops.
+plan improves the more often you run it. {doc}`architecture/differentiators` covers both
+halves, and where each one stops.
 
 ## How it compares
 
@@ -304,24 +262,30 @@ Polars compute the wrong revenue, and the harness refuses to time them.
 These are the headline results. The full picture, including the methodology behind every
 figure, is in {doc}`benchmarks/index`.
 
-### Analytics: three suites, measured 2026-07-18
+### Analytics: four suites
 
-Single node, 16 cores, release build. Every engine reads the **identical zero-copy Arrow
-input**, so this compares execution rather than storage formats.
+Every engine reads the **identical zero-copy Arrow input**, so this compares execution rather
+than storage formats. The suites below were measured on a single node, at the scale and date
+each row names.
 
 | suite | vs DuckDB on the same Arrow |
 |---|---|
-| **TPC-H**, 22 comparable queries | **won 22 of 22**, 1.1x to 7.1x faster |
+| **TPC-H sf10**, all 22 queries, 96 cores | **won 21 of 22**, **1.89x** on the suite total |
+| **TPC-H sf1**, all 22 queries, 16 cores | **won 22 of 22**, 1.1x to 7.1x faster |
 | **ClickBench**, 43 queries | **won 42 of 43**, and 43/43 correct |
 | **Semi-structured JSON**, 5 queries | **won 5 of 5**, 3.6x to 12.5x faster |
 | **Operator mix**, 11 kernels | **won 10 of 11** |
 
-Against Polars the JSON suite is **11x to 100x faster**, and Polars' SQL front-end cannot
-express most of TPC-H at all (multi-table `FROM`, `EXISTS`, non-equi joins).
+![Diverging bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22. Batcher is 2.08x behind DuckDB on its own native store, winning 4 of 22.](_static/diagrams/tpch_sf10.svg)
+
+At sf10 Batcher is also **2.26x** faster than Polars over the suite, winning 17 of 22. On the
+JSON suite it is **11x to 100x** faster than Polars, whose SQL front-end cannot express most of
+TPC-H at all (multi-table `FROM`, `EXISTS`, non-equi joins).
 
 Run TPC-H against DuckDB's own compressed store instead, where it decompresses as it scans and
-never pays an Arrow ingest, and DuckDB leads on the join-heavy queries. Both columns are
-published per query in {doc}`benchmarks/tpch`.
+never pays an Arrow ingest, and DuckDB leads: **2.08x** on the sf10 suite, with Batcher winning
+4 of 22. That comparison is not like-for-like, and both columns are published per query in
+{doc}`benchmarks/tpch`.
 
 Seven ClickBench queries return in about 0.2 ms because Kyber answers them from **metadata**,
 meaning footer statistics and sketches, rather than scanning at all. Those are excluded from
@@ -363,12 +327,12 @@ The mergeable algebra means the *same* operators run distributed. TPC-H sf10 q6 
 
 **2.4x faster than Daft on equal hardware, and correct where Daft is not.**
 
-**[Full benchmarks and methodology](benchmarks/index.md)**
+**{doc}`Full benchmarks and methodology <benchmarks/index>`**
 
 ### Why the wins happen
 
 None of this is tuning. Each result traces to a design choice you can read about in the
-[architecture guide](architecture/index.md).
+{doc}`architecture guide <architecture/index>`.
 
 Batcher runs in-process and native over Arrow, with no task-scheduler or object-store hop per
 operation, so a small query pays almost no fixed cost before it starts doing real work. On the
@@ -380,23 +344,71 @@ GPU forward pass, which is what holds the device at or above 80% utilization whe
 sampled. And plans re-tune on measured cardinalities mid-query, so a bad estimate corrects
 itself rather than stalling or running out of memory.
 
-## Where to start
+## Find your way around
 
-The docs branch by what you are doing, not by what part of the engine you are touching.
+The docs branch by what you are doing, not by which part of the engine you are touching.
+Pick the row that matches you.
 
-- **New here?** {doc}`getting-started/index` installs Batcher and runs a first query, then
-  {doc}`getting-started/concepts/index` covers the one idea the rest of the API rests on.
-- **Porting something?** {doc}`migration/index` maps Spark, pandas, Polars, and SQL verb by
-  verb, and proves the port returns the same rows.
-- **Building something specific?** {doc}`user-guide/index` is one page per capability, and
-  {doc}`examples/index` is working code you can paste and change.
-- **Running a model?** {doc}`ml/index` covers inference, embeddings, retrieval, and feeding
-  a training loop.
-- **Curious how it works?** {doc}`architecture/index` gives the shape, and
-  {doc}`deep-dives/index` takes one mechanism at a time.
+::::{grid} 1 2 2 2
+:gutter: 3
 
-If you would rather be handed an ordered reading list for your role, use
-{doc}`learning-paths/index`.
+:::{grid-item-card} {octicon}`rocket;1.1em` Start here
+:link: getting-started/index
+:link-type: doc
+Install Batcher, run a first query, then the {doc}`core concepts <getting-started/concepts/index>`
+the rest of the API rests on.
+:::
+
+:::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from another tool
+:link: migration/index
+:link-type: doc
+Spark, pandas, Polars, DuckDB, and Daft translated verb by verb, ending in a check that the
+port returns the same rows.
+:::
+
+:::{grid-item-card} {octicon}`book;1.1em` Learn by doing
+:link: tutorials/index
+:link-type: doc
+End-to-end {doc}`tutorials <tutorials/index>`, task-sized {doc}`examples <examples/index>`, and
+a {doc}`cookbook <cookbook/index>` of runnable single-purpose scripts.
+:::
+
+:::{grid-item-card} {octicon}`checklist;1.1em` Follow a path
+:link: learning-paths/index
+:link-type: doc
+An ordered reading list for a data engineer, data scientist, ML engineer, or platform
+engineer.
+:::
+
+:::{grid-item-card} {octicon}`repo;1.1em` Build something
+:link: user-guide/index
+:link-type: doc
+One page per capability, plus {doc}`ml/index` for models and {doc}`configuration/index` for
+the knobs.
+:::
+
+:::{grid-item-card} {octicon}`code-square;1.1em` Look something up
+:link: api/index
+:link-type: doc
+The {doc}`API reference <api/index>`, a one-page {doc}`quick reference <api/reference>`, and
+the {doc}`full signature listing <api/complete>`.
+:::
+
+:::{grid-item-card} {octicon}`plug;1.1em` Connect your stack
+:link: integrations/index
+:link-type: doc
+Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, and
+Hugging Face.
+:::
+
+:::{grid-item-card} {octicon}`telescope;1.1em` Understand the engine
+:link: architecture/index
+:link-type: doc
+The {doc}`architecture <architecture/index>`, {doc}`what makes it different
+<architecture/differentiators>`, and {doc}`deep dives <deep-dives/index>` one mechanism at a
+time.
+:::
+::::
 
 ```{toctree}
 :hidden:

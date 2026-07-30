@@ -190,14 +190,14 @@ A GPU sits idle while it waits for data. To avoid that:
 - Run input shaping (decode, filter, feature engineering) in the engine with
   expressions and CPU `map_batches`, so GPU actors receive ready batches.
 - Stream rather than materialize, so batches arrive continuously; see
-  [Streaming](streaming.md).
+  {doc}`Streaming <streaming>`.
 - Tune `batch_size` up to the largest batch that fits in device memory; larger
   batches amortize per-call overhead.
 - Raise `concurrency` (and use fractional `num_gpus`) until the devices are fully
   utilized.
 
-## Next steps
+## See also
 
-- [Inference](inference.md): the `infer` / `embed` workflow.
-- [The ML accessor](../api/ml.md): the full argument reference.
-- [Streaming](streaming.md): feed actors with a continuous batch stream.
+- {doc}`Inference <inference>`: the `infer` / `embed` workflow.
+- {doc}`The ML accessor <../api/ml>`: the full argument reference.
+- {doc}`Streaming <streaming>`: feed actors with a continuous batch stream.

@@ -83,7 +83,7 @@ Classify a column once with `tag`, then govern every column carrying that tag wi
 `email` as `pii` wherever it appears, write one policy, and tables added later are
 covered automatically.
 
-The masks themselves are ordinary expressions ([`mask`](../api/complete.md),
+The masks themselves are ordinary expressions ({doc}``mask` <../api/complete>`,
 `hmac_sha256`, `aes_encrypt`), so they run in the Rust data plane at full speed.
 
 ```python
@@ -197,6 +197,10 @@ and the distributed path all run the same governed plan.
 
 ## Choosing a protection
 
+Two properties decide which function to apply. Reversibility says whether the original
+value can be recovered, and joinability says whether two rows with the same input still
+match after masking:
+
 | Function        | Reversible?       | Joinable? | Use it for                   |
 | --------------- | ----------------- | --------- | ---------------------------- |
 | `mask`          | no                | no        | partial disclosure to humans |
@@ -234,8 +238,8 @@ out = users.select(p=bt.hmac_sha256(bt.col("email"), key="s3cret")).to_pydict()
 print(out["p"][0] == out["p"][1] != out["p"][2])  # stable, so it still joins
 ```
 
-Where the key itself comes from — an environment variable, a mounted file, or Vault via a
-helper command — is covered in {doc}`secrets`, along with the same indirection for
+Where the key itself comes from, whether an environment variable, a mounted file, or Vault
+via a helper command, is covered in {doc}`secrets`, along with the same indirection for
 connector passwords and API tokens.
 
 ## Fingerprints and change detection
@@ -417,9 +421,9 @@ own store and check into review.
 
 ## See also
 
-- [Data quality](data-quality.md): validate and quarantine rows before they reach a
+- {doc}`Data quality <data-quality>`: validate and quarantine rows before they reach a
   consumer.
-- [Complete API reference](../api/complete.md): `SecurityCatalog`, `Principal`,
+- {doc}`Complete API reference <../api/complete>`: `SecurityCatalog`, `Principal`,
   `GovernanceEvent`, and `security`.
-- [Agent skills](../agents/index.md): `apply-governance-and-security`, the same
+- {doc}`Agent skills <../agents/index>`: `apply-governance-and-security`, the same
   surface as a procedure, with what to verify before trusting an enforced plan.

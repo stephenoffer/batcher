@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/text_length.py
 ```
+
+## See also
+
+- {doc}`text_formatting`: did the model obey the output format you asked for?
+- {doc}`text_overlap`: comparing a generated answer against a reference, without a model.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

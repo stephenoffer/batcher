@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/text_features.py
 ```
+
+## See also
+
+- {doc}`preprocessing_scaling`: scaling numeric features, and why the choice of scaler matters.
+- {doc}`vector_search`: vector search over an embedding column, in the engine.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

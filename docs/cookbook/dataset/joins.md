@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/joins.py
 ```
+
+## See also
+
+- {doc}`iteration`: getting results out: batches, rows, slices, and the single-value cases.
+- {doc}`meta_columns`: profiling one column: bounds, uniqueness, nulls, and constancy.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

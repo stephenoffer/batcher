@@ -23,7 +23,8 @@ from typing import Any
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import Config
-from batcher.kyber.learning import QUANTILES_KEY, columns_for, load_learned_stats
+from batcher.kyber.column_tables import QUANTILES_KEY, columns_for
+from batcher.kyber.learning import load_learned_stats
 from batcher.kyber.optimizer import optimize_logical
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/temporal_business_days.py
 ```
+
+## See also
+
+- {doc}`structs_and_maps`: struct and map columns: nested records without flattening the table.
+- {doc}`temporal_differences`: durations between two timestamp columns, and shifting a timestamp.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

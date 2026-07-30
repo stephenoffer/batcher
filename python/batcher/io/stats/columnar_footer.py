@@ -230,15 +230,29 @@ def parquet_statistics(fs: Any, files: list[str], schema: pa.Schema) -> SourceSt
             continue
         saw_any = True
         total_rows += meta.num_rows
-        names = meta.schema.names
         for rg in range(meta.num_row_groups):
             row_group_count += 1
             rgroup = meta.row_group(rg)
             total_bytes += rgroup.total_byte_size
             for ci in range(rgroup.num_columns):
                 col = rgroup.column(ci)
-                name = names[ci] if ci < len(names) else col.path_in_schema
-                _accumulate(acc.setdefault(name, _ColAcc()), col)
+                # `path_in_schema`, **not** `schema.names[ci]`. Parquet stores one column
+                # chunk per *leaf*, and `ParquetSchema.names` reports each leaf's bare field
+                # name while `path_in_schema` reports its full dotted path. For a flat table
+                # the two agree; for a nested one they do not, and the bare name silently
+                # merges a struct field's bounds into whatever top-level column shares its
+                # name.
+                #
+                # Measured on a table with a top-level `a` of 1..3 beside a struct `s{a}` of
+                # 1000..3000: this path reported `a` in [1, 3000]. Those bounds carry
+                # `Provenance.EXACT` for a numeric column, which is the provenance that lets
+                # Kyber answer `max(a)` from metadata without reading the data — so the
+                # collision is a **wrong answer**, not a loose estimate. The native footer
+                # walk keys by the path and reported [1, 3] for the same file, so the two
+                # implementations of one statistic disagreed, and the Python one is the
+                # fallback that runs whenever the native reader declines (an fsspec backend,
+                # a read-through cache, a declared `sorting_columns`).
+                _accumulate(acc.setdefault(col.path_in_schema, _ColAcc()), col)
     if not saw_any:
         return None
     columns = _finalize_columns(acc, schema, single_row_group=row_group_count == 1)

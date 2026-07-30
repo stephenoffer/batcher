@@ -28,6 +28,7 @@ pub mod metrics;
 mod ops;
 pub mod par;
 mod rusage;
+mod spill_split;
 pub mod stream;
 mod window_spill;
 
@@ -56,11 +57,98 @@ pub(crate) fn count_rows(batches: &[RecordBatch]) -> u64 {
 /// made this report 3.9 GB — every morsel re-counting the entire buffer. Carbonite fits its
 /// memory model on this figure, so the over-count would have it budget ~100x the real
 /// footprint and spill (or reject) plans that fit comfortably.
+///
+/// A **shared dictionary** is the same bug one level down, and the slice fix does not reach
+/// it. Morsels of a dictionary-encoded column share one values array, but each morsel's slice
+/// size includes that whole dictionary — so the relation is counted as `morsels x dictionary`
+/// instead of `dictionary + indices`. Measured on 600 morsels over a 50,000-entry string
+/// dictionary: **609 MB reported for 40 MB resident, a 15x over-count**. Dictionary encoding
+/// exists precisely for low-cardinality string columns, so this is the common case for the
+/// most common encoding, and the consequence is that the engine spills a sort, join, or
+/// window that would have fitted in memory.
+///
+/// Each distinct dictionary is therefore counted once, identified by its buffer address —
+/// unambiguous because every morsel being measured is alive, so two live dictionaries cannot
+/// share an address. Relations with no dictionary column skip the bookkeeping entirely.
 pub(crate) fn batch_bytes(batches: &[RecordBatch]) -> u64 {
-    batches
+    let gross: u64 = batches
         .iter()
         .flat_map(|b| b.columns().iter())
         .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .sum();
+    // Fast path: no dictionary anywhere in the schema, so nothing can be double-counted and
+    // the walk below would only cost allocations. This is every relation of plain numeric,
+    // string, or nested-non-dictionary columns.
+    if !batches.first().is_some_and(|b| {
+        b.schema()
+            .fields()
+            .iter()
+            .any(|f| has_dictionary(f.data_type()))
+    }) {
+        return gross;
+    }
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let recounted: u64 = batches
+        .iter()
+        .flat_map(|b| b.columns().iter())
+        .map(|c| recounted_dictionary_bytes(&c.to_data(), &mut seen))
+        .sum();
+    gross.saturating_sub(recounted)
+}
+
+/// Whether `dt` contains a dictionary anywhere in its nesting.
+fn has_dictionary(dt: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Dictionary(..) => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => has_dictionary(f.data_type()),
+        DataType::Struct(fs) => fs.iter().any(|f| has_dictionary(f.data_type())),
+        DataType::Union(fs, _) => fs.iter().any(|(_, f)| has_dictionary(f.data_type())),
+        DataType::RunEndEncoded(_, f) => has_dictionary(f.data_type()),
+        _ => false,
+    }
+}
+
+/// Bytes of `data` that [`batch_bytes`]'s gross sum counted for a dictionary it had already
+/// seen — the amount to subtract so a shared dictionary is charged once for the relation.
+///
+/// On the first sighting of a dictionary, its values are kept in the total and the walk
+/// descends *into* them, so a dictionary nested inside a dictionary's values is deduplicated
+/// too. On a later sighting the whole values subtree is subtracted, which is exactly what the
+/// gross sum added for it.
+fn recounted_dictionary_bytes(
+    data: &arrow::array::ArrayData,
+    seen: &mut std::collections::HashSet<usize>,
+) -> u64 {
+    use arrow::datatypes::DataType;
+    if matches!(data.data_type(), DataType::Dictionary(..)) {
+        let Some(values) = data.child_data().first() else {
+            return 0;
+        };
+        // A buffer address identifies the allocation. With no buffers there is nothing to
+        // identify it by (and nothing meaningful to save), so treat it as distinct.
+        let Some(id) = values.buffers().first().map(|b| b.as_ptr() as usize) else {
+            return 0;
+        };
+        if seen.insert(id) {
+            return recounted_dictionary_bytes_of_children(values, seen);
+        }
+        return values.get_slice_memory_size().unwrap_or(0) as u64;
+    }
+    recounted_dictionary_bytes_of_children(data, seen)
+}
+
+/// [`recounted_dictionary_bytes`] over every child of `data`.
+fn recounted_dictionary_bytes_of_children(
+    data: &arrow::array::ArrayData,
+    seen: &mut std::collections::HashSet<usize>,
+) -> u64 {
+    data.child_data()
+        .iter()
+        .map(|c| recounted_dictionary_bytes(c, seen))
         .sum()
 }
 
@@ -747,5 +835,157 @@ mod union_coerce_tests {
         let out = coerce_union_branches(vec![a, b]).unwrap();
         assert_eq!(out[0].column(0).data_type(), &DataType::Int64);
         assert_eq!(out[1].column(0).data_type(), &DataType::Int64);
+    }
+}
+
+/// How big a relation *is* — the figure every spill decision is made from.
+///
+/// [`batch_bytes`] is what Carbonite fits its memory model on, and what the sort, join,
+/// window, and grace fan-outs size themselves against. An over-count there does not fail
+/// anything: it makes the engine spill a query that would have fitted in memory, which looks
+/// like slowness rather than like a bug — so it needs its own assertions.
+#[cfg(test)]
+mod relation_sizing_tests {
+    use super::batch_bytes;
+    use arrow::array::{Array, DictionaryArray, Int32Array, RecordBatch, StringArray};
+    use arrow::datatypes::Int32Type;
+    use std::sync::Arc;
+
+    const ENTRIES: i32 = 20_000;
+    const MORSELS: usize = 200;
+    const ROWS: usize = 4_096;
+
+    fn dictionary(prefix: &str) -> Arc<dyn Array> {
+        let vals: Vec<String> = (0..ENTRIES).map(|i| format!("{prefix}-{i:06}")).collect();
+        Arc::new(StringArray::from(
+            vals.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))
+    }
+
+    fn keys(rows: usize) -> Int32Array {
+        Int32Array::from((0..rows as i32).map(|i| i % ENTRIES).collect::<Vec<_>>())
+    }
+
+    fn dict_morsel(values: &Arc<dyn Array>, rows: usize) -> RecordBatch {
+        let d = DictionaryArray::<Int32Type>::try_new(keys(rows), values.clone()).expect("dict");
+        RecordBatch::try_from_iter(vec![("k", Arc::new(d) as Arc<dyn Array>)]).expect("batch")
+    }
+
+    fn size_of(a: &Arc<dyn Array>) -> u64 {
+        a.to_data().get_slice_memory_size().unwrap_or(0) as u64
+    }
+
+    /// A shared dictionary must be charged once for the relation, not once per morsel.
+    ///
+    /// Morsels of a dictionary-encoded column all point at the same values array, but each
+    /// morsel's slice size includes that whole dictionary. Measured before this fix, on 600
+    /// morsels over a 50,000-entry string dictionary: **609 MB reported for 40 MB resident, a
+    /// 15x over-count**. Dictionary encoding exists precisely for low-cardinality string
+    /// columns, so this is the common case for the most common encoding — and the consequence
+    /// is a sort, join, or window spilling when it would have fitted.
+    #[test]
+    fn a_shared_dictionary_is_counted_once_for_the_relation() {
+        let values = dictionary("category");
+        let batches: Vec<RecordBatch> = (0..MORSELS).map(|_| dict_morsel(&values, ROWS)).collect();
+
+        let dict_bytes = size_of(&values);
+        let index_bytes = (MORSELS * ROWS * 4) as u64;
+        let measured = batch_bytes(&batches);
+
+        // The honest figure is one dictionary plus the indices. The old sum was
+        // `MORSELS * dict_bytes` on top of that.
+        assert!(
+            measured <= dict_bytes + index_bytes,
+            "measured {measured} for a relation of {} resident bytes — the shared dictionary \
+             is still being counted per morsel ({MORSELS} x {dict_bytes})",
+            dict_bytes + index_bytes
+        );
+        assert!(
+            measured >= index_bytes,
+            "measured {measured} but the indices alone are {index_bytes} — the deduplication \
+             subtracted more than the dictionary"
+        );
+        // And the over-count it replaces was an order of magnitude, not a rounding difference.
+        let naive: u64 = batches
+            .iter()
+            .flat_map(|b| b.columns().iter())
+            .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+            .sum();
+        assert!(
+            naive > measured * 5,
+            "the naive sum ({naive}) should be many times the deduplicated one ({measured}); \
+             if it is not, this test is no longer measuring the shape it was written for"
+        );
+    }
+
+    /// Two *distinct* dictionaries must both be counted. Deduplicating by buffer address is
+    /// sound only because every morsel being measured is alive, so two live dictionaries
+    /// cannot share an address — this is the assertion that the dedup does not collapse them.
+    #[test]
+    fn two_distinct_dictionaries_are_both_counted() {
+        let a = dictionary("category");
+        let b = dictionary("other");
+        let shared_twice = batch_bytes(&[dict_morsel(&a, ROWS), dict_morsel(&a, ROWS)]);
+        let two_distinct = batch_bytes(&[dict_morsel(&a, ROWS), dict_morsel(&b, ROWS)]);
+        // `b`'s size, not `a`'s: the two prefixes differ in length, so the dictionaries do
+        // too, and the second one is what the extra bytes should account for.
+        assert!(
+            two_distinct >= shared_twice + size_of(&b),
+            "two distinct dictionaries measured {two_distinct}, barely more than the \
+             {shared_twice} of one shared twice — the dedup is collapsing dictionaries it \
+             should count"
+        );
+    }
+
+    /// A relation with no dictionary must measure exactly what it did before, and take the
+    /// fast path rather than paying for bookkeeping that cannot apply.
+    #[test]
+    fn a_relation_without_dictionaries_is_unchanged() {
+        let batches: Vec<RecordBatch> = (0..MORSELS)
+            .map(|_| {
+                RecordBatch::try_from_iter(vec![("k", Arc::new(keys(ROWS)) as Arc<dyn Array>)])
+                    .expect("batch")
+            })
+            .collect();
+        let naive: u64 = batches
+            .iter()
+            .flat_map(|b| b.columns().iter())
+            .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+            .sum();
+        assert_eq!(batch_bytes(&batches), naive);
+    }
+
+    /// A dictionary *nested* inside a struct is deduplicated too — the walk is over the whole
+    /// array tree, not just top-level columns, because a multimodal or semi-structured schema
+    /// is where dictionary columns most often sit one level down.
+    #[test]
+    fn a_dictionary_nested_in_a_struct_is_deduplicated() {
+        use arrow::array::StructArray;
+        use arrow::datatypes::{DataType, Field};
+
+        let values = dictionary("category");
+        let mk = || {
+            let d =
+                DictionaryArray::<Int32Type>::try_new(keys(ROWS), values.clone()).expect("dict");
+            let field = Field::new(
+                "k",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            );
+            let s = StructArray::from(vec![(Arc::new(field), Arc::new(d) as Arc<dyn Array>)]);
+            RecordBatch::try_from_iter(vec![("s", Arc::new(s) as Arc<dyn Array>)]).expect("batch")
+        };
+        let batches: Vec<RecordBatch> = (0..MORSELS).map(|_| mk()).collect();
+
+        let measured = batch_bytes(&batches);
+        let naive: u64 = batches
+            .iter()
+            .flat_map(|b| b.columns().iter())
+            .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+            .sum();
+        assert!(
+            naive > measured * 5,
+            "a struct-nested dictionary was not deduplicated: naive {naive}, measured {measured}"
+        );
     }
 }

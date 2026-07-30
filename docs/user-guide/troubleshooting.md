@@ -218,20 +218,20 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 
 ## See also
 
-- [Explain plans](explain-plans.md): the first thing to read when the answer or the
+- {doc}`Explain plans <explain-plans>`: the first thing to read when the answer or the
   runtime surprises you, and how to tell whether a predicate reached the scan.
-- [Performance and memory](performance.md): caching, spill tuning, reading a query
+- {doc}`Performance and memory <performance>`: caching, spill tuning, reading a query
   plan.
-- [Exceptions API](../api/exceptions.md): the reference for every type in the table above,
+- {doc}`Exceptions API <../api/exceptions>`: the reference for every type in the table above,
   including the attributes they carry.
-- [Data quality](data-quality.md): turn "the answer looks wrong" into an assertion that
+- {doc}`Data quality <data-quality>`: turn "the answer looks wrong" into an assertion that
   fails loudly, with the offending rows quarantined.
-- [Observability](observability.md): the event stream, the progress reporter, and
+- {doc}`Observability <observability>`: the event stream, the progress reporter, and
   `bt.start_ui()` for watching a running query.
-- [Spilling](../deep-dives/spilling.md): what `spill=True` actually does, and why a spilled
+- {doc}`Spilling <../deep-dives/spilling>`: what `spill=True` actually does, and why a spilled
   query gets slower rather than dying.
-- [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing a
+- {doc}`Distributed fault tolerance <../architecture/fault-tolerance>`: diagnosing a
   failed task, shuffle, or node.
-- [Configuration options](../configuration/options.md): every tunable and its default.
-- [Agent skills](../agents/index.md): `debug-a-batcher-query` is the triage tree a
+- {doc}`Configuration options <../configuration/options>`: every tunable and its default.
+- {doc}`Agent skills <../agents/index>`: `debug-a-batcher-query` is the triage tree a
   coding agent follows, organized by symptom, with the bisect procedure against DuckDB.

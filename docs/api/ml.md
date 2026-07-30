@@ -1,6 +1,6 @@
 # The ML accessor
 
-This page covers the `.ml` accessor on a `Dataset` and the `batcher.ml` package behind it. For the relational surface these compose with, see [Dataset](dataset.md).
+This page covers the `.ml` accessor on a `Dataset` and the `batcher.ml` package behind it. For the relational surface these compose with, see {doc}`Dataset <dataset>`.
 
 ML work attaches to a `Dataset` through the `.ml` accessor:
 
@@ -109,7 +109,7 @@ labelled = ds.ml.map_batches(Classifier(), num_gpus=1, concurrency=4)
 | `num_workers` | Number of workers (`map_batches`). |
 
 `num_gpus` and `concurrency` together describe a GPU actor pool: each actor holds
-`num_gpus` of a device, and `concurrency` actors run in parallel. `batch_format` converts only around the call, and the engine boundary stays Arrow. See [GPU scheduling](../ml/gpu.md).
+`num_gpus` of a device, and `concurrency` actors run in parallel. `batch_format` converts only around the call, and the engine boundary stays Arrow. See {doc}`GPU scheduling <../ml/gpu>`.
 
 ## infer and embed
 
@@ -129,12 +129,12 @@ scored = ds.ml.infer(Classifier(), output_columns=[...], batch_size=512, num_gpu
 vectors = ds.ml.embed(Embedder(), output_columns=[...], batch_size=256, num_gpus=1, concurrency=2)
 ```
 
-See [Inference](../ml/inference.md) for the inference workflow and
-[Streaming](../ml/streaming.md) for feeding training loops.
+See {doc}`Inference <../ml/inference>` for the inference workflow and
+{doc}`Streaming <../ml/streaming>` for feeding training loops.
 
 ## What lives outside the accessor
 
-Operators that aren't `Dataset` methods live in `batcher.ml`: the standalone `embed` and `llm_generate` functions, the [preprocessors](../ml/preprocessors/index.md), the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), the `Chain` preprocessor pipeline, the `ResumableSampler` checkpointable per-rank index stream, and the [LLM engines](../ml/llm.md).
+Operators that aren't `Dataset` methods live in `batcher.ml`: the standalone `embed` and `llm_generate` functions, the {doc}`preprocessors <../ml/preprocessors/index>`, the {doc}`serving adapters <../ml/serving>`, {doc}`vector search <../ml/multimodal>`, the `Chain` preprocessor pipeline, the `ResumableSampler` checkpointable per-rank index stream, and the {doc}`LLM engines <../ml/llm>`.
 
 A *callable* model passed to `map_batches` or `infer` receives the whole batch and picks its own columns, so there's no `input_columns=` keyword. The model-identifier form of `infer` and `embed` takes the `column` to run on instead.
 
@@ -302,14 +302,14 @@ The `batcher.ml` surface is large enough to be split by what you are doing:
 - {doc}`ml-models`: tabular scoring, in-engine estimators, and evaluation metrics.
 - {doc}`ml-statistics`: drift, fairness, resampling, cross-validation, interpretation.
 
-## Next steps
+## See also
 
-- [Inference](../ml/inference.md): batch prediction and embeddings.
-- [Preprocessors](../ml/preprocessors/index.md): fit/transform feature engineering.
-- [Multimodal](../ml/multimodal.md): download, decode, tensors, vector search.
-- [Serving](../ml/serving.md) and [LLM inference](../ml/llm.md).
-- [PyTorch](../ml/pytorch.md) and [streaming](../ml/streaming.md) training loaders.
-- [GPU scheduling](../ml/gpu.md): how `num_gpus` and `concurrency` map to actors.
-- [Tabular models](../ml/tabular-models.md): scoring XGBoost, LightGBM, and scikit-learn.
-- [Evaluation](../ml/evaluation.md): metrics, per-segment scoring, diagnostic tables.
-- [Statistics and drift](../ml/statistics-and-drift.md): feature screening and monitoring.
+- {doc}`Inference <../ml/inference>`: batch prediction and embeddings.
+- {doc}`Preprocessors <../ml/preprocessors/index>`: fit/transform feature engineering.
+- {doc}`Multimodal <../ml/multimodal>`: download, decode, tensors, vector search.
+- {doc}`Serving <../ml/serving>` and {doc}`LLM inference <../ml/llm>`.
+- {doc}`PyTorch <../ml/pytorch>` and {doc}`streaming <../ml/streaming>` training loaders.
+- {doc}`GPU scheduling <../ml/gpu>`: how `num_gpus` and `concurrency` map to actors.
+- {doc}`Tabular models <../ml/tabular-models>`: scoring XGBoost, LightGBM, and scikit-learn.
+- {doc}`Evaluation <../ml/evaluation>`: metrics, per-segment scoring, diagnostic tables.
+- {doc}`Statistics and drift <../ml/statistics-and-drift>`: feature screening and monitoring.

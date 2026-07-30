@@ -1,6 +1,6 @@
 # Quick reference
 
-This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The [area pages](index.md) explain the same surface with runnable examples, and the [complete reference](complete.md) renders every signature and docstring.
+This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The {doc}`area pages <index>` explain the same surface with runnable examples, and the {doc}`complete reference <complete>` renders every signature and docstring.
 
 ```python
 import batcher as bt
@@ -79,6 +79,9 @@ Each returns a new lazy Dataset.
 | `.map_batches(fn, ...)` | run a Python callable over whole Arrow batches |
 
 ### Reshaping
+
+These change a dataset's shape rather than its contents, turning rows into columns or the
+reverse:
 
 | Method | Effect |
 | --- | --- |
@@ -178,7 +181,7 @@ schema wherever a column is expected. They produce a `Selector`.
 | `bt.string()` / `bt.boolean()` / `bt.temporal()` | string / boolean / date-time columns |
 | `bt.exclude(*names)` | every column except the named ones |
 
-`bt.by_dtype`, `bt.matches`, `bt.starts_with`, `bt.ends_with`, and `bt.contains` select by dtype or by name pattern. See the [complete reference](complete.md) for their signatures.
+`bt.by_dtype`, `bt.matches`, `bt.starts_with`, `bt.ends_with`, and `bt.contains` select by dtype or by name pattern. See the {doc}`complete reference <complete>` for their signatures.
 
 ## Scalar, aggregate, and window functions
 
@@ -230,7 +233,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | `bt.nth_value(expr, n)` | the `n`-th value of the ordered partition (window) |
 | `bt.current_timestamp()` | current timestamp, bound at plan-build time |
 | `bt.current_date()` | today's date, bound at plan-build time |
-| `bt.date_part(part, expr)` | extract a calendar field (`year`/`month`/`dow`/…) |
+| `bt.date_part(part, expr)` | extract a calendar field such as `year`, `month`, or `dow` |
 | `bt.date_add(expr, days)` | add a whole number of `days` to a date/time column (Spark `date_add`) |
 | `bt.date_sub(expr, days)` | subtract a whole number of `days` from a date/time column (Spark `date_sub`) |
 | `bt.make_date(year, month, day)` | build a Date from integer components; an impossible date is null |
@@ -279,7 +282,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
   `.pct_change(n=1)`, `.shift(n)`, `.rank(method="min")`, `.is_duplicated()` /
   `.is_unique()`
 - Full list, plus the `.str` / `.dt` / `.list` / `.struct` / `.json` / `.map` /
-  `.image` / `.audio` / `.video` accessors: the [expressions API page](expressions.md).
+  `.image` / `.audio` / `.video` accessors: the {doc}`expressions API page <expressions>`.
 
 ```python
 out = ds.select(
@@ -309,7 +312,7 @@ Typed methods hang off an expression by namespace rather than crowding `Expr` it
 
 ## SQL
 
-`bt.sql(query, table_name=ds_or_table, ...)` returns a Dataset. Each table named in the query is bound by a keyword argument. The [SQL page](sql.md) lists the supported clauses and features in full.
+`bt.sql(query, table_name=ds_or_table, ...)` returns a Dataset. Each table named in the query is bound by a keyword argument. The {doc}`SQL page <sql>` lists the supported clauses and features in full.
 
 ```python
 out = bt.sql("SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds)
@@ -347,8 +350,8 @@ model once per worker.
 | `Tokenizer` / `Concatenator` | stateless text split / feature-vector assembly |
 | `Chain` | each step, fit on the previous step's output |
 
-See the [preprocessors guide](../ml/preprocessors/index.md) for the workflow and the
-[ML API page](ml.md) for the per-class reference.
+See the {doc}`preprocessors guide <../ml/preprocessors/index>` for the workflow and the
+{doc}`ML API page <ml>` for the per-class reference.
 
 ## Configuration
 

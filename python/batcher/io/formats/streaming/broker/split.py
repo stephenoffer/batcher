@@ -53,6 +53,7 @@ class BrokerSplit:
     topic: str
     partition: int
     poll_size: int
+    poll_bytes: int = BrokerSource.DEFAULT_POLL_BYTES
     #: `repr=False` because these are the *client* options — they carry `sasl.password`,
     #: `sasl_plain_password`, and Event Hubs' `connection_str` (a SAS key). A split is
     #: pickled to every worker and appears verbatim in any traceback that mentions it, so
@@ -66,6 +67,7 @@ class BrokerSplit:
         return cls(  # type: ignore[no-any-return]
             self.topic,
             poll_size=self.poll_size,
+            poll_bytes=self.poll_bytes,
             partitions=[self.partition],
             **self.options,
         )

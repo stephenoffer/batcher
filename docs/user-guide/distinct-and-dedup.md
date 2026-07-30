@@ -94,7 +94,7 @@ print(events.distinct(["user"], keep="first", order_by="ts").sort("user").to_pyd
 `order_by` also takes a list, and `[("ts", True)]` reverses a key, so
 `keep="first", order_by=[("ts", True)]` is another spelling of "newest wins". This
 lowers to `row_number() OVER (PARTITION BY subset ORDER BY ...)`, which is exactly what
-you would write by hand in SQL. See [window functions](window-functions.md) if you need
+you would write by hand in SQL. See {doc}`window functions <window-functions>` if you need
 the rank itself.
 
 ## Float keys: NaN and -0.0 collapse
@@ -197,7 +197,7 @@ Recall is not total: a similar pair can miss every LSH band and survive. `bands`
 dial, trading candidate pairs for recall. Precision is guaranteed instead, since every
 returned pair is verified against `threshold`, so nothing below it is ever dropped. In
 other words, near-duplicate dedup can leave a duplicate behind, but it will not delete a
-row that was not one. See the [preprocessors guide](../ml/preprocessors/index.md) for the
+row that was not one. See the {doc}`preprocessors guide <../ml/preprocessors/index>` for the
 tuning detail.
 :::
 
@@ -215,19 +215,19 @@ deduped = stream.drop_duplicates_within_watermark(
 ```
 
 Over a bounded source it degrades to plain exact deduplication. See
-[streaming](streaming.md).
+{doc}`streaming <streaming>`.
 
 ## See also
 
-- [Aggregations](aggregations.md): `n_unique` / `approx_n_unique` when you want the
+- {doc}`Aggregations <aggregations>`: `n_unique` / `approx_n_unique` when you want the
   count rather than the rows.
-- [Sorting](sorting.md): the tie-order rules that decide which row `keep="any"` gives you.
-- [Data quality](data-quality.md): assert uniqueness instead of silently repairing it.
-- [Aggregation internals](../deep-dives/aggregation-internals.md): the canonical hash key
+- {doc}`Sorting <sorting>`: the tie-order rules that decide which row `keep="any"` gives you.
+- {doc}`Data quality <data-quality>`: assert uniqueness instead of silently repairing it.
+- {doc}`Aggregation internals <../deep-dives/aggregation-internals>`: the canonical hash key
   every dedup path shares, and why it has to be shared.
-- [Deduplication recipe](../examples/data-engineering/deduplication.md): the same three
+- {doc}`Deduplication recipe <../examples/data-engineering/deduplication>`: the same three
   jobs, on a real table.
-- [Training-data dedup](../examples/ml/training-data-dedup.md): near-duplicate removal
+- {doc}`Training-data dedup <../examples/ml/training-data-dedup>`: near-duplicate removal
   before an expensive embed.
-- [Dataset API](../api/dataset.md): the `distinct`, `union`, `intersect`, and `except_`
+- {doc}`Dataset API <../api/dataset>`: the `distinct`, `union`, `intersect`, and `except_`
   reference.

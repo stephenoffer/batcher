@@ -132,15 +132,9 @@ exclude_patterns = [
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.
     "internals/mathematical_foundations.md",
-    # An engineering audit ledger (findings fixed / still open), kept in-tree so the
-    # analysis is recoverable. A working record for contributors, not a site page.
-    "internals/audit_ledger.md",
-    # The same: a measured audit of the connectors at TB/PB scale, kept in-tree as the
-    # record behind the scale work. A working document, not a published page.
+    # A measured audit of the connectors at TB/PB scale, kept in-tree as the record behind
+    # the scale work. A working document for contributors, not a published page.
     "internals/connector_scale_audit.md",
-    # The same again: the running ledger of the engine-wide defect hunt (found / fixed /
-    # open). A contributor's working record, not a site page.
-    "internals/bug_hunt_ledger.md",
     # The enterprise-requirement scorecard against the commercial platforms (Databricks,
     # Snowflake, SageMaker, Anyscale, SkyPilot). Every cell carries an evidence citation or
     # reads UNMEASURED. A working record for contributors deciding what to build next, and it
@@ -152,22 +146,6 @@ exclude_patterns = [
     "internals/snowflake_parity.md",
     "internals/anyscale_parity.md",
     "internals/orchestration_parity.md",
-    # The running index of improvements to the estimators' mathematics (cardinality,
-    # sketches, cost, learning, resource control). A working record for anyone touching
-    # one of those closed forms, not a page a user reads.
-    "internals/math_improvements_ledger.md",
-    # The running index of improvements/fixes/features that harden Batcher's streaming
-    # workloads (triggers, watermarks, windowed/stateful aggregation, checkpointing,
-    # sources/sinks, the morsel-streaming executor). A working record, not a user page.
-    "internals/streaming_improvements_ledger.md",
-    # The running index of improvements/features that make Batcher better at running
-    # user-supplied UDFs and callables (map_batches/map, class model UDFs, the batch-inference
-    # plane, and the threads/processes/GPU scheduling beneath). A working record, not a user page.
-    "internals/udf_improvements_ledger.md",
-    # The running record of the Daft-versus-Batcher capability gap: what was measured, what
-    # closed, what is open, and where the comparison runs the other way. A contributor
-    # working document (and deliberately blunt about what it does not claim), not a site page.
-    "internals/daft_parity_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
@@ -175,9 +153,6 @@ exclude_patterns = [
     # DuckDB (fixes the sf100 OOM, kills the high-selectivity gather tax) while preserving
     # every invariant. In-tree for contributors; not a site page until accepted.
     "internals/rfc-streaming-executor.md",
-    # Design/migration note for porting the optimizer's cold hot-path passes to Rust.
-    # A contributor working record (scope + dependency-ordered migration), not a site page.
-    "internals/rust_optimizer_port.md",
     # A code-checked audit of Batcher's architecture against DuckDB / Polars / Spark /
     # Flink / Daft / Snowflake: where it genuinely wins, where it loses, the
     # structural ceilings, and the claims the code does not support. A working record for
@@ -188,10 +163,6 @@ exclude_patterns = [
     # competitor file it was read from, plus the ranked build order. A contributor working
     # record, not a site page.
     "internals/competitor_technique_review.md",
-    # The build log against that parts list: one row per landed engine improvement with its
-    # source technique, its safety argument and its measurement, plus what is still open. A
-    # contributor working record, not a site page.
-    "internals/engine_improvements_ledger.md",
     # The other half of that review: gaps found by *executing* the reference engines and
     # Batcher side by side over their whole function surface, the wrong answers that
     # measurement turned up, and the build log against them. A contributor working record,

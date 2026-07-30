@@ -226,10 +226,10 @@ to materialize. Use `iter_batches()`, a write with a trigger, or bound it with
 
 ## See also
 
-- [Streaming](../user-guide/streaming.md): triggers, watermarks, output modes, checkpoints.
-- [Kafka ETL](../examples/streaming/kafka-etl.md): this connector end to end, decode to sink.
-- [Exactly-once sink](../examples/streaming/exactly-once-sink.md): what the stable
+- {doc}`Streaming <../user-guide/streaming>`: triggers, watermarks, output modes, checkpoints.
+- {doc}`Kafka ETL <../examples/streaming/kafka-etl>`: this connector end to end, decode to sink.
+- {doc}`Exactly-once sink <../examples/streaming/exactly-once-sink>`: what the stable
   `query_name` above is buying you.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Event Hubs](eventhubs.md): its Kafka protocol endpoint works here, without the Azure SDK.
-- [Kinesis](kinesis.md): the same broker schema, a different shard model.
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Event Hubs <eventhubs>`: its Kafka protocol endpoint works here, without the Azure SDK.
+- {doc}`Kinesis <kinesis>`: the same broker schema, a different shard model.

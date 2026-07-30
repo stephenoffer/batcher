@@ -127,7 +127,11 @@ def run_relational(
         from batcher.plan.visitor import walk
 
         families = {type(node).__name__ for node in walk(plan)}
-        adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config(families)
+        # The plan itself goes with them, so a **cold** store can still size the morsel: the
+        # learned width only exists after a query of this shape has run, and the first run
+        # of a multimodal pipeline is the one that OOMs. The schema knows the width before a
+        # row is read, and a measured width still wins wherever there is one.
+        adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config(families, plan)
         if adapted is not None:
             scope = config_context(adapted)
     # Hold an execution slot for the whole run, and narrow this query's pool to its share

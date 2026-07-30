@@ -165,12 +165,12 @@ neither `query=` nor `table=`.
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md): the guided tour of the reader surface.
-- [Multi-source join](../examples/data-engineering/multi-source-join.md): a BigQuery table
+- {doc}`Reading data <../user-guide/reading-data>`: the guided tour of the reader surface.
+- {doc}`Multi-source join <../examples/data-engineering/multi-source-join>`: a BigQuery table
   joined against the lake without staging either side.
-- [Incremental ingest](../examples/data-engineering/incremental-ingest.md): reading only the
+- {doc}`Incremental ingest <../examples/data-engineering/incremental-ingest>`: reading only the
   new partitions, which is the cheapest read there is.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Snowflake](snowflake.md): the other big warehouse, and the only one Batcher writes.
-- [Databricks](databricks.md): also read-only, also credential-vended, but the read lands on Delta
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Snowflake <snowflake>`: the other big warehouse, and the only one Batcher writes.
+- {doc}`Databricks <databricks>`: also read-only, also credential-vended, but the read lands on Delta
   files rather than a proprietary API.

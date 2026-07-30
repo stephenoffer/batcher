@@ -190,9 +190,20 @@ pub(crate) fn column_stats(
     Ok(out)
 }
 
-/// Merge `ColumnStats` for each requested column across all batches in one pass.
+/// Accumulate one `ColumnStats` per requested column across all batches, in one pass.
 /// Shared by `column_stats`, `column_quantiles`, and `column_stats_full` so each
 /// column's HLL+KLL sketch is built once per call site.
+///
+/// Each array is folded into the column's existing sketch rather than summarized into a
+/// fresh one and merged. The difference is one HLL per *column* instead of one per
+/// (column, morsel): a `HyperLogLog::default_precision()` is a 16 KB register array, so the
+/// build-then-merge shape allocated and zeroed 16 KB per morsel per column and then walked
+/// all of it again to take the register-wise maximum. On a 49-morsel, 16-column relation
+/// that is roughly 12 MB allocated and 12 MB merged, on the query path, to summarize data
+/// already in hand.
+///
+/// The distinct estimate is unchanged bit-for-bit (an HLL register is a maximum either way).
+/// See `ColumnStats::update` for why the quantile sketch is not, and why that is fine.
 pub(crate) fn merge_column_stats(
     columns: &[String],
     batches: &[PyArrowType<RecordBatch>],
@@ -203,11 +214,10 @@ pub(crate) fn merge_column_stats(
         let b = &batch.0;
         for name in columns {
             if let Some(col) = b.column_by_name(name) {
-                let stats = bc_sketches::ColumnStats::from_array(col);
                 merged
                     .entry(name.clone())
-                    .and_modify(|s| s.merge(&stats))
-                    .or_insert(stats);
+                    .or_insert_with(bc_sketches::ColumnStats::empty)
+                    .update(col);
             }
         }
     }

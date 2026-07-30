@@ -69,7 +69,7 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | `write.mongo(collection, ...)` | A MongoDB collection | a running MongoDB |
 
 Delta, Iceberg, and Hudi table writes (transactional append and merge/upsert) are
-covered in [Lakehouse tables](lakehouse.md). The sinks that need an optional extra or
+covered in {doc}`Lakehouse tables <lakehouse>`. The sinks that need an optional extra or
 a live service are shown but not executed:
 
 ```python
@@ -133,10 +133,10 @@ The distributed path uses the same mergeable execution as a single-node write, s
 the output is identical in content. Distribution changes only how the work is
 scheduled.
 
-## Next steps
+## See also
 
-- [Lakehouse tables](lakehouse.md): transactional Delta writes, merge/upsert,
+- {doc}`Lakehouse tables <lakehouse>`: transactional Delta writes, merge/upsert,
   slowly-changing dimensions.
-- [Data quality](data-quality.md): validate and quarantine before you write.
-- [Cloud storage](cloud-storage.md): write to an object store.
-- [IO API](../api/io.md): the full `ds.write` writer reference.
+- {doc}`Data quality <data-quality>`: validate and quarantine before you write.
+- {doc}`Cloud storage <cloud-storage>`: write to an object store.
+- {doc}`IO API <../api/io>`: the full `ds.write` writer reference.

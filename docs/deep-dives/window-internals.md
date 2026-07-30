@@ -220,12 +220,12 @@ a 16-core release build with every correctness check passing.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): pipeline breakers, and why a window is one
-- [Execution engine](../internals/execution.md): where the window kernel is driven from
-- [Kyber](../internals/kyber.md): the pass that sets `rank_limit`
-- [Window functions](../user-guide/window-functions.md): the API, frames, and `QUALIFY`
-- [Analytics benchmarks](../benchmarks/analytics.md): the four window shapes measured above
-- [Aggregation internals](aggregation-internals.md): the dense group ids the shortcut reuses
-- [Sort internals](sort-internals.md): the per-partition ordering the ranking functions pay for
-- [Spilling](spilling.md): the same grace partitioning, bounding a window
+- {doc}`Architecture <../architecture/index>`: pipeline breakers, and why a window is one
+- {doc}`Execution engine <../internals/execution>`: where the window kernel is driven from
+- {doc}`Kyber <../internals/kyber>`: the pass that sets `rank_limit`
+- {doc}`Window functions <../user-guide/window-functions>`: the API, frames, and `QUALIFY`
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: the four window shapes measured above
+- {doc}`Aggregation internals <aggregation-internals>`: the dense group ids the shortcut reuses
+- {doc}`Sort internals <sort-internals>`: the per-partition ordering the ranking functions pay for
+- {doc}`Spilling <spilling>`: the same grace partitioning, bounding a window
 :::

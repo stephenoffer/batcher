@@ -179,12 +179,12 @@ of a service account.
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md) and [Writing data](../user-guide/writing-data.md).
-- [Incremental ingest](../examples/data-engineering/incremental-ingest.md): pulling only the
+- {doc}`Reading data <../user-guide/reading-data>` and {doc}`Writing data <../user-guide/writing-data>`.
+- {doc}`Incremental ingest <../examples/data-engineering/incremental-ingest>`: pulling only the
   new rows, which is how you keep the query cost above under control.
-- [Multi-source join](../examples/data-engineering/multi-source-join.md): a warehouse table
+- {doc}`Multi-source join <../examples/data-engineering/multi-source-join>`: a warehouse table
   joined against the lake, in one plan.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [BigQuery](bigquery.md): the other big warehouse. Read-only, with a genuinely parallel
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`BigQuery <bigquery>`: the other big warehouse. Read-only, with a genuinely parallel
   server-side read path.
-- [Databricks](databricks.md): the third, where the read lands on Delta files.
+- {doc}`Databricks <databricks>`: the third, where the read lands on Delta files.

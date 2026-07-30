@@ -203,11 +203,11 @@ hands you that envelope undecoded; de-aggregate it in `map_batches` if your prod
 
 ## See also
 
-- [Streaming](../user-guide/streaming.md): triggers, watermarks, and checkpointing.
-- [Windowed aggregation](../examples/streaming/windowed-aggregation.md): what to do with the
+- {doc}`Streaming <../user-guide/streaming>`: triggers, watermarks, and checkpointing.
+- {doc}`Windowed aggregation <../examples/streaming/windowed-aggregation>`: what to do with the
   records once they land.
-- [Exactly-once sink](../examples/streaming/exactly-once-sink.md): the `query_name` contract
+- {doc}`Exactly-once sink <../examples/streaming/exactly-once-sink>`: the `query_name` contract
   the write above depends on.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Kafka](kafka.md): the same broker schema and the same decode pattern.
-- [Pub/Sub](pubsub.md): the other cloud broker, and the one that does not split.
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Kafka <kafka>`: the same broker schema and the same decode pattern.
+- {doc}`Pub/Sub <pubsub>`: the other cloud broker, and the one that does not split.

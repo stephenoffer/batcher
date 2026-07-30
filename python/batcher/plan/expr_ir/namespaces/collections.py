@@ -361,7 +361,7 @@ class _JsonNamespace:
         return StrFunc("json_contains", self._e, pattern=value)
 
     def pretty(self) -> StrFunc:
-        """Re-render the document with two-space indentation (→ Utf8).
+        """Re-render the document with four-space indentation (→ Utf8).
 
         DuckDB ``json_pretty``. Text that is not valid JSON is null rather than an error.
 
@@ -375,7 +375,7 @@ class _JsonNamespace:
                 >>> ds = bt.from_pydict({"j": ['{"a":1}']})
                 >>> print(ds.select(r=bt.col("j").json.pretty()).to_pydict()["r"][0])
                 {
-                  "a": 1
+                    "a": 1
                 }
         """
         return StrFunc("json_pretty", self._e)

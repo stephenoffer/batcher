@@ -35,4 +35,11 @@ def bind_compat_methods(cls: type) -> None:
         for name in module.__all__:
             func = getattr(module, name)
             func.__qualname__ = f"{cls.__name__}.{name}"
+            # `__module__` must move with `__qualname__`. Sphinx resolves a method's
+            # owning class by looking `Expr` up in `sys.modules[func.__module__]`, and
+            # these functions are defined in `compat.*` where `Expr` exists only under
+            # `TYPE_CHECKING`. Leaving the pair inconsistent made autodoc raise
+            # "module ... has no attribute 'Expr'" for every alias, which fails the
+            # docs build under `-W`.
+            func.__module__ = cls.__module__
             setattr(cls, name, func)

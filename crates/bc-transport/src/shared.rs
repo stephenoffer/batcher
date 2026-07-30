@@ -224,13 +224,31 @@ pub(crate) fn write_ipc_file(
             arrow::ipc::MetadataVersion::V5,
         )
         .map_err(std::io::Error::other)?;
+        // Buffered, because arrow's IPC writer issues a separate `write` per message *and
+        // per buffer within it*: a batch with `k` columns costs on the order of `2k`
+        // syscalls, most of them a few KB of validity/offset data. A spilled bucket of a few
+        // hundred morsels over a dozen columns is thousands of syscalls for bytes that
+        // coalesce into a handful of 1 MiB writes. Unlike the runtime spill store — which
+        // holds one writer per partition and so budgets its buffering in total — this path
+        // writes exactly one file at a time, so a fixed buffer cannot multiply.
+        //
+        // The bytes on disk are identical (the reader mmaps the same file), and the flush
+        // below still runs before the rename that publishes it.
+        let file = std::io::BufWriter::with_capacity(1 << 20, file);
         let mut writer = FileWriter::try_new_with_options(file, &batches[0].schema(), opts)
             .map_err(std::io::Error::other)?;
         for b in batches {
             writer.write(b).map_err(std::io::Error::other)?;
         }
         writer.finish().map_err(std::io::Error::other)?;
-        let mut file = writer.into_inner().map_err(std::io::Error::other)?;
+        // `into_inner` on the `BufWriter` is what surfaces a failed flush of the *buffered*
+        // tail. Dropping it would swallow that error and the rename below would publish a
+        // truncated bucket — the one failure this path must not make silent.
+        let mut file = writer
+            .into_inner()
+            .map_err(std::io::Error::other)?
+            .into_inner()
+            .map_err(std::io::Error::other)?;
         file.flush()?;
     }
     fs::rename(&tmp, path)
@@ -411,6 +429,19 @@ pub fn clear_plan_shared(addr: &str, plan_id: u64) {
 
 #[cfg(test)]
 mod tests {
+    /// A peer address unique to this process.
+    ///
+    /// The shm root is a **cross-process** namespace, and a peer's directory is named only
+    /// after its address — so a hardcoded address collides whenever two test processes of
+    /// this crate run at once. That is not exotic: a full-workspace build, a second agent's
+    /// suite, or CI running two jobs on one machine all do it, and the collision shows up as
+    /// one process's `clear_shared` deleting the file another just published (an
+    /// intermittent `NotFound` from `publish_shared`, or a fetch that finds nothing).
+    /// Reproduced at roughly one run in four before this.
+    fn test_addr(name: &str) -> String {
+        format!("{name}-{}:1", std::process::id())
+    }
+
     /// `clear_plan_shared` must evict exactly one plan's files.
     ///
     /// It infers the filename prefix from the ticket format (`plan/stage/...` sanitized to
@@ -426,7 +457,7 @@ mod tests {
         if super::shm_root().is_none() {
             return; // no tmpfs on this platform; the shm path is inert
         }
-        let addr = "clear-plan-shared-test:1";
+        let addr = &test_addr("clear-plan-shared");
         super::clear_shared(addr);
 
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
@@ -467,7 +498,7 @@ mod tests {
 
     #[test]
     fn publish_then_fetch_roundtrips_the_batches() {
-        let addr = "host_1:55501";
+        let addr = &test_addr("host_1");
         let ticket = "1/0/2/3/0";
         let batches = vec![batch(&[1, 2, 3]), batch(&[4, 5])];
         publish_shared(addr, ticket, &batches).unwrap();
@@ -484,14 +515,14 @@ mod tests {
         assert!(fetch_shared("nobody_99999:1", "9/9/9/9/9")
             .unwrap()
             .is_none());
-        let addr = "host_2:55502";
+        let addr = &test_addr("host_2");
         publish_shared(addr, "t", &[]).unwrap(); // empty ⇒ writes nothing
         assert!(fetch_shared(addr, "t").unwrap().is_none());
     }
 
     #[test]
     fn clear_removes_published_files() {
-        let addr = "host_3:55503";
+        let addr = &test_addr("host_3");
         publish_shared(addr, "t", &[batch(&[7])]).unwrap();
         assert!(fetch_shared(addr, "t").unwrap().is_some());
         clear_shared(addr);
@@ -504,7 +535,7 @@ mod tests {
     /// for enabling shared memory by default.
     #[test]
     fn roundtrips_strings_nulls_and_mixed_columns() {
-        let addr = "host_4:55504";
+        let addr = &test_addr("host_4");
         let ticket = "9/0/1/2/0";
         let schema = Arc::new(Schema::new(vec![
             Field::new("s", DataType::Utf8, true),
@@ -531,7 +562,7 @@ mod tests {
     /// (body dropped): the footer's blocks now reference offsets far beyond the tiny file.
     #[test]
     fn corrupt_footer_with_out_of_range_blocks_is_a_miss_not_a_panic() {
-        let addr = "host_6:55506";
+        let addr = &test_addr("host_6");
         let ticket = "9/0/3/3/0";
         // A valid multi-batch file so the footer references non-trivial block offsets.
         publish_shared(addr, ticket, &[batch(&[1, 2, 3]), batch(&[4, 5, 6])]).unwrap();
@@ -563,7 +594,7 @@ mod tests {
     /// blocks decoded before the record batches) — a distinct code path from plain arrays.
     #[test]
     fn roundtrips_dictionary_encoded_column() {
-        let addr = "host_5:55505";
+        let addr = &test_addr("host_5");
         let ticket = "9/0/2/2/0";
         let mut b = StringDictionaryBuilder::<Int32Type>::new();
         for v in ["red", "green", "red", "blue", "green", "red"] {
@@ -594,7 +625,7 @@ mod tests {
     fn published_buckets_and_their_directories_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let addr = "127.0.0.1:59991";
+        let addr = &test_addr("perms");
         let ticket = "perm/0/0/0";
         publish_shared(addr, ticket, &[batch(&[1])]).expect("publish");
 
@@ -656,16 +687,16 @@ mod tests {
         let root = shm_root().expect("a shm root");
 
         // A directory owned by a pid that cannot exist (pid_max is well under this).
-        let dead = root.join("reap_dead_peer");
+        let dead = root.join(test_addr("reap_dead_peer"));
         create_private_dir(&dead).expect("dead dir");
         fs::write(dead.join(OWNER_MARKER), "4294967290").expect("dead marker");
         fs::write(dead.join("bucket.arrow"), b"x").expect("dead bucket");
 
         // One owned by this very process, and one with no marker at all (an older build).
-        let live = root.join("reap_live_peer");
+        let live = root.join(test_addr("reap_live_peer"));
         create_private_dir(&live).expect("live dir");
         mark_owner(&live);
-        let unmarked = root.join("reap_unmarked_peer");
+        let unmarked = root.join(test_addr("reap_unmarked_peer"));
         create_private_dir(&unmarked).expect("unmarked dir");
 
         reap_stale_shm();
@@ -690,7 +721,7 @@ mod tests {
     fn the_owner_marker_is_private_and_names_this_process() {
         use std::os::unix::fs::PermissionsExt;
 
-        let addr = "127.0.0.1:59992";
+        let addr = &test_addr("marker");
         publish_shared(addr, "own/0/0/0", &[batch(&[1])]).expect("publish");
         let dir = shm_root().expect("root").join(sanitize(addr));
         let marker = dir.join(OWNER_MARKER);

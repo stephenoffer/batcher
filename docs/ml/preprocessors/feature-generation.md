@@ -18,7 +18,7 @@ it as a number that grows forever. What a model can learn from is the *parts*, b
 repeat.
 
 `DateTimeFeaturizer` expands a timestamp into calendar parts as ordinary integer columns,
-which is what a tree wants — it can split on "hour >= 18" directly.
+which is what a tree wants, because it can split on "hour >= 18" directly.
 
 ```python
 import datetime as dt
@@ -33,7 +33,7 @@ print(featurized.fit_transform(ds).columns)
 
 `CyclicalEncoder` is what a linear model, a distance metric, or a neural net needs instead.
 Encoded as an integer, hour 23 and hour 0 sit 23 units apart while being one hour apart, so
-the model learns a discontinuity at midnight that is not there — and no amount of scaling
+the model learns a discontinuity at midnight that is not there, and no amount of scaling
 fixes it. Two coordinates on a circle put them adjacent, which is the truth.
 
 ```python
@@ -52,8 +52,8 @@ fitted in between.
 ## Surface features from text
 
 An embedding is the powerful way to featurize text and the expensive one. A great many text
-signals need no model at all — whether a review is long, whether a message is all-caps, how
-many digits a field has — and they are what a gradient-boosted model actually splits on.
+signals need no model at all: whether a review is long, whether a message is all-caps, and how
+many digits a field has. Those are what a gradient-boosted model actually splits on.
 `TextStatFeaturizer` computes them as pure string expressions, so a dozen text features over
 a billion rows is one pass and no GPU.
 
@@ -98,7 +98,7 @@ drop them, or let a booster use the null as the signal it is.
 
 ## Reducing dimensionality
 
-`PCA` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan — the mean and covariance are aggregates — and only the small eigendecomposition runs on the driver.
+`PCA` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan, because the mean and covariance are aggregates, and only the small eigendecomposition runs on the driver.
 
 ```python
 from batcher.ml.preprocessors import PCA
@@ -131,7 +131,7 @@ print(assembled.column("features").to_pylist())
 ```
 
 The assembled list column becomes a tensor for training with zero or one copy. See
-[PyTorch integration](../pytorch.md).
+{doc}`PyTorch integration <../pytorch>`.
 
 ### Deriving and selecting columns
 

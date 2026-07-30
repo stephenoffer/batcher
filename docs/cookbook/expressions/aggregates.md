@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/aggregates.py
 ```
+
+## See also
+
+- {doc}`column_selectors`: selectors: naming columns by type or pattern instead of one at a time.
+- {doc}`conditionals`: branching inside an expression: when/then/otherwise, and the SQL null helpers.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

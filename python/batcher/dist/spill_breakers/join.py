@@ -25,6 +25,15 @@ from batcher.dist.spill import (
 from batcher.io.source import Source
 from batcher.plan.logical import Join
 
+# The salt for the local re-split of a bucket. Non-zero — 0 is the unsalted, cluster-wide
+# assignment, which the shuffle must agree on and a local re-split must not reuse.
+_SUBBUCKET_SALT = 0x9E3779B97F4A7C15 | 1
+# How many times a bucket pair that still exceeds the envelope may be re-split, and how many
+# ways. The depth bound is for the case no hash can fix: a single hot join key re-hashes to
+# one sub-bucket however it is salted.
+_MAX_JOIN_SPLIT_DEPTH = 3
+_JOIN_SUB_BUCKETS = 8
+
 
 def supports_spilling_join(join: Join) -> bool:
     """Whether this join can grace-partition out-of-core: each side must name one source.
@@ -121,26 +130,25 @@ def stream_spilling_join(
             map_projection(join, right_sid),
         )
 
+        key_idx = (
+            _key_indices(left_schema, join.left_keys),
+            _key_indices(right_schema, join.right_keys),
+        )
         for b in range(n_buckets):
             if left_handles[b] is None and right_handles[b] is None:
                 continue
-            # `read_reserved` accounts each side's resident footprint against the process
-            # buffer pool: reading a bucket back is the one step of spilling that can undo
-            # it, and a plain `read` told the pool nothing, so a concurrent query sizing its
-            # own state saw headroom this join was already using.
-            left_b = _read_bucket(store, left_handles[b]) or [_empty_batch(left_schema)]
-            right_b = _read_bucket(store, right_handles[b]) or [_empty_batch(right_schema)]
-            try:
-                for rb in nat.execute_plan(join_ir, [left_b, right_b], cfg_json):
-                    if rb.num_rows > 0:
-                        yield rb
-            finally:
-                # Equal keys hash to one bucket on both sides, so this pair will never be
-                # read again. Releasing it here bounds peak scratch to the outstanding
-                # bucket pairs rather than to both spilled sides in full.
-                for handle in (left_handles[b], right_handles[b]):
-                    if handle is not None:
-                        store.release(handle)
+            yield from _join_bucket_pair(
+                nat,
+                store,
+                left_handles[b],
+                right_handles[b],
+                join_ir,
+                cfg_json,
+                left_schema,
+                right_schema,
+                key_idx,
+                0,
+            )
     finally:
         # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
         # open (a partition phase abandoned by an exception) and deletes both tiers' files
@@ -218,6 +226,13 @@ def _spill_paths_to_subbuckets(nat, paths, key_names, n, work_dir, tag):
     Reads one path at a time and appends each sub-bucket's batches to an incrementally
     written stream file, so peak memory is one path's batches — not the whole side.
     Returns `(sub_bucket_paths, schema)` where an absent sub-bucket is `None`.
+
+    **Salted**, and that is what makes it a re-partition rather than a copy. These paths are
+    one reducer's bucket, already assigned by the shuffle's hash; re-partitioning them with
+    that same hash is inert whenever both counts are powers of two, because bucket assignment
+    reads the low bits there — every row lands in `bucket & (n - 1)`, one sub-bucket, and the
+    reduce pays a full write and re-read to change nothing. Both sides take the same salt, so
+    equal keys still co-locate and each sub-bucket pair remains an independent join.
     """
     import os
 
@@ -235,7 +250,9 @@ def _spill_paths_to_subbuckets(nat, paths, key_names, n, work_dir, tag):
         if schema is None:
             schema = batches[0].schema
             key_idx = [schema.get_field_index(k) for k in key_names]
-        for i, bucket in enumerate(nat.partition_batches(batches, key_idx, n)):
+        for i, bucket in enumerate(
+            nat.partition_batches_salted(batches, key_idx, n, _SUBBUCKET_SALT)
+        ):
             for b in bucket:
                 if not b.num_rows:
                     continue
@@ -300,3 +317,110 @@ def _spill_side(
     for b, w in writers.items():
         handles[b] = w.close()
     return handles
+
+
+def _key_indices(schema: pa.Schema, names) -> list[int]:
+    """Positions of the join key columns in a side's spilled schema."""
+    return [schema.get_field_index(n) for n in names]
+
+
+def _resident(handle) -> int:
+    """A bucket's **uncompressed** size — what reading it back costs in RAM.
+
+    `nbytes` is the on-disk size, which for a compressible bucket (repeated keys, low-entropy
+    payloads) can be several times smaller; budgeting against it lets an over-large bucket
+    through the guard below and into the join that cannot hold it.
+    """
+    if handle is None:
+        return 0
+    return handle.logical_nbytes or handle.nbytes
+
+
+def _join_bucket_pair(
+    nat, store, lh, rh, join_ir, cfg_json, left_schema, right_schema, key_idx, depth
+):
+    """Join one co-partitioned bucket pair, re-splitting it first if it does not fit.
+
+    The bucket count is a constant, so under key skew one pair holds far more than its share
+    — and both sides were read whole before the join, so a skewed pair OOMs at exactly the
+    point spilling was meant to have prevented it. Both handles are measured *before* being
+    read, which is the point: the decision has to happen without first pulling in the thing
+    that does not fit.
+
+    The **probe** side counts as much as the build side. The bucket count is sized from the
+    build side alone, so a fact table with a hot key leaves a probe bucket orders of magnitude
+    over the envelope even when every build bucket fits.
+
+    A re-split re-partitions both sides with the *same* salt and count, so equal keys still
+    co-locate and each sub-pair is an independent join whose union is the same relation. The
+    salt is what makes it a re-partition at all: an unsalted split of a power-of-two bucket
+    count into another power of two reads the same low hash bits and moves no rows.
+    """
+    bucket_max = active_config().memory.spill_bucket_max_bytes
+    biggest = max(_resident(lh), _resident(rh))
+    if bucket_max > 0 and biggest > bucket_max and depth < _MAX_JOIN_SPLIT_DEPTH:
+        salt = _SUBBUCKET_SALT * (depth + 1) % (1 << 64) | 1
+        lsub = _resplit_handle(nat, store, lh, key_idx[0], salt, f"jl_d{depth}")
+        rsub = _resplit_handle(nat, store, rh, key_idx[1], salt, f"jr_d{depth}")
+        for sb in range(_JOIN_SUB_BUCKETS):
+            if lsub.get(sb) is None and rsub.get(sb) is None:
+                continue
+            yield from _join_bucket_pair(
+                nat,
+                store,
+                lsub.get(sb),
+                rsub.get(sb),
+                join_ir,
+                cfg_json,
+                left_schema,
+                right_schema,
+                key_idx,
+                depth + 1,
+            )
+        return
+
+    # `read_reserved` (inside `_read_bucket`) accounts each side's resident footprint against
+    # the process buffer pool: reading a bucket back is the one step of spilling that can undo
+    # it, and a plain `read` told the pool nothing, so a concurrent query sizing its own state
+    # saw headroom this join was already using.
+    left_b = _read_bucket(store, lh) or [_empty_batch(left_schema)]
+    right_b = _read_bucket(store, rh) or [_empty_batch(right_schema)]
+    try:
+        for rb in nat.execute_plan(join_ir, [left_b, right_b], cfg_json):
+            if rb.num_rows > 0:
+                yield rb
+    finally:
+        # Equal keys hash to one bucket on both sides, so this pair will never be read again.
+        # Releasing it here bounds peak scratch to the outstanding bucket pairs rather than to
+        # both spilled sides in full.
+        for handle in (lh, rh):
+            if handle is not None:
+                store.release(handle)
+
+
+def _resplit_handle(nat, store, handle, key_idx, salt, tag) -> dict:
+    """Stream one side's bucket into `_JOIN_SUB_BUCKETS` salted sub-buckets on disk.
+
+    The bucket that did not fit is never held whole: one batch is read, sharded, appended, and
+    released before the next arrives. The parent is released as soon as it has been
+    re-partitioned — it is the largest file in the recursion, so holding it would make each
+    level cost more disk instead of the same.
+    """
+    if handle is None:
+        return {}
+    writers: dict[int, object] = {}
+    for batch in store.read_stream(handle):
+        for sb, parts in enumerate(
+            nat.partition_batches_salted([batch], key_idx, _JOIN_SUB_BUCKETS, salt)
+        ):
+            for pb in parts:
+                if not pb.num_rows:
+                    continue
+                w = writers.get(sb)
+                if w is None:
+                    w = store.writer(f"{tag}_s{sb}_{id(handle):x}")
+                    writers[sb] = w
+                w.write(pb)
+    out = {sb: w.close() for sb, w in writers.items()}
+    store.release(handle)
+    return out

@@ -239,6 +239,7 @@ pub(crate) fn bounded_group_quantile(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        crate::ops::external_sort::DEFAULT_RUN_TARGET_BYTES,
         codec,
         None,
     )?
@@ -365,37 +366,20 @@ pub(crate) fn bounded_group_quantile(
     Ok((group_columns, Arc::new(out.finish())))
 }
 
-/// Canonicalize a `Float64` group-key column so `-0.0`/`0.0` fold to one value and every
+/// Canonicalize a float group-key column so `-0.0`/`0.0` fold to one value and every
 /// NaN bit-pattern maps to one canonical quiet NaN — the same identity the in-memory
-/// `assign_groups` groups by (`bc_runtime::keys::canon_f64`). Any other column type (or a
-/// non-`Float64` key) is returned unchanged.
+/// `assign_groups` groups by. A non-float column is returned unchanged.
 ///
 /// Without this the bounded out-of-core paths sort/boundary-detect on the raw
 /// `RowConverter` encoding, which maps `-0.0` and `0.0` to different bytes — so a
 /// GROUP BY on a float key holding both would return **two groups where the in-memory
-/// grace path (and DuckDB) return one**: a silent spill-only wrong answer. `bc-runtime`'s
-/// canonicalizer is `pub(crate)` there, so the identity is restated here for the one
-/// crate that cannot import it.
+/// grace path (and DuckDB) return one**: a silent spill-only wrong answer.
+///
+/// The identity itself is [`bc_arrow::canon_float_array`], the workspace's single
+/// definition, so this path cannot drift from the in-memory one it must match. This
+/// wrapper survives only to name *why* the spill path canonicalizes.
 pub(super) fn canon_float_key(arr: &ArrayRef) -> ArrayRef {
-    if arr.data_type() != &DataType::Float64 {
-        return arr.clone();
-    }
-    let a = arr.as_primitive::<Float64Type>();
-    let out: Float64Array = a
-        .iter()
-        .map(|opt| {
-            opt.map(|v| {
-                if v.is_nan() {
-                    f64::from_bits(0x7ff8_0000_0000_0000) // one canonical quiet NaN
-                } else if v == 0.0 {
-                    0.0 // fold -0.0 into +0.0
-                } else {
-                    v
-                }
-            })
-        })
-        .collect();
-    Arc::new(out)
+    bc_arrow::canon_float_array(arr)
 }
 
 /// Flatten `parts` to `(g0..gN, v)` rows with the value kept in its **native** type
@@ -489,6 +473,7 @@ pub(crate) fn bounded_group_distinct(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        crate::ops::external_sort::DEFAULT_RUN_TARGET_BYTES,
         codec,
         None,
     )?
@@ -611,6 +596,7 @@ pub(crate) fn bounded_group_mode(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        crate::ops::external_sort::DEFAULT_RUN_TARGET_BYTES,
         codec,
         None,
     )?

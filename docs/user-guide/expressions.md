@@ -271,29 +271,29 @@ print(out.to_pydict())
 # {'total': [60.0], 'avg_qty': [2.0], 'rows': [3]}
 ```
 
-## Next steps
+## See also
 
 The rest of the expression language continues on two more pages:
 
-- [Expression accessors](expression-accessors.md): the `.str`, `.dt`, `.list`,
+- {doc}`Expression accessors <expression-accessors>`: the `.str`, `.dt`, `.list`,
   `.struct`, and `.json` namespaces, which hold the methods specific to one kind of
   column.
-- [Expression recipes](expression-recipes.md): porting from pandas or Polars, feature
+- {doc}`Expression recipes <expression-recipes>`: porting from pandas or Polars, feature
   engineering, and curating a text corpus.
 
 Then, for reference and for where expressions are used:
 
-- [Expressions API](../api/expressions.md) and
-  [Expression accessors API](../api/expression-accessors.md): every `Expr` method and
+- {doc}`Expressions API <../api/expressions>` and
+  {doc}`Expression accessors API <../api/expression-accessors>`: every `Expr` method and
   every accessor method, enumerated.
-- [Aggregations](aggregations.md) and [Window functions](window-functions.md): where
+- {doc}`Aggregations <aggregations>` and {doc}`Window functions <window-functions>`: where
   aggregate and windowed expressions are used.
-- [SQL](sql.md): the same column language, spelled as SQL.
-- [Transformations](transformations.md): where expressions are applied to a Dataset.
+- {doc}`SQL <sql>`: the same column language, spelled as SQL.
+- {doc}`Transformations <transformations>`: where expressions are applied to a Dataset.
 
 And for what happens to an expression after you write it:
 
-- [Expression evaluation](../deep-dives/expression-evaluation.md): how a tree of `Expr`
+- {doc}`Expression evaluation <../deep-dives/expression-evaluation>`: how a tree of `Expr`
   nodes becomes vectorized work over an Arrow batch.
-- [JIT compilation](../deep-dives/jit-compilation.md): when the Cranelift tier compiles an
+- {doc}`JIT compilation <../deep-dives/jit-compilation>`: when the Cranelift tier compiles an
   arithmetic chain, and why it silently falls back rather than diverging.

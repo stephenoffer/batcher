@@ -36,7 +36,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.flight_worker import _ticket, current_plan_id
-from batcher.dist.shuffle_replication import replicate_shuffle_output
+from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, LogicalPlan
@@ -420,18 +420,7 @@ def _reduce_with_recovery(
             # the old epoch's ticket, which reads back as an EMPTY bucket rather than an
             # error, so falling back to it would silently drop this mapper's rows. See the
             # epoch invariant in `dist/shuffle_replication.py`.
-            if replicas is not None and src < len(replicas):
-                if replicas[src]:
-                    events.publish(
-                        events.RECOVERY,
-                        name="aggregate",
-                        event="replica_retired",
-                        shuffle="aggregate",
-                        src=src,
-                        worker=host,
-                        replicas=len(replicas[src]),
-                    )
-                replicas[src] = []
+            retire_replicas(replicas, src, host, "aggregate")
             lineage[src] = lineage.get(src, ShuffleLineage(0, src)).reincarnate()
             target = _pick_live({host})
             placement.relocate(src, target)  # it lives here now, not on `src`

@@ -24,6 +24,7 @@ import pyarrow.compute as pc
 
 if TYPE_CHECKING:
     from batcher.plan.source_stats import SourceStatistics
+    from batcher.plan.stats import ColumnStat
 
 # Materializes column `name` as one (widened) chunked array/array, or raises if absent.
 ColumnBuilder = Callable[[str], "pa.ChunkedArray | pa.Array"]
@@ -32,169 +33,76 @@ ColumnBuilder = Callable[[str], "pa.ChunkedArray | pa.Array"]
 # "not derivable" (None / skip), never propagated: the metadata answer is optional.
 _ARROW_ERRORS = (pa.ArrowInvalid, pa.ArrowNotImplementedError, KeyError)
 
-
-def column_ndv(build: ColumnBuilder, name: str) -> int | None:
-    """EXACT distinct count of `name`'s non-null values, or None if not derivable.
-
-    A float column is canonicalized first, because Arrow's `count_distinct` distinguishes
-    `-0.0` from `0.0` (they have different bits) while the engine, SQL, and DuckDB do not
-    (they are numerically equal, and the engine's grouping key normalizes the sign). Without
-    this, a column holding both spellings of zero reported **two** distinct values from
-    metadata and **one** from executing — a `COUNT(DISTINCT)` that the optimization made
-    wrong, which is the worst kind of wrong. NaN needs no such treatment: Arrow already
-    counts every NaN as one value, as the engine and DuckDB do.
-    """
-    try:
-        return pc.count_distinct(_canonical_zeros(build(name)), mode="only_valid").as_py()
-    except _ARROW_ERRORS:
-        return None
+# Types with a total order, so min/max is meaningful and `pc.min_max` has a kernel. Decimal
+# belongs here and was missing: it is the type money is stored in, and without bounds a range
+# predicate on a price column falls back to a prior instead of interpolating. `duration` is
+# admitted by `is_temporal` but has no `min_max` kernel, so it still lands in the None path.
+_ORDERED_TYPES = (
+    pa.types.is_integer,
+    pa.types.is_floating,
+    pa.types.is_temporal,
+    pa.types.is_decimal,
+)
 
 
-def _canonical_zeros(col: pa.ChunkedArray | pa.Array) -> pa.ChunkedArray | pa.Array:
-    """`col` with any `-0.0` replaced by `0.0`; non-float columns pass through unchanged.
+def _decoded(col: pa.ChunkedArray | pa.Array) -> pa.ChunkedArray | pa.Array:
+    """A dictionary column's values as a plain array; anything else passes through.
 
-    The one place the metadata layer adopts the engine's view of a signed zero. `-0.0 == 0.0`
-    is true, so the two must never count as different values — but they are different *bits*,
-    and any statistic computed by hashing raw bits will disagree unless the sign is normalized
-    first. `pc.add(col, 0.0)` is that normalization: adding positive zero maps `-0.0` to `0.0`
-    and leaves every other value (NaN and the infinities included) exactly as it was.
-    """
-    if not pa.types.is_floating(col.type):
-        return col
-    return pc.add(col, pa.scalar(0.0, col.type))
+    Every statistic in this module describes the relation the **engine** will execute over,
+    and the engine decodes dictionary encoding at the FFI boundary: a `dictionary<string>`
+    column collects back as plain `string`, 9.2 bytes per row where the encoded form was 4.0.
+    A statistic computed on the encoded form would therefore describe a relation that never
+    exists at runtime.
 
-
-def column_mean(build: ColumnBuilder, name: str) -> float | None:
-    """EXACT average of `name`'s non-null values (a float, matched within tolerance)."""
-    try:
-        return pc.mean(build(name), skip_nulls=True).as_py()
-    except _ARROW_ERRORS:
-        return None
-
-
-def column_sum(build: ColumnBuilder, name: str) -> float | int | None:
-    """EXACT total of `name`'s non-null values, or None if not exactly representable.
-
-    A float column's sum is float (matches a run within tolerance). An integer column's sum
-    is returned only when exactly representable (``|sum| < 2**53``) — then it also fits
-    ``i64`` and equals the engine's overflow-checked ``SUM``; a larger integer sum could
-    overflow, so None (fall back to execution, which errors identically).
-    """
-    try:
-        col = build(name)
-        if pa.types.is_floating(col.type):
-            return pc.sum(col, skip_nulls=True).as_py()
-        if pa.types.is_integer(col.type):
-            approx = pc.sum(pc.cast(col, pa.float64()), skip_nulls=True).as_py()
-            if approx is not None and abs(approx) < 2**53:
-                return round(approx)  # exact: an integer sum < 2**53 is exact in f64
-    except _ARROW_ERRORS:
-        return None
-    return None
-
-
-# SQL comparison → the Arrow compute kernel whose truth count IS the surviving row
-# count of ``WHERE col <op> value``. Every kernel yields null for a null cell, so summing
-# the boolean counts only non-null matches — exactly SQL's three-valued comparison, where a
-# null operand is never true (dropped from every comparison, `=` and `<>` alike).
-_PREDICATE_KERNEL = {
-    "eq": pc.equal,
-    "ne": pc.not_equal,
-    "lt": pc.less,
-    "le": pc.less_equal,
-    "gt": pc.greater,
-    "ge": pc.greater_equal,
-}
-
-
-def column_predicate_count(build: ColumnBuilder, op: str, name: str, value: object) -> int | None:
-    """EXACT count of rows satisfying ``name <op> value`` (nulls excluded, SQL semantics).
-
-    `op` is one of eq/ne/lt/le/gt/ge. The matching Arrow kernel is null for a null cell, so
-    the boolean sum counts exactly the non-null rows the SQL comparison keeps — the surviving
-    count of ``WHERE col <op> value`` directly, no null-count bookkeeping. None if unsupported.
-    """
-    kernel = _PREDICATE_KERNEL.get(op)
-    if kernel is None:
-        return None
-    try:
-        col = build(name)
-        if _float_order_differs(col):
-            return None  # see below — this count would not be the count the engine produces
-        count = pc.sum(kernel(col, _literal_scalar(value, col.type)), skip_nulls=True).as_py()
-        return int(count) if count is not None else 0
-    except (*_ARROW_ERRORS, pa.ArrowTypeError):
-        return None
-
-
-def _literal_scalar(value: object, col_type: pa.DataType) -> pa.Scalar:
-    """The literal as a scalar that still *means* `value` against a `col_type` column.
-
-    Typing the scalar as the column's type is the fast path and is right whenever the cast
-    is lossless. It is not always lossless: `pa.scalar(-2.5, pa.int64())` is `-2`, so a
-    count for ``n > -0.5`` was taken as ``n > 0`` and silently lost every row where
-    ``n == 0``, while ``n == -2.5`` — which no integer can satisfy — counted the rows equal
-    to `-2`. Because this count answers `COUNT(*)` *without executing*, the result
-    contradicted the rows the same filter materializes: `count()` said 1 where
-    `to_pydict()` returned none.
-
-    When the cast would change the value, the scalar keeps its own type instead and Arrow's
-    kernels promote both sides to a common type — which is what the engine does when it
-    evaluates the predicate for real, so the count and the rows agree again.
+    Arrow's compute kernels agree by omission. `count_distinct`, `min_max`, `mean` and `sum`
+    have no dictionary kernel and raise `ArrowNotImplementedError`, which `_ARROW_ERRORS`
+    swallows -- so a categorical column silently lost its distinct count, its mean, its sum
+    and its bounds together, all four at once. Dictionary encoding is the default for a
+    low-cardinality column in Parquet and ORC and is what a pandas categorical arrives as, so
+    this was most of the exact-statistics surface on a very common column shape.
 
     Args:
-        value: The literal the predicate compares against.
-        col_type: The Arrow type of the column being compared.
+        col: The materialized column.
 
     Returns:
-        A scalar equal to `value`, typed as the column where that is exact.
+        `col` decoded when it is dictionary-encoded, otherwise `col` unchanged.
     """
-    try:
-        typed = pa.scalar(value, col_type)
-    except (*_ARROW_ERRORS, pa.ArrowTypeError, pa.ArrowInvalid):
-        return pa.scalar(value)
-    return typed if typed.as_py() == value else pa.scalar(value)
+    return col.cast(col.type.value_type) if pa.types.is_dictionary(col.type) else col
 
 
-def _float_order_differs(col: pa.ChunkedArray | pa.Array) -> bool:
-    """Whether this column holds a value on which Arrow's comparison and the engine's differ.
+def _value_dtype(dtype: pa.DataType) -> pa.DataType:
+    """The type a column's values have once decoded, seeing through dictionary encoding.
 
-    The counts above are computed with **pyarrow's** comparison kernels, which are IEEE. The
-    engine compares floats on arrow-rs's *total* order — NaN above every number, `-0.0` below
-    `0.0`. For ordinary values the two coincide, but on a NaN or a signed zero they do not, and
-    a count taken with one and used to answer the other is a wrong count.
+    `pa.types.is_integer(dictionary<values=int64, indices=int32>)` is `False`, so a type
+    predicate applied to the encoded label rejects a column whose values are perfectly
+    ordered integers. This is the same shape as an extension type hiding its storage type
+    from `plan.types.widths` -- a predicate asked about the label rather than the values.
 
-    Rather than guess which is right, this refuses to shortcut the columns where they disagree:
-    a column holding a NaN, or holding a zero (the only place `-0.0` can hide). Everything else
-    keeps the fast path. Cheap to decide — two vectorized predicates, no per-row Python.
+    Args:
+        dtype: The declared column type.
 
-    (The engine's total-order comparison also disagrees with DuckDB — `WHERE f = 0.0` misses
-    `-0.0`, `WHERE f > 1` matches NaN — which is the underlying bug, recorded in
-    `docs/internals/bug_hunt_ledger.md`. When it is fixed, this guard can go.)
+    Returns:
+        `dtype.value_type` for a dictionary type, otherwise `dtype` unchanged.
     """
-    if not pa.types.is_floating(col.type):
-        return False
-    has_nan = pc.any(pc.is_nan(col), min_count=0).as_py()
-    has_zero = pc.any(pc.equal(col, pa.scalar(0.0, col.type)), min_count=0).as_py()
-    return bool(has_nan) or bool(has_zero)
+    return dtype.value_type if pa.types.is_dictionary(dtype) else dtype
 
 
 def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
     """EXACT `ColumnStat` (min/max/null-count) for one column, or `None` if not derivable.
 
-    A single vectorized ``min_max`` pass. Returns `None` for a non-ordered type
-    (string/nested), an all-null column (its SQL ``MIN``/``MAX`` is NULL — let a run
-    return it), or an unsupported kernel — the same skips [`statistics`] makes per column.
+    A single vectorized ``min_max`` pass over an ordered type ([`_ORDERED_TYPES`]). Returns
+    `None` for a non-ordered type (string/nested), an all-null column (its SQL ``MIN``/``MAX``
+    is NULL — let a run return it), or an unsupported kernel — the same skips [`statistics`]
+    makes per column.
     Float columns take [`_float_bounds`], whose NaN handling `pc.min_max` does not give us.
     """
-    if not (
-        pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_temporal(dtype)
-    ):
+    dtype = _value_dtype(dtype)
+    if not any(ordered(dtype) for ordered in _ORDERED_TYPES):
         return None
     from batcher.plan.stats import ColumnStat, Provenance
 
     try:
-        col = build(name)
+        col = _decoded(build(name))
         if pa.types.is_floating(dtype):
             return _float_bounds(col)
         mm = pc.min_max(col, skip_nulls=True)
@@ -259,27 +167,186 @@ def statistics(build: ColumnBuilder, schema: pa.Schema, rows: int) -> SourceStat
     `has_nulls`, and `dq.not_null` free on the columns most tables are actually made of.
     """
     from batcher.plan.source_stats import SourceStatistics
-    from batcher.plan.stats import ColumnStat, Provenance
 
     columns: dict[str, ColumnStat] = {}
     for f in schema:
-        stat = column_bounds(build, f.type, f.name)
+        stat = column_stat(build, f.type, f.name)
         if stat is not None:
             columns[f.name] = stat
-            continue
-        nulls = column_null_count(build, f.name)
-        if nulls is not None:
-            # No trustworthy bounds (a string, a nested type, an all-null column), but an exact
-            # null count. `null_count_provenance` is what lets the second ride without the first.
-            columns[f.name] = ColumnStat(
-                null_count=float(nulls),
-                provenance=Provenance.DEFAULT,
-                null_count_provenance=Provenance.EXACT,
-            )
     # `column_bounds` records NaN as the max when the column holds one (SQL ranks NaN
     # greatest), so unlike a Parquet footer these bounds *are* sound for `max(f)` and
     # for every float fact derived from them — declare it.
     return SourceStatistics(row_count=rows, columns=columns, bounds_include_nan=True)
+
+
+def column_stat(build: ColumnBuilder, dtype: pa.DataType, name: str) -> ColumnStat | None:
+    """Everything exactly known about one column: its bounds, or failing those its nulls.
+
+    The single definition both callers share, and the reason it exists is that they had
+    drifted. `statistics()` fell back to a null-count-only stat when a column had no
+    trustworthy bounds — a string, a nested type, an all-null column — while
+    `InMemorySource.column_bounds` returned `None` for exactly those columns and its
+    docstring claimed that was "exactly as `statistics()` skips it". It is not what
+    `statistics()` does, and `column_bounds` is the form the conductor actually calls: every
+    real query narrows to the columns its predicates name (`_resident_subset_stats`), so the
+    whole-relation path that got this right was the one nothing took.
+
+    The cost was the exact fact, thrown away with the inexact one it sat beside. A string
+    column of 1,000 rows with 100 nulls reported its null count on the raw path and nothing
+    on the narrowed one, so `IS NULL` fell back to the 0.05 prior, and `n_null`, `count(col)`
+    and `dq.not_null` lost the answer that was already in hand — on the column types most
+    tables are made of.
+
+    Args:
+        build: The per-column array builder.
+        dtype: The column's Arrow type.
+        name: The column to describe.
+
+    Returns:
+        A `ColumnStat`, or `None` when nothing exact is derivable.
+    """
+    import dataclasses
+
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    width = column_avg_bytes(build, name)
+    stat = column_bounds(build, dtype, name)
+    if stat is not None:
+        return stat if width is None else dataclasses.replace(stat, avg_bytes=width)
+    nulls = column_null_count(build, name)
+    if nulls is None and width is None:
+        return None
+    # No trustworthy bounds, but an exact null count and/or an exact width.
+    # `null_count_provenance` is what lets the second ride without the first.
+    return ColumnStat(
+        null_count=None if nulls is None else float(nulls),
+        avg_bytes=width,
+        provenance=Provenance.DEFAULT,
+        null_count_provenance=Provenance.DEFAULT if nulls is None else Provenance.EXACT,
+    )
+
+
+def _dictionary_width(col: pa.ChunkedArray | pa.Array) -> float | None:
+    """Bytes per row a dictionary column will occupy **once the engine decodes it**.
+
+    The encoded buffers are the wrong number to report. The engine decodes at the FFI
+    boundary, so a 12-value string dictionary that measures 4.0 bytes per row encoded runs at
+    9.2 -- and reporting 4.0 under-sizes the memory envelope by 2.3x, which is the direction
+    that OOMs. Dictionary encoding exists precisely because the column is low-cardinality, so
+    this under-report lands on exactly the columns a categorical schema is made of.
+
+    Measured off the dictionary's own values, whose count is the distinct count rather than
+    the row count, so this stays O(distinct) and the cheap path stays cheap. That makes it an
+    *estimate*: it takes the mean dictionary entry to be the mean decoded value, which is
+    exact only when every entry appears equally often. Getting it exact needs the index
+    distribution, which is an O(rows) pass -- the very thing the cheap path exists to avoid.
+
+    The assumption is sound under *value* skew and breaks under **width** skew, where the
+    frequent values and the wide values are different values: it reports 9.16667 against a
+    9.16664 truth on a uniform dictionary but is 25.7x high on one shape and 0.51x low on its
+    mirror image. The prior it replaces is 125x low on that same worst case, so it is better
+    exactly where being wrong costs most. Measurements in the decision-quality ledger.
+
+    Args:
+        col: A dictionary-encoded column.
+
+    Returns:
+        Estimated decoded bytes per row, or `None` for an empty dictionary.
+    """
+    chunks = col.chunks if isinstance(col, pa.ChunkedArray) else [col]
+    total = sum(c.dictionary.nbytes for c in chunks)
+    entries = sum(len(c.dictionary) for c in chunks)
+    return total / entries if entries else None
+
+
+def _avg_bytes_of(col: pa.ChunkedArray | pa.Array) -> float | None:
+    """Bytes per row `col` occupies as the engine will hold it. The one width computation.
+
+    Args:
+        col: The materialized column.
+
+    Returns:
+        Average bytes per row, or `None` for an empty column.
+    """
+    if pa.types.is_dictionary(col.type):
+        return _dictionary_width(col)
+    rows = len(col)
+    return float(col.nbytes) / rows if rows else None
+
+
+def column_cheap_stat(build: ColumnBuilder, name: str) -> ColumnStat | None:
+    """Only what costs O(1): the null count and the average width. No bounds pass.
+
+    The conductor narrows per-column statistics to the columns a plan's predicates name,
+    because computing *bounds* is an O(rows) pass per column and a wide relation should not
+    pay it for columns nothing reads. But that narrowing is keyed on `column_bounds_needed`
+    and gates **everything**, so a plan with no predicate at all — a `group_by`, a plain scan
+    — received no column statistics whatsoever.
+
+    The width is not a bounds pass. Arrow tracks its buffer sizes, so it is a field read, and
+    it is the number the memory envelope, the morsel row cap, broadcast eligibility and the
+    task fan-out are all derived from. Measured: a `group_by` over a column of 2 KB documents
+    priced its rows at the 36-byte string prior while the identical source under a *filter*
+    reported the true 2,004.
+
+    Both facts come off one materialization, because building the column twice more than
+    doubled the cost of a call a wide relation makes once per column. A dictionary-encoded
+    column is measured through [`_avg_bytes_of`], since the engine decodes it and the encoded
+    size is not what runs.
+
+    Args:
+        build: The per-column array builder.
+        name: The column to describe.
+
+    Returns:
+        A bounds-free `ColumnStat`, or `None` when neither fact is derivable.
+    """
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    try:
+        col = build(name)
+        nulls = float(col.null_count)
+        width = _avg_bytes_of(col)
+    except _ARROW_ERRORS:
+        return None
+    return ColumnStat(
+        null_count=nulls,
+        avg_bytes=width,
+        provenance=Provenance.DEFAULT,
+        null_count_provenance=Provenance.EXACT,
+    )
+
+
+def column_avg_bytes(build: ColumnBuilder, name: str) -> float | None:
+    """EXACT average bytes per row of `name`, or None if not derivable.
+
+    Arrow tracks its buffer sizes, so `nbytes / len` is a field read rather than a pass —
+    the same argument `column_null_count` makes, and it costs microseconds on a
+    half-megabyte column.
+
+    It matters because the alternative is a *prior*. `plan.types.column_bytes` returns a
+    flat 32-byte guess for any variable-length column, which is the only thing available
+    before a row is read — and on text it is wrong by whatever the text actually is. Measured
+    on a corpus of 2 KB documents: 36 B/row estimated against a true 2,004, a **56x**
+    under-estimate of the number the memory envelope, the morsel row cap, broadcast
+    eligibility and the task fan-out are all derived from. The same shape as sizing a decoded
+    image column at 32 bytes, arriving through the other modality.
+
+    A resident source is the one place this is free, which is exactly the argument that
+    already justifies seeding distinct counts and heavy hitters there. `learn_column_stats`
+    measures it after a run; this makes the *first* run right.
+
+    Args:
+        build: The per-column array builder.
+        name: The column to measure.
+
+    Returns:
+        Average bytes per row, or `None` for an empty or unreadable column.
+    """
+    try:
+        return _avg_bytes_of(build(name))
+    except _ARROW_ERRORS:
+        return None
 
 
 def column_null_count(build: ColumnBuilder, name: str) -> int | None:

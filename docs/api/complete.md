@@ -2,7 +2,7 @@
 
 This page lists the public names in `batcher` that don't have a dedicated area page,
 rendered from the source docstrings. It's the exhaustive backstop behind the
-[quick reference](reference.md) and the example-first [area pages](index.md). Each
+{doc}`quick reference <reference>` and the example-first {doc}`area pages <index>`. Each
 top-level function links to its own page.
 
 Two large surfaces have their own pages rather than sitting here: {doc}`functions` for
@@ -93,7 +93,7 @@ Reference and derive columns, build literals, and branch.
 
 ## Column selectors
 
-A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the [transformations guide](../user-guide/transformations.md) for how they compose.
+A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the {doc}`transformations guide <../user-guide/transformations>` for how they compose.
 
 ```{eval-rst}
 .. autosummary::
@@ -126,7 +126,7 @@ A *selector* stands for every column matching a predicate. Pass one anywhere a c
 
 ## Configuration functions
 
-Read and override the engine tunables. See the [configuration guide](configuration.md).
+Read and override the engine tunables. See the {doc}`configuration guide <configuration>`.
 
 ```{eval-rst}
 .. autosummary::
@@ -144,7 +144,7 @@ Read and override the engine tunables. See the [configuration guide](configurati
 ### Options by name
 
 Address any tunable by its dotted path, in the style of `pandas.set_option` and
-`spark.conf.set`. See the [configuration guide](../configuration/index.md).
+`spark.conf.set`. See the {doc}`configuration guide <../configuration/index>`.
 
 ```{eval-rst}
 .. autofunction:: batcher.config.get_option
@@ -165,7 +165,7 @@ Address any tunable by its dotted path, in the style of `pandas.set_option` and
 ### Logging and verbosity
 
 One-line switches over `ObservabilityConfig`. See
-[observability](../user-guide/observability.md).
+{doc}`observability <../user-guide/observability>`.
 
 ```{eval-rst}
 .. autofunction:: batcher.config.set_log_level
@@ -206,7 +206,7 @@ Process-wide counters as plain data, for Prometheus, OpenTelemetry, or a log lin
 
 ## Governance
 
-See the [governance guide](../user-guide/governance.md) for how these fit together.
+See the {doc}`governance guide <../user-guide/governance>` for how these fit together.
 
 ```{eval-rst}
 .. autoclass:: batcher.SecurityCatalog
@@ -326,7 +326,7 @@ and slowly-changing-dimension workflows.
 
 ## Metadata shortcuts
 
-The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the [metadata shortcuts guide](../user-guide/metadata-shortcuts.md).
+The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the {doc}`metadata shortcuts guide <../user-guide/metadata-shortcuts>`.
 
 ```{eval-rst}
 .. autoclass:: batcher.api.dataset.meta.frame.DatasetMeta
@@ -382,7 +382,7 @@ The `ds.meta` namespace and the accessors it hands out read answers from footers
 
 ## Configuration classes
 
-The tunables, grouped by subsystem. See the [configuration guide](configuration.md)
+The tunables, grouped by subsystem. See the {doc}`configuration guide <configuration>`
 for what each one does and when to change it.
 
 ```{eval-rst}
@@ -433,3 +433,11 @@ for what each one does and when to change it.
 .. autoclass:: batcher.config.config.ShuffleTlsConfig
    :members:
 ```
+
+
+## See also
+
+- {doc}`reference`: the same surface as a short lookup table rather than a full listing.
+- {doc}`dataset`: the `Dataset` methods, with the semantics behind each one.
+- {doc}`expressions`: the `Expr` surface these methods take.
+- {doc}`../user-guide/index`: the task-oriented guides behind this reference.

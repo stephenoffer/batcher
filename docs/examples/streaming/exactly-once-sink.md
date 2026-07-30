@@ -78,6 +78,9 @@ already consumed everything.
 
 ## Which sinks actually dedup a replayed batch
 
+Sinks differ in what they deduplicate on, and that decides whether a replay is safe. The
+key column below is the identity the sink compares:
+
 | Sink | Dedup | Key |
 | --- | --- | --- |
 | `ds.write(path, format=...)` | by **position** | the file name, `part-batch00007.parquet` |
@@ -197,16 +200,16 @@ you were counting on cannot happen. Put the checkpoint on object storage.
 
 ## See also
 
-- [Kafka to the lake](kafka-etl.md): the ingestion job this write terminates.
-- [Windowed aggregation](windowed-aggregation.md): the stateful query whose snapshots live in
+- {doc}`Kafka to the lake <kafka-etl>`: the ingestion job this write terminates.
+- {doc}`Windowed aggregation <windowed-aggregation>`: the stateful query whose snapshots live in
   the same checkpoint directory.
-- [Stream join](stream-join.md): the one query shape that cannot reach any of these sinks.
-- [Writing data](../../user-guide/writing-data.md): the batch write surface and Delta
+- {doc}`Stream join <stream-join>`: the one query shape that cannot reach any of these sinks.
+- {doc}`Writing data <../../user-guide/writing-data>`: the batch write surface and Delta
   commits.
-- [Streaming](../../user-guide/streaming.md): triggers, checkpoints, and the query handle.
-- [Delta Lake integration](../../integrations/delta-lake.md): the `txn` action that makes the
+- {doc}`Streaming <../../user-guide/streaming>`: triggers, checkpoints, and the query handle.
+- {doc}`Delta Lake integration <../../integrations/delta-lake>`: the `txn` action that makes the
   strongest sink strong.
-- [Fault tolerance](../../architecture/fault-tolerance.md): the recovery model the offset and
+- {doc}`Fault tolerance <../../architecture/fault-tolerance>`: the recovery model the offset and
   commit logs implement.
-- [Deduplication](../data-engineering/deduplication.md): what to do when the sink you are
+- {doc}`Deduplication <../data-engineering/deduplication>`: what to do when the sink you are
   stuck with cannot dedup at all.

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/dq_contracts.py
 ```
+
+## See also
+
+- {doc}`deduplication`: deduplication: exact keys, whole rows, and keeping a chosen survivor.
+- {doc}`grouping`: grouping: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

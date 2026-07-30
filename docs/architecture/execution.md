@@ -14,8 +14,9 @@ crosses it. The Python entry point is Core handing the plan to the native engine
 out, metrics = _native.execute_plan_metered(plan.to_json(), sources, cfg.engine_config_json())
 ```
 
-For the engine's internals, the tiers, the morsel loop, and the runtime primitives,
-see {doc}`Execution engine <../internals/execution>`.
+For the contributor's view, which crate runs which scale, the thresholds with their
+config names, and the metadata layer that answers some terminals without a scan, see
+{doc}`Execution engine <../internals/execution>`.
 
 ## Lazy evaluation
 
@@ -66,9 +67,12 @@ scheduling granular and the working set in cache.
 
 ## Execution paths
 
-There is one set of operator semantics, exercised by three paths. The Tier-0
-sequential interpreter is the reference. It is deterministic and kept obviously
-correct, and the other two paths are tested against it.
+There is one set of operator semantics, exercised by three paths.
+
+The Tier-0 sequential interpreter is the reference. It is deterministic and kept
+obviously correct, and the other two paths are tested against it.
+
+![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](../_static/diagrams/execution_tiers.svg)
 
 Tier-0 parallel reuses the same operator code and changes only the scheduling. It
 morselizes, runs on a rayon thread pool, and hash-shuffles into the breakers,
@@ -87,9 +91,9 @@ Stateful operators are written once as mergeable primitives: `partial(batch)`
 builds a partial state, `combine(states)` merges two of them, and `finalize(state)`
 emits rows. Because `combine` is associative and commutative, partials merge in any
 order. That single implementation serves one core (the sequential interpreter),
-many cores (the parallel path builds partials and combines them), and many machines
-and many machines, where the distributed path composes the same `partial`, `combine`,
-and `finalize`. There is no separate distributed operator with its own semantics, so a
+many cores (the parallel path builds partials and combines them), and many machines,
+where the distributed path composes the same `partial`, `combine`, and `finalize`.
+There is no separate distributed operator with its own semantics, so a
 result is identical whether it runs on a laptop or a cluster. CI asserts exactly that.
 
 ## Adaptive re-optimization
@@ -129,7 +133,7 @@ disk and network are two sinks for one mechanism.
 
 ## See also
 
-- {doc}`Execution engine <../internals/execution>`: pipelines, morsels, and the tiers in detail.
+- {doc}`Execution engine <../internals/execution>`: the tiers, the crate map, and the exact thresholds.
 - {doc}`Architecture overview <overview>`: the two planes and the control-plane subsystems.
 - {doc}`Fault tolerance <fault-tolerance>`: what happens when a worker or a task fails.
 - {doc}`Configuration options <../configuration/options>`: every execution knob.

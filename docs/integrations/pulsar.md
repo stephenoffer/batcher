@@ -37,7 +37,7 @@ form. It is passed to the client verbatim, so use whatever your cluster expects.
 
 Rows come back in the fixed broker schema every streaming source shares (`key`, `value`,
 `partition`, `offset`, `timestamp`, `topic`), with `value` the raw payload bytes and `key` the
-partition key. Decoding is a transformation, not a reader option; the [Kafka page](kafka.md)
+partition key. Decoding is a transformation, not a reader option; the {doc}`Kafka page <kafka>`
 shows the JSON-payload pattern, and it is identical here.
 
 Two of those columns mean something slightly different on Pulsar.
@@ -165,7 +165,7 @@ write, or `bt.Trigger.available_now()` to drain the backlog that has already arr
 Auth is not wired. `PulsarSource` builds `pulsar.Client(service_url)` and nothing else. Token
 auth, TLS, and OAuth2 parameters have no way in today, so a cluster that requires
 authentication cannot be read without extending the source. See
-[custom connectors](../user-guide/custom-connectors.md).
+{doc}`custom connectors <../user-guide/custom-connectors>`.
 :::
 
 A poll waits. Each `receive` blocks for up to one second before giving up, and the poll stops
@@ -182,11 +182,11 @@ start rejecting producers. Delete the subscription when you retire a pipeline.
 
 ## See also
 
-- [Streaming](../user-guide/streaming.md): triggers, watermarks, output modes, checkpoints.
-- [Windowed aggregation](../examples/streaming/windowed-aggregation.md): the shape most
+- {doc}`Streaming <../user-guide/streaming>`: triggers, watermarks, output modes, checkpoints.
+- {doc}`Windowed aggregation <../examples/streaming/windowed-aggregation>`: the shape most
   Pulsar pipelines end up in.
-- [Custom connectors](../user-guide/custom-connectors.md): the `Source`/`Split` protocol, if
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the `Source`/`Split` protocol, if
   you need auth or a `Key_Shared` subscription.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Kafka](kafka.md): the same broker schema, and the payload-decoding example.
-- [Event Hubs](eventhubs.md): the other broker whose resume path needs care.
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Kafka <kafka>`: the same broker schema, and the payload-decoding example.
+- {doc}`Event Hubs <eventhubs>`: the other broker whose resume path needs care.

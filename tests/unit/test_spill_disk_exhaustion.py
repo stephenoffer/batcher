@@ -112,3 +112,76 @@ def test_a_non_enospc_oserror_is_not_relabelled(tmp_path) -> None:
         writer.write(_batch())
     assert not isinstance(excinfo.value, ResourceError)
     assert excinfo.value.errno == errno.EACCES
+
+
+class _FullAfter:
+    """An IPC writer that behaves normally, then reports the disk full.
+
+    Wraps the real writer rather than patching a production seam, so the code under test is
+    exactly what runs in a query.
+    """
+
+    def __init__(self, inner, after: int) -> None:
+        self._inner = inner
+        self._left = after
+
+    def write_batch(self, batch) -> None:
+        if self._left <= 0:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self._left -= 1
+        self._inner.write_batch(batch)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_a_volume_that_fills_mid_bucket_carries_over_to_remote(tmp_path) -> None:
+    """A local volume filling *during* a bucket must not fail the query.
+
+    The tier is chosen per bucket, which handles a volume that is already low. It cannot
+    handle one that fills partway through — and at scale a bucket is a whole partition, so
+    that is the case that matters: a 16-way spill of a terabyte writes ~60 GB per bucket,
+    and the check at open is one sample taken before any of it was written.
+
+    `memory.spill_remote_uri` is documented to keep an out-of-core query alive when local
+    disk fills, and it only did so at bucket boundaries. The batches already streamed are on
+    disk, not discarded, so they can be carried across one at a time.
+    """
+    store = TieredSpillStore(
+        str(tmp_path / "scratch"),
+        remote_uri=f"memory://{tmp_path.name}-carry",
+        compression=None,
+    )
+    writer = store.writer("b0")
+
+    # Two batches land locally; the third finds the volume full.
+    writer.write(_batch(100))
+    writer.write(_batch(100))
+    assert writer._tier is SpillTier.LOCAL
+    writer._writer = _FullAfter(writer._writer, after=0)
+
+    writer.write(_batch(100))
+    writer.write(_batch(100))
+    handle = writer.close()
+
+    assert handle is not None
+    assert handle.tier is SpillTier.REMOTE, "the bucket did not carry over to the remote tier"
+    assert handle.num_rows == 400
+    # Every row is there, including the two batches written before the disk filled.
+    assert sum(b.num_rows for b in store.read_stream(handle)) == 400
+    # And the local partial file is gone rather than stranded on the full volume.
+    assert not list((tmp_path / "scratch").glob("b0*"))
+
+
+def test_a_mid_bucket_fill_still_fails_loudly_with_no_remote_tier(tmp_path) -> None:
+    """Without a remote tier there is nowhere to carry the bucket to, so the query must fail
+    with the actionable error rather than pretend."""
+    store = TieredSpillStore(str(tmp_path / "scratch"), compression=None)
+    writer = store.writer("b0")
+    writer.write(_batch(10))
+    writer._writer = _FullAfter(writer._writer, after=0)
+
+    with pytest.raises(ResourceError) as exc:
+        writer.write(_batch(10))
+    assert "spill" in str(exc.value).lower()
+    writer.abort()

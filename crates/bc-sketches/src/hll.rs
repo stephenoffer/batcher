@@ -95,7 +95,7 @@ impl HyperLogLog {
     /// distinct NaN payloads, as separate distinct values, over-counting the ndv).
     fn add_array_fast(&mut self, array: &ArrayRef) -> bool {
         use arrow::array::*;
-        use arrow::datatypes::DataType as DT;
+        use arrow::datatypes::{DataType as DT, TimeUnit};
 
         macro_rules! prim {
             ($ty:ty, $hashval:expr) => {{
@@ -131,6 +131,61 @@ impl HyperLogLog {
             DT::Float64 => prim!(Float64Array, |v: f64| canon_float_bits(v)),
             DT::Date32 => prim!(Date32Array, |v: i32| v as i64),
             DT::Date64 => prim!(Date64Array, |v: i64| v),
+            // The temporal and decimal families below are as primitive as the integers above
+            // — one fixed-width value per row — and they were falling through to the
+            // `RowConverter` path, which builds a converter and materializes a full row-format
+            // encoding of the column **per array**. That is the slow path for types with no
+            // scalar representation, and it was being taken by `Timestamp` and `Decimal128`:
+            // the column types of essentially every event table and every financial table.
+            //
+            // The unit and the timezone are fixed by the column's `DataType`, so within a
+            // column the raw storage integer is a faithful identity — two rows are the same
+            // instant exactly when the integer matches. Across columns nothing is compared,
+            // and nothing persists an HLL, so no stored sketch mixes the two hashings.
+            DT::Timestamp(TimeUnit::Second, _) => prim!(TimestampSecondArray, |v: i64| v),
+            DT::Timestamp(TimeUnit::Millisecond, _) => {
+                prim!(TimestampMillisecondArray, |v: i64| v)
+            }
+            DT::Timestamp(TimeUnit::Microsecond, _) => {
+                prim!(TimestampMicrosecondArray, |v: i64| v)
+            }
+            DT::Timestamp(TimeUnit::Nanosecond, _) => prim!(TimestampNanosecondArray, |v: i64| v),
+            DT::Time32(TimeUnit::Second) => prim!(Time32SecondArray, |v: i32| v as i64),
+            DT::Time32(TimeUnit::Millisecond) => prim!(Time32MillisecondArray, |v: i32| v as i64),
+            DT::Time64(TimeUnit::Microsecond) => prim!(Time64MicrosecondArray, |v: i64| v),
+            DT::Time64(TimeUnit::Nanosecond) => prim!(Time64NanosecondArray, |v: i64| v),
+            DT::Duration(TimeUnit::Second) => prim!(DurationSecondArray, |v: i64| v),
+            DT::Duration(TimeUnit::Millisecond) => prim!(DurationMillisecondArray, |v: i64| v),
+            DT::Duration(TimeUnit::Microsecond) => prim!(DurationMicrosecondArray, |v: i64| v),
+            DT::Duration(TimeUnit::Nanosecond) => prim!(DurationNanosecondArray, |v: i64| v),
+            // Precision and scale are fixed by the column type, so the unscaled integer is the
+            // value's identity — the same argument as the temporal storage integers above.
+            DT::Decimal128(_, _) => prim!(Decimal128Array, |v: i128| v),
+            DT::Decimal256(_, _) => {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .expect("decimal256");
+                for i in 0..a.len() {
+                    if a.is_valid(i) {
+                        self.add_hash(SEED.hash_one(a.value(i).to_be_bytes()));
+                    }
+                }
+                true
+            }
+            // Two distinct values at most, and the row-format path was encoding every one.
+            DT::Boolean => {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("boolean");
+                for i in 0..a.len() {
+                    if a.is_valid(i) {
+                        self.add_hash(SEED.hash_one(a.value(i)));
+                    }
+                }
+                true
+            }
             DT::Utf8 => {
                 let a = array.as_any().downcast_ref::<StringArray>().expect("utf8");
                 for i in 0..a.len() {
@@ -643,5 +698,119 @@ mod tests {
                 "trial {trial}: precision={precision} n={n} estimate mismatch after roundtrip"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+    use arrow::array::{
+        BooleanArray, Decimal128Array, Decimal256Array, DurationMicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::i256;
+    use std::sync::Arc;
+
+    /// The estimate for `array` must be close to the true distinct count. A precision-14
+    /// sketch has ~0.81% relative error, so 5% is loose enough never to flake and tight
+    /// enough to catch a hashing that collides values or splits equal ones.
+    fn assert_counts(array: ArrayRef, truth: u64) {
+        let mut hll = HyperLogLog::default_precision();
+        hll.add_array(&array);
+        let est = hll.estimate();
+        let tol = (truth as f64 * 0.05).max(1.0);
+        assert!(
+            (est - truth as f64).abs() <= tol,
+            "estimate {est} for {truth} distinct values of {:?}",
+            array.data_type()
+        );
+    }
+
+    /// Every type below reached the sketch through Arrow's `RowConverter` before it was
+    /// fast-pathed, so these pin two things at once: the estimate is still right, and the
+    /// column types of essentially every event and financial table no longer materialize a
+    /// row-format encoding of the whole column per morsel to be counted.
+    #[test]
+    fn timestamps_are_counted() {
+        let values: Vec<i64> = (0..10_000).map(|i| i * 1_000).collect();
+        assert_counts(
+            Arc::new(TimestampMicrosecondArray::from(values)) as ArrayRef,
+            10_000,
+        );
+    }
+
+    #[test]
+    fn a_timestamp_with_a_timezone_is_counted() {
+        let values: Vec<i64> = (0..5_000).collect();
+        let array = TimestampMicrosecondArray::from(values).with_timezone("UTC");
+        assert_counts(Arc::new(array) as ArrayRef, 5_000);
+    }
+
+    #[test]
+    fn repeated_timestamps_are_one_distinct_value() {
+        let array = TimestampMicrosecondArray::from(vec![7_i64; 4_096]);
+        assert_counts(Arc::new(array) as ArrayRef, 1);
+    }
+
+    #[test]
+    fn times_and_durations_are_counted() {
+        let times: Vec<i64> = (0..3_000).collect();
+        assert_counts(
+            Arc::new(Time64NanosecondArray::from(times)) as ArrayRef,
+            3_000,
+        );
+        let durations: Vec<i64> = (0..3_000).map(|i| i * 17).collect();
+        assert_counts(
+            Arc::new(DurationMicrosecondArray::from(durations)) as ArrayRef,
+            3_000,
+        );
+    }
+
+    #[test]
+    fn decimals_are_counted() {
+        let values: Vec<i128> = (0..8_000).map(|i| i * 3).collect();
+        let array = Decimal128Array::from(values)
+            .with_precision_and_scale(38, 2)
+            .unwrap();
+        assert_counts(Arc::new(array) as ArrayRef, 8_000);
+
+        let wide: Vec<i256> = (0..2_000).map(i256::from_i128).collect();
+        let array = Decimal256Array::from(wide)
+            .with_precision_and_scale(50, 2)
+            .unwrap();
+        assert_counts(Arc::new(array) as ArrayRef, 2_000);
+    }
+
+    #[test]
+    fn booleans_have_at_most_two_distinct_values() {
+        let array = BooleanArray::from((0..10_000).map(|i| i % 2 == 0).collect::<Vec<_>>());
+        assert_counts(Arc::new(array) as ArrayRef, 2);
+    }
+
+    #[test]
+    fn nulls_are_not_distinct_values() {
+        let array = TimestampMicrosecondArray::from(
+            (0..2_000)
+                .map(|i| if i % 3 == 0 { None } else { Some(i as i64) })
+                .collect::<Vec<_>>(),
+        );
+        let truth = (0..2_000).filter(|i| i % 3 != 0).count() as u64;
+        assert_counts(Arc::new(array) as ArrayRef, truth);
+    }
+
+    /// Accumulating batch by batch must agree with counting the whole column at once —
+    /// the property `ColumnStats::update` relies on.
+    #[test]
+    fn accumulating_matches_one_pass() {
+        let all: Vec<i64> = (0..12_000).collect();
+        let mut whole = HyperLogLog::default_precision();
+        whole.add_array(&(Arc::new(TimestampMicrosecondArray::from(all.clone())) as ArrayRef));
+
+        let mut folded = HyperLogLog::default_precision();
+        for chunk in all.chunks(1_000) {
+            let array: ArrayRef = Arc::new(TimestampMicrosecondArray::from(chunk.to_vec()));
+            folded.add_array(&array);
+        }
+        assert_eq!(whole.estimate(), folded.estimate());
     }
 }

@@ -202,12 +202,12 @@ to fall back. Never ship a JIT path that disagrees with the oracle.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): where a second execution tier is allowed to live
-- [Execution engine](../internals/execution.md): the tiering contract at the architecture level
+- {doc}`Architecture <../architecture/index>`: where a second execution tier is allowed to live
+- {doc}`Execution engine <../internals/execution>`: the tiering contract at the architecture level
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the parity argument, stated formally
-- [Performance](../user-guide/performance.md): writing predicates that land on this tier
-- [Analytics benchmarks](../benchmarks/analytics.md): the `filter → count` and `filter → project` ratios quoted above
-- [Expression evaluation](expression-evaluation.md): the Tier-0 oracle it must match
-- [Morsel parallelism](morsel-parallelism.md): the loop the compiled artifact runs inside
-- [Cost model](cost-model.md): how `jit_speedup` prices a compilable expression
+- {doc}`Performance <../user-guide/performance>`: writing predicates that land on this tier
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: the `filter → count` and `filter → project` ratios quoted above
+- {doc}`Expression evaluation <expression-evaluation>`: the Tier-0 oracle it must match
+- {doc}`Morsel parallelism <morsel-parallelism>`: the loop the compiled artifact runs inside
+- {doc}`Cost model <cost-model>`: how `jit_speedup` prices a compilable expression
 :::

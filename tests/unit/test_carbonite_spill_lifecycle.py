@@ -167,6 +167,36 @@ def test_free_disk_reading_is_ttl_cached(tmp_path, monkeypatch) -> None:
     assert calls["n"] == 2
 
 
+def test_classifying_the_volume_does_not_route_around_the_cache(tmp_path, monkeypatch) -> None:
+    """`disk_pressure` reads free space through the TTL cache and then took `total` twice
+    with raw `shutil.disk_usage` calls — once directly, once inside `disk_floor_bytes`.
+
+    The store consults the pressure once per bucket open, so a 4,096-way partitioned spill
+    made 8,192 uncached `statvfs` calls: more than the storm the cache was added to stop,
+    for a number that moves even less than free space does.
+    """
+    import shutil
+
+    spill_disk.reset_disk_sampling()
+    calls = {"n": 0}
+
+    class _Usage:
+        total = 100 << 30
+        used = 0
+        free = 80 << 30
+
+    def counted(_path):
+        calls["n"] += 1
+        return _Usage()
+
+    monkeypatch.setattr(shutil, "disk_usage", counted)
+    for _ in range(50):
+        spill_disk.disk_pressure(str(tmp_path))
+
+    # One reading of free, one of capacity, for the whole window.
+    assert calls["n"] == 2
+
+
 def test_disk_floor_shrinks_on_a_small_volume(tmp_path, monkeypatch) -> None:
     """A fixed 256 MiB reserve is a quarter of a 1 GiB container scratch mount."""
     import shutil
@@ -201,3 +231,113 @@ def test_an_unknown_compression_codec_is_recorded_not_silent(monkeypatch) -> Non
     )
     assert spill_disk.ipc_options("zstandard") is None
     assert seen, "a codec that does not exist must be reported, not silently dropped"
+
+
+def test_a_truncated_bucket_is_refused_rather_than_read_short(tmp_path) -> None:
+    """A spilled bucket cut at a message boundary must fail, not shorten the answer.
+
+    An Arrow IPC *stream* truncated at a message boundary -- the last complete batch present,
+    the end-of-stream marker gone -- is byte-for-byte a shorter valid stream, so
+    `pa.ipc.open_stream` returns the batches it finds and reports success. The reducer then
+    computes a correct answer over the wrong rows, with nothing recording that it happened.
+
+    The boundary is constructed exactly, from a reference bucket of three batches minus its
+    8-byte end-of-stream marker, rather than by cutting an arbitrary fraction: a cut that
+    lands *inside* a message arrow catches on its own, and only the boundary case needs the
+    row count `SpillHandle` has always carried for it.
+    """
+    from batcher._internal.errors import ResourceError
+
+    eos_bytes = 8  # continuation marker + zero length
+
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+
+    # A reference bucket of three batches: its length is the boundary.
+    ref = store.writer("ref")
+    for _ in range(3):
+        ref.write(_batch(1000))
+    ref_handle = ref.close()
+    boundary = os.path.getsize(ref_handle.path) - eos_bytes
+
+    # The real bucket: five batches, cut back to the three-batch boundary.
+    w = store.writer("b0")
+    for _ in range(5):
+        w.write(_batch(1000))
+    handle = w.close()
+    assert handle.num_rows == 5000
+    with open(handle.path, "r+b") as fh:
+        fh.truncate(boundary)
+
+    with pytest.raises(ResourceError) as exc:
+        list(store.read_stream(handle))
+    assert "3000" in str(exc.value) and "5000" in str(exc.value)
+
+
+def test_an_intact_bucket_reads_back_without_complaint(tmp_path) -> None:
+    """The truncation check must not fire on a healthy bucket, or it would be a way to fail
+    every spilling query rather than a guard on a rare one."""
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+    w = store.writer("b0")
+    for _ in range(4):
+        w.write(_batch(500))
+    handle = w.close()
+
+    assert sum(b.num_rows for b in store.read_stream(handle)) == 2000
+    assert sum(b.num_rows for b in store.read(handle)) == 2000
+
+
+def test_a_shared_dictionary_is_charged_once_per_bucket(tmp_path) -> None:
+    """A dictionary-encoded column must not be charged its dictionary in every batch.
+
+    Batches of such a column all point at the *same* values array, but `nbytes` includes the
+    whole dictionary in each one -- measured at 256 KB per batch for 16 KB of indices on a
+    20,000-entry string dictionary, so a bucket of 100 batches is charged ~25 MB for ~1.8 MB
+    of content.
+
+    Three decisions run on that figure and all three go wrong the same way: the local budget
+    overflows to object storage far too early, `read_reserved` reserves ~14x the memory the
+    read takes, and the bucket looks over `spill_bucket_max_bytes` so the re-split recursion
+    pays a full extra write and read to split a bucket that already fitted. None is a wrong
+    answer, which is why it survived -- it only shows up as slowness.
+    """
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+    values = pa.array([f"c-{i:06}" for i in range(20_000)], type=pa.string())
+    indices = pa.array([i % 20_000 for i in range(4_096)], type=pa.int32())
+
+    def morsel() -> pa.RecordBatch:
+        return pa.record_batch({"k": pa.DictionaryArray.from_arrays(indices, values)})
+
+    n = 20
+    w = store.writer("dict")
+    for _ in range(n):
+        w.write(morsel())
+    handle = w.close()
+
+    per_batch = morsel().nbytes
+    naive = per_batch * n
+    honest = values.nbytes + indices.nbytes * n
+
+    assert handle is not None
+    assert handle.logical_nbytes <= honest, (
+        f"charged {handle.logical_nbytes} for a bucket whose content is {honest} bytes -- the "
+        f"shared dictionary is still being counted in every batch"
+    )
+    assert naive > handle.logical_nbytes * 5, (
+        f"the naive charge ({naive}) should be many times the deduplicated one "
+        f"({handle.logical_nbytes}); if not, this test no longer measures its shape"
+    )
+    # Every row still reads back, so the cheaper accounting has not changed the data.
+    assert sum(b.num_rows for b in store.read_stream(handle)) == 4_096 * n
+
+
+def test_a_bucket_without_dictionaries_is_charged_as_before(tmp_path) -> None:
+    """The deduplication must not disturb an ordinary bucket -- the common case."""
+    store = TieredSpillStore(str(tmp_path / "s"), compression=None)
+    w = store.writer("plain")
+    batches = [_batch(1000) for _ in range(5)]
+    for b in batches:
+        w.write(b)
+    handle = w.close()
+
+    assert handle is not None
+    assert handle.logical_nbytes == sum(b.nbytes for b in batches)

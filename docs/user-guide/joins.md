@@ -116,8 +116,8 @@ print(enriched.to_pydict())
 #  'amount': [10, 20, 30, 40, 50], 'region': ['west', 'east', 'west', 'east', 'west']}
 ```
 
-## Next steps
+## See also
 
-- [Aggregations](aggregations.md): summarize joined results.
-- [Window functions](window-functions.md): per-row computations over partitions.
-- [Dataset API](../api/dataset.md): the `join` and `join_asof` reference.
+- {doc}`Aggregations <aggregations>`: summarize joined results.
+- {doc}`Window functions <window-functions>`: per-row computations over partitions.
+- {doc}`Dataset API <../api/dataset>`: the `join` and `join_asof` reference.

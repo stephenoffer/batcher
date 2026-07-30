@@ -12,7 +12,7 @@ The single-pass metric *expressions* such as `bt.rmse` and `bt.f1_score` live in
 `batcher.ml.tabular` is the classical-ML inference plane behind
 {meth}`~batcher.Dataset.ml.predict`: it assembles Arrow columns into the dense matrix an
 XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model expects, and wraps the model as a
-load-once class UDF. See the [tabular models guide](../ml/tabular-models.md).
+load-once class UDF. See the {doc}`tabular models guide <../ml/tabular-models>`.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.tabular
@@ -28,7 +28,7 @@ load-once class UDF. See the [tabular models guide](../ml/tabular-models.md).
 
 ## Linear models
 
-`batcher.ml.linear` fits ordinary and ridge regression inside the engine — the normal equations
+`batcher.ml.linear` fits ordinary and ridge regression inside the engine. The normal equations
 are built from the feature/target moments, so the whole fit is a single scan and only the small
 solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 
@@ -72,7 +72,7 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
    :members:
 ```
 
-`batcher.ml.glm` fits the Tweedie family of generalized linear models — the general form and its Poisson and gamma special cases — by the same one-scan IRLS steps.
+`batcher.ml.glm` fits the Tweedie family of generalized linear models by the same one-scan IRLS steps, covering the general form and its Poisson and gamma special cases.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.glm
@@ -120,9 +120,9 @@ its own (quadratic boundaries).
 ## Evaluation
 
 `batcher.ml.metrics` holds the metrics that need a global ordering or return a table. The
-single-pass metric *expressions* — `bt.rmse`, `bt.f1_score`, and the rest — are in the
-[expression reference](expressions.md) instead, because they are ordinary aggregates. See
-the [evaluation guide](../ml/evaluation.md).
+single-pass metric *expressions*, meaning `bt.rmse`, `bt.f1_score`, and the rest, are in the
+{doc}`expression reference <expressions>` instead, because they are ordinary aggregates. See
+the {doc}`evaluation guide <../ml/evaluation>`.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.metrics
@@ -150,7 +150,7 @@ the [evaluation guide](../ml/evaluation.md).
 
 A recommender is scored differently: what matters is the order within *one* query, averaged
 over queries. These compute the metric per group and then average, never pooling rows across
-groups — which silently rewards a model that ranks one heavy user well and everyone else
+groups, which silently rewards a model that ranks one heavy user well and everyone else
 badly.
 
 ```{eval-rst}
@@ -204,7 +204,7 @@ a single streaming pass.
    :members:
 ```
 
-`batcher.ml.mixture` fits a Gaussian mixture — soft clustering and density estimation by EM.
+`batcher.ml.mixture` fits a Gaussian mixture, giving soft clustering and density estimation by EM.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.mixture
@@ -261,7 +261,7 @@ the filter half of scikit-learn's `SelectKBest`.
 .. autofunction:: select_k_best
 ```
 
-`batcher.ml.timeseries` diagnoses serial structure — the autocorrelation function and the standard tests of whether a series or a model's residuals still carry it.
+`batcher.ml.timeseries` diagnoses serial structure with the autocorrelation function and the standard tests of whether a series or a model's residuals still carry it.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.timeseries

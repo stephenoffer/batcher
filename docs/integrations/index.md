@@ -10,7 +10,7 @@ production.
 
 Every connector is built from the same four types (`Source`, `Sink`, `Split`, and the
 format registry). If yours is not on this list, that surface is public and documented in
-[custom connectors](../user-guide/custom-connectors.md).
+{doc}`custom connectors <../user-guide/custom-connectors>`.
 
 :::{tip}
 Every connector page opens with a capability table: what it reads, what it writes, the pip extra,
@@ -162,12 +162,12 @@ Datasets in with no copy; model ids that load once per worker.
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md) and [Writing data](../user-guide/writing-data.md):
+- {doc}`Reading data <../user-guide/reading-data>` and {doc}`Writing data <../user-guide/writing-data>`:
   the reader and writer surface every connector on this page plugs into, including how a source
   divides itself into splits and which predicates reach it.
-- [Custom connectors](../user-guide/custom-connectors.md): the protocol, for a system not listed.
-- [Cloud storage](../user-guide/cloud-storage.md): credentials and object-store paths.
-- [I/O API](../api/io.md): the reference.
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the protocol, for a system not listed.
+- {doc}`Cloud storage <../user-guide/cloud-storage>`: credentials and object-store paths.
+- {doc}`I/O API <../api/io>`: the reference.
 
 ```{toctree}
 :hidden:

@@ -167,20 +167,20 @@ an undersized budget.
 There is no side output for the rows the watermark drops, and no per-batch late-row
 counter in `recent_progress()`. A window that closed early is quietly short, and nothing in
 the job's metrics says so. Late data is covered in
-[Late data and watermarks](late-data-watermarks.md).
+{doc}`Late data and watermarks <late-data-watermarks>`.
 :::
 
 ## See also
 
-- [Late data and watermarks](late-data-watermarks.md): what `lateness` actually costs.
-- [Exactly-once sinks](exactly-once-sink.md): making the gold write survive a restart.
-- [Kafka to the lake](kafka-etl.md): the bronze layer this gold one aggregates.
-- [Streaming](../../user-guide/streaming.md): triggers, output modes, and the query handle.
-- [Aggregations](../../user-guide/aggregations.md): the aggregate surface itself.
-- [Window functions](../../user-guide/window-functions.md): the other kind of window, over a
+- {doc}`Late data and watermarks <late-data-watermarks>`: what `lateness` actually costs.
+- {doc}`Exactly-once sinks <exactly-once-sink>`: making the gold write survive a restart.
+- {doc}`Kafka to the lake <kafka-etl>`: the bronze layer this gold one aggregates.
+- {doc}`Streaming <../../user-guide/streaming>`: triggers, output modes, and the query handle.
+- {doc}`Aggregations <../../user-guide/aggregations>`: the aggregate surface itself.
+- {doc}`Window functions <../../user-guide/window-functions>`: the other kind of window, over a
   bounded frame.
-- [Delta Lake integration](../../integrations/delta-lake.md): the sink in the query above.
-- [Mergeable algebra](../../deep-dives/mergeable-algebra.md): why one running partial per open
+- {doc}`Delta Lake integration <../../integrations/delta-lake>`: the sink in the query above.
+- {doc}`Mergeable algebra <../../deep-dives/mergeable-algebra>`: why one running partial per open
   window is all the state there is.
-- [Time-series rollups](../analytics/time-series-rollups.md): the same windows, computed as a
+- {doc}`Time-series rollups <../analytics/time-series-rollups>`: the same windows, computed as a
   batch.

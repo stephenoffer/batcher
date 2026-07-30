@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/operations/error_handling.py
 ```
+
+## See also
+
+- {doc}`environment`: what is installed, what the engine sees, and what to paste into a bug report.
+- {doc}`inspecting_a_query`: reading a plan, timing a query, and checking what the engine actually ran.
+- {doc}`../../user-guide/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`../../user-guide/observability`: what the engine records about a run, and where.

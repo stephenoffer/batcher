@@ -86,7 +86,7 @@ latest = events.distinct(subset=["event_id"], keep="last", order_by="ingested_at
 `keep="last"` is the right choice for a *mutable* record, where the later row is a newer
 version of the same entity rather than a copy of the same event. Ordering by a
 monotonic sequence and keeping the last is the "latest state per key" pattern that the
-[CDC pipeline](cdc-pipeline.md) leans on.
+{doc}`CDC pipeline <cdc-pipeline>` leans on.
 :::
 
 ::::
@@ -170,6 +170,9 @@ looked nice.
 
 ## Picking the tool
 
+Four tools deduplicate, and they differ in what they hand back and what they cost. Match
+the row to the question you actually need answered:
+
 | Tool | Gives you | Costs | Reach for it when |
 |---|---|---|---|
 | `distinct(subset=..., keep=..., order_by=...)` | one row per key | one hash pass | you want the answer and nothing else |
@@ -178,10 +181,10 @@ looked nice.
 
 ## See also
 
-- [CDC pipeline](cdc-pipeline.md): duplicates plus deletes plus reordering.
-- [Quality gates](quality-gates.md): fail the run when the duplicate rate spikes.
-- [Late-arriving data](late-arriving-data.md): what the watermark is really doing.
-- [Distinct and dedup](../../user-guide/distinct-and-dedup.md): every form of `distinct`.
-- [Window functions](../../user-guide/window-functions.md): `row_number` and its friends.
-- [Kafka](../../integrations/kafka.md): where the at-least-once delivery comes from.
-- [Dataset API](../../api/dataset.md): `distinct`, `n_unique`, and the `dq` accessor.
+- {doc}`CDC pipeline <cdc-pipeline>`: duplicates plus deletes plus reordering.
+- {doc}`Quality gates <quality-gates>`: fail the run when the duplicate rate spikes.
+- {doc}`Late-arriving data <late-arriving-data>`: what the watermark is really doing.
+- {doc}`Distinct and dedup <../../user-guide/distinct-and-dedup>`: every form of `distinct`.
+- {doc}`Window functions <../../user-guide/window-functions>`: `row_number` and its friends.
+- {doc}`Kafka <../../integrations/kafka>`: where the at-least-once delivery comes from.
+- {doc}`Dataset API <../../api/dataset>`: `distinct`, `n_unique`, and the `dq` accessor.

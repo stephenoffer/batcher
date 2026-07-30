@@ -100,7 +100,7 @@ print(QuantileTransformer("x", n_quantiles=4).fit_transform(ds).to_pydict())
 ```
 
 `PowerTransformer` is the data-driven middle ground. It finds the Yeo-Johnson power that
-makes the column most Gaussian by maximum likelihood — and does it in **one pass**, because
+makes the column most Gaussian by maximum likelihood, and it does so in **one pass**, because
 the likelihood at every candidate lambda is an aggregate, so the whole grid is evaluated
 together rather than one scan per optimizer iteration.
 
@@ -130,8 +130,8 @@ point: a new record-breaking value is clamped rather than extrapolated into a re
 model never saw.
 
 `MissingIndicator` records which values were missing **before** an imputer fills them.
-Missingness is usually a signal — a blank income field means something different from a low
-one — and imputing first destroys it permanently.
+Missingness is usually a signal, since a blank income field means something different from a
+low one, and imputing first destroys that signal permanently.
 
 ```python
 from batcher.ml.preprocessors import Chain, MissingIndicator, SimpleImputer
@@ -143,7 +143,7 @@ print(flagged.to_pydict()["income_missing"])
 
 ## Rank and label transforms
 
-`RankTransformer` replaces a value with its percentile rank — like `QuantileTransformer` it
+`RankTransformer` replaces a value with its percentile rank. Like `QuantileTransformer` it
 keeps only the order and is immune to outliers, but it is exact (every distinct value gets its
 own rank) rather than binned, which matters on a small column.
 
@@ -155,7 +155,7 @@ ds = bt.from_pydict({"x": [10.0, 40.0, 20.0, 1000.0]})
 print(RankTransformer("x").fit_transform(ds).to_pydict()["x"])
 ```
 
-`LabelBinarizer` one-vs-rest expands a categorical *label* into a 0/1 column per class — the
+`LabelBinarizer` one-vs-rest expands a categorical *label* into a 0/1 column per class. It is the
 target-side counterpart of one-hot encoding, for a per-class metric or a set of binary models.
 `MultiLabelBinarizer` does the same for a *list* column, where a row can carry many labels at
 once (tags, genres), which is the standard input shaping for a multi-label classifier.

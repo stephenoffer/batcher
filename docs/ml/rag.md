@@ -122,7 +122,7 @@ The whole ingest chain of scan, strip, chunk, explode, dedupe, and embed is row-
 apart from the dedup, so it streams and distributes with no breaker before the GPU stage.
 The one thing no static estimate can know is how many chunks a document yields. The
 engine measures the real fan-out on the first run and sizes the downstream GPU stage for
-it on the next. See [adaptive re-optimization](../internals/kyber.md).
+it on the next. See {doc}`adaptive re-optimization <../internals/kyber>`.
 
 ## Retrieval
 
@@ -179,7 +179,7 @@ Metadata scoping is a predicate here, not a post-filter.
 :::{tip}
 That `filter` runs against the index rather than against the k rows it returned, which is
 the difference between "5 results, all from this tenant" and "5 results, 2 of which you
-have to throw away". See [vector search](vector-search.md).
+have to throw away". See {doc}`vector search <vector-search>`.
 :::
 
 ## Building the prompt
@@ -221,7 +221,7 @@ answers.write.parquet("s3://bucket/answers.parquet")
 `template` builds the prompt from columns, so the context you assembled above lands in
 the prompt without a per-row Python string format. For a JSON answer, `parse_json=True`
 with a `guided_json` schema gets typed columns back instead of a string you have to
-regex. See [LLM inference](llm.md).
+regex. See {doc}`LLM inference <llm>`.
 
 ## The failure modes, in order
 
@@ -245,15 +245,15 @@ retrieves nonsense with confident-looking distances.
 
 ## See also
 
-- [Embeddings](embeddings.md): the encode stage in detail.
-- [Vector search](vector-search.md): brute force vs an ANN index.
-- [LLM inference](llm.md): engines, chat templates, structured output.
-- [Governance](../user-guide/governance.md): row filters and column masks, if the corpus
+- {doc}`Embeddings <embeddings>`: the encode stage in detail.
+- {doc}`Vector search <vector-search>`: brute force vs an ANN index.
+- {doc}`LLM inference <llm>`: engines, chat templates, structured output.
+- {doc}`Governance <../user-guide/governance>`: row filters and column masks, if the corpus
   is not all one tenant's.
-- [RAG from scratch](../tutorials/rag-from-scratch.md): the tutorial, built up step by
+- {doc}`RAG from scratch <../tutorials/rag-from-scratch>`: the tutorial, built up step by
   step.
-- [RAG index recipe](../examples/ml/rag-index.md): the ingest half as a runnable job.
-- [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): how the engine
+- {doc}`RAG index recipe <../examples/ml/rag-index>`: the ingest half as a runnable job.
+- {doc}`Adaptive re-optimization <../deep-dives/adaptive-reoptimization>`: how the engine
   learns the chunk fan-out no static estimate could know.
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): what the embed and generate
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: what the embed and generate
   stages cost.

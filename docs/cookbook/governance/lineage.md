@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/governance/lineage.py
 ```
+
+## See also
+
+- {doc}`masking_and_filters`: column masking and row filtering as a plan rewrite, not a wrapper.
+- {doc}`pii_transforms`: masking, hashing, and encrypting a sensitive column.
+- {doc}`../../user-guide/governance`: row filters and column masks as a plan rewrite.
+- {doc}`../../user-guide/hardening`: the trust boundaries governance does and does not cover.

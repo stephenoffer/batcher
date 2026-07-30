@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/horizontal.py
 ```
+
+## See also
+
+- {doc}`conditionals`: branching inside an expression: when/then/otherwise, and the SQL null helpers.
+- {doc}`json_columns`: reading JSON held in a string column, without parsing it in Python.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

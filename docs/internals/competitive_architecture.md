@@ -1,7 +1,17 @@
 # Competitive architecture: where Batcher wins, where it loses, and what it must build
 
-**Status:** audit, 2026-07-14. Every claim below was checked against code, not documentation.
-Where the docs and the code disagreed, the code won and the doc is named as wrong.
+**Status:** audit, 2026-07-14; partially re-audited 2026-07-29. Every claim below was checked
+against code, not documentation. Where the docs and the code disagreed, the code won and the
+doc is named as wrong.
+
+**What the 2026-07-29 pass changed**, so a reader knows which numbers are current:
+ceiling 3 (shuffle replication) is now wired to all four shuffles rather than one; ceiling 8
+(first-seen query latency) was re-measured and is **3-5x better than recorded**, so it is no
+longer the largest latency item; claim 4 in [Claims to retire](#claims-to-retire) is fixed.
+It also retired a claim this document did not make but the research paper did — that
+high-cardinality grouping is a systematic kernel gap. Measured, plain high-cardinality
+grouping wins by 7-11x; the loss was grouped `COUNT(DISTINCT)`, and it is closed.
+Everything else here is the 2026-07-14 reading.
 
 The mandate is *"beat DuckDB, Spark, Ray Data and Polars across the whole range — sub-second to
 PB, batch and streaming, single-node and distributed"* (`CLAUDE.md`). This document answers, for
@@ -111,8 +121,7 @@ training, where Batcher does not compete — see ceilings):
   Daft spends a call per fact. It leads on **audio**: Daft has **no native
   mel-spectrogram / MFCC** (per-row UDFs), which Batcher does in-engine (both torchaudio-matched).
   Daft still leads on the **variable-shape tensor type** (ceiling below). The
-  color-conversion gap this bullet used to record is closed; see
-  `daft_parity_ledger.md`.
+  color-conversion gap this bullet used to record is closed.
 - **Ray Data** has good CPU preprocessors (scalers/encoders/imputers) and a tensor type, but
   multimodal decode is a torch/PIL **UDF per batch**, not an engine expression; **no native
   mel-spectrogram**; fuzzy-match/minhash are user code.
@@ -262,17 +271,27 @@ a per-operator state slot.
 spill, no external shuffle service. A dead worker loses its buckets → lineage recompute (re-read
 the source, re-run the map — the longest phase). Spark writes shuffle to disk and re-fetches it.
 
-The mitigation is **partly wired** (this section previously said "dead code"; that is now
-half-true and the half matters):
+The mitigation is now **wired to every shuffle** (this section previously said "dead code",
+then "exactly one caller"; both are out of date):
 - `carbonite/resilience/replication.py::assign_replica_hosts` and
   `dist/flight_worker.py::replicate_buckets` are called by
   `dist/shuffle_replication.py::replicate_shuffle_output`.
-- That has **exactly one caller** — the flat aggregate reduce (`flight_aggregate.py`). The
-  combiner tree (which is the path a *large* cluster takes, i.e. where node loss is likeliest),
-  join, sort, and window still pass `replicas=None`, so they fall back to full lineage recompute.
-- `DistributedConfig.shuffle_replication` defaults to **1**, not 2.
+- Its callers are now **aggregate (flat reduce *and* combiner tree), join, sort, and window**.
+  A join publishes two shuffle stages (left on 0, right on 1) so its replica is all-or-nothing
+  across both — a half-copy would silently under-join rather than raise.
+- A dead worker used to force a recompute of its sources *even when a replica held them*,
+  because `run_bucket_reduce` treated "the reducer host died" and "its mapped output is gone"
+  as one event. With `workers == n_buckets` that is every kill, so replication did nothing on
+  exactly the small clusters it was testable on. The regeneration is now skipped when a copy
+  survives on a live peer (at most once per source, so an unreachable replica still falls
+  through to a recompute rather than exhausting the attempt budget).
+- `DistributedConfig.shuffle_replication` still defaults to **1**, rising to 2 under the
+  `spot` resilience profile — an on-demand cluster pays no copy.
 
-So on a spot cluster you get re-fetch for a flat `GROUP BY` and recompute for everything else.
+So on a spot cluster you now get re-fetch recovery for every shuffle. What is still missing
+is the *durability* half: replicas are memory-resident, there is no disk tier and no external
+shuffle service, and inside the combiner tree only the leaf partials are copied — an interior
+combiner's output lives on one node, so a loss there still costs a recompute round.
 
 **Bucket eviction: FIXED (2026-07-26).** `clear_plan`/`release` were bound end to end through
 Rust with **zero production call sites** — only the streaming pipeline released anything — so a
@@ -408,8 +427,8 @@ the same data ingested by an untimed `CREATE TABLE`, DuckDB plans `IE_JOIN`:
 | 1,000,000 | 476 ms | **274 ms** | *(not run)* |
 | 2,000,000 | 1,093 ms | **383 ms** | *(not run)* |
 
-**That was the state when this section was written. It has since been rewritten** — see
-`engine_improvements_ledger.md` entry 14 — and the operator is now 2.4x to 7.5x faster than the
+**That was the state when this section was written. It has since been rewritten**, and the
+operator is now 2.4x to 7.5x faster than the
 table above, which puts it *ahead* of DuckDB below about half a million rows:
 
 | n | Batcher (now) | DuckDB (`IE_JOIN`) | Batcher is |
@@ -449,7 +468,31 @@ user handing DuckDB an Arrow table gets the quadratic plan. That belongs in the 
 the rest of the `duckdb` vs `duckdb_arrow` findings in `benchmarks/TPCH_FINDINGS.md`, and it
 must not be quoted as "Batcher beats DuckDB at range joins."
 
-### 8. A first-seen query shape costs ~8 ms of optimizer, in Python
+### 8. A first-seen query shape costs ~8 ms of optimizer, in Python — **stale; re-measured 2026-07-29**
+
+**Read this before the section below, which is kept for its diagnosis and its four failed
+attempts, not for its numbers.** Re-measured on the current tree (96 cores, `optimize()`
+timed directly rather than inferred from end-to-end latency, a fresh literal per iteration so
+the plan cache cannot hit):
+
+| shape | cold `optimize()` | warm (plan-cache hit) |
+|---|---|---|
+| single-table filter + project | **1.52 ms** (median of 15) | **0.002 ms** |
+| filter -> join -> group-by | **2.75 ms** (median of 10) | 0.002 ms |
+
+That is **3-5x faster than the 5-8 ms this section reported**, so "the largest single latency
+item on the board" is no longer true. End to end it does not read as a gap at all: over 12
+never-seen shapes at n = 10,000, Batcher is **0.80x** DuckDB on a cold filter and **0.27x** on
+a cold `count(*)` over a filter — DuckDB pays its own first-query cost, and ours is now
+smaller. What remains is a **warm** ~2x on the narrowest shape (filter 10,000 rows and return
+them: 4.07 ms against 2.04 ms), and planning is 0.002 ms of that, so it is per-query fixed
+cost — FFI, Arrow hand-off, orchestration — and *not* the optimizer. The measurement was taken
+under load average ~18, which if anything overstates the Batcher numbers.
+
+The diagnosis below (282 rules over 7 phases, 19 traversals, no single dominant term) and the
+four measured-and-reverted attempts remain worth reading. Do not re-quote its timings.
+
+#### The original measurement, superseded
 
 Measured at `n = 10,000`, DuckDB in native storage, median over 12 never-seen query shapes:
 
@@ -525,8 +568,11 @@ These are asserted in the repo and contradicted by its own code.
    DuckDB does not filter 60M rows 57× slower than Rust. That figure is almost certainly timing
    DuckDB's Arrow scan plus result materialization, not its filter. It is the least credible
    number in the repo and it discredits the real results around it.
-4. **`core/executor.py:1-11` references "the `bc-adapt` re-optimization loop."** There is no
-   `bc-adapt` crate. The Rust side has no adaptivity at all.
+4. ~~**`core/executor.py:1-11` references "the `bc-adapt` re-optimization loop."**~~ **Fixed
+   2026-07-29.** There is no `bc-adapt` crate and the Rust side has no adaptivity at all; both
+   `core/executor.py` and `core/__init__.py` now say so and point at `api/adaptive/`, which is
+   where the stage-boundary loop actually lives (it must, since re-planning re-runs Kyber and
+   Core may not import it).
 
 ## Defects found and fixed in this pass
 
@@ -591,9 +637,12 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
    19.6x on the low-cardinality string filter); what remains is `StringView`, keeping the
    dictionary alive through project/join rather than decoding at the leaf, and a dict-aware
    string join key.
-3. **Wire the shuffle replication that already exists** (four call sites) and call `clear_plan` on
-   the batch path. Converts spot preemption from recompute to re-fetch, and stops long-lived
-   fleets leaking every bucket.
+3. **~~Wire the shuffle replication that already exists~~ (done — all four shuffles) and
+   ~~call `clear_plan` on the batch path~~ (done).** Spot preemption is now a re-fetch rather
+   than a recompute for aggregate, join, sort and window, and long-lived fleets no longer leak
+   buckets. Remaining on this ceiling: a **disk tier / external shuffle service** (replicas are
+   RAM today, so they cost memory and a whole-node loss taking every copy still recomputes),
+   and replicating **interior combiner-tree outputs**, which are single-copy.
 4. **~~Default `stream_inference=True`~~ (done), generalize to N stages with per-stage
    autoscaling.** The AI moat is now on out of the box. Remaining: the N-stage topology,
    per-stage autoscaling, a variable-shape tensor type, and keeping data resident on-device

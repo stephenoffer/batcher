@@ -178,14 +178,14 @@ segments, and if it is not, whether that is a bug in the bucketing.
 ## See also
 
 :::{seealso}
-- [Funnel analysis](funnel-analysis.md): the one-row-per-user collapse, in more detail.
-- [Retention curves](retention-curves.md): another denominator that has to come from the
+- {doc}`Funnel analysis <funnel-analysis>`: the one-row-per-user collapse, in more detail.
+- {doc}`Retention curves <retention-curves>`: another denominator that has to come from the
   cohort rather than from the behaviour log.
-- [Sampling](../../user-guide/sampling.md): `sample` is a stable seeded content hash, so a
+- {doc}`Sampling <../../user-guide/sampling>`: `sample` is a stable seeded content hash, so a
   holdout is reproducible and identical single-node or distributed.
-- [Aggregations](../../user-guide/aggregations.md): `count_if`, `bool_or`, and the rest.
-- [Joins](../../user-guide/joins.md): the left join that keeps `u4` in the denominator.
-- [Join algorithms](../../deep-dives/join-algorithms.md): what the left join does with the
+- {doc}`Aggregations <../../user-guide/aggregations>`: `count_if`, `bool_or`, and the rest.
+- {doc}`Joins <../../user-guide/joins>`: the left join that keeps `u4` in the denominator.
+- {doc}`Join algorithms <../../deep-dives/join-algorithms>`: what the left join does with the
   rows that have no match.
-- [Expressions API](../../api/expressions.md): `count_if`, `bool_or`, `fill_null`.
+- {doc}`Expressions API <../../api/expressions>`: `count_if`, `bool_or`, `fill_null`.
 :::

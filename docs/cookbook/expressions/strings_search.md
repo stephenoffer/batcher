@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_search.py
 ```
+
+## See also
+
+- {doc}`strings_regex`: regular expressions over a column: extract, replace, and count.
+- {doc}`strings_similarity`: fuzzy string matching against a reference value.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

@@ -95,6 +95,25 @@ def _is_benign_record_error(err: Any) -> bool:
         return False
 
 
+def _payload_bytes(records: list[Any]) -> int:
+    """Total payload size of `records`, without materializing any of it.
+
+    ``Message.len()`` is the size librdkafka already knows; `value()` would copy every
+    payload into a Python `bytes` a second time — once here to measure it and once in
+    `_decode` to keep it — which on the megabyte-message topics this bound exists for is
+    the whole batch, twice. A client without `len()` falls back to the copy rather than
+    losing the bound.
+    """
+    total = 0
+    for rec in records:
+        size = getattr(rec, "len", None)
+        if size is not None:
+            total += size() or 0
+        else:  # pragma: no cover - a client whose Message has no `len()`
+            total += len(rec.value() or b"")
+    return total
+
+
 @SOURCES.register("kafka")
 class KafkaSource(BrokerSource):
     """An unbounded Kafka topic, consumed via ``confluent-kafka``.
@@ -103,7 +122,9 @@ class KafkaSource(BrokerSource):
     conveniences: ``bootstrap_servers`` (→ ``bootstrap.servers``) and ``group``
     (→ ``group.id``). ``partitions`` restricts the source to specific
     topic-partitions (set by :class:`BrokerSplit` on a worker); omit it to consume
-    all partitions of the topic.
+    all partitions of the topic. ``poll_bytes`` bounds a poll by payload size as
+    ``poll_size`` bounds it by count — raise it for a topic of small messages, lower it for
+    one whose ``message.max.bytes`` is large.
     """
 
     format_name = "kafka"
@@ -115,6 +136,7 @@ class KafkaSource(BrokerSource):
         topic: str,
         *,
         poll_size: int = 16_384,
+        poll_bytes: int | None = None,
         partitions: list[int] | None = None,
         bootstrap_servers: str = "localhost:9092",
         group: str = "batcher",
@@ -125,6 +147,7 @@ class KafkaSource(BrokerSource):
         super().__init__(
             topic,
             poll_size=poll_size,
+            poll_bytes=poll_bytes,
             bootstrap_servers=bootstrap_servers,
             group=group,
             **options,
@@ -252,8 +275,13 @@ class KafkaSource(BrokerSource):
         throughput is unchanged, because a backlogged partition fills the queue and the drain
         returns the whole batch in one extra call.
 
+        The drain is bounded by `poll_bytes` as well as by ``poll_size``, because a count
+        says nothing about memory when a message can be a megabyte — see the attribute's
+        own note for what a 16,384-message poll costs on such a topic.
+
         Returns:
-            Up to ``poll_size`` raw client records, oldest first.
+            Up to ``poll_size`` raw client records, oldest first, and no more than roughly
+            ``poll_bytes`` of payload.
         """
         consumer = self._client()
         records = consumer.consume(num_messages=1, timeout=self._poll_timeout)
@@ -264,12 +292,14 @@ class KafkaSource(BrokerSource):
         # fills the batch, and stop the moment a pass comes back short — that means the queue
         # is empty and another pass would only add syscalls.
         remaining = self.poll_size - len(records)
-        while remaining > 0:
+        budget = self.poll_bytes - _payload_bytes(records)
+        while remaining > 0 and budget > 0:
             more = consumer.consume(num_messages=remaining, timeout=0)
             if not more:
                 break
             records.extend(more)
             remaining -= len(more)
+            budget -= _payload_bytes(more)
         return records
 
     def _decode(self, records: list[Any]) -> list[BrokerMessage]:

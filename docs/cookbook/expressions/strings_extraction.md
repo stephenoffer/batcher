@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_extraction.py
 ```
+
+## See also
+
+- {doc}`strings_counts`: counting structure in text: words, lines, sentences, and entities.
+- {doc}`strings_hashing`: hashing and encoding a string column: keys, checksums, and safe transport.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

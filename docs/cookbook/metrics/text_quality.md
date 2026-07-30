@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/text_quality.py
 ```
+
+## See also
+
+- {doc}`text_pii_safety`: PII leak rates over a text column.
+- {doc}`text_retrieval`: RAG groundedness: is the answer actually supported by the retrieved context?
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

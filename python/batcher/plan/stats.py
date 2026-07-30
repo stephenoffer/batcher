@@ -56,9 +56,9 @@ def ambiguous_float_bound(value: Any) -> bool:
     costs a row. This is the single definition, shared by every such rule, so they cannot drift
     apart on the question of when a float bound may be trusted.
 
-    (The underlying engine divergence — its scalar float comparisons follow the total order
-    rather than IEEE, so `WHERE f = 0.0` misses `-0.0` and disagrees with DuckDB — is recorded
-    as B26 in `docs/internals/bug_hunt_ledger.md`. This guard is sound under either semantics.)
+    (The underlying engine divergence is that its scalar float comparisons follow the total
+    order rather than IEEE, so `WHERE f = 0.0` misses `-0.0` and disagrees with DuckDB. That
+    is a separately-owned question; this guard is sound under either semantics.)
 
     Args:
         value: A recorded `min` or `max` bound.

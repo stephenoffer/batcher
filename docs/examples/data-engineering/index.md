@@ -93,21 +93,21 @@ The small-files problem, and when it is actually worth fixing.
 ## Where to start
 
 If you are building a pipeline from nothing, the order that tends to work is: get the data
-in ([incremental ingest](incremental-ingest.md)), put a gate in front of the write
-([quality gates](quality-gates.md)), make the write idempotent
-([deduplication](deduplication.md)), and only then worry about the table's shape over time
-([schema evolution](schema-evolution.md), [file compaction](file-compaction.md)).
+in ({doc}`incremental ingest <incremental-ingest>`), put a gate in front of the write
+({doc}`quality gates <quality-gates>`), make the write idempotent
+({doc}`deduplication <deduplication>`), and only then worry about the table's shape over time
+({doc}`schema evolution <schema-evolution>`, {doc}`file compaction <file-compaction>`).
 
 :::{seealso}
-- [Lakehouse tables](../../user-guide/lakehouse.md): the transactional target most of these
+- {doc}`Lakehouse tables <../../user-guide/lakehouse>`: the transactional target most of these
   recipes write to.
-- [Reading data](../../user-guide/reading-data.md) and
-  [Writing data](../../user-guide/writing-data.md): the reader and the sink, in full.
-- [Delta Lake](../../integrations/delta-lake.md) and [Kafka](../../integrations/kafka.md):
+- {doc}`Reading data <../../user-guide/reading-data>` and
+  {doc}`Writing data <../../user-guide/writing-data>`: the reader and the sink, in full.
+- {doc}`Delta Lake <../../integrations/delta-lake>` and {doc}`Kafka <../../integrations/kafka>`:
   the systems the recipes talk to, and what each guarantees.
-- [Building a lakehouse](../../tutorials/building-a-lakehouse.md): these pieces assembled
+- {doc}`Building a lakehouse <../../tutorials/building-a-lakehouse>`: these pieces assembled
   into one pipeline, end to end.
-- [Data engineer learning path](../../learning-paths/data-engineer.md): a reading order.
+- {doc}`Data engineer learning path <../../learning-paths/data-engineer>`: a reading order.
 :::
 
 ```{toctree}

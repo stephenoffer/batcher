@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_slicing.py
 ```
+
+## See also
+
+- {doc}`strings_similarity`: fuzzy string matching against a reference value.
+- {doc}`structs_and_maps`: struct and map columns: nested records without flattening the table.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

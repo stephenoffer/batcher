@@ -110,7 +110,7 @@ The two rows on `2024-01-02` are gone; `id=9` replaced them.
 ::::
 
 For the full `WHEN`-clause statement (`when_matched` / `when_not_matched_by_source`, SCD-2, CDC
-feeds) see the [lakehouse guide](../user-guide/lakehouse.md).
+feeds) see the {doc}`lakehouse guide <../user-guide/lakehouse>`.
 
 ## How it parallelizes
 
@@ -175,7 +175,7 @@ deleted underneath it, and your `version=` history is gone.
 ## Credentials
 
 Cloud paths take their credentials from the environment (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, and
-friends; see [cloud storage](../user-guide/cloud-storage.md)). Delta also accepts
+friends; see {doc}`cloud storage <../user-guide/cloud-storage>`). Delta also accepts
 `storage_options=`, whose keys are delta-rs's own. That is how vended credentials (Unity Catalog, a
 short-lived STS token) reach the reader and the writer.
 
@@ -226,13 +226,13 @@ columns in the plan (`select`, `cast`) rather than hoping the writer coerces.
 
 ## See also
 
-- [Lakehouse](../user-guide/lakehouse.md): merge clauses, SCD, CDC, file skipping in depth.
-- [Writing data](../user-guide/writing-data.md): modes, partitioning, the commit path.
-- [Partition backfill](../examples/data-engineering/partition-backfill.md): `replace_where=`
+- {doc}`Lakehouse <../user-guide/lakehouse>`: merge clauses, SCD, CDC, file skipping in depth.
+- {doc}`Writing data <../user-guide/writing-data>`: modes, partitioning, the commit path.
+- {doc}`Partition backfill <../examples/data-engineering/partition-backfill>`: `replace_where=`
   as a re-runnable job.
-- [File compaction](../examples/data-engineering/file-compaction.md): `bt.compact` and
+- {doc}`File compaction <../examples/data-engineering/file-compaction>`: `bt.compact` and
   Z-ordering on a schedule.
-- [Exactly-once sink](../examples/streaming/exactly-once-sink.md): `app_id` and `txn_version`
+- {doc}`Exactly-once sink <../examples/streaming/exactly-once-sink>`: `app_id` and `txn_version`
   in a streaming pipeline.
-- [I/O API](../api/io.md): the full reader/writer reference.
-- [Iceberg](iceberg.md) and [Hudi](hudi.md): the other two table formats.
+- {doc}`I/O API <../api/io>`: the full reader/writer reference.
+- {doc}`Iceberg <iceberg>` and {doc}`Hudi <hudi>`: the other two table formats.

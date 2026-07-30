@@ -5,7 +5,7 @@ and run vectorized over Arrow batches. This page is the reference for the
 constructors, operators, and methods callable on an `Expr`. The accessor namespaces
 (`.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, `.video`) are
 enumerated on {doc}`expression-accessors`. For a guided tour with runnable examples, see
-the [expressions user guide](../user-guide/expressions.md).
+the {doc}`expressions user guide <../user-guide/expressions>`.
 
 Blocks on this page share one namespace and run in order.
 
@@ -16,6 +16,9 @@ ds = bt.from_pydict({"a": [1, 2, 3], "b": [10.0, 20.0, 30.0]})
 ```
 
 ## Constructors
+
+Every expression starts from one of these. `bt.col` names an input column, and the rest
+build a value that has no column behind it:
 
 | Call | Meaning |
 | --- | --- |
@@ -78,6 +81,9 @@ print(out.to_pydict())
 
 ## Operators
 
+Python's operators are overloaded on `Expr`, so an expression reads like ordinary
+arithmetic. Each group below lowers to the same engine kernel a named method would:
+
 | Group | Operators |
 | --- | --- |
 | Arithmetic | `+` `-` `*` `/` `%` `**` (reflected forms work, e.g. `2 * bt.col("a")`) |
@@ -94,6 +100,9 @@ print(out.to_pydict())
 ```
 
 ## Null handling
+
+Arithmetic propagates nulls, so these methods are how you test for a null and how you
+replace one:
 
 | Method | Description |
 | --- | --- |
@@ -113,6 +122,9 @@ print(out.to_pydict())
 ```
 
 ## Type, membership, and range
+
+These convert a value's type or test it against a set or an interval, which is the work
+most filters do before anything else happens:
 
 | Method | Description |
 | --- | --- |
@@ -154,13 +166,16 @@ print(out.to_pydict())
 
 ## Other core methods
 
+The remaining methods on the base `Expr` name an output, sort within a window, or reach
+the accessor namespaces:
+
 | Method | Description |
 | --- | --- |
 | `.alias(name)` | bind an output name to a derived expression, for positional `select` |
 | `.neg()` | arithmetic negation (the Polars spelling of the unary minus) |
 | `.chr()` | the character at this Unicode code point (DuckDB/Spark `chr`) |
 | `.to_base(radix)` | this integer written in base 2..36 (DuckDB `to_base`; `bin` is radix 2) |
-| `.format_bytes(si=False)` | a byte count as human-readable text — `1.5 KiB`, or `1.5 kB` with `si=True` |
+| `.format_bytes(si=False)` | a byte count as human-readable text, such as `1.5 KiB`, or `1.5 kB` with `si=True` |
 | `.clip(lower=None, upper=None)` | clamp each value into `[lower, upper]` (either bound optional) |
 | `.eq_missing(other)` | null-safe equality (SQL `IS NOT DISTINCT FROM`): two nulls compare equal, null vs non-null is false (never null) |
 | `.try_cast(type)` | the safe-ingest spelling of `.cast`: unconvertible values become NULL instead of erroring (DuckDB `TRY_CAST`) |
@@ -187,7 +202,7 @@ total: `.entropy()` (base-2 Shannon entropy of the value distribution, DuckDB `e
 `.kurtosis_pop()` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
 quantile *element*, where `.quantile(q)` interpolates between two of them), `.top_k(k)`
 (the `k` most frequent values as a list, DuckDB `approx_top_k`, computed exactly here),
-`.kahan_sum()` (compensated summation, DuckDB `fsum`/`kahan_sum` — the same answer as
+`.kahan_sum()` (compensated summation, DuckDB `fsum` or `kahan_sum`) gives the same answer as
 `.sum()` on a well-conditioned column and a materially better one when the addends differ
 wildly in magnitude), and `.any_value()` (one value from the group, DuckDB `any_value` / `arbitrary`; the
 engine resolves "unspecified" to the group minimum so a distributed run agrees with a
@@ -200,7 +215,7 @@ mergeable, so results are identical single-node and distributed.
 
 An aggregate does not have to appear inside `group_by(...).agg(...)`. In a `select`
 whose every item is an aggregate it means the whole-frame aggregation and returns one
-row; anywhere else — `with_columns`, a mixed `select`, a `filter` predicate — it means
+row. Anywhere else, including `with_columns`, a mixed `select`, and a `filter` predicate, it means
 the whole-frame aggregate **broadcast to every row**, which is `.over()` with no
 partition:
 
@@ -254,7 +269,7 @@ print(c.with_columns(cs=bt.col("x").cum_sum(), prev=bt.col("x").shift(1)).to_pyd
 # {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
 ```
 
-A window expression composes with ordinary arithmetic and other windows. The engine lifts it into a `Window` operator and rewrites the surrounding expression to read the result, as described in [window functions](../user-guide/window-functions.md). The shapes that come up most have their own names:
+A window expression composes with ordinary arithmetic and other windows. The engine lifts it into a `Window` operator and rewrites the surrounding expression to read the result, as described in {doc}`window functions <../user-guide/window-functions>`. The shapes that come up most have their own names:
 
 | Method | Equivalent |
 | --- | --- |
@@ -290,7 +305,7 @@ For migration, many operations carry a second, framework-familiar name alongside
 SQL-style primary. These delegate to the primary spelling, with the same behavior and no new IR.
 
 Trig / clip / range on `Expr`: `.arcsin()`, `.arccos()`, `.arctan()`, `.arcsinh()`,
-`.arccosh()`, `.arctanh()` (NumPy/Polars names for `.asin()`…), `.clip_min(lo)` /
+`.arccosh()`, `.arctanh()` (the NumPy and Polars names for `.asin()` and friends), `.clip_min(lo)` /
 `.clip_max(hi)` (Polars, for `.clip(...)`), and `.is_between(lo, hi, closed="both")`
 (Polars, for `.between(...)`). Top-level `bt.arctan2(y, x)` mirrors `bt.atan2`.
 
@@ -444,7 +459,7 @@ print(out.to_pydict())
 
 **Weighted statistics** (when rows carry survey, recency, or size weights):
 `bt.weighted_mean(x, w)`, `bt.weighted_var(x, w)`, `bt.weighted_std(x, w)`,
-`bt.weighted_covariance(x, y, w)`, and `bt.weighted_correlation(x, y, w)` — each the
+`bt.weighted_covariance(x, y, w)`, and `bt.weighted_correlation(x, y, w)` are each the
 frequency-weighted form matching `numpy.average`.
 
 Column-level profiling aggregates complete the toolkit: `bt.q1(x)` / `bt.q3(x)` /

@@ -147,10 +147,10 @@ for one (`| STATS COUNT(*)`) and let the cluster compute it.
 
 ## See also
 
-- [Reading data](../user-guide/reading-data.md): sources, splits, pushdown.
-- [Anomaly detection](../examples/analytics/anomaly-detection.md): the analysis a log index is
+- {doc}`Reading data <../user-guide/reading-data>`: sources, splits, pushdown.
+- {doc}`Anomaly detection <../examples/analytics/anomaly-detection>`: the analysis a log index is
   usually pulled into.
-- [Custom connectors](../user-guide/custom-connectors.md): the `Source`/`Split` protocol, if you
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the `Source`/`Split` protocol, if you
   need the sink this connector does not have.
-- [I/O API](../api/io.md): the full reader reference.
-- [MongoDB](mongodb.md): the other document store, read *and* write.
+- {doc}`I/O API <../api/io>`: the full reader reference.
+- {doc}`MongoDB <mongodb>`: the other document store, read *and* write.

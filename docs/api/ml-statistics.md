@@ -11,7 +11,7 @@ of them is an engine query.
 
 `batcher.ml.stats` covers the statistics that need more than one aggregate, and the
 reference-versus-current comparisons a deployed model needs. See the
-[statistics and drift guide](../ml/statistics-and-drift.md).
+{doc}`statistics and drift guide <../ml/statistics-and-drift>`.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.stats
@@ -68,7 +68,7 @@ reference-versus-current comparisons a deployed model needs. See the
 
 ## Fairness
 
-`batcher.ml.metrics` includes the fairness metrics — grouped comparisons that reveal a model
+`batcher.ml.metrics` includes the fairness metrics, the grouped comparisons that reveal a model
 treating a protected group differently, each a single grouped aggregate.
 
 ```{eval-rst}
@@ -87,7 +87,7 @@ treating a protected group differently, each a single grouped aggregate.
 
 ## Resampling for imbalanced learning
 
-`batcher.ml.sampling` reshapes the class balance as a relational operation — an exact
+`batcher.ml.sampling` reshapes the class balance as a relational operation: an exact
 content-hashed filter or concatenation, never a driver-side shuffle.
 
 ```{eval-rst}
@@ -105,7 +105,7 @@ content-hashed filter or concatenation, never a driver-side shuffle.
 ## Cross-validated scoring
 
 `batcher.ml.model_selection` ties the fold splitter, a fitted model, and a metric into one
-loop — each fold's data runs through the engine rather than a driver-held array.
+loop, and each fold's data runs through the engine rather than a driver-held array.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.model_selection
@@ -144,15 +144,15 @@ sample, because both techniques re-score through the engine.
 .. autofunction:: partial_dependence
 ```
 
-- [Inference](../ml/inference.md): batch prediction and embeddings.
-- [Preprocessors](../ml/preprocessors/index.md): fit/transform feature engineering.
-- [Multimodal](../ml/multimodal.md): download, decode, tensors, vector search.
-- [Serving](../ml/serving.md) and [LLM inference](../ml/llm.md).
-- [PyTorch](../ml/pytorch.md) and [streaming](../ml/streaming.md) training loaders.
-- [GPU scheduling](../ml/gpu.md): how `num_gpus` and `concurrency` map to actors.
-- [Tabular models](../ml/tabular-models.md): scoring XGBoost, LightGBM, and scikit-learn.
-- [Evaluation](../ml/evaluation.md): metrics, per-segment scoring, diagnostic tables.
-- [Statistics and drift](../ml/statistics-and-drift.md): feature screening and monitoring.
+- {doc}`Inference <../ml/inference>`: batch prediction and embeddings.
+- {doc}`Preprocessors <../ml/preprocessors/index>`: fit/transform feature engineering.
+- {doc}`Multimodal <../ml/multimodal>`: download, decode, tensors, vector search.
+- {doc}`Serving <../ml/serving>` and {doc}`LLM inference <../ml/llm>`.
+- {doc}`PyTorch <../ml/pytorch>` and {doc}`streaming <../ml/streaming>` training loaders.
+- {doc}`GPU scheduling <../ml/gpu>`: how `num_gpus` and `concurrency` map to actors.
+- {doc}`Tabular models <../ml/tabular-models>`: scoring XGBoost, LightGBM, and scikit-learn.
+- {doc}`Evaluation <../ml/evaluation>`: metrics, per-segment scoring, diagnostic tables.
+- {doc}`Statistics and drift <../ml/statistics-and-drift>`: feature screening and monitoring.
 
 ## See also
 

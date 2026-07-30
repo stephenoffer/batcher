@@ -41,19 +41,32 @@ pub(crate) fn partition_morsels(
     keys: &[String],
     parts: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    partition_morsels_with(batches, parts, |b| columns_by_name(b, keys))
+    partition_morsels_with(batches, parts, |b| columns_by_name(b, keys), 0)
 }
 
 /// [`partition_morsels`] keyed by column *index* — the form the distributed shuffle
 /// speaks (`dist::partition_batches` receives key indices, not names).
-pub(crate) fn partition_morsels_by_index(
+/// Hash-partition morsels by the key columns at `key_indices`, re-mixing the hash with
+/// `salt`.
+///
+/// `salt == 0` is the cluster-wide bucket assignment, which a shuffle must never perturb. A
+/// non-zero salt exists for **re-splitting a bucket that did not fit**, where re-using the
+/// unsalted hash is not merely suboptimal but inert: `bucket_of` reads the low bits at a
+/// power-of-two bucket count, so re-partitioning a 16-way bucket into 8 sub-buckets sends
+/// every row to `bucket & 7` — one sub-bucket, always. The re-partition writes and re-reads
+/// the whole bucket and changes nothing.
+pub(crate) fn partition_morsels_by_index_salted(
     batches: &[RecordBatch],
     key_indices: &[usize],
     parts: usize,
+    salt: u64,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    partition_morsels_with(batches, parts, |b| {
-        Ok(key_indices.iter().map(|&i| b.column(i).clone()).collect())
-    })
+    partition_morsels_with(
+        batches,
+        parts,
+        |b| Ok(key_indices.iter().map(|&i| b.column(i).clone()).collect()),
+        salt,
+    )
 }
 
 /// The shared body: everything but *how a morsel's key columns are selected* is
@@ -62,6 +75,7 @@ fn partition_morsels_with(
     batches: &[RecordBatch],
     parts: usize,
     key_cols_of: impl Fn(&RecordBatch) -> Result<Vec<ArrayRef>, InterpError> + Sync,
+    salt: u64,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     debug_assert!(parts >= 1);
     if parts == 1 || batches.is_empty() {
@@ -75,7 +89,7 @@ fn partition_morsels_with(
         .par_iter()
         .map(|batch| {
             let key_cols = key_cols_of(batch)?;
-            let part_of = shuffle::bucket_of_rows(&key_cols, batch.num_rows(), parts)?;
+            let part_of = shuffle::bucket_of_rows_salted(&key_cols, batch.num_rows(), parts, salt)?;
             Ok(shuffle::bucket_csr(&part_of, parts))
         })
         .collect::<Result<_, InterpError>>()?;

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/temporal_timezones.py
 ```
+
+## See also
+
+- {doc}`temporal_parts`: pulling calendar parts out of a timestamp column.
+- {doc}`temporal_truncation`: bucketing timestamps: truncate to a period, or snap to a period boundary.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

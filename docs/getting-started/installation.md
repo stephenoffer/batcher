@@ -94,7 +94,7 @@ just build-release  # optimized build
 
 Once built, `import batcher` resolves the locally compiled engine.
 
-## Next steps
+## See also
 
 ::::{grid} 1 2 2 2
 :gutter: 3

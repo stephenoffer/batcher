@@ -99,7 +99,7 @@ def test_adaptive_morsel_sizing_is_result_invariant(monkeypatch):
     monkeypatch.setattr(
         ResourceManager,
         "recommend_morsel_target",
-        lambda self, families=None: (1024, 64 * 1024),
+        lambda self, families=None, plan=None: (1024, 64 * 1024),
     )
     with config_context(Config().replace(execution=ExecutionConfig(adaptive_morsel_sizing=True))):
         adapted = query()

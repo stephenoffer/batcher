@@ -105,6 +105,9 @@ function puts every key back in the same bucket, and the recursion never termina
 
 ## What spills, and how
 
+Every stateful operator has a spill path, and each one uses a mechanism suited to its
+state. The table names the mechanism and the file that implements it:
+
 | Operator | Mechanism | Code |
 |---|---|---|
 | Aggregate | grace partition + per-bucket combine | `bc-runtime/src/agg/spill.rs` |
@@ -243,14 +246,14 @@ limit.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why bounded memory is an operator property, not a mode
-- [Carbonite](../internals/carbonite.md): the resource manager whose reservation failure starts this
+- {doc}`Architecture <../architecture/index>`: why bounded memory is an operator property, not a mode
+- {doc}`Carbonite <../internals/carbonite>`: the resource manager whose reservation failure starts this
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the distributive equivalence grace rests on
-- [Performance](../user-guide/performance.md): the memory knobs, and when to raise them
-- [Troubleshooting](../user-guide/troubleshooting.md): what to do when a query is spilling and you did not expect it
-- [Scaling benchmarks](../benchmarks/scaling.md): larger-than-memory queries, measured
-- [The buffer pool](buffer-pool.md): the reservation whose failure triggers all of this
-- [Aggregation internals](aggregation-internals.md): the in-memory path grace falls back from
-- [Sort internals](sort-internals.md): runs and the k-way merge
-- [Join algorithms](join-algorithms.md): the in-memory hash join
+- {doc}`Performance <../user-guide/performance>`: the memory knobs, and when to raise them
+- {doc}`Troubleshooting <../user-guide/troubleshooting>`: what to do when a query is spilling and you did not expect it
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: larger-than-memory queries, measured
+- {doc}`The buffer pool <buffer-pool>`: the reservation whose failure triggers all of this
+- {doc}`Aggregation internals <aggregation-internals>`: the in-memory path grace falls back from
+- {doc}`Sort internals <sort-internals>`: runs and the k-way merge
+- {doc}`Join algorithms <join-algorithms>`: the in-memory hash join
 :::

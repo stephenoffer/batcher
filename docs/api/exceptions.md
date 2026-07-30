@@ -81,7 +81,7 @@ except bt.BatcherError as exc:
 
 Catching `bt.BatcherError` covers every Batcher-specific failure while letting unrelated exceptions propagate, such as a bug in your own batch function.
 
-## Next steps
+## See also
 
-- [Dataset](dataset.md): the operations that raise these errors.
-- [Configuration](configuration.md): resource limits that govern `ResourceError`.
+- {doc}`Dataset <dataset>`: the operations that raise these errors.
+- {doc}`Configuration <configuration>`: resource limits that govern `ResourceError`.

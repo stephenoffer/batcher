@@ -13,6 +13,9 @@ page passed that gate first.
 
 ## Scorecard
 
+Each row is one workload shape, with the engine that won it and by how much. Read the
+ratios alongside the methodology above, not on their own:
+
 | Shape | Winner |
 |---|---|
 | Image decode → tensor | Batcher, 2.4× |
@@ -65,7 +68,7 @@ The full 11-case operator mix goes the same way: the latest sweep in `benchmarks
 :::{warning}
 **On 16 cores Daft is faster on the join-heavy TPC-H queries**, led by q20 at 2.03x, q3 at 1.55x, and q4 at 1.51x. It's also about **2x faster on a per-batch Python UDF**, where a numpy `map_batches` reduce takes 85 ms against Daft's 41 ms.
 
-**On 96 cores that reverses.** A re-run at sf1 on a 96-core node put Batcher ahead on 18 of the 19 queries both engines answer, including q20 at 0.80x, q3 at 0.52x, q17 at 0.20x and q5 at 0.80x. q4 is the one that stays Daft's, at 1.41x rather than 1.51x. Both measurements are real; the join result is a function of core count, so quote the machine with the number. The 96-core run is recorded in `docs/internals/daft_parity_ledger.md`.
+**On 96 cores that reverses.** A re-run at sf1 on a 96-core node put Batcher ahead on 18 of the 19 queries both engines answer, including q20 at 0.80x, q3 at 0.52x, q17 at 0.20x and q5 at 0.80x. q4 is the one that stays Daft's, at 1.41x rather than 1.51x. Both measurements are real; the join result is a function of core count, so quote the machine with the number.
 :::
 
 That reversal also puts a question against the explanation below. If the gap were purely that Batcher's single-node parallelism plateaus around 8 cores while Daft uses all 16, more cores should widen it rather than close it on four of five queries. Either work landed since this section was written, or the diagnosis is incomplete. It is left standing, with this note, rather than quietly rewritten.

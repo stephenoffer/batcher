@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/embeddings.py
 ```
+
+## See also
+
+- {doc}`diagnostic`: diagnostic metrics: the epidemiology-style view of a binary classifier.
+- {doc}`probabilistic_losses`: losses that score a probability or a margin rather than a hard label.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

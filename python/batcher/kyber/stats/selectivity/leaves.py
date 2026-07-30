@@ -14,6 +14,11 @@ from typing import Any
 
 from batcher.config import CardinalityConfig
 from batcher.kyber.stats.distribution import mcv_join_rows, residual_eq_frequency
+from batcher.kyber.stats.selectivity.patterns import (
+    anchored_selectivity,
+    like_selectivity,
+    regex_selectivity,
+)
 from batcher.kyber.stats.selectivity.scalars import (
     _FLIP_OP,
     _column_of_comparison,
@@ -41,17 +46,37 @@ from batcher.plan.expr_ir import (
 
 # Boolean-valued string predicates whose match fraction is a fixed prior — the pattern is
 # implicit in the function (`contains` is always a substring, `starts_with` always anchored).
-# `like`/`ilike` are *not* here: they carry a raw SQL pattern, so their selectivity depends
-# on where the wildcards fall and is computed by `_like_selectivity`.
+# The pattern-carrying predicates (`like`/`ilike`/`regexp_matches`) are *not* here: their
+# selectivity depends on where the anchors and wildcards fall, and is read off the pattern
+# by `selectivity.patterns`.
+# `starts_with`/`ends_with` go through `anchored_selectivity` rather than reading
+# `prefix_selectivity` directly, because an anchored match is a strict subset of the
+# floating one and must never be estimated as keeping more rows than it.
 _STR_PATTERN_SELECTIVITY = {
     "contains": lambda cfg: cfg.substring_selectivity,
-    "regexp_matches": lambda cfg: cfg.substring_selectivity,
-    "starts_with": lambda cfg: cfg.prefix_selectivity,
-    "ends_with": lambda cfg: cfg.prefix_selectivity,
+    "starts_with": anchored_selectivity,
+    "ends_with": anchored_selectivity,
+    # `json_contains` is the same question asked of a document instead of a string: does
+    # this value occur *inside* this composite value? Nothing in a column's statistics can
+    # answer either without element-level histograms, so they share a prior because they
+    # share a shape. It fell through to `default_filter_selectivity` — the "no information"
+    # prior meant for an opaque boolean — which estimated ten times as many survivors as the
+    # identical predicate over a string, on exactly the semi-structured data where a bad
+    # cardinality is hardest to recover from downstream.
+    "json_contains": lambda cfg: cfg.substring_selectivity,
+    # `json_exists` is deliberately NOT here. It asks whether a *path is present*, which is
+    # a schema question rather than a value search: in a schema-on-read corpus a field
+    # someone queries is often in most documents and sometimes in almost none, and that
+    # spread is genuinely unknown. `default_filter_selectivity` is the honest answer, and
+    # putting a number here would be inventing one.
 }
 
-# SQL `LIKE` wildcards: `%` matches any run, `_` any single character.
-_LIKE_WILDCARDS = ("%", "_")
+# Pattern-carrying predicates, each answered by reading its own pattern.
+_PATTERN_READERS = {
+    "like": like_selectivity,
+    "ilike": like_selectivity,
+    "regexp_matches": regex_selectivity,
+}
 
 
 def _str_func_selectivity(
@@ -60,59 +85,15 @@ def _str_func_selectivity(
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
 ) -> float:
-    """Selectivity of a boolean string predicate, from its function and (for LIKE) pattern."""
-    if expr.fn in ("like", "ilike"):
-        return _like_selectivity(expr, ndv, cfg, mcv)
+    """Selectivity of a boolean string predicate, from its function and (where it carries
+    one) its pattern."""
+    reader = _PATTERN_READERS.get(expr.fn)
+    if reader is not None:
+        return reader(expr, ndv, cfg, mcv)
     pattern_sel = _STR_PATTERN_SELECTIVITY.get(expr.fn)
     if pattern_sel is not None:
         return pattern_sel(cfg)
     return cfg.default_filter_selectivity
-
-
-def _like_selectivity(
-    expr: StrFunc,
-    ndv: dict[str, float],
-    cfg: CardinalityConfig,
-    mcv: dict[str, dict[str, float]],
-) -> float:
-    """`col LIKE pattern` selectivity, read from where the wildcards fall.
-
-    A single blunt `substring_selectivity` for every `LIKE` throws away what the pattern
-    plainly says — and the shapes it conflates differ by an order of magnitude:
-
-    * **no wildcards** (`col LIKE 'DELIVER IN PERSON'`) is exact *equality*, so it gets the
-      equality estimate (`1/ndv`, or a measured skew frequency) — often 10-100x more
-      selective than a substring, and a common shape (TPC-H Q19's `l_shipinstruct`, an
-      enum column matched to a constant);
-    * an **anchored prefix** (`'AIR%'`) or **suffix** (`'%ing'`) matches far fewer rows than
-      an unanchored substring, so it gets `prefix_selectivity`;
-    * a genuine **substring** (`'%foo%'`, or any pattern with an interior `%`/`_`) keeps
-      `substring_selectivity`.
-
-    An unparseable or non-literal pattern falls back to `substring_selectivity`, exactly as
-    every `LIKE` did before.
-    """
-    pat = expr.pattern
-    if not isinstance(pat, str):
-        return cfg.substring_selectivity
-    if not any(w in pat for w in _LIKE_WILDCARDS):
-        # No wildcards → `LIKE` is `=`. Reuse the equality estimate over the literal.
-        if isinstance(expr.input, Col):
-            name = expr.input.name
-            col_mcv = (mcv or {}).get(name)
-            freq = _mcv_lookup(col_mcv, pat)
-            if freq is not None:
-                return freq
-            d = ndv.get(name)
-            if d and d > 0:
-                return residual_eq_frequency(d, col_mcv, cfg.eq_selectivity)
-        return cfg.eq_selectivity
-    if "_" not in pat:
-        body = pat.strip("%")
-        # An anchored match: the single wildcard run sits at exactly one end.
-        if body and "%" not in body and (pat.startswith("%") ^ pat.endswith("%")):
-            return cfg.prefix_selectivity
-    return cfg.substring_selectivity
 
 
 def _in_list_selectivity(

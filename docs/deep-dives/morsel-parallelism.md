@@ -84,7 +84,7 @@ Result *order* for the hash-based operators (aggregate, distinct, join) depends 
 count and is therefore not stable across machines. These are unordered relations, so the tests
 compare them as multisets. A sort, by contrast, is order-defining, and its parallel path is
 deliberately built to produce a **bit-identical** permutation. See
-[Sort internals](sort-internals.md).
+{doc}`Sort internals <sort-internals>`.
 
 ## How wide?
 
@@ -185,13 +185,13 @@ open work. Closing that gap is what would close the join-heavy TPC-H gap against
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): where scheduling sits relative to operator semantics
-- [Execution engine](../internals/execution.md): the sequential oracle this path must agree with
-- [Carbonite](../internals/carbonite.md): who decides how big a morsel may get under pressure
-- [Performance](../user-guide/performance.md): the `morsel_rows` and `parallelism` knobs, applied
-- [Analytics benchmarks](../benchmarks/analytics.md): the single-node numbers
-- [Scaling benchmarks](../benchmarks/scaling.md): where the 1.7x to 3.8x figure comes from
-- [Mergeable algebra](mergeable-algebra.md): why the parallel schedule computes the same answer
-- [Join algorithms](join-algorithms.md): the shuffle-and-bucket join in detail
-- [Arrow and memory](arrow-memory.md): the byte budget a morsel is bounded by
+- {doc}`Architecture <../architecture/index>`: where scheduling sits relative to operator semantics
+- {doc}`Execution engine <../internals/execution>`: the sequential oracle this path must agree with
+- {doc}`Carbonite <../internals/carbonite>`: who decides how big a morsel may get under pressure
+- {doc}`Performance <../user-guide/performance>`: the `morsel_rows` and `parallelism` knobs, applied
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: the single-node numbers
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: where the 1.7x to 3.8x figure comes from
+- {doc}`Mergeable algebra <mergeable-algebra>`: why the parallel schedule computes the same answer
+- {doc}`Join algorithms <join-algorithms>`: the shuffle-and-bucket join in detail
+- {doc}`Arrow and memory <arrow-memory>`: the byte budget a morsel is bounded by
 :::

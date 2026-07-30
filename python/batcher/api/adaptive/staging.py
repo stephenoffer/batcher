@@ -425,7 +425,15 @@ def _worth_staging(srcs: list[Source], hub):
         try:
             from batcher.api.adaptive.gating import _build_estimator
 
-            return _build_estimator(srcs, hub).estimate(node).provenance >= Provenance.DEFAULT
+            # `Provenance` is ordered strongest-trust *first* (EXACT=0 … DEFAULT=4), so the
+            # test for "less than exact" is `> EXACT`. Comparing `>= DEFAULT` instead — as
+            # this did — accepted only the pure Selinger guess and rejected HISTOGRAM,
+            # SKETCH and LEARNED, which is nearly every breaker in a warmed-up process.
+            # The loop then staged almost nothing: the join above a `learned`-sized
+            # aggregate chose its build side from that estimate rather than from the
+            # measured size, and adaptive re-optimization got quietly *weaker* the more the
+            # learning loop knew.
+            return _build_estimator(srcs, hub).estimate(node).provenance > Provenance.EXACT
         except Exception as exc:  # pragma: no cover - an estimate must never break staging
             note_suppressed("api", "read breaker provenance for staging", exc)
             return True

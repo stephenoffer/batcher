@@ -222,7 +222,7 @@ machine: GenuineIntel/16c/64GiB/l3=32MiB/nvme [a2f5aeb968ef]
 
 Every timing above it is relative to that machine, so it's what makes two profiles from
 different nodes comparable. The fingerprint is also the key the engine stores its learned
-costs under, which makes it the answer to "why did this node plan worse than that one?" — a
+costs under, which makes it the answer to "why did this node plan worse than that one?" A
 different fingerprint means the two learned separately and neither inherited the other's
 measurements. {doc}`performance` covers what that changes.
 
@@ -258,7 +258,7 @@ diagnosis rather than verdicts:
 | Field | What it tells you |
 |---|---|
 | `major_faults` | Pages fetched from disk. Any material count means the box is paging. |
-| `minor_faults` | Pages committed without disk I/O — the *measured* working set, against which `peak_rss_bytes` is a high-water mark and the planner's estimate is a model. |
+| `minor_faults` | Pages committed without disk I/O, giving the *measured* working set, against which `peak_rss_bytes` is a high-water mark and the planner's estimate is a model. |
 | `invol_ctx_switches` | Times the scheduler evicted the operator from a core. |
 | `preemption_rate` | The same, per core-second, so it compares across operators of different widths and durations. |
 | `vol_ctx_switches` | Times the operator blocked and yielded. High against low `cpu_util` means genuinely I/O- or lock-bound, rather than under-parallelized. |
@@ -285,16 +285,16 @@ Then, and only then, start changing the query.
 
 ## See also
 
-- [Performance](performance.md): the tuning knobs behind these measurements.
-- [Caching](caching.md): stop re-running the plan you just read.
-- [Troubleshooting](troubleshooting.md): what to do about what you found.
-- [Query lifecycle](../deep-dives/query-lifecycle.md): the stages the plan passes
+- {doc}`Performance <performance>`: the tuning knobs behind these measurements.
+- {doc}`Caching <caching>`: stop re-running the plan you just read.
+- {doc}`Troubleshooting <troubleshooting>`: what to do about what you found.
+- {doc}`Query lifecycle <../deep-dives/query-lifecycle>`: the stages the plan passes
   through, which is what the tree is a picture of.
-- [The plan IR](../deep-dives/plan-ir.md): the JSON document the tree is printed from, and
+- {doc}`The plan IR <../deep-dives/plan-ir>`: the JSON document the tree is printed from, and
   the contract the Rust engine reads it under.
-- [Cost model](../deep-dives/cost-model.md): how an `est≈N` becomes a join order.
-- [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): why the same
+- {doc}`Cost model <../deep-dives/cost-model>`: how an `est≈N` becomes a join order.
+- {doc}`Adaptive re-optimization <../deep-dives/adaptive-reoptimization>`: why the same
   `explain()` says something different after a run.
-- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md): this checklist,
+- {doc}`Optimizing a slow query <../tutorials/optimizing-a-slow-query>`: this checklist,
   walked end to end on a query that is actually slow.
-- [Dataset API](../api/dataset.md): the `explain` and `stats` reference.
+- {doc}`Dataset API <../api/dataset>`: the `explain` and `stats` reference.

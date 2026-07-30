@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.metadata.hardware_scope import scoped
+from batcher.plan.feedback import oversubscribed
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -155,12 +156,42 @@ def learned_cpu_weight_factor(hub: MetadataHub | None, family: str) -> float | N
     at the target busy fraction keeps its full weight (factor 1.0); one that used only a quarter
     of its reserved cores (IO/GPU-bound) reserves a quarter as many next time (factor 0.25). The
     unmeasured 0.0 sentinel is dropped so an older engine's blank signal never collapses the
-    reservation. Purely a packing decision — the rows a task processes are unchanged."""
+    reservation. Purely a packing decision — the rows a task processes are unchanged.
+
+    **A contended family is not a low-utilization family**, and this is the one place the
+    distinction has to be made. A family whose threads were repeatedly evicted from their
+    cores, or whose pages were being fetched back from disk, measures exactly as low as one
+    that never wanted the cores — and the response the reading above would give is the
+    opposite of the right one. Shrinking a contended family's reservation lets Ray pack more
+    of its tasks onto the cores they are already fighting over, which lowers utilization
+    further, which shrinks the reservation again: a loop that tightens itself with no step in
+    it that looks wrong. `oversubscribed` reads the preemption and major-fault history Core
+    already records and suppresses the learned factor, so the caller keeps its planned weight.
+
+    Deliberately suppression rather than a *raise*: reserving more than planned under
+    contention would relieve it, but it also over-provisions a whole cluster off a signal
+    measured per operator family, and the loop this closes is the amplifying one."""
     samples = [u for u in _family_samples(hub, family, "cpu_utilization") if u > 0.0]
     if len(samples) < _MIN_SAMPLES:
         return None
+    if _family_oversubscribed(hub, family):
+        return None
     mean_util = sum(samples) / len(samples)
     return max(_CPU_FACTOR_LO, min(_CPU_FACTOR_HI, mean_util / _CPU_TARGET_UTIL))
+
+
+def _family_oversubscribed(hub: MetadataHub | None, family: str) -> bool:
+    """Whether this family's measured history shows it competing for the machine.
+
+    Best-effort: any failure reads as "no evidence", which keeps the caller's prior behavior.
+    """
+    if hub is None:
+        return False
+    try:
+        return oversubscribed(hub.op_stats_by_kind().get(family, []))
+    except Exception as exc:  # pragma: no cover - a learned read must never break a query
+        note_suppressed("dist", "read family contention", exc)
+        return False
 
 
 # --- Shuffle fan-out (reducer count) -----------------------------------------------------

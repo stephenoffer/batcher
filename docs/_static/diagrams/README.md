@@ -53,11 +53,33 @@ not required to work on the documentation.
 
 ## Charts
 
-`gpu_utilization` and `stage_overlap` are charts rather than diagrams, so they answer to
-`.claude/rules/documentation.md`'s charts rule as well: every figure traces to a committed
-benchmark, named in the generating script's docstring, and the axes carry their units. Both
-were color-checked against each surface rather than eyeballed. The light "before" bar in
-`stage_overlap` failed the 3:1 contrast floor at its first value and was re-stepped.
+`gpu_utilization`, `stage_overlap`, and `tpch_sf10` are charts rather than diagrams, so they
+answer to `.claude/rules/documentation.md`'s charts rule as well: every figure traces to a
+committed benchmark, named in the generating script's docstring, and the axes carry their
+units. All were color-checked against each surface rather than eyeballed. The light "before"
+bar in `stage_overlap` failed the 3:1 contrast floor at its first value and was re-stepped.
+
+`tpch_sf10` plots suite *ratios* around a 1.0x parity line rather than absolute totals,
+because only two of the four engines in that run have a recorded total. Back-solving the
+other two and presenting them as measured is exactly what the contract forbids, so the
+script says so in its docstring and the caption repeats it on the page.
+
+## Diagrams that carry a disciplined claim
+
+Two figures state something the project has deliberately narrowed, and both name their
+source so the picture cannot drift away from the audit:
+
+- `adaptive_loop` and `adaptive_positioning` are drawn to the wording
+  `docs/internals/competitive_architecture.md` sanctions, **not** to the retired claim that
+  Batcher re-optimizes more finely than Spark AQE. It does not: the within-query loop is
+  stage-boundary adaptation at the same granularity, gated off below the thresholds in
+  `python/batcher/api/adaptive/gating.py`. The differentiator those diagrams draw is that
+  the loop runs single-node as well as distributed, and that what it measured survives into
+  the next run. `adaptive_positioning` is a capability matrix rather than a timeline for
+  precisely this reason: a timeline invites the "more marks means better" reading the
+  retired claim was made of.
+- `execution_tiers` draws the JIT fallback edge explicitly, because "falls back rather than
+  diverges" is the load-bearing half of the parity contract and the half a reader forgets.
 
 Current diagrams: `hub`, `lifecycle`, `mergeable`, `two_planes`, `layer_stack`,
 `data_flow`, `pipeline_breakers`, `carbonite_loop`, `adaptive_loop`, `transfer_modes`,

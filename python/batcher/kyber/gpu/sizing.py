@@ -58,14 +58,47 @@ def size_gpu_map_batches(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPla
         # devices is the point of threading a profile into the optimizer: the driver is routinely
         # a CPU-only head node whose probe finds nothing.
         device_gb = ctx.hardware.gpu_memory_bytes / (1 << 30) or None
+    # The width of one input row, so the batch seed charges the input tensor's own VRAM and
+    # not only the activation prior. This is the estimator Kyber already threads through the
+    # context, so the rule pays nothing extra for it; an estimator that abstains yields `0.0`,
+    # which is the previous activation-only budget exactly.
+    input_row_bytes = _input_row_bytes(node, ctx)
     params = decide_gpu_map_params(
         node.model_memory_gb,
         node.num_gpus,
         node.batch_size,
         gpu_memory_gb=device_gb,
         assign_num_gpus=not is_non_gpu_accel,
+        input_row_bytes=input_row_bytes,
     )
     if params.num_gpus == node.num_gpus and params.batch_size == node.batch_size:
         return None
     ctx.notes.setdefault("gpu_resource_sizing", []).append(params.reason)
     return dataclasses.replace(node, num_gpus=params.num_gpus, batch_size=params.batch_size)
+
+
+def _input_row_bytes(node: MapBatches, ctx: OptimizerContext) -> float:
+    """Estimated Arrow bytes of one row entering `node`, or `0.0` when unknowable.
+
+    The batch a GPU stage dispatches occupies the device twice over — the input rows and the
+    activations derived from them — and only the second was ever budgeted. On a decoded image
+    or video column the input tensor is the larger of the two by a wide margin, so the seed
+    was asking the device for several times the VRAM it has.
+
+    Never raises: a batch-size *seed* is an optimization, and an estimator that abstains must
+    leave it at the previous activation-only budget rather than fail the plan.
+
+    Args:
+        node: The accelerator `map_batches` being sized.
+        ctx: The optimizer context, carrying the shared estimator.
+
+    Returns:
+        Bytes per input row, or `0.0` when no estimate is available.
+    """
+    from batcher._internal.logging import note_suppressed
+
+    try:
+        return float(ctx.estimator.row_width(node.input, ctx.config.optimizer.row_bytes))
+    except Exception as exc:  # pragma: no cover - sizing must never break a plan
+        note_suppressed("kyber", "size gpu batch from input width", exc)
+        return 0.0

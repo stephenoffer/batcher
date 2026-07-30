@@ -39,9 +39,13 @@ DIR_MAX_DEPTH = 5  # directory levels under a package/src root
 # fragment one cohesive family registry. Keyed by posix path relative to the repo root.
 DIR_ALLOW: dict[str, str] = {
     "python/batcher/ml/metrics": (
-        "the model-metrics family package: one module per metric family (classification, "
-        "regression, ranking, clustering, calibration, fairness, tables, comparison) plus their "
-        "shared helpers, kept separate so each family stays discoverable and under the line limit"
+        "the model-metrics family package, 13 modules against a cap of 12: one module per "
+        "metric family (regression, ranking, ranked, clustering, cluster_quality, calibration, "
+        "fairness, thresholds, tables, comparison, evaluate) plus their shared helpers, kept "
+        "separate so each family stays discoverable and under the line limit. There is "
+        "deliberately no `classification.py` — the classification measures are split across "
+        "`evaluate`/`calibration`/`thresholds`/`tables` here and the plan-layer "
+        "`plan/functions/metrics/model/`, so do not go looking for one"
     ),
     "python/batcher/kyber/rules/extra": (
         "Kyber's extended rule families: one small module per family + a registry, the "
@@ -55,7 +59,7 @@ DIR_ALLOW: dict[str, str] = {
         "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "OVER BUDGET AND TRACKED: 17 modules against a cap of 12. The learned-adaptive family "
+        "OVER BUDGET AND TRACKED: 18 modules against a cap of 12. The learned-adaptive family "
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
     ),
@@ -89,6 +93,16 @@ _ACCESSOR_RE = re.compile(r"Namespace$")
 # the list from becoming the place oversized files go to be forgotten. Every entry
 # is printed on each run so the set stays visible and shrinks over time.
 STRUCTURE_ALLOW: dict[str, str] = {
+    # Sat at exactly 500 lines — the ceiling — so adding a single `__slots__` entry tipped
+    # it over. That entry is `__weakref__`, and it is load-bearing rather than cosmetic:
+    # without it the only per-instance handle on an in-memory source is `id()`, which
+    # CPython reuses the moment an object is freed, so four transient frames shared one
+    # learned-statistics key and each planned from another relation's distinct counts and
+    # most-common-values (see `plan/source_stats.py::source_stats_key`). The real fix is to
+    # split the widening helpers (`_widen_*`, the narrow-type mapping) out of the source
+    # class they sit above — a genuinely separate concern — but that is a refactor to do
+    # deliberately, not as a side effect of a one-line correctness fix.
+    "python/batcher/io/source/inmemory.py": "at the ceiling; one __slots__ entry tipped it — extract the _widen_* helpers next",
     # Sat at 499 lines — one under the ceiling — so wiring shuffle-output replication
     # into the reduce tipped it over. The replication logic itself was extracted to
     # `dist/shuffle_replication.py` rather than left inline; what remains is the reduce

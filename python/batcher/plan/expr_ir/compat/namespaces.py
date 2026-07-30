@@ -304,4 +304,7 @@ def bind_namespace_compat() -> None:
         cls = classes[accessor]
         for func in funcs:
             func.__qualname__ = f"{cls.__name__}.{func.__name__}"  # type: ignore[attr-defined]
+            # Move `__module__` with `__qualname__`, so Sphinx can resolve the accessor
+            # class where it is actually defined. See the note in `compat/binder.py`.
+            func.__module__ = cls.__module__  # type: ignore[attr-defined]
             setattr(cls, func.__name__, func)

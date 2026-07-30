@@ -193,19 +193,19 @@ print(train.count(), test.count())
 
 Splitting on `user_id` rather than on the row is the difference between measuring
 generalization to a new user and measuring memorization of an old one. See
-[train/test split](train-test-split.md) for the other two ways that goes wrong.
+{doc}`train/test split <train-test-split>` for the other two ways that goes wrong.
 
 ## See also
 
-- [Feature pipeline](feature-pipeline.md): scale, encode, and assemble these columns.
-- [Train/test split](train-test-split.md): entity splits, time splits, and leakage.
-- [Window functions](../../user-guide/window-functions.md): frames, ranks, and lag/lead in full.
-- [Aggregations](../../user-guide/aggregations.md): the mergeable aggregate surface.
-- [Joins](../../user-guide/joins.md): left, anti, and cross joins, and what each one costs.
-- [Preprocessors](../../ml/preprocessors/index.md): `MultiHotEncoder` and the rest of the estimators.
-- [Data loaders](../../ml/data-loaders.md): getting the finished rows into a training loop.
-- [ML API reference](../../api/ml.md): `ds.ml.train_test_split` and the `batcher.ml` estimators.
-- [Mergeable algebra](../../deep-dives/mergeable-algebra.md): why these aggregates give the
+- {doc}`Feature pipeline <feature-pipeline>`: scale, encode, and assemble these columns.
+- {doc}`Train/test split <train-test-split>`: entity splits, time splits, and leakage.
+- {doc}`Window functions <../../user-guide/window-functions>`: frames, ranks, and lag/lead in full.
+- {doc}`Aggregations <../../user-guide/aggregations>`: the mergeable aggregate surface.
+- {doc}`Joins <../../user-guide/joins>`: left, anti, and cross joins, and what each one costs.
+- {doc}`Preprocessors <../../ml/preprocessors/index>`: `MultiHotEncoder` and the rest of the estimators.
+- {doc}`Data loaders <../../ml/data-loaders>`: getting the finished rows into a training loop.
+- {doc}`ML API reference <../../api/ml>`: `ds.ml.train_test_split` and the `batcher.ml` estimators.
+- {doc}`Mergeable algebra <../../deep-dives/mergeable-algebra>`: why these aggregates give the
   same answer on one core and on a cluster.
-- [Sessionization](../analytics/sessionization.md): the window-function recipe this one borrows
+- {doc}`Sessionization <../analytics/sessionization>`: the window-function recipe this one borrows
   its sequence features from.

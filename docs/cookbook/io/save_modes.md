@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/io/save_modes.py
 ```
+
+## See also
+
+- {doc}`parquet_roundtrip`: writing and reading Parquet, with partitioning and column pruning.
+- {doc}`sources_and_sinks`: the source and sink registries: what formats exist, and the objects behind them.
+- {doc}`../../user-guide/reading-data`: every source format and how paths and schemas resolve.
+- {doc}`../../user-guide/writing-data`: sinks, save modes, and partitioned output.

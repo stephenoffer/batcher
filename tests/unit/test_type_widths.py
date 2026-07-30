@@ -70,6 +70,65 @@ def test_variable_length_list_scales_with_its_element_type():
     assert column_bytes(pa.large_list(pa.int64())) - column_bytes(pa.list_(pa.int64())) == 4.0
 
 
+def test_extension_type_is_sized_by_its_storage():
+    # THE multimodal case. Every decoded image, audio waveform, video frame stack, and
+    # model output in Batcher is the canonical `arrow.fixed_shape_tensor` extension type
+    # (io/formats/ml/tensor.py, ml/decode/media.py, core/udf/call.py). None of the
+    # `pa.types.is_*` predicates see through an extension label, so before this a
+    # 224x224x3 uint8 image was sized at the 32 B varlen prior against a true 150,528 —
+    # a 4,704x under-estimate, in the direction that makes a memory envelope too small
+    # and a build side look broadcastable when replicating it would OOM every worker.
+    image = pa.fixed_shape_tensor(pa.uint8(), [224, 224, 3])
+    assert column_bytes(image) == 224 * 224 * 3
+    # And an embedding column produced the same way is exact, not a prior.
+    assert column_bytes(pa.fixed_shape_tensor(pa.float32(), [768])) == 768 * 4
+
+
+def test_map_is_sized_as_a_list_of_entries():
+    # A map is how every semi-structured source (JSON objects with open-ended keys,
+    # Parquet MAP groups, Avro maps) lands in Arrow, and it matches none of the list
+    # predicates — so it used to fall through to the flat 32 B scalar prior.
+    entry = column_bytes(pa.string()) + column_bytes(pa.int64())
+    assert column_bytes(pa.map_(pa.string(), pa.int64())) > entry
+    # Bigger values make a bigger map: the element types are not ignored.
+    assert column_bytes(pa.map_(pa.string(), pa.float64())) > column_bytes(
+        pa.map_(pa.string(), pa.int8())
+    )
+
+
+def test_null_column_costs_nothing():
+    # Arrow's `null` type is pure metadata with no value buffer. Charging it the varlen
+    # prior invented 32 B/row for a column occupying none — the shape a JSON or CSV
+    # source produces for a field it saw only nulls in.
+    assert column_bytes(pa.null()) == 0.0
+
+
+def test_run_end_encoded_is_bounded_by_one_run_per_row():
+    # An honest worst case (a run of length 1), not an invented compression ratio —
+    # and still far below the 32 B prior it used to hit.
+    ree = pa.run_end_encoded(pa.int32(), pa.int64())
+    assert column_bytes(ree) == column_bytes(pa.int32()) + column_bytes(pa.int64())
+    assert column_bytes(ree) < DEFAULT_VARLEN_BYTES
+
+
+def test_union_is_sized_by_its_layout():
+    # A sparse union allocates every variant for every row; a dense union allocates only
+    # the chosen one. Both used to fall through to the scalar prior, which under-reads a
+    # sparse union by roughly its arity — the shape an Avro union takes.
+    fields = [pa.field("a", pa.int64()), pa.field("b", pa.float64())]
+    sparse = column_bytes(pa.sparse_union(fields))
+    dense = column_bytes(pa.dense_union(fields))
+    assert sparse > dense
+    assert sparse >= column_bytes(pa.int64()) + column_bytes(pa.float64())
+
+
+def test_view_types_carry_the_view_struct_not_an_offset():
+    # A string view inlines short values in a 16-byte struct instead of an offset pair.
+    assert column_bytes(pa.string_view()) == DEFAULT_VARLEN_BYTES + 16.0
+    # A list view carries an offset *and* a size buffer, so two buffers wide per row.
+    assert column_bytes(pa.list_view(pa.int64())) == column_bytes(pa.large_list(pa.int64()))
+
+
 def test_schema_row_bytes_sums_the_columns():
     # The exact shape that decides a broadcast: a two-int64 join key is 16 B/row,
     # not the 64 B/row a flat per-row constant would have charged it.

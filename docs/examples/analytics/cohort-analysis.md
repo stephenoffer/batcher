@@ -201,15 +201,15 @@ and the one that decides whether this query fits in memory. Two things keep it b
 ## See also
 
 :::{seealso}
-- [Retention curves](retention-curves.md): the same cohort skeleton, measured in days
+- {doc}`Retention curves <retention-curves>`: the same cohort skeleton, measured in days
   and normalized to a rate.
-- [Funnel analysis](funnel-analysis.md): the other one-row-per-user collapse, and the
+- {doc}`Funnel analysis <funnel-analysis>`: the other one-row-per-user collapse, and the
   self-join it replaces.
-- [Window functions](../../user-guide/window-functions.md): `over` in full.
-- [Aggregations](../../user-guide/aggregations.md): `n_unique` and the approximate
+- {doc}`Window functions <../../user-guide/window-functions>`: `over` in full.
+- {doc}`Aggregations <../../user-guide/aggregations>`: `n_unique` and the approximate
   variant for large inputs.
-- [Pivoting](../../user-guide/pivoting.md): `pivot`, `unpivot`, and fixing the column set.
-- [Window internals](../../deep-dives/window-internals.md): what the partition-by shuffle
+- {doc}`Pivoting <../../user-guide/pivoting>`: `pivot`, `unpivot`, and fixing the column set.
+- {doc}`Window internals <../../deep-dives/window-internals>`: what the partition-by shuffle
   actually costs, and when it spills.
-- [Expressions API](../../api/expressions.md): `dt.strftime`, `dt.year`, `min().over(...)`.
+- {doc}`Expressions API <../../api/expressions>`: `dt.strftime`, `dt.year`, `min().over(...)`.
 :::

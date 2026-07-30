@@ -112,7 +112,7 @@ the whole time.
 ## Picking the number
 
 Measure it, don't guess it. Land the raw events first (see
-[Kafka to the lake](kafka-etl.md)), then look at the distribution of
+{doc}`Kafka to the lake <kafka-etl>`), then look at the distribution of
 `processing_time - event_time` in the bronze table. The p99 of that lag is a defensible
 lateness. The max is not: one pathological device should not hold every window open.
 
@@ -191,15 +191,15 @@ affected windows in a batch job, which is a reconciliation pipeline, not a strea
 
 ## See also
 
-- [Windowed aggregation](windowed-aggregation.md): the windows this watermark closes.
-- [Joining two streams](stream-join.md): the same watermark, evicting join buffers.
-- [Kafka to the lake](kafka-etl.md): landing the raw events you measure the lag distribution
+- {doc}`Windowed aggregation <windowed-aggregation>`: the windows this watermark closes.
+- {doc}`Joining two streams <stream-join>`: the same watermark, evicting join buffers.
+- {doc}`Kafka to the lake <kafka-etl>`: landing the raw events you measure the lag distribution
   on.
-- [Streaming](../../user-guide/streaming.md): watermarks, triggers, and output modes in full.
-- [Late-arriving data](../data-engineering/late-arriving-data.md): the batch reconciliation
+- {doc}`Streaming <../../user-guide/streaming>`: watermarks, triggers, and output modes in full.
+- {doc}`Late-arriving data <../data-engineering/late-arriving-data>`: the batch reconciliation
   pipeline this page keeps pointing at.
-- [Deduplication](../data-engineering/deduplication.md): dedup without a watermark to bound it.
-- [Data quality](../../user-guide/data-quality.md): catching the clock-from-the-future row at
+- {doc}`Deduplication <../data-engineering/deduplication>`: dedup without a watermark to bound it.
+- {doc}`Data quality <../../user-guide/data-quality>`: catching the clock-from-the-future row at
   the edge.
-- [Spilling](../../deep-dives/spilling.md): what bounded state buys you, and where it goes when
+- {doc}`Spilling <../../deep-dives/spilling>`: what bounded state buys you, and where it goes when
   it does not fit.

@@ -84,6 +84,39 @@ def execute_spilling_sort(
     return empty_result_table(sort, sort.available_columns())
 
 
+def _buckets_for_staged(stage_handle: object, hint: int) -> int:
+    """How many ordered buckets the staged input should be split into.
+
+    The bucket count used to be a constant (16, or whatever the caller passed), and that is
+    the one number in an out-of-core sort that must not be a constant: each bucket is read
+    back **whole** to be sorted, so a fixed count makes peak memory `input / 16` — it grows
+    linearly with the input. A sort large enough to need this path is exactly the sort that
+    then OOMs on its first bucket, and the failure looks like an ordinary OOM rather than a
+    misconfigured spill.
+
+    Staging has already measured the mapped input, so the count can come from the same
+    envelope the aggregate reduce uses (`memory.spill_bucket_max_bytes`). `logical_nbytes`
+    is the **uncompressed** size — what reading the bucket back actually costs in RAM —
+    where `nbytes` is the on-disk size, which for a compressible column can be several times
+    smaller and would let an over-large bucket through.
+
+    The caller's `hint` is a floor, so a small sort still gets the parallelism it had, and
+    `_fd_safe` is the ceiling, because the partition phase holds one writer per non-empty
+    bucket open at once.
+
+    A range partition cannot split a *single* key value across buckets — equal keys must
+    share one, or the concatenation is not sorted — so a sort whose key is one hot value is
+    still bounded by that value's rows. That is inherent to ordering, not to this sizing.
+    """
+    if stage_handle is None:
+        return max(1, hint)
+    resident = getattr(stage_handle, "logical_nbytes", 0) or getattr(stage_handle, "nbytes", 0)
+    bucket_max = active_config().memory.spill_bucket_max_bytes
+    if bucket_max <= 0 or resident <= 0:
+        return _fd_safe(max(1, hint))
+    return _fd_safe(max(hint, -(-resident // bucket_max)))
+
+
 def stage_and_partition(
     source, map_ir, key_name, nulls_first, descending, n_buckets, store, cfg_json, projection=None
 ):
@@ -114,6 +147,9 @@ def stage_and_partition(
             if grid:
                 grids.append((grid, rb.num_rows))
     stage_handle = stage.close()
+    # Staging has measured the whole mapped input, so the bucket count no longer has to be
+    # guessed — size it from what was actually staged. See `_buckets_for_staged`.
+    n_buckets = _buckets_for_staged(stage_handle, n_buckets)
     boundaries = merge_boundaries(grids, n_buckets) if n_buckets > 1 else []
 
     # --- pass 2: assign staged rows to ordered buckets and spill ----------
@@ -182,8 +218,10 @@ def stream_spilling_sort(
             cfg_json,
             map_projection(sort, sid),
         )
-        # Sort each bucket, yield in key order (reversed for descending).
-        order = range(n_buckets - 1, -1, -1) if desc else range(n_buckets)
+        # Sort each bucket, yield in key order (reversed for descending). The count comes
+        # from `handles`, not from `n_buckets`: staging measures the input and sizes the
+        # split from it, so the number of buckets is decided in there, not here.
+        order = range(len(handles) - 1, -1, -1) if desc else range(len(handles))
         emitted = 0
         for b in order:
             if handles[b] is None:

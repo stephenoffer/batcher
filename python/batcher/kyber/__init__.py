@@ -15,13 +15,15 @@ estimators, and join ordering land on top of this seam.
 
 from __future__ import annotations
 
-from batcher.kyber.correction import estimate_is_reliable
-from batcher.kyber.learning import (
+from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
     columns_for,
+)
+from batcher.kyber.correction import estimate_is_reliable
+from batcher.kyber.learning import (
     load_learned_stats,
     record_column_stats,
     record_execution,

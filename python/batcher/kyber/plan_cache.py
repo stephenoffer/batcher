@@ -45,6 +45,7 @@ and the data its pruning decisions read. Both are keyed exactly.
 from __future__ import annotations
 
 import hashlib
+import math
 from collections import OrderedDict
 from typing import Any
 
@@ -111,12 +112,12 @@ def cache_key(
     source_ids = _source_keys(sources)
     if source_ids is None:
         return None
-    # Injectivity: the first eight fields are all `|`-free (a fixed `kind`, three hex digests,
-    # three integers, a comma-joined hardware fingerprint), so a `|`-split recovers them and
-    # everything after the eighth `|` is the
-    # source component. That component is `repr(source_ids)` — unambiguous for a list of
-    # strings even when a source identity (a file path) contains `|` or `,`, which a naive
-    # delimiter-join would let collide two different source sets onto one key.
+    # Injectivity: the first nine fields are all `|`-free (a fixed `kind`, three hex digests,
+    # three integers, and two comma-joined numeric vectors), so a `|`-split recovers them and
+    # everything after the ninth `|` is the source component. That component is
+    # `repr(source_ids)` — unambiguous for a list of strings even when a source identity (a
+    # file path) contains `|` or `,`, which a naive delimiter-join would let collide two
+    # different source sets onto one key.
     return "|".join(
         (
             kind,
@@ -125,10 +126,48 @@ def cache_key(
             str(id(hub)),
             str(learning.generation()),
             _calibration_epoch(hub),
+            _read_cost_key(hub, sources),
             _source_stats_key(source_stats),
             _hardware_key(hardware),
             repr(source_ids),
         )
+    )
+
+
+# Half-octave buckets: a read-cost factor is folded into the key at
+# ``round(log2(factor) * _READ_COST_BUCKETS)``, so a plan is re-optimized when a source's
+# measured throughput moves by roughly 40% relative to its neighbours and not when the
+# smoothed figure twitches. This is the same trade `_calibration_epoch` makes and for the
+# same reason: keyed on the raw value the memo would miss on every query and cease to exist,
+# keyed on nothing the plan would freeze at whichever factors were in force when it was first
+# cached — which for a cold store is all-1.0, i.e. the measurement would never be spent.
+_READ_COST_BUCKETS = 2
+
+
+def _read_cost_key(hub: Any, sources: list | None) -> str:
+    """A coarse fingerprint of the per-source read-cost factors, or ``"-"``.
+
+    The third door past the generation counter, after cost calibration and CPU shares: the
+    cost model prices a `Scan`'s bytes by the source's *measured* throughput relative to the
+    plan's median (`metadata.io_stats.relative_read_cost`), and that is re-derived from the
+    hub on every optimize. A plan memoized without it keeps whichever join order and build
+    side the throughputs implied when it was first cached, however far they have since moved.
+
+    Bucketed rather than exact — see `_READ_COST_BUCKETS`. A cold store, a single source, or
+    an unidentifiable one all produce the same all-1.0 vector and therefore the same key, so
+    nothing that was cacheable before becomes uncacheable.
+    """
+    if hub is None or not sources:
+        return "-"
+    try:
+        from batcher.metadata.io_stats import relative_read_cost
+        from batcher.plan.source_stats import source_identity
+
+        factors = relative_read_cost(hub, [source_identity(s) for s in sources])
+    except Exception:  # pragma: no cover - a learned read must never break the memo
+        return "-"
+    return ",".join(
+        str(round(math.log2(f) * _READ_COST_BUCKETS)) if f > 0.0 else "0" for f in factors
     )
 
 

@@ -257,9 +257,39 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
             rows = src.row_count() or 0
             if not cols or rows * len(cols) > max_cells:
                 continue
-            ndv = core.column_ndv(src.read(projection=cols), cols)
-            if ndv:
-                kyber.record_column_stats(hub, ndv, {}, source_key=source_key)
+            batches = src.read(projection=cols)
+            ndv = core.column_ndv(batches, cols)
+            # Heavy hitters, from the same batches, for the same reason the ndv is seeded:
+            # the data is already resident, so measuring costs no I/O — and skew is the one
+            # distribution the estimator cannot approximate at all without it.
+            #
+            # Under uniformity an equality is `1/ndv`, which is exactly wrong on a skewed
+            # key. Measured on 100,000 rows with one value at 50%: `k = 7` estimated at 20
+            # rows against a true 49,868, a **2,487x** under-estimate, and a Zipf column was
+            # 139x under. That estimate sizes the filter, then the join built on its output,
+            # then that join's memory envelope — so a cold query over a hot key mis-sizes
+            # every stage below it. `learn_column_stats` measures this today, but only
+            # *after* a query of the shape has run, so the first one plans blind.
+            #
+            # Over a **bounded sample**, exactly as the post-run pass does: Misra-Gries is
+            # ~56 ns a cell against the ndv sketch's ~4, so sketching a whole large source
+            # here would add to every cold query what `_STATS_SAMPLE_ROWS` exists to cap. A
+            # frequency is a fraction of rows and a uniform sample preserves it, which is
+            # what makes the bound sound rather than merely cheap.
+            mcv: dict[str, dict[str, float]] = {}
+            sample = _sketch_sample(batches)
+            sampled_rows = sum(b.num_rows for b in sample)
+            if sampled_rows > 0:
+                min_frac = active_config().optimizer.cardinality.mcv_min_fraction
+                for col_name, hits in core.heavy_hitters(sample, cols, min_frac).items():
+                    if hits:
+                        mcv[col_name] = {str(v): n / sampled_rows for v, n in hits}
+            if ndv or mcv:
+                # `avg_bytes` is deliberately left empty: `learn_column_stats` gates its own
+                # "already known" check on that key precisely so seeding cannot suppress the
+                # post-run pass, which is the only source of quantile grids. Writing one
+                # here would silently switch that pass off for the column.
+                kyber.record_column_stats(hub, ndv, {}, mcv=mcv, source_key=source_key)
     except Exception as exc:  # pragma: no cover - learning must never break execution
         note_suppressed("api", "learn column NDV", exc)
 

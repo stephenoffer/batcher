@@ -10,6 +10,9 @@ the step function.
 
 ## Which loader
 
+Find the row that matches your training setup. Each loader hands batches to a different
+consumer, and picking the wrong one is what puts Python back on the hot path:
+
 | Situation | Reach for |
 | --- | --- |
 | Anything, in Arrow, no framework | `ds.iter_batches()` |
@@ -129,11 +132,11 @@ for batch in DataLoader(iterable, batch_size=None):  # already sized
 Wrapping this in a `DistributedSampler` shards an already-sharded stream, so each rank
 sees a fraction of its fraction and most of your corpus is never read. The job runs, the
 loss falls, and you are training on a quarter of the data. `stream_loader` is the only
-shard authority. While you are there, note that passing `batch_size` to the `DataLoader`
+shard authority. While you are there, remember that passing `batch_size` to the `DataLoader`
 re-batches batches that are already the right size.
 :::
 
-See [distributed training](distributed-training.md) for the balance, determinism, and
+See {doc}`distributed training <distributed-training>` for the balance, determinism, and
 resume guarantees.
 
 ## streaming_split: an unbounded source
@@ -200,7 +203,7 @@ print(first.schema.names, first.num_rows)
 ```
 
 For learned statistics such as standardization, one-hot encoding, or imputation, fit a
-[preprocessor](preprocessors/index.md) on the train split and `transform` the stream. The fit
+{doc}`preprocessor <preprocessors/index>` on the train split and `transform` the stream. The fit
 is one mergeable pass over the data, and the transform is an engine stage. Neither one
 runs in the training loop.
 
@@ -219,14 +222,14 @@ In order of frequency:
 
 ## See also
 
-- [PyTorch](pytorch.md): device transfer, collate, zero-copy, and DDP in full.
-- [Distributed training](distributed-training.md): the multi-rank sharding contract.
-- [Streaming for training](streaming.md): the bounded-memory ingest path.
-- [Preprocessors](preprocessors/index.md): the fit-on-train, transform-the-stream contract.
-- [Tensor columns](../deep-dives/tensor-columns.md): how a fixed-shape tensor reaches the
+- {doc}`PyTorch <pytorch>`: device transfer, collate, zero-copy, and DDP in full.
+- {doc}`Distributed training <distributed-training>`: the multi-rank sharding contract.
+- {doc}`Streaming for training <streaming>`: the bounded-memory ingest path.
+- {doc}`Preprocessors <preprocessors/index>`: the fit-on-train, transform-the-stream contract.
+- {doc}`Tensor columns <../deep-dives/tensor-columns>`: how a fixed-shape tensor reaches the
   loop with its shape intact.
-- [GPU execution](../deep-dives/gpu-execution.md): what the device is waiting on when it
+- {doc}`GPU execution <../deep-dives/gpu-execution>`: what the device is waiting on when it
   is waiting.
-- [Distributed training pipeline](../tutorials/distributed-training-pipeline.md): the
+- {doc}`Distributed training pipeline <../tutorials/distributed-training-pipeline>`: the
   whole path, from files to a loop.
-- [ML API](../api/ml.md): the loader and converter reference.
+- {doc}`ML API <../api/ml>`: the loader and converter reference.
