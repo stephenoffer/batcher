@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.api.orchestration.sizing import (
     DEFAULT_PARTITIONS,
     declared_row_count,
@@ -109,7 +110,52 @@ def execute_distributed(
         envelope.credits,
         (time.perf_counter() - started) * 1000.0,
     )
+    _record_distributed_cardinality(ctx.hub, plan, sources, result)
     return result
+
+
+def _record_distributed_cardinality(hub, plan: LogicalPlan, sources: list[Source], result) -> None:
+    """Close the *cardinality* loop for a distributed run, as the single-node path does.
+
+    `record_distributed` above learns the scheduling knobs — worker fan-out, credit window.
+    The plan-level learned state is a different loop and was single-node only: this path
+    never reached `record_cardinality_outcome`, so a distributed query measured its own
+    output on every run and learned nothing from it, while the identical query on one node
+    learned. That is backwards. A distributed workload is the long-running, repeatedly-issued
+    one, which is exactly where cross-run learning is worth the most — and it was the one
+    configuration with the loop switched off.
+
+    The row count is taken only where it is already known. A materialized result is a table
+    and carries it; a partitioned result left on the fleet reports it from its handles
+    without fetching a batch. Anything else declines rather than forcing a materialization —
+    learning must not change what the run costs.
+
+    Best-effort, like every other write on this path.
+
+    Args:
+        hub: The metadata hub; a `None` hub is a no-op.
+        plan: The pre-optimization plan — the identity the learner keys on.
+        sources: The plan's bound sources, for the selectivity denominator.
+        result: The run's result, a table or a partitioned source.
+    """
+    # The whole body is inside the guard, counting included. Asking a partitioned result for
+    # its row count reaches the fleet's handles, and a worker lost between the answer landing
+    # and this call would otherwise turn a *completed* query into a failed one — the run has
+    # already produced its rows, and nothing about learning from them is worth that.
+    try:
+        rows = getattr(result, "num_rows", None)
+        if rows is None:
+            counter = getattr(result, "row_count", None)
+            rows = counter() if callable(counter) else None
+        if rows is None:
+            return
+        # Imported here, not at module scope: `run` imports this module, so the dependency
+        # only runs one way at import time.
+        from batcher.api.orchestration.run import record_cardinality_outcome
+
+        record_cardinality_outcome(hub, plan, sources, int(rows))
+    except Exception as exc:  # pragma: no cover - learning must never break a completed run
+        note_suppressed("api", "record distributed cardinality", exc)
 
 
 def spill_to_disk(

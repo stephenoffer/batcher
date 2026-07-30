@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 945 Python modules across 146 packages and 180 Rust files across 13 crates.
+Covering 946 Python modules across 146 packages and 180 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -283,7 +283,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
 | `run.py` | 492 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 204 | What the conductor needs to know about a plan's size before it runs it. |
-| `stages.py` | 226 | The three ways the conductor can execute an admitted plan, plus the source read. |
+| `stages.py` | 272 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
 ### `batcher/api/security/` — 5 · conductor
 
@@ -686,7 +686,7 @@ Per-operator distributed executor implementations.
 | `aggregate.py` | 245 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 48 | Distributed DISTINCT — deduplicate across workers via the aggregate shuffle. |
 | `join.py` | 865 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
-| `map.py` | 1450 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 1470 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 522 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 216 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -758,8 +758,9 @@ Distributed streaming heterogeneous execution — overlapped, resource-class sta
 
 | module | lines | what it is |
 |---|---|---|
+| `consumers.py` | 90 | The GPU consumer pool of the streaming pipeline: how many, and which one next. |
 | `microbatch.py` | 431 | A streaming micro-batch, run across the cluster — one epoch, one transaction. |
-| `pipeline.py` | 473 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
+| `pipeline.py` | 455 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
 
 ### `batcher/kyber/` — 3 · subsystem
 
@@ -2067,7 +2068,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/range/band.rs` | 240 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 456 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
-| `join/range/mod.rs` | 619 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/mod.rs` | 657 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
 | `join/scratch_bench.rs` | 2 | TEMPORARY scratch measurement — not part of the crate's contract. |
 | `join/sort_merge.rs` | 180 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 243 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |

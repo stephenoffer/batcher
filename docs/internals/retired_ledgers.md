@@ -59,11 +59,14 @@ deliberately declined, each for a reason worth keeping:
   *encoded* size, so a dictionary-encoded string column reads far narrower than its Arrow
   width. Feeding it to the width estimator would understate exactly the columns that matter
   most. The right source is the measurement Core already takes.
-- **Learned state still lags on the distributed path.** Per-operator feedback flows, but the
-  Flight transport paths, `dist/executors/write.py`, and `reduce_join_paths_spilling` are
-  unmetered, and the plan-level learned state (`record_execution`, `learn_column_stats`,
-  `record_selectivity`, `record_run_feedback`) is single-node only. "Single-node ==
-  distributed" holds for *results*, not yet for all learned state.
+- **Learned state still lags on the distributed path**, though less than when this was
+  written. `record_execution` / `record_selectivity` now fire on the distributed relational
+  route (`stages._record_distributed_cardinality`, counting only where the count is already
+  known so learning never forces a materialization) and on the distributed `map_batches`
+  branch. What remains unmetered: the Flight transport paths, `dist/executors/write.py`, and
+  `reduce_join_paths_spilling`; `learn_column_stats` and `record_run_feedback` are still
+  single-node. "Single-node == distributed" holds for *results*, not yet for all learned
+  state.
 - **Spill throughput is a table, not a measurement.** `kyber.storage_cost.spill_device_factor`
   prices a spilled byte from a static device-class table read out of `/sys` (10x network, 30x
   rotational, local flash the omitted baseline), while Core records `spill_bytes`,
