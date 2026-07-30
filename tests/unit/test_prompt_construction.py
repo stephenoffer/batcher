@@ -184,3 +184,102 @@ def test_the_budget_functions_reject_a_non_positive_budget() -> None:
     for build in (pr.truncate_to_token_budget, pr.truncate_middle):
         with pytest.raises(PlanError):
             build("t", budget=0)
+
+
+# --- reading a conversation column -------------------------------------------------
+
+_CHAT = [
+    {"role": "user", "content": "what is 2+2?"},
+    {"role": "assistant", "content": "4"},
+    {"role": "user", "content": "and 3+3?"},
+]
+
+
+def _chat(rows: list) -> bt.Dataset:
+    return bt.from_pydict({"msgs": rows})
+
+
+def test_conversation_turns_counts_every_message() -> None:
+    assert _chat([_CHAT]).select(n=pr.conversation_turns("msgs")).to_pydict()["n"] == [3]
+
+
+def test_conversation_turns_counts_one_role() -> None:
+    """A log full of user messages with no answers is a collection failure, not a short chat."""
+    got = _chat([_CHAT]).select(n=pr.conversation_turns("msgs", "assistant")).to_pydict()["n"]
+    assert got == [1]
+
+
+def test_conversation_turns_of_an_absent_role_is_zero() -> None:
+    got = _chat([_CHAT]).select(n=pr.conversation_turns("msgs", "system")).to_pydict()["n"]
+    assert got == [0]
+
+
+def test_conversation_turns_rejects_an_empty_role() -> None:
+    with pytest.raises(PlanError):
+        pr.conversation_turns("msgs", "  ")
+
+
+def test_last_message_reads_how_the_conversation_ended() -> None:
+    got = _chat([_CHAT]).select(v=pr.last_message("msgs")).to_pydict()["v"]
+    assert got == ["and 3+3?"]
+
+
+def test_last_message_of_a_role_reads_that_role_s_final_turn() -> None:
+    got = _chat([_CHAT]).select(v=pr.last_message("msgs", "assistant")).to_pydict()["v"]
+    assert got == ["4"]
+
+
+def test_last_message_of_an_absent_role_is_null_not_empty() -> None:
+    """Null keeps the rows that never had one countable, instead of scoring as empty answers."""
+    got = _chat([_CHAT]).select(v=pr.last_message("msgs", "system")).to_pydict()["v"]
+    assert got == [None]
+
+
+def test_ends_with_role_finds_the_truncated_conversations() -> None:
+    rows = [_CHAT[:2], _CHAT]
+    got = _chat(rows).select(v=pr.ends_with_role("msgs")).to_pydict()["v"]
+    assert got == [True, False]
+
+
+def test_ends_with_role_composes_into_the_completeness_filter() -> None:
+    ds = bt.from_pydict({"msgs": [_CHAT[:2], _CHAT], "id": [1, 2]})
+    kept = ds.filter(pr.ends_with_role("msgs")).to_pydict()
+    assert kept["id"] == [1]
+
+
+def test_ends_with_role_rejects_an_empty_role() -> None:
+    with pytest.raises(PlanError):
+        pr.ends_with_role("msgs", "")
+
+
+def test_render_messages_prefixes_each_turn_with_its_role() -> None:
+    got = _chat([_CHAT[:2]]).select(v=pr.render_messages("msgs")).to_pydict()["v"]
+    assert got == ["user: what is 2+2?\nassistant: 4"]
+
+
+def test_render_messages_takes_the_separator_and_suffix() -> None:
+    expr = pr.render_messages("msgs", separator=" | ", role_suffix="=")
+    got = _chat([_CHAT[:2]]).select(v=expr).to_pydict()["v"]
+    assert got == ["user=what is 2+2? | assistant=4"]
+
+
+def test_the_chat_helpers_take_non_default_field_names() -> None:
+    """The role/content convention is not universal, and renaming a field is a materialization."""
+    rows = [[{"speaker": "user", "text": "hi"}, {"speaker": "bot", "text": "hello"}]]
+    ds = bt.from_pydict({"msgs": rows})
+    got = ds.select(
+        n=pr.conversation_turns("msgs", "bot", role_field="speaker"),
+        v=pr.last_message("msgs", "bot", role_field="speaker", content_field="text"),
+    ).to_pydict()
+    assert got == {"n": [1], "v": ["hello"]}
+
+
+def test_a_conversation_column_aggregates_like_any_other() -> None:
+    """The reason these are expressions: a corpus profile is one scan."""
+    ds = bt.from_pydict({"msgs": [_CHAT, _CHAT[:2], _CHAT[:1]]})
+    got = ds.agg(
+        mean_turns=pr.conversation_turns("msgs").mean(),
+        complete=pr.ends_with_role("msgs").cast("float64").mean(),
+    ).to_pydict()
+    assert got["mean_turns"] == [2.0]
+    assert got["complete"] == [pytest.approx(1 / 3)]
