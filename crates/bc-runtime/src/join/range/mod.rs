@@ -1410,6 +1410,12 @@ mod tests {
             let sl = k_lo.sorted_left(nl, &lmap, &rmap);
             let sort_l = t.elapsed();
 
+            // NOTE: this is the *sequential, generic-comparison* merge, written out here rather
+            // than called. It is no longer what the operator runs — `bounds_by_merge` takes a
+            // contiguous `u64` fast path and splits it across workers — so read `merge1` as the
+            // reference cost this phase used to have, and read `whole` for what the operator
+            // actually costs. Keeping it is useful (it is the ceiling the fast path is measured
+            // against); mistaking it for the live path is not.
             let t = Instant::now();
             let mut at = vec![0u32; nl];
             let mut p = 0usize;
