@@ -169,12 +169,13 @@ def _eligible(
     datasets: list[str] | tuple[str, ...],
     zone_budget_watts: float,
 ) -> tuple[GpuNodeTopology, ...]:
-    """Nodes a collective may actually use: residency-permitted, and in a zone with power left.
+    """Nodes a collective may actually use: healthy, residency-permitted, and with power left.
 
-    Both filters are no-ops by default — no datasets named, no budget configured — so a caller
-    that passes neither gets exactly the fleet it passed in.
+    The residency and power filters are no-ops by default — no datasets named, no budget
+    configured — so a caller that passes neither gets exactly the fleet it passed in, minus
+    any node the fleet health probe has condemned.
     """
-    out = records
+    out = _without_unhealthy(records)
     if datasets:
         from batcher.dist.executors.ray_runtime.fabric.residency import permitted_nodes
         from batcher.governance.residency import active_residency
@@ -191,6 +192,40 @@ def _eligible(
             != 0
         )
     return out
+
+
+def _without_unhealthy(records: tuple[GpuNodeTopology, ...]) -> tuple[GpuNodeTopology, ...]:
+    """Drop nodes holding a device that should not be scheduled on.
+
+    A gang-scheduled collective is the placement least tolerant of a bad node: every rank
+    waits on the slowest, so one device with its NVLink down or its memory condemned sets the
+    rate for the whole group — and a strict-pack bundle has no way to route around it once
+    placed. This is the one filter worth paying a fleet probe for.
+
+    Only *quarantined* devices exclude a node. A degraded one is still contributing, and a
+    fleet under a thermal or power clamp is often every node at once, so excluding those would
+    empty the cluster over a condition the clamp is there to manage.
+
+    Args:
+        records: The candidate nodes.
+
+    Returns:
+        The nodes with nothing quarantined on them. Returns `records` unchanged when the probe
+        answered for no node — an unreadable fleet is not an unhealthy one — and when every
+        node is condemned, because refusing to place work at all is worse than placing it on a
+        fleet the operator has already been told about.
+    """
+    from batcher.config import active_config
+
+    if not records or not active_config().accelerator.health.enabled:
+        return records
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_device_health
+
+    condemned = {r["node_id"] for r in cluster_device_health() if r.get("quarantined")}
+    if not condemned:
+        return records
+    healthy = tuple(n for n in records if n.node_id not in condemned)
+    return healthy or records
 
 
 def _preferred_order(

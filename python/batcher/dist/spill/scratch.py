@@ -13,7 +13,6 @@ import tempfile
 
 import pyarrow as pa
 
-from batcher._internal.site import local_scratch_root
 from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
 from batcher.io.source import Source
@@ -36,6 +35,8 @@ def _work_dir(spill_dir: str | None, prefix: str) -> tuple[str, bool]:
     beside unused storage, and the failure looks like an undersized query rather than a
     misplaced directory.
     """
+    from batcher._internal.site import local_scratch_root
+
     if spill_dir is not None:
         return spill_dir, False
     root = active_config().memory.spill_dir or local_scratch_root()

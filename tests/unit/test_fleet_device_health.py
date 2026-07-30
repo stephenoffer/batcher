@@ -111,3 +111,84 @@ def test_the_report_omits_health_entirely_off_a_cluster(monkeypatch):
     fleet: dict = {}
     report_mod._add_fleet_health(fleet)
     assert fleet == {}
+
+
+# --- Placement keeps a collective off a condemned node -------------------------------------
+
+
+def _topology(*node_ids: str):
+    from batcher.dist.executors.ray_runtime.fabric.topology import GpuNodeTopology
+
+    return tuple(
+        GpuNodeTopology(node_id=n, gpus=8, accelerator_type="NVIDIA_H100") for n in node_ids
+    )
+
+
+def _health_enabled(enabled: bool = True):
+    """Scope `accelerator.health.enabled`, which is what gates the fleet probe."""
+    from batcher.config import Config, config_context
+
+    return config_context(Config.from_dict({"accelerator": {"health": {"enabled": enabled}}}))
+
+
+def test_a_gang_bundle_avoids_a_node_with_a_condemned_device(monkeypatch):
+    # A strict-pack collective has no way to route around a bad rank once placed: every rank
+    # waits on the slowest, so the whole group runs at the bad device's rate.
+    from batcher.dist.executors.ray_runtime.fabric import placement
+
+    monkeypatch.setattr(
+        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        lambda: (_record("good"), _record("bad", quarantined=["GPU-2"])),
+    )
+    with _health_enabled():
+        kept = placement._without_unhealthy(_topology("good", "bad"))
+    assert [n.node_id for n in kept] == ["good"]
+
+
+def test_a_degraded_but_working_device_does_not_empty_the_node(monkeypatch):
+    # A thermal or power clamp is often every node at once, and it is the clamp doing its job.
+    from batcher.dist.executors.ray_runtime.fabric import placement
+
+    monkeypatch.setattr(
+        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        lambda: (_record("a", degraded=["GPU-1"]), _record("b", degraded=["GPU-0"])),
+    )
+    with _health_enabled():
+        kept = placement._without_unhealthy(_topology("a", "b"))
+    assert [n.node_id for n in kept] == ["a", "b"]
+
+
+def test_an_unreadable_fleet_is_not_an_unhealthy_one(monkeypatch):
+    from batcher.dist.executors.ray_runtime.fabric import placement
+
+    monkeypatch.setattr(
+        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health", lambda: ()
+    )
+    with _health_enabled():
+        kept = placement._without_unhealthy(_topology("a", "b"))
+    assert len(kept) == 2
+
+
+def test_a_wholly_condemned_fleet_still_gets_a_placement(monkeypatch):
+    # Refusing to place work at all is worse than placing it on a fleet whose state the
+    # operator has already been told about.
+    from batcher.dist.executors.ray_runtime.fabric import placement
+
+    monkeypatch.setattr(
+        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        lambda: (_record("a", quarantined=["x"]), _record("b", quarantined=["y"])),
+    )
+    with _health_enabled():
+        kept = placement._without_unhealthy(_topology("a", "b"))
+    assert len(kept) == 2
+
+
+def test_the_probe_is_not_run_when_health_checking_is_off(monkeypatch):
+    from batcher.dist.executors.ray_runtime.fabric import placement
+
+    monkeypatch.setattr(
+        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        lambda: pytest.fail("probed the fleet with health checking disabled"),
+    )
+    with _health_enabled(enabled=False):
+        assert len(placement._without_unhealthy(_topology("a"))) == 1
