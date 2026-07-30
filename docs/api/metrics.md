@@ -250,6 +250,24 @@ measuring how much of the answer the context supports and how much is unsupporte
    citation_rate
 ```
 
+The phrase-level pair is the harder test. Token overlap scores an answer built from the
+context's own vocabulary and rearranged into a claim the context never made, which is what a
+confident hallucination looks like; requiring whole spans to match catches it. The last group
+scores the *retrieval* rather than the answer, over a list column of passages:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   phrase_groundedness
+   unsupported_phrase_rate
+   empty_retrieval_rate
+   duplicate_context_rate
+   mean_retrieved_passages
+   context_token_estimate
+```
+
 The readability metrics score how complex a generated column reads, for matching a target reading
 level.
 

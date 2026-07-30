@@ -223,6 +223,69 @@ the prompt without a per-row Python string format. For a JSON answer, `parse_jso
 with a `guided_json` schema gets typed columns back instead of a string you have to
 regex. See {doc}`LLM inference <llm>`.
 
+## Measuring the pipeline
+
+The failures below are easier to fix than to notice, so measure them. Each of these is an
+aggregate over a column, so a whole eval set is one scan and every one breaks down by index
+version, tenant, or day with `group_by`.
+
+Start on the retrieval side, because a grounding score computed over a context that was never
+retrieved is measuring nothing. `bt.empty_retrieval_rate` counts the queries that got no
+passages at all, which is the failure that presents as unexplained hallucination: with no
+context the model answers from its parameters, fluently and without a citation.
+`bt.duplicate_context_rate` catches the same chunk arriving twice, which spends the window
+twice on one passage, and `bt.mean_retrieved_passages` shows when the retriever is quietly
+returning fewer than the `k` you asked for.
+
+```python
+import batcher as bt
+
+runs = bt.from_pydict(
+    {
+        "index": ["v1", "v1", "v2", "v2"],
+        "hits": [[], ["a chunk"], ["a chunk", "a chunk"], ["a chunk", "another"]],
+    }
+)
+print(
+    runs.group_by("index")
+    .agg(
+        empty=bt.empty_retrieval_rate("hits"),
+        duplicated=bt.duplicate_context_rate("hits"),
+        mean_k=bt.mean_retrieved_passages("hits"),
+    )
+    .sort("index")
+    .to_pydict()
+)
+```
+
+`bt.context_token_estimate` sizes what the retrieval is about to cost. Retrieved context is
+usually the largest part of a RAG prompt and the part that grows silently: raising `k` from 5
+to 10 doubles the input bill of every request, and nothing in the pipeline says so.
+
+On the answer side, `bt.answer_groundedness` measures how much of the answer its context backs
+at the vocabulary level, and `bt.phrase_groundedness` does the same at the phrase level. Read
+them together. An answer built from the context's own words, rearranged into a claim the
+context never made, scores perfectly on the first and badly on the second — and that gap is
+what a confident hallucination looks like.
+
+```python
+answers = bt.from_pydict(
+    {
+        "answer": ["mat sat cat quietly the on"],
+        "context": ["the cat sat quietly on the mat"],
+    }
+)
+print(
+    answers.agg(
+        tokens=bt.answer_groundedness("answer", "context"),
+        phrases=bt.phrase_groundedness("answer", "context"),
+    ).to_pydict()
+)
+```
+
+`bt.unsupported_phrase_rate` is the same signal inverted, which is the direction a dashboard
+wants: it rises as the system gets worse, so a threshold and an alert read the way you expect.
+
 ## The failure modes, in order
 
 Every one of these is a data bug that presents as a model bug, which is why they survive
