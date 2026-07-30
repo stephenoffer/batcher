@@ -30,6 +30,23 @@
 //! Comparison is order-sensitive on purpose for `Sort`, because an order-independent
 //! comparison cannot see a sort bug. Everything else is compared as a multiset, because
 //! aggregation and join output order is not part of their contract.
+//!
+//! # Why there is no memory-budget dimension here
+//!
+//! The obvious next axis is spill, and this repo has good reason to reach for it — a
+//! `sort(descending=True)` once returned unsorted data under spill while every gate stayed
+//! green. It was tried here and **removed deliberately**, because it is not a sound
+//! equivalence axis for this particular property: a dictionary-encoded column genuinely
+//! occupies less memory than the same column decoded, which is the entire reason the encoding
+//! exists. So under a budget the two runs are *supposed* to be able to diverge — one fitting
+//! where the other spills, or errors — and an assertion that they agree would be asserting
+//! that dictionary encoding does not save memory.
+//!
+//! (Passing a budget of 1 also does not reach a spill at all: `execute_streaming` raises
+//! "operator state exceeds the memory budget and cannot spill: the streaming sort does not
+//! spill" rather than handing off, so the variant was testing an error path, not the spilling
+//! executor.) Spill behaviour over dictionaries is worth testing; it needs its own harness
+//! that compares against a spilled *oracle*, not against the other encoding.
 
 use std::sync::Arc;
 
