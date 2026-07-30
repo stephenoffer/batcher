@@ -25,6 +25,7 @@ from batcher._internal.device_specs import (
     device_tflops_per_watt,
     known_device_names,
     rank_devices_by_efficiency,
+    resolve_device_name,
 )
 
 pytestmark = pytest.mark.unit
@@ -105,3 +106,34 @@ def test_nvlink_domain_distinguishes_fabric_from_pcie() -> None:
     assert device_nvlink_gbps("NVIDIA_L40S") == 0.0
     assert device_nvlink_domain("NVIDIA_H100") == 8
     assert device_nvlink_domain("NVIDIA_GB200") == 72, "rack-scale NVLink domain"
+
+
+def test_a_driver_reported_name_resolves_to_a_table_key() -> None:
+    # Nothing in the fleet spells a device the way the table does: NVML reports a board
+    # variant and a memory size, Ray reports a label, and neither is the key.
+    assert resolve_device_name("NVIDIA H100 80GB HBM3") == "NVIDIA_H100"
+    assert resolve_device_name("Tesla T4") == "NVIDIA_TESLA_T4"
+    assert resolve_device_name("AMD Instinct MI300X") == "AMD_INSTINCT_MI300X"
+    assert resolve_device_name("TPU v4") == "TPU-V4"
+
+
+def test_the_part_token_wins_over_a_shared_memory_token() -> None:
+    # `80G` prefixes the `80GB` in an H100's name, so a substring match resolves an H100 to
+    # an A100 — a 2x error in bandwidth, power, and tensor rate, silently.
+    assert resolve_device_name("NVIDIA H100 80GB HBM3") != "NVIDIA_A100_80G"
+    assert resolve_device_name("NVIDIA A100-SXM4-80GB") == "NVIDIA_A100_80G"
+    assert resolve_device_name("NVIDIA A100-SXM4-40GB") == "NVIDIA_A100_40G"
+
+
+def test_a_name_without_a_memory_size_takes_the_conservative_entry() -> None:
+    resolved = resolve_device_name("NVIDIA A100")
+    assert resolved == "NVIDIA_A100"
+    assert device_spec(resolved).memory_gib == 40, "the smallest shipping variant"
+
+
+def test_an_unrecognized_part_resolves_to_unknown_not_a_neighbour() -> None:
+    assert resolve_device_name("NVIDIA GeForce RTX 4090") is None
+    assert resolve_device_name("Some Future GPU") is None
+    assert resolve_device_name("NVIDIA") is None, "a vendor alone identifies no part"
+    assert resolve_device_name("") is None
+    assert resolve_device_name(None) is None

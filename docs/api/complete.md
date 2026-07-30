@@ -67,6 +67,7 @@ register SQL functions or sessions.
    show_versions
    accelerators
    show_accelerators
+   measure_energy
    start_ui
    stop_ui
    ui_url

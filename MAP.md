@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 993 Python modules across 153 packages and 183 Rust files across 13 crates.
+Covering 992 Python modules across 153 packages and 183 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -1032,7 +1032,6 @@ Ordered-comparison sargable transposition, proved rather than assumed.
 | module | lines | what it is |
 |---|---|---|
 | `bounds.py` | 113 | Ordered sargable transposition proved by a column's **measured min/max**. |
-| `narrow.py` | 90 | Ordered sargable transposition proved by a column's **declared integer width**. |
 | `shared.py` | 185 | The decomposition and the overflow proof shared by the ordered sargable rules. |
 
 ### `batcher/kyber/rules/joins/` — 3 · subsystem
@@ -2110,7 +2109,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 2845 | The multi-core executor. |
+| `par.rs` | 2864 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 494 | The breakers: operators that must see all of their input before they can emit any output. |
@@ -2271,10 +2270,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `hardware.rs` | 190 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 240 | The host's instruction-set capabilities, in full. |
-| `lib.rs` | 229 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `lib.rs` | 232 | `bc-arrow` — Arrow building blocks shared across the engine. |
 | `placement.rs` | 153 | Which CPU a worker thread should run on. |
 | `row_sort.rs` | 118 | A stable multi-column sort permutation over the Arrow row format. |
-| `topology.rs` | 582 | The machine's memory and core topology, as the data plane needs to see it. |
+| `topology.rs` | 561 | The machine's memory and core topology, as the data plane needs to see it. |
 
 ### `bc-sketches`
 

@@ -83,10 +83,27 @@ because clamping it would mean inventing the watts it draws.
 
 ## Report what a run cost
 
-Energy is recorded per stage, and the report is where a GPU-hour becomes actionable. The
-figures a datacenter cares about are efficiency ratios rather than totals: tokens per joule for
-a generative stage, rows per joule for a relational one, and the share of energy spent holding
-devices that were not computing.
+Energy is recorded per stage, and the report is where a GPU-hour becomes actionable. Wrap the
+work in `bt.measure_energy()` and every accelerator stage inside records what it drew:
+
+```python
+import batcher as bt
+
+with bt.measure_energy() as energy:
+    out = bt.from_pydict({"g": [1, 1, 2], "v": [10, 20, 30]}).group_by("g").agg(
+        total=bt.col("v").sum()
+    ).to_pydict()
+
+print(sorted(out))
+# ['g', 'total']
+print(energy.total_joules >= 0.0)
+# True
+```
+
+A CPU-only run records nothing, which is why the ledger above is empty: only accelerator
+stages draw device power. The figures a datacenter cares about are efficiency ratios rather
+than totals: tokens per joule for a generative stage, rows per joule for a relational one, and
+the share of energy spent holding devices that were not computing.
 
 ```python
 from batcher.observe import format_energy_report
@@ -145,7 +162,7 @@ domain when the fleet has one wide enough. Label your nodes so it can:
 | `batcher.io/power-zone` | The breaker or busway whose budget the node's draw counts against |
 | `topology.kubernetes.io/zone` | Availability zone, read before Ray's own label |
 
-An unlabelled fleet reports no rack, fabric, or power zone, and placement degrades to the
+An unlabeled fleet reports no rack, fabric, or power zone, and placement degrades to the
 node-level decision it made before. That is deliberate: a placement hint that fires on missing
 data moves work for a reason that is not there.
 
@@ -320,7 +337,7 @@ that is merely busy.
 - MIG instances must already exist. Batcher plans against the profiles a device supports and
   never reconfigures one.
 - Residency applies to the regions Batcher can see on node labels. A worker whose region is
-  unlabelled is never refused, so labelling is part of enabling the control.
+  unlabeled is never refused, so labeling is part of enabling the control.
 
 ## See also
 

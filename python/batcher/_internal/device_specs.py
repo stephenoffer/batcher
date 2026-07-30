@@ -55,6 +55,7 @@ __all__ = [
     "devices_by_generation",
     "known_device_names",
     "rank_devices_by_efficiency",
+    "resolve_device_name",
 ]
 
 
@@ -394,3 +395,67 @@ def devices_by_generation(generation: str) -> tuple[str, ...]:
     """
     want = generation.lower()
     return tuple(name for name, spec in _SPECS.items() if spec.generation == want)
+
+
+def _tokens(name: str) -> list[str]:
+    """A device name split into uppercase alphanumeric tokens."""
+    return [t for t in "".join(c if c.isalnum() else " " for c in name).upper().split() if t]
+
+
+def _model_token(key: str) -> str:
+    """The token that identifies the *part* in a table key: the first one carrying a digit.
+
+    `NVIDIA_A100_80G` yields `A100`, not `80G`. The distinction is the whole point — a memory
+    token matches across parts (`80G` prefixes the `80GB` in an H100's reported name), so
+    keying on it silently resolves an H100 to an A100 and plans against the wrong bandwidth,
+    the wrong power, and the wrong tensor rate.
+    """
+    for token in _tokens(key):
+        if any(c.isdigit() for c in token):
+            return token
+    return ""
+
+
+def resolve_device_name(reported: str | None) -> str | None:
+    """Map a driver-reported device name onto a table key, or `None` when nothing matches.
+
+    The two vocabularies do not agree and never will. Ray labels a node `NVIDIA_A100_80G`;
+    the driver reports `"NVIDIA A100-SXM4-80GB"` and NVML reports `"NVIDIA H100 80GB HBM3"`,
+    each carrying a board variant, a form factor, and a memory size in its own spelling.
+    Matching by equality therefore fails on every locally probed device, which is exactly
+    where the power and bandwidth figures are most useful.
+
+    Two rules, in order. The key's **part token** — its first token carrying a digit — must
+    match a token of the reported name, which is what keeps an H100 from resolving to an A100
+    through a shared `80G`. Among the keys that pass, the one sharing the most tokens wins,
+    and a tie goes to the *shorter* key, so a name with no memory size resolves to the
+    conservative base entry rather than to its largest variant.
+
+    Args:
+        reported: A device name as a driver, framework, or node label reports it.
+
+    Returns:
+        The canonical table key, or `None` when nothing matches. `None` means unknown, and
+        every accessor then reports unknown rather than a nearest guess.
+    """
+    if not reported:
+        return None
+    normalized = "".join(c if c.isalnum() else "_" for c in reported).upper()
+    if normalized in _SPECS:
+        return normalized
+    name_tokens = _tokens(reported)
+    if not name_tokens:
+        return None
+    best: tuple[int, int, str] | None = None
+    for key in _SPECS:
+        part = _model_token(key)
+        if not part or not any(t.startswith(part) or part.startswith(t) for t in name_tokens):
+            continue
+        key_tokens = _tokens(key)
+        score = sum(1 for kt in key_tokens if any(nt.startswith(kt) for nt in name_tokens))
+        if score < 2:
+            continue
+        candidate = (score, -len(key), key)
+        if best is None or candidate > best:
+            best = candidate
+    return best[2] if best is not None else None

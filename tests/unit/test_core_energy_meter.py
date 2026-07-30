@@ -126,3 +126,58 @@ def test_the_summary_reports_how_much_was_measured(monkeypatch) -> None:
             pass
     fraction = ledger.summary()["measured_fraction"]
     assert 0.0 < fraction < 1.0
+
+
+def test_the_gpu_kernel_is_bracketed_so_a_stage_is_actually_recorded(monkeypatch) -> None:
+    # The meter is only worth having if something on the live path calls it. `gpu_groupby_agg`
+    # is the one point every GPU relational stage passes through — local dispatch and Ray
+    # worker alike — so this pins that the bracket is there and that it counts the rows.
+    import pyarrow as pa
+
+    from batcher.core import gpu_transform
+
+    table = pa.table({"g": [1, 1, 2], "v": [10, 20, 30]})
+    result = pa.table({"g": [1, 2], "total": [30, 30]})
+    monkeypatch.setattr(gpu_transform, "gpu_available", lambda: True)
+    monkeypatch.setattr(gpu_transform, "accelerator_backend", lambda: "cuda")
+    monkeypatch.setattr(gpu_transform, "_dispatch_groupby", lambda *a, **k: result)
+    monkeypatch.setattr(gpu_transform, "_local_device_model", lambda: "NVIDIA_H100")
+
+    with energy_scope() as ledger:
+        out = gpu_transform.gpu_groupby_agg(table, "g", {"total": ("v", "sum")})
+
+    assert out is result
+    assert len(ledger.stages) == 1
+    record = ledger.stages[0]
+    assert record.stage.startswith("GpuGroupBy#")
+    assert record.accelerator_type == "NVIDIA_H100"
+    assert record.rows == 2
+    assert record.joules > 0
+
+
+def test_the_untraced_gpu_path_is_unchanged(monkeypatch) -> None:
+    import pyarrow as pa
+
+    from batcher.core import gpu_transform
+
+    result = pa.table({"g": [1], "total": [30]})
+    monkeypatch.setattr(gpu_transform, "gpu_available", lambda: True)
+    monkeypatch.setattr(gpu_transform, "accelerator_backend", lambda: "cuda")
+    monkeypatch.setattr(gpu_transform, "_dispatch_groupby", lambda *a, **k: result)
+    assert active_ledger() is None
+    out = gpu_transform.gpu_groupby_agg(
+        pa.table({"g": [1], "v": [30]}), "g", {"total": ("v", "sum")}
+    )
+    assert out is result, "no scope open: the kernel returns exactly what it returned before"
+
+
+def test_the_public_scope_is_the_same_ledger() -> None:
+    import batcher as bt
+
+    with (
+        bt.measure_energy() as ledger,
+        measure_stage("A#1", accelerator_type="NVIDIA_H100", device_count=1) as meter,
+    ):
+        meter.add_rows(7)
+    assert ledger.total_rows == 7
+    assert active_ledger() is None

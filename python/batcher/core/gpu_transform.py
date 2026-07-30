@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import accelerator_backend, gpu_devices_absent
 from batcher._internal.logging import note_suppressed
+from batcher.core.energy import measure_stage
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -129,6 +130,30 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
             f"gpu_groupby_agg found no usable accelerator (detected backend {backend!r}); "
             "the caller should use the CPU engine"
         )
+    # Bracketed so the stage's energy is recorded wherever one is being collected: this is
+    # the one place every GPU relational stage passes through, local dispatch and Ray worker
+    # alike, and it is the only point that knows both the device and the rows it produced.
+    # Outside an `energy_scope` the meter returns immediately, so the untraced path is
+    # unchanged.
+    with measure_stage(
+        f"GpuGroupBy#{id(table) & 0xFFFF}",
+        accelerator_type=_local_device_model(),
+        device_count=1,
+    ) as meter:
+        out = _dispatch_groupby(table, key, aggs, backend=backend, device=device)
+        meter.add_rows(out.num_rows)
+        return out
+
+
+def _dispatch_groupby(
+    table: pa.Table,
+    key: str,
+    aggs: dict[str, tuple[str, str]],
+    *,
+    backend: str,
+    device: str,
+) -> pa.Table:
+    """Run the group-by on the best kernel this backend has: cuDF where installed, else torch."""
     if backend in ("cuda", "rocm"):
         try:
             import cudf  # noqa: F401
@@ -137,6 +162,23 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
         except ImportError:
             pass  # cudf not installed -> fall through to the next backend, then the CPU
     return _torch_groupby_agg(table, key, aggs, device=device)
+
+
+@functools.lru_cache(maxsize=1)
+def _local_device_model() -> str:
+    """This host's device model as a `device_specs` key, or `""` when it cannot be resolved.
+
+    Memoized: the attached hardware does not change within a process, and the lookup would
+    otherwise run per stage on a path that is meant to be free when nothing is measuring.
+    """
+    from batcher._internal.device_specs import resolve_device_name
+    from batcher._internal.hardware import gpu_inventory
+
+    for device in gpu_inventory():
+        resolved = resolve_device_name(str(device.get("name") or ""))
+        if resolved:
+            return resolved
+    return ""
 
 
 def _cudf_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]) -> pa.Table:
