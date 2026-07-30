@@ -22,7 +22,12 @@ from __future__ import annotations
 import contextlib
 import os
 
-from batcher._internal.hardware.fabric.pcie import PcieLink, pcie_link
+from batcher._internal.hardware.fabric.pcie import (
+    PcieLink,
+    degraded_pcie_links,
+    pcie_class,
+    pcie_link,
+)
 from batcher._internal.hardware.nvml import _decode, _device_count, _nvml, _read
 
 __all__ = [
@@ -32,6 +37,7 @@ __all__ = [
     "device_numa_nodes",
     "device_pcie_links",
     "gpu_pci_addresses",
+    "nearest_rdma_device",
     "visible_device_indices",
 ]
 
@@ -87,7 +93,7 @@ def degraded_device_links() -> tuple[PcieLink, ...]:
         The degraded links, in device order. Empty when every link is at full capability or
         when nothing could be read.
     """
-    return tuple(link for link in device_pcie_links() if link.degraded)
+    return degraded_pcie_links(gpu_pci_addresses())
 
 
 def device_link_efficiency() -> float:
@@ -214,3 +220,45 @@ def _uuid_indices(nv, count: int) -> dict[str, int]:
         if uuid:
             out[uuid] = index
     return out
+
+
+def nearest_rdma_device(ordinal: int = 0) -> str:
+    """The RDMA NIC closest to one accelerator on the PCI bus, or `""`.
+
+    The pairing a GPU-to-fabric transfer depends on and nothing else establishes. A dense node
+    carries several NICs, and traffic between a device and a NIC on a different root complex
+    crosses the inter-socket link in both directions — for a transfer whose entire purpose is
+    to leave the node. Choosing the first NIC in the list is right by luck on half a
+    two-socket box.
+
+    Ranked by `pcie_class`, so a NIC under the same switch beats one merely on the same root
+    complex, which beats one across the socket. Ties break on device name, so the choice is
+    stable across processes on the same node — two workers that disagree about which NIC is
+    nearest would each be right and would still contend.
+
+    Args:
+        ordinal: The device's index as this process sees it (CUDA's numbering).
+
+    Returns:
+        The RDMA device name (`"mlx5_3"`), or `""` when there is no active fabric, when the
+        device's address is unreadable, or when no NIC publishes one.
+    """
+    from batcher._internal.hardware.fabric.pcie import PCIE_CLASSES
+    from batcher._internal.hardware.fabric.rdma import active_rdma_devices
+
+    visible = visible_device_indices()
+    addresses = gpu_pci_addresses()
+    if ordinal < 0 or ordinal >= len(visible):
+        return ""
+    index = visible[ordinal]
+    if index >= len(addresses) or not addresses[index]:
+        return ""
+    device_address = addresses[index]
+    candidates = [n for n in active_rdma_devices() if n.pci_address]
+    if not candidates:
+        return ""
+    ranked = min(
+        candidates,
+        key=lambda nic: (PCIE_CLASSES.index(pcie_class(device_address, nic.pci_address)), nic.name),
+    )
+    return ranked.name

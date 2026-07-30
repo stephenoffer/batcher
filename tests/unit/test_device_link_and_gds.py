@@ -22,11 +22,17 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _fresh():
-    gds.reset_gds_probe()
-    pcie.pcie_link.cache_clear()
+    """Re-probe around every test; a name a test replaced has no cache to clear."""
+
+    def _clear():
+        gds.reset_gds_probe()
+        clear = getattr(pcie.pcie_link, "cache_clear", None)
+        if clear is not None:
+            clear()
+
+    _clear()
     yield
-    gds.reset_gds_probe()
-    pcie.pcie_link.cache_clear()
+    _clear()
 
 
 # --- The measured host link ---------------------------------------------------------------
@@ -49,7 +55,11 @@ class _FakeNvml:
 def _use(monkeypatch, addresses, links):
     monkeypatch.setattr(device_links, "_nvml", lambda: _FakeNvml(addresses))
     monkeypatch.setattr(device_links, "_device_count", lambda nv: nv.nvmlDeviceGetCount())
+    # Patched in the module that owns it: `degraded_device_links` delegates to the generic
+    # `degraded_pcie_links`, which reads the probe from its own module rather than through
+    # this one.
     monkeypatch.setattr(device_links, "pcie_link", lambda a: links[a])
+    monkeypatch.setattr(pcie, "pcie_link", lambda a: links[a])
 
 
 def test_no_driver_reports_full_efficiency_not_a_penalty(monkeypatch):
@@ -224,3 +234,69 @@ def gds_spec(path: str):
     from batcher.io.splits.device import DeviceReadSpec
 
     return DeviceReadSpec(path=path)
+
+
+# --- Pairing a device with the NIC it should leave the node through -------------------------
+
+
+def test_the_nearest_nic_is_the_one_on_the_same_root_complex(monkeypatch):
+    # A transfer routed via a NIC on the other root complex crosses the inter-socket link
+    # twice on its way *off* the node, which is the opposite of the point.
+    from batcher._internal.hardware.fabric import device_links
+    from batcher._internal.hardware.fabric.rdma import RdmaDevice
+
+    monkeypatch.setattr(device_links, "visible_device_indices", lambda: (0,))
+    monkeypatch.setattr(device_links, "gpu_pci_addresses", lambda: ("0000:0c:00.0",))
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.rdma.active_rdma_devices",
+        lambda: (
+            RdmaDevice("mlx5_far", 1, state="ACTIVE", pci_address="0000:aa:00.0"),
+            RdmaDevice("mlx5_near", 1, state="ACTIVE", pci_address="0000:0d:00.0"),
+        ),
+    )
+    classes = {("0000:0c:00.0", "0000:0d:00.0"): "pix", ("0000:0c:00.0", "0000:aa:00.0"): "sys"}
+    monkeypatch.setattr(device_links, "pcie_class", lambda a, b: classes.get((a, b), "sys"))
+    assert device_links.nearest_rdma_device(0) == "mlx5_near"
+
+
+def test_the_pairing_is_stable_when_two_nics_are_equally_close(monkeypatch):
+    # Two workers that disagree about which NIC is nearest would each be right and would
+    # still contend, so ties break on a name rather than on enumeration order.
+    from batcher._internal.hardware.fabric import device_links
+    from batcher._internal.hardware.fabric.rdma import RdmaDevice
+
+    monkeypatch.setattr(device_links, "visible_device_indices", lambda: (0,))
+    monkeypatch.setattr(device_links, "gpu_pci_addresses", lambda: ("0000:0c:00.0",))
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.rdma.active_rdma_devices",
+        lambda: (
+            RdmaDevice("mlx5_9", 1, state="ACTIVE", pci_address="0000:0e:00.0"),
+            RdmaDevice("mlx5_1", 1, state="ACTIVE", pci_address="0000:0d:00.0"),
+        ),
+    )
+    monkeypatch.setattr(device_links, "pcie_class", lambda a, b: "pix")
+    assert device_links.nearest_rdma_device(0) == "mlx5_1"
+
+
+def test_no_fabric_or_no_address_pairs_with_nothing(monkeypatch):
+    from batcher._internal.hardware.fabric import device_links
+
+    monkeypatch.setattr(device_links, "visible_device_indices", lambda: (0,))
+    monkeypatch.setattr(device_links, "gpu_pci_addresses", lambda: ("0000:0c:00.0",))
+    monkeypatch.setattr("batcher._internal.hardware.fabric.rdma.active_rdma_devices", lambda: ())
+    assert device_links.nearest_rdma_device(0) == ""
+    # A device whose own address the driver would not publish pairs with nothing either.
+    monkeypatch.setattr(device_links, "gpu_pci_addresses", lambda: ("",))
+    assert device_links.nearest_rdma_device(0) == ""
+    assert device_links.nearest_rdma_device(3) == ""
+
+
+def test_the_degraded_link_helpers_are_one_implementation(monkeypatch):
+    # Two functions answering "which of these links came up low" is the duplication the
+    # subsystem rules forbid; the device-specific one delegates to the generic primitive.
+    from batcher._internal.hardware.fabric import device_links, pcie
+
+    bad = pcie.PcieLink("0000:1a:00.0", gen=3, width=8, max_gen=5, max_width=16)
+    monkeypatch.setattr(device_links, "gpu_pci_addresses", lambda: ("0000:1a:00.0",))
+    monkeypatch.setattr(pcie, "pcie_link", lambda a: bad)
+    assert [link.address for link in device_links.degraded_device_links()] == ["0000:1a:00.0"]

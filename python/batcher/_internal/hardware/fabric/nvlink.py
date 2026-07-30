@@ -241,9 +241,10 @@ def nvlink_summary(status: tuple[NvLinkStatus, ...] | None = None) -> dict:
         status: Readings to inspect, or `None` to take them live.
 
     Returns:
-        Device count, total and active link counts, how many devices are degraded, and the
-        summed error counters. All zero on a node with no NVLink and on one where NVML is
-        unavailable, which a caller distinguishes with `nvml_available()`.
+        Device count, total and active link counts, how many devices are degraded, how many
+        device pairs share an active link, and the summed error counters. All zero on a node
+        with no NVLink and on one where NVML is unavailable, which a caller distinguishes with
+        `nvml_available()`.
     """
     records = nvlink_status() if status is None else status
     errors: dict[str, int] = {}
@@ -255,5 +256,9 @@ def nvlink_summary(status: tuple[NvLinkStatus, ...] | None = None) -> dict:
         "links": sum(r.links for r in records),
         "active_links": sum(r.active_links for r in records),
         "degraded_devices": len(nvlink_degraded_devices(records)),
+        # Pairs that can actually exchange on the fabric. A link count says how much fabric
+        # exists; this says how much of it connects the devices a collective would be placed
+        # across, which is the figure that changes when one board drops off the mesh.
+        "peer_pairs": len(p2p_pairs(records)),
         "errors": errors,
     }

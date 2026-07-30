@@ -76,12 +76,21 @@ def _add_measured_link(row: dict, index: int) -> None:
     reader needs, while one at half width is the whole explanation for a transfer-bound stage
     that used to be fast.
     """
-    from batcher._internal.hardware.fabric.device_links import device_pcie_links
+    from batcher._internal.hardware.fabric.device_links import (
+        device_pcie_links,
+        nearest_rdma_device,
+    )
 
     links = device_pcie_links()
     if index >= len(links):
         return
     link = links[index]
+    nic = nearest_rdma_device(index)
+    if nic:
+        # Which NIC this device should reach the fabric through. A transfer routed via a NIC
+        # on the other root complex crosses the inter-socket link twice on its way off the
+        # node, and nothing else in the report pairs the two halves.
+        row["nearest_nic"] = nic
     if link.numa_node >= 0:
         # Which socket the device hangs off: the host half of its pipeline belongs there too.
         row["numa_node"] = link.numa_node
@@ -308,6 +317,11 @@ def _add_fabric(report: dict) -> None:
     if nvlink["links"]:
         fabric["nvlink"] = nvlink
     if fabric:
+        from batcher.kyber.cost.fabric import net_weight_summary
+
+        # What the fabric measurement did to the plan ranking. Otherwise invisible: two
+        # clusters produce different plans for the same query and the report explains neither.
+        fabric["cost"] = net_weight_summary()
         report["fabric"] = fabric
 
 

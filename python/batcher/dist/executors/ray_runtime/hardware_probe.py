@@ -234,7 +234,11 @@ def _device_health_on_this_worker() -> dict:
         fabric_error_total,
         nvlink_summary,
     )
-    from batcher._internal.hardware.faults import xid_readable
+    from batcher._internal.hardware.faults import (
+        faulted_devices,
+        misconfigured_devices,
+        xid_readable,
+    )
     from batcher.carbonite.accel import assess_fleet, device_reset_candidates
 
     verdicts = assess_fleet()
@@ -248,6 +252,12 @@ def _device_health_on_this_worker() -> dict:
         "degraded": [v.uuid or v.device_index for v in verdicts if v.state == "degraded"],
         "reasons": sorted({r for v in verdicts for r in v.reasons}),
         "reset_pending": list(device_reset_candidates()),
+        # The memory faults behind those verdicts, and the settings that cost this node
+        # something without failing anything. Neither is a drain reason on its own — a
+        # device with ECC off is working, it is simply not reporting — but both are what an
+        # operator reconciles a slow node against.
+        "faulted": [f.uuid or f.index for f in faulted_devices()],
+        "config_findings": sorted({f for m in misconfigured_devices() for f in m.findings}),
         "degraded_links": [link.address for link in degraded_device_links()],
         "nvlink": nvlink_summary(),
         "xid_readable": xid_readable(),
