@@ -444,6 +444,16 @@ pub enum ListBinaryFunc {
     /// and type-general (n-gram strings, token ids); a null row on either side → null, a
     /// null element matches nothing.
     MultisetOverlap,
+    /// The length of the longest common **subsequence** of the two lists — the one overlap
+    /// measure that reads order. `MultisetOverlap` cannot tell `the cat sat` from
+    /// `sat cat the`; this scores the second far lower, which is the difference between
+    /// ROUGE-N and ROUGE-L and why summarization is scored with the latter. The subsequence
+    /// need not be contiguous.
+    ///
+    /// **`O(n·m)` per row**, against `O(n+m)` for every other list op here. Fine on tokenized
+    /// sentences, a real cost on two thousand-token documents. A null row on either side →
+    /// null; a null element matches nothing and cannot extend a subsequence.
+    LcsLength,
 }
 
 /// Two-argument math functions (→ Float64).

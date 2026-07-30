@@ -9,7 +9,7 @@
 //! `list_intersect`). Element comparison is type-general via Arrow's order-preserving
 //! row encoding, so any element type works. A null list row yields a null result row.
 
-use std::collections::HashSet;
+use crate::eval::FastSet;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, ListArray, UInt32Array};
@@ -74,13 +74,17 @@ pub(crate) fn eval_list_set(
         }
         // The right row's element set (null right row → empty set). `OwnedRow` owns its
         // bytes, so it can live in the set across the loop.
-        let mut rset: HashSet<OwnedRow> = HashSet::new();
+        // `FastSet`, not `HashSet`: these sets are rebuilt for every list row, so the
+        // per-probe hash cost is paid once per element per row. Membership and
+        // first-occurrence dedup are hasher-independent (the output order comes from the
+        // element scan below, never from iterating the set), so this changes no result.
+        let mut rset: FastSet<OwnedRow> = FastSet::default();
         if row < r.len() && r.is_valid(row) {
             for k in ro[row] as usize..ro[row + 1] as usize {
                 rset.insert(crows.row(roffset + k).owned());
             }
         }
-        let mut seen: HashSet<OwnedRow> = HashSet::new();
+        let mut seen: FastSet<OwnedRow> = FastSet::default();
         // Left elements: kept by membership for intersect/except, always for union.
         for k in lo[row] as usize..lo[row + 1] as usize {
             let owned = crows.row(k).owned();
@@ -137,7 +141,10 @@ fn eval_list_concat(
     let roffset = lc.len();
     let (lo, ro) = (l.value_offsets(), r.value_offsets());
 
-    let mut keep: Vec<u32> = Vec::new();
+    // Concat keeps *every* element of both sides, so the final length is known exactly.
+    // Growing into it instead reallocates roughly `log2(n)` times, copying about `2n` indices
+    // along the way — pure waste when the answer is already in hand.
+    let mut keep: Vec<u32> = Vec::with_capacity(combined.len());
     let mut offsets: Vec<i32> = Vec::with_capacity(l.len() + 1);
     offsets.push(0);
 

@@ -70,6 +70,7 @@ class ListBinaryFn(StrEnum):
     HAMMING = "hamming"
     JACCARD = "jaccard"
     MULTISET_OVERLAP = "multiset_overlap"
+    LCS_LENGTH = "lcs_length"
 
 
 class ListSetFn(StrEnum):

@@ -155,6 +155,9 @@ from batcher.plan.functions.metrics.text.ngram import (
     ngram_novelty,
     ngram_precision,
     ngram_recall,
+    rouge_l_f1,
+    rouge_l_precision,
+    rouge_l_recall,
 )
 from batcher.plan.functions.metrics.text.overlap import (
     char_ngram_f1,
@@ -367,6 +370,9 @@ __all__ = [
     "repeated_punctuation_rate",
     "rmse",
     "rmsle",
+    "rouge_l_f1",
+    "rouge_l_precision",
+    "rouge_l_recall",
     "short_output_rate",
     "smape",
     "specificity",

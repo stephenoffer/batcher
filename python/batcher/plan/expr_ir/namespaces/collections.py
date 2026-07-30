@@ -1474,6 +1474,43 @@ class _ListNamespace:
         """
         return ListBinary("multiset_overlap", self._e, _wrap(other))
 
+    def lcs_length(self, other: Any) -> ListBinary:
+        """The length of the longest common subsequence of the two lists (→ Float64).
+
+        The one overlap measure that reads *order*. :meth:`multiset_overlap` cannot tell
+        ``the cat sat`` from ``sat cat the`` — both share the same three tokens — while an LCS
+        scores the reordering far lower. That difference is exactly what separates ROUGE-N from
+        ROUGE-L, and why summarization is scored with the latter: a summary using the right
+        words in the wrong order is not a summary.
+
+        The subsequence need not be contiguous, so ``a x b y c`` and ``a b c`` share three.
+
+        **This is the expensive one.** It is ``O(n·m)`` in the two rows' lengths, against
+        ``O(n+m)`` for every other list operation here. On tokenized sentences that is nothing;
+        on two thousand-token documents it is a million cell updates per row. Truncate, or score
+        at the sentence level, rather than reaching for it on whole documents.
+
+        Args:
+            other: The other list column to find a common subsequence with.
+
+        Returns:
+            A new Float64 expression: the longest common subsequence length.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [["the", "cat", "sat"]], "b": [["sat", "cat", "the"]]}
+                ... )
+                >>> ds.select(
+                ...     ordered=bt.col("a").list.lcs_length(bt.col("a")),
+                ...     shuffled=bt.col("a").list.lcs_length(bt.col("b")),
+                ... ).to_pydict()
+                {'ordered': [3.0], 'shuffled': [1.0]}
+        """
+        return ListBinary("lcs_length", self._e, _wrap(other))
+
     def cosine_similarity(self, other: Any) -> ListBinary:
         """Cosine similarity with another vector column, in ``[-1, 1]`` (→ Float64).
 

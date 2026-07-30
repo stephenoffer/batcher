@@ -21,7 +21,7 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column
-from batcher.plan.functions.metrics.text._text import token_ngrams
+from batcher.plan.functions.metrics.text._text import token_ngrams, tokens
 
 __all__ = [
     "bleu",
@@ -31,6 +31,9 @@ __all__ = [
     "ngram_novelty",
     "ngram_precision",
     "ngram_recall",
+    "rouge_l_f1",
+    "rouge_l_precision",
+    "rouge_l_recall",
 ]
 
 
@@ -330,3 +333,96 @@ def ngram_novelty(prediction: IntoExpr, reference: IntoExpr, n: int = 4) -> Expr
     distinct = pred.list.n_unique()
     shared = pred.list.set_intersection(gold).list.len()
     return _mean_over(distinct - shared, distinct)
+
+
+def _lcs_parts(prediction: IntoExpr, reference: IntoExpr) -> tuple[Expr, Expr, Expr]:
+    """The LCS length and the two token counts the ROUGE-L ratios divide by."""
+    pred = tokens(_as_column(prediction))
+    gold = tokens(_as_column(reference))
+    return pred.list.lcs_length(gold), pred.list.len(), gold.list.len()
+
+
+def rouge_l_precision(prediction: IntoExpr, reference: IntoExpr) -> Expr:
+    """The mean ROUGE-L precision — the longest in-order match, over the generation's length.
+
+    Where `ngram_precision` asks which n-grams the reference can account for, this asks how much
+    of the generation lies on a single thread running through the reference in order. A summary
+    that uses the reference's vocabulary in its own arrangement scores well on the first and
+    badly here, which is the distinction ROUGE-L exists to make.
+
+    Args:
+        prediction: The generated-text column (name or expression).
+        reference: The gold-reference column.
+
+    Returns:
+        The mean ROUGE-L precision over the corpus, in ``[0, 1]``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"p": ["cat sat down"], "r": ["cat sat down today"]})
+            >>> ds.agg(p=bt.rouge_l_precision("p", "r")).to_pydict()["p"][0]
+            1.0
+    """
+    lcs, pred_len, _ = _lcs_parts(prediction, reference)
+    return _mean_over(lcs, pred_len)
+
+
+def rouge_l_recall(prediction: IntoExpr, reference: IntoExpr) -> Expr:
+    """The mean ROUGE-L recall — the longest in-order match, over the reference's length.
+
+    How much of the reference the generation covered *in order*. This is the recall-oriented
+    half ROUGE-L reports, and the primary number for summarization, where covering the source's
+    content in its sequence matters more than saying nothing extra.
+
+    Args:
+        prediction: The generated-text column.
+        reference: The gold-reference column.
+
+    Returns:
+        The mean ROUGE-L recall over the corpus, in ``[0, 1]``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"p": ["cat sat"], "r": ["cat sat down today"]})
+            >>> round(ds.agg(r=bt.rouge_l_recall("p", "r")).to_pydict()["r"][0], 4)
+            0.5
+    """
+    lcs, _, gold_len = _lcs_parts(prediction, reference)
+    return _mean_over(lcs, gold_len)
+
+
+def rouge_l_f1(prediction: IntoExpr, reference: IntoExpr) -> Expr:
+    """The mean ROUGE-L F1 — the balanced longest-in-order-match score.
+
+    The harmonic mean of `rouge_l_precision` and `rouge_l_recall` per example, averaged over the
+    corpus. This is the number usually meant by "ROUGE-L", and the one to report alongside
+    `ngram_f1`: a gap between them says the generation has the right content in the wrong order.
+
+    It is `O(n·m)` per row in the two token counts, unlike every other metric here — see
+    :meth:`~batcher.Expr.list.lcs_length`. Truncate long documents, or score per sentence.
+
+    Args:
+        prediction: The generated-text column.
+        reference: The gold-reference column.
+
+    Returns:
+        The mean ROUGE-L F1 over the corpus, in ``[0, 1]``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"p": ["cat sat down"], "r": ["cat sat down"]})
+            >>> ds.agg(f=bt.rouge_l_f1("p", "r")).to_pydict()["f"][0]
+            1.0
+    """
+    lcs, pred_len, gold_len = _lcs_parts(prediction, reference)
+    precision = when(pred_len > lit(0)).then(lcs / pred_len).otherwise(lit(0.0))
+    recall = when(gold_len > lit(0)).then(lcs / gold_len).otherwise(lit(0.0))
+    total = precision + recall
+    f1 = when(total > lit(0)).then(lit(2.0) * precision * recall / total).otherwise(lit(0.0))
+    return f1.mean()

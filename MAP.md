@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1041 Python modules across 164 packages and 188 Rust files across 13 crates.
+Covering 1041 Python modules across 164 packages and 189 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -164,7 +164,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 404 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 779 | Top-level expression constructors re-exported for the public API. |
+| `functions.py` | 785 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
@@ -1834,7 +1834,7 @@ The scalar expression algebra.
 | `audio.py` | 312 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 5171 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 182 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `fn_names.py` | 183 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 366 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 497 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 265 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -1863,7 +1863,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 82 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 470 | The curated per-accessor docstrings, keyed by accessor name. |
-| `collections.py` | 1645 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1682 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `strings.py` | 4030 | The `.str` accessor namespace. |
 | `temporal.py` | 1084 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
@@ -1957,7 +1957,7 @@ Metrics that score generated or collected text, with no model in the loop.
 | `diversity.py` | 276 | Degeneration and diversity metrics — catching a model that has started repeating itself. |
 | `formatting.py` | 337 | Output-shape metrics — did the generation take the form it was asked to take. |
 | `length.py` | 430 | Length, size, and reading-level metrics — how much text there is and how hard it is. |
-| `ngram.py` | 332 | Word n-gram overlap — the clipped-count metrics BLEU and ROUGE-N are defined on. |
+| `ngram.py` | 428 | Word n-gram overlap — the clipped-count metrics BLEU and ROUGE-N are defined on. |
 | `overlap.py` | 382 | Lexical-overlap metrics — scoring generated text against a reference, in one pass. |
 | `pii_safety.py` | 175 | PII and safety monitors — did the model leak contact details or emit a banned pattern. |
 | `quality.py` | 408 | Surface-quality metrics — the hygiene of raw text, before anyone judges its meaning. |
@@ -2254,7 +2254,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/group/combine.rs` | 649 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/mod.rs` | 24 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/hll.rs` | 104 | APPROX_COUNT_DISTINCT — bounded-memory distinct count via per-group HyperLogLog. |
-| `agg/median.rs` | 490 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
+| `agg/median.rs` | 495 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
 | `agg/mod.rs` | 796 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/qsketch.rs` | 87 | APPROX_QUANTILE / APPROX_MEDIAN — bounded-memory quantiles via per-group DDSketch. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
@@ -2273,7 +2273,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/range/keys.rs` | 638 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
 | `join/range/mod.rs` | 701 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
-| `join/sort_merge.rs` | 180 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
+| `join/sort_merge.rs` | 206 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 243 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 264 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 36 | `bc-runtime` — the engine's runtime library. |
@@ -2330,17 +2330,18 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/dispatch.rs` | 399 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
-| `eval/in_list.rs` | 249 | `x IN (lit, lit, …)` — hash-set membership. |
-| `eval/list.rs` | 797 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
+| `eval/in_list.rs` | 243 | `x IN (lit, lit, …)` — hash-set membership. |
+| `eval/list.rs` | 796 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 127 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/gather.rs` | 79 | `list.gather` — reorder or select from a list by a second list of indices. |
 | `eval/list_ops/jaccard_str.rs` | 72 | `list.jaccard` over string element types. |
+| `eval/list_ops/lcs.rs` | 91 | `list.lcs_length` — the longest common subsequence length of two lists. |
 | `eval/list_ops/list_hof.rs` | 85 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
 | `eval/list_ops/list_reduce.rs` | 243 | Per-row numeric transforms over a `List` row for `eval/list.rs` (`normalize`, `softmax`, `log_softmax`, `arg_sort`, `cum_sum`, `diff`, `entropy`). |
 | `eval/list_ops/list_reshape.rs` | 62 | Reshaping `List`-column operations that change nesting depth — currently `flatten` (`List<List<T>>` → `List<T>`). |
-| `eval/list_ops/list_set.rs` | 181 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
+| `eval/list_ops/list_set.rs` | 188 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
-| `eval/list_ops/mod.rs` | 26 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
+| `eval/list_ops/mod.rs` | 28 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/multiset.rs` | 80 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 194 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
@@ -2353,7 +2354,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/mod.rs` | 42 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/speech.rs` | 126 | Waveform conditioning for speech pipelines: silence trimming, peak normalization, and the zero-crossing rate. |
 | `eval/media/video.rs` | 159 | Video-decode evaluation for `Expr::Video` (the `.video` namespace). |
-| `eval/mod.rs` | 21 | Evaluation bodies for the scalar `Expr` variants. |
+| `eval/mod.rs` | 38 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
 | `eval/security/mask.rs` | 35 | Character masking — the redaction primitive behind partial-disclosure policies ("show only the last four digits"). |
@@ -2374,8 +2375,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1286 | `bc-expr` — scalar expression IR and its evaluation. |
-| `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
+| `lib.rs` | 1296 | `bc-expr` — scalar expression IR and its evaluation. |
+| `select.rs` | 412 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
 

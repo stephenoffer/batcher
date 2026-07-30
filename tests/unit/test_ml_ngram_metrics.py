@@ -226,3 +226,75 @@ def test_the_metrics_compose_with_group_by():
     scores = dict(zip(got["kind"], got["b"], strict=True))
     assert scores["good"] == 1.0
     assert scores["bad"] == 0.0
+
+
+# --- ROUGE-L: the metric that reads order ------------------------------------------
+
+
+def test_lcs_length_counts_an_in_order_match():
+    ds = bt.from_pydict({"a": [["the", "cat", "sat"]]})
+    assert ds.select(n=bt.col("a").list.lcs_length(bt.col("a"))).to_pydict()["n"] == [3.0]
+
+
+def test_lcs_length_falls_on_a_reordering():
+    """The property that separates it from a bag intersection."""
+    ds = bt.from_pydict({"a": [["the", "cat", "sat"]], "b": [["sat", "cat", "the"]]})
+    out = ds.select(
+        bag=bt.col("a").list.multiset_overlap(bt.col("b")),
+        ordered=bt.col("a").list.lcs_length(bt.col("b")),
+    ).to_pydict()
+    assert out["bag"] == [3.0]
+    assert out["ordered"] == [1.0]
+
+
+def test_lcs_length_allows_a_gap():
+    ds = bt.from_pydict({"a": [["a", "x", "b", "y", "c"]], "b": [["a", "b", "c"]]})
+    assert ds.select(n=bt.col("a").list.lcs_length(bt.col("b"))).to_pydict()["n"] == [3.0]
+
+
+def test_rouge_l_scores_a_verbatim_prefix_perfectly_on_precision():
+    assert (
+        _score(bt.rouge_l_precision("p", "r"), p=["cat sat down"], r=["cat sat down today"]) == 1.0
+    )
+
+
+def test_rouge_l_recall_measures_coverage_of_the_reference():
+    got = _score(bt.rouge_l_recall("p", "r"), p=["cat sat"], r=["cat sat down today"])
+    assert got == pytest.approx(0.5)
+
+
+def test_rouge_l_separates_a_reordering_from_a_reproduction():
+    """The distinction ROUGE-L exists to make, and the one ROUGE-N cannot."""
+    columns = {"p": ["down sat cat"], "r": ["cat sat down"]}
+    assert _score(bt.ngram_f1("p", "r"), **columns) == 1.0
+    assert _score(bt.rouge_l_f1("p", "r"), **columns) < 0.5
+
+
+def test_rouge_l_f1_is_one_for_an_exact_reproduction():
+    text = ["the quick brown fox jumps"]
+    assert _score(bt.rouge_l_f1("p", "r"), p=text, r=text) == 1.0
+
+
+def test_rouge_l_of_disjoint_texts_is_zero():
+    assert _score(bt.rouge_l_f1("p", "r"), p=["alpha beta"], r=["gamma delta"]) == 0.0
+
+
+def test_rouge_l_f1_is_the_harmonic_mean_of_its_two_halves():
+    columns = {"p": ["cat sat on a warm mat"], "r": ["cat sat on the mat"]}
+    precision = _score(bt.rouge_l_precision("p", "r"), **columns)
+    recall = _score(bt.rouge_l_recall("p", "r"), **columns)
+    expected = 2 * precision * recall / (precision + recall)
+    assert _score(bt.rouge_l_f1("p", "r"), **columns) == pytest.approx(expected)
+
+
+def test_an_empty_generation_scores_rouge_l_zero_rather_than_dropping_out():
+    got = _score(bt.rouge_l_f1("p", "r"), p=["cat sat", ""], r=["cat sat", "cat sat"])
+    assert got == 0.5
+
+
+def test_rouge_l_never_exceeds_rouge_n_recall_on_the_same_text():
+    """An in-order match is a subset of a bag match, so ROUGE-L can only be the stricter one."""
+    columns = {"p": ["the fox jumps over the dog"], "r": ["the quick fox jumps over a dog"]}
+    assert _score(bt.rouge_l_recall("p", "r"), **columns) <= _score(
+        bt.ngram_recall("p", "r"), **columns
+    )
