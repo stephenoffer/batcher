@@ -340,3 +340,37 @@ def test_union_distinct_folds_negative_zero(be):
     assert sorted(map(repr, got.select(expected.column_names).to_pylist())) == sorted(
         map(repr, expected.to_pylist())
     )
+
+
+# --- casts the two implementations format differently ---------------------------------
+
+
+def test_a_float_to_string_cast_is_declined(be):
+    """Three separate formatting disagreements, none of which is the more correct one.
+
+    An integral value keeps its `.0` on one side and not the other, the sign of zero prints
+    differently, and `NaN` becomes the string `"nan"` on one side and a null on the other. A
+    column of numbers would become a column of subtly different text, so the stage falls back.
+    """
+    from batcher.core.gpu_plan import Unsupported
+    from batcher.core.gpu_plan.execute import run_chain
+
+    table = pa.table({"f": [0.0, -0.0, 4.0, 1.5, float("nan"), None]})
+    ds = bt.from_arrow(table).select(s=col("f").cast("string"))
+    spec = gpu_plan_ops(ds._plan)
+    assert spec is not None, "the shape matches; the expression is what declines"
+    with pytest.raises(Unsupported):
+        run_chain(table, spec[1], be)
+
+
+def test_an_integer_to_string_cast_still_runs(be):
+    """The counter-case: integers have one spelling, so that cast is not in question."""
+    table = pa.table({"i": [0, -7, 42, None]})
+    got, expected = _run(lambda ds: ds.select(s=col("i").cast("string")), table, be)
+    assert got.column("s").to_pylist() == expected.column("s").to_pylist()
+
+
+def test_a_float_to_integer_cast_still_rounds(be):
+    table = pa.table({"f": [1.5, 2.5, -1.5, None]})
+    got, expected = _run(lambda ds: ds.select(i=col("f").cast("int64")), table, be)
+    assert got.column("i").to_pylist() == expected.column("i").to_pylist()
