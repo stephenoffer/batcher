@@ -1164,6 +1164,83 @@ mod tests {
         assert_eq!(got.right, sequential.right);
     }
 
+    /// The band's parallel cursor walk must equal the sequential one row for row.
+    ///
+    /// Nothing else covers it, and the gap was structural rather than an oversight:
+    /// `a_band_over_one_right_key_matches_the_cross_product_oracle` runs at 25 rows a side, and
+    /// `the_parallel_paths_agree_with_an_analytic_answer` hands the two conditions *different*
+    /// right arrays, so `Arc::ptr_eq` fails and it routes to IEJoin. The band's parallel branch
+    /// does not engage below `2 * PARALLEL_MIN_PER_WORKER` left rows, so both of those run the
+    /// sequential merge and a broken seek would pass every band test in the file.
+    ///
+    /// The walk is split by seeking each chunk's starting cursor with a binary search, which is
+    /// exact only because the walk is monotone over a sorted array. **Heavy key duplication is
+    /// the point of this data**: `skip_equal` decides whether an equal-key run is skipped or
+    /// kept, so a chunk boundary landing inside such a run is precisely where a wrong seek
+    /// would surface. At ~250 rows per distinct key, boundaries land inside runs constantly.
+    ///
+    /// All four strictness combinations are bands (`Lt`/`Le` bound the right key from below,
+    /// `Gt`/`Ge` from above), and each is checked against a single-threaded rayon pool, which
+    /// takes the sequential branch and is what makes the two comparable.
+    ///
+    /// This test was mutation-checked rather than assumed to have teeth, and the result is worth
+    /// knowing: replacing the seek with `partition_point(|y| y <= lk)` fails it on the first
+    /// combination, while `partition_point(|y| y < lk)` **passes** — because the walk only
+    /// advances, so an undershooting seek is corrected by it and is merely slower. Only an
+    /// overshoot is a wrong answer, which is the property the comment on the seek records.
+    #[test]
+    fn the_parallel_band_merge_agrees_with_the_sequential_one() {
+        const N: usize = 50_000;
+        const SPAN: u64 = 200;
+
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let ry: Vec<Option<i64>> = (0..N).map(|_| Some((rng.next() % SPAN) as i64)).collect();
+        let la: Vec<Option<i64>> = (0..N).map(|_| Some((rng.next() % SPAN) as i64)).collect();
+        let lb: Vec<Option<i64>> = la.iter().map(|v| Some(v.unwrap() + 3)).collect();
+        // ONE array, cloned, so `Arc::ptr_eq` holds and the band path fires.
+        let ry_arr = arr(&ry);
+
+        for (op_lo, op_hi) in [
+            (RangeOp::Le, RangeOp::Ge),
+            (RangeOp::Lt, RangeOp::Ge),
+            (RangeOp::Le, RangeOp::Gt),
+            (RangeOp::Lt, RangeOp::Gt),
+        ] {
+            let run = || {
+                range_join_indices(
+                    &[arr(&la), arr(&lb)],
+                    &[ry_arr.clone(), ry_arr.clone()],
+                    &[op_lo, op_hi],
+                    JoinType::Inner,
+                )
+                .expect("join runs")
+            };
+
+            let parallel = run();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single-thread pool");
+            let sequential = pool.install(run);
+
+            assert_eq!(
+                parallel.left, sequential.left,
+                "{op_lo:?}/{op_hi:?}: left indices differ between the parallel and \
+                 sequential band merge"
+            );
+            assert_eq!(
+                parallel.right, sequential.right,
+                "{op_lo:?}/{op_hi:?}: right indices differ between the parallel and \
+                 sequential band merge"
+            );
+            // A shape that matched nothing would make the equality above vacuous.
+            assert!(
+                !parallel.left.is_empty(),
+                "{op_lo:?}/{op_hi:?}: the band matched no rows, so this proves nothing"
+            );
+        }
+    }
+
     #[test]
     fn the_mark_set_finds_every_bit_across_summary_blocks() {
         // Every level boundary: a word (64), and then each successive summary's span

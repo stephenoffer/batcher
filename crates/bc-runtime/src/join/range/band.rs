@@ -31,6 +31,7 @@
 //! speed; it cannot cost correctness.
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -121,13 +122,58 @@ impl Right<'_> {
         // order, `order[p]` does not — every cursor step is a random probe into a 40 MB
         // array at five million rows, which was most of what the merge cost.
         if let (Some(rk), Some(all)) = (self.sorted, keys.fast()) {
-            let mut p = 0usize;
-            for &e in &sorted_left {
-                let lk = all[e as usize];
-                while p < rk.len() && (rk[p] < lk || (skip_equal && rk[p] == lk)) {
-                    p += 1;
+            // The cursor walk is monotone over a *sorted* array, which is what lets it be
+            // split without replaying it. The value the sequential walk holds after resolving
+            // left key `lk` is exactly `partition_point(skip(lk))` over `rk` — the walk is
+            // only ever computing that bound incrementally. So a chunk can seek its own
+            // starting cursor with one binary search and then walk only its own rows, and the
+            // `at` it writes is identical to the sequential pass's, not merely equivalent.
+            //
+            // Writes are disjoint: `sorted_left` is a permutation of the left entries, so each
+            // `e` is assigned by exactly one chunk. The compiler cannot see that, so the slot
+            // type carries it, the same way `pos1` does in the IEJoin path.
+            //
+            // The seek's error is **one-sided, and only one direction is a bug.** The `while`
+            // below only ever advances, so a seek that lands *short* of the true bound is
+            // corrected by it and costs a few extra steps; a seek that lands *past* it cannot
+            // be undone and silently under- or over-joins. That asymmetry is why the predicate
+            // here must be the identical `skip` the walk uses rather than a lookalike:
+            // `partition_point(|y| y < lk)` is safe-but-slower, `partition_point(|y| y <= lk)`
+            // is wrong. Both were tried against
+            // `the_parallel_band_merge_agrees_with_the_sequential_one`; the first passes, the
+            // second fails on the first strictness combination it reaches.
+            let skip = |y: u64, lk: u64| y < lk || (skip_equal && y == lk);
+            let workers = rayon::current_num_threads()
+                .min(nl / PARALLEL_MIN_PER_WORKER)
+                .min(SWEEP_MAX_WORKERS);
+            if workers < 2 {
+                let mut p = 0usize;
+                for &e in &sorted_left {
+                    let lk = all[e as usize];
+                    while p < rk.len() && skip(rk[p], lk) {
+                        p += 1;
+                    }
+                    at[e as usize] = p as u32;
                 }
-                at[e as usize] = p as u32;
+                return at;
+            }
+            let slots: Vec<AtomicU32> = (0..nl).map(|_| AtomicU32::new(0)).collect();
+            let per = nl.div_ceil(workers);
+            sorted_left.par_chunks(per).for_each(|slice| {
+                let Some(&first) = slice.first() else {
+                    return;
+                };
+                let mut p = rk.partition_point(|&y| skip(y, all[first as usize]));
+                for &e in slice {
+                    let lk = all[e as usize];
+                    while p < rk.len() && skip(rk[p], lk) {
+                        p += 1;
+                    }
+                    slots[e as usize].store(p as u32, AtomicOrdering::Relaxed);
+                }
+            });
+            for (dst, slot) in at.iter_mut().zip(&slots) {
+                *dst = slot.load(AtomicOrdering::Relaxed);
             }
             return at;
         }
