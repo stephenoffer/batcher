@@ -144,9 +144,21 @@ def write_event_log(
 
     Assembling the profile is not free — it walks every operator and renders the whole
     document to a plain dict — so it happens only once something will actually read it: a
-    bus subscriber, the JSON event log, or an OTel exporter. With none attached (the
-    default) this closes the query out on the bus and stops, which is what keeps
-    observability off the critical path of a sub-second query.
+    bus subscriber, the JSON event log, or an OTel exporter. With none attached, this closes
+    the query out on the bus and stops.
+
+    **`ObservabilityConfig.event_log` defaults to `True`, so by default one *is* attached.**
+    An earlier version of this note claimed the opposite — that the default kept observability
+    off the critical path of a sub-second query — which was never true of the shipped default.
+    Measured on a `filter -> group_by -> sum`, the render plus dump plus write costs **+0.32 ms
+    (+23%) at 1,000 rows and +1.11 ms (+34%) at 2,000,000**, because the document grows with
+    the plan while the fixed part does not amortize on a small query.
+
+    That is the price of every query leaving a debuggable artifact, and it is a deliberate
+    default rather than an oversight — but it is a price, and this is where someone chasing
+    per-query overhead will look for it. To get the behavior the old wording described, set
+    `observability.event_log` to `False` through `bt.set_config` / `bt.config_context`, or
+    export `BATCHER_OBSERVABILITY_EVENT_LOG=0`.
     """
     if collector is None or collector.optimized_ir is None:
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
