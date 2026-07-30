@@ -1302,6 +1302,12 @@ class DistributedConfig:
     # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
     # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
     gpu_shard_oversubscribe: int = 4
+    # A GPU shard that fails after its Ray retries is recomputed by the native CPU engine on a
+    # CPU worker, instead of the whole query abandoning the accelerated path. Both compute the
+    # same mergeable partial, so the combined answer is identical either way — only that shard
+    # is slower. Off → a lost shard fails the GPU attempt and the caller re-runs everything on
+    # the host, which is the older, coarser behavior.
+    gpu_shard_cpu_fallback: bool = True
     # Kyber's cost-based GPU-backend policy (`backend="auto"`, and the memory routing under an
     # explicit `backend="gpu"`). Below `gpu_min_rows` estimated rows the fixed GPU overhead —
     # host<->device transfer, kernel launch, first-touch cuDF import — is not amortized, so

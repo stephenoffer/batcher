@@ -8,8 +8,10 @@ engine for everything else (and when no GPU is present). Two routes:
   it fans out one shard per GPU (mergeable combine) when the working set exceeds one GPU — so it
   scales past one GPU's memory (2B rows where single-GPU cuDF/Polars-GPU OOM) — or runs a single
   worker-read shard when it fits one GPU. Only a non-splittable in-memory source is shipped whole.
-* A linear chain of ops — filter, project / with_columns, multi-key group-by, sort, distinct,
-  limit, window — is translated to a cuDF execution (`core.gpu_plan`) and run on one GPU.
+* A linear chain of ops — filter, project / with_columns, group-by aggregate, sort, distinct,
+  limit, window, join, union — is translated to a cuDF execution (`core.gpu_plan`). A chain
+  ending in a **mergeable** aggregate fans out across every GPU (`dist.gpu`), each device
+  reducing the shard it reads itself; anything else runs as a single dispatch on one GPU.
 
 The GPU tasks ship batcher (`worker_runtime_env`) + cuDF (a merged runtime_env) so the worker
 runs the tested kernels. This is the "CPU and GPU backends for data transformations" seam: same
@@ -25,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
 from batcher.api.terminal.routing import _ray_already_live
+from batcher.dist.gpu import gpu_task_options
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -100,14 +103,18 @@ def try_gpu_collect(
             )
         return result
 
-    # General path: a linear chain of supported ops (filter / project / sort / distinct / limit /
-    # multi-key aggregate) is translated to cuDF and run on ONE GPU (single-dispatch). Correct for
-    # any data that fits a GPU; OOM / an unsupported expression falls back to the CPU engine.
+    # General path: a linear chain of translatable operators. A chain ENDING IN AN AGGREGATE
+    # fans out across every GPU first — each device reduces its own shard and the small partials
+    # are folded once — so the query is bounded by the shard count rather than by one device's
+    # memory. Anything else runs as a single dispatch on one GPU.
     from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops, gpu_union_spec
 
     plan_spec = gpu_plan_ops(plan)
     if plan_spec is not None:
         scan, ops = plan_spec
+        fanned = _try_sharded_aggregate(sources[scan.source_id], ops, gpu_count, decision)
+        if fanned is not None:
+            return fanned
         batches = list(sources[scan.source_id].read())
         if not batches:
             return None
@@ -136,6 +143,28 @@ def try_gpu_collect(
             return None
         return _dispatch_cudf_union([t for t, _ in tables], [o for _, o in tables], distinct, ops)
     return None
+
+
+def _try_sharded_aggregate(source: Source, ops: list[dict], gpu_count: int, decision):
+    """Fan a chain ending in an aggregate out across the cluster's GPUs, or `None`.
+
+    `None` means the fan-out does not apply — the chain does not end in an aggregate, a
+    reduction has no mergeable partial form, the source is not splittable, or the cluster is
+    unreadable — and the caller then uses the single-device dispatch. Every failure mode is a
+    slower path, never a different answer: the fan-out is the mergeable decomposition of the
+    same aggregate, and it holds a GPU autoscale floor for its duration so a churning spot
+    cluster does not reclaim the devices mid-reduction."""
+    from batcher.dist.executors.ray_runtime.scaling import release_autoscale, request_autoscale
+    from batcher.dist.gpu import sharded_gpu_aggregate
+
+    request_autoscale(gpu_count, target_gpus=float(gpu_count))
+    try:
+        return sharded_gpu_aggregate(source, ops, gpu_count=gpu_count, sharded=decision.distributed)
+    except Exception as exc:
+        note_suppressed("api", "fan the GPU aggregate out across devices", exc)
+        return None
+    finally:
+        release_autoscale()
 
 
 def _agg_input_rows(plan, sources, fallback: int = 0) -> int:
@@ -302,8 +331,7 @@ def _distributed_gpu_aggregate(
         _ensure_ray(n_gpus)
         descs = partition_descriptors(source, n_shards)
         partial_aggs = _partial_aggs(aggs)
-        opts = _gpu_task_opts()
-        task = ray.remote(**opts)(_gpu_partial_task)
+        task = ray.remote(**gpu_task_options())(_gpu_partial_task)
         partials = ray.get([task.remote(d, key, partial_aggs) for d in descs])
     finally:
         release_autoscale()
@@ -370,7 +398,7 @@ def _dispatch_on_gpu(worker, *args) -> pa.Table | None:
         from batcher.dist.executors.ray_runtime import _ensure_ray
 
         _ensure_ray(1)
-        return ray.get(ray.remote(**_gpu_task_opts())(worker).remote(*args))
+        return ray.get(ray.remote(**gpu_task_options())(worker).remote(*args))
     except Exception:
         return None
 
@@ -395,38 +423,6 @@ def _gpu_agg_spec(plan: LogicalPlan):
             return None
         aggs[spec.alias] = (ae.input.name, ae.func)
     return gk.alias, gk.expr.name, aggs, plan.input
-
-
-def _gpu_task_runtime_env() -> dict | None:
-    """The runtime_env for a GPU dispatch task: batcher (via `worker_runtime_env`, so the worker
-    can import the kernel) plus — when `distributed.gpu_backend_cudf` is on — cuDF (pip) so the
-    group-by uses cuDF's fast kernels. numpy is pinned to the cluster version so arrays returned
-    from the task unpickle on the driver (cuDF's install otherwise drags numpy to 2.x)."""
-    from batcher.config import active_config
-    from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
-
-    rt = dict(worker_runtime_env() or {})
-    if active_config().distributed.gpu_backend_cudf:
-        rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
-    return rt or None
-
-
-def _gpu_task_opts() -> dict:
-    """Ray remote-options for a GPU dispatch task: one GPU, the batcher+cuDF runtime_env, and a
-    spot-preemption retry budget.
-
-    `max_retries` reruns a task whose GPU worker/node was lost (spot reclamation) on surviving
-    capacity — so a large GPU query on a churning spot cluster self-heals instead of one lost
-    shard collapsing it to the single-node CPU fallback. `retry_exceptions` is deliberately left
-    off: a deterministic application error (a GPU OOM, an unsupported expression) must fall back
-    to the CPU engine immediately, not after N pointless retries."""
-    from batcher.config import active_config
-
-    opts: dict = {"num_gpus": 1, "max_retries": int(active_config().distributed.task_max_retries)}
-    rt = _gpu_task_runtime_env()
-    if rt is not None:
-        opts["runtime_env"] = rt
-    return opts
 
 
 def _cluster_gpu_count() -> int:
@@ -472,6 +468,5 @@ def _dispatch_gpu_aggregate(table: pa.Table, key: str, aggs: dict) -> pa.Table:
     from batcher.dist.executors.ray_runtime import _ensure_ray
 
     _ensure_ray(1)
-    opts = _gpu_task_opts()
-    task = ray.remote(**opts)(_gpu_aggregate_worker)
+    task = ray.remote(**gpu_task_options())(_gpu_aggregate_worker)
     return ray.get(task.remote(table, key, aggs))

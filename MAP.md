@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 972 Python modules across 150 packages and 179 Rust files across 13 crates.
+Covering 976 Python modules across 151 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -343,7 +343,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 477 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 472 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -444,7 +444,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 | `generate.py` | 428 | LLM batch generation — the columnar half of offline text generation. |
 | `packing.py` | 184 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
 | `requests.py` | 290 | Turning a `RecordBatch` into the per-row requests an engine receives. |
-| `sizing.py` | 199 | Sizing an LLM engine from the workload instead of from the model's maximum. |
+| `sizing.py` | 277 | Sizing an LLM engine from the workload instead of from the model's maximum. |
 | `structured.py` | 426 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
 
 ### `batcher/ml/llm/engines/` — 6 · front-end
@@ -720,7 +720,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `reduce.py` | 241 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `scaling.py` | 500 | Live cluster topology and the autoscaler request lifecycle. |
-| `scheduling.py` | 292 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 334 | The metadata-driven scheduling envelope and placement-group machinery. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
 
@@ -741,6 +741,15 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
 | `plan_id.py` | 155 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `source.py` | 193 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
+
+### `batcher/dist/gpu/` — 4 · backend
+
+Multi-GPU *scheduling* for the translated GPU backend.
+
+| module | lines | what it is |
+|---|---|---|
+| `aggregate.py` | 154 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `tasks.py` | 123 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -1194,7 +1203,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 485 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 232 | How big a morsel should be, given memory pressure and the rows' measured width. |
-| `scheduling.py` | 218 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
+| `scheduling.py` | 258 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 263 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
 
@@ -1205,7 +1214,7 @@ Carbonite fault tolerance: Spark-style recompute-from-lineage on worker loss.
 | module | lines | what it is |
 |---|---|---|
 | `lineage.py` | 103 | Shuffle lineage — how to recompute an output a lost worker produced. |
-| `preemption.py` | 354 | Preemption detection so the engine drains proactively, not reactively. |
+| `preemption.py` | 356 | Preemption detection so the engine drains proactively, not reactively. |
 | `recovery.py` | 135 | Shuffle recovery — the recompute-on-failure coordination loop. |
 | `replication.py` | 121 | Where each mapper's shuffle output is copied, so a lost worker costs a fetch not a recompute. |
 | `speculative.py` | 269 | Straggler mitigation — speculative backup tasks for shuffle barriers. |
@@ -1260,6 +1269,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 173 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 482 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
+| `mergeable.py` | 118 | Decompose a group-by aggregate into `partial → combine → finalize`, in the plan IR. |
 | `ops.py` | 124 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `windows.py` | 310 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
@@ -1314,7 +1324,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `masks.py` | 166 | Declarative, picklable column-mask factories. |
 | `policy.py` | 149 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
-| `residency.py` | 232 | Data residency — where a dataset is allowed to be computed on, not just stored. |
+| `residency.py` | 326 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 
 ### `batcher/governance/authn/` — 3 · subsystem
 
@@ -1959,7 +1969,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 191 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2363 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2369 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 151 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |

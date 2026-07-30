@@ -95,9 +95,15 @@ def _texts():
 
 
 def _canon(v):
-    """`NaN` folded to a sentinel, since it never compares equal to itself."""
+    """`NaN` folded to a sentinel, floats compared to twelve significant digits.
+
+    Relative, not absolute: a mergeable fold re-associates float arithmetic, which the project
+    tolerates as "up to float summation order". An absolute `round(v, 9)` calls two values that
+    differ in their last two bits unequal once they are large — a product that reaches 1e214
+    fails on a difference of one part in 1e15.
+    """
     if isinstance(v, float):
-        return "__nan__" if v != v else round(v, 9)
+        return "__nan__" if v != v else float(f"{v:.12e}")
     return v
 
 
@@ -163,14 +169,16 @@ def test_chain_matches_cpu_engine(build, be):
 def test_deep_chain_matches_cpu_engine(be):
     """Eight operators deep — the shape a real query reaches the translator as."""
     got, exp = _run(
-        lambda ds: ds.filter(col("y") > 0.2)
-        .with_columns(w=col("y") * 10.0)
-        .filter(col("w") < 8.0)
-        .group_by("x")
-        .agg(s=col("w").sum(), n=bt.count())
-        .filter(col("n") > 1)
-        .sort("s", descending=True)
-        .limit(5),
+        lambda ds: (
+            ds.filter(col("y") > 0.2)
+            .with_columns(w=col("y") * 10.0)
+            .filter(col("w") < 8.0)
+            .group_by("x")
+            .agg(s=col("w").sum(), n=bt.count())
+            .filter(col("n") > 1)
+            .sort("s", descending=True)
+            .limit(5)
+        ),
         _table(),
         be,
     )
@@ -345,9 +353,7 @@ def test_ranking_window_matches_cpu_engine(function, be):
 @pytest.mark.parametrize(
     "build",
     [
-        lambda ds: ds.window(
-            partition_by=["z"], order_by=[("y", True)], functions={"r": "rank"}
-        ),
+        lambda ds: ds.window(partition_by=["z"], order_by=[("y", True)], functions={"r": "rank"}),
         lambda ds: ds.window(
             partition_by=["z"],
             order_by=[("x", False), ("y", True)],
