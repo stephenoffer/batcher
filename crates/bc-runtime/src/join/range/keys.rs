@@ -5,6 +5,8 @@
 //! the answer: an order-preserving `u64` per value where the type allows one, the encoder
 //! where it does not, and a dense rank so the sweep compares `u32`s and never an encoded key.
 
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
@@ -210,30 +212,106 @@ fn packed_keys(keys: &[u64]) -> Option<Vec<u64>> {
     }
 }
 
-/// Sort the packed keys and read the order and dense ranks off them in one pass.
+/// Sort the packed keys and read the order and dense ranks off them.
+///
+/// The ranking looks inherently serial — a running counter bumped on every key change — but it
+/// is a prefix sum in disguise, and that is what lets it be split. The rank at sorted position
+/// `i` is exactly *the number of key changes in `1..=i`*, so a chunk needs only the count of
+/// changes before it in order to compute all of its own ranks independently. Three phases:
+/// count the changes per chunk in parallel, exclusive-scan those per-chunk counts (one pass over
+/// as many entries as there are chunks, so it stays serial without mattering), then have each
+/// chunk walk its own range from its base.
+///
+/// This was the last serial pass over the universe on either axis, and at five million rows a
+/// side there are ten million entries of it, twice — once per axis, inside a phase whose sort
+/// half was already parallel.
+///
+/// Every write is a reindexing of the same values: `order` is written at the index it is read
+/// from, and `ranks` is scattered through `order`, which is a permutation, so each slot is
+/// written exactly once. The slot type carries that disjointness the way `pos1` does in the
+/// IEJoin sweep. The chunk-boundary comparison reads `packed[start - 1]`, i.e. across the chunk
+/// edge, which is why the phases index the whole array rather than the chunk slices.
 fn rank_packed(mut packed: Vec<u64>) -> (Vec<u32>, Vec<u32>) {
     if packed.len() >= PARALLEL_SORT_MIN_ROWS {
         packed.par_sort_unstable();
     } else {
         packed.sort_unstable();
     }
-    let mut order = Vec::with_capacity(packed.len());
-    let mut ranks = vec![0u32; packed.len()];
-    let mut rank = 0u32;
-    let mut prev = u64::MAX;
-    for (i, &p) in packed.iter().enumerate() {
-        let k = p >> 32;
-        if i == 0 || k != prev {
-            if i != 0 {
+    let n = packed.len();
+
+    // `i` opens a new dense rank when its key differs from its predecessor's. Position 0 never
+    // does, which is what makes the first rank 0 rather than 1.
+    let changes = |lo: usize, hi: usize| -> u32 {
+        let mut c = 0u32;
+        for i in lo.max(1)..hi {
+            if packed[i] >> 32 != packed[i - 1] >> 32 {
+                c += 1;
+            }
+        }
+        c
+    };
+
+    if n < PARALLEL_MAP_MIN {
+        let mut order = vec![0u32; n];
+        let mut ranks = vec![0u32; n];
+        let mut rank = 0u32;
+        for i in 0..n {
+            if i > 0 && packed[i] >> 32 != packed[i - 1] >> 32 {
                 rank += 1;
             }
-            prev = k;
+            let e = (packed[i] & 0xFFFF_FFFF) as u32;
+            ranks[e as usize] = rank;
+            order[i] = e;
         }
-        let e = (p & 0xFFFF_FFFF) as u32;
-        ranks[e as usize] = rank;
-        order.push(e);
+        return (order, ranks);
     }
-    (order, ranks)
+
+    // One chunk per worker, floored so a modest universe is not split into slivers whose
+    // scheduling costs more than their scan.
+    let per = n
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(super::SETUP_CHUNK);
+    let bounds: Vec<(usize, usize)> = (0..n.div_ceil(per))
+        .map(|c| (c * per, ((c + 1) * per).min(n)))
+        .collect();
+
+    // Phase 1: how many ranks each chunk opens, counted independently.
+    let counts: Vec<u32> = bounds.par_iter().map(|&(lo, hi)| changes(lo, hi)).collect();
+
+    // Phase 2: exclusive scan, so `base[c]` is the number of changes strictly before chunk `c`
+    // — which is the rank its first element carries before its own change is counted.
+    let mut base = Vec::with_capacity(bounds.len());
+    let mut acc = 0u32;
+    for &c in &counts {
+        base.push(acc);
+        acc += c;
+    }
+
+    // Phase 3: each chunk walks its own range from its base.
+    let order_slots: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let rank_slots: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    bounds
+        .par_iter()
+        .zip(base.par_iter())
+        .for_each(|(&(lo, hi), &b)| {
+            let mut rank = b;
+            for i in lo..hi {
+                if i > 0 && packed[i] >> 32 != packed[i - 1] >> 32 {
+                    rank += 1;
+                }
+                let e = (packed[i] & 0xFFFF_FFFF) as u32;
+                rank_slots[e as usize].store(rank, AtomicOrdering::Relaxed);
+                order_slots[i].store(e, AtomicOrdering::Relaxed);
+            }
+        });
+
+    let unwrap = |slots: Vec<AtomicU32>| -> Vec<u32> {
+        slots
+            .into_iter()
+            .map(|s| s.into_inner())
+            .collect::<Vec<u32>>()
+    };
+    (unwrap(order_slots), unwrap(rank_slots))
 }
 
 /// Sort `(key, entry)` pairs, on rayon once the input is large enough.
