@@ -126,6 +126,7 @@ Nothing is done until the gate is green. Run what your change touches:
 | Any Python | `just lint-py` → `just lint-layers` → `just lint-structure` → `just build` → `just test-py` |
 | FFI surface or IR tags | **both** of the above (the two sides must move together) |
 | Public API | `just lint-docstrings` + `just docs` |
+| Any test | `just lint-tests` — an ordered result compared unordered, or an assertion true by construction, fails the build |
 | Docs / agent guidance | `just docs` + `just lint-guardrails` |
 | Anything perf-relevant | `just bench` (+ `bench-ops` / `bench-dist`) |
 | Moved or renamed a file | `just map` + `just lint-guardrails` + `just surface-diff` |

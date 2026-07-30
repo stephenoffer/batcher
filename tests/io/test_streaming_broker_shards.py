@@ -313,3 +313,143 @@ def test_pulsar_drains_with_a_short_timeout_after_the_first_receive():
         assert src._consumer.timeouts == [5000, 1, 1, 1]
     finally:
         target._import_pulsar = original
+
+
+def test_pulsar_drains_a_whole_buffered_batch_in_one_client_call():
+    """`batch_receive()` is one crossing of the Python/C++ boundary for the whole buffer.
+
+    The drain used to be one `receive()` per message, so a poll that collected a full
+    16,384-message budget made 16,384 calls plus one more to be told the queue was empty —
+    per-message overhead on the latency path, for messages the client already held.
+    """
+    from batcher.io.formats.streaming import pulsar as pmod
+
+    class _Timeout(Exception):
+        pass
+
+    class _FakePulsar:
+        Timeout = _Timeout
+
+        class ConsumerBatchReceivePolicy:
+            def __init__(self, max_num_message, max_num_bytes, timeout_ms):
+                self.args = (max_num_message, max_num_bytes, timeout_ms)
+
+    class _Msg:
+        def data(self):
+            return b"v"
+
+        def message_id(self):
+            return _MessageId(1, 1)
+
+        def publish_timestamp(self):
+            return 0
+
+        def partition_key(self):
+            return ""
+
+    class _Consumer:
+        def __init__(self, buffered):
+            self.receives: list[int] = []
+            self.batch_calls = 0
+            self._buffered = buffered
+
+        def receive(self, timeout_millis):
+            self.receives.append(timeout_millis)
+            return _Msg()
+
+        def batch_receive(self):
+            self.batch_calls += 1
+            out, self._buffered = [_Msg()] * self._buffered, 0
+            return out
+
+    import batcher.io.formats.streaming.pulsar as target
+
+    original = target._import_pulsar
+    target._import_pulsar = lambda: _FakePulsar
+    try:
+        src = pmod.PulsarSource("t", poll_size=100, receive_timeout_millis=5000)
+        src._consumer = _Consumer(40)
+        src._client_obj = object()
+        assert len(src._poll()) == 41
+        # One blocking wait for the first message, one call for the other forty.
+        assert src._consumer.receives == [5000]
+        assert src._consumer.batch_calls == 1
+    finally:
+        target._import_pulsar = original
+
+
+def test_pulsar_sizes_its_batch_policy_for_the_drain():
+    """The policy is what bounds `batch_receive`: a poll's budget, and a millisecond before
+    it gives up — so an empty buffer costs nothing and the blocking wait stays the `receive`."""
+    from batcher.io.formats.streaming import pulsar as pmod
+
+    class _Policy:
+        def __init__(self, max_num_message, max_num_bytes, timeout_ms):
+            self.args = (max_num_message, max_num_bytes, timeout_ms)
+
+    class _FakePulsar:
+        Timeout = RuntimeError
+        ConsumerBatchReceivePolicy = _Policy
+
+        class ConsumerType:
+            Shared = "shared"
+
+    captured: dict = {}
+
+    class _Client:
+        def subscribe(self, topics, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    import batcher.io.formats.streaming.pulsar as target
+
+    original = target._import_pulsar
+    target._import_pulsar = lambda: _FakePulsar
+    try:
+        src = pmod.PulsarSource("t", poll_size=512)
+        src._client_obj = _Client()
+        src._client()
+    finally:
+        target._import_pulsar = original
+    assert captured["batch_receive_policy"].args == (
+        512,
+        src.poll_bytes,
+        pmod._DRAIN_TIMEOUT_MILLIS,
+    )
+
+
+def test_pulsar_bounds_its_batch_by_bytes_at_the_client_not_afterwards():
+    """An unacked Pulsar message is redelivered only after `ackTimeout`, so trimming an
+    over-large received batch would reorder the partition rather than defer it. The bound
+    therefore has to be the policy's, so the client stops filling."""
+    from batcher.io.formats.streaming import pulsar as pmod
+
+    class _Policy:
+        def __init__(self, max_num_message, max_num_bytes, timeout_ms):
+            self.args = (max_num_message, max_num_bytes, timeout_ms)
+
+    class _FakePulsar:
+        Timeout = RuntimeError
+        ConsumerBatchReceivePolicy = _Policy
+
+        class ConsumerType:
+            Shared = "shared"
+
+    captured: dict = {}
+
+    class _Client:
+        def subscribe(self, topics, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    import batcher.io.formats.streaming.pulsar as target
+
+    original = target._import_pulsar
+    target._import_pulsar = lambda: _FakePulsar
+    try:
+        src = pmod.PulsarSource("t", poll_size=16_384, poll_bytes=4 << 20)
+        src._client_obj = _Client()
+        src._client()
+    finally:
+        target._import_pulsar = original
+    assert captured["batch_receive_policy"].args[1] == 4 << 20

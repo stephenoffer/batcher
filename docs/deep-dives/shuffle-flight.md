@@ -216,6 +216,9 @@ and setting `require_client_auth` there turns that into mutual TLS.
 
 ## Code map
 
+Each concern below has a single owning file, so the transport path this page describes can
+be traced end to end:
+
 | Concern | File |
 |---|---|
 | Flight server, handler, ticket, store | `crates/bc-transport/src/{exchange,handler,ticket,store}.rs` |
@@ -229,13 +232,13 @@ and setting `require_client_auth` there turns that into mutual TLS.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): distribution as a scheduling concern, not a second semantics
-- [Carbonite](../internals/carbonite.md): the transport knobs, and who owns them
-- [Fault tolerance](../architecture/fault-tolerance.md): what `epoch` and the missing-file path are for
-- [Ray integration](../integrations/ray.md): what Ray is actually doing in this picture
-- [Configuration options](../configuration/options.md): every `distributed.*` and `flow_control.*` knob
-- [Scaling benchmarks](../benchmarks/scaling.md): what distribution buys, measured
-- [Credit-based flow control](credit-flow-control.md): what stops a mapper flooding a reducer
-- [Distributed scheduling](distributed-scheduling.md): who runs where
-- [Mergeable algebra](mergeable-algebra.md): why a bucket can be reduced independently
+- {doc}`Architecture <../architecture/index>`: distribution as a scheduling concern, not a second semantics
+- {doc}`Carbonite <../internals/carbonite>`: the transport knobs, and who owns them
+- {doc}`Fault tolerance <../architecture/fault-tolerance>`: what `epoch` and the missing-file path are for
+- {doc}`Ray integration <../integrations/ray>`: what Ray is actually doing in this picture
+- {doc}`Configuration options <../configuration/options>`: every `distributed.*` and `flow_control.*` knob
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: what distribution buys, measured
+- {doc}`Credit-based flow control <credit-flow-control>`: what stops a mapper flooding a reducer
+- {doc}`Distributed scheduling <distributed-scheduling>`: who runs where
+- {doc}`Mergeable algebra <mergeable-algebra>`: why a bucket can be reduced independently
 :::

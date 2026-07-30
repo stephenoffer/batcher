@@ -33,20 +33,20 @@ The backstop index: every symbol without an area page of its own.
 
 These are the curated, example-first references, grouped the way you'd look something up. Each one leads with a runnable example and then enumerates the surface. {doc}`complete` is the backstop index for anything without a page of its own, and {doc}`reference` is the cheat sheet to keep open while you work.
 
-- [Dataset](dataset.md): build, transform, aggregate, join, and collect.
-- [Expressions](expressions.md): column math, predicates, operators, and window methods.
-- [Expression accessors](expression-accessors.md): every `.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, and `.video` method.
-- [Functions](functions.md): scalar, horizontal, aggregate, and window functions.
-- [Metrics](metrics.md): scoring and statistical aggregates.
-- [Reading and writing](io.md): every reader and writer, with the optional extras.
-- [SQL](sql.md): the SQL surface and how it lowers to the DataFrame API.
-- [ML](ml.md): the `.ml` accessor, plus the LLM, serving, loader, and vector surfaces.
-- [Preprocessors](preprocessors.md): the fit/transform estimators and `Chain`.
-- [Models and evaluation](ml-models.md): tabular scoring, in-engine estimators, metrics.
-- [Statistics and validation](ml-statistics.md): drift, fairness, resampling, cross-validation.
-- [Governance](governance.md): row filters, column masks, grants, and lineage.
-- [Configuration](configuration.md): the tunables and how they're set.
-- [Errors](exceptions.md): the typed exceptions and what raises them.
+- {doc}`Dataset <dataset>`: build, transform, aggregate, join, and collect.
+- {doc}`Expressions <expressions>`: column math, predicates, operators, and window methods.
+- {doc}`Expression accessors <expression-accessors>`: every `.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, and `.video` method.
+- {doc}`Functions <functions>`: scalar, horizontal, aggregate, and window functions.
+- {doc}`Metrics <metrics>`: scoring and statistical aggregates.
+- {doc}`Reading and writing <io>`: every reader and writer, with the optional extras.
+- {doc}`SQL <sql>`: the SQL surface and how it lowers to the DataFrame API.
+- {doc}`ML <ml>`: the `.ml` accessor, plus the LLM, serving, loader, and vector surfaces.
+- {doc}`Preprocessors <preprocessors>`: the fit/transform estimators and `Chain`.
+- {doc}`Models and evaluation <ml-models>`: tabular scoring, in-engine estimators, metrics.
+- {doc}`Statistics and validation <ml-statistics>`: drift, fairness, resampling, cross-validation.
+- {doc}`Governance <governance>`: row filters, column masks, grants, and lineage.
+- {doc}`Configuration <configuration>`: the tunables and how they're set.
+- {doc}`Errors <exceptions>`: the typed exceptions and what raises them.
 
 ## See also
 

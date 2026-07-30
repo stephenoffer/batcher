@@ -5,7 +5,7 @@ This page describes how Batcher decides where distributed work runs, how many pi
 A cluster gives you more cores and more RAM. It also gives you a scheduler, a serialization boundary, and a network, none of which a single-node engine pays for. Batcher's distributed path exists to buy the cores and the RAM without paying much for the rest, and the way it does that is by refusing to be a second engine.
 
 :::{important}
-There is one set of operator semantics. `dist/` decides *where* work runs and *how many pieces* it runs in. It doesn't decide what an aggregate means. The mergeable algebra of `partial -> combine -> finalize`, described in [Mergeable algebra](mergeable-algebra.md), already guarantees that a result assembled from partitions equals the single-node result, so distribution is a scheduling problem and nothing else.
+There is one set of operator semantics. `dist/` decides *where* work runs and *how many pieces* it runs in. It doesn't decide what an aggregate means. The mergeable algebra of `partial -> combine -> finalize`, described in {doc}`Mergeable algebra <mergeable-algebra>`, already guarantees that a result assembled from partitions equals the single-node result, so distribution is a scheduling problem and nothing else.
 :::
 
 ```text
@@ -121,6 +121,9 @@ The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists
 
 ## Code map
 
+Each scheduling concern below lives in one file, so you can follow a task from submission
+to result in the source:
+
 | Concern | File |
 |---|---|
 | Entry point, fan-out, plan-shape dispatch | `python/batcher/dist/executor.py` |
@@ -135,14 +138,14 @@ The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): distribution as a backend, never a second semantics
-- [Fault tolerance](../architecture/fault-tolerance.md): straggler speculation and worker loss
-- [Carbonite](../internals/carbonite.md): the envelope each worker runs inside
-- [Ray integration](../integrations/ray.md): setting up the cluster this schedules onto
-- [Configuration options](../configuration/options.md): every `distributed.*` knob named here
-- [Scaling benchmarks](../benchmarks/scaling.md): the node-count curves, and the cluster grid
-- [Mergeable algebra](mergeable-algebra.md): why a partitioned result equals a single-node one
-- [Shuffle over Arrow Flight](shuffle-flight.md): how the bytes actually move
-- [Credit-based flow control](credit-flow-control.md): what keeps a reducer from drowning
-- [Learned metadata](learned-metadata.md): where the learned partition counts live
+- {doc}`Architecture <../architecture/index>`: distribution as a backend, never a second semantics
+- {doc}`Fault tolerance <../architecture/fault-tolerance>`: straggler speculation and worker loss
+- {doc}`Carbonite <../internals/carbonite>`: the envelope each worker runs inside
+- {doc}`Ray integration <../integrations/ray>`: setting up the cluster this schedules onto
+- {doc}`Configuration options <../configuration/options>`: every `distributed.*` knob named here
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: the node-count curves, and the cluster grid
+- {doc}`Mergeable algebra <mergeable-algebra>`: why a partitioned result equals a single-node one
+- {doc}`Shuffle over Arrow Flight <shuffle-flight>`: how the bytes actually move
+- {doc}`Credit-based flow control <credit-flow-control>`: what keeps a reducer from drowning
+- {doc}`Learned metadata <learned-metadata>`: where the learned partition counts live
 :::

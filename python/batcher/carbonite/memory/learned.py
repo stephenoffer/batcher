@@ -117,6 +117,13 @@ _MODEL_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, LearnedMe
     weakref.WeakKeyDictionary()
 )
 
+# Per-hub memo of the *derived* per-row samples behind the fit, keyed weakly alongside
+# `_MODEL_CACHE`. Maps operator kind -> `_KindSamples`; see `_derive_samples` for why the
+# derivation is incremental rather than a fresh pass over the whole bucket.
+_SAMPLE_CACHE: weakref.WeakKeyDictionary[MetadataHub, dict[str, _KindSamples]] = (
+    weakref.WeakKeyDictionary()
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LearnedMemoryModel:
@@ -271,36 +278,94 @@ def _memory_basis_rows(row: dict) -> float:
     return float(n_in) + float(row.get("n_build") or 0)
 
 
+@dataclass(slots=True)
+class _KindSamples:
+    """One operator kind's derived per-row footprints, and the prefix they came from.
+
+    `anchor` is the bucket's first row *object* at derivation time, held by strong
+    reference on purpose: comparing it with `is` is what makes "the prefix I already
+    derived is still the prefix of this bucket" a sound test. An `id()` comparison would
+    not be — a trimmed-away row can be freed and its address reused by a later row, which
+    would silently accept a stale sample list.
+    """
+
+    anchor: object
+    consumed: int
+    footprints: list[float]
+    spills: list[float]
+
+
+def _derive_samples(rows: list[dict], prior: _KindSamples | None) -> _KindSamples:
+    """This kind's per-row footprint samples, extending `prior` rather than re-deriving.
+
+    `op_stats` buckets are append-mostly: a refit sees ~`_REFIT_AFTER` new rows against a
+    bucket the hub caps at a few thousand, and a row's derived sample never changes once
+    written. Re-deriving the whole bucket each time therefore did O(history) float work to
+    learn O(64) new facts, and it was the dominant term in the fit — measured at 4.16 ms of
+    a 4.76 ms refit over two 4,000-row buckets, or ~215-300 us on *every* query once
+    amortized across the refit interval. Extending the prior derivation makes a steady-state
+    refit proportional to the new rows instead.
+
+    Falls back to a full derivation whenever the prefix is not provably intact (a cold
+    cache, or a bucket the hub trimmed from the front), so the samples are always exactly
+    what a from-scratch pass would produce.
+
+    The reused prefix is **copied, not extended in place.** `execution.max_concurrent_queries`
+    lets several queries run in one process, so two threads can refit the same hub at once;
+    appending to the cached lists would let them both extend the same object and double-count
+    every new row. Copying keeps each caller's derivation private, and the loser of a race on
+    the cache dict merely discards a result that was equally correct. The copy is O(bucket)
+    but it is a list-of-floats memcpy rather than O(bucket) dict lookups and float
+    conversions — tens of microseconds against the 4.8 ms it replaces.
+    """
+    if (
+        prior is not None
+        and prior.consumed <= len(rows)
+        and (prior.consumed == 0 or (rows and rows[0] is prior.anchor))
+    ):
+        start = prior.consumed
+        footprints, spills = list(prior.footprints), list(prior.spills)
+    else:
+        start, footprints, spills = 0, [], []
+    for r in rows[start:]:
+        # The true peak is the greater of the Arrow working-set estimate and the measured
+        # process RSS high-water (`peak_rss_bytes`): the latter captures transient scratch,
+        # allocator fragmentation, and off-pool buffers the estimate cannot see, so fitting
+        # against the max sizes admission/spill against reality and never under-provisions.
+        peak = max(
+            float(r.get("m_peak_bytes", 0) or 0.0),
+            float(r.get("peak_rss_bytes", 0) or 0.0),
+        )
+        basis = _memory_basis_rows(r)
+        if peak > 0.0 and basis > 0.0:
+            footprints.append(peak / basis)
+        spill = float(r.get("spill_bytes", 0) or 0.0)
+        if spill > 0.0 and basis > 0.0:
+            spills.append(spill / basis)
+    return _KindSamples(
+        anchor=rows[0] if rows else None,
+        consumed=len(rows),
+        footprints=footprints,
+        spills=spills,
+    )
+
+
 def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
     """Fit the per-family bytes-per-row model from the hub's measured `op_stats`."""
     opt = cfg.optimizer
     min_samples = max(1, opt.cost_calibration_min_samples)
     by_kind = hub.op_stats_by_kind()
+    cached = _SAMPLE_CACHE.setdefault(hub, {})
     bpr: dict[str, float] = {}
     spr: dict[str, float] = {}
     for kind, rows in by_kind.items():
-        samples: list[float] = []
-        spill_samples: list[float] = []
-        for r in rows:
-            # The true peak is the greater of the Arrow working-set estimate and the measured
-            # process RSS high-water (`peak_rss_bytes`): the latter captures transient scratch,
-            # allocator fragmentation, and off-pool buffers the estimate cannot see, so fitting
-            # against the max sizes admission/spill against reality and never under-provisions.
-            peak = max(
-                float(r.get("m_peak_bytes", 0) or 0.0),
-                float(r.get("peak_rss_bytes", 0) or 0.0),
-            )
-            basis = _memory_basis_rows(r)
-            if peak > 0.0 and basis > 0.0:
-                samples.append(peak / basis)
-            spill = float(r.get("spill_bytes", 0) or 0.0)
-            if spill > 0.0 and basis > 0.0:
-                spill_samples.append(spill / basis)
+        derived = _derive_samples(rows, cached.get(kind))
+        cached[kind] = derived
         canon = _canonical_kind(kind)
-        if len(samples) >= min_samples:
-            bpr[canon] = _upper_quantile(samples)
-        if len(spill_samples) >= min_samples:
-            spr[canon] = _upper_quantile(spill_samples)
+        if len(derived.footprints) >= min_samples:
+            bpr[canon] = _upper_quantile(derived.footprints)
+        if len(derived.spills) >= min_samples:
+            spr[canon] = _upper_quantile(derived.spills)
     return LearnedMemoryModel(
         _bytes_per_row=bpr,
         _alpha=opt.learning_smoothing_alpha,

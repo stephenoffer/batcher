@@ -185,13 +185,13 @@ you care about.
 ## See also
 
 :::{seealso}
-- [Time series rollups](time-series-rollups.md): `dt.truncate` is the same snap-to-a-grid
+- {doc}`Time series rollups <time-series-rollups>`: `dt.truncate` is the same snap-to-a-grid
   move, one dimension and a calendar.
-- [Basket analysis](basket-analysis.md): another recipe whose difficulty is entirely in
+- {doc}`Basket analysis <basket-analysis>`: another recipe whose difficulty is entirely in
   choosing a key that groups.
-- [Filtering](../../user-guide/filtering.md): `between`, and how predicates reach the scan.
-- [Aggregations](../../user-guide/aggregations.md): the `group_by` the grid feeds.
-- [Expressions API](../../api/expressions.md): `floor`, `concat_ws`, `width_bucket`.
-- [Aggregation internals](../../deep-dives/aggregation-internals.md): what the hash shuffle
+- {doc}`Filtering <../../user-guide/filtering>`: `between`, and how predicates reach the scan.
+- {doc}`Aggregations <../../user-guide/aggregations>`: the `group_by` the grid feeds.
+- {doc}`Expressions API <../../api/expressions>`: `floor`, `concat_ws`, `width_bucket`.
+- {doc}`Aggregation internals <../../deep-dives/aggregation-internals>`: what the hash shuffle
   on the cell key actually does.
 :::

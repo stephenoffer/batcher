@@ -149,7 +149,7 @@ mysteriously single-threaded, look for delete files.
 
 **Writes are append/overwrite only.** No merge-on-read writes, no equality deletes, no row-level
 `MERGE`. pyiceberg's support is not solid enough to build on, and Batcher raises rather than
-pretending. If you need upserts today, use [Delta](delta-lake.md), where `merge_on=` is a real
+pretending. If you need upserts today, use {doc}`Delta <delta-lake>`, where `merge_on=` is a real
 `MERGE INTO`.
 
 :::{important}
@@ -173,12 +173,12 @@ rather than failing, so the result is right and the scan is wide. The incrementa
 
 ## See also
 
-- [Lakehouse](../user-guide/lakehouse.md): the table-format guide.
-- [Writing data](../user-guide/writing-data.md): modes, partitioning, and what a commit is.
-- [Schema evolution](../examples/data-engineering/schema-evolution.md): adding a column to a
+- {doc}`Lakehouse <../user-guide/lakehouse>`: the table-format guide.
+- {doc}`Writing data <../user-guide/writing-data>`: modes, partitioning, and what a commit is.
+- {doc}`Schema evolution <../examples/data-engineering/schema-evolution>`: adding a column to a
   table other jobs are reading.
-- [Partition backfill](../examples/data-engineering/partition-backfill.md): why `overwrite`
+- {doc}`Partition backfill <../examples/data-engineering/partition-backfill>`: why `overwrite`
   being table-wide matters here.
-- [I/O API](../api/io.md): the full reader/writer reference.
-- [Delta Lake](delta-lake.md): upserts, `replace_where`, vacuum.
-- [Hudi](hudi.md): the read-only third format.
+- {doc}`I/O API <../api/io>`: the full reader/writer reference.
+- {doc}`Delta Lake <delta-lake>`: upserts, `replace_where`, vacuum.
+- {doc}`Hudi <hudi>`: the read-only third format.

@@ -96,10 +96,10 @@ The three-sigma rule never fires, because the outlier is inside its own baseline
 ## See also
 
 :::{seealso}
-- [Aggregations](../../user-guide/aggregations.md) and [window functions](../../user-guide/window-functions.md): the two operators most of these recipes are built from.
-- [SQL](../../user-guide/sql.md): the same plans, written as queries.
-- [Expressions API](../../api/expressions.md) and [Dataset API](../../api/dataset.md): the reference for everything used here.
-- [Data engineering recipes](../data-engineering/index.md): the pipelines that produce the tables these queries read.
+- {doc}`Aggregations <../../user-guide/aggregations>` and {doc}`window functions <../../user-guide/window-functions>`: the two operators most of these recipes are built from.
+- {doc}`SQL <../../user-guide/sql>`: the same plans, written as queries.
+- {doc}`Expressions API <../../api/expressions>` and {doc}`Dataset API <../../api/dataset>`: the reference for everything used here.
+- {doc}`Data engineering recipes <../data-engineering/index>`: the pipelines that produce the tables these queries read.
 :::
 
 ```{toctree}

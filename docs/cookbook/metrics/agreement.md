@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/agreement.py
 ```
+
+## See also
+
+- {doc}`classification`: classification metrics computed as aggregates over a predictions table.
+- {doc}`diagnostic`: diagnostic metrics: the epidemiology-style view of a binary classifier.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

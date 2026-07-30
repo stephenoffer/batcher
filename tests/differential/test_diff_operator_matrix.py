@@ -2,7 +2,13 @@
 
 `collect()`, `collect(spill=True)` and `iter_batches()` are three *schedulings* of the same
 operator semantics (invariant #7), so they must agree with each other and with DuckDB — on
-nulls, on empty input, on a single row, on `-0.0`/NaN float keys, and on every ordering flag.
+nulls, on empty input, on a single row, on `-0.0`/NaN float keys, on every ordering flag, and
+on an input long enough to cross a morsel boundary (`MULTIBATCH`, without which the three
+"paths" are three names for a single batch).
+
+The reshape and nearest-match operators — `unnest`, `unpivot`, `sample`, `asof_join`,
+`range_join` — live in `test_diff_reshape_matrix.py`, and
+`test_diff_operator_matrix_coverage.py` fails if any `RelOp` tag is missing from the two.
 
 This matrix exists because the per-operator tests each covered their own operator on its own
 happy path, and the *combinations* were nobody's job. Four wrong-answer bugs lived in that gap:
@@ -63,7 +69,27 @@ BASE = pa.table(
         "v": pa.array([5, 3, 9, 1, 4, 8, 2, 7, 6, 0, 5, 3, 8, 1, 2], pa.int64()),
     }
 )
-INPUTS = {"base": BASE, "empty": BASE.slice(0, 0), "single": BASE.slice(0, 1)}
+#: `BASE` repeated past two 16,384-row morsels, so the paths this matrix compares are
+#: actually *different* rather than three names for one batch.
+#:
+#: Every other shape here is 15 rows, which is one morsel: `iter_batches()` yields a single
+#: batch, and there is no boundary for a row to be dropped at, double-emitted at, or
+#: reordered across. That made "the streaming scheduling" a scheduling of one batch, and
+#: left the whole class of morsel-boundary bugs — the class this file exists for —
+#: structurally invisible. (The `window_row_number` note below has referred to a
+#: `MULTIBATCH` shape since it was written; the shape itself was never added.)
+#:
+#: Repetition, rather than fresh values, is deliberate: it keeps exactly the edges `BASE`
+#: was built for (the nulls, the `-0.0`/NaN float key, the duplicates) and multiplies the
+#: tie groups, which is what a partitioned or spilled path has to get right.
+MULTIBATCH = pa.concat_tables([BASE] * 2400)  # 36,000 rows
+
+INPUTS = {
+    "base": BASE,
+    "empty": BASE.slice(0, 0),
+    "single": BASE.slice(0, 1),
+    "multibatch": MULTIBATCH,
+}
 RIGHT = pa.table(
     {"k": pa.array([1, 3, 5, 7, 9, None], pa.int64()), "w": ["p", "q", "r", "s", "u", "z"]}
 )
@@ -338,19 +364,95 @@ def test_row_number_is_a_permutation_consistent_with_its_order_key(shape):
         assert_row_number_contract(out, partition="g", order="k")
 
 
+def assert_sort_contract(
+    out: pa.Table, table: pa.Table, *, key: str, descending: bool, nulls_first: bool
+) -> None:
+    """Assert everything ``ORDER BY <one key>`` actually promises.
+
+    Which of two rows *tied on the key* comes first is unspecified in SQL, so a row-by-row
+    comparison against another engine over-asserts on a partially-ordered key: it compares
+    a free choice. On the 15-row shapes Batcher and DuckDB happened to agree; on
+    `MULTIBATCH`, where each key value repeats 2,400 times, they diverge at the first tie
+    group — the sort is correct and the assertion was wrong.
+
+    What *is* specified, and what this pins instead, is:
+
+    * the output is a permutation of the input — no row invented, dropped, or duplicated,
+      which is how a spilled run that loses or re-emits a bucket is caught;
+    * the non-null keys are monotone in the requested direction;
+    * the nulls are contiguous, and on the requested side.
+
+    Those three together still fail every sort bug this file was written for, including
+    the spilled `descending` sort that emitted nulls mid-result.
+
+    Args:
+        out: The sort's output table.
+        table: The input table it was sorted from.
+        key: Name of the single sort key.
+        descending: Whether the sort was descending.
+        nulls_first: Whether nulls were requested first.
+    """
+    assert_tables_equal(out, table)  # a permutation: same multiset of rows
+
+    keys = out.column(key).to_pylist()
+    non_null = [k for k in keys if k is not None]
+    nulls_at_front = keys[: len(keys) - len(non_null)]
+    nulls_at_back = keys[len(non_null) :]
+    if nulls_first:
+        assert all(k is None for k in nulls_at_front), (
+            f"nulls_first: {key} nulls are not all at the front: {keys[:20]}"
+        )
+        ordered_keys = keys[len(keys) - len(non_null) :]
+    else:
+        assert all(k is None for k in nulls_at_back), (
+            f"nulls_last: {key} nulls are not all at the back: {keys[-20:]}"
+        )
+        ordered_keys = keys[: len(non_null)]
+    assert None not in ordered_keys, f"{key} nulls are not contiguous: {keys[:20]}"
+    for i in range(1, len(ordered_keys)):
+        prev, cur = ordered_keys[i - 1], ordered_keys[i]
+        if descending:
+            assert prev >= cur, f"{key} increases {prev!r} -> {cur!r} at rank {i + 1}"
+        else:
+            assert prev <= cur, f"{key} decreases {prev!r} -> {cur!r} at rank {i + 1}"
+
+
 @pytest.mark.parametrize(("descending", "nulls_first"), ORDERINGS)
 @pytest.mark.parametrize("shape", sorted(INPUTS))
 def test_sort_matches_duckdb_on_every_ordering(duck, shape, descending, nulls_first):
-    """Ordered assertion — the only kind that can see a sort bug."""
+    """Ordered assertion — the only kind that can see a sort bug.
+
+    Ordered on *every* column, so each tie group holds wholly identical rows and the row
+    sequence is uniquely determined. Ordering on `k` alone leaves the within-tie order a
+    free choice, which is not a shared contract to assert against DuckDB; that shape is
+    covered by `test_sort_contract_holds_on_a_tie_heavy_key` instead.
+    """
     table = INPUTS[shape]
     duck.register("t", table)
     out = (
         bt.from_arrow(table)
-        .sort(bt.col("k"), descending=descending, nulls_first=nulls_first)
+        .sort(*[bt.col(c) for c in TOTAL_ORDER], descending=descending, nulls_first=nulls_first)
         .collect()
     )
     d, n = ("DESC" if descending else "ASC"), ("FIRST" if nulls_first else "LAST")
-    assert_same_ordered(out, duck.sql(f"SELECT * FROM t ORDER BY k {d} NULLS {n}"))
+    order_by = ", ".join(f"{c} {d} NULLS {n}" for c in TOTAL_ORDER)
+    assert_same_ordered(out, duck.sql(f"SELECT * FROM t ORDER BY {order_by}"))
+
+
+@pytest.mark.parametrize(("descending", "nulls_first"), ORDERINGS)
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+@pytest.mark.parametrize("key", ["k", "g"])
+def test_sort_contract_holds_on_a_tie_heavy_key(shape, key, descending, nulls_first):
+    """The single-key sort, asserted on what it guarantees, on every path.
+
+    This is the shape the DuckDB comparison can no longer assert a row sequence for. It is
+    the interesting one — `MULTIBATCH` ties 2,400 rows per key value, spanning morsels — so
+    it is checked here on all three schedulings rather than dropped.
+    """
+    table = INPUTS[shape]
+    plan = bt.from_arrow(table).sort(bt.col(key), descending=descending, nulls_first=nulls_first)
+    for out in (plan.collect(), plan.collect(spill=True), _stream(plan)):
+        assert_sort_contract(out, table, key=key, descending=descending, nulls_first=nulls_first)
 
 
 @pytest.mark.parametrize(("descending", "nulls_first"), ORDERINGS)
@@ -364,3 +466,85 @@ def test_sort_paths_agree_on_every_ordering(shape, key, descending, nulls_first)
     oracle = plan.collect()
     assert_tables_equal(plan.collect(spill=True), oracle, ordered=True)
     assert_tables_equal(_stream(plan), oracle, ordered=True)
+
+
+# --- the assertions themselves, tested ----------------------------------------------
+#
+# `assert_sort_contract` replaced a row-by-row DuckDB comparison that could not survive a
+# tie-heavy key. A weaker replacement would be invisible: every sort test would still be
+# green, and the sort would simply stop being checked. So the helper is fed each defect it
+# claims to reject, and must reject it.
+
+
+def _sorted_ok(descending: bool = False, nulls_first: bool = False) -> tuple:
+    """A correctly sorted (output, input) pair to mutate in the tests below."""
+    table = pa.table(
+        {"k": pa.array([3, 1, None, 2, None, 1], pa.int64()), "v": pa.array(list("abcdef"))}
+    )
+    out = (
+        bt.from_arrow(table)
+        .sort(bt.col("k"), descending=descending, nulls_first=nulls_first)
+        .collect()
+    )
+    return out, table
+
+
+def test_the_sort_contract_accepts_a_correct_sort():
+    for descending, nulls_first in ORDERINGS:
+        out, table = _sorted_ok(descending, nulls_first)
+        assert_sort_contract(out, table, key="k", descending=descending, nulls_first=nulls_first)
+
+
+def test_the_sort_contract_rejects_a_dropped_row():
+    """The permutation half — a spilled run that loses a bucket."""
+    out, table = _sorted_ok()
+    with pytest.raises(AssertionError):
+        assert_sort_contract(
+            out.slice(0, out.num_rows - 1), table, key="k", descending=False, nulls_first=False
+        )
+
+
+def test_the_sort_contract_rejects_a_duplicated_row():
+    """...and one that re-emits a bucket."""
+    out, table = _sorted_ok()
+    doubled = pa.concat_tables([out, out.slice(0, 1)])
+    with pytest.raises(AssertionError):
+        assert_sort_contract(doubled, table, key="k", descending=False, nulls_first=False)
+
+
+def test_the_sort_contract_rejects_an_unsorted_key():
+    """The monotonicity half — the same rows, in the wrong order."""
+    out, table = _sorted_ok()
+    scrambled = pa.concat_tables([out.slice(out.num_rows - 1, 1), out.slice(0, out.num_rows - 1)])
+    with pytest.raises(AssertionError):
+        assert_sort_contract(scrambled, table, key="k", descending=False, nulls_first=False)
+
+
+def test_the_sort_contract_rejects_a_null_emitted_mid_result():
+    """The exact historic bug: the spilled `descending` sort put nulls in the middle.
+
+    The rows are all present and the non-null keys are still monotone, so only the
+    null-placement half of the contract can catch it.
+    """
+    out, table = _sorted_ok(descending=True, nulls_first=False)
+    rows = out.to_pylist()
+    non_null = [r for r in rows if r["k"] is not None]
+    nulls = [r for r in rows if r["k"] is None]
+    mid = len(non_null) // 2
+    interleaved = pa.Table.from_pylist(non_null[:mid] + nulls + non_null[mid:], schema=out.schema)
+    with pytest.raises(AssertionError):
+        assert_sort_contract(interleaved, table, key="k", descending=True, nulls_first=False)
+
+
+def test_the_sort_contract_rejects_the_wrong_null_side():
+    """`nulls_first=True` satisfied by a nulls-last result, and vice versa."""
+    out, table = _sorted_ok(descending=False, nulls_first=False)
+    with pytest.raises(AssertionError):
+        assert_sort_contract(out, table, key="k", descending=False, nulls_first=True)
+
+
+def test_the_sort_contract_rejects_the_wrong_direction():
+    """An ascending result asserted as descending."""
+    out, table = _sorted_ok(descending=False, nulls_first=False)
+    with pytest.raises(AssertionError):
+        assert_sort_contract(out, table, key="k", descending=True, nulls_first=False)

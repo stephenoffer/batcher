@@ -2,8 +2,9 @@
 
 Backed by ``pulsar-client`` (the optional ``pulsar`` extra). A
 :class:`PulsarSource` consumes a topic with a shared subscription, draining up to
-``poll_size`` messages per poll (``Consumer.receive(timeout_millis=…)``) and
-assembling them into one Arrow batch via the shared ``_make_batch`` helper.
+``poll_size`` messages per poll (one blocking ``Consumer.receive(timeout_millis=…)`` for
+the first message, then a single ``batch_receive()`` for whatever the client already holds)
+and assembling them into one Arrow batch via the shared ``_make_batch`` helper.
 
 Messages are acknowledged only after an epoch is **published**, never when it is polled.
 `_poll` holds the raw messages and `_commit_delivered` acks them once the engine has staged,
@@ -86,6 +87,7 @@ class PulsarSource(BrokerSource):
         topic: str,
         *,
         poll_size: int = 16_384,
+        poll_bytes: int | None = None,
         partitions: list[int] | None = None,
         service_url: str = "pulsar://localhost:6650",
         subscription: str = "batcher",
@@ -96,6 +98,7 @@ class PulsarSource(BrokerSource):
         super().__init__(
             topic,
             poll_size=poll_size,
+            poll_bytes=poll_bytes,
             service_url=service_url,
             subscription=subscription,
             **options,
@@ -136,10 +139,28 @@ class PulsarSource(BrokerSource):
         pulsar = _import_pulsar()
         if self._client_obj is None:
             self._client_obj = pulsar.Client(self._options["service_url"])
+        kwargs: dict[str, Any] = {}
+        policy = getattr(pulsar, "ConsumerBatchReceivePolicy", None)
+        if policy is not None:
+            # Sized for the *drain*, which is the only thing `batch_receive` is used for:
+            # take everything the client has already buffered, up to a poll's budget, and
+            # come back within a millisecond if it has nothing. The blocking wait for the
+            # first message stays a plain `receive` with the full timeout, so an idle topic
+            # still parks instead of spinning.
+            #
+            # The policy's *byte* bound carries `poll_bytes` — the point being that the
+            # client stops filling the batch, rather than this code receiving a huge one and
+            # then having to put messages back. There is no putting them back: an unacked
+            # Pulsar message is redelivered only after `ackTimeout`, so trimming an
+            # over-large batch here would reorder the partition rather than defer it.
+            kwargs["batch_receive_policy"] = policy(
+                self.poll_size, self.poll_bytes, _DRAIN_TIMEOUT_MILLIS
+            )
         self._consumer = self._client_obj.subscribe(
             self._topic_names(),
             subscription_name=self._options["subscription"],
             consumer_type=pulsar.ConsumerType.Shared,
+            **kwargs,
         )
         return self._consumer
 
@@ -148,11 +169,56 @@ class PulsarSource(BrokerSource):
             return list(self._partitions)
         return list(range(max(1, self._num_partitions)))
 
+    def _drain(self, consumer: Any, pulsar: Any) -> list[Any]:
+        """Everything the client has already buffered, in as few client calls as possible.
+
+        `batch_receive()` hands back a whole buffered batch in **one** call, bounded by the
+        `batch_receive_policy` set at subscribe time. The drain used to be one `receive()`
+        per message, so a poll that collected a full 16,384-message budget crossed the
+        Python/C++ boundary 16,384 times, plus one more to be told the queue was empty —
+        pure per-message overhead on the latency-critical path, for messages the client
+        already held in memory.
+
+        Older `pulsar-client` builds have no `batch_receive`, so the per-message loop stays
+        as the fallback rather than becoming a hard version requirement on an optional extra.
+        """
+        budget = self.poll_size - 1
+        if budget <= 0:
+            return []
+        batch_receive = getattr(consumer, "batch_receive", None)
+        if batch_receive is not None:
+            try:
+                return list(batch_receive())[:budget]
+            except pulsar.Timeout:
+                return []
+        drained: list[Any] = []
+        while budget > 0:
+            try:
+                drained.append(consumer.receive(timeout_millis=_DRAIN_TIMEOUT_MILLIS))
+            except pulsar.Timeout:
+                break
+            budget -= 1
+        return drained
+
+    def _to_message(self, msg: Any) -> BrokerMessage:
+        """One Pulsar message as the broker schema's fixed shape."""
+        mid = msg.message_id()
+        return BrokerMessage(
+            value=msg.data(),
+            partition=msg.partition() if hasattr(msg, "partition") else 0,
+            offset=_message_id_to_offset(mid),
+            # The int64 `offset` folds (ledger, entry) lossily, so it cannot be seeked to.
+            # The serialized `MessageId` is the exact position, and it is what `_apply_seek`
+            # hands back to `Consumer.seek`.
+            resume_token=_serialize_message_id(mid),
+            timestamp=msg.publish_timestamp(),
+            topic=msg.topic_name() if hasattr(msg, "topic_name") else self.topic,
+            key=msg.partition_key().encode("utf-8") if msg.partition_key() else None,
+        )
+
     def _poll(self) -> list[BrokerMessage] | None:
         pulsar = _import_pulsar()
         consumer = self._client()
-        messages: list[BrokerMessage] = []
-        raw: list[Any] = []
         # Wait out `receive_timeout_millis` for the *first* message only, then drain what the
         # client has already buffered with a near-zero timeout. Charging every `receive` the
         # full timeout meant the last one — the one that finds the queue empty and ends the
@@ -160,28 +226,12 @@ class PulsarSource(BrokerSource):
         # trigger paid a fixed second of latency to notice it had run out. That is the same
         # shape as the Kafka `consume()` trap, and it hid in the same place: a loop that looks
         # like it is reading is in fact mostly waiting to be told there is nothing left.
-        for i in range(self.poll_size):
-            try:
-                timeout = self._receive_timeout_millis if i == 0 else _DRAIN_TIMEOUT_MILLIS
-                msg = consumer.receive(timeout_millis=timeout)
-            except pulsar.Timeout:
-                break
-            raw.append(msg)
-            mid = msg.message_id()
-            messages.append(
-                BrokerMessage(
-                    value=msg.data(),
-                    partition=msg.partition() if hasattr(msg, "partition") else 0,
-                    offset=_message_id_to_offset(mid),
-                    # The int64 `offset` folds (ledger, entry) lossily, so it cannot be
-                    # seeked to. The serialized `MessageId` is the exact position, and it is
-                    # what `_apply_seek` hands back to `Consumer.seek`.
-                    resume_token=_serialize_message_id(mid),
-                    timestamp=msg.publish_timestamp(),
-                    topic=msg.topic_name() if hasattr(msg, "topic_name") else self.topic,
-                    key=msg.partition_key().encode("utf-8") if msg.partition_key() else None,
-                )
-            )
+        try:
+            first = consumer.receive(timeout_millis=self._receive_timeout_millis)
+        except pulsar.Timeout:
+            return []
+        raw: list[Any] = [first, *self._drain(consumer, pulsar)]
+        messages = [self._to_message(m) for m in raw]
         # Deliberately does not acknowledge. Assembling a batch is not publishing it: the
         # engine has not staged, logged, or published this epoch yet. Acking here made Pulsar
         # believe the messages were handled the moment they were *read*, so a crash between

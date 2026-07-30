@@ -19,7 +19,18 @@ __all__ = ["reset_hardware_probes"]
 # scanning module attributes: a scan would silently stop covering a probe the day someone
 # renamed it, and the failure mode is a test that passes against a stale reading.
 _MEMOIZED = (
-    (cgroup, ("cgroup_v2_dirs", "cfs_quota_count", "_read_cgroup_v2_quota")),
+    (
+        cgroup,
+        (
+            "cgroup_v2_dirs",
+            "cfs_quota_count",
+            "_read_cgroup_v2_quota",
+            # TTL-sampled rather than lifetime-memoized, but they expose the same
+            # `cache_clear`, so a test faking `/sys` resets every probe through one call.
+            "cgroup_throttled_ratio",
+            "_cgroup_pressure_sampled",
+        ),
+    ),
     (cache, ("cache_hierarchy",)),
     (memory, ("machine_memory_bytes", "page_size_bytes", "hugepage_bytes", "swap_configured")),
     (isa, ("_cpuinfo_fields", "cpu_features", "cpu_vendor", "cpu_model_name")),

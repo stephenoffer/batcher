@@ -149,15 +149,15 @@ print(back.drop_nulls().sort("region", "quarter").to_pydict())
 
 ## See also
 
-- [Aggregations](aggregations.md): the aggregate a pivot cell is built from.
-- [Transformations](transformations.md): `explode` and `unnest`, the other two reshapers.
-- [SQL](sql.md): the SQL surface. SQL `PIVOT` and `UNPIVOT` are *not* supported and raise
+- {doc}`Aggregations <aggregations>`: the aggregate a pivot cell is built from.
+- {doc}`Transformations <transformations>`: `explode` and `unnest`, the other two reshapers.
+- {doc}`SQL <sql>`: the SQL surface. SQL `PIVOT` and `UNPIVOT` are *not* supported and raise
   `NotImplementedError`. Reshaping goes through `ds.pivot(...)` and `ds.unpivot(...)`,
   which you can call on the result of a `bt.sql(...)` query.
-- [Aggregation internals](../deep-dives/aggregation-internals.md): the grouped hash
+- {doc}`Aggregation internals <../deep-dives/aggregation-internals>`: the grouped hash
   aggregate a pivot cell is computed by.
-- [Time-series rollups](../examples/analytics/time-series-rollups.md): a wide report
+- {doc}`Time-series rollups <../examples/analytics/time-series-rollups>`: a wide report
   built from a long fact table.
-- [Cohort analysis](../examples/analytics/cohort-analysis.md): the other classic pivot,
+- {doc}`Cohort analysis <../examples/analytics/cohort-analysis>`: the other classic pivot,
   with a declared column vocabulary.
-- [Dataset API](../api/dataset.md): the `pivot` and `unpivot` reference.
+- {doc}`Dataset API <../api/dataset>`: the `pivot` and `unpivot` reference.

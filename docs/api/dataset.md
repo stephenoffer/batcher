@@ -80,7 +80,7 @@ Each method returns a new `Dataset`. They chain.
 | `.cube(*keys)` | Aggregate at every subset of `keys` (SQL `CUBE`). |
 | `.grouping_sets(*sets)` | Aggregate at exactly the levels given (SQL `GROUPING SETS`). |
 | `.map_batches(fn, ...)` | Apply a Python function to whole Arrow batches. |
-| `.offload_blobs(column="bytes", ...)` | Move a large-payload column to a content-addressed store, leaving URI handles ([blob-by-reference](../ml/multimodal.md)). |
+| `.offload_blobs(column="bytes", ...)` | Move a large-payload column to a content-addressed store, leaving URI handles ({doc}`blob-by-reference <../ml/multimodal>`). |
 | `.materialize_blobs(...)` | Read offloaded payloads back from their handles (inverse of `offload_blobs`). |
 | `.repartition(num_files=None, *, by=None, target_size_mb=None)` | Set how the next `write` lays out files (data unchanged). |
 
@@ -206,7 +206,7 @@ print(ranked.select("category", "price", "rnk").to_pydict())
 applies a Python function to whole Arrow `RecordBatch`es, never per row. It is the
 escape hatch for logic that has no expression form. When the function changes the
 schema, pass `output_columns` so later operations know the new columns. The `.ml`
-accessor exposes the same call with ML defaults; see [the ML accessor](ml.md).
+accessor exposes the same call with ML defaults; see {doc}`the ML accessor <ml>`.
 
 ```python
 import pyarrow.compute as pc
@@ -258,7 +258,7 @@ print(summary.to_pydict())
 
 Call `group_by()` with no keys for a global aggregate, and pass several keys to
 group by each unique combination. Derived keys are allowed as keyword expressions
-or via `with_columns`. See [Aggregations](../user-guide/aggregations.md) for the
+or via `with_columns`. See {doc}`Aggregations <../user-guide/aggregations>` for the
 full aggregate function set.
 
 ### Subtotals: rollup, cube and grouping sets
@@ -267,7 +267,7 @@ A subtotal report needs the same aggregate at several grouping levels at once.
 `rollup(*keys)` aggregates at every prefix of the keys and then the grand total,
 `cube(*keys)` at every subset, and `grouping_sets(*sets)` at exactly the levels you
 name (`[]` is the grand total). Each returns a builder you finish with `.agg(...)`,
-and each is the DataFrame spelling of the SQL clause of the same name — the two
+and each is the DataFrame spelling of the SQL clause of the same name. The two
 front-ends produce identical rows. A key that is not part of a level reads as NULL,
 which is how a subtotal row is told apart from a detail row:
 
@@ -409,8 +409,8 @@ Two accessors hang off a `Dataset` for validation and dimension maintenance:
 | `.dq` | Data-quality expectations. Constraint methods accumulate (returning a new `DatasetDQ`); a terminal method (`fail` / `drop` / `quarantine` / `validate`) applies them. |
 | `.scd` | Dimension maintenance. `type1` / `type2` / `type3` take an incoming snapshot (natural keys + attributes); `apply_changes` takes a CDC change feed, with deletes, redeliveries, and out-of-order rows. |
 
-## Next steps
+## See also
 
-- [Expressions](expressions.md): the column expressions used above.
-- [SQL](sql.md): run SQL against a dataset.
-- [The ML accessor](ml.md): batch inference and embeddings.
+- {doc}`Expressions <expressions>`: the column expressions used above.
+- {doc}`SQL <sql>`: run SQL against a dataset.
+- {doc}`The ML accessor <ml>`: batch inference and embeddings.

@@ -151,14 +151,21 @@ def spill_to_disk(
         rm.recommend_spill_partitions(opt) or partitions_from_physical(opt) or DEFAULT_PARTITIONS
     )
     partitions = max(partitions, rm.partitions_for_bounds(opt, verdict.suggested_bounds))
-    if ctx.profile is not None:
-        from batcher.api.terminal.profile import record_spill
-
-        record_spill(ctx.profile, partitions, rm.spill_reason(opt))
     # Force the learned spill codec (large IO-bound state compresses; small state does not).
     # IPC self-describes its codec, so the un-spilled result is byte-identical either way.
     with spill_compression_scope(rm, opt):
-        return spill_collect(logical_opt, sources, partitions)
+        spilled = spill_collect(logical_opt, sources, partitions)
+    # Record the spill only once it has actually happened. `spill_collect` returns `None` for
+    # a shape with no out-of-core path (a string-keyed sort, a filter/project with no state),
+    # and the caller then falls through to the in-memory path — so recording *before* the
+    # call told every such run it had "executed out-of-core under bounded memory". That is
+    # the one claim a reader reaches for while diagnosing an OOM, and it was exactly backwards
+    # on the runs that stayed resident.
+    if spilled is not None and ctx.profile is not None:
+        from batcher.api.terminal.profile import record_spill
+
+        record_spill(ctx.profile, partitions, rm.spill_reason(opt))
+    return spilled
 
 
 class ResolvedSources:

@@ -6,17 +6,17 @@ its budget.
 
 ## Reading order
 
-1. [Getting started](../getting-started/index.md): install and verify the build.
-1. [Installation](../getting-started/installation.md): packaging and extras.
-1. [Configuration](../configuration/index.md): the `Config` model and precedence.
-1. [Configuration options](../configuration/options.md): every field and default.
-1. [Environment variables](../configuration/environment.md): `BATCHER_*` and
+1. {doc}`Getting started <../getting-started/index>`: install and verify the build.
+1. {doc}`Installation <../getting-started/installation>`: packaging and extras.
+1. {doc}`Configuration <../configuration/index>`: the `Config` model and precedence.
+1. {doc}`Configuration options <../configuration/options>`: every field and default.
+1. {doc}`Environment variables <../configuration/environment>`: `BATCHER_*` and
    `BATCHER_CONFIG_FILE`.
-1. [Configuration recipes](../configuration/profiles.md): configs for common goals.
-1. [Cloud storage](../user-guide/cloud-storage.md): object-store access.
-1. [Best practices](../user-guide/best-practices.md) and
-   [troubleshooting](../user-guide/troubleshooting.md).
-1. [Configuration API reference](../api/configuration.md).
+1. {doc}`Configuration recipes <../configuration/profiles>`: configs for common goals.
+1. {doc}`Cloud storage <../user-guide/cloud-storage>`: object-store access.
+1. {doc}`Best practices <../user-guide/best-practices>` and
+   {doc}`troubleshooting <../user-guide/troubleshooting>`.
+1. {doc}`Configuration API reference <../api/configuration>`.
 
 ## Example: set process-wide defaults
 
@@ -61,13 +61,13 @@ print((cfg.execution.parallelism, cfg.memory.soft_limit))
 - `distributed.py` compares a single node against a cluster and gets identical results.
   It needs the `[ray]` extra.
 
-See also [performance and memory](../user-guide/performance.md) and
-[distributed fault tolerance](../architecture/fault-tolerance.md).
+See also {doc}`performance and memory <../user-guide/performance>` and
+{doc}`distributed fault tolerance <../architecture/fault-tolerance>`.
 
 
 ## How the engine spends your machine
 
-If you operate Batcher, the [deep dives](../deep-dives/index.md) are where the operational
+If you operate Batcher, the {doc}`deep dives <../deep-dives/index>` are where the operational
 behavior is explained: what spills and when, how the shuffle applies backpressure, and how a
 plan re-tunes itself mid-query.
 
@@ -100,7 +100,14 @@ What actually happens when you add nodes.
 ::::
 
 :::{seealso}
-- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md): a real diagnosis, start to finish.
-- [Explain plans](../user-guide/explain-plans.md): reading what the optimizer decided.
-- [Ray](../integrations/ray.md): scheduling only. The data plane goes over Arrow Flight.
+- {doc}`Optimizing a slow query <../tutorials/optimizing-a-slow-query>`: a real diagnosis, start to finish.
+- {doc}`Explain plans <../user-guide/explain-plans>`: reading what the optimizer decided.
+- {doc}`Ray <../integrations/ray>`: scheduling only. The data plane goes over Arrow Flight.
 :::
+
+
+## See also
+
+- {doc}`data-engineer`: the pipelines you are operating.
+- {doc}`../user-guide/hardening`: the trust boundaries to establish before a shared deployment.
+- {doc}`../internals/index`: how the engine works, when an incident needs it.

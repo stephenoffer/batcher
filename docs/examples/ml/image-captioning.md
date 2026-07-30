@@ -186,17 +186,17 @@ written = (
 
 ## See also
 
-- [Image classification](image-classification.md): the discriminative version of this pipeline.
-- [Audio transcription](audio-transcription.md): the same fetch → decode → model shape, for
+- {doc}`Image classification <image-classification>`: the discriminative version of this pipeline.
+- {doc}`Audio transcription <audio-transcription>`: the same fetch → decode → model shape, for
   sound.
-- [LLM inference](../../ml/llm.md): vision engines, guided decoding, token accounting.
-- [Multimodal](../../ml/multimodal.md): decode expressions, tensor columns, blob offload.
-- [GPU scheduling](../../ml/gpu.md): `num_gpus`, `concurrency`, and accelerator placement.
-- [ML API reference](../../api/ml.md): `ds.ml.download`, `ds.ml.upload`, `ds.ml.generate`.
-- [Multimodal-ingest benchmarks](../../benchmarks/multimodal-ingest.md) and
-  [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the decode and overlap numbers
+- {doc}`LLM inference <../../ml/llm>`: vision engines, guided decoding, token accounting.
+- {doc}`Multimodal <../../ml/multimodal>`: decode expressions, tensor columns, blob offload.
+- {doc}`GPU scheduling <../../ml/gpu>`: `num_gpus`, `concurrency`, and accelerator placement.
+- {doc}`ML API reference <../../api/ml>`: `ds.ml.download`, `ds.ml.upload`, `ds.ml.generate`.
+- {doc}`Multimodal-ingest benchmarks <../../benchmarks/multimodal-ingest>` and
+  {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: the decode and overlap numbers
   quoted here.
-- [GPU execution](../../deep-dives/gpu-execution.md): how the decode stage and the model stage
+- {doc}`GPU execution <../../deep-dives/gpu-execution>`: how the decode stage and the model stage
   overlap.
-- [HuggingFace integration](../../integrations/huggingface.md): where the vision model comes
+- {doc}`HuggingFace integration <../../integrations/huggingface>`: where the vision model comes
   from.

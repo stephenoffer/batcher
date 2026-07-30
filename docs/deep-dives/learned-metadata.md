@@ -189,7 +189,7 @@ Four families, across three subsystems, all reading the same hub.
 **Kyber: cardinality and cost.** The per-signature q-error correction
 (`__cardinality_correction__`), plus per-column NDV, quantiles, most-common-values, and
 average byte width. Cost coefficients are recalibrated from measured operator times. See
-[Cost model](cost-model.md).
+{doc}`Cost model <cost-model>`.
 
 **Kyber: physical strategy** (`kyber/learned_tuning/`). A UCB1 bandit over the three
 equivalent join algorithms:
@@ -277,6 +277,9 @@ Three more, each a real hole rather than a rough edge:
 
 ## Code map
 
+Each stage of the learning loop lives in one file. Read them in this order to follow a
+measurement from recording to reuse:
+
 | Concern | File |
 |---|---|
 | The hub | `python/batcher/metadata/hub.py` |
@@ -291,15 +294,15 @@ Three more, each a real hole rather than a rough edge:
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the contract loop, and why the subsystems meet only here
-- [Kyber optimizer](../internals/kyber.md): the biggest reader
-- [Carbonite](../internals/carbonite.md): the second-biggest
+- {doc}`Architecture <../architecture/index>`: the contract loop, and why the subsystems meet only here
+- {doc}`Kyber optimizer <../internals/kyber>`: the biggest reader
+- {doc}`Carbonite <../internals/carbonite>`: the second-biggest
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): UCB1, the shrinkage estimator, the EWMA
-- [Configuration options](../configuration/options.md): the `metadata.*` backend settings
-- [Adaptive execution](../getting-started/concepts/adaptive.md): what a user actually sees from this
-- [TPC-H benchmarks](../benchmarks/tpch.md): cold versus warm, measured
-- [Cardinality estimation](cardinality-estimation.md): the biggest consumer
-- [Cost model](cost-model.md): coefficient calibration
-- [Adaptive re-optimization](adaptive-reoptimization.md): the within-query half of the loop
-- [The buffer pool](buffer-pool.md): what the learned memory model sizes
+- {doc}`Configuration options <../configuration/options>`: the `metadata.*` backend settings
+- {doc}`Adaptive execution <../getting-started/concepts/adaptive>`: what a user actually sees from this
+- {doc}`TPC-H benchmarks <../benchmarks/tpch>`: cold versus warm, measured
+- {doc}`Cardinality estimation <cardinality-estimation>`: the biggest consumer
+- {doc}`Cost model <cost-model>`: coefficient calibration
+- {doc}`Adaptive re-optimization <adaptive-reoptimization>`: the within-query half of the loop
+- {doc}`The buffer pool <buffer-pool>`: what the learned memory model sizes
 :::

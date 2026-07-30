@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/operations/streaming_basics.py
 ```
+
+## See also
+
+- {doc}`observability`: watching a query run: verbosity, logging, and execution statistics.
+- {doc}`memory_and_caching`: bounded memory: caching a reused branch and spilling under a tight budget.
+- {doc}`../../user-guide/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`../../user-guide/observability`: what the engine records about a run, and where.

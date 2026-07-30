@@ -83,7 +83,7 @@ terminal: the shortcut returns `None` and the query executes normally. Weaken th
 :::
 
 See `python/batcher/api/terminal/metadata_answer/` and
-[the execution engine page](../internals/execution.md).
+{doc}`the execution engine page <../internals/execution>`.
 
 ### 2 and 3. Optimize, then admit
 
@@ -174,9 +174,12 @@ The fixed cost of a small query is the thing this design most easily gets wrong,
 | Arrow handoff | once per input relation | Zero-copy through the C Data Interface. |
 | The metrics walk | once per metered run | Only on the metered entry point. |
 
-On the operator benchmarks a global sum over TPC-H `lineitem` at scale factor 1, 6M rows on 16 cores, completes in 0.5 ms end to end against DuckDB's 2.7 ms. That is the honest measure of the fixed overhead. See [the analytics benchmarks](../benchmarks/analytics.md) for the full table and the hardware.
+On the operator benchmarks a global sum over TPC-H `lineitem` at scale factor 1, 6M rows on 16 cores, completes in 0.5 ms end to end against DuckDB's 2.7 ms. That is the honest measure of the fixed overhead. See {doc}`the analytics benchmarks <../benchmarks/analytics>` for the full table and the hardware.
 
 ## Where the code lives
+
+The steps below are in the order a query passes through them, so the table doubles as a
+reading path through the control plane:
 
 | Step | Code |
 |---|---|
@@ -196,14 +199,14 @@ One thing the diagram above flattens: a query with a pipeline breaker may run st
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the three-subsystem shape this sequence wires together
-- [Execution engine](../internals/execution.md): the architecture-level view of steps 4 through 6
-- [Kyber](../internals/kyber.md): what step 2 actually does to the plan
-- [Carbonite](../internals/carbonite.md): what step 3 admits against
-- [Reading a plan](../user-guide/explain-plans.md): how to read the `explain()` output above
-- [Performance](../user-guide/performance.md): applying all of this to a slow query
-- [Analytics benchmarks](../benchmarks/analytics.md): where the 0.5 ms fixed-overhead figure comes from
-- [Plan IR](plan-ir.md): the JSON wire contract the boundary speaks
-- [Morsel parallelism](morsel-parallelism.md): how a plan becomes work for N cores
-- [Adaptive re-optimization](adaptive-reoptimization.md): why steps 2 through 5 can run more than once
+- {doc}`Architecture <../architecture/index>`: the three-subsystem shape this sequence wires together
+- {doc}`Execution engine <../internals/execution>`: the architecture-level view of steps 4 through 6
+- {doc}`Kyber <../internals/kyber>`: what step 2 actually does to the plan
+- {doc}`Carbonite <../internals/carbonite>`: what step 3 admits against
+- {doc}`Reading a plan <../user-guide/explain-plans>`: how to read the `explain()` output above
+- {doc}`Performance <../user-guide/performance>`: applying all of this to a slow query
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: where the 0.5 ms fixed-overhead figure comes from
+- {doc}`Plan IR <plan-ir>`: the JSON wire contract the boundary speaks
+- {doc}`Morsel parallelism <morsel-parallelism>`: how a plan becomes work for N cores
+- {doc}`Adaptive re-optimization <adaptive-reoptimization>`: why steps 2 through 5 can run more than once
 :::

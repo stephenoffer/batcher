@@ -182,7 +182,7 @@ to partition the data into two halves partitions it into three.
 
 Where NaN and `-0.0` do get canonicalized is in a hash key: grouping, `distinct`, joins,
 and shuffles all treat every NaN as one key and `-0.0` as `0.0`, so a group cannot split
-across partitions. See [distinct and dedup](distinct-and-dedup.md).
+across partitions. See {doc}`distinct and dedup <distinct-and-dedup>`.
 
 ## Integer division and mixed arithmetic
 
@@ -234,20 +234,20 @@ print(nested.explode("tags").to_pydict())
 
 A fixed-shape tensor column (every row the same N-dimensional shape) is Arrow's
 canonical tensor type, so the shape travels with the data across the FFI edge and
-arrives at a model stage correctly shaped. See [multimodal](../ml/multimodal.md).
+arrives at a model stage correctly shaped. See {doc}`multimodal <../ml/multimodal>`.
 
 ## See also
 
-- [Expressions](expressions.md): the full method surface, per type.
-- [Reading data](reading-data.md): schema inference and schema evolution on the way in.
-- [Data quality](data-quality.md): assert the types and ranges you expect, instead of
+- {doc}`Expressions <expressions>`: the full method surface, per type.
+- {doc}`Reading data <reading-data>`: schema inference and schema evolution on the way in.
+- {doc}`Data quality <data-quality>`: assert the types and ranges you expect, instead of
   discovering them.
-- [Arrow memory](../deep-dives/arrow-memory.md): the zero-copy boundary the
+- {doc}`Arrow memory <../deep-dives/arrow-memory>`: the zero-copy boundary the
   normalization happens at, and why it happens exactly once.
-- [Expression evaluation](../deep-dives/expression-evaluation.md): the two numeric paths
+- {doc}`Expression evaluation <../deep-dives/expression-evaluation>`: the two numeric paths
   the widening buys, and what the JIT does with them.
-- [Tensor columns](../deep-dives/tensor-columns.md): fixed-shape tensors, the one nested
+- {doc}`Tensor columns <../deep-dives/tensor-columns>`: fixed-shape tensors, the one nested
   type with a shape contract.
-- [Schema evolution](../examples/data-engineering/schema-evolution.md): types that change
+- {doc}`Schema evolution <../examples/data-engineering/schema-evolution>`: types that change
   under you between files.
-- [Expressions API](../api/expressions.md): the `cast` / `try_cast` reference.
+- {doc}`Expressions API <../api/expressions>`: the `cast` / `try_cast` reference.

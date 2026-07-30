@@ -12,18 +12,21 @@ than a paragraph you find out about the hard way. Copy them with that in mind.
 
 ## Pick one
 
+Each tutorial is self-contained, so start with the goal that matches yours rather than
+reading in order:
+
 | If you want to | Read |
 |---|---|
-| Learn the API from nothing | [Your first pipeline](first-pipeline.md) |
-| Bring SQL habits with you | [From SQL to DataFrames](sql-to-dataframe.md) |
-| Find out why a query is slow | [Optimizing a slow query](optimizing-a-slow-query.md) |
-| Build a transactional table | [Building a lakehouse](building-a-lakehouse.md) |
-| Handle a source that never ends | [A streaming pipeline](streaming-pipeline.md) |
-| Run a model over a corpus | [Batch inference](batch-inference.md) |
-| Build retrieval and generation | [RAG from scratch](rag-from-scratch.md) |
-| Feed DDP ranks | [Distributed training pipeline](distributed-training-pipeline.md) |
-| Make a feature matrix | [Feature engineering](feature-engineering.md) |
-| Build test data first | [Synthetic data generation](synthetic-data-generation.md) |
+| Learn the API from nothing | {doc}`Your first pipeline <first-pipeline>` |
+| Bring SQL habits with you | {doc}`From SQL to DataFrames <sql-to-dataframe>` |
+| Find out why a query is slow | {doc}`Optimizing a slow query <optimizing-a-slow-query>` |
+| Build a transactional table | {doc}`Building a lakehouse <building-a-lakehouse>` |
+| Handle a source that never ends | {doc}`A streaming pipeline <streaming-pipeline>` |
+| Run a model over a corpus | {doc}`Batch inference <batch-inference>` |
+| Build retrieval and generation | {doc}`RAG from scratch <rag-from-scratch>` |
+| Feed DDP ranks | {doc}`Distributed training pipeline <distributed-training-pipeline>` |
+| Make a feature matrix | {doc}`Feature engineering <feature-engineering>` |
+| Build test data first | {doc}`Synthetic data generation <synthetic-data-generation>` |
 
 ::::{grid} 1 3 3 3
 :gutter: 3
@@ -92,13 +95,13 @@ Build a model-ready feature matrix with fit/transform preprocessors and `Chain`.
 
 ## See also
 
-- [Quickstart](../getting-started/quickstart.md): shorter than a tutorial, if you want to see
+- {doc}`Quickstart <../getting-started/quickstart>`: shorter than a tutorial, if you want to see
   the shape of the thing.
-- [User guide](../user-guide/index.md): the reference-by-topic these tutorials teach from.
-- [Examples](../examples/index.md): short recipes, one problem each, when you already know
+- {doc}`User guide <../user-guide/index>`: the reference-by-topic these tutorials teach from.
+- {doc}`Examples <../examples/index>`: short recipes, one problem each, when you already know
   the API.
-- [Learning paths](../learning-paths/index.md): these tutorials sequenced by the job you do.
-- [API reference](../api/index.md): every public name.
+- {doc}`Learning paths <../learning-paths/index>`: these tutorials sequenced by the job you do.
+- {doc}`API reference <../api/index>`: every public name.
 
 ```{toctree}
 :hidden:

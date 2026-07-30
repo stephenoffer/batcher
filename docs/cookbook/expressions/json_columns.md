@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/json_columns.py
 ```
+
+## See also
+
+- {doc}`horizontal`: horizontal functions: reducing across columns instead of down rows.
+- {doc}`lists_aggregate`: reducing a list column to one value per row.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

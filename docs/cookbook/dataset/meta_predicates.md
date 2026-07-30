@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/meta_predicates.py
 ```
+
+## See also
+
+- {doc}`meta_comparison`: asking about a join before running it, and reading approximate statistics.
+- {doc}`meta_schema`: asking about a dataset's shape without executing it.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

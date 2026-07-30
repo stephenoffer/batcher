@@ -17,6 +17,8 @@ Neutral layer: imports only `pyarrow`.
 
 from __future__ import annotations
 
+import functools
+
 import pyarrow as pa
 
 __all__ = ["DEFAULT_VARLEN_BYTES", "column_bytes", "schema_row_bytes"]
@@ -64,12 +66,22 @@ def _storage_type(dtype: pa.DataType) -> pa.DataType | None:
     return storage if isinstance(storage, pa.DataType) else None
 
 
+@functools.lru_cache(maxsize=2048)
 def column_bytes(dtype: pa.DataType, default_varlen: float = DEFAULT_VARLEN_BYTES) -> float:
     """Estimated bytes per row for a column of `dtype`.
 
     Fixed-width types are exact (the Arrow bit width). Variable-length types return
     `default_varlen` plus their offset-buffer cost, since their true width needs a
     measurement.
+
+    Memoized on `(dtype, default_varlen)`, which is the whole input: this is a pure
+    function of an Arrow type, and Arrow types are immutable and hash by value. It is worth
+    caching because it is called per column per plan node per estimate, while a query has
+    only a handful of distinct types — a warm TPC-H q8 made **1,109 calls covering 15
+    distinct types**, and the walk is not cheap (a chain of `pa.types.is_*` predicates, plus
+    recursion for nested types, where a `struct` or `map` re-derives every field's width on
+    every call). The recursive arms below re-enter through this same wrapper, so a nested
+    type's children are cached too.
 
     Args:
         dtype: The column's Arrow type.
@@ -194,6 +206,7 @@ def _has_type(dtype: pa.DataType, *predicates: str) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=1024)
 def schema_row_bytes(schema: pa.Schema, default_varlen: float = DEFAULT_VARLEN_BYTES) -> float:
     """Estimated bytes per row for a whole schema — the sum of its columns' widths.
 

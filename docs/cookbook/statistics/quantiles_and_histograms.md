@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/statistics/quantiles_and_histograms.py
 ```
+
+## See also
+
+- {doc}`distribution_shape`: is this column symmetric, skewed, or heavy-tailed?
+- {doc}`robust_dispersion`: robust spread: quantile-based measures that one outlier cannot move.
+- {doc}`../../ml/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`../../api/ml-statistics`: the reference for every statistical function.

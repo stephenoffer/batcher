@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/feature_construction.py
 ```
+
+## See also
+
+- {doc}`clustering_and_decomposition`: unsupervised models: KMeans, Gaussian mixtures, PCA, and truncated SVD.
+- {doc}`glm_regressors`: generalized linear models for counts, costs, and mixed zero-and-positive targets.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

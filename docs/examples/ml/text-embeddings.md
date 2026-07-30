@@ -218,14 +218,14 @@ Three ways to score, and the corpus size decides which:
 
 ## See also
 
-- [RAG index](rag-index.md): chunk long documents before embedding them.
-- [Training-data dedup](training-data-dedup.md): the near-duplicate pass to run before you
+- {doc}`RAG index <rag-index>`: chunk long documents before embedding them.
+- {doc}`Training-data dedup <training-data-dedup>`: the near-duplicate pass to run before you
   spend a GPU-hour embedding the same document twice.
-- [Embeddings](../../ml/embeddings.md) and [vector search](../../ml/vector-search.md): the
+- {doc}`Embeddings <../../ml/embeddings>` and {doc}`vector search <../../ml/vector-search>`: the
   encoder surface and the index it feeds.
-- [Inference](../../ml/inference.md): the pool and stage-overlap mechanics.
-- [Multimodal](../../ml/multimodal.md): the `.list` vector expressions in full.
-- [ML API reference](../../api/ml.md): `ds.ml.embed`, `build_vector_index`, `vector_search`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the 33,611 text/s on text
+- {doc}`Inference <../../ml/inference>`: the pool and stage-overlap mechanics.
+- {doc}`Multimodal <../../ml/multimodal>`: the `.list` vector expressions in full.
+- {doc}`ML API reference <../../api/ml>`: `ds.ml.embed`, `build_vector_index`, `vector_search`.
+- {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: where the 33,611 text/s on text
   embeddings comes from.
-- [Tensor columns](../../deep-dives/tensor-columns.md): how a vector column is laid out.
+- {doc}`Tensor columns <../../deep-dives/tensor-columns>`: how a vector column is laid out.

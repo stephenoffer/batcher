@@ -224,13 +224,13 @@ composable.
 
 ## See also
 
-- [Multimodal](../../ml/multimodal.md): `.audio` expressions, tensor columns, blob offload.
-- [Inference](../../ml/inference.md): pools, stage overlap, and adaptive batch sizing.
-- [GPU scheduling](../../ml/gpu.md): `num_gpus`, `concurrency`, and `model_memory_gb`.
-- [Image classification](image-classification.md): the same decode → model shape, for pixels.
-- [Image captioning](image-captioning.md): the same shape again, with a vision-language model.
-- [ML API reference](../../api/ml.md): `bt.read.audio`, `ds.ml.infer`, `max_errored_rows`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the 38,546 clip/s on the
+- {doc}`Multimodal <../../ml/multimodal>`: `.audio` expressions, tensor columns, blob offload.
+- {doc}`Inference <../../ml/inference>`: pools, stage overlap, and adaptive batch sizing.
+- {doc}`GPU scheduling <../../ml/gpu>`: `num_gpus`, `concurrency`, and `model_memory_gb`.
+- {doc}`Image classification <image-classification>`: the same decode → model shape, for pixels.
+- {doc}`Image captioning <image-captioning>`: the same shape again, with a vision-language model.
+- {doc}`ML API reference <../../api/ml>`: `bt.read.audio`, `ds.ml.infer`, `max_errored_rows`.
+- {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: where the 38,546 clip/s on the
   audio pipeline comes from.
-- [GPU execution](../../deep-dives/gpu-execution.md): the CPU/GPU overlap that produces it.
-- [HuggingFace integration](../../integrations/huggingface.md): loading Whisper and friends.
+- {doc}`GPU execution <../../deep-dives/gpu-execution>`: the CPU/GPU overlap that produces it.
+- {doc}`HuggingFace integration <../../integrations/huggingface>`: loading Whisper and friends.

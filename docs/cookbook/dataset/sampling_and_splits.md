@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/sampling_and_splits.py
 ```
+
+## See also
+
+- {doc}`reshaping`: reshaping: pivot, unpivot, explode, unnest, and set operations.
+- {doc}`sql_interface`: SQL over the same engine, and mixing SQL with DataFrame verbs.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

@@ -9,7 +9,7 @@ There's no filtering pass after the fact, and no privileged bypass to forget.
 from batcher.governance import Principal, SecurityCatalog, Grant, Redact, enforce
 ```
 
-The [governance guide](../user-guide/governance.md) is the worked introduction; this
+The {doc}`governance guide <../user-guide/governance>` is the worked introduction; this
 page is the symbol reference.
 
 :::{important}
@@ -97,8 +97,8 @@ JWKS, and needs the optional `pyjwt` dependency.
 Verification is a **deployment** control, not a security boundary. Code running inside the
 engine's process can construct a `Principal` with any `issuer` it likes, and no in-process
 mechanism can stop it. What this buys is that a query whose identity nobody established is
-refused instead of silently trusted. The boundary is still the process — run one per trust
-domain. See {doc}`../user-guide/hardening`.
+refused instead of silently trusted. The boundary is still the process, so run one per
+trust domain. See {doc}`../user-guide/hardening`.
 ```
 
 ## The catalog
@@ -187,12 +187,12 @@ value three transformations downstream, after it has been renamed and cast and a
 ## See also
 
 :::{seealso}
-- [Governance guide](../user-guide/governance.md): the worked introduction, with a runnable
+- {doc}`Governance guide <../user-guide/governance>`: the worked introduction, with a runnable
   catalog, principal, and rewritten plan.
-- [Data quality](../user-guide/data-quality.md): validation, which composes with this.
-- [Explain plans](../user-guide/explain-plans.md): reading the rewrite `enforce` produced.
-- [Quality gates](../examples/data-engineering/quality-gates.md): failing the pipeline
+- {doc}`Data quality <../user-guide/data-quality>`: validation, which composes with this.
+- {doc}`Explain plans <../user-guide/explain-plans>`: reading the rewrite `enforce` produced.
+- {doc}`Quality gates <../examples/data-engineering/quality-gates>`: failing the pipeline
   rather than the dashboard.
-- [The plan IR](../deep-dives/plan-ir.md): the tree governance rewrites.
-- [Dataset API](dataset.md) and [expressions](expressions.md): what a mask lowers to.
+- {doc}`The plan IR <../deep-dives/plan-ir>`: the tree governance rewrites.
+- {doc}`Dataset API <dataset>` and {doc}`expressions <expressions>`: what a mask lowers to.
 :::

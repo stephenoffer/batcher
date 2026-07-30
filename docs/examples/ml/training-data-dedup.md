@@ -187,19 +187,19 @@ this pass is worth doing, which is the only scale where it is worth doing.
 For dedup on *meaning* rather than on words (two descriptions of the same product, written
 independently), `ds.ml.similarity_join` is the same two-stage recipe over embeddings:
 SimHash bands the candidates, exact cosine verifies them. See
-[preprocessors](../../ml/preprocessors/index.md).
+{doc}`preprocessors <../../ml/preprocessors/index>`.
 
 ## See also
 
-- [Train/test split](train-test-split.md): dedup first, then split, in that order.
-- [Text embeddings](text-embeddings.md): the embedding half of `similarity_join`.
-- [Preprocessors](../../ml/preprocessors/index.md): MinHash, SimHash, and the LSH banding math.
-- [Embeddings](../../ml/embeddings.md): the encoder that makes semantic dedup possible.
-- [Distinct and dedup](../../user-guide/distinct-and-dedup.md): the exact-match surface, and
+- {doc}`Train/test split <train-test-split>`: dedup first, then split, in that order.
+- {doc}`Text embeddings <text-embeddings>`: the embedding half of `similarity_join`.
+- {doc}`Preprocessors <../../ml/preprocessors/index>`: MinHash, SimHash, and the LSH banding math.
+- {doc}`Embeddings <../../ml/embeddings>`: the encoder that makes semantic dedup possible.
+- {doc}`Distinct and dedup <../../user-guide/distinct-and-dedup>`: the exact-match surface, and
   when it is enough.
-- [Deduplication](../data-engineering/deduplication.md): the same problem on an event stream,
+- {doc}`Deduplication <../data-engineering/deduplication>`: the same problem on an event stream,
   where the key is known.
-- [ML API reference](../../api/ml.md): `near_duplicates`, `drop_near_duplicates`,
+- {doc}`ML API reference <../../api/ml>`: `near_duplicates`, `drop_near_duplicates`,
   `similarity_join`.
-- [Join algorithms](../../deep-dives/join-algorithms.md): the equi-join the LSH banding
+- {doc}`Join algorithms <../../deep-dives/join-algorithms>`: the equi-join the LSH banding
   lowers to, and why it distributes.

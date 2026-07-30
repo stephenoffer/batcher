@@ -207,15 +207,15 @@ running it every epoch is pure waste.
 
 ## See also
 
-- [Preprocessors](preprocessors/index.md): the fit and transform contract, and the rest of the family.
-- [LLM inference](llm.md): generation over the tokens, and sequence packing in context.
-- [Data loaders](data-loaders.md): getting the token column into a training loop.
-- [Distributed training](distributed-training.md): the loader that reads the tokens you
+- {doc}`Preprocessors <preprocessors/index>`: the fit and transform contract, and the rest of the family.
+- {doc}`LLM inference <llm>`: generation over the tokens, and sequence packing in context.
+- {doc}`Data loaders <data-loaders>`: getting the token column into a training loop.
+- {doc}`Distributed training <distributed-training>`: the loader that reads the tokens you
   wrote out.
-- [UDFs](../user-guide/udfs.md): the class-per-worker contract the tokenizer stage rests
+- {doc}`UDFs <../user-guide/udfs>`: the class-per-worker contract the tokenizer stage rests
   on.
-- [Arrow memory](../deep-dives/arrow-memory.md): what a `List<Int64>` column costs, and
+- {doc}`Arrow memory <../deep-dives/arrow-memory>`: what a `List<Int64>` column costs, and
   why the boundary stays zero-copy.
-- [Feature pipeline](../examples/ml/feature-pipeline.md): tokenization inside a larger
+- {doc}`Feature pipeline <../examples/ml/feature-pipeline>`: tokenization inside a larger
   preprocessing job.
-- [ML API](../api/ml.md): the `Tokenizer`, `pack_sequences`, and `LabelEncoder` reference.
+- {doc}`ML API <../api/ml>`: the `Tokenizer`, `pack_sequences`, and `LabelEncoder` reference.

@@ -249,12 +249,12 @@ If your operator genuinely has no mergeable form, that's a design conversation, 
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the invariant this page is the implementation of
+- {doc}`Architecture <../architecture/index>`: the invariant this page is the implementation of
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the algebraic statement and its proofs
-- [Execution engine](../internals/execution.md): where `partial`/`combine`/`finalize` are called from
-- [Aggregations](../user-guide/aggregations.md): the surface this algebra is hiding behind
-- [Scaling benchmarks](../benchmarks/scaling.md): what bounded per-node memory buys as the cluster grows
-- [Aggregation internals](aggregation-internals.md): how `partial` and `combine` actually run
-- [Morsel parallelism](morsel-parallelism.md): the scheduling this algebra makes safe
-- [Distributed scheduling](distributed-scheduling.md): the same three functions, mapped over Ray
+- {doc}`Execution engine <../internals/execution>`: where `partial`/`combine`/`finalize` are called from
+- {doc}`Aggregations <../user-guide/aggregations>`: the surface this algebra is hiding behind
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: what bounded per-node memory buys as the cluster grows
+- {doc}`Aggregation internals <aggregation-internals>`: how `partial` and `combine` actually run
+- {doc}`Morsel parallelism <morsel-parallelism>`: the scheduling this algebra makes safe
+- {doc}`Distributed scheduling <distributed-scheduling>`: the same three functions, mapped over Ray
 :::

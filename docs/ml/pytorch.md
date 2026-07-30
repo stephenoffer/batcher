@@ -16,7 +16,7 @@ training and for larger-than-memory or streaming sources.
 
 `ds.ml.stream_loader(...)` returns a `torch.utils.data.IterableDataset` for
 *distributed* training under DDP, FSDP, or DeepSpeed, with a deterministic, balanced,
-resumable global sample order across ranks. [Streaming for training](streaming.md)
+resumable global sample order across ranks. {doc}`Streaming for training <streaming>`
 covers it.
 
 ## The pattern
@@ -259,7 +259,7 @@ is orthogonal to sharding the *data*, which is what the loader does. The loader 
 the data split. Because the
 global order is deterministic in `(seed, epoch)` and independent of `world_size`, a job
 can checkpoint `global_consumed` and resume mid-epoch on a differently-sized cluster
-with no repeated or skipped samples. See [Streaming for training](streaming.md) for the
+with no repeated or skipped samples. See {doc}`Streaming for training <streaming>` for the
 ordering contract and resumption in detail.
 
 ## Behavior worth knowing
@@ -274,11 +274,11 @@ Four details of this path surprise people often enough to state outright:
   to 32-bit when targeting Apple MPS, which has no 64-bit dtype, so `device="auto"`
   works on a dev box without a crash.
 - For inference rather than training, use `ds.ml.infer`. See
-  [Inference](inference.md).
+  {doc}`Inference <inference>`.
 
-## Next steps
+## See also
 
-- [Streaming](streaming.md): the `iter_batches()` contract and distributed
+- {doc}`Streaming <streaming>`: the `iter_batches()` contract and distributed
   `stream_loader`.
-- [GPU scheduling](gpu.md): run transforms on GPU workers.
-- [The ML accessor](../api/ml.md): `map_batches` / `infer` / `embed`.
+- {doc}`GPU scheduling <gpu>`: run transforms on GPU workers.
+- {doc}`The ML accessor <../api/ml>`: `map_batches` / `infer` / `embed`.

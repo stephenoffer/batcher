@@ -116,10 +116,10 @@ print(result.to_pydict())
 # {'name': ['cy', 'ann'], 'age': [40, 30], 'city': ['nyc', 'nyc']}
 ```
 
-## Next steps
+## See also
 
-- [Aggregations](aggregations.md): group and summarize the rows you kept.
-- [Joins](joins.md): combine datasets and use semi/anti joins to filter by
+- {doc}`Aggregations <aggregations>`: group and summarize the rows you kept.
+- {doc}`Joins <joins>`: combine datasets and use semi/anti joins to filter by
   existence.
-- [Dataset API](../api/dataset.md): the `filter`, `distinct`, `sample`, and `limit`
+- {doc}`Dataset API <../api/dataset>`: the `filter`, `distinct`, `sample`, and `limit`
   reference.

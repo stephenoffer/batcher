@@ -39,6 +39,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
+from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
 from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.logical import LogicalPlan, Sort
@@ -242,6 +243,14 @@ def execute_sort_flight(
         )
         _phase("map_range_publish", _t.perf_counter() - _s)
 
+        # Placed HERE, as soon as the buckets exist and before anything can take a worker
+        # away — replicating after a loss would be probing a corpse. A sort's buckets are
+        # raw rows rather than pre-aggregated state, so the copy is larger than the
+        # aggregate's; it is still cheaper than re-reading the source and re-running the
+        # sample + range partition. `None` (the default factor of 1) leaves the reduce
+        # byte-identical to the unreplicated path.
+        replicas = replicate_shuffle_output(actors, mapper_addrs, n_buckets, workers, dead)
+
         if _fault_inject:
             for i in _fault_inject:
                 ray.kill(actors[i])
@@ -260,6 +269,7 @@ def execute_sort_flight(
             n_buckets,
             workers,
             dead=dead,
+            replicas=replicas,
         )
         _phase("reduce_gather_sort", _t.perf_counter() - _s)
     finally:
@@ -295,12 +305,14 @@ def _sort_reduce_with_recovery(
     n_buckets,
     workers,
     dead=None,
+    replicas=None,
 ):
     """Run the sort reduce under recompute-on-worker-loss recovery.
 
     Returns a `{bucket_id: sorted_batches}` dict so the driver can concatenate the
     ranges in key order regardless of completion order. A reducer reporting an
-    unreachable mapper (or whose host died) drives a recompute of that worker's range
+    unreachable mapper fetches the byte-identical bucket from a `replicas` survivor;
+    only a source whose every copy is gone drives a recompute of that worker's range
     bucket from its on-disk source partition onto a survivor, then a retry.
     """
     import ray
@@ -309,10 +321,13 @@ def _sort_reduce_with_recovery(
 
     def remote_reduce(host: int, bucket: int):
         return actors[host].sort_reduce.remote(
-            sort_ir, addrs, bucket, None, None, current_plan_id()
+            sort_ir, addrs, bucket, None, replicas, current_plan_id()
         )
 
     def republish(target: int, src: int) -> None:
+        # Retire before republishing — a replica taken at the old epoch reads back as an
+        # empty bucket, not an error. See `dist/shuffle_replication.py::retire_replicas`.
+        retire_replicas(replicas, src, target, "sort")
         addrs[src] = ray.get(
             actors[target].range_publish.remote(
                 map_ir,
@@ -336,6 +351,8 @@ def _sort_reduce_with_recovery(
         remote_reduce=remote_reduce,
         republish=republish,
         dead=dead,
+        mapper_addrs=addrs,
+        replicas=replicas,
     )
     # Keyed by bucket so the driver concatenates ranges in key order; an "ok" reduce over an
     # empty range returns None, coerced to [] so the concatenation never sees a hole.

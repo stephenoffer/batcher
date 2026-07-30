@@ -207,12 +207,12 @@ not, and a gap is what you get when the bookmark lives only in a dead process.
 
 ## See also
 
-- [Slowly changing dimensions](slowly-changing-dimensions.md): keep the history
+- {doc}`Slowly changing dimensions <slowly-changing-dimensions>`: keep the history
   instead of overwriting it.
-- [Deduplication](deduplication.md): the same collapse-by-sequence trick, on a feed
+- {doc}`Deduplication <deduplication>`: the same collapse-by-sequence trick, on a feed
   with no deletes.
-- [Late-arriving data](late-arriving-data.md): the other reason yesterday's numbers move.
-- [Lakehouse tables](../../user-guide/lakehouse.md): the transactional target.
-- [Kafka](../../integrations/kafka.md): the source connector and its offsets.
-- [Delta Lake](../../integrations/delta-lake.md): change feeds, and what a commit buys you.
-- [Dataset API](../../api/dataset.md): `ds.scd.apply_changes` and the rest of the accessor.
+- {doc}`Late-arriving data <late-arriving-data>`: the other reason yesterday's numbers move.
+- {doc}`Lakehouse tables <../../user-guide/lakehouse>`: the transactional target.
+- {doc}`Kafka <../../integrations/kafka>`: the source connector and its offsets.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: change feeds, and what a commit buys you.
+- {doc}`Dataset API <../../api/dataset>`: `ds.scd.apply_changes` and the rest of the accessor.

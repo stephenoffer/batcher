@@ -237,6 +237,9 @@ python/batcher/ml/decode.py::video_dataset
 
 ## Code map
 
+Each concern below maps to one file, covering how a tensor column is declared, stored, and
+handed to a model:
+
 | Concern | File |
 |---|---|
 | The type helpers | `python/batcher/io/formats/ml/tensor.py` |
@@ -249,13 +252,13 @@ python/batcher/ml/decode.py::video_dataset
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why there is no Batcher tensor type
-- [Execution engine](../internals/execution.md): where the decode expression is scheduled
-- [Multimodal guide](../ml/multimodal.md): how to write these pipelines
-- [ML guide](../ml/index.md): the loaders and converters on the other end
-- [Multimodal ingest benchmarks](../benchmarks/multimodal-ingest.md): the img/s figures above
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): the training-ingest comparison
-- [Arrow and memory](arrow-memory.md): what a `FixedSizeList` buffer actually is
-- [GPU execution](gpu-execution.md): what consumes these tensors
-- [Expression evaluation](expression-evaluation.md): where the decode kernels run
+- {doc}`Architecture <../architecture/index>`: why there is no Batcher tensor type
+- {doc}`Execution engine <../internals/execution>`: where the decode expression is scheduled
+- {doc}`Multimodal guide <../ml/multimodal>`: how to write these pipelines
+- {doc}`ML guide <../ml/index>`: the loaders and converters on the other end
+- {doc}`Multimodal ingest benchmarks <../benchmarks/multimodal-ingest>`: the img/s figures above
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the training-ingest comparison
+- {doc}`Arrow and memory <arrow-memory>`: what a `FixedSizeList` buffer actually is
+- {doc}`GPU execution <gpu-execution>`: what consumes these tensors
+- {doc}`Expression evaluation <expression-evaluation>`: where the decode kernels run
 :::

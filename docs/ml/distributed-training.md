@@ -253,16 +253,16 @@ improves, and the improvement is not real.
 
 ## See also
 
-- [Data loaders](data-loaders.md): the loader map and the framework converters.
-- [PyTorch](pytorch.md): DDP and FSDP wiring on the training side.
-- [Preprocessors](preprocessors/index.md): the fit and transform contract.
-- [Streaming for training](streaming.md): the bounded-memory ingest path in depth.
-- [Distributed training pipeline](../tutorials/distributed-training-pipeline.md): the
+- {doc}`Data loaders <data-loaders>`: the loader map and the framework converters.
+- {doc}`PyTorch <pytorch>`: DDP and FSDP wiring on the training side.
+- {doc}`Preprocessors <preprocessors/index>`: the fit and transform contract.
+- {doc}`Streaming for training <streaming>`: the bounded-memory ingest path in depth.
+- {doc}`Distributed training pipeline <../tutorials/distributed-training-pipeline>`: the
   tutorial, from raw files to a multi-rank loop.
-- [Distributed scheduling](../deep-dives/distributed-scheduling.md): what the engine is
+- {doc}`Distributed scheduling <../deep-dives/distributed-scheduling>`: what the engine is
   doing while the ranks are reading.
-- [Train/test split recipe](../examples/ml/train-test-split.md): the leak-free split, on
+- {doc}`Train/test split recipe <../examples/ml/train-test-split>`: the leak-free split, on
   its own.
-- [Scaling benchmarks](../benchmarks/scaling.md): what the ingest path holds up to.
-- [ML API](../api/ml.md): the `stream_loader`, `ResumableSampler`, and `epoch_order`
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: what the ingest path holds up to.
+- {doc}`ML API <../api/ml>`: the `stream_loader`, `ResumableSampler`, and `epoch_order`
   reference.

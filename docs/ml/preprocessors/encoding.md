@@ -94,7 +94,7 @@ path, a product SKU, a user agent, a postcode. Three strategies handle it, in in
 order of the cardinality they tolerate.
 
 `FrequencyEncoder` replaces each category with how often it occurs. One numeric column, and
-it often carries real signal — a rare value behaves differently from a common one. An unseen
+it often carries real signal, because a rare value behaves differently from a common one. An unseen
 category encodes as 0, which is the correct answer.
 
 ```python
@@ -117,7 +117,7 @@ print(encoder.transform(bt.from_pydict({"c": ["never_seen"]})).to_pydict())
 ```
 
 `HashingEncoder` hashes into a fixed number of buckets. Unbounded cardinality, no fitted
-state at all, and therefore no train/serve skew — at the cost of collisions, which a tree
+state at all, and therefore no train/serve skew, at the cost of collisions, which a tree
 model tolerates better than most people expect. It uses the engine's stable `xxhash64`
 rather than Python's `hash()`, which varies per process and would be a silent skew.
 
@@ -128,7 +128,7 @@ rather than Python's `hash()`, which varies per process and would be a silent sk
 `TargetEncoder` replaces a category with the target's mean; `WOEEncoder` replaces it with the
 log-odds of the target relative to the overall odds. That is the transform a regulated credit
 scorecard is built on, because WOE is additive in the log-odds space a logistic regression
-works in — a WOE-encoded feature enters a linear model as a straight, interpretable
+works in. A WOE-encoded feature enters a linear model as a straight, interpretable
 coefficient.
 
 ```python

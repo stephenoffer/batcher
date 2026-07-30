@@ -182,20 +182,20 @@ the last two years hides slow drift and screams at every deploy. What you usuall
 trailing window: `col("latency").rolling_mean(60, partition_by=["host"], order_by=["minute"])`
 gives a moving reference, and the deviation from *that* is what you threshold. The
 `rolling_*` functions count rows, not minutes, so the series has to be dense first. See
-[time series rollups](time-series-rollups.md). Otherwise a gap in the metrics quietly
+{doc}`time series rollups <time-series-rollups>`. Otherwise a gap in the metrics quietly
 stretches your one-hour window across a day.
 :::
 
 ## See also
 
 :::{seealso}
-- [Time series rollups](time-series-rollups.md): densify the series before you window over it.
-- [A/B testing](ab-testing.md): the other page here where a pooled statistic hides the
+- {doc}`Time series rollups <time-series-rollups>`: densify the series before you window over it.
+- {doc}`A/B testing <ab-testing>`: the other page here where a pooled statistic hides the
   thing you were trying to measure.
-- [Aggregations](../../user-guide/aggregations.md): `median`, `quantile`, and the sketch-backed
+- {doc}`Aggregations <../../user-guide/aggregations>`: `median`, `quantile`, and the sketch-backed
   `approx_median` for when the groups are too big to hold.
-- [Joins](../../user-guide/joins.md): the baseline-broadcast join used three times here.
-- [Aggregation internals](../../deep-dives/aggregation-internals.md): why `median` is the
+- {doc}`Joins <../../user-guide/joins>`: the baseline-broadcast join used three times here.
+- {doc}`Aggregation internals <../../deep-dives/aggregation-internals>`: why `median` is the
   expensive aggregate and how the sketch-backed version avoids it.
-- [Expressions API](../../api/expressions.md): `mean`, `std`, `median`, `abs`, `round`.
+- {doc}`Expressions API <../../api/expressions>`: `mean`, `std`, `median`, `abs`, `round`.
 :::

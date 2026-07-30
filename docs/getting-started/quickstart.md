@@ -170,7 +170,7 @@ as SQL, inspected a plan, and round-tripped a file. That is the whole shape of a
 pipeline: **read, chain lazy verbs, collect once at the end.** Scaling it up changes the
 source and the machine, not the code.
 
-## Next steps
+## See also
 
 ::::{grid} 1 3 3 3
 :gutter: 3

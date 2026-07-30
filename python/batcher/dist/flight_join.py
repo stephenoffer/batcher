@@ -26,6 +26,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
+from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
@@ -165,6 +166,15 @@ def execute_join_flight(
 
         mapper_addrs, mapper_dead = map_barrier(workers, _launch)
 
+        # Placed HERE, as soon as the buckets exist and before anything can take a worker
+        # away — replicating after a loss would be probing a corpse. A join's mapper
+        # publishes BOTH sides under one address, so one replica covers both and a lost
+        # worker costs no re-read of either source. `None` (the default factor of 1)
+        # leaves the reduce byte-identical to the unreplicated path.
+        replicas = replicate_shuffle_output(
+            actors, mapper_addrs, n_buckets, workers, mapper_dead, stages=(0, 1)
+        )
+
         # Simulate worker loss after the map barrier (test hook).
         if _fault_inject:
             for i in _fault_inject:
@@ -187,6 +197,7 @@ def execute_join_flight(
             finalize=not combine_partials,
             dead=mapper_dead,
             publish=publish,
+            replicas=replicas,
         )
         if publish:
             from batcher.dist.fleet import FlightMaterializedSource
@@ -277,14 +288,17 @@ def _join_reduce_with_recovery(
     finalize=True,
     dead=None,
     publish=False,
+    replicas=None,
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
     Each reducer is hosted on a live worker; one that reports an unreachable mapper
-    (or whose host died) drives a recompute of that worker's *both* sides (the join
-    co-partitions left and right) from their on-disk source partitions onto a
-    survivor, then a retry. Returns the joined batches — or, with `publish`, the
-    `(addr, ticket, rows, schema)` handles of the buckets left ON the workers.
+    fetches the byte-identical buckets from a `replicas` survivor, which holds *both*
+    sides (a join replica is all-or-nothing across the two shuffle stages). Only a
+    source whose every copy is gone drives a recompute of both sides from their on-disk
+    source partitions onto a survivor, then a retry. Returns the joined batches — or,
+    with `publish`, the `(addr, ticket, rows, schema)` handles of the buckets left ON
+    the workers.
 
     `dead` seeds the workers the map barrier already lost, so no reducer is hosted on
     an actor that is gone.
@@ -304,7 +318,7 @@ def _join_reduce_with_recovery(
         # Otherwise the reducer ships its batches back.
         if publish:
             return actors[host].reduce_join_publish.remote(
-                join_ir, addrs, bucket, lschema, rschema, None, None, current_plan_id()
+                join_ir, addrs, bucket, lschema, rschema, None, replicas, current_plan_id()
             )
         return actors[host].reduce_join.remote(
             join_ir,
@@ -316,11 +330,14 @@ def _join_reduce_with_recovery(
             aj,
             finalize,
             None,
-            None,
+            replicas,
             current_plan_id(),
         )
 
     def republish(target: int, src: int) -> None:
+        # Retire before republishing — a replica taken at the old epoch reads back as an
+        # empty bucket, not an error. See `dist/shuffle_replication.py::retire_replicas`.
+        retire_replicas(replicas, src, target, "join")
         # One call for both sides, as in the map barrier: awaiting only the right side would
         # let a left-side failure pass for a successful republish.
         addrs[src] = ray.get(
@@ -342,6 +359,8 @@ def _join_reduce_with_recovery(
         remote_reduce=remote_reduce,
         republish=republish,
         dead=dead,
+        mapper_addrs=addrs,
+        replicas=replicas,
     )
     if publish:
         # One `(addr, ticket, rows, schema)` handle per non-empty bucket, still on its worker.

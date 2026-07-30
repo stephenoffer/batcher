@@ -9,7 +9,7 @@ This page is the reference. For how they fit into a training workflow, read
 
 `batcher.ml.preprocessors` holds the fit/transform feature-engineering estimators.
 Each one `fit`s over a `Dataset` to learn its statistics, then `transform`s any `Dataset` with them. `Chain` composes several into one pipeline. See the
-[preprocessors guide](../ml/preprocessors/index.md) for how they fit into a training
+{doc}`preprocessors guide <../ml/preprocessors/index>` for how they fit into a training
 workflow.
 
 ```{eval-rst}
@@ -174,7 +174,7 @@ cannot learn on its own, and group-relative statistics that let a row see its co
 ## Timestamp features
 
 A raw timestamp is the least useful column in a feature table. These turn it into parts a
-model can learn from — integer parts for a tree, circular coordinates for anything that
+model can learn from: integer parts for a tree, and circular coordinates for anything that
 measures distance:
 
 ```{eval-rst}
@@ -189,7 +189,7 @@ measures distance:
 
 History as columns, for a forecasting model. Both exclude the current row by construction,
 because a rolling window that includes it puts the target's own value inside its own
-feature — the most common leak in a forecasting pipeline, and one that raises nothing:
+feature. That is the most common leak in a forecasting pipeline, and one that raises nothing:
 
 ```{eval-rst}
 .. autoclass:: LagFeaturizer
@@ -201,7 +201,7 @@ feature — the most common leak in a forecasting pipeline, and one that raises 
 
 ## Text surface features
 
-Cheap, interpretable text signals — length, word count, character mix — that need no model
+Cheap, interpretable text signals such as length, word count, and character mix, all needing no model
 and often carry most of the signal a gradient-boosted model splits on:
 
 ```{eval-rst}
@@ -213,7 +213,7 @@ and often carry most of the signal a gradient-boosted model splits on:
 
 A fitted preprocessor's state has to outlive the process that fitted it, or a serving
 request is standardized with its own mean instead of the training set's. These read and
-write that state as plain JSON — reviewable, diffable, portable, and safe to load from a
+write that state as plain JSON, which is reviewable, diffable, portable, and safe to load from a
 store you do not fully control, which a pickle is none of.
 
 ```{eval-rst}

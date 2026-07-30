@@ -222,9 +222,9 @@ print(
 `count(1) OVER (PARTITION BY x)` compared against 1. Both are most useful inside
 `filter`.
 
-## Next steps
+## See also
 
-- [Aggregations](aggregations.md): collapse groups into summary rows.
-- [Joins](joins.md): combine windowed output with other datasets.
-- [Expressions API](../api/expressions.md): the reference for every window, ranking
+- {doc}`Aggregations <aggregations>`: collapse groups into summary rows.
+- {doc}`Joins <joins>`: combine windowed output with other datasets.
+- {doc}`Expressions API <../api/expressions>`: the reference for every window, ranking
   and rolling method.

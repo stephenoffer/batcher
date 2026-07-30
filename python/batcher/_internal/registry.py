@@ -127,6 +127,8 @@ class Registry(Generic[T]):
         try:
             return self._items[name]
         except (KeyError, TypeError):
+            # Not an error yet, and deliberately not traced: a miss here is ordinary
+            # control flow on the way to the retry below, not a suppressed failure.
             pass
         # A miss may only mean the family that owns this name has not registered yet.
         self.complete()

@@ -594,6 +594,41 @@ mod tests {
     use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use bc_ir::{JoinStrategy, JoinType};
 
+    /// A band range join's two conditions name the *same* right column, and the band
+    /// algorithm in `bc-runtime` detects that by `Arc::ptr_eq` on the two key arrays. That
+    /// only works because `columns_by_name` hands out `Arc` clones rather than copies, so
+    /// this pins the precondition explicitly.
+    ///
+    /// Without it, a future `columns_by_name` that materialized a fresh array per name would
+    /// send every `r.y BETWEEN l.a AND l.b` back to the general IEJoin path — a silent
+    /// ~2x regression on the commonest inequality-join shape, with every correctness test
+    /// still green because both paths compute the same answer.
+    #[test]
+    fn one_column_named_twice_is_shared_not_copied() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("y", DataType::Int64, true),
+                ArrowField::new("z", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![4i64, 5, 6])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let same = columns_by_name(&batch, &["y".to_string(), "y".to_string()]).unwrap();
+        assert!(
+            Arc::ptr_eq(&same[0], &same[1]),
+            "the band join's detection depends on this being one shared Arc"
+        );
+
+        // Two different columns must NOT compare equal, or detection would fire on a
+        // general two-inequality join and slice an order its second bound does not index.
+        let differ = columns_by_name(&batch, &["y".to_string(), "z".to_string()]).unwrap();
+        assert!(!Arc::ptr_eq(&differ[0], &differ[1]));
+    }
+
     /// The identity short-circuit must be invisible: a side whose index buffer is exactly
     /// `0..n` returns the source column itself, and that must equal what the gather produces.
     /// A *prefix* of the identity is not the identity — it selects a subset — so the second

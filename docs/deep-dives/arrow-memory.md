@@ -234,13 +234,13 @@ per-chunk `concat` (~3 GB/s) does not. The result is byte-identical to `concat_b
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the Arrow-only invariant, and the crate DAG it implies
-- [Carbonite](../internals/carbonite.md): the resource manager that drives this pool
-- [Execution engine](../internals/execution.md): what the operators do with these buffers
-- [Type system](../user-guide/type-system.md): the types that survive the boundary normalization
-- [Performance](../user-guide/performance.md): staying out of Python containers on the hot path
-- [Analytics benchmarks](../benchmarks/analytics.md): where the 6M-row filter figures come from
-- [Morsel parallelism](morsel-parallelism.md): what the byte budget is for
-- [Query lifecycle](query-lifecycle.md): where the zero-copy handoff happens
-- [The buffer pool](buffer-pool.md): the pressure ladder above, in full
+- {doc}`Architecture <../architecture/index>`: the Arrow-only invariant, and the crate DAG it implies
+- {doc}`Carbonite <../internals/carbonite>`: the resource manager that drives this pool
+- {doc}`Execution engine <../internals/execution>`: what the operators do with these buffers
+- {doc}`Type system <../user-guide/type-system>`: the types that survive the boundary normalization
+- {doc}`Performance <../user-guide/performance>`: staying out of Python containers on the hot path
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: where the 6M-row filter figures come from
+- {doc}`Morsel parallelism <morsel-parallelism>`: what the byte budget is for
+- {doc}`Query lifecycle <query-lifecycle>`: where the zero-copy handoff happens
+- {doc}`The buffer pool <buffer-pool>`: the pressure ladder above, in full
 :::

@@ -113,7 +113,7 @@ subscriber clients on one subscription, and Batcher's split model has no way to 
 today: a split is a *named piece of the source*, and there is nothing here to name. If ingest
 rate is your bottleneck, run several queries against several subscriptions on the same topic
 and union the results downstream, or write a custom source (see
-[custom connectors](../user-guide/custom-connectors.md)).
+{doc}`custom connectors <../user-guide/custom-connectors>`).
 
 `poll_size` maps to `max_messages` on the pull request. The service treats it as an upper
 bound and routinely returns far fewer, so the default 16,384 is optimistic rather than wrong.
@@ -203,10 +203,10 @@ topic) is not applied. Decode in `map_batches`, per batch, never per row.
 
 ## See also
 
-- [Streaming](../user-guide/streaming.md): triggers, watermarks, dedup, checkpointing.
-- [Late data and watermarks](../examples/streaming/late-data-watermarks.md): the bounded-state
+- {doc}`Streaming <../user-guide/streaming>`: triggers, watermarks, dedup, checkpointing.
+- {doc}`Late data and watermarks <../examples/streaming/late-data-watermarks>`: the bounded-state
   dedup above, in a full pipeline.
-- [Custom connectors](../user-guide/custom-connectors.md): the `Source`/`Split` protocol.
-- [Reading and writing](../api/io.md): the full reader/writer surface.
-- [Kafka](kafka.md): the shared broker schema and the JSON-payload decode example.
-- [Kinesis](kinesis.md): the cloud broker that does split, one worker per shard.
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: the `Source`/`Split` protocol.
+- {doc}`Reading and writing <../api/io>`: the full reader/writer surface.
+- {doc}`Kafka <kafka>`: the shared broker schema and the JSON-payload decode example.
+- {doc}`Kinesis <kinesis>`: the cloud broker that does split, one worker per shard.

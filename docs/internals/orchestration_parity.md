@@ -54,8 +54,9 @@ Around it:
 - **No cross-cloud anything.** Batcher reads object stores; it does not manage clouds.
 - **`UNMEASURED` recovery cost.** Every recovery claim above is mechanism-only. The resilience
   matrix has no timings because Ray task execution does not work in this sandbox: `ray.init`
-  succeeds and a bare `@ray.remote def add(a, b)` times out at 60 s. The reproducer is in
-  `AI_WORKLOAD_LEDGER.md`.
+  succeeds and a bare `@ray.remote def add(a, b)` times out at 60 s. Run that four-line
+  reproducer before diagnosing any distributed failure here: it separates "the engine is
+  wrong" from "Ray is not running tasks".
 
 ## The composition that actually makes sense
 

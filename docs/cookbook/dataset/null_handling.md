@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/null_handling.py
 ```
+
+## See also
+
+- {doc}`meta_schema`: asking about a dataset's shape without executing it.
+- {doc}`profiling`: profiling a table you have just been handed.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

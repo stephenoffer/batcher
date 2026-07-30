@@ -59,6 +59,9 @@ double-counting one bad row. State the null rule explicitly when you mean it.
 
 ## Three ways to spend a report
 
+A report ends in one of three verdicts, and the choice decides what happens to the rows
+that failed:
+
 | Verdict | What happens to a bad row | What it is for |
 |---|---|---|
 | `fail()` | nothing loads; `DataQualityError` carries the counts | a data contract at a pipeline boundary |
@@ -164,7 +167,7 @@ print(orphans.to_pydict())
 
 Run this *before* the join that consumes the key. An inner join with an orphan key drops
 the row and reports nothing, so you find out from a row count that does not tie out. See
-[multi-source join](multi-source-join.md), where that is the whole story.
+{doc}`multi-source join <multi-source-join>`, where that is the whole story.
 
 ## Where the gate goes
 
@@ -193,12 +196,12 @@ predicates everywhere.
 
 ## See also
 
-- [Deduplication](deduplication.md): what `unique` found, and what to do about it.
-- [Schema evolution](schema-evolution.md): gating the shape rather than the values.
-- [Multi-source join](multi-source-join.md): the orphan key, and what an inner join does
+- {doc}`Deduplication <deduplication>`: what `unique` found, and what to do about it.
+- {doc}`Schema evolution <schema-evolution>`: gating the shape rather than the values.
+- {doc}`Multi-source join <multi-source-join>`: the orphan key, and what an inner join does
   with it.
-- [Data quality](../../user-guide/data-quality.md): every constraint in the accessor.
-- [Writing data](../../user-guide/writing-data.md): where to land the quarantined rows.
-- [Delta Lake](../../integrations/delta-lake.md): the target the gate stands in front of.
-- [Dataset API](../../api/dataset.md): `ds.dq`, `validate`, `fail`, `drop`, `quarantine`.
-- [Exceptions](../../api/exceptions.md): `DataQualityError` and what it carries.
+- {doc}`Data quality <../../user-guide/data-quality>`: every constraint in the accessor.
+- {doc}`Writing data <../../user-guide/writing-data>`: where to land the quarantined rows.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: the target the gate stands in front of.
+- {doc}`Dataset API <../../api/dataset>`: `ds.dq`, `validate`, `fail`, `drop`, `quarantine`.
+- {doc}`Exceptions <../../api/exceptions>`: `DataQualityError` and what it carries.

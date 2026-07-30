@@ -197,7 +197,13 @@ def _fanout(node: LogicalPlan, estimator) -> float:
     try:
         in_rows = estimator.estimate(inp).rows
         out_rows = estimator.estimate(node).rows
-    except Exception:  # pragma: no cover - budgeting must never break a plan
+    except Exception as exc:  # pragma: no cover - budgeting must never break a plan
+        # Falling back to 1.0 budgets every operator below this one at a single morsel.
+        # That is the right *behaviour*, but it is indistinguishable from a plan that
+        # genuinely does not fan out, so an estimator broken here would quietly cap
+        # parallelism forever. Trace it the way the annotate loop at the bottom of this
+        # module already traces its own abstention.
+        note_suppressed("kyber", "estimate operator fan-out", exc)
         return 1.0
     if in_rows <= 0 or out_rows <= 0:
         return 1.0

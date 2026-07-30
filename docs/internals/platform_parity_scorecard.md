@@ -67,7 +67,8 @@ picture. Each would end an enterprise evaluation on its own, regardless of throu
    at-rest protection. Both commercial platforms encrypt by default with customer-managed keys.
 5. **Fault tolerance is verified in mechanism, not in timing.** The recovery machinery is real
    and now observable (Phase 1A), but no cell in the resilience matrix has a recovery *number*,
-   because Ray task execution does not work in this sandbox (`AI_WORKLOAD_LEDGER.md`).
+   because Ray task execution does not work in this sandbox: `ray.init` succeeds and a bare
+   `@ray.remote def add(a, b)` then times out at 60 s.
 
 ## The matrix
 
@@ -266,5 +267,4 @@ In rough order of evaluation impact:
 - `competitive_architecture.md` — the execution-model scorecard vs the OSS engines. The
   authority on performance; never contradicted here.
 - `databricks_parity.md` — the deep Databricks ledger, with the per-phase records of this pass.
-- `bug_hunt_ledger.md`, `audit_ledger.md` — the defect records behind section 2.
 - `benchmarks/BENCHMARK_RESULTS.md` — every number cited above, with its conditions.

@@ -18,6 +18,7 @@ avoid an import-time cycle.
 from __future__ import annotations
 
 import datetime as _dt
+import decimal as _decimal
 import itertools
 import math
 from collections.abc import Iterable
@@ -1024,7 +1025,8 @@ class Expr:
             radix: The base, from 2 to 36.
 
         Returns:
-            A new Utf8 expression: the digits, with a leading ``-`` when negative.
+            A new Utf8 expression: the digits in uppercase, with a leading ``-`` when
+            negative.
 
         Raises:
             PlanError: If `radix` is outside 2..36.
@@ -1035,7 +1037,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"n": [15, 255]})
                 >>> ds.select(b=bt.col("n").to_base(2), h=bt.col("n").to_base(16)).to_pydict()
-                {'b': ['1111', '11111111'], 'h': ['f', 'ff']}
+                {'b': ['1111', '11111111'], 'h': ['F', 'FF']}
         """
         from batcher.plan.expr_ir.func_nodes import StrFunc
 
@@ -1059,7 +1061,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"n": [512, 1536]})
                 >>> ds.select(r=bt.col("n").format_bytes()).to_pydict()
-                {'r': ['512 B', '1.5 KiB']}
+                {'r': ['512 bytes', '1.5 KiB']}
         """
         from batcher.plan.expr_ir.func_nodes import StrFunc
 
@@ -3229,7 +3231,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").kurtosis_pop()).to_pydict()
-                {'g': ['a'], 'r': [0.5049148147577234]}
+                {'g': ['a'], 'r': [-0.21199999999999974]}
         """
         return AggExpr("kurtosis_pop", self)
 
@@ -4549,6 +4551,88 @@ from batcher.plan.expr_ir.node_base import (  # noqa: E402
 )
 
 
+def _as_exact_float(value: object) -> object:
+    """A `Decimal` as a float when the float is the same number; anything else unchanged.
+
+    `Decimal` is the type money is stored in, so `price > Decimal("9.99")` is the natural way
+    -- and the only exact way -- to write the most common predicate in analytics. It raised
+    `unsupported literal type: Decimal`, from `to_ir`, so the traceback pointed at `collect()`
+    rather than at the `filter`. The column type works fine; only the literal was missing.
+
+    The IR has no decimal literal, and adding one is a two-sided change to the wire contract.
+    What is available is that the engine already compares a decimal *column* against a float
+    literal correctly: `0.10`, `2.675` and `999999999.99` each match DuckDB exactly, because
+    both sides land on the same float. That holds right up until the decimal carries more
+    significant digits than a float64 can distinguish, where it silently stops matching --
+    a 25-digit decimal compares equal to nothing at all.
+
+    Silently wrong on money is far worse than unsupported, so the conversion is made only when
+    it is provably lossless: the float must round-trip back to the same number. Everything
+    inside float64's ~15 significant digits converts, which is every currency amount, rate and
+    price; anything wider raises a typed error naming the limit instead of quietly answering
+    the wrong question.
+
+    Args:
+        value: The literal a caller passed.
+
+    Returns:
+        An equal `float` for a round-tripping `Decimal`, else `value` unchanged.
+
+    Raises:
+        PlanError: If `value` is a `Decimal` that no float represents exactly.
+    """
+    if not isinstance(value, _decimal.Decimal):
+        return value
+    if not value.is_finite():
+        return float(value)
+    as_float = float(value)
+    if _decimal.Decimal(repr(as_float)) == value:
+        return as_float
+    raise PlanError(
+        f"decimal literal {value} has more significant digits than a 64-bit float can "
+        f"represent, and the plan IR has no exact decimal literal. Compare against a float "
+        f"or a string instead, or round the literal to 15 significant digits."
+    )
+
+
+def _as_python_scalar(value: object) -> object:
+    """An array scalar as its plain Python equivalent; anything else unchanged.
+
+    NumPy scalars are what real data work produces — `arr.max()`, `np.percentile(...)`,
+    a pandas `Series.max()`, the result of any integer arithmetic on an array — and they
+    reach the API constantly as filter thresholds. Almost none of them are subclasses of
+    the Python types the wire encoder dispatches on: `numpy.float64` subclasses `float` and
+    so worked by accident, while `numpy.int64`, every other width, `numpy.bool_` and a
+    0-d array did not and raised `unsupported literal type: int64` — from `to_ir`, which
+    on a lazy API means the traceback points at `collect()` rather than at the `filter`
+    that built it.
+
+    `.item()` is the conversion the array protocol already defines, and it lands each one on
+    exactly the type the encoder below wants — including `numpy.datetime64`, which becomes a
+    `datetime`/`date` the ladder already handles.
+
+    Recognised structurally (`.item()` plus a `dtype`) rather than by importing NumPy: `plan`
+    is the neutral contract layer and must not take a hard dependency on it. A 0-d array
+    converts; an array with dimensions is left alone, so it still fails as the non-scalar it
+    is instead of being silently reduced to its first element.
+
+    Args:
+        value: The literal a caller passed.
+
+    Returns:
+        The Python equivalent for an array scalar, else `value` unchanged.
+    """
+    item = getattr(value, "item", None)
+    if not callable(item) or not hasattr(value, "dtype"):
+        return value
+    if getattr(value, "ndim", 0) != 0:
+        return value  # a real array is not a scalar; let it fail as one
+    try:
+        return item()
+    except (ValueError, TypeError):  # pragma: no cover - an exotic dtype with no Python form
+        return value
+
+
 class Lit(Expr):
     """A constant literal. The wire kind is inferred from the Python type."""
 
@@ -4560,7 +4644,7 @@ class Lit(Expr):
 
     def __init__(self, value: int | float | bool | str) -> None:
         """Wrap a Python scalar (or date/datetime) as a literal expression node."""
-        self.value = value
+        self.value = _as_exact_float(_as_python_scalar(value))
         self._ir_cache: dict[str, Any] | None = None
 
     def to_ir(self) -> dict[str, Any]:
@@ -4572,9 +4656,10 @@ class Lit(Expr):
         kind = type(v)
         # Exact-type dispatch for the four scalar kinds that make up almost every literal
         # in a plan, before the `isinstance` ladder the subclass relationships require
-        # (bool before int, datetime before date). A subclass of one of these — a
-        # `numpy.bool_`, an `IntEnum` — still falls through to the ladder below and is
-        # tagged exactly as it was.
+        # (bool before int, datetime before date). A subclass of one of these — an
+        # `IntEnum` — still falls through to the ladder below and is tagged exactly as it
+        # was. An **array scalar** is not a subclass and never reached the ladder at all;
+        # `__init__` converts it before it gets here (see `_as_python_scalar`).
         if kind is int:
             tagged: dict[str, Any] = {"int": v}
         elif kind is str:

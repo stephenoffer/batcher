@@ -146,7 +146,7 @@ print(sorted(again_test.to_pydict()["event_id"]))
 ```
 
 That property is why the split composes with the rest of the engine. Fit a
-[preprocessor](feature-pipeline.md) on `train`, transform both parts, and the fitted
+{doc}`preprocessor <feature-pipeline>` on `train`, transform both parts, and the fitted
 statistics stay attached to the same rows on every run.
 :::
 
@@ -165,19 +165,19 @@ clean = events.ml.drop_near_duplicates("text", threshold=0.8)
 train, test = clean.ml.train_test_split(0.2, seed=42, key="doc_id")
 ```
 
-[Training-data dedup](training-data-dedup.md) covers the fuzzy case, which is the one that
+{doc}`Training-data dedup <training-data-dedup>` covers the fuzzy case, which is the one that
 matters on a real corpus.
 
 ## See also
 
-- [Feature pipeline](feature-pipeline.md): fit on train, transform both parts.
-- [Training-data dedup](training-data-dedup.md): remove the twins before splitting.
-- [Recommender features](recommender-features.md): the point-in-time filter that is the
+- {doc}`Feature pipeline <feature-pipeline>`: fit on train, transform both parts.
+- {doc}`Training-data dedup <training-data-dedup>`: remove the twins before splitting.
+- {doc}`Recommender features <recommender-features>`: the point-in-time filter that is the
   time-split's cousin.
-- [Preprocessors](../../ml/preprocessors/index.md): what each `fit` learns, and from which split.
-- [Streaming for training](../../ml/streaming.md): deterministic, resumable sample order
+- {doc}`Preprocessors <../../ml/preprocessors/index>`: what each `fit` learns, and from which split.
+- {doc}`Streaming for training <../../ml/streaming>`: deterministic, resumable sample order
   across DDP ranks.
-- [Data loaders](../../ml/data-loaders.md): handing `train` and `test` to a training loop.
-- [ML API reference](../../api/ml.md): `train_test_split`, `random_split`,
+- {doc}`Data loaders <../../ml/data-loaders>`: handing `train` and `test` to a training loop.
+- {doc}`ML API reference <../../api/ml>`: `train_test_split`, `random_split`,
   `drop_near_duplicates`.
-- [Sampling](../../user-guide/sampling.md): the sampling surface the split is built on.
+- {doc}`Sampling <../../user-guide/sampling>`: the sampling surface the split is built on.

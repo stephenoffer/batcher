@@ -114,7 +114,7 @@ The shuffle is a data plane on the wire.
 :::
 
 The rest (retries, straggler speculation, skew salting, adaptive credits) is in
-[configuration options](../configuration/options.md), and the defaults fill a cluster with no
+{doc}`configuration options <../configuration/options>`, and the defaults fill a cluster with no
 tuning: one worker per node, an even share of each node's cores, reducer count scaled to workers.
 
 ## Bringing in a Ray Dataset
@@ -172,10 +172,10 @@ to avoid. Batches move over Flight; Ray moves the paths.
 
 ## See also
 
-- [Execution architecture](../architecture/execution.md): morsels, breakers, the shuffle.
-- [Shuffle over Arrow Flight](../deep-dives/shuffle-flight.md): the transport that replaces the
+- {doc}`Execution architecture <../architecture/execution>`: morsels, breakers, the shuffle.
+- {doc}`Shuffle over Arrow Flight <../deep-dives/shuffle-flight>`: the transport that replaces the
   object store, and its credits.
-- [Distributed scheduling](../deep-dives/distributed-scheduling.md): how a plan becomes Ray tasks.
-- [Configuration options](../configuration/options.md): every distributed knob.
-- [Fault tolerance](../architecture/fault-tolerance.md): retries, recovery, speculation.
-- [PyTorch](pytorch.md): distributed training ingest.
+- {doc}`Distributed scheduling <../deep-dives/distributed-scheduling>`: how a plan becomes Ray tasks.
+- {doc}`Configuration options <../configuration/options>`: every distributed knob.
+- {doc}`Fault tolerance <../architecture/fault-tolerance>`: retries, recovery, speculation.
+- {doc}`PyTorch <pytorch>`: distributed training ingest.

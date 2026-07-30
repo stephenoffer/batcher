@@ -209,11 +209,11 @@ which.
 ## See also
 
 :::{seealso}
-- [Sessionization](sessionization.md): scoping the funnel to a single visit.
-- [Retention curves](retention-curves.md): the same one-row-per-user shape, over days.
-- [Aggregations](../../user-guide/aggregations.md): `count_if` and the rest of `agg`.
-- [Pivoting](../../user-guide/pivoting.md): `pivot` and `unpivot`, the two moves this page turns on.
-- [Joins](../../user-guide/joins.md): what the self-join you are avoiding would have cost.
-- [Join algorithms](../../deep-dives/join-algorithms.md): why the intermediate blows up, in detail.
-- [Dataset API](../../api/dataset.md): `pivot`, `unpivot`, `group_by`.
+- {doc}`Sessionization <sessionization>`: scoping the funnel to a single visit.
+- {doc}`Retention curves <retention-curves>`: the same one-row-per-user shape, over days.
+- {doc}`Aggregations <../../user-guide/aggregations>`: `count_if` and the rest of `agg`.
+- {doc}`Pivoting <../../user-guide/pivoting>`: `pivot` and `unpivot`, the two moves this page turns on.
+- {doc}`Joins <../../user-guide/joins>`: what the self-join you are avoiding would have cost.
+- {doc}`Join algorithms <../../deep-dives/join-algorithms>`: why the intermediate blows up, in detail.
+- {doc}`Dataset API <../../api/dataset>`: `pivot`, `unpivot`, `group_by`.
 :::

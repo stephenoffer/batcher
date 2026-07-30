@@ -44,6 +44,9 @@ scored.write.parquet("output/scored.parquet")
 
 ## Arguments
 
+`ds.ml.infer` takes the following arguments. The first group names columns, and the rest
+size the work and decide what happens when a batch fails:
+
 | Argument | Meaning |
 | --- | --- |
 | `column` | Input column to score, when `model` is a model id (a HuggingFace pipeline). |
@@ -57,7 +60,7 @@ scored.write.parquet("output/scored.parquet")
 | `output_columns` | Names of the columns the model adds, when they differ from the input. |
 
 `num_gpus` and `concurrency` together size the GPU actor pool. See
-[GPU scheduling](gpu.md).
+{doc}`GPU scheduling <gpu>`.
 
 ## The model-id shortcut
 
@@ -113,7 +116,7 @@ against, converting only around the call. The engine boundary stays Arrow:
 A tensor column holds a same-shape N-d array in every row, such as a set of decoded
 images. It arrives as a stacked `ndarray` under `"numpy"` and `"torch"`, so a
 `(batch, H, W, 3)` block feeds straight into a vision model. See
-[multimodal](multimodal.md) for building those columns.
+{doc}`multimodal <multimodal>` for building those columns.
 
 ```python
 import batcher as bt
@@ -140,7 +143,7 @@ print(out.to_pydict()["score"])
 Inference does not have to run on a GPU. When it does, the placement is declared on
 the same call: `num_gpus` reserves a device per actor, `concurrency` sizes the pool.
 Preprocessing stays on CPU workers while the model runs on GPU actors.
-[GPU scheduling](gpu.md) covers fractional packing and how to keep the devices fed.
+{doc}`GPU scheduling <gpu>` covers fractional packing and how to keep the devices fed.
 
 ## Embeddings
 
@@ -281,8 +284,8 @@ print(ds.ml.map_batches(Threshold(0.5)).to_pydict())
 Swap the threshold for a model forward pass and the structure is identical. That
 is what `infer` and `embed` run.
 
-## Next steps
+## See also
 
-- [The ML accessor](../api/ml.md): the full `map_batches` / `infer` / `embed` reference.
-- [GPU scheduling](gpu.md): how `num_gpus` and `concurrency` allocate devices.
-- [Streaming](streaming.md): stream results into a training loop.
+- {doc}`The ML accessor <../api/ml>`: the full `map_batches` / `infer` / `embed` reference.
+- {doc}`GPU scheduling <gpu>`: how `num_gpus` and `concurrency` allocate devices.
+- {doc}`Streaming <streaming>`: stream results into a training loop.

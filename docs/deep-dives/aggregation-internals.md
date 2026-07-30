@@ -5,7 +5,7 @@ are made at runtime rather than at plan time. This page follows a `group_by(...)
 from the morsel to the output rows.
 
 The algebra it obeys (`partial → combine → finalize`, with `combine` associative and
-commutative) is covered in [Mergeable algebra](mergeable-algebra.md). This page covers what
+commutative) is covered in {doc}`Mergeable algebra <mergeable-algebra>`. This page covers what
 those three functions do, and the one decision the executor refuses to take on faith.
 
 ## Step 1: assign each row a dense group id
@@ -68,13 +68,13 @@ a full copy of the key column that the merge never reads as one array, and on a 
 string key that copy is the merge's largest single cost. So `combine_radix` hashes each partial
 in place, flattens the hashes in partial order, and gathers each partition's rows straight from
 the partials through `(partial, row)` pairs. A companion, `combine_partitioned`, stops one step
-earlier and hands the key-disjoint partitions back as separate morsels — the executor's aggregate
+earlier and hands the key-disjoint partitions back as separate morsels, so the executor's aggregate
 tail emits those directly rather than gluing them into one batch and re-splitting for the next
 operator.
 
 The threshold is `radix_parallel_threshold`, set on `RuntimeTuning` in `bc-arrow` and mirrored on
-`EngineConfig` in `bc-ir`. Its default, `0`, derives the crossover from the machine — `partitions
-× 256` — because the parallel path's overhead is per *partition* (a bucket list, a gather, a hash
+`EngineConfig` in `bc-ir`. Its default, `0`, derives the crossover from the machine as
+`partitions × 256`, because the parallel path's overhead is per *partition* (a bucket list, a gather, a hash
 table) while the serial path's is per *row*, so the turn is a fixed number of rows per partition,
 not one absolute count that is too high on a large box and too low on a small one. A positive
 value pins it. Group *order* differs from the serial path either way, which callers already treat
@@ -257,13 +257,13 @@ state instead, and merge in constant space.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): where an operator's state is allowed to live
-- [Execution engine](../internals/execution.md): the operator the plan node lowers to
+- {doc}`Architecture <../architecture/index>`: where an operator's state is allowed to live
+- {doc}`Execution engine <../internals/execution>`: the operator the plan node lowers to
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the sketch error bounds behind `approx_*`
-- [Aggregations](../user-guide/aggregations.md): the API this page is under
-- [Distinct and dedup](../user-guide/distinct-and-dedup.md): the `DISTINCT` surface
-- [Analytics benchmarks](../benchmarks/analytics.md): the group-by numbers quoted above
-- [Mergeable algebra](mergeable-algebra.md): why any of this is allowed to run in parallel
-- [Morsel parallelism](morsel-parallelism.md): where the morsels come from
-- [Spilling](spilling.md): what happens when the state does not fit
+- {doc}`Aggregations <../user-guide/aggregations>`: the API this page is under
+- {doc}`Distinct and dedup <../user-guide/distinct-and-dedup>`: the `DISTINCT` surface
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: the group-by numbers quoted above
+- {doc}`Mergeable algebra <mergeable-algebra>`: why any of this is allowed to run in parallel
+- {doc}`Morsel parallelism <morsel-parallelism>`: where the morsels come from
+- {doc}`Spilling <spilling>`: what happens when the state does not fit
 :::

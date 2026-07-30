@@ -44,16 +44,48 @@ class BrokerSource(ABC):
     #: read partition-per-worker across the cluster (see `BrokerSplit.read_epoch`).
     partitionable = True
 
-    __slots__ = ("_options", "_positions", "_resume_from", "_should_stop", "poll_size", "topic")
+    #: Payload bytes one poll may accumulate before it stops early, whatever `poll_size` says.
+    #:
+    #: `poll_size` bounds a batch by *count*, and a count says nothing about memory when a
+    #: message can be a megabyte. Kafka's own `message.max.bytes` defaults to about 1 MiB and
+    #: is routinely raised, so the default 16,384-message poll is a 16 GiB micro-batch on such
+    #: a topic — held in the poll, again as an Arrow batch, and again by every operator that
+    #: touches it. It also walks into a hard Arrow limit well before that: a `binary` column
+    #: has 32-bit offsets, so the batch fails to build at all past 2 GiB, as an opaque
+    #: overflow from inside the array builder rather than as anything naming the poll.
+    #:
+    #: This is the same bound the media sources already put on blob batching, for the same
+    #: reason. A drain that reaches it stops early and the rest of the queue is the next
+    #: epoch's, which costs nothing: the messages are already buffered client-side.
+    DEFAULT_POLL_BYTES = 128 << 20
 
-    def __init__(self, topic: str, *, poll_size: int = 16_384, **options: Any) -> None:
+    __slots__ = (
+        "_options",
+        "_positions",
+        "_resume_from",
+        "_should_stop",
+        "poll_bytes",
+        "poll_size",
+        "topic",
+    )
+
+    def __init__(
+        self,
+        topic: str,
+        *,
+        poll_size: int = 16_384,
+        poll_bytes: int | None = None,
+        **options: Any,
+    ) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
 
+        ``poll_bytes`` additionally bounds a poll by payload size (see `DEFAULT_POLL_BYTES`);
         ``options`` are passed through to the concrete client (broker addresses,
         credentials, consumer group, …); subclasses document what they accept.
         """
         self.topic = topic
         self.poll_size = poll_size
+        self.poll_bytes = self.DEFAULT_POLL_BYTES if poll_bytes is None else poll_bytes
         self._options = options
         # The latest position delivered per partition this run (offset or native
         # `resume_token`). A streaming checkpoint write-aheads this via
@@ -272,6 +304,7 @@ class BrokerSource(ABC):
                 topic=self.topic,
                 partition=p,
                 poll_size=self.poll_size,
+                poll_bytes=self.poll_bytes,
                 options=dict(self._options),
             )
             for p in self._discover_partitions()

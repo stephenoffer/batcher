@@ -113,7 +113,7 @@ plan and the same result.
 | `ds.width` / `ds.height` / `ds.empty` | `len(ds.columns)` / `ds.count()` / `ds.is_empty()` |
 | `ds.info()` / `ds.glimpse()` / `ds.memory_usage()` | schema-and-count summaries |
 | `ds.iter_rows()` / `ds.iter_slices()` | `ds.iter_batches()` |
-| `ds.lazy()` / `ds.copy()` | identity — a `Dataset` is already lazy and immutable |
+| `ds.lazy()` / `ds.copy()` | identity, because a `Dataset` is already lazy and immutable |
 
 Argument names carry over too. `ds.sort()` takes `by=` and `ascending=` alongside
 `descending=`, and `na_position=` alongside `nulls_first=`. `ds.sample()` reads a

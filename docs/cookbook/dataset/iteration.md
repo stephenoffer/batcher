@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/iteration.py
 ```
+
+## See also
+
+- {doc}`grouping`: grouping: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
+- {doc}`joins`: join types, key spellings, and the as-of join for time series.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

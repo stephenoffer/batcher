@@ -107,13 +107,13 @@ labeled.write.parquet("output/labeled.parquet")
 
 The same accessor also offers `ds.ml.infer(model, ...)` and
 `ds.ml.embed(model, ...)` for the common inference and embedding cases. See the
-[ML guide](../ml/index.md) and [inference reference](../ml/inference.md).
+{doc}`ML guide <../ml/index>` and {doc}`inference reference <../ml/inference>`.
 
 :::{tip}
 Leave `batch_size` unset unless you have measured a reason to set it. Adaptive batch sizing
 picks a VRAM-safe default and halves the batch on a CUDA OOM, which is why
 `ds.map_batches(Model, num_gpus=1)` with no knobs runs at 2,451 img/s and 82% GPU
-utilization on the [AI and GPU benchmark](../benchmarks/ai-and-gpu.md), within 2% of the
+utilization on the {doc}`AI and GPU benchmark <../benchmarks/ai-and-gpu>`, within 2% of the
 hand-tuned batch size.
 :::
 
@@ -147,9 +147,9 @@ Fractional GPUs, stage overlap, and the warm pool.
 
 ## See also
 
-- [Inference guide](../ml/inference.md): `infer`, `embed`, `generate`, and the pool.
-- [PyTorch integration](../ml/pytorch.md): zero-copy tensors, device transfer, prefetch.
-- [UDFs](../user-guide/udfs.md): the batch-callback contract, and its cost.
-- [GPU execution](../deep-dives/gpu-execution.md): why stage overlap lifts a two-stage
+- {doc}`Inference guide <../ml/inference>`: `infer`, `embed`, `generate`, and the pool.
+- {doc}`PyTorch integration <../ml/pytorch>`: zero-copy tensors, device transfer, prefetch.
+- {doc}`UDFs <../user-guide/udfs>`: the batch-callback contract, and its cost.
+- {doc}`GPU execution <../deep-dives/gpu-execution>`: why stage overlap lifts a two-stage
   pipeline from 942 to 2,504 img/s.
-- [ML API reference](../api/ml.md): the full `.ml` accessor surface.
+- {doc}`ML API reference <../api/ml>`: the full `.ml` accessor surface.

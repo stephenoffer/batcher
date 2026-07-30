@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_padding.py
 ```
+
+## See also
+
+- {doc}`strings_hashing`: hashing and encoding a string column: keys, checksums, and safe transport.
+- {doc}`strings_paths`: parsing file paths held in a column.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

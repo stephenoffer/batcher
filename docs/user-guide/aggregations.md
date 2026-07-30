@@ -54,7 +54,7 @@ than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`,
 `quantile(q)`, `n_unique`, `std`, `var`, `count` (non-null values per column), and
 `len` (the per-group row count). With no arguments they reduce every non-key
 column, keeping its name. Pass column names or a
-[selector](transformations.md) to reduce a subset. The arithmetic reductions
+{doc}`selector <transformations>` to reduce a subset. The arithmetic reductions
 (`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns
 only, matching pandas' `numeric_only`.
 
@@ -80,7 +80,7 @@ The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
 `var`, `std`, `median`, `quantile(q)`, `count`, and `n_unique` (also spelled
 `count_distinct`). {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
 builds an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that `agg(...)`
-consumes and that `.over(...)` lifts into a [window function](window-functions.md).
+consumes and that `.over(...)` lifts into a {doc}`window function <window-functions>`.
 You rarely name it directly.
 
 ```python
@@ -320,11 +320,11 @@ print(buckets.to_pydict())
 # {'tier': ['high', 'low'], 'n': [3, 2], 'revenue': [120.0, 30.0]}
 ```
 
-## Next steps
+## See also
 
-- [Joins](joins.md): combine grouped results with other datasets.
-- [Window functions](window-functions.md): per-row aggregates that keep the rows.
-- [Performance and memory](performance.md): cache a rollup you reuse, and spill the
+- {doc}`Joins <joins>`: combine grouped results with other datasets.
+- {doc}`Window functions <window-functions>`: per-row aggregates that keep the rows.
+- {doc}`Performance and memory <performance>`: cache a rollup you reuse, and spill the
   aggregations too big for memory.
-- [Expressions API](../api/expressions.md): every aggregate and approximate-aggregate
+- {doc}`Expressions API <../api/expressions>`: every aggregate and approximate-aggregate
   method in one place.

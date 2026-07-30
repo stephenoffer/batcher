@@ -48,3 +48,10 @@ you want to confirm what the optimizer actually did.
 ```python
 print(plan.explain())
 ```
+
+
+## See also
+
+- {doc}`expressions`: what goes inside a plan once you have one.
+- {doc}`adaptive`: how a lazy plan gets re-planned on measured row counts.
+- {doc}`../../user-guide/explain-plans`: reading what the optimizer decided.

@@ -211,15 +211,15 @@ window.
 
 ## See also
 
-- [Exactly-once sinks](exactly-once-sink.md): what the checkpoint actually guarantees,
+- {doc}`Exactly-once sinks <exactly-once-sink>`: what the checkpoint actually guarantees,
   and the ways a file sink can silently drop data.
-- [Windowed aggregation](windowed-aggregation.md): the gold layer over this bronze one.
-- [Streaming inference](streaming-inference.md): scoring these events as they land.
-- [Streaming](../../user-guide/streaming.md): the full source/sink/trigger reference.
-- [Kafka integration](../../integrations/kafka.md): consumer groups, splits, and the broker
+- {doc}`Windowed aggregation <windowed-aggregation>`: the gold layer over this bronze one.
+- {doc}`Streaming inference <streaming-inference>`: scoring these events as they land.
+- {doc}`Streaming <../../user-guide/streaming>`: the full source/sink/trigger reference.
+- {doc}`Kafka integration <../../integrations/kafka>`: consumer groups, splits, and the broker
   schema above.
-- [Writing data](../../user-guide/writing-data.md): the sink surface and Delta commits.
-- [Reading data](../../user-guide/reading-data.md): `files_incremental` and the rest of the
+- {doc}`Writing data <../../user-guide/writing-data>`: the sink surface and Delta commits.
+- {doc}`Reading data <../../user-guide/reading-data>`: `files_incremental` and the rest of the
   sources.
-- [Incremental ingest](../data-engineering/incremental-ingest.md): the same directory-watching
+- {doc}`Incremental ingest <../data-engineering/incremental-ingest>`: the same directory-watching
   job, run as a batch.

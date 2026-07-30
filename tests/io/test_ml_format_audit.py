@@ -219,3 +219,68 @@ def test_webdataset_schema_matches_read_and_roundtrips(tmp_path):
     data = batches[0].to_pydict()
     assert data["__key__"] == ["a", "b"]
     assert data["jpg"] == [b"x" * 1000, b"y" * 1000]
+
+
+# --------------------------------------------------------------------------
+# NumPy: typing a file must not mean loading it.
+# --------------------------------------------------------------------------
+def test_a_npy_schema_comes_from_the_header_not_the_array(tmp_path, monkeypatch):
+    """`schema()` runs eagerly at `bt.read.numpy(...)`, so loading the array to learn the
+    column names makes constructing a reader over a 200 GB file cost 200 GB."""
+    path = tmp_path / "a.npy"
+    np.save(path, np.arange(64, dtype=np.int64).reshape(16, 4))
+
+    def _boom(_fh):
+        raise AssertionError("the array was loaded to answer schema()")
+
+    monkeypatch.setattr(npmod, "_table_from_npy_handle", _boom)
+    assert npmod.NumpySource(str(path)).schema() == pa.schema(
+        [pa.field("data", pa.list_(pa.int64(), 4))]
+    )
+
+
+@pytest.mark.parametrize(
+    "array",
+    [
+        pytest.param(lambda np: np.arange(10, dtype=np.int64), id="1d"),
+        pytest.param(lambda np: np.arange(12, dtype=np.float32).reshape(4, 3), id="2d"),
+        pytest.param(lambda np: np.arange(24, dtype=np.uint8).reshape(2, 3, 4), id="3d"),
+    ],
+)
+def test_the_header_schema_equals_the_schema_the_read_produces(tmp_path, array):
+    """The header path and the load path must agree exactly, or the planner types the
+    query one way and the batches arrive another."""
+    from batcher.io.formats.ml.numpy import NumpySource, _table_from_npy_handle
+
+    path = tmp_path / "a.npy"
+    np.save(path, array(np))
+    with open(path, "rb") as fh:
+        loaded = _table_from_npy_handle(fh).schema
+    assert NumpySource(str(path)).schema() == loaded
+
+
+def test_an_npz_archive_still_reports_every_column(tmp_path):
+    """An `.npz` has no single header, so it must fall back to the load rather than
+    reporting a wrong or empty schema."""
+    from batcher.io.formats.ml.numpy import NumpySource
+
+    path = tmp_path / "z.npz"
+    np.savez(path, x=np.arange(4, dtype=np.int64), y=np.arange(4, dtype=np.float64))
+    assert NumpySource(str(path)).schema().names == ["x", "y"]
+
+
+def test_a_npy_read_is_cut_into_morsels(tmp_path):
+    """One array is one Arrow chunk, so this used to emit the whole file as a single
+    RecordBatch — which every downstream operator then had to hold whole."""
+    import dataclasses
+
+    from batcher.config import Config, config_context
+    from batcher.io.formats.ml.numpy import NumpySource
+
+    path = tmp_path / "a.npy"
+    np.save(path, np.arange(50, dtype=np.int64))
+    base = Config()
+    cfg = base.replace(execution=dataclasses.replace(base.execution, morsel_rows=16))
+    with config_context(cfg):
+        sizes = [b.num_rows for b in NumpySource(str(path)).read()]
+    assert sizes == [16, 16, 16, 2]

@@ -420,13 +420,13 @@ print(isinstance(bt.engine_version(), str))
 # True
 ```
 
-## Next steps
+## See also
 
-- [Transformations](transformations.md): reshape and derive columns.
-- [Filtering](filtering.md): select rows, drop duplicates.
-- [Lakehouse tables](lakehouse.md): read Delta and Iceberg tables, and travel back
+- {doc}`Transformations <transformations>`: reshape and derive columns.
+- {doc}`Filtering <filtering>`: select rows, drop duplicates.
+- {doc}`Lakehouse tables <lakehouse>`: read Delta and Iceberg tables, and travel back
   through their versions.
-- [Data quality](data-quality.md): validate inputs as they arrive.
-- [IO API](../api/io.md): the full `bt.read` reader reference.
-- [Agent skills](../agents/index.md): `read-and-write-data` covers picking a reader or
+- {doc}`Data quality <data-quality>`: validate inputs as they arrive.
+- {doc}`IO API <../api/io>`: the full `bt.read` reader reference.
+- {doc}`Agent skills <../agents/index>`: `read-and-write-data` covers picking a reader or
   sink, cloud paths, globs, schema evolution, and error tolerance.

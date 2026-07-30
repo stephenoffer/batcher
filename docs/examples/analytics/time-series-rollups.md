@@ -180,21 +180,21 @@ DST-aware, so the 23-hour and 25-hour days come out right.
 Then late data. A rollup run at midnight is a rollup of the events that had arrived by
 midnight. If your pipeline backfills, yesterday's number changes after you published it. Either
 recompute a trailing window of days on every run, or hold the bucket open with a watermark (see
-[streaming](../../user-guide/streaming.md)). Decide, rather than discovering it when finance
+{doc}`streaming <../../user-guide/streaming>`). Decide, rather than discovering it when finance
 asks why the number moved.
 :::
 
 ## See also
 
 :::{seealso}
-- [Anomaly detection](anomaly-detection.md): what to do once the series is dense.
-- [Sessionization](sessionization.md): the opposite problem, where the buckets have to be
+- {doc}`Anomaly detection <anomaly-detection>`: what to do once the series is dense.
+- {doc}`Sessionization <sessionization>`: the opposite problem, where the buckets have to be
   derived from the gaps rather than fixed by the calendar.
-- [Window functions](../../user-guide/window-functions.md): `rolling_*`, frames, and
+- {doc}`Window functions <../../user-guide/window-functions>`: `rolling_*`, frames, and
   `forward_fill`.
-- [Joins](../../user-guide/joins.md): the left join and the cross join used here.
-- [Aggregations](../../user-guide/aggregations.md): what `group_by(...).agg(...)` supports.
-- [Aggregation internals](../../deep-dives/aggregation-internals.md): how the daily rollup
+- {doc}`Joins <../../user-guide/joins>`: the left join and the cross join used here.
+- {doc}`Aggregations <../../user-guide/aggregations>`: what `group_by(...).agg(...)` supports.
+- {doc}`Aggregation internals <../../deep-dives/aggregation-internals>`: how the daily rollup
   merges across partitions.
-- [Dataset API](../../api/dataset.md): `date_range`, `join`, `cross_join`.
+- {doc}`Dataset API <../../api/dataset>`: `date_range`, `join`, `cross_join`.
 :::

@@ -1,6 +1,6 @@
 # Configuration API reference
 
-This page covers the public configuration surface: the `Config` dataclass, the two entry points that install one, and how the layers combine. For the field-by-field reference of every section, see [configuration/options](../configuration/options.md).
+This page covers the public configuration surface: the `Config` dataclass, the two entry points that install one, and how the layers combine. For the field-by-field reference of every section, see {doc}`configuration/options <../configuration/options>`.
 
 ```python
 from batcher import Config, set_config, config_context
@@ -34,7 +34,7 @@ Sections are themselves frozen dataclasses. Read fields directly, and derive new
 
 The section dataclasses are exported so you can construct one and slot it into
 `Config.replace`. Their fields are documented in
-[configuration/options](../configuration/options.md); each is summarized here.
+{doc}`configuration/options <../configuration/options>`; each is summarized here.
 
 | Class | Configures |
 | --- | --- |
@@ -83,7 +83,7 @@ print(cfg.execution.parallelism)
 
 `Config.from_file(path, base=None)` overlays a JSON document of nested section
 overrides onto `base` and returns a new `Config`. The JSON mirrors the section
-structure. See [configuration/environment](../configuration/environment.md) for the
+structure. See {doc}`configuration/environment <../configuration/environment>` for the
 format.
 
 ```python
@@ -126,7 +126,7 @@ print(out)
 
 ## Precedence
 
-Highest first: `config_context` > `set_config` > `BATCHER_*` env vars > `BATCHER_CONFIG_FILE` JSON > defaults. The environment and file layers are read once at import, and the runtime entry points override them. See [configuration/index](../configuration/index.md) for the full discussion.
+Highest first: `config_context` > `set_config` > `BATCHER_*` env vars > `BATCHER_CONFIG_FILE` JSON > defaults. The environment and file layers are read once at import, and the runtime entry points override them. See {doc}`configuration/index <../configuration/index>` for the full discussion.
 
 ## See also
 

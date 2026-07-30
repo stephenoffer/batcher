@@ -142,7 +142,7 @@ repeat harmless. That is the trade worth taking almost every time.
 Discovery is per *file*, keyed by path. A producer that rewrites `part-0.parquet` in
 place with new contents will not be re-read: the path is already marked. If your
 upstream mutates files, this pattern is the wrong one. Read a change feed instead (see
-[CDC pipeline](cdc-pipeline.md)).
+{doc}`CDC pipeline <cdc-pipeline>`).
 
 `state_dir` is single-writer. Two ingest jobs pointed at one landing zone and one state
 directory will race on the SQLite store. Give each consumer its own `state_dir`, and they
@@ -199,11 +199,11 @@ preemption finishes the parts it did not write instead of starting over.
 
 ## See also
 
-- [Deduplication](deduplication.md): the incoming batch has duplicates in it.
-- [File compaction](file-compaction.md): a thousand small arrivals make a thousand
+- {doc}`Deduplication <deduplication>`: the incoming batch has duplicates in it.
+- {doc}`File compaction <file-compaction>`: a thousand small arrivals make a thousand
   small files.
-- [Quality gates](quality-gates.md): what to check before the arrivals reach the table.
-- [Reading data](../../user-guide/reading-data.md): the full reader surface.
-- [Writing data](../../user-guide/writing-data.md): `merge`, `resume`, and the sink options.
-- [Delta Lake](../../integrations/delta-lake.md): the transactional target and its commits.
-- [IO API reference](../../api/io.md): `bt.read` and `ds.write` in full.
+- {doc}`Quality gates <quality-gates>`: what to check before the arrivals reach the table.
+- {doc}`Reading data <../../user-guide/reading-data>`: the full reader surface.
+- {doc}`Writing data <../../user-guide/writing-data>`: `merge`, `resume`, and the sink options.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: the transactional target and its commits.
+- {doc}`IO API reference <../../api/io>`: `bt.read` and `ds.write` in full.

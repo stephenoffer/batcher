@@ -1,8 +1,8 @@
 # Carbonite
 
 Carbonite is the resource manager. It decides whether a plan is feasible, hands
-out memory reservations and shuffle credits, and decides when a query must spill —
-and it does nothing else. It never rewrites a plan (that is Kyber) and never
+out memory reservations and shuffle credits, and decides when a query must spill.
+It does nothing else. It never rewrites a plan (that is Kyber) and never
 computes a result (that is the engine). Most users never call it directly; it runs
 underneath every query to keep the engine inside its memory envelope instead of
 running it out of memory.
@@ -21,8 +21,8 @@ The `ResourceManager` is a thin orchestrator over four pluggable policies
 (admission, spill, flow control, and memory estimation) plus the memory subsystem:
 a buffer pool and a pressure monitor. Its job comes down to four decisions.
 `validate(plan)` answers whether a plan is feasible; when it does not fit, the
-verdict carries a counter-offer — a smaller credit window, a lower parallelism — for
-Kyber to re-plan around, rather than a flat rejection. `reserve(bytes)` accounts an
+verdict carries a counter-offer for Kyber to re-plan around, such as a smaller credit
+window or a lower parallelism, rather than a flat rejection. `reserve(bytes)` accounts an
 allocation against the process-wide buffer pool with blocking semantics, so
 concurrent operators cannot collectively overshoot the envelope. `should_spill(plan)`
 compares a plan's estimated footprint against live memory, sending a query that will
@@ -111,8 +111,8 @@ credit_ceiling_factor`.
 By default the credit window is the static grant above. Setting
 `config.distributed.adaptive_credits` turns on a TCP-like AIMD controller that grows
 and shrinks the window per remote fetch from observed backpressure. It is off by
-default so the static path — and single-node-equals-distributed equivalence —
-stays unchanged.
+default, so the static path stays unchanged and single-node-equals-distributed
+equivalence holds.
 
 ## Data transfer
 
@@ -148,26 +148,26 @@ half-built hash table interrupts an operator that is still using it.
 ### Same-node zero-copy fast path (automatic)
 
 Within a shuffle, a reducer's sources fall into three tiers, and Carbonite picks the
-cheapest for each one with **no configuration** — it just works:
+cheapest for each one with **no configuration**:
 
 | Source | Path | Cost |
 |--------|------|------|
-| Same process | `DIRECT_MEMORY` — read straight from the local store | no copy, no socket |
-| **Same node, different process** | `SHARED_MEMORY` — mmap a 64-byte-aligned Arrow IPC file, decoded **zero-copy** | ~a memcpy; **≈23× a loopback Flight hop** |
-| Another node | `NETWORK` — credit-bounded Arrow Flight | one gRPC stream |
+| Same process | `DIRECT_MEMORY`, reading straight from the local store | no copy, no socket |
+| **Same node, different process** | `SHARED_MEMORY`, mmapping a 64-byte-aligned Arrow IPC file, decoded **zero-copy** | about a memcpy; **roughly 23× a loopback Flight hop** |
+| Another node | `NETWORK`, over credit-bounded Arrow Flight | one gRPC stream |
 
 The common GPU-cluster shape packs several worker actors per node, so many of a
-reducer's fetches are same-node-but-cross-process — exactly the tier the shared-memory
-path accelerates. It is **on by default** (`config.distributed.shared_memory_transfer`)
+reducer's fetches are same-node-but-cross-process, which is exactly the tier the
+shared-memory path accelerates. It is **on by default** (`config.distributed.shared_memory_transfer`)
 and safe to leave on because it is:
 
 - **Adaptive / self-limiting.** The mmap file is a second copy (in tmpfs = RAM) on top
   of the in-memory store Flight serves remote reducers from, so a mapper **skips** the
   mirror whenever the node is under memory pressure (`PressureLevel.SPILL`+). The reducer
-  then falls back to Flight. On a churning spot node — where recompute transiently
-  doubles live state — the fast path steps aside rather than risking OOM.
+  then falls back to Flight. On a churning spot node, where recompute transiently
+  doubles live state, the fast path steps aside rather than risking OOM.
 - **Concurrency-preserving.** Same-node buckets are read from shared memory *inside* the
-  concurrent gather, so cross-node buckets still fan out in parallel — you get the 23× on
+  concurrent gather, so cross-node buckets still fan out in parallel. You get the 23× on
   the same-node fraction with no loss of cross-node throughput.
 - **Result-preserving.** A shm miss (bucket not mirrored, another node, shm unavailable)
   transparently falls back to Flight, which is bit-identical, so single-node == distributed
@@ -182,7 +182,7 @@ the full concurrent gather; ~23× point-to-point).
 A single reducer's inbound rate is bounded by its NIC (~2.7 GB/s = ~22 Gbps on a T4
 node, i.e. line rate); the 10× is in the **aggregate** all-to-all, where every node
 reduces at once. Measured aggregate shuffle throughput: **2.0 → 6.9 → 15.2 GB/s at 2 → 4
-→ 8 nodes** — it grows with the node count, because the mergeable `partial → combine →
+→ 8 nodes**. It grows with the node count, because the mergeable `partial → combine →
 finalize` algebra plus credit flow control keep per-node memory bounded no matter how
 wide the cluster. The shuffle runtime's worker-thread pool is **auto-sized to the host's
 cores** (clamped to keep concurrent-decode throughput near the NIC without
@@ -191,12 +191,12 @@ unusual node shape.
 
 ## Self-tuning from measured metadata
 
-The contract loop does not just protect the current query — it *learns* from it.
+The contract loop does more than protect the current query. It *learns* from it.
 Core measures what every operator actually did (rows in/out, wall time, per-core CPU
 busy fraction, and peak bytes) and records it into the `MetadataHub`; Carbonite then
 sizes the next run against that measured reality instead of a cold plan estimate.
 Every decision here is **result-invariant**: it changes how much memory a query
-reserves, when it spills, and how big a morsel is — never what the query returns.
+reserves, when it spills, and how big a morsel is, never what the query returns.
 That invariance is property-tested (tuned run == untuned run), which is what lets
 the sizing learn aggressively; the worst a stale learned value can do is cost
 throughput.
@@ -205,11 +205,11 @@ throughput.
 
 Carbonite's headline learner is the `LearnedMemoryModel`. It closes a specific gap:
 Core records each operator's *actual* peak memory (`m_peak_bytes`), but historically
-every sizing decision — admission, spill, reservation, morsel — sized from Kyber's
+every sizing decision (admission, spill, reservation, morsel) sized from Kyber's
 plan estimate alone and never consulted what the operator really used. The model is
 the memory analog of Kyber's cost calibration: from the measured peaks it fits a
 per-operator-family **bytes-per-input-row** figure (a *ratio*, not an absolute peak,
-so it is size-general — a 1M-row aggregate and a 10-row one share one coefficient),
+so it is size-general, and a 1M-row aggregate and a 10-row one share one coefficient),
 and each sizing decision blends the plan's byte estimate toward that measured figure,
 clamped so a noisy sample can never wildly move sizing.
 
@@ -220,7 +220,7 @@ That single blended peak feeds every memory decision through one `_peak_bytes(pl
 `reserve` account against reality. Morsel sizing tightens too: the widest learned
 per-row width caps the morsel row count so a workload of wide rows (large strings,
 embeddings, blob handles) keeps its true byte working set within budget. On a cold
-store the model is an empty pass-through — every method defers to the plan estimate,
+store the model is an empty pass-through: every method defers to the plan estimate,
 so a first run is byte-for-byte the pre-learning behavior.
 
 ### Learned flow control
@@ -228,10 +228,10 @@ so a first run is byte-for-byte the pre-learning behavior.
 The credit machinery learns the same way. `grant_credits(signature=…)` warm-starts a
 recurring shuffle channel from the window past runs of that shape converged on (a
 learned credit window), rather than the static `default_credits`. The AIMD controller
-still governs the window actually used from live backpressure — with hysteresis
-between `backpressure_high` and `backpressure_low` so a channel does not oscillate —
-so learning only moves the *starting point*; the converged window is persisted back
-after the run to seed the next one. Single-node-equals-distributed equivalence is
+still governs the window actually used from live backpressure, with hysteresis
+between `backpressure_high` and `backpressure_low` so a channel does not oscillate.
+Learning therefore moves only the *starting point*. The converged window is persisted
+back after the run to seed the next one. Single-node-equals-distributed equivalence is
 untouched, because a credit window only bounds in-flight batches, never the result.
 
 ### The sibling tuning layers
@@ -239,20 +239,20 @@ untouched, because a credit window only bounds in-flight batches, never the resu
 Carbonite owns the memory and resource half of a larger, coherent self-tuning system;
 the other halves live in their own subsystems and are wired together by `api`:
 
-- **Kyber — `learned_tuning`** picks *physical strategy* from measured runs: a UCB1
+- **Kyber, in `learned_tuning`**, picks *physical strategy* from measured runs: a UCB1
   bandit over equivalent join algorithms (hash / broadcast / sort-merge), learned
   broadcast-byte and sort-merge-row thresholds (an OLS line crossover), learned
-  build-side and partition priors, and whether partial pre-aggregation pays off — see
-  [Kyber optimizer](kyber.md).
-- **Core / Dist — `adaptive_sizing`** tunes *distributed scheduling*: learned
+  build-side and partition priors, and whether partial pre-aggregation pays off. See
+  {doc}`kyber`.
+- **Core and Dist, in `adaptive_sizing`**, tune *distributed scheduling*: learned
   UDF/inference actor-pool size, GPU batch caps, source partition count, per-task CPU
-  share, shuffle reducer fan-out, and straggler-speculation aggressiveness — each a
-  pure scheduling knob under the mergeable algebra.
-- **`api` — `tuning`** is the conductor half: it *activates* the read-side decisions
+  share, shuffle reducer fan-out, and straggler-speculation aggressiveness. Each one is
+  a pure scheduling knob under the mergeable algebra.
+- **`api`, in `tuning`**, is the conductor half. It *activates* the read-side decisions
   each subsystem exposes and *records* the measured outcomes back, closing every
   feedback loop (join bandit, group-reduction, converged credit window) so the
-  learning actually accrues — see the adaptive re-optimization loop in
-  [Execution engine](execution.md).
+  learning actually accrues. See the adaptive re-optimization loop in
+  {doc}`execution`.
 
 All of them share the one rule above: they tune performance and scheduling, and a
 cold `MetadataHub` reproduces the untuned behavior exactly.
@@ -272,10 +272,12 @@ cfg = base.replace(
 )
 ```
 
-See [Configuration options](../configuration/options.md) for every field.
+See {doc}`../configuration/options` for every field.
 
 ## See also
 
-- [Kyber optimizer](kyber.md) — what Carbonite checks feasibility for
-- [Execution engine](execution.md) — where reservations and spill happen
-- [Configuration options](../configuration/options.md) — the memory and flow-control knobs
+- {doc}`kyber`: the optimizer whose plans Carbonite checks feasibility for.
+- {doc}`execution`: where reservations and spill actually happen.
+- {doc}`../configuration/options`: every memory and flow-control knob named on this page.
+- {doc}`../deep-dives/buffer-pool`: how the envelope is accounted, one allocation at a time.
+- {doc}`../deep-dives/credit-flow-control`: the credit protocol in full detail.

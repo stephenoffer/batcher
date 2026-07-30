@@ -57,7 +57,7 @@ intermediate arrays that exist only to be consumed by the next node:
    Tier-1 runs the same tree as one loop: nothing but `out` is allocated.
 ```
 
-That is the cost of the interpreter, and it is the cost the [JIT](jit-compilation.md) exists
+That is the cost of the interpreter, and it is the cost the {doc}`JIT <jit-compilation>` exists
 to remove.
 
 Two exceptions are worth knowing, because they change the constant factor without changing
@@ -196,12 +196,12 @@ compiled once per (expr, column types, simd) and reused across every morsel
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why every scalar computation lives on this side of the boundary
-- [Execution engine](../internals/execution.md): where `eval` is called from
-- [Expressions](../user-guide/expressions.md): the Python surface that builds these trees
-- [Expression reference](../api/expressions.md): every `Expr` method and accessor namespace
-- [Analytics benchmarks](../benchmarks/analytics.md): the filter-then-project numbers above, in context
-- [JIT compilation](jit-compilation.md): the Tier-1 path and what it can and cannot compile
-- [Plan IR](plan-ir.md): how an `Expr` gets here from Python
-- [Tensor columns](tensor-columns.md): what the media decode kernels produce
+- {doc}`Architecture <../architecture/index>`: why every scalar computation lives on this side of the boundary
+- {doc}`Execution engine <../internals/execution>`: where `eval` is called from
+- {doc}`Expressions <../user-guide/expressions>`: the Python surface that builds these trees
+- {doc}`Expression reference <../api/expressions>`: every `Expr` method and accessor namespace
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: the filter-then-project numbers above, in context
+- {doc}`JIT compilation <jit-compilation>`: the Tier-1 path and what it can and cannot compile
+- {doc}`Plan IR <plan-ir>`: how an `Expr` gets here from Python
+- {doc}`Tensor columns <tensor-columns>`: what the media decode kernels produce
 :::

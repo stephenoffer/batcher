@@ -3028,7 +3028,7 @@ class _StrNamespace:
         return ListJoin(AggExpr("list_agg", self._e), delimiter)
 
     def escape_regex(self) -> StrFunc:
-        """Escape the regex metacharacters — the Polars ``str.escape_regex`` spelling.
+        """Escape the regex metacharacters, spelled as Polars ``str.escape_regex``.
 
         Returns:
             A new Utf8 expression, safe to embed in a pattern as a literal.
@@ -3039,7 +3039,7 @@ class _StrNamespace:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"s": ["a.b"]})
                 >>> ds.select(r=bt.col("s").str.escape_regex()).to_pydict()
-                {'r': ['a\\.b']}
+                {'r': ['a\\\\.b']}
         """
         return self.regexp_escape()
 

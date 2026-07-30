@@ -2,7 +2,7 @@
 
 How the engine actually works, one mechanism at a time.
 
-The [architecture guide](../architecture/index.md) gives the shape of the system. These
+The {doc}`architecture guide <../architecture/index>` gives the shape of the system. These
 pages go a level down: what a mechanism is for, how it works, what it costs, and where the
 code lives. Each one names real files, so you can stop reading and go look.
 
@@ -53,41 +53,41 @@ The shape of the system, if these pages are already a level too deep.
 
 Follow one query from Python down to Arrow and back.
 
-- [Query lifecycle](query-lifecycle.md): what happens between `collect()` and your rows.
-- [The plan IR](plan-ir.md): the JSON wire contract between the control plane and the engine.
-- [Expression evaluation](expression-evaluation.md): one `Expr`, vectorized over Arrow.
-- [JIT compilation](jit-compilation.md): the Cranelift fast path, and why it must fall back rather than diverge.
+- {doc}`Query lifecycle <query-lifecycle>`: what happens between `collect()` and your rows.
+- {doc}`The plan IR <plan-ir>`: the JSON wire contract between the control plane and the engine.
+- {doc}`Expression evaluation <expression-evaluation>`: one `Expr`, vectorized over Arrow.
+- {doc}`JIT compilation <jit-compilation>`: the Cranelift fast path, and why it must fall back rather than diverge.
 
 ## Parallelism and the operator core
 
 The first two pages give you the shape shared by every operator. The last four are the four
 stateful operators themselves, each one an instance of that shape.
 
-- [Morsel parallelism](morsel-parallelism.md): why work is cut into 16,384-row chunks.
-- [Mergeable algebra](mergeable-algebra.md): `partial → combine → finalize`, and why one core and one cluster run the same code.
-- [Aggregation internals](aggregation-internals.md): a `group_by().agg()` from the morsel to the output rows, and the decisions made at runtime rather than at plan time.
-- [Join algorithms](join-algorithms.md): the one row-index primitive every join type and strategy is built on.
-- [Sort internals](sort-internals.md): the only operator whose order is the answer, and why an order-independent test cannot see its bugs.
-- [Window internals](window-internals.md): a pipeline breaker that must return every input row, in the original order.
+- {doc}`Morsel parallelism <morsel-parallelism>`: why work is cut into 16,384-row chunks.
+- {doc}`Mergeable algebra <mergeable-algebra>`: `partial → combine → finalize`, and why one core and one cluster run the same code.
+- {doc}`Aggregation internals <aggregation-internals>`: a `group_by().agg()` from the morsel to the output rows, and the decisions made at runtime rather than at plan time.
+- {doc}`Join algorithms <join-algorithms>`: the one row-index primitive every join type and strategy is built on.
+- {doc}`Sort internals <sort-internals>`: the only operator whose order is the answer, and why an order-independent test cannot see its bugs.
+- {doc}`Window internals <window-internals>`: a pipeline breaker that must return every input row, in the original order.
 
 ## Memory
 
 Start with the contract, then the accounting, then what happens when the accounting says no.
 
-- [Arrow memory model](arrow-memory.md): the only columnar contract, and what zero-copy really buys.
-- [Tensor columns](tensor-columns.md): how an image becomes a column without a Python round trip.
-- [The buffer pool](buffer-pool.md): the process-wide byte account every allocation of consequence reserves against.
-- [Spilling](spilling.md): staying alive when the data does not fit.
+- {doc}`Arrow memory model <arrow-memory>`: the only columnar contract, and what zero-copy really buys.
+- {doc}`Tensor columns <tensor-columns>`: how an image becomes a column without a Python round trip.
+- {doc}`The buffer pool <buffer-pool>`: the process-wide byte account every allocation of consequence reserves against.
+- {doc}`Spilling <spilling>`: staying alive when the data does not fit.
 
 ## Distribution
 
 Scaling out is a scheduling concern, not a second engine. These pages cover what moves, what
 schedules it, and what keeps a fast producer from burying a slow consumer.
 
-- [Shuffle over Arrow Flight](shuffle-flight.md): why bulk data bypasses the Ray object store.
-- [Credit-based flow control](credit-flow-control.md): one credit is one batch slot, and the producer blocks at zero.
-- [Distributed scheduling](distributed-scheduling.md): where work runs, how many pieces it runs in, and what does and doesn't travel through Ray.
-- [GPU execution](gpu-execution.md): the two paths that run work on a device, and the scheduling that keeps it busy.
+- {doc}`Shuffle over Arrow Flight <shuffle-flight>`: why bulk data bypasses the Ray object store.
+- {doc}`Credit-based flow control <credit-flow-control>`: one credit is one batch slot, and the producer blocks at zero.
+- {doc}`Distributed scheduling <distributed-scheduling>`: where work runs, how many pieces it runs in, and what does and doesn't travel through Ray.
+- {doc}`GPU execution <gpu-execution>`: the two paths that run work on a device, and the scheduling that keeps it busy.
 
 ## The adaptive layer
 
@@ -97,20 +97,20 @@ same granularity as Spark AQE, but available single-node too. It is also off for
 half: a sketch-backed *cross-query* learned-stats and bandit loop, so a plan improves the more
 a query runs. Read these pages for how both halves work and where each one stops.
 
-- [Adaptive re-optimization](adaptive-reoptimization.md): re-planning mid-query on measured cardinalities.
-- [Cardinality estimation](cardinality-estimation.md): how many rows a subtree will produce, how wrong that guess is, and how the engine tracks which.
-- [The cost model](cost-model.md): turning row counts into the one comparable number that ranks two plans.
-- [Learned metadata](learned-metadata.md): Core measures, Kyber consumes, and the plan improves the more a query runs.
+- {doc}`Adaptive re-optimization <adaptive-reoptimization>`: re-planning mid-query on measured cardinalities.
+- {doc}`Cardinality estimation <cardinality-estimation>`: how many rows a subtree will produce, how wrong that guess is, and how the engine tracks which.
+- {doc}`The cost model <cost-model>`: turning row counts into the one comparable number that ranks two plans.
+- {doc}`Learned metadata <learned-metadata>`: Core measures, Kyber consumes, and the plan improves the more a query runs.
 
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the shape of the system these pages sit inside
-- [Kyber](../internals/kyber.md), [Carbonite](../internals/carbonite.md), [the execution engine](../internals/execution.md): the three subsystems, at design level
+- {doc}`Architecture <../architecture/index>`: the shape of the system these pages sit inside
+- {doc}`Kyber <../internals/kyber>`, {doc}`Carbonite <../internals/carbonite>`, {doc}`the execution engine <../internals/execution>`: the three subsystems, at design level
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the contracts, the control theory, the sketch error bounds, the regret proofs
-- [Performance](../user-guide/performance.md) and [reading a plan](../user-guide/explain-plans.md): where a reader applies all of this
-- [Benchmarks](../benchmarks/index.md): the numbers these pages keep quoting
-- [Extending the engine](../internals/extending.md): what to read before you change one of these mechanisms
+- {doc}`Performance <../user-guide/performance>` and {doc}`reading a plan <../user-guide/explain-plans>`: where a reader applies all of this
+- {doc}`Benchmarks <../benchmarks/index>`: the numbers these pages keep quoting
+- {doc}`Extending the engine <../internals/extending>`: what to read before you change one of these mechanisms
 :::
 
 ```{toctree}

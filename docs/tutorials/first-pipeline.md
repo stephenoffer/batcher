@@ -139,7 +139,7 @@ sort                            est≈2,000 (default)
         scan                    est≈200,000 (exact)
 ```
 
-That example is from [optimizing a slow query](optimizing-a-slow-query.md), which is the
+That example is from {doc}`optimizing a slow query <optimizing-a-slow-query>`, which is the
 tutorial that teaches you to read one properly.
 :::
 
@@ -175,7 +175,7 @@ because it took no time.
 Column work belongs in an expression, not in a Python callback. `bt.col("price") *
 bt.col("qty")` runs in Rust across every core and the optimizer can see through it; the same
 arithmetic in a `map_batches` blocks predicate pushdown and roughly halves throughput. The
-[slow query tutorial](optimizing-a-slow-query.md) measures exactly that.
+{doc}`slow query tutorial <optimizing-a-slow-query>` measures exactly that.
 :::
 
 ## What you learned
@@ -213,9 +213,9 @@ Run a model over Arrow batches with the `.ml` accessor.
 
 ## See also
 
-- [Expressions](../user-guide/expressions.md): the column language, in full.
-- [Aggregations](../user-guide/aggregations.md): every aggregate, and `GroupBy`.
-- [Reading data](../user-guide/reading-data.md): the sources the last block reached for.
-- [Lazy evaluation](../getting-started/concepts/lazy.md): why nothing ran until the terminal
+- {doc}`Expressions <../user-guide/expressions>`: the column language, in full.
+- {doc}`Aggregations <../user-guide/aggregations>`: every aggregate, and `GroupBy`.
+- {doc}`Reading data <../user-guide/reading-data>`: the sources the last block reached for.
+- {doc}`Lazy evaluation <../getting-started/concepts/lazy>`: why nothing ran until the terminal
   op.
-- [Dataset API](../api/dataset.md): the reference for every method on this page.
+- {doc}`Dataset API <../api/dataset>`: the reference for every method on this page.

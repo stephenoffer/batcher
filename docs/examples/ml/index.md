@@ -111,13 +111,13 @@ None of that comes from per-workload tuning. It comes from the model loading onc
 stage overlapping the GPU stage, and the decode running in the data plane.
 
 :::{seealso}
-- [ML guide](../../ml/index.md): the reference for every surface these recipes call.
-- [Inference](../../ml/inference.md) and [GPU scheduling](../../ml/gpu.md): pools, stage
+- {doc}`ML guide <../../ml/index>`: the reference for every surface these recipes call.
+- {doc}`Inference <../../ml/inference>` and {doc}`GPU scheduling <../../ml/gpu>`: pools, stage
   overlap, adaptive batch sizing, fractional packing.
-- [ML API reference](../../api/ml.md): the `ds.ml` namespace and the `batcher.ml` functions.
-- [GPU execution](../../deep-dives/gpu-execution.md) and
-  [tensor columns](../../deep-dives/tensor-columns.md): the mechanisms underneath.
-- [Streaming recipes](../streaming/index.md): the same model stages, over a source that
+- {doc}`ML API reference <../../api/ml>`: the `ds.ml` namespace and the `batcher.ml` functions.
+- {doc}`GPU execution <../../deep-dives/gpu-execution>` and
+  {doc}`tensor columns <../../deep-dives/tensor-columns>`: the mechanisms underneath.
+- {doc}`Streaming recipes <../streaming/index>`: the same model stages, over a source that
   never ends.
 :::
 

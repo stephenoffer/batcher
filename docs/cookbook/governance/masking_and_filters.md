@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/governance/masking_and_filters.py
 ```
+
+## See also
+
+- {doc}`lineage`: column lineage: which inputs does this output column actually depend on?
+- {doc}`pii_transforms`: masking, hashing, and encrypting a sensitive column.
+- {doc}`../../user-guide/governance`: row filters and column masks as a plan rewrite.
+- {doc}`../../user-guide/hardening`: the trust boundaries governance does and does not cover.

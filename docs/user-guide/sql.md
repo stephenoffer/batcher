@@ -162,10 +162,10 @@ print(ds.sql("SELECT category FROM self WHERE price >= 50 ORDER BY price").to_py
 # {'category': ['a', 'c']}
 ```
 
-## Next steps
+## See also
 
-- [SQL API](../api/sql.md): the `Session`, function registration, and the supported
+- {doc}`SQL API <../api/sql>`: the `Session`, function registration, and the supported
   SQL surface.
-- [Expressions](expressions.md): the DataFrame column language SQL lowers to.
-- [Joins](joins.md) and [Window functions](window-functions.md): the relational
+- {doc}`Expressions <expressions>`: the DataFrame column language SQL lowers to.
+- {doc}`Joins <joins>` and {doc}`Window functions <window-functions>`: the relational
   operations behind `JOIN` and `OVER`.

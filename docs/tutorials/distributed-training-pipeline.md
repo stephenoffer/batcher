@@ -320,14 +320,14 @@ Preprocessors and `Chain`, the step-3 story in full.
 
 ## See also
 
-- [Distributed training guide](../ml/distributed-training.md): DDP, elasticity, and the
+- {doc}`Distributed training guide <../ml/distributed-training>`: DDP, elasticity, and the
   resume contract.
-- [Data loaders](../ml/data-loaders.md): `iter_torch_batches` and `stream_loader` side by
+- {doc}`Data loaders <../ml/data-loaders>`: `iter_torch_batches` and `stream_loader` side by
   side.
-- [Tensor columns](../deep-dives/tensor-columns.md): the DLPack path behind the zero-copy
+- {doc}`Tensor columns <../deep-dives/tensor-columns>`: the DLPack path behind the zero-copy
   claim in step 4.
-- [Mergeable algebra](../deep-dives/mergeable-algebra.md): why the `fit` in step 3 gives the
+- {doc}`Mergeable algebra <../deep-dives/mergeable-algebra>`: why the `fit` in step 3 gives the
   same statistics on a cluster.
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): the 3.0× on `iter_torch_batches`, and
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the 3.0× on `iter_torch_batches`, and
   the configurations it was measured under.
-- [Scaling out](../benchmarks/scaling.md): what the distributed preprocessing in step 9 costs.
+- {doc}`Scaling out <../benchmarks/scaling>`: what the distributed preprocessing in step 9 costs.

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/outlier_detection.py
 ```
+
+## See also
+
+- {doc}`model_selection`: cross-validation, learning curves, and feature importance -- all in the engine.
+- {doc}`preprocessing_binning`: discretizing, clipping, and reshaping the distribution of a numeric column.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

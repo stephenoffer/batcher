@@ -1026,13 +1026,16 @@ class DistributedConfig:
     # it stays at 1 for a stable on-demand cluster and rises to 2 under the `spot`
     # resilience profile, where preemption is expected rather than exceptional.
     #
-    # **Scope: the flat aggregate reduce.** The driver placement lives in
-    # `dist/flight_aggregate.py::_replicate_shuffle_output`, which assigns off-node hosts
+    # **Scope: every Flight shuffle** — aggregate (both the flat reduce and the combiner
+    # tree a wide shuffle takes), join, sort, and window. The driver placement lives in
+    # `dist/shuffle_replication.py::replicate_shuffle_output`, which assigns off-node hosts
     # (`carbonite/resilience/replication.py::assign_replica_hosts`), calls
     # `replicate_buckets`, and passes the acked addresses into the reducers' `replicas=`.
-    # A **wide** shuffle (`workers > shuffle_fan_in`) reduces through the combiner tree
-    # instead, and that path does not thread replicas yet — it still degrades to recompute.
-    # So this buys re-fetch recovery on the common shuffle and nothing on a very wide one.
+    # A join publishes two shuffle stages (left on 0, right on 1) under one address, so its
+    # replica is all-or-nothing across both — a copy holding one side would under-join.
+    # One residue: inside the combiner tree only the *leaf* partials carry replicas. An
+    # interior combiner's output lives on a single node and is not copied, so losing a
+    # worker mid-tree still costs a recompute round.
     #
     # A replica is advertised only once its `replicate_buckets` call has acked, and a
     # source's replicas are retired when it is recomputed: a replica holds the *old*

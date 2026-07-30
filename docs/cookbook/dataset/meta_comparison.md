@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/meta_comparison.py
 ```
+
+## See also
+
+- {doc}`meta_columns`: profiling one column: bounds, uniqueness, nulls, and constancy.
+- {doc}`meta_predicates`: cheap yes/no questions about the data, and the column-check shorthands.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

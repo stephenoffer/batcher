@@ -12,9 +12,8 @@ Read `docs/migration/transforming.md` and `docs/migration/reading-and-writing.md
 and `docs/benchmarks/vs-daft.md` (the scorecard) before promising a user a speedup.
 Batcher wins multimodal ingest and top-N and ties aggregation. The join-heavy TPC-H
 result is **hardware-dependent and has moved**: that page measures Daft ahead on a
-16-core node, while a 96-core re-run has Batcher ahead on 18 of the 19 queries both
-engines answer (`docs/internals/daft_parity_ledger.md`). Quote the conditions, not a
-multiplier.
+16-core node, while a 96-core re-run at sf1 has Batcher ahead on 18 of the 19 queries
+both engines answer. Quote the conditions, not a multiplier.
 
 Every Batcher name below is verified against the live surface. If you need one this
 skill doesn't list, check it — `python -c "import batcher as bt; print(bt.<name>)"`,
@@ -251,8 +250,8 @@ assuming the port is wrong.
   expression touches? Leave it `None` (the default) — every column stays alive.
 - **Do not promise a blanket speedup**, in either direction. The join-heavy TPC-H
   comparison depends on core count and has reversed between the two machines measured;
-  per-batch Python UDFs are still Daft's by ~2×. Quote `docs/benchmarks/vs-daft.md` and
-  the parity ledger *with their conditions*, never a bare multiplier.
+  per-batch Python UDFs are still Daft's by ~2×. Quote `docs/benchmarks/vs-daft.md`
+  *with its conditions*, never a bare multiplier.
 - **Do expect a ported SQL workload to change answers where Daft was wrong.** On TPC-H
   at sf1 the harness's DuckDB gate fails Daft on q6, q15 and q18 and Daft errors on q21
   and q22 — 5 of 22. If a ported query's numbers move, check DuckDB before assuming the

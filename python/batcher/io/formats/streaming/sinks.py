@@ -87,7 +87,7 @@ _MEMORY: dict[str, list[pa.Table]] = {}
 _MEMORY_SCHEMA: dict[str, pa.Schema] = {}
 
 
-def _check_memory_sink_size(name: str, held: int) -> None:
+def _check_memory_sink_size(name: str, held: int, *, replaces: bool = False) -> None:
     """Raise a clear `ResourceError` if a named in-memory sink has outgrown the cap.
 
     In `append`/`update` mode this sink retains every micro-batch for the lifetime of
@@ -97,6 +97,14 @@ def _check_memory_sink_size(name: str, held: int) -> None:
     actionable error naming the sink, not a silent OOM. The cap is the same
     `memory.streaming_state_max_bytes` envelope that bounds watermark-held state.
 
+    `complete` mode is checked too, and used not to be. Replacing the table each
+    micro-batch bounds the sink by the *running result* rather than by the stream, which
+    is why the append-mode guard did not apply — but a running result is not small by
+    construction: a `group_by` over a high-cardinality key is exactly the shape whose
+    result grows with the stream, and it is the shape a `complete`-mode query is usually
+    written for. So the one mode with no guard was the one whose remedy the other mode's
+    error message recommends.
+
     `held` is passed in rather than recomputed. Summing `nbytes` across every retained
     table on every micro-batch is O(batches) work per batch, so the guard against the sink
     growing without bound was itself quadratic in the number of micro-batches — the check
@@ -105,6 +113,8 @@ def _check_memory_sink_size(name: str, held: int) -> None:
     Args:
         name: The in-memory sink's registered name, quoted back in the error.
         held: Bytes the sink currently retains.
+        replaces: Whether the sink replaces its contents each micro-batch (`complete`
+            mode), which decides what the error can usefully suggest.
 
     Raises:
         ResourceError: If ``held`` exceeds the streaming-state budget.
@@ -112,15 +122,22 @@ def _check_memory_sink_size(name: str, held: int) -> None:
     from batcher.config import active_config
 
     cap = active_config().memory.streaming_state_budget_bytes()
-    if held > cap:
-        from batcher._internal.errors import ResourceError
+    if held <= cap:
+        return
+    from batcher._internal.errors import ResourceError
 
-        raise ResourceError(
-            f"in-memory streaming sink {name!r} reached {held} bytes (cap {cap}): it "
-            "retains every micro-batch in append/update mode and never evicts. Use a "
-            "durable sink (parquet/delta) for an unbounded stream, switch to "
-            "outputMode='complete', or raise memory.streaming_state_max_bytes."
-        )
+    remedy = (
+        "its running result alone exceeds the budget, so no output mode makes it smaller. "
+        "Narrow the grouping key, use a durable sink (parquet/delta), or raise "
+        "memory.streaming_state_max_bytes."
+        if replaces
+        else "it retains every micro-batch in append/update mode and never evicts. Use a "
+        "durable sink (parquet/delta) for an unbounded stream, switch to "
+        "outputMode='complete', or raise memory.streaming_state_max_bytes."
+    )
+    raise ResourceError(
+        f"in-memory streaming sink {name!r} reached {held} bytes (cap {cap}): {remedy}"
+    )
 
 
 def memory_table(name: str) -> pa.Table:
@@ -174,10 +191,11 @@ class MemoryStreamSink:
         _MEMORY_SCHEMA.setdefault(self._name, table.schema)
         if self._replace:
             _MEMORY[self._name] = [table]
+            self._held = table.nbytes
         else:
             _MEMORY[self._name].append(table)
             self._held += table.nbytes
-            _check_memory_sink_size(self._name, self._held)
+        _check_memory_sink_size(self._name, self._held, replaces=self._replace)
         return None
 
     def close(self) -> None:

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/vector_search.py
 ```
+
+## See also
+
+- {doc}`text_features`: turning raw text into model-ready features without a model.
+- {doc}`preprocessing_scaling`: scaling numeric features, and why the choice of scaler matters.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

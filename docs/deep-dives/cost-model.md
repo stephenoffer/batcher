@@ -282,18 +282,18 @@ the errors are usually in the same direction on both sides of the comparison.
 
 It is only as good as the cardinalities feeding it. A cost model applied to a row count that
 is 80× low produces a confident, precise, wrong answer. That is the cold-start join failure
-described in [Cardinality estimation](cardinality-estimation.md).
+described in {doc}`Cardinality estimation <cardinality-estimation>`.
 
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): Kyber decides, and the cost model is how
-- [Kyber optimizer](../internals/kyber.md): the phases these costs run in
+- {doc}`Architecture <../architecture/index>`: Kyber decides, and the cost model is how
+- {doc}`Kyber optimizer <../internals/kyber>`: the phases these costs run in
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the shrinkage estimator and its fixed point
-- [Configuration options](../configuration/options.md): `optimizer.cost_coeffs` and `cost_weights`
-- [Reading a plan](../user-guide/explain-plans.md): the decisions block these numbers produce
-- [TPC-H benchmarks](../benchmarks/tpch.md): the join-order shapes the DP is for
-- [Cardinality estimation](cardinality-estimation.md): the row counts every formula multiplies
-- [Learned metadata](learned-metadata.md): where `op_stats` lives and what else reads it
-- [JIT compilation](jit-compilation.md): the tier `jit_speedup` is pricing
+- {doc}`Configuration options <../configuration/options>`: `optimizer.cost_coeffs` and `cost_weights`
+- {doc}`Reading a plan <../user-guide/explain-plans>`: the decisions block these numbers produce
+- {doc}`TPC-H benchmarks <../benchmarks/tpch>`: the join-order shapes the DP is for
+- {doc}`Cardinality estimation <cardinality-estimation>`: the row counts every formula multiplies
+- {doc}`Learned metadata <learned-metadata>`: where `op_stats` lives and what else reads it
+- {doc}`JIT compilation <jit-compilation>`: the tier `jit_speedup` is pricing
 :::

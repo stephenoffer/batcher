@@ -26,7 +26,7 @@ batch, so the weights land once and the forward pass is a local call.
 scored = ds.ml.infer(Classifier, output_columns=[...], num_gpus=1, concurrency=4)
 ```
 
-That is [batch scoring](batch-scoring.md), and it is the right answer for anything you
+That is {doc}`batch scoring <batch-scoring>`, and it is the right answer for anything you
 can schedule yourself.
 
 :::
@@ -182,26 +182,29 @@ for result in pool.run(request_batches()):
 
 ## Choosing
 
+The pattern to use follows from who owns the model and where it runs, not from how large
+it is. Find your situation below:
+
 | Situation | Reach for |
 | --- | --- |
 | A batch job, model you can schedule | `ds.ml.infer(ModelClass, num_gpus=…)` |
 | Model owned by another team or another cluster | `http_client`, `triton_client`, or `serve_deployment` |
 | CPU preprocessing starving a GPU stage | `run_pipeline` with `Stage` credits |
 | You are driving the stream, and want adaptive batching | `InferencePool` |
-| An LLM behind an OpenAI-compatible endpoint | `http_engine`, covered in [LLM inference](llm.md) |
+| An LLM behind an OpenAI-compatible endpoint | `http_engine`, covered in {doc}`LLM inference <llm>` |
 
 ## See also
 
-- [Serving](serving.md): the adapters and the `ServingClient` contract in full.
-- [Batch scoring](batch-scoring.md): the offline job end to end.
-- [Inference](inference.md): the load-once-per-worker contract.
-- [GPU scheduling](gpu.md): sizing actors and packing models onto devices.
-- [Credit flow control](../deep-dives/credit-flow-control.md): the credits `Stage` hands
+- {doc}`Serving <serving>`: the adapters and the `ServingClient` contract in full.
+- {doc}`Batch scoring <batch-scoring>`: the offline job end to end.
+- {doc}`Inference <inference>`: the load-once-per-worker contract.
+- {doc}`GPU scheduling <gpu>`: sizing actors and packing models onto devices.
+- {doc}`Credit flow control <../deep-dives/credit-flow-control>`: the credits `Stage` hands
   out, and the same mechanism in the engine's shuffle.
-- [GPU execution](../deep-dives/gpu-execution.md): why a CPU stage starves a GPU stage,
+- {doc}`GPU execution <../deep-dives/gpu-execution>`: why a CPU stage starves a GPU stage,
   and what overlapping them buys.
-- [Streaming inference](../examples/streaming/streaming-inference.md): the online half,
+- {doc}`Streaming inference <../examples/streaming/streaming-inference>`: the online half,
   as a runnable recipe.
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): in-process against the served
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: in-process against the served
   path, measured.
-- [ML API](../api/ml.md): the `InferencePool`, `Stage`, and `run_pipeline` reference.
+- {doc}`ML API <../api/ml>`: the `InferencePool`, `Stage`, and `run_pipeline` reference.

@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/conditionals.py
 ```
+
+## See also
+
+- {doc}`column_selectors`: selectors: naming columns by type or pattern instead of one at a time.
+- {doc}`horizontal`: horizontal functions: reducing across columns instead of down rows.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

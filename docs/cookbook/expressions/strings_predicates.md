@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_predicates.py
 ```
+
+## See also
+
+- {doc}`strings_paths`: parsing file paths held in a column.
+- {doc}`strings_ratios`: character-class ratios: cheap quality signals for a text corpus.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

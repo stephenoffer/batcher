@@ -60,7 +60,7 @@ SIMD resize, fanned out per row across every core. The result crosses into a sha
 tensor column with no per-batch re-type step. On a 96-core node that decodes and resizes
 **5,693 images per second**, which is **2.4x Daft**, and streams LiDAR point clouds at
 **21,467 frames per second**. See
-[Multimodal ingest benchmarks](../benchmarks/multimodal-ingest.md) and the reproducible
+{doc}`Multimodal ingest benchmarks <../benchmarks/multimodal-ingest>` and the reproducible
 head-to-heads under `benchmarks/scenarios/`.
 
 You can also decode inside a pipeline with the `.image` expression after a download:
@@ -333,7 +333,7 @@ captioned.write.parquet("s3://bucket/captioned.parquet")
 
 Passing the `Captioner` **class**, rather than an instance or a function, loads the model
 once per GPU actor. A plain function would rebuild it on every batch. See
-[GPU scheduling](gpu.md) for sizing the actor pool.
+{doc}`GPU scheduling <gpu>` for sizing the actor pool.
 
 ## Cleaning scraped text
 
@@ -382,7 +382,7 @@ The whole chain of scan, chunk, explode, and embed is a linear row-wise pipeline
 distributes across workers and streams over an unbounded source with no breaker. The
 one thing no static rule can know is how many chunks a document yields. Kyber estimates
 a fan-out of 1 on the first run, Core measures the real fan-out, and the next plan sizes
-the downstream GPU stage for it. See [adaptive re-optimization](../internals/kyber.md).
+the downstream GPU stage for it. See {doc}`adaptive re-optimization <../internals/kyber>`.
 
 ## Vector search over the embeddings
 
@@ -392,7 +392,7 @@ does the same work and takes an `EncoderFactory`. That is a zero-argument callab
 returning an encoder, which is any callable mapping `list[str]` to one equal-length
 vector per string. The factory is called once per worker, so the embedding model loads a
 single time and every batch that worker handles reuses it. It has the same shape as the
-`WorkerFactory` in [inference](inference.md), which is the reason a sentence-transformers
+`WorkerFactory` in {doc}`inference <inference>`, which is the reason a sentence-transformers
 model, a local ONNX encoder, and a hosted embedding API are interchangeable here.
 
 ```python
@@ -426,8 +426,8 @@ hits = vector_search("s3://bucket/vectors.lance", query_vector, column="embeddin
 top = hits.collect()  # k rows nearest to the query, with a _distance column
 ```
 
-Vector search needs `batcher-engine[lance]`. See [embeddings](embeddings.md) for the
-compute side and [LLM inference](llm.md) for generation over retrieved context.
+Vector search needs `batcher-engine[lance]`. See {doc}`embeddings <embeddings>` for the
+compute side and {doc}`LLM inference <llm>` for generation over retrieved context.
 
 Sometimes the embeddings already ride in a column, as in a reranking pass or a small
 candidate set that does not warrant an index. Score them against a query vector in-engine
@@ -475,9 +475,9 @@ print(unit.select("id", score=col("u").list.dot(array(1.0, 0.0))).to_pydict())
 # {'id': [1, 2, 3], 'score': [0.6, 0.0, 1.0]}
 ```
 
-## Next steps
+## See also
 
-- [Inference](inference.md): run a model over the decoded tensors.
-- [Preprocessors](preprocessors/index.md): assemble the decoded features into a training matrix.
-- [Expressions API](../api/expressions.md): the `.image`/`.audio`/`.video` and vector
+- {doc}`Inference <inference>`: run a model over the decoded tensors.
+- {doc}`Preprocessors <preprocessors/index>`: assemble the decoded features into a training matrix.
+- {doc}`Expressions API <../api/expressions>`: the `.image`/`.audio`/`.video` and vector
   `.list` method reference.

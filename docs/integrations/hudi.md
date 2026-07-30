@@ -37,8 +37,8 @@ except BackendError as exc:
 ```
 
 :::{tip}
-If you need a table format Batcher can write transactionally, that is [Delta](delta-lake.md)
-(append, overwrite, merge, replace-where) or [Iceberg](iceberg.md) (append, overwrite).
+If you need a table format Batcher can write transactionally, that is {doc}`Delta <delta-lake>`
+(append, overwrite, merge, replace-where) or {doc}`Iceberg <iceberg>` (append, overwrite).
 :::
 
 ## Reading
@@ -155,9 +155,9 @@ fail to open with a `BackendError` naming the table. Pin the reader version agai
 
 ## See also
 
-- [Lakehouse](../user-guide/lakehouse.md): the table-format guide.
-- [Reading data](../user-guide/reading-data.md): sources, splits, and pushdown.
-- [CDC pipeline](../examples/data-engineering/cdc-pipeline.md): what an incremental read
+- {doc}`Lakehouse <../user-guide/lakehouse>`: the table-format guide.
+- {doc}`Reading data <../user-guide/reading-data>`: sources, splits, and pushdown.
+- {doc}`CDC pipeline <../examples/data-engineering/cdc-pipeline>`: what an incremental read
   between two instants usually feeds.
-- [I/O API](../api/io.md): the full reader reference.
-- [Delta Lake](delta-lake.md) and [Iceberg](iceberg.md): the writable table formats.
+- {doc}`I/O API <../api/io>`: the full reader reference.
+- {doc}`Delta Lake <delta-lake>` and {doc}`Iceberg <iceberg>`: the writable table formats.

@@ -233,13 +233,13 @@ about.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why an order-defining operator needs its own determinism machinery
-- [Execution engine](../internals/execution.md): the sequential oracle the four paths must match
-- [Carbonite](../internals/carbonite.md): the envelope that decides whether the sort goes out of core
-- [Sorting](../user-guide/sorting.md): the API, including `nulls_first` and mixed directions
-- [Performance](../user-guide/performance.md): why `sort().limit()` is not `sort()` then slice
-- [Analytics benchmarks](../benchmarks/analytics.md): the `sort → LIMIT` numbers quoted above
-- [Morsel parallelism](morsel-parallelism.md): where the ranges get their cores
-- [Join algorithms](join-algorithms.md): the other operator that depends on gather cost
-- [Spilling](spilling.md): the external merge sort, in its wider context
+- {doc}`Architecture <../architecture/index>`: why an order-defining operator needs its own determinism machinery
+- {doc}`Execution engine <../internals/execution>`: the sequential oracle the four paths must match
+- {doc}`Carbonite <../internals/carbonite>`: the envelope that decides whether the sort goes out of core
+- {doc}`Sorting <../user-guide/sorting>`: the API, including `nulls_first` and mixed directions
+- {doc}`Performance <../user-guide/performance>`: why `sort().limit()` is not `sort()` then slice
+- {doc}`Analytics benchmarks <../benchmarks/analytics>`: the `sort → LIMIT` numbers quoted above
+- {doc}`Morsel parallelism <morsel-parallelism>`: where the ranges get their cores
+- {doc}`Join algorithms <join-algorithms>`: the other operator that depends on gather cost
+- {doc}`Spilling <spilling>`: the external merge sort, in its wider context
 :::

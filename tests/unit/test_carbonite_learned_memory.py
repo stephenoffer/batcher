@@ -19,7 +19,14 @@ import batcher as bt
 from batcher import Config, col, config_context
 from batcher.carbonite import ResourceManager
 from batcher.carbonite.base import ResourceContext
-from batcher.carbonite.memory.learned import LearnedMemoryModel, learned_memory_model
+from batcher.carbonite.memory.learned import (
+    LearnedMemoryModel,
+    _canonical_kind,
+    _fit,
+    _memory_basis_rows,
+    _upper_quantile,
+    learned_memory_model,
+)
 from batcher.carbonite.policies import BudgetingAdmission, DefaultSchedulingPolicy
 from batcher.config import active_config
 from batcher.metadata import MetadataHub
@@ -358,3 +365,112 @@ def test_recovering_rows_from_bytes_uses_the_published_width():
     plan = PhysicalPlan(ir={}, output_schema=None, ops=(op,))
     # Recovers 5,000 rows, not the 50,000 a flat-64 inversion would report.
     assert model.predicted_spill_bytes(plan.ops) == int(100.0 * rows)
+
+
+def _from_scratch(hub: MetadataHub, cfg) -> tuple[dict[str, float], dict[str, float]]:
+    """The fit derived in one pass over every bucket — the oracle for the incremental one."""
+    opt = cfg.optimizer
+    min_samples = max(1, opt.cost_calibration_min_samples)
+    bpr: dict[str, float] = {}
+    spr: dict[str, float] = {}
+    for kind, rows in hub.op_stats_by_kind().items():
+        footprints: list[float] = []
+        spills: list[float] = []
+        for r in rows:
+            peak = max(
+                float(r.get("m_peak_bytes", 0) or 0.0),
+                float(r.get("peak_rss_bytes", 0) or 0.0),
+            )
+            basis = _memory_basis_rows(r)
+            if peak > 0.0 and basis > 0.0:
+                footprints.append(peak / basis)
+            spill = float(r.get("spill_bytes", 0) or 0.0)
+            if spill > 0.0 and basis > 0.0:
+                spills.append(spill / basis)
+        canon = _canonical_kind(kind)
+        if len(footprints) >= min_samples:
+            bpr[canon] = _upper_quantile(footprints)
+        if len(spills) >= min_samples:
+            spr[canon] = _upper_quantile(spills)
+    return bpr, spr
+
+
+def test_incremental_sample_derivation_matches_a_full_pass():
+    """Extending the cached samples fits exactly what re-deriving the bucket would.
+
+    The derivation is incremental because it was the dominant term in a refit — O(bucket)
+    float work to absorb O(`_REFIT_AFTER`) new rows, which amortized to hundreds of
+    microseconds on *every* query. That is only a safe trade if the samples are identical,
+    so this drives the fit through the growth *and* the hub's front-trim (where the cached
+    prefix is no longer a prefix and the derivation must start over).
+    """
+    hub = _hub()
+    cfg = active_config()
+    seen_trim = False
+    previous = 0
+    for round_ in range(24):
+        _seed(hub, "aggregate", bytes_per_row=8.0 + round_, n=500, rows=1000)
+        bucket = len(hub.op_stats_by_kind()["aggregate"])
+        seen_trim = seen_trim or bucket < previous
+        previous = bucket
+        model = _fit(hub, cfg)
+        want_bpr, want_spr = _from_scratch(hub, cfg)
+        assert model._bytes_per_row == want_bpr, f"round {round_}: bytes-per-row diverged"
+        assert model._spill_per_row == want_spr, f"round {round_}: spill-per-row diverged"
+    assert seen_trim, "expected the hub to trim a bucket, exercising the re-derivation path"
+
+
+def test_a_trimmed_bucket_does_not_reuse_the_stale_prefix():
+    """A bucket trimmed from the front re-derives rather than extending the old samples.
+
+    The cached prefix is keyed on the bucket's first row *object*. If that check were by
+    `id()` a freed row's address could be reused and the stale samples silently accepted,
+    which would pin the fit to measurements the hub has already discarded.
+    """
+    hub = _hub()
+    cfg = active_config()
+    _seed(hub, "aggregate", bytes_per_row=4.0, n=40, rows=1000)
+    assert _fit(hub, cfg)._bytes_per_row["aggregate"] == 4.0
+
+    # Replace the bucket wholesale: same length, entirely different rows and objects.
+    bucket = hub.op_stats_by_kind()["aggregate"]
+    bucket[:] = [dict(r, m_peak_bytes=9_000) for r in bucket]
+    assert _fit(hub, cfg)._bytes_per_row["aggregate"] == 9.0
+
+
+def test_concurrent_refits_do_not_double_count_the_shared_prefix():
+    """Two threads refitting one hub agree with a single-threaded fit.
+
+    `execution.max_concurrent_queries` runs several queries per process, so the incremental
+    derivation must not extend the cached sample lists in place: both threads would append to
+    the same object and count every new row twice, inflating the learned footprint and with it
+    every reservation sized from it.
+    """
+    import threading
+
+    hub = _hub()
+    cfg = active_config()
+    _seed(hub, "aggregate", bytes_per_row=6.0, n=200, rows=1000)
+    _fit(hub, cfg)  # prime the cache so the threads race on the *reuse* path
+    _seed(hub, "aggregate", bytes_per_row=6.0, n=50, rows=1000)
+
+    results: list[float] = []
+    lock = threading.Lock()
+
+    def refit():
+        model = _fit(hub, cfg)
+        with lock:
+            results.append(model._bytes_per_row["aggregate"])
+
+    threads = [threading.Thread(target=refit) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    want, _ = _from_scratch(hub, cfg)
+    assert results, "expected every thread to produce a fit"
+    assert set(results) == {want["aggregate"]}, (
+        f"concurrent refits diverged from the single-threaded fit "
+        f"{want['aggregate']}: {set(results)}"
+    )

@@ -36,6 +36,8 @@ def run_bucket_reduce(
     remote_reduce: Callable[[int, int], Any],
     republish: Callable[[int, int], None],
     dead: set[int] | None = None,
+    mapper_addrs: list[str] | None = None,
+    replicas: list[list[str]] | None = None,
 ) -> dict[int, Any]:
     """Reduce every shuffle bucket under recompute-on-worker-loss recovery.
 
@@ -52,6 +54,11 @@ def run_bucket_reduce(
         remote_reduce: Launches one bucket's reduce on a host, returning an `ObjectRef`.
         republish: Regenerates a lost worker's mapped output onto a live worker.
         dead: Workers already known to be gone.
+        mapper_addrs: `mapper_addrs[src]` is the address source `src` published on, used
+            with `replicas` to tell a lost *copy* from a lost *source*.
+        replicas: `replicas[src]` are the peers holding a copy of that source's buckets.
+            Supplying both this and `mapper_addrs` is what lets a dead worker that also
+            hosted a reducer avoid an unnecessary recompute — see `_survives_on_a_peer`.
 
     Returns:
         One entry per bucket, mapping the bucket index to the reducer's payload.
@@ -85,6 +92,33 @@ def run_bucket_reduce(
         # `bucket b → actor b`, unless dead/avoided; `avoid` lets a straggler's backup
         # land on a different live worker than the slow original.
         return bucket if bucket not in lost and bucket not in avoid else _pick_live(avoid)
+
+    def _survives_on_a_peer(src: int) -> bool:
+        """Whether `src`'s published buckets still exist somewhere that is not lost.
+
+        A dead worker is two losses at once: the *reducer* it was hosting, and the
+        *mapped output* it was serving. Those are independent, and treating them as one
+        is what made replication look like it did nothing on a small cluster. When
+        `workers == n_buckets` the bucket-`b`-on-actor-`b` rule puts a reducer on every
+        worker, so any kill also kills a reducer host — and the host branch below
+        scheduled a recompute of that worker's sources unconditionally, even with a
+        byte-identical copy sitting on a survivor. The reducer only has to be re-launched
+        elsewhere; its gather then falls over to the replica by itself.
+
+        Returns False when replication is off, so the unreplicated path is unchanged.
+        """
+        if not replicas or mapper_addrs is None or src >= len(replicas):
+            return False
+        # A replica hosted on a worker that is itself lost is no help. Workers are known
+        # here by index and replicas by address, so map back through the addresses the
+        # lost workers published on.
+        gone = {
+            mapper_addrs[s]
+            for host in lost
+            for s in placement.sources_on(host)
+            if s < len(mapper_addrs)
+        }
+        return any(addr not in gone for addr in replicas[src])
 
     # A bucket reduce that returns "ok" consumed its complete input and is
     # deterministic, so cache it across recovery rounds (keyed by bucket index) and
@@ -136,15 +170,31 @@ def run_bucket_reduce(
                             worker=payload,
                             dead_total=len(lost) + 1,
                         )
-                    lost.add(payload)  # host died — its mapped output is lost too
+                    lost.add(payload)  # host died — the reducer it hosted with it
                     # `payload` is a HOST id; `failed` carries SOURCE ids (the other branch
                     # reports unreachable sources). Translate through the current placement so
                     # a relocated source is recomputed and an unrelated one is not — on a
                     # clean run this is exactly `{payload}`.
+                    #
+                    # Everything the host held goes in, *including* sources a replica makes
+                    # cheap to recover. Whether to regenerate is `recompute`'s decision, not
+                    # this branch's. Filtering here instead looks equivalent and is not:
+                    # `failed` is also the signal that another round is needed at all, so
+                    # emptying it returns `done` **without the bucket this dead host never
+                    # finished** — a silently short answer rather than an error. That is what
+                    # the correctness assertions in `test_shuffle_replication.py` caught.
                     failed.update(placement.sources_on(payload))
             else:
                 failed.update(payload)  # the reducer named the mappers it could not reach
         return done, failed
+
+    # Sources whose regeneration was skipped once because a replica still held them. The
+    # skip is deliberately at most once per source: if the copy really does serve the next
+    # attempt, this source never comes back and the recompute was pure waste avoided. If it
+    # does not — a replica that is unreachable for its own reason — the second visit falls
+    # through to the ordinary recompute instead of spending the whole attempt budget
+    # re-trying a fetch that cannot work.
+    replica_served: set[int] = set()
 
     def recompute(failed_srcs: set[int]) -> None:
         for src in failed_srcs:
@@ -154,6 +204,14 @@ def run_bucket_reduce(
             # hand out again, spending the recovery budget on a host that cannot answer.
             host = placement.host_of(src)
             lost.add(host)
+            if src not in replica_served and _survives_on_a_peer(src):
+                # The worker serving this output died; the output did not. Re-running the
+                # map to regenerate a partition a peer already holds byte-for-byte is the
+                # expensive half of recovery, and it buys nothing — the next attempt
+                # re-launches the bucket on a live host and its gather falls over to the
+                # copy. Placement is left alone on purpose: the source has not moved.
+                replica_served.add(src)
+                continue
             target = _pick_live({host})
             placement.relocate(src, target)  # it lives here now, not on `src`
             republish(target, src)

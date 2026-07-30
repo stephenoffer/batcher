@@ -326,8 +326,22 @@ def gpu_inventory() -> list[dict[str, object]]:
 
 @functools.lru_cache(maxsize=1)
 def _gpu_inventory_probe() -> tuple[dict[str, object], ...]:
-    """The one-shot device probe behind `gpu_inventory` — NVML, then torch, then device nodes."""
-    return tuple(_nvml_inventory() or _torch_inventory() or _other_accelerator_inventory())
+    """The one-shot device probe behind `gpu_inventory` — NVML, then torch, then device nodes.
+
+    The torch fallback is gated on [`gpu_devices_absent`], which is the whole reason that
+    function exists. Without the gate, a host with torch installed and no GPU paid a ~1.4 s
+    `import torch` on its **first relational query** — `Optimizer.__init__` builds a
+    `HardwareProfile`, which asks for the GPU inventory — purely to be told there is nothing
+    to accelerate. That is the single largest fixed cost in a cold process, and it lands on
+    pure SQL that will never touch a device. Skipping is not a heuristic: the gate returns
+    True only when every vendor device node is missing, and `torch.cuda.is_available()` on
+    such a host returns False, so the branch it skips is provably empty.
+    """
+    nvml = _nvml_inventory()
+    if nvml:
+        return tuple(nvml)
+    torch_devices = [] if gpu_devices_absent() else _torch_inventory()
+    return tuple(torch_devices or _other_accelerator_inventory())
 
 
 def _nvml_inventory() -> list[dict[str, object]]:

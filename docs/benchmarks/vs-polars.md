@@ -13,6 +13,9 @@ both directions.
 
 ## Scorecard
 
+Each row is one workload shape, with the engine that won it and by how much. Read them
+against the methodology above rather than in isolation:
+
 | Shape | Winner |
 |---|---|
 | Sort → top-N (`LIMIT`) | Batcher, 50× |
@@ -23,6 +26,7 @@ both directions.
 | Group-by (high cardinality, 1.25M groups) | Polars, 2.1× |
 | Full sort on a float key | Polars, 1.7× |
 | `SUM() OVER (PARTITION BY)` | Polars, 3.1× |
+| TPC-H overall (sf10), same Arrow input | Batcher, 2.26×; wins 17 of 22 |
 | `MEDIAN` / `QUANTILE_CONT` per group | Polars, 210 ms vs 66 ms |
 | TPC-H through the SQL frontend | Polars errors on most of the suite |
 

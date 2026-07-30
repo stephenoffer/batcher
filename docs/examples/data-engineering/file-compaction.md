@@ -158,7 +158,7 @@ print(bt.read.parquet(clustered).to_pydict())
 Both `d1` rows now live in one file, so `filter(col("day") == "d1")` reads one file and
 proves the other cannot match. On a Delta table the same statistics land in the
 transaction log and the pruning happens at *plan* time, before any file is opened. That is
-covered in [lakehouse tables](../../user-guide/lakehouse.md).
+covered in {doc}`lakehouse tables <../../user-guide/lakehouse>`.
 
 :::{tip}
 Compaction without clustering gives you fewer files. Compaction with clustering also cuts
@@ -225,10 +225,10 @@ One file here, so nothing to do. Run it against the 40,000-file table and it say
 
 ## See also
 
-- [Incremental ingest](incremental-ingest.md): the job that makes the small files.
-- [Partition backfill](partition-backfill.md): rewriting a slice rather than the table.
-- [Late-arriving data](late-arriving-data.md): the other reason a day gets rewritten.
-- [Writing data](../../user-guide/writing-data.md): the write options in full.
-- [Lakehouse tables](../../user-guide/lakehouse.md): file statistics, pruning, time travel.
-- [Delta Lake](../../integrations/delta-lake.md): what `vacuum` is protecting you from.
-- [IO API reference](../../api/io.md): `bt.compact`, `bt.vacuum`, and the sink arguments.
+- {doc}`Incremental ingest <incremental-ingest>`: the job that makes the small files.
+- {doc}`Partition backfill <partition-backfill>`: rewriting a slice rather than the table.
+- {doc}`Late-arriving data <late-arriving-data>`: the other reason a day gets rewritten.
+- {doc}`Writing data <../../user-guide/writing-data>`: the write options in full.
+- {doc}`Lakehouse tables <../../user-guide/lakehouse>`: file statistics, pruning, time travel.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: what `vacuum` is protecting you from.
+- {doc}`IO API reference <../../api/io>`: `bt.compact`, `bt.vacuum`, and the sink arguments.

@@ -113,7 +113,7 @@ print(ds.map_batches(Splitter(","), output_columns=["text", "price", "qty", "par
 Pass the class itself, as in `map_batches(Classifier, num_gpus=1)`, when construction
 needs to happen inside the worker. That is the case for anything holding a CUDA context. The
 engine warns you if a GPU stage gets a bare function, because that is the single most
-expensive mistake in this API. See [inference](../ml/inference.md).
+expensive mistake in this API. See {doc}`inference <../ml/inference>`.
 
 A model class almost never takes zero arguments, so `fn_constructor_args` and
 `fn_constructor_kwargs` supply them. The class is still built once per worker, so this is
@@ -360,14 +360,14 @@ effect out of the UDF and into a `write`.
 
 ## See also
 
-- [Expressions](expressions.md): check here first, because the expression usually exists.
-- [Inference](../ml/inference.md): the class-per-worker pattern with a real model.
-- [Explain plans](explain-plans.md): see what a UDF does to the plan the optimizer builds.
-- [Expression evaluation](../deep-dives/expression-evaluation.md): what an expression
+- {doc}`Expressions <expressions>`: check here first, because the expression usually exists.
+- {doc}`Inference <../ml/inference>`: the class-per-worker pattern with a real model.
+- {doc}`Explain plans <explain-plans>`: see what a UDF does to the plan the optimizer builds.
+- {doc}`Expression evaluation <../deep-dives/expression-evaluation>`: what an expression
   gets that a UDF cannot, meaning vectorization, fusion, and the JIT.
-- [Arrow memory](../deep-dives/arrow-memory.md): why `fn` is handed a zero-copy
+- {doc}`Arrow memory <../deep-dives/arrow-memory>`: why `fn` is handed a zero-copy
   `RecordBatch` and what happens when you convert it.
-- [Expressions API](../api/expressions.md): the method surface to check before you write
+- {doc}`Expressions API <../api/expressions>`: the method surface to check before you write
   a function.
-- [Feature pipeline](../examples/ml/feature-pipeline.md): batch functions and expressions
+- {doc}`Feature pipeline <../examples/ml/feature-pipeline>`: batch functions and expressions
   side by side in one job.

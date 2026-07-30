@@ -1,7 +1,17 @@
 # Batcher
 
-**One data engine that runs on your laptop and scales to a cluster — and tunes
-itself while your query runs.**
+**One data engine for SQL, DataFrames, streaming, and models — from a laptop to a
+cluster, on the same code.**
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://pypi.org/project/batcher-engine/)
+[![PyPI](https://img.shields.io/badge/pypi-batcher--engine-blue.svg)](https://pypi.org/project/batcher-engine/)
+[![Docs](https://img.shields.io/badge/docs-batcher-blue.svg)](https://stephenoffer.github.io/batcher/)
+
+[Documentation](https://stephenoffer.github.io/batcher/) ·
+[Quickstart](https://stephenoffer.github.io/batcher/getting-started/quickstart.html) ·
+[Benchmarks](https://stephenoffer.github.io/batcher/benchmarks/index.html) ·
+[Architecture](https://stephenoffer.github.io/batcher/architecture/index.html)
 
 Most data tools make you choose: fast on a single machine, or able to scale across
 many — rarely both. So teams outgrow their tool and rewrite the pipeline, or run one
@@ -23,19 +33,60 @@ revenue = (
 print(revenue.to_pydict())   # nothing runs until here
 ```
 
+## Install
+
+Prebuilt wheels ship for Linux, macOS, and Windows on Python 3.10+ — no Rust needed.
+Batcher is on PyPI as `batcher-engine` and imported as `batcher` (the bare `batcher`
+name belongs to an unrelated project):
+
+```bash
+pip install batcher-engine
+```
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"x": [1, 2, 3]})
+print(ds.select(doubled=bt.col("x") * 2).to_pydict())
+# {'doubled': [2, 4, 6]}
+```
+
+Optional features are extras, e.g. `pip install "batcher-engine[ray,cloud]"`.
+
+## What it does
+
+| Area | What ships |
+|---|---|
+| **Read** | Parquet, CSV, JSON, Arrow, ORC, Avro · text and documents · images, audio, video · SQL databases and warehouses · Kafka, Kinesis, Pulsar, Pub/Sub |
+| **Query** | SQL and a DataFrame API over the same plan · joins, windows, pivots, `MERGE INTO` · typed accessors for strings, dates, lists, structs, JSON |
+| **Tables** | Delta, Iceberg, and Hudi with transactional writes, time travel, change feeds, schema evolution, compaction |
+| **Stream** | Unbounded sources, triggers, watermarks, stateful windows, stream joins, checkpointing, exactly-once sinks |
+| **Model** | GPU batch inference, LLM scoring, embeddings and vector search, RAG, tabular models, preprocessors, zero-copy PyTorch loaders |
+| **Operate** | Out-of-core spill, caching, explain plans, a live progress UI, metrics, data-quality contracts, column masking and row-level security |
+
 ## What makes it different
 
 Most engines decide how to run your query before they have looked at any data, then
 stick with that plan even when the data turns out different — which is the usual
-reason a job stalls or runs out of memory. Batcher watches the data as it flows and
-adjusts the plan as it goes, so a query that starts on a bad guess corrects itself
-instead of failing. No other engine does this *during* a query.
+reason a job stalls or runs out of memory. Batcher measures each stage as it completes
+and re-plans the rest of the query on the real numbers, so a query that starts on a
+bad guess corrects itself instead of failing.
+
+Being precise about that, because it is easy to overclaim: this is stage-boundary
+re-optimization, the same mechanism and granularity as Spark AQE, and it engages only
+on a joined query whose scan input clears 20M rows or roughly 1.3 GB. Two things about
+it *are* different. It runs **single-node**, where DuckDB has no equivalent at all, and
+what it measured is **kept**: cardinality sketches, cost coefficients calibrated from
+measured operator times, and a bandit over join strategies all feed the *next* run, so
+a query gets a better plan the more often it runs. Neither DuckDB nor Spark does that
+second half. [What makes Batcher different](https://stephenoffer.github.io/batcher/architecture/differentiators.html)
+covers both halves and where each one stops.
 
 ## How it compares
 
 | Tool | Where it stops | What Batcher does instead | Measured |
 |------|----------------|---------------------------|----------|
-| **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **won 22/22** TPC-H and **42/43** ClickBench on the same Arrow |
+| **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **21/22** TPC-H at sf10 (**1.89×** on the suite), **22/22** at sf1, **42/43** ClickBench — all on the same Arrow |
 | **Polars** | fast, but single-node | the same code runs from one core to a cluster | **12×–81×** on JSON; **7×–33×** on windows and top-N |
 | **Daft** | scales, but plans once | adaptive re-optimization, and a correct q6 | **2.4× faster** cluster-vs-cluster, and Daft's q6 is wrong |
 | **Spark** | scales, but heavy on small jobs | runs in-process locally — no cluster to spin up | **5×–33×** on TPC-H |
@@ -46,8 +97,9 @@ real bugs in other engines — on TPC-H q6, Daft and Polars both return `75,207,
 official answer is `123,141,078.2283`, and Batcher returns the official answer exactly.
 
 Two places Batcher does **not** win, stated up front: DuckDB reading its own compressed store
-still leads on join-heavy TPC-H (~1.4× geomean), and high-concurrency serving is not this
-engine's shape at all. Both are detailed below.
+still leads on join-heavy TPC-H (~1.4× geomean at sf1, 2.08× on the sf10 suite, where Batcher
+takes 4 of 22), and high-concurrency serving is not this engine's shape at all. Both are
+detailed below.
 
 ## Benchmarks
 
@@ -55,7 +107,7 @@ Numbers, not adjectives — and every one is **correctness-gated**: the harness 
 on every engine, checks they return the *identical* result (a sorted row multiset within float
 tolerance), and only then trusts the timing. A fast wrong answer is a bug, not a win. Setup:
 TPC-H `lineitem` (6M rows at scale 1, 60M at scale 10), read once into Arrow and shared
-byte-identically across engines; a 9-node / 128-CPU cluster; 8×T4 GPUs for the ML runs. Full
+byte-identically across engines; an 8-node / 128-CPU cluster; 8×T4 GPUs for the ML runs. Full
 per-scale tables: [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
 
 **Single-node, head-to-head on the same in-memory Arrow (TPC-H sf1).** Each engine runs the
@@ -66,7 +118,6 @@ correctness-gated against DuckDB:
 
 | operator | vs DuckDB | vs Polars | vs PyArrow | vs Spark² |
 |-------------------------|:--------:|:--------:|:----------:|:--------:|
-| filter → count          | **265×** | **41×**  | **1225×** | **125×** |
 | global sum              | **33×**  | **12×**  | **25×**   | **197×** |
 | group-by sum (1 key)    | **5.0×** | **2.6×** | **2.0×**  | **28×**  |
 | group-by sum (2 keys)   | **4.3×** | **2.7×** | **2.0×**  | **21×**  |
@@ -80,6 +131,14 @@ correctness-gated against DuckDB:
 
 **Batcher wins all 11 against DuckDB, all 7 against PyArrow, and 8 of 11 against Polars.**
 
+The `filter → count` row is deliberately left out of the table above. It measures 265×
+against DuckDB and 1225× against PyArrow, and those figures are almost certainly timing
+each competitor's Arrow scan and result materialization rather than its filter. Our own
+architecture audit calls it "the least credible number in the repo", and a headline that
+needs it is weaker than one that doesn't. It is still in
+[`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md) with that caveat
+attached.
+
 ¹ PyArrow (Acero) has no window functions. ² The DuckDB, Polars and PyArrow columns were
 re-measured 2026-07-18 on a release build; the Spark column is from the dated runs in
 [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
@@ -89,7 +148,8 @@ Arrow input, so these compare *execution*, not storage formats:
 
 | suite | result vs DuckDB on the same Arrow |
 |---|---|
-| **TPC-H** — all 22 queries | **won 22 of 22**, 1.1×–6.9× faster |
+| **TPC-H sf10** — all 22 queries, 96 cores | **won 21 of 22**, **1.89×** on the suite total |
+| **TPC-H sf1** — all 22 queries, 16 cores | **won 22 of 22**, 1.1×–6.9× faster |
 | **ClickBench** — 43 queries | **won 42 of 43**, 43/43 correct |
 | **Semi-structured JSON** — 5 queries | **won 5 of 5**, 3.5×–12.7× faster (**12×–81×** vs Polars) |
 
@@ -112,7 +172,7 @@ scale we measured. Against DuckDB the story is scale-dependent, and we report it
 | scale (single node) | Batcher vs DuckDB (same-input execution) |
 |---------------------|-------------------------------------------|
 | **sf1** — 6M rows, in memory   | wins **all 22** TPC-H queries (1.1–6.9×) |
-| **sf10** — 60M rows, in memory | wins 15 of 21; trails on 6 aggregate/join-heavy queries (1.2–3×) |
+| **sf10** — 60M rows, in memory | wins **21 of 22** and the suite total by **1.89×** (re-measured 2026-07-27, 96 cores) |
 | **sf100** — 600M rows, scanned | DuckDB leads 2–11×; Batcher OOMs on the deepest join trees (q3/q4/q5) |
 
 The gap grows with scale for three structural reasons, none of them a tuning knob: DuckDB
@@ -151,28 +211,22 @@ key column twice — so `GROUP BY` and `COUNT(DISTINCT)` over string or near-uni
 stage-overlapped streaming for GPU work, and adaptive re-optimization that re-tunes the plan on
 measured cardinalities mid-query.
 
-## Install
+## Documentation
 
-Prebuilt wheels ship for Linux, macOS, and Windows on Python 3.10+ — no Rust needed.
-Batcher is on PyPI as `batcher-engine` and imported as `batcher` (the bare `batcher`
-name belongs to an unrelated project):
+Full docs: **<https://stephenoffer.github.io/batcher/>**
 
-```bash
-pip install batcher-engine
-```
-
-```python
-import batcher as bt
-
-ds = bt.from_pydict({"x": [1, 2, 3]})
-print(ds.select(doubled=bt.col("x") * 2).to_pydict())
-# {'doubled': [2, 4, 6]}
-```
-
-Optional features are extras, e.g. `pip install "batcher-engine[ray,cloud]"`.
-
-New here? The [documentation](https://stephenoffer.github.io/batcher/) has a
-quickstart, guides, and runnable examples.
+| If you want to | Go to |
+|---|---|
+| Install it and run a first query | [Getting started](https://stephenoffer.github.io/batcher/getting-started/index.html) |
+| Understand the one idea the API rests on | [Core concepts](https://stephenoffer.github.io/batcher/getting-started/concepts/index.html) |
+| Port from Spark, pandas, Polars, or DuckDB | [Migration guides](https://stephenoffer.github.io/batcher/migration/index.html) |
+| Look up a capability | [User guide](https://stephenoffer.github.io/batcher/user-guide/index.html) |
+| Run models, embeddings, or a training loop | [Machine learning](https://stephenoffer.github.io/batcher/ml/index.html) |
+| Copy working code | [Tutorials](https://stephenoffer.github.io/batcher/tutorials/index.html) and [examples](https://stephenoffer.github.io/batcher/examples/index.html) |
+| Look up a name | [API reference](https://stephenoffer.github.io/batcher/api/index.html) |
+| Connect Kafka, Snowflake, Delta, Ray, PyTorch | [Integrations](https://stephenoffer.github.io/batcher/integrations/index.html) |
+| See the numbers and how they were measured | [Benchmarks](https://stephenoffer.github.io/batcher/benchmarks/index.html) |
+| Know how the engine works | [Architecture](https://stephenoffer.github.io/batcher/architecture/index.html) and [deep dives](https://stephenoffer.github.io/batcher/deep-dives/index.html) |
 
 ## Under the hood
 

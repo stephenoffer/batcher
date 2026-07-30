@@ -24,6 +24,7 @@ import contextlib
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
+from batcher.api.terminal.routing import _ray_already_live
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -450,15 +451,20 @@ def _cluster_gpu_count() -> int:
 
     The count — not just presence — so Kyber's policy can size the cluster's aggregate GPU
     memory and pick single-device vs sharded execution."""
-    try:
-        import ray
+    # Gated exactly as the `distributed="auto"` probe is, and for the same reason: this runs
+    # on every terminal op, and `import ray` costs ~0.44 s the first time to answer a question
+    # `sys.modules` already settles — a cluster cannot be initialized in a process that has
+    # not imported Ray. See `routing._ray_already_live` for the full argument.
+    if _ray_already_live():
+        try:
+            import ray
 
-        if ray.is_initialized():
-            from batcher.dist.executors.ray_runtime import cluster_topology
+            if ray.is_initialized():
+                from batcher.dist.executors.ray_runtime import cluster_topology
 
-            return int(cluster_topology().get("gpus", 0))
-    except Exception as exc:
-        note_suppressed("api", "read cluster GPU topology", exc)
+                return int(cluster_topology().get("gpus", 0))
+        except Exception as exc:
+            note_suppressed("api", "read cluster GPU topology", exc)
     from batcher.core.gpu_transform import gpu_available
 
     return 1 if gpu_available() else 0

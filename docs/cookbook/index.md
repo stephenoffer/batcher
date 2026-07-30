@@ -15,7 +15,7 @@ them on every test run.
 | {doc}`expressions/index` | 34 | Recipes for the expression API: strings, temporal, lists, JSON, selectors, and the scalar algebra |
 | {doc}`metrics/index` | 14 | Model and text metrics computed as aggregate expressions, so evaluation is a `select` over the table rather than a pull into pandas |
 | {doc}`statistics/index` | 6 | Summary statistics, robust dispersion, distribution shape, association, and A/B test inference, all as aggregates in the engine |
-| {doc}`ml/index` | 16 | Preprocessors, estimators, model selection, batch inference, and vector search on the `batcher |
+| {doc}`ml/index` | 16 | Preprocessors, estimators, model selection, batch inference, and vector search on the `batcher.ml` surface |
 | {doc}`io/index` | 6 | Reading and writing: Parquet, text formats, Arrow interop, save modes, streaming reads, and the source/sink registries |
 | {doc}`governance/index` | 3 | Column masking, row filters, PII transforms, and column lineage, all applied as plan rewrites |
 | {doc}`dataset/index` | 14 | The Dataset verbs: joins, grouping, reshaping, deduplication, sampling, profiling, null handling, and the `meta` accessor |

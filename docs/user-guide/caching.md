@@ -173,14 +173,14 @@ Here is the whole decision:
 
 ## See also
 
-- [Performance](performance.md): morsel sizing, spilling, and the memory budget.
-- [Explain plans](explain-plans.md): confirm the plan you cached is the plan you meant.
-- [Writing data](writing-data.md): the checkpoint alternative.
-- [Query lifecycle](../deep-dives/query-lifecycle.md): what "the plan runs twice" means,
+- {doc}`Performance <performance>`: morsel sizing, spilling, and the memory budget.
+- {doc}`Explain plans <explain-plans>`: confirm the plan you cached is the plan you meant.
+- {doc}`Writing data <writing-data>`: the checkpoint alternative.
+- {doc}`Query lifecycle <../deep-dives/query-lifecycle>`: what "the plan runs twice" means,
   stage by stage.
-- [Buffer pool](../deep-dives/buffer-pool.md): the memory the cache is yielding back
+- {doc}`Buffer pool <../deep-dives/buffer-pool>`: the memory the cache is yielding back
   when a running query needs it more.
-- [Configuration options](../configuration/options.md): `memory.result_cache_max_bytes`
+- {doc}`Configuration options <../configuration/options>`: `memory.result_cache_max_bytes`
   and the rest of the memory envelope.
-- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md): caching in its
+- {doc}`Optimizing a slow query <../tutorials/optimizing-a-slow-query>`: caching in its
   place, among the other fixes.

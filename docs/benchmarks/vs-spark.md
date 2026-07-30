@@ -45,6 +45,9 @@ recurring query gets a better plan each time it executes.
 
 ## Where the two engines differ
 
+The differences that matter are architectural rather than incidental. Each row names one
+and gives both engines' answer:
+
 | | Spark | Batcher |
 |---|---|---|
 | Re-optimization points | Stage (shuffle) boundaries | Every pipeline breaker |

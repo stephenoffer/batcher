@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/strings_cleaning.py
 ```
+
+## See also
+
+- {doc}`strings_chunking`: splitting long documents into overlapping chunks for a RAG index.
+- {doc}`strings_counts`: counting structure in text: words, lines, sentences, and entities.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

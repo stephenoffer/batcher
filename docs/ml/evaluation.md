@@ -8,7 +8,7 @@ Every metric on this page is an `Expr`, not a function that takes two arrays. Th
 
 - The metrics run **in the engine**, so evaluating a billion scored rows never materializes them on a driver.
 - Asking for ten metrics costs what asking for one costs, because they reduce to the same aggregate pass.
-- They compose with `group_by`, so "what is the F1 *per country, per month*" is the same query with a grouping added — the question a model review actually asks, and the one a driver-side call cannot answer at scale.
+- They compose with `group_by`, so "what is the F1 *per country, per month*" is the same query with a grouping added. That is the question a model review actually asks, and the one a driver-side call cannot answer at scale.
 
 The exceptions are the metrics that need a global ordering rather than a per-row quantity: ROC AUC, average precision, and the KS statistic. Those are Dataset functions built on a window rank, and each adds one sort.
 
@@ -89,13 +89,13 @@ A few of these exist specifically because the obvious choice misleads, and it is
 
 `mape` is undefined where the actual is zero, and Batcher excludes those rows from *both* the numerator and the denominator. Use `wape` when zeros are common: it is a ratio of totals rather than a mean of ratios, so one near-zero actual cannot dominate it.
 
-`mean_percentage_error` keeps the sign `mape` discards, so it measures a forecast's *bias* — a positive value means it systematically under-predicts. `normalized_rmse` divides the RMSE by the mean of the actuals, making it comparable across series on different scales. On the classification side `false_negative_rate` (`1 - recall`) is the miss rate to watch when an undetected positive is the costly outcome.
+`mean_percentage_error` keeps the sign `mape` discards, so it measures a forecast's *bias*. A positive value means it systematically under-predicts. `normalized_rmse` divides the RMSE by the mean of the actuals, making it comparable across series on different scales. On the classification side `false_negative_rate` (`1 - recall`) is the miss rate to watch when an undetected positive is the costly outcome.
 
 `roc_auc` counts every negative equally, so at very low prevalence it stays high while the top of the ranking is worthless. Report `average_precision` instead when positives are rare.
 
 `log_loss` and `brier_score` are the only metrics here that score *calibration*. A model that ranks perfectly but predicts probabilities twice as large as the truth looks excellent on AUC and fails the moment a prediction is multiplied by a dollar amount.
 
-`hinge_loss` and `squared_hinge_loss` score a raw decision function rather than a probability — the margin a support-vector machine or a linear classifier produces. They are zero once a point is correctly classified with room to spare and grow with how far a point sits on the wrong side, which is the objective those models optimize.
+`hinge_loss` and `squared_hinge_loss` score a raw decision function rather than a probability, which is the margin a support-vector machine or a linear classifier produces. They are zero once a point is correctly classified with room to spare and grow with how far a point sits on the wrong side, which is the objective those models optimize.
 
 ## Diagnostic tables
 
@@ -110,7 +110,7 @@ print(lift_table(ds, "y", "s", buckets=2).to_pydict()["lift"])
 print(calibration_curve(ds, "y", "s", bins=2).to_pydict()["observed_rate"])
 ```
 
-`confusion_matrix` is long form — one row per `(actual, predicted)` pair — which is what stays correct when the label set is large or discovered from the data, and what joins to a cost table.
+`confusion_matrix` is long form, with one row per `(actual, predicted)` pair. That shape stays correct when the label set is large or discovered from the data, and it joins to a cost table.
 
 `threshold_sweep` reports precision, recall, and the four confusion counts at every cutoff in one pass, which is what picking an operating point actually needs.
 
@@ -134,7 +134,7 @@ print(classification_report(ds, "y", "p").sort("class").to_pydict()["f1"])
 `evaluate(task="multiclass")` adds the two ways of averaging those per-class numbers, and
 reporting only one of them is how a model that ignores the minority class passes review.
 The **macro** average weights every class equally, so a rare class the model ignores drags
-it down; the **weighted** average weights by support, so it tracks accuracy and a rare class
+it down. The **weighted** average weights by support, so it tracks accuracy and a rare class
 barely moves it.
 
 ```python
@@ -145,7 +145,7 @@ print(round(ds.ml.evaluate("y", y_pred="p", task="multiclass")["macro_f1"], 4))
 
 A classifier outputs a score, not a decision. Turning it into an action needs a cutoff, and
 0.5 is right only when the classes are balanced *and* a false positive costs exactly what a
-false negative costs — which is close to never true.
+false negative costs, which is close to never true.
 
 `best_threshold` finds the cutoff that maximizes a metric, in one pass plus an argmax over
 the candidates:
@@ -169,13 +169,13 @@ print(best["threshold"], best["total_cost"])
 ```
 
 `expected_cost_curve` returns the whole curve when you want to see the shape rather than
-just the minimum — a flat curve means the cutoff barely matters, which is worth knowing
+only the minimum. A flat curve means the cutoff barely matters, which is worth knowing
 before anyone argues about it.
 
 ## Comparing candidate models
 
 Because the metrics are aggregate expressions, several models' metrics go into the *same*
-`agg` — so comparing six candidates costs one scan, not six evaluations:
+`agg`, so comparing six candidates costs one scan rather than six evaluations:
 
 ```python
 from batcher.ml.metrics import compare_models
@@ -188,16 +188,16 @@ print(table.sort("f1", descending=True).to_pydict()["model"])
 ```
 
 The result is a `Dataset`, so it sorts, joins to a latency or serving-cost column, and
-appends to an experiment log — which is what turns a comparison into a record of why a model
+appends to an experiment log. That is what turns a comparison into a record of why a model
 was chosen. Rank-based metrics need a sort each and are refused rather than silently made
-slow; ask for those per model with `roc_auc(..., by=)`.
+slow, so ask for those per model with `roc_auc(..., by=)`.
 
 ## Fairness
 
 A model can be accurate overall and systematically worse for one group, and no aggregate
 metric shows it. The fairness metrics compare the model's behaviour across a protected
-attribute and report the gap — and because the definitions disagree (you cannot satisfy all
-at once), naming them separately forces the choice to be explicit.
+attribute and report the gap. Because the definitions disagree, and you cannot satisfy all
+of them at once, naming them separately forces the choice to be explicit.
 
 ```python
 from batcher.ml.metrics import demographic_parity_difference, equal_opportunity_difference
@@ -213,7 +213,7 @@ print(equal_opportunity_difference(ds, "race", "y", "p"))   # true-positive-rate
 `equal_opportunity_difference` and `equalized_odds_difference` measure equal *error rates*;
 `predictive_parity_difference` measures whether a positive prediction means the same thing in
 each group. `group_fairness_report` returns the per-group rates the disparities are computed
-from. None of these is a verdict — a gap can be justified — but an unmeasured gap cannot.
+from. None of these is a verdict, because a gap can be justified. An unmeasured gap cannot.
 
 ## Agreement, not just correlation
 
@@ -242,8 +242,8 @@ ROC AUC uses the rank identity rather than integrating a threshold sweep, so it 
 
 ## Is the probability calibrated?
 
-A model can rank perfectly and still lie about its confidence — an excellent AUC with a
-useless probability. Calibration is the property AUC cannot see, and it is what matters the
+A model can rank perfectly and still lie about its confidence, pairing an excellent AUC with
+a useless probability. Calibration is the property AUC cannot see, and it is what matters the
 moment a predicted probability is multiplied by a dollar amount.
 
 ```python
@@ -255,7 +255,7 @@ print(round(brier_skill_score(ds, "y", "s"), 4))
 ```
 
 `expected_calibration_error` is the support-weighted average gap between predicted confidence
-and observed accuracy; `maximum_calibration_error` is the worst band's gap, for when one
+and observed accuracy. `maximum_calibration_error` is the worst band's gap, for when one
 region of the score range drives a high-stakes call. `brier_skill_score` rescales the Brier
 score against the base rate so it reads like R²: 1 is perfect, 0 is no better than predicting
 the base rate, negative is worse.
@@ -264,7 +264,7 @@ the base rate, negative is worse.
 
 RMSE assumes symmetric, constant-variance error. A count (claims, clicks, defects) or a rate
 is neither, and a Poisson, gamma, or Tweedie model is fitted on the matching *deviance*
-instead — so the deviance is the honest way to score it. All three are expressions, checked
+instead, so the deviance is the honest way to score it. All three are expressions, checked
 against scikit-learn:
 
 ```python
@@ -272,7 +272,7 @@ ds = bt.from_pydict({"y": [0.0, 2.0, 5.0], "p": [1.0, 2.0, 4.0]})
 print(round(ds.agg(m=bt.poisson_deviance("y", "p")).to_pydict()["m"][0], 4))
 ```
 
-`bt.gamma_deviance` handles a positive, right-skewed target (a claim size, a duration). `bt.tweedie_deviance(y, p, power=...)` spans the whole family — 1 is Poisson, 2 is gamma, and a
+`bt.gamma_deviance` handles a positive, right-skewed target (a claim size, a duration). `bt.tweedie_deviance(y, p, power=...)` spans the whole family: 1 is Poisson, 2 is gamma, and a
 power in ``(1, 2)`` is the compound distribution that describes insurance pure premium.
 `d2_tweedie_score` (in `batcher.ml.metrics`) is the deviance-explained score, R² for a count
 model. `d2_absolute_error_score` and `d2_pinball_score` are the same idea on the L1 and quantile
@@ -283,9 +283,9 @@ least-squares one.
 
 ## Regression diagnostics
 
-A single RMSE hides where the error lives. `residual_summary` groups the residual — its
-mean (systematic bias), spread, and quantiles — by any column, which is what surfaces a
-model that is unbiased overall while badly over-predicting one segment:
+A single RMSE hides where the error lives. `residual_summary` groups the residual by any
+column, reporting its mean (the systematic bias), its spread, and its quantiles. That is what
+surfaces a model that is unbiased overall while badly over-predicting one segment:
 
 ```python
 from batcher.ml.metrics import residual_summary
@@ -295,9 +295,9 @@ print(residual_summary(ds, "y", "p", by="seg").sort("seg").to_pydict()["mean_res
 ```
 
 `prediction_interval_coverage` checks a quantile model's central promise: that a "90%
-interval" actually contains ≈90% of the actuals. `top_k_accuracy` scores a ranked
-multi-class prediction — was the true label among the model's top `k` guesses — which is the
-honest number for a recommender where the top-1 label being wrong is not a failure.
+interval" actually contains about 90% of the actuals. `top_k_accuracy` scores a ranked
+multi-class prediction by asking whether the true label was among the model's top `k` guesses.
+That is the honest number for a recommender where the top-1 label being wrong is not a failure.
 
 ## Baselines
 
@@ -321,6 +321,7 @@ The multi-class averages are computed from a per-class report rather than a sing
 
 ## See also
 
-- {doc}`tabular-models` — produce the predictions this page scores.
-- {doc}`statistics-and-drift` — watch the inputs when the labels have not arrived yet.
-- {doc}`../user-guide/aggregations` — the aggregate surface these metrics are built on.
+- {doc}`tabular-models`: produce the predictions this page scores.
+- {doc}`statistics-and-drift`: watch the inputs when the labels have not arrived yet.
+- {doc}`../user-guide/aggregations`: the aggregate surface these metrics are built on.
+- {doc}`../cookbook/metrics/index`: short runnable recipes for each metric family.

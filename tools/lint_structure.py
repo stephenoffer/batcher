@@ -39,9 +39,13 @@ DIR_MAX_DEPTH = 5  # directory levels under a package/src root
 # fragment one cohesive family registry. Keyed by posix path relative to the repo root.
 DIR_ALLOW: dict[str, str] = {
     "python/batcher/ml/metrics": (
-        "the model-metrics family package: one module per metric family (classification, "
-        "regression, ranking, clustering, calibration, fairness, tables, comparison) plus their "
-        "shared helpers, kept separate so each family stays discoverable and under the line limit"
+        "the model-metrics family package, 13 modules against a cap of 12: one module per "
+        "metric family (regression, ranking, ranked, clustering, cluster_quality, calibration, "
+        "fairness, thresholds, tables, comparison, evaluate) plus their shared helpers, kept "
+        "separate so each family stays discoverable and under the line limit. There is "
+        "deliberately no `classification.py` — the classification measures are split across "
+        "`evaluate`/`calibration`/`thresholds`/`tables` here and the plan-layer "
+        "`plan/functions/metrics/model/`, so do not go looking for one"
     ),
     "python/batcher/kyber/rules/extra": (
         "Kyber's extended rule families: one small module per family + a registry, the "
@@ -55,7 +59,7 @@ DIR_ALLOW: dict[str, str] = {
         "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "OVER BUDGET AND TRACKED: 17 modules against a cap of 12. The learned-adaptive family "
+        "OVER BUDGET AND TRACKED: 18 modules against a cap of 12. The learned-adaptive family "
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
     ),

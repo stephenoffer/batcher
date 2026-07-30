@@ -243,6 +243,17 @@ def _accelerator_names() -> tuple[str, ...]:
 # binding is cleared by `reset_hardware_probes` alongside the probes it is built from.
 _PROFILE: HardwareProfile | None = None
 
+# The digest of that profile, computed on first use and cleared with it.
+#
+# `HardwareProfile.fingerprint()` joins fourteen fields into a string and SHA-256s it, and it
+# is the scoping key for every learned parameter — so it is asked for repeatedly on the query
+# path rather than once. Measured at **11 calls per warm query** (~0.12 ms, about 7% of a
+# small `collect()`), all returning the same digest, because the profile it hashes is
+# assembled once per process and frozen. The method stays uncached: it is the honest
+# computation for *any* profile, including one reconstructed from a remote worker's dict,
+# and only the local-machine shorthand below can know its answer cannot change.
+_FINGERPRINT: str | None = None
+
 
 def hardware_profile() -> HardwareProfile:
     """The assembled description of this machine, probed once per process.
@@ -297,10 +308,14 @@ def fingerprint() -> str:
     Returns:
         A 12-character hex digest identifying this machine class.
     """
-    return hardware_profile().fingerprint()
+    global _FINGERPRINT
+    if _FINGERPRINT is None:
+        _FINGERPRINT = hardware_profile().fingerprint()
+    return _FINGERPRINT
 
 
 def _reset_profile() -> None:
     """Forget the assembled profile so the next call re-probes (test hook)."""
-    global _PROFILE
+    global _PROFILE, _FINGERPRINT
     _PROFILE = None
+    _FINGERPRINT = None

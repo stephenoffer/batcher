@@ -57,20 +57,20 @@ than discover. None of them is a bug you can configure away.
 
 | The edge | What actually happens | Where it is covered |
 | --- | --- | --- |
-| A stream-stream join has no sink | A streaming write takes a single source; `write.delta(...)` on a joined stream raises `PlanError`. The only consumer is `iter_batches()`. | [Stream join](stream-join.md) |
-| A stream cannot join a static dimension table | The plan has to materialize, so the engine refuses it with a `PlanError` rather than hanging. Enrich inside `map_batches`. | [Stream join](stream-join.md) |
-| The file sink dedups by *position* | A different batch 0 written into a directory that already holds `part-batch00000.parquet` is skipped, silently. One query, one output directory. | [Exactly-once sink](exactly-once-sink.md) |
-| A non-replayable source ignores `checkpoint=` | No offsets are recorded, so a restart re-reads from the beginning. Nothing warns you. | [Exactly-once sink](exactly-once-sink.md) |
-| Late rows vanish | No side output, no dead-letter, no late-row counter in `recent_progress()`. Your total is quietly low. | [Late data and watermarks](late-data-watermarks.md) |
+| A stream-stream join has no sink | A streaming write takes a single source; `write.delta(...)` on a joined stream raises `PlanError`. The only consumer is `iter_batches()`. | {doc}`Stream join <stream-join>` |
+| A stream cannot join a static dimension table | The plan has to materialize, so the engine refuses it with a `PlanError` rather than hanging. Enrich inside `map_batches`. | {doc}`Stream join <stream-join>` |
+| The file sink dedups by *position* | A different batch 0 written into a directory that already holds `part-batch00000.parquet` is skipped, silently. One query, one output directory. | {doc}`Exactly-once sink <exactly-once-sink>` |
+| A non-replayable source ignores `checkpoint=` | No offsets are recorded, so a restart re-reads from the beginning. Nothing warns you. | {doc}`Exactly-once sink <exactly-once-sink>` |
+| Late rows vanish | No side output, no dead-letter, no late-row counter in `recent_progress()`. Your total is quietly low. | {doc}`Late data and watermarks <late-data-watermarks>` |
 
 :::{seealso}
-- [Streaming](../../user-guide/streaming.md): the full source, sink, trigger, and output-mode
+- {doc}`Streaming <../../user-guide/streaming>`: the full source, sink, trigger, and output-mode
   reference.
-- [Kafka integration](../../integrations/kafka.md): brokers, consumer groups, and splits.
-- [Writing data](../../user-guide/writing-data.md): the batch write surface and Delta commits.
-- [Late-arriving data](../data-engineering/late-arriving-data.md): the batch reconciliation
+- {doc}`Kafka integration <../../integrations/kafka>`: brokers, consumer groups, and splits.
+- {doc}`Writing data <../../user-guide/writing-data>`: the batch write surface and Delta commits.
+- {doc}`Late-arriving data <../data-engineering/late-arriving-data>`: the batch reconciliation
   half of the same problem.
-- [ML recipes](../ml/index.md): the model stages that these queries run per micro-batch.
+- {doc}`ML recipes <../ml/index>`: the model stages that these queries run per micro-batch.
 :::
 
 ```{toctree}

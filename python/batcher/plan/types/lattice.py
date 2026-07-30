@@ -55,14 +55,29 @@ def widen(dt: pa.DataType) -> pa.DataType:
     """Widen a narrow numeric type the way the FFI boundary does, else pass through.
 
     Mirrors ``bc_py::normalize_to``: Int8/16/32 and every unsigned int normalize to
-    ``int64``; Float16/32 normalize to ``float64``. The widening **recurses into nested
-    types** — a ``struct<a: int32>`` becomes ``struct<a: int64>`` and a ``list<float32>``
-    becomes ``list<float64>`` — because the boundary widens a narrow numeric at every
-    nesting depth, so a narrow field buried in a struct/list must be predicted widened too
-    or ``Dataset.schema`` would lie (and later arithmetic on the widened engine value would
-    disagree with the inferred narrow type). Booleans, strings, and dictionaries are
-    unchanged. Idempotent.
+    ``int64``; Float16/32 normalize to ``float64``; ``LargeUtf8`` normalizes to ``string``;
+    a ``dictionary`` column is **decoded to its value type** (then widened). The widening
+    **recurses into nested types** — a ``struct<a: int32>`` becomes ``struct<a: int64>`` and
+    a ``list<float32>`` becomes ``list<float64>`` — because the boundary widens a narrow
+    numeric at every nesting depth, so a narrow field buried in a struct/list must be
+    predicted widened too or ``Dataset.schema`` would lie (and later arithmetic on the
+    widened engine value would disagree with the inferred narrow type). Booleans and
+    strings are unchanged. Idempotent.
+
+    The dictionary and ``LargeUtf8`` arms are what make this an actual mirror. Leaving them
+    out did make ``Dataset.schema`` lie in exactly the way the paragraph above warns
+    against: a dictionary-encoded column — what Parquet emits natively for a
+    low-cardinality string — was reported as ``dictionary<values=string, indices=int32>``
+    while ``collect()`` returned plain ``string``, which is what the boundary produces and
+    what ``test_dictionary_decodes_to_value_type`` already pinned. Worse than a cosmetic
+    lie: joining such a column against a plain-string one was rejected at build time with
+    "join key type mismatch: left is dictionary<...> but right is string" for a join the
+    engine would have run correctly, because both sides reach it decoded.
     """
+    if pa.types.is_dictionary(dt):
+        return widen(dt.value_type)
+    if pa.types.is_large_string(dt):
+        return pa.string()
     if pa.types.is_integer(dt):
         # All narrow + unsigned ints normalize to int64 at the boundary; int64
         # itself is already wide and unchanged.

@@ -25,8 +25,9 @@ at a slower pace: {doc}`../tutorials/first-pipeline` builds a pipeline from noth
 
 ## Recipe collections
 
-Four cookbooks, grouped by the kind of problem rather than the API used. Each collection
-opens by naming the traps its recipes exist to avoid.
+Four collections, grouped by the kind of problem rather than the API used. Each one
+opens by naming the traps its recipes exist to avoid. If you would rather browse by the
+API surface a recipe exercises, that is the {doc}`../cookbook/index` instead.
 
 - {doc}`data-engineering/index`: ingest, reconcile, and repair tables.
 - {doc}`analytics/index`: cohorts, funnels, sessions, and rankings.

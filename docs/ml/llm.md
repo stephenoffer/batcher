@@ -332,7 +332,7 @@ captions = llm_generate(
 
 `ds.ml.embed` with a sentence-transformers model id embeds a text `column`, loading
 the model once per worker and scheduling it across GPU actors. It is the
-retrieval-pipeline companion to [vector search](vector-search.md). It appends one
+retrieval-pipeline companion to {doc}`vector search <vector-search>`. It appends one
 fixed-width vector column named by `output_column` and keeps the dataset lazy.
 `num_gpus` reserves an accelerator fraction per worker, `concurrency` sets the worker
 count as an int or an autoscaling `(min, max)` range, and `batch_size` controls how many
@@ -362,8 +362,8 @@ columns you can query, and measuring whether it was any good:
 - {doc}`llm-evaluation`: scoring generations against a reference, and the single-scan
   monitors for running generation at scale.
 
-## Next steps
+## See also
 
-- [Inference](inference.md): the general batch-inference and embedding path.
-- [Serving](serving.md): expose a model behind an endpoint.
-- [GPU scheduling](gpu.md): how `num_gpus` and `concurrency` map to actors.
+- {doc}`Inference <inference>`: the general batch-inference and embedding path.
+- {doc}`Serving <serving>`: expose a model behind an endpoint.
+- {doc}`GPU scheduling <gpu>`: how `num_gpus` and `concurrency` map to actors.

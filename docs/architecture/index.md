@@ -39,6 +39,12 @@ Kyber's passes, cost-based choices, and adaptive re-optimization.
 :link-type: doc
 Retries, shuffle recompute, epoch fencing, and backpressure.
 :::
+
+:::{grid-item-card} {octicon}`milestone;1.1em` What makes Batcher different
+:link: differentiators
+:link-type: doc
+The six design decisions that separate it from DuckDB, Spark, and Ray Data, and where each one stops.
+:::
 ::::
 
 ```{toctree}
@@ -48,4 +54,5 @@ overview
 execution
 optimization
 fault-tolerance
+differentiators
 ```

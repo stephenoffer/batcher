@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 
 from batcher._internal.mathx import ceil_div
 
@@ -23,6 +24,49 @@ __all__ = [
     "cgroup_v2_dirs",
     "read_cgroup_bytes",
 ]
+
+
+#: How long a sampled contention reading is reused before the cgroup files are re-read.
+#:
+#: The probes below are the only ones here that read a *changing* value, so they cannot be
+#: memoized for the process lifetime the way the quota and hierarchy probes are. They were
+#: therefore not memoized at all — and they run on every terminal op, costing up to twelve
+#: `open`+parse round trips (four cgroup levels x three resources) plus `cpu.stat`. On a
+#: minimal warm query that measured **~0.2-0.35 ms, about what executing the query itself
+#: cost**, which is a real tax on the sub-second-small-query mandate.
+#:
+#: A short TTL is not a precision trade here, because none of these values is instantaneous
+#: to begin with: PSI reports a **10-second** rolling average, and `cpu.stat`'s counters are
+#: monotonic over the process lifetime. Re-reading a 10-second average more than four times
+#: a second cannot observe anything a quarter-second-old sample missed. 250 ms still
+#: oversamples the underlying window by 40x, so every consumer sees the same verdict it did
+#: before while the file reads collapse to a handful per second.
+_CONTENTION_TTL_S = 0.25
+
+
+def _ttl_cached(fn):
+    """Memoize a zero-argument probe for `_CONTENTION_TTL_S`, `lru_cache`-shaped.
+
+    Exposes `cache_clear` so `reset_hardware_probes` clears it through exactly the same
+    mechanism as every `functools.lru_cache` probe in this package — a test faking `/sys`
+    resets one way, not two.
+    """
+    state: dict[str, object] = {"expires": 0.0, "value": None, "primed": False}
+
+    @functools.wraps(fn)
+    def wrapper():
+        now = time.monotonic()
+        if state["primed"] and now < state["expires"]:
+            return state["value"]
+        value = fn()
+        state.update(expires=now + _CONTENTION_TTL_S, value=value, primed=True)
+        return value
+
+    def cache_clear() -> None:
+        state.update(expires=0.0, value=None, primed=False)
+
+    wrapper.cache_clear = cache_clear  # type: ignore[attr-defined]
+    return wrapper
 
 
 def _quota_cores(quota: int, period: int) -> int | None:
@@ -134,6 +178,7 @@ def _cgroup_stat(base: str, name: str) -> dict[str, int]:
         return {}
 
 
+@_ttl_cached
 def cgroup_throttled_ratio() -> float | None:
     """Share of CFS periods in which this cgroup was throttled, or `None` if unreadable.
 
@@ -141,6 +186,9 @@ def cgroup_throttled_ratio() -> float | None:
     this is a lifetime average rather than a live reading — enough to answer "is the quota
     binding at all", which is the question that distinguishes a throttled container from an
     under-parallelized query.
+
+    Sampled at most every `_CONTENTION_TTL_S`; see that constant for why a lifetime average
+    loses nothing to a quarter-second-old reading.
 
     Returns:
         Throttled period fraction in [0, 1], or `None` when the counters are unavailable.
@@ -169,9 +217,19 @@ def cgroup_pressure() -> dict[str, float]:
     resource whose file is absent (PSI off, cgroup v1, not Linux) is omitted rather than
     reported as zero, which would read as "no pressure" when it means "no measurement".
 
+    Sampled at most every `_CONTENTION_TTL_S`; see that constant for why a 10-second rolling
+    average loses nothing to a quarter-second-old reading. A fresh dict per call, because the
+    memo must not hand the same mutable mapping to every caller.
+
     Returns:
         The available stall shares, each in [0, 1], keyed by resource.
     """
+    return dict(_cgroup_pressure_sampled())
+
+
+@_ttl_cached
+def _cgroup_pressure_sampled() -> dict[str, float]:
+    """The TTL-sampled PSI read behind `cgroup_pressure` — never handed out directly."""
     out: dict[str, float] = {}
     # Leaf-most first: pressure on our own slice is what binds us, and a parent's figure folds
     # in every sibling's stalls, which we neither cause nor can act on.

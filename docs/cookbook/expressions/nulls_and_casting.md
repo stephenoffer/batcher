@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/nulls_and_casting.py
 ```
+
+## See also
+
+- {doc}`lists_vectors`: embedding vectors as list columns: similarity, distance, and normalization.
+- {doc}`numeric_math`: arithmetic and math functions on numeric columns.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

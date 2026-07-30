@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 400" role="img" width="980" height="400"><defs><style>
+  .surf { fill: #ffffff; }
+  .plot { fill: #f8fafc; stroke: #e2e8f0; }
+  .win { fill: #2563eb; }
+  .loss { fill: #d97706; }
+  .parity { stroke: #64748b; }
+  .t-head { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-val { fill: #1e293b; }
+  @media (prefers-color-scheme: dark) {
+    .surf { fill: #131c31; }
+    .plot { fill: #0f172a; stroke: #243049; }
+    .win { fill: #60a5fa; }
+    .loss { fill: #f59e0b; }
+    .parity { stroke: #94a3b8; }
+    .t-head { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-val { fill: #e2e8f0; }
+  }
+</style></defs><rect x="0" y="0" width="980" height="400" rx="14" class="surf"/><text x="40" y="50" font-family="Helvetica,Arial,sans-serif" font-size="19" font-weight="700" class="t-head">TPC-H scale factor 10, all 22 queries</text><text x="40" y="74" font-family="Helvetica,Arial,sans-serif" font-size="13" class="t-sub">Batcher total 4,453 ms on 96 cores, correctness-gated. Bars show the suite ratio against each engine.</text><line x1="500" y1="100" x2="500" y2="304" class="parity" stroke-width="1.6" stroke-dasharray="5 4"/><text x="500" y="324" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-sub">1.0x parity</text><text x="514" y="112" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Batcher ahead &#8594;</text><text x="486" y="112" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">&#8592; Batcher behind</text><text x="40" y="140" font-family="Helvetica,Arial,sans-serif" font-size="14.5" font-weight="700" class="t-head">DuckDB on the same Arrow</text><text x="40" y="158" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">like-for-like: identical zero-copy input</text><rect x="500" y="120" width="133.49999999999997" height="44" rx="5" class="win"/><text x="645.5" y="142" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="700" class="t-val">1.89x faster</text><text x="645.5" y="159" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">wins 21 of 22 (q9 a tie at 1.01x)</text><text x="40" y="206" font-family="Helvetica,Arial,sans-serif" font-size="14.5" font-weight="700" class="t-head">Polars</text><text x="40" y="224" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">same Arrow input</text><rect x="500" y="186" width="188.99999999999997" height="44" rx="5" class="win"/><text x="701.0" y="208" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="700" class="t-val">2.26x faster</text><text x="701.0" y="225" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">wins 17 of 22</text><text x="40" y="272" font-family="Helvetica,Arial,sans-serif" font-size="14.5" font-weight="700" class="t-head">DuckDB, native store</text><text x="40" y="290" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">its own compressed format, no Arrow ingest</text><rect x="338.0" y="252" width="162.0" height="44" rx="5" class="loss"/><text x="326.0" y="274" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="700" class="t-val">2.08x behind</text><text x="326.0" y="291" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">wins 4 of 22</text><text x="40" y="356" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Source: benchmarks/BENCHMARK_RESULTS.md, 2026-07-27. Ratios are suite totals; only Batcher (4,453 ms) and DuckDB-on-Arrow (8,436 ms) have</text><text x="40" y="374" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">recorded absolute totals, so the other bars are plotted from their stated ratios. The box was shared during the run, and the entry notes totals swing about 25%.</text></svg>

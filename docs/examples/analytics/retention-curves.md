@@ -32,7 +32,7 @@ print(activity.count())
 
 ## Cohort and day number
 
-Same skeleton as [cohort analysis](cohort-analysis.md), in days rather than months. The
+Same skeleton as {doc}`cohort analysis <cohort-analysis>`, in days rather than months. The
 cohort is the user's first active day, and `day_n` is days since then.
 
 Dates do not subtract and window aggregates do not reduce a `Date32`, so convert to an
@@ -218,13 +218,13 @@ print(approx.to_pydict()["active"])
 ## See also
 
 :::{seealso}
-- [Cohort analysis](cohort-analysis.md): the same skeleton, measured in months and revenue.
-- [A/B testing](ab-testing.md): the other page where the denominator has to come from the
+- {doc}`Cohort analysis <cohort-analysis>`: the same skeleton, measured in months and revenue.
+- {doc}`A/B testing <ab-testing>`: the other page where the denominator has to come from the
   assignment rather than from the behaviour.
-- [Aggregations](../../user-guide/aggregations.md): `n_unique` and its sketch-backed twin.
-- [Window functions](../../user-guide/window-functions.md): `min().over(...)` and the rest.
-- [Pivoting](../../user-guide/pivoting.md): laying the days out across the top.
-- [Aggregation internals](../../deep-dives/aggregation-internals.md): why the HyperLogLog
+- {doc}`Aggregations <../../user-guide/aggregations>`: `n_unique` and its sketch-backed twin.
+- {doc}`Window functions <../../user-guide/window-functions>`: `min().over(...)` and the rest.
+- {doc}`Pivoting <../../user-guide/pivoting>`: laying the days out across the top.
+- {doc}`Aggregation internals <../../deep-dives/aggregation-internals>`: why the HyperLogLog
   sketch merges across partitions and the exact count does not.
-- [Dataset API](../../api/dataset.md): `group_by`, `join`, `pivot`.
+- {doc}`Dataset API <../../api/dataset>`: `group_by`, `join`, `pivot`.
 :::

@@ -209,7 +209,7 @@ you a row. That asymmetry is why you can trust it without checking it.
 
 On a 200-file Delta table, that mechanism takes a `count(*) WHERE day = 42` from 98.8 ms
 reading 200 files to 7.4 ms reading one, past DuckDB's `delta_scan` at 21.8 ms.
-See [vs DuckDB](../benchmarks/vs-duckdb.md).
+See {doc}`vs DuckDB <../benchmarks/vs-duckdb>`.
 
 ## 9. Do it on a cluster
 
@@ -286,13 +286,13 @@ Validate and quarantine before you commit.
 
 ## See also
 
-- [Delta Lake integration](../integrations/delta-lake.md) and
-  [Iceberg](../integrations/iceberg.md): the connectors underneath.
-- [Writing data](../user-guide/writing-data.md): every write mode, in one place.
-- [vs DuckDB](../benchmarks/vs-duckdb.md): the file-skipping measurement, and the optimizer
+- {doc}`Delta Lake integration <../integrations/delta-lake>` and
+  {doc}`Iceberg <../integrations/iceberg>`: the connectors underneath.
+- {doc}`Writing data <../user-guide/writing-data>`: every write mode, in one place.
+- {doc}`vs DuckDB <../benchmarks/vs-duckdb>`: the file-skipping measurement, and the optimizer
   bug that used to break it.
-- [Partition backfill](../examples/data-engineering/partition-backfill.md) and
-  [slowly changing dimensions](../examples/data-engineering/slowly-changing-dimensions.md):
+- {doc}`Partition backfill <../examples/data-engineering/partition-backfill>` and
+  {doc}`slowly changing dimensions <../examples/data-engineering/slowly-changing-dimensions>`:
   the recipes step 7 generalizes to.
-- [Governance](../user-guide/governance.md): row filters and column masks on the curated
+- {doc}`Governance <../user-guide/governance>`: row filters and column masks on the curated
   table.

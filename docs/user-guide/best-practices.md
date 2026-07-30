@@ -125,7 +125,7 @@ only on a big job.
 
 ## See also
 
-- [Performance and memory](performance.md): caching, spill, and the adaptive knobs.
-- [Data quality](data-quality.md): validate and enforce a contract on inputs.
-- [Distributed fault tolerance](../architecture/fault-tolerance.md): how the engine
+- {doc}`Performance and memory <performance>`: caching, spill, and the adaptive knobs.
+- {doc}`Data quality <data-quality>`: validate and enforce a contract on inputs.
+- {doc}`Distributed fault tolerance <../architecture/fault-tolerance>`: how the engine
   recovers from node and task failures.

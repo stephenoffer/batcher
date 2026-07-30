@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/metrics/text_formatting.py
 ```
+
+## See also
+
+- {doc}`text_diversity`: degeneracy detection: repetition, truncation, refusal, and empty output.
+- {doc}`text_length`: length and readability distribution over a text column.
+- {doc}`../../ml/evaluation`: scoring a model, per segment, in one pass.
+- {doc}`../../api/metrics`: the complete metric vocabulary.

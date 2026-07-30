@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/grouping.py
 ```
+
+## See also
+
+- {doc}`dq_contracts`: data-quality contracts: validate, fail, drop, or quarantine.
+- {doc}`iteration`: getting results out: batches, rows, slices, and the single-value cases.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

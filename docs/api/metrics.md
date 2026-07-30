@@ -15,7 +15,7 @@ instead, on {doc}`ml-models`.
 
 Scoring aggregates over a column of labels and a column of predictions. They are ordinary
 aggregates, so they compose with `group_by(...).agg(...)` to score per segment in one pass.
-See the [model evaluation guide](../ml/evaluation.md).
+See the {doc}`model evaluation guide <../ml/evaluation>`.
 
 The classification metrics take a label column and a predicted-label column, plus
 `positive=` to say which label value counts as positive:
@@ -325,7 +325,7 @@ drift or emoji spam.
 ## Statistical analysis
 
 Descriptive and inferential statistics as aggregates. See the
-[model evaluation guide](../ml/evaluation.md).
+{doc}`model evaluation guide <../ml/evaluation>`.
 
 ```{eval-rst}
 .. autosummary::

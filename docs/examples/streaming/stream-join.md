@@ -193,16 +193,16 @@ one-sided stream is a broken pipeline, and a bigger budget only delays the diagn
 
 ## See also
 
-- [Late data and watermarks](late-data-watermarks.md): how the watermark that evicts this
+- {doc}`Late data and watermarks <late-data-watermarks>`: how the watermark that evicts this
   buffer is computed.
-- [Windowed aggregation](windowed-aggregation.md): the other operator this watermark bounds.
-- [Exactly-once sinks](exactly-once-sink.md): what you would have had, if this join could
+- {doc}`Windowed aggregation <windowed-aggregation>`: the other operator this watermark bounds.
+- {doc}`Exactly-once sinks <exactly-once-sink>`: what you would have had, if this join could
   reach a sink.
-- [Joins](../../user-guide/joins.md): the bounded join surface, including the outer joins
+- {doc}`Joins <../../user-guide/joins>`: the bounded join surface, including the outer joins
   the streaming path does not have.
-- [Streaming](../../user-guide/streaming.md): sources, sinks, watermarks, and the query handle.
-- [Join algorithms](../../deep-dives/join-algorithms.md): what the bounded join does with the
+- {doc}`Streaming <../../user-guide/streaming>`: sources, sinks, watermarks, and the query handle.
+- {doc}`Join algorithms <../../deep-dives/join-algorithms>`: what the bounded join does with the
   build side that the streaming one cannot.
-- [Kafka integration](../../integrations/kafka.md): the two topics above.
-- [Multi-source join](../data-engineering/multi-source-join.md): the batch recipe for the same
+- {doc}`Kafka integration <../../integrations/kafka>`: the two topics above.
+- {doc}`Multi-source join <../data-engineering/multi-source-join>`: the batch recipe for the same
   attribution question.

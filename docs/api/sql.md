@@ -221,8 +221,8 @@ print(out.to_pydict())
 # {'id': [3, 4, 5], 'amount': [30.0, 40.0, 50.0]}
 ```
 
-## Next steps
+## See also
 
-- [SQL user guide](../user-guide/sql.md): a guided tour with runnable queries.
-- [Dataset](dataset.md): the DataFrame surface SQL lowers to.
-- [Expressions](expressions.md): the scalar functions available in projections.
+- {doc}`SQL user guide <../user-guide/sql>`: a guided tour with runnable queries.
+- {doc}`Dataset <dataset>`: the DataFrame surface SQL lowers to.
+- {doc}`Expressions <expressions>`: the scalar functions available in projections.

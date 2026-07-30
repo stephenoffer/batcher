@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/preprocessing_scaling.py
 ```
+
+## See also
+
+- {doc}`preprocessing_imputation`: filling missing values, and keeping the fact that they were missing.
+- {doc}`text_features`: turning raw text into model-ready features without a model.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

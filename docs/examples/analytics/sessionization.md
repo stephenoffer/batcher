@@ -220,14 +220,14 @@ than "everyone uses 30".
 ## See also
 
 :::{seealso}
-- [Funnel analysis](funnel-analysis.md): scope a funnel to one session by grouping on
+- {doc}`Funnel analysis <funnel-analysis>`: scope a funnel to one session by grouping on
   `(user, session)` instead of `user`.
-- [Time-series rollups](time-series-rollups.md): the other side of the clock, where the
+- {doc}`Time-series rollups <time-series-rollups>`: the other side of the clock, where the
   bucket is fixed and the gaps are the problem.
-- [Window functions](../../user-guide/window-functions.md): `lag`, frames, and `cum_sum`.
-- [Streaming](../../user-guide/streaming.md): the same sessions computed incrementally,
+- {doc}`Window functions <../../user-guide/window-functions>`: `lag`, frames, and `cum_sum`.
+- {doc}`Streaming <../../user-guide/streaming>`: the same sessions computed incrementally,
   with a watermark bounding how long a session stays open.
-- [Window internals](../../deep-dives/window-internals.md): the partition-sort-scan the
+- {doc}`Window internals <../../deep-dives/window-internals>`: the partition-sort-scan the
   three window expressions above share.
-- [Expressions API](../../api/expressions.md): `lag`, `cum_sum`, `dt.epoch`.
+- {doc}`Expressions API <../../api/expressions>`: `lag`, `cum_sum`, `dt.epoch`.
 :::

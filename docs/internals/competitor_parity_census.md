@@ -24,7 +24,7 @@ call per signature, run it in both engines, and sort the results into *matches*,
 The mismatches are the valuable column — a gap is an honest refusal, a mismatch is a
 wrong answer nobody has noticed.
 
-**Counting rule** (carried from `engine_improvements_ledger.md`). An entry is a change to
+**Counting rule.** An entry is a change to
 behaviour that is verified by a committed test. A refactor, a doc, or an unproven change
 is not an entry. The rule exists because the temptation on a "make N improvements" task is
 to inflate the count, and an inflated ledger is worse than a short one.

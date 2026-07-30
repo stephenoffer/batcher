@@ -24,22 +24,58 @@ load-bearing rather than defensive:
 2. **Retire a source's replicas when it is recomputed** — done by the caller, which owns
    the lineage.
 
-Scope: this serves the flat aggregate reduce. A wide shuffle (``workers > fan_in``)
-reduces through the combiner tree, which does not thread replicas yet and still degrades
-to recompute.
+Scope: every Flight shuffle — aggregate (flat reduce and combiner tree), join, sort, and
+window. Nothing here is aggregate-specific: a shuffle is a set of published buckets keyed
+by ``(src, bucket)``, and that is all a replica copies, which is why one placement
+function serves all four operators.
 """
 
 from __future__ import annotations
 
 import contextlib
 
+from batcher._internal import events
 from batcher._internal.logging import note_suppressed
 from batcher.dist.flight_worker import current_plan_id
 
-__all__ = ["replicate_shuffle_output"]
+__all__ = ["replicate_shuffle_output", "retire_replicas"]
 
 
-def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
+def retire_replicas(replicas, src: int, worker: int, shuffle: str) -> None:
+    """Drop source `src`'s advertised replicas, before its output is recomputed.
+
+    Every shuffle's recovery path must call this *before* it republishes a lost source.
+    A replica was copied under the ticket of the epoch it was taken at; a recompute
+    reincarnates the source to the next epoch, so the replica's ticket no longer
+    resolves — and an unregistered ticket reads back as an **empty bucket rather than an
+    error**. A reducer allowed to fall over to the stale copy would therefore silently
+    drop that mapper's rows and return a wrong answer with nothing turning red. See the
+    epoch invariant in this module's docstring.
+
+    A no-op when replication is off (`replicas is None`), so a caller never has to guard.
+
+    Args:
+        replicas: The per-source replica lists, mutated in place, or `None`.
+        src: The source whose output is about to be recomputed.
+        worker: The worker that held it, for the recovery event.
+        shuffle: Which shuffle this is (`aggregate`/`join`/`sort`/`window`), for the event.
+    """
+    if replicas is None or src >= len(replicas):
+        return
+    if replicas[src]:
+        events.publish(
+            events.RECOVERY,
+            name=shuffle,
+            event="replica_retired",
+            shuffle=shuffle,
+            src=src,
+            worker=worker,
+            replicas=len(replicas[src]),
+        )
+    replicas[src] = []
+
+
+def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0,)):
     """Place a second copy of every mapper's buckets on an off-node survivor.
 
     Best-effort by construction: anything that fails leaves that source unreplicated and
@@ -51,6 +87,11 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
         n_reducers: Bucket count per mapper, so a replica copies every one of them.
         workers: Live worker count.
         dead: Workers already known gone; never given a copy to hold.
+        stages: The shuffle stages this operator published. Aggregate, sort and window
+            each publish one (stage 0); a **join publishes two** — the left side on stage
+            0 and the right on stage 1, under one address. A replica of a join mapper is
+            only usable if it holds *both*, so every stage's ack is required before the
+            host is advertised (see the all-or-nothing rule below).
 
     Returns:
         ``replicas[src] = [addr, ...]`` for the reduce gather to fall over to, or ``None``
@@ -85,13 +126,16 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
         return None
 
     assignment = assign_replica_hosts(primaries, nodes, factor, frozenset(dead or ()))
-    refs: dict[tuple[int, int], object] = {}
+    refs: dict[tuple[int, int], list[object]] = {}
     for src, hosts in assignment.items():
         for host in hosts:
             with contextlib.suppress(Exception):
-                refs[(src, host)] = actors[host].replicate_buckets.remote(
-                    addrs[src], src, n_reducers, 0, 0, current_plan_id()
-                )
+                refs[(src, host)] = [
+                    actors[host].replicate_buckets.remote(
+                        addrs[src], src, n_reducers, stage, 0, current_plan_id()
+                    )
+                    for stage in stages
+                ]
 
     replicas: list[list[str]] = [[] for _ in range(len(addrs))]
     if not refs:
@@ -102,13 +146,21 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead):
     # `ray.wait` for all of them makes the waiting concurrent, and reading each ref
     # afterwards keeps the per-source error isolation the degradation story depends on: a
     # source whose replica never acked must keep recompute, not fail the query.
-    pending = list(refs.values())
+    pending = [ref for stage_refs in refs.values() for ref in stage_refs]
     with contextlib.suppress(Exception):
         ray.wait(pending, num_returns=len(pending))
-    for (src, _host), ref in refs.items():
+    for (src, _host), stage_refs in refs.items():
         try:
-            replicas[src].append(ray.get(ref))
+            # All-or-nothing *across stages*, for the same reason `replicate_buckets` is
+            # all-or-nothing across buckets: a join replica holding the left side but not
+            # the right is a half-filled copy, and an unregistered ticket reads back as an
+            # empty bucket rather than an error — so a reducer falling over to it would
+            # silently emit an under-joined result. Every stage acks or the host is not
+            # advertised at all. Each ack is this host's address, so any one of them names it.
+            acks = [ray.get(ref) for ref in stage_refs]
         except Exception as exc:  # unacked ⇒ never advertised; that source keeps recompute
             note_suppressed("dist", "collect a replica acknowledgement", exc)
             continue
+        if acks:
+            replicas[src].append(acks[0])
     return replicas if any(replicas) else None

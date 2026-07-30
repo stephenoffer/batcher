@@ -26,6 +26,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
+from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Window
 
@@ -94,12 +95,26 @@ def execute_window_flight(
             ),
         )
 
+        # Placed HERE, as soon as the buckets exist and before anything can take a worker
+        # away — replicating after a loss would be probing a corpse. `None` (the default
+        # factor of 1) leaves the reduce byte-identical to the unreplicated path.
+        replicas = replicate_shuffle_output(actors, addrs, n_buckets, workers, dead)
+
         if _fault_inject:
             for i in _fault_inject:
                 ray.kill(actors[i])
 
         batches = _window_reduce_with_recovery(
-            actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=dead
+            actors,
+            addrs,
+            parts,
+            map_ir,
+            key_names,
+            win_json,
+            n_buckets,
+            workers,
+            dead=dead,
+            replicas=replicas,
         )
     finally:
         release_fleet(actors, pg, owns)
@@ -113,14 +128,15 @@ def execute_window_flight(
 
 
 def _window_reduce_with_recovery(
-    actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=None
+    actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=None, replicas=None
 ):
     """Run the window reduce under recompute-on-worker-loss recovery.
 
-    A reducer that reports an unreachable mapper (or whose host died) drives a
-    recompute of that worker's row bucket from its on-disk source partition onto a
-    survivor, then a retry — matching the aggregate/join paths. Returns the windowed
-    batches. `dead` seeds the workers the map barrier already lost.
+    A reducer that reports an unreachable mapper (or whose host died) fetches the
+    byte-identical bucket from a `replicas` survivor; only a source whose every copy is
+    gone drives a recompute from its on-disk source partition onto a survivor, then a
+    retry — matching the aggregate/join paths. Returns the windowed batches. `dead` seeds
+    the workers the map barrier already lost.
     """
     import ray
 
@@ -128,10 +144,13 @@ def _window_reduce_with_recovery(
 
     def remote_reduce(host: int, bucket: int):
         return actors[host].reduce_window.remote(
-            win_json, addrs, bucket, None, None, current_plan_id()
+            win_json, addrs, bucket, None, replicas, current_plan_id()
         )
 
     def republish(target: int, src: int) -> None:
+        # Retire before republishing — a replica taken at the old epoch reads back as an
+        # empty bucket, not an error. See `dist/shuffle_replication.py::retire_replicas`.
+        retire_replicas(replicas, src, target, "window")
         addrs[src] = ray.get(
             actors[target].map_publish_raw.remote(
                 map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
@@ -146,6 +165,8 @@ def _window_reduce_with_recovery(
         remote_reduce=remote_reduce,
         republish=republish,
         dead=dead,
+        mapper_addrs=addrs,
+        replicas=replicas,
     )
     out: list[pa.RecordBatch] = []
     for res in done.values():

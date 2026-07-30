@@ -222,13 +222,13 @@ same paragraph and the model will pick one at random.
 
 ## See also
 
-- [Text embeddings](text-embeddings.md): the encoder stage in detail.
-- [LLM batch scoring](llm-batch-scoring.md): engines, prompt templates, typed outputs.
-- [RAG](../../ml/rag.md) and [vector search](../../ml/vector-search.md): the retrieval surface
+- {doc}`Text embeddings <text-embeddings>`: the encoder stage in detail.
+- {doc}`LLM batch scoring <llm-batch-scoring>`: engines, prompt templates, typed outputs.
+- {doc}`RAG <../../ml/rag>` and {doc}`vector search <../../ml/vector-search>`: the retrieval surface
   end to end.
-- [Embeddings](../../ml/embeddings.md): encoders, normalization, and the distance kernels.
-- [Multimodal](../../ml/multimodal.md): `build_vector_index`, `vector_search`, and the
+- {doc}`Embeddings <../../ml/embeddings>`: encoders, normalization, and the distance kernels.
+- {doc}`Multimodal <../../ml/multimodal>`: `build_vector_index`, `vector_search`, and the
   `.list` distance expressions.
-- [ML API reference](../../api/ml.md): `str.chunk`, `ds.ml.embed`, `ds.ml.generate`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the throughput figures quoted above.
-- [Tensor columns](../../deep-dives/tensor-columns.md): how the vectors are stored and shipped.
+- {doc}`ML API reference <../../api/ml>`: `str.chunk`, `ds.ml.embed`, `ds.ml.generate`.
+- {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: the throughput figures quoted above.
+- {doc}`Tensor columns <../../deep-dives/tensor-columns>`: how the vectors are stored and shipped.

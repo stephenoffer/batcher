@@ -239,14 +239,14 @@ print(people.unnest("person").to_pydict())
 ```
 
 To reach a single field without flattening the whole struct, use the `.struct` and
-`.json` accessors (see [Expressions](expressions.md)) in a `select`: `.struct.field(name)`
+`.json` accessors (see {doc}`Expressions <expressions>`) in a `select`: `.struct.field(name)`
 projects one struct field, and `.json.extract_int(path)` (and its typed siblings)
 reads a value from a JSON-text column by JSONPath without a decode step. Explode a
 list of structs first, then `unnest`, to flatten a nested array of records into a
 flat table.
 
-## Next steps
+## See also
 
-- [Filtering](filtering.md): row selection, deduplication, limits.
-- [Aggregations](aggregations.md): grouped and global summaries.
-- [Dataset API](../api/dataset.md): the full method reference for every transformation.
+- {doc}`Filtering <filtering>`: row selection, deduplication, limits.
+- {doc}`Aggregations <aggregations>`: grouped and global summaries.
+- {doc}`Dataset API <../api/dataset>`: the full method reference for every transformation.

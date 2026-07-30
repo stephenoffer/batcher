@@ -84,8 +84,8 @@ print(out.to_pydict())
 # {'code': [82, 82, 99], 'bytes': [6, 6, 5], 'dist': [3, 1, 7], 'phonetic': ['R163', 'R163', 'C100']}
 ```
 
-`hamming(target)` counts the positions at which two equal-length strings differ — the
-right distance for fixed-width codes — and `jaccard(target)` scores the overlap of two
+`hamming(target)` counts the positions at which two equal-length strings differ, which is the
+right distance for fixed-width codes. `jaccard(target)` scores the overlap of two
 values' character sets. `hamming` raises on unequal lengths rather than comparing a
 prefix, because a prefix comparison answers a caller's mistake with a plausible number.
 
@@ -456,7 +456,7 @@ print(out.to_pydict())
 
 ### Inspecting a document's shape
 
-Extraction assumes you already know the document. When you don't, these methods answer questions about its structure instead. `structure()` renders the shape with each leaf replaced by its type name — the thing to group by when finding out what shapes a column holds; `value(path)` returns a scalar's JSON token and null for a container (DuckDB draws that line between `json_value` and `json_extract_string`); `contains(value)` tests membership; `pretty()` re-renders for a human. `array_length(path)` counts elements without
+Extraction assumes you already know the document. When you don't, these methods answer questions about its structure instead. `structure()` renders the shape with each leaf replaced by its type name, which is the thing to group by when finding out what shapes a column holds. `value(path)` returns a scalar's JSON token and null for a container (DuckDB draws that line between `json_value` and `json_extract_string`); `contains(value)` tests membership; `pretty()` re-renders for a human. `array_length(path)` counts elements without
 parsing any of them, `keys(path)` lists an object's keys in source order, `type_of(path)`
 names the JSON type so you can route a field whose type varies row to row, and
 `exists(path)` reports presence.

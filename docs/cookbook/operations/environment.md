@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/operations/environment.py
 ```
+
+## See also
+
+- {doc}`configuration`: configuring the engine: options, scoped overrides, and profiles.
+- {doc}`error_handling`: the exception hierarchy: catching the failure you meant to catch.
+- {doc}`../../user-guide/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`../../user-guide/observability`: what the engine records about a run, and where.

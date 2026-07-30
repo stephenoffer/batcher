@@ -1,7 +1,7 @@
 # Hardening a deployment
 
 This page covers the settings to change before running Batcher somewhere that matters, and
-— just as importantly — the boundaries Batcher does not enforce, so you can put a real one
+and, just as importantly, the boundaries Batcher does not enforce, so you can put a real one
 around it.
 
 Read {doc}`governance` first for what row filters and column masks do. This page is about
@@ -18,8 +18,8 @@ into your process, and code already inside a process cannot be kept out of it.
 
 So the trust boundary is **the process**, and the deployment pattern that follows is:
 
-- Run one process per trust domain. Authenticate at the layer that has a network edge —
-  your notebook server, API gateway, or job submitter — and pass the identity it
+- Run one process per trust domain. Authenticate at the layer that has a network edge,
+  meaning your notebook server, API gateway, or job submitter, and pass the identity it
   established into `bt.security(...)`.
 - Treat "who is running this query" as answered before Batcher starts, not by Batcher.
 
@@ -55,7 +55,7 @@ print(strict.governance.mode)
 ```
 
 Under `strict`, a read that no `security()` block covers raises `AccessDeniedError`. So
-does a source that cannot be governed at all — an in-memory table or a live stream has no
+does a source that cannot be governed at all. An in-memory table or a live stream has no
 durable name to write a policy about, so it is refused rather than silently exempted.
 
 ```{tip}
@@ -211,7 +211,7 @@ Point `memory.spill_dir` at a volume you control rather than a shared `/tmp`.
 
 Pass keys and credentials by reference, never inline. An inline key is embedded in the
 query plan, and therefore in any plan log, profile, or `explain()` output. See
-{doc}`secrets` for the `env:`, `file:`, and `cmd:` reference schemes — `cmd:` is how you
+{doc}`secrets` for the `env:`, `file:`, and `cmd:` reference schemes. `cmd:` is how you
 reach Vault, AWS Secrets Manager, or Google Secret Manager without Batcher linking a cloud
 SDK.
 
@@ -222,7 +222,7 @@ When the hub is shared across a fleet (the Redis or object-storage backends), so
 everything in it.
 
 Inside a `security()` block, columns that are masked or invisible to the running principal
-keep only their cardinalities — row counts, null counts, distinct estimates. Value-derived
+keep only their cardinalities: row counts, null counts, and distinct estimates. Value-derived
 statistics are dropped, because a bloom filter over a governed column answers membership
 questions about its values, and `min`/`max` are two of those values outright.
 
@@ -255,6 +255,7 @@ Before a deployment that matters, complete the following:
 
 ## See also
 
-- {doc}`governance` — writing the row filters and column masks this page makes mandatory.
-- {doc}`secrets` — reference schemes for keys and credentials.
-- {doc}`observability` — what the engine records about a query, and where.
+- {doc}`governance`: writing the row filters and column masks this page makes mandatory.
+- {doc}`secrets`: reference schemes for keys and credentials.
+- {doc}`observability`: what the engine records about a query, and where.
+- {doc}`cloud-storage`: how credentials reach an object store in the first place.

@@ -86,7 +86,7 @@ next to its measured one, and the UDF carries none.
 :::{warning}
 That absence is the diagnosis. A `map_batches` is a Python callback: the optimizer cannot
 see inside it, cannot know what columns it reads, and cannot know what it does to the row
-count. It is a wall in the middle of the plan — the engine can time it, but it cannot plan
+count. It is a wall in the middle of the plan. The engine can time it, but it cannot plan
 around it.
 :::
 
@@ -304,13 +304,13 @@ Where the engine is fast, and where it is not.
 
 ## See also
 
-- [Explain plans](../user-guide/explain-plans.md): every field in the output you just read.
-- [UDFs](../user-guide/udfs.md): when a `map_batches` *is* the right answer, and how to make
+- {doc}`Explain plans <../user-guide/explain-plans>`: every field in the output you just read.
+- {doc}`UDFs <../user-guide/udfs>`: when a `map_batches` *is* the right answer, and how to make
   it cost less.
-- [Caching](../user-guide/caching.md): what `cache()` stores, and when it is evicted.
-- [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): the pipeline-breaker
+- {doc}`Caching <../user-guide/caching>`: what `cache()` stores, and when it is evicted.
+- {doc}`Adaptive re-optimization <../deep-dives/adaptive-reoptimization>`: the pipeline-breaker
   re-plan that step 6 relies on.
-- [JIT compilation](../deep-dives/jit-compilation.md): what `interp+jit` in the backend
+- {doc}`JIT compilation <../deep-dives/jit-compilation>`: what `interp+jit` in the backend
   column actually means.
-- [Spilling](../deep-dives/spilling.md): what happens when the budget in step 8 binds.
-- [Troubleshooting](../user-guide/troubleshooting.md): the other failure modes.
+- {doc}`Spilling <../deep-dives/spilling>`: what happens when the budget in step 8 binds.
+- {doc}`Troubleshooting <../user-guide/troubleshooting>`: the other failure modes.

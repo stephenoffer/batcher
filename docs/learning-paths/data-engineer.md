@@ -6,25 +6,25 @@ operation, and all per-row work runs in Rust.
 
 ## Reading order
 
-1. [Getting started](../getting-started/index.md): install and run a first query.
-1. [Your first pipeline](../tutorials/first-pipeline.md): the end-to-end flow.
-1. [Reading data](../user-guide/reading-data.md): sources and file formats.
-1. [Transformations](../user-guide/transformations.md): `select`, `with_columns`,
+1. {doc}`Getting started <../getting-started/index>`: install and run a first query.
+1. {doc}`Your first pipeline <../tutorials/first-pipeline>`: the end-to-end flow.
+1. {doc}`Reading data <../user-guide/reading-data>`: sources and file formats.
+1. {doc}`Transformations <../user-guide/transformations>`: `select`, `with_columns`,
    `filter`, `sort`.
-1. [Filtering](../user-guide/filtering.md): predicate expressions.
-1. [Aggregations](../user-guide/aggregations.md): `group_by` and `.agg`.
-1. [Joins](../user-guide/joins.md): join kinds and keys.
-1. [Window functions](../user-guide/window-functions.md): ranking and rolling
+1. {doc}`Filtering <../user-guide/filtering>`: predicate expressions.
+1. {doc}`Aggregations <../user-guide/aggregations>`: `group_by` and `.agg`.
+1. {doc}`Joins <../user-guide/joins>`: join kinds and keys.
+1. {doc}`Window functions <../user-guide/window-functions>`: ranking and rolling
    aggregates.
-1. [Writing data](../user-guide/writing-data.md): output formats and partitioning.
-1. [Lakehouse tables](../user-guide/lakehouse.md): Delta read/write/merge and SCD.
-1. [Data quality](../user-guide/data-quality.md): validate against a contract and
+1. {doc}`Writing data <../user-guide/writing-data>`: output formats and partitioning.
+1. {doc}`Lakehouse tables <../user-guide/lakehouse>`: Delta read/write/merge and SCD.
+1. {doc}`Data quality <../user-guide/data-quality>`: validate against a contract and
    quarantine what fails it.
-1. [Cloud storage](../user-guide/cloud-storage.md): object-store paths.
-1. [Performance and memory](../user-guide/performance.md): caching and spill.
-1. [Best practices](../user-guide/best-practices.md) and
-   [troubleshooting](../user-guide/troubleshooting.md).
-1. [Dataset API reference](../api/dataset.md).
+1. {doc}`Cloud storage <../user-guide/cloud-storage>`: object-store paths.
+1. {doc}`Performance and memory <../user-guide/performance>`: caching and spill.
+1. {doc}`Best practices <../user-guide/best-practices>` and
+   {doc}`troubleshooting <../user-guide/troubleshooting>`.
+1. {doc}`Dataset API reference <../api/dataset>`.
 
 ## Example: transform and aggregate
 
@@ -73,7 +73,7 @@ These scripts build their own data and run directly with `python examples/<name>
 
 ## Recipes for the problems you will actually hit
 
-The [data-engineering cookbook](../examples/data-engineering/index.md) is the applied half
+The {doc}`data-engineering cookbook <../examples/data-engineering/index>` is the applied half
 of this path. Each recipe opens on the failure and shows the code that avoids it.
 
 ::::{grid} 1 2 2 2
@@ -105,7 +105,14 @@ The column that changed type under you.
 ::::
 
 :::{seealso}
-- [Integrations](../integrations/index.md): connecting to Kafka, Snowflake, Delta, and the rest.
-- [Building a lakehouse](../tutorials/building-a-lakehouse.md): the same pieces, end to end.
-- [Custom connectors](../user-guide/custom-connectors.md): when the format you need isn't built in.
+- {doc}`Integrations <../integrations/index>`: connecting to Kafka, Snowflake, Delta, and the rest.
+- {doc}`Building a lakehouse <../tutorials/building-a-lakehouse>`: the same pieces, end to end.
+- {doc}`Custom connectors <../user-guide/custom-connectors>`: when the format you need isn't built in.
 :::
+
+
+## See also
+
+- {doc}`platform-engineer`: the operational half, once the pipelines exist.
+- {doc}`../user-guide/index`: the reference guides this path draws on.
+- {doc}`../examples/data-engineering/index`: runnable versions of the patterns above.

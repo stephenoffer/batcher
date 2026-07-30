@@ -258,15 +258,15 @@ summaries = tickets.ml.generate(
 
 ## See also
 
-- [LLM inference](../../ml/llm.md): engines, structured output, sequence packing.
-- [Batch scoring](../../ml/batch-scoring.md): the general model-over-a-table surface.
-- [Text embeddings](text-embeddings.md): the retrieval half of a RAG pipeline.
-- [RAG index](rag-index.md): generation over retrieved context.
-- [ML API reference](../../api/ml.md): `classify`, `extract`, `generate`, `vllm_engine`,
+- {doc}`LLM inference <../../ml/llm>`: engines, structured output, sequence packing.
+- {doc}`Batch scoring <../../ml/batch-scoring>`: the general model-over-a-table surface.
+- {doc}`Text embeddings <text-embeddings>`: the retrieval half of a RAG pipeline.
+- {doc}`RAG index <rag-index>`: generation over retrieved context.
+- {doc}`ML API reference <../../api/ml>`: `classify`, `extract`, `generate`, `vllm_engine`,
   `http_engine`, `json_schema`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): the LLM batch-inference
+- {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: the LLM batch-inference
   throughput, and the hardware ceiling behind it.
-- [HuggingFace integration](../../integrations/huggingface.md): model ids, tokenizers, and
+- {doc}`HuggingFace integration <../../integrations/huggingface>`: model ids, tokenizers, and
   datasets.
-- [GPU execution](../../deep-dives/gpu-execution.md): why the pool is warm and the stages
+- {doc}`GPU execution <../../deep-dives/gpu-execution>`: why the pool is warm and the stages
   overlap.

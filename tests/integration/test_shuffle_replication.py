@@ -187,3 +187,208 @@ def test_single_worker_places_no_replicas():
 
     with _replicated(factor=2):
         assert replicate_shuffle_output(object(), ["a"], 2, 1, set()) is None
+
+
+# ---------------------------------------------------------------------------
+# The other three shuffles. Replication used to serve the aggregate alone, so a
+# spot cluster got re-fetch recovery for `GROUP BY` and a full map-stage recompute
+# for every join, sort and window. These pin the same two properties per operator:
+# the answer survives the loss, and the replica — not the recompute — served it.
+# ---------------------------------------------------------------------------
+
+
+def _spy_republish(monkeypatch):
+    """Record every source the join/sort/window reduce had to regenerate.
+
+    These three do **not** recompute through `ShuffleLineage` the way the aggregate does
+    — they hand `run_bucket_reduce` a `republish` closure that re-runs the map onto a
+    survivor directly. Spying on the aggregate's lineage therefore observes nothing here,
+    and an assertion built on it passes whether or not replication is wired at all. That
+    is not hypothetical: it is what the first version of these tests did, and the
+    `test_unreplicated_loss_recomputes_*` control below is what caught it. Wrap the actual
+    mechanism instead.
+    """
+    from batcher.dist.executors.ray_runtime import reduce as reduce_mod
+
+    calls: list[int] = []
+    real = reduce_mod.run_bucket_reduce
+
+    def _spy(*, republish, **kw):
+        def _counted(target: int, src: int) -> None:
+            calls.append(src)
+            return republish(target, src)
+
+        return real(republish=_counted, **kw)
+
+    # The flight drivers do `from ...ray_runtime import run_bucket_reduce` *inside* the
+    # reduce function, so patching the defining module is what the call site resolves.
+    monkeypatch.setattr(reduce_mod, "run_bucket_reduce", _spy)
+    monkeypatch.setattr("batcher.dist.executors.ray_runtime.run_bucket_reduce", _spy, raising=False)
+    return calls
+
+
+def _join_tables():
+    rng = np.random.default_rng(13)
+    n = 80_000
+    left = pa.table(
+        {"k": rng.integers(0, 80, n).astype("int64"), "lv": rng.integers(0, 50, n).astype("int64")}
+    )
+    right = pa.table({"k": np.arange(80, dtype="int64"), "label": [f"g{i}" for i in range(80)]})
+    return left, right
+
+
+def _joined():
+    left, right = _join_tables()
+    return bt.from_arrow(left).join(bt.from_arrow(right), on="k", how="inner")
+
+
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_replicated_join_survives_worker_loss(killed):
+    # A join mapper publishes BOTH sides under one address (left on shuffle stage 0,
+    # right on stage 1), so its replica must hold both. A copy carrying only the left
+    # side would not raise — an unregistered ticket reads back as an empty bucket — it
+    # would silently emit an under-joined result, which is exactly what this compares.
+    from batcher.dist.flight_join import execute_join_flight
+
+    ds = _joined()
+    expected = ds.collect()
+    with _replicated():
+        recovered = execute_join_flight([], ds._plan, ds._sources, workers=4, _fault_inject=killed)
+    assert _norm(recovered) == _norm(expected)
+
+
+def test_join_replication_serves_the_loss_without_a_recompute(monkeypatch):
+    from batcher.dist.flight_join import execute_join_flight
+
+    calls = _spy_republish(monkeypatch)
+    ds = _joined()
+    expected = ds.collect()
+    with _replicated():
+        recovered = execute_join_flight([], ds._plan, ds._sources, workers=4, _fault_inject={1})
+
+    assert _norm(recovered) == _norm(expected)
+    assert calls == [], f"expected the replica to serve the loss, but recomputed sources {calls}"
+
+
+def _sorted_ds():
+    return bt.from_arrow(_data()).sort("v")
+
+
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_replicated_sort_survives_worker_loss(killed):
+    from batcher.dist.flight_sort import execute_sort_flight
+
+    ds = _sorted_ds()
+    expected = ds.collect()
+    with _replicated():
+        recovered = execute_sort_flight([], ds._plan, ds._sources, workers=4, _fault_inject=killed)
+    # A sort is the one operator whose ORDER is the answer, so this compares the key
+    # column position-by-position rather than as a multiset — `_norm` could not see a
+    # range delivered out of order, which is precisely how a replication bug here
+    # would present.
+    assert recovered.column("v").to_pylist() == expected.column("v").to_pylist()
+
+
+def test_sort_replication_serves_the_loss_without_a_recompute(monkeypatch):
+    from batcher.dist.flight_sort import execute_sort_flight
+
+    calls = _spy_republish(monkeypatch)
+    ds = _sorted_ds()
+    expected = ds.collect()
+    with _replicated():
+        recovered = execute_sort_flight([], ds._plan, ds._sources, workers=4, _fault_inject={1})
+
+    assert recovered.column("v").to_pylist() == expected.column("v").to_pylist()
+    assert calls == [], f"expected the replica to serve the loss, but recomputed sources {calls}"
+
+
+def _windowed():
+    return bt.from_arrow(_data()).with_columns(r=col("v").sum().over("k"))
+
+
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_replicated_window_survives_worker_loss(killed):
+    from batcher.dist.flight_window import execute_window_flight
+
+    ds = _windowed()
+    expected = ds.collect()
+    with _replicated():
+        recovered = execute_window_flight(
+            [], ds._plan, ds._sources, workers=4, _fault_inject=killed
+        )
+    assert _norm(recovered) == _norm(expected)
+
+
+def test_window_replication_serves_the_loss_without_a_recompute(monkeypatch):
+    from batcher.dist.flight_window import execute_window_flight
+
+    calls = _spy_republish(monkeypatch)
+    ds = _windowed()
+    expected = ds.collect()
+    with _replicated():
+        recovered = execute_window_flight([], ds._plan, ds._sources, workers=4, _fault_inject={1})
+
+    assert _norm(recovered) == _norm(expected)
+    assert calls == [], f"expected the replica to serve the loss, but recomputed sources {calls}"
+
+
+@pytest.mark.parametrize(
+    ("shuffle", "stages"),
+    [("aggregate", (0,)), ("sort", (0,)), ("window", (0,)), ("join", (0, 1))],
+)
+def test_every_shuffle_declares_the_stages_it_publishes(shuffle, stages, monkeypatch):
+    # The wiring contract, asserted directly rather than inferred from a kill: each driver
+    # must ask for a replica of every stage it published. A join that asked for stage 0
+    # only would place a half-copy that silently under-joins, and no correctness test
+    # above would fail on a cluster where the replica was never needed.
+    import batcher.dist.shuffle_replication as repl
+
+    seen: dict[str, tuple] = {}
+    real = repl.replicate_shuffle_output
+
+    def _spy(actors, addrs, n_reducers, workers, dead, stages=(0,)):
+        seen["stages"] = tuple(stages)
+        return real(actors, addrs, n_reducers, workers, dead, stages)
+
+    for mod in ("flight_aggregate", "flight_join", "flight_sort", "flight_window"):
+        monkeypatch.setattr(f"batcher.dist.{mod}.replicate_shuffle_output", _spy, raising=False)
+
+    plans = {
+        "aggregate": (_agg, "batcher.dist.flight_aggregate", "execute_aggregate_flight"),
+        "join": (_joined, "batcher.dist.flight_join", "execute_join_flight"),
+        "sort": (_sorted_ds, "batcher.dist.flight_sort", "execute_sort_flight"),
+        "window": (_windowed, "batcher.dist.flight_window", "execute_window_flight"),
+    }
+    build, module, fn_name = plans[shuffle]
+    import importlib
+
+    fn = getattr(importlib.import_module(module), fn_name)
+    ds = build()
+    with _replicated():
+        fn([], ds._plan, ds._sources, workers=4)
+    assert seen.get("stages") == stages, f"{shuffle} replicated stages {seen.get('stages')}"
+
+
+@pytest.mark.parametrize(
+    ("module", "fn_name", "build"),
+    [
+        ("batcher.dist.flight_join", "execute_join_flight", "join"),
+        ("batcher.dist.flight_sort", "execute_sort_flight", "sort"),
+        ("batcher.dist.flight_window", "execute_window_flight", "window"),
+    ],
+)
+def test_unreplicated_loss_recomputes_for_every_shuffle(module, fn_name, build, monkeypatch):
+    # The control for the three `..._serves_the_loss_without_a_recompute` tests above.
+    # Without it those assertions are vacuous: `calls == []` also holds for a shuffle that
+    # never loses anything, or whose kill hook stopped working. With replication off the
+    # identical kill must drive at least one recompute, so an empty list there means the
+    # replica did the work rather than the fault never happening.
+    import importlib
+
+    calls = _spy_republish(monkeypatch)
+    ds = {"join": _joined, "sort": _sorted_ds, "window": _windowed}[build]()
+    fn = getattr(importlib.import_module(module), fn_name)
+    with _replicated(factor=1):
+        fn([], ds._plan, ds._sources, workers=4, _fault_inject={1})
+
+    assert calls, f"unreplicated {build} worker loss should have recomputed the lost source"

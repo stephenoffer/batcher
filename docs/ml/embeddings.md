@@ -72,12 +72,13 @@ Sizing the actor pool is the other half of keeping the device busy.
 | Large enough to fill a device | `num_gpus=1, concurrency=4` | four actors, each holding a whole GPU |
 | Small (MiniLM is 90 MB) | `num_gpus=0.25, concurrency=8` | several packed onto each device, usually double the throughput |
 
-See [GPU scheduling](gpu.md).
+See {doc}`GPU scheduling <gpu>`.
 
 ## Embed via a served endpoint
 
-When the embedding model runs behind a service — a HuggingFace Text-Embeddings-Inference
-(TEI) server on a GPU box, or a hosted API such as OpenAI — the worker calls it instead of
+The embedding model can also run behind a service, such as a HuggingFace
+Text-Embeddings-Inference (TEI) server on a GPU box or a hosted API such as OpenAI.
+The worker then calls it instead of
 loading weights. Two load-once encoders speak the two common wire shapes and drop into
 `ds.ml.embed` exactly like a local model:
 
@@ -99,8 +100,8 @@ vectors = docs.ml.embed(tei, output_columns=["id", "text", "embedding"])
 Each batch's texts are sent in concurrent, size-bounded requests, so a served endpoint is
 saturated rather than called one row at a time. The `dimensions` argument asks a Matryoshka
 model (the `text-embedding-3-*` family) for a shorter vector, trading a little recall for a
-smaller index. The output column is a `fixed_size_list<float32>` — the shape Lance ANN
-indexing expects — so the served and local paths are interchangeable downstream.
+smaller index. The output column is a `fixed_size_list<float32>`, the shape Lance ANN
+indexing expects, so the served and local paths are interchangeable downstream.
 
 The mechanics run without a GPU, which is worth seeing once. The encoder here is a toy,
 but the pipeline shape is the real one.
@@ -163,7 +164,7 @@ print(coded.select(col("code")).to_pydict()["code"][0])
 
 A Matryoshka-trained model (the `text-embedding-3-*` family, Nomic, mxbai) packs the most
 signal into the leading dimensions, so a prefix is a smaller, faster index for a small
-recall cost. Take the prefix with `ds.ml.truncate_embeddings`, which re-normalizes it — a
+recall cost. Take the prefix with `ds.ml.truncate_embeddings`, which re-normalizes it. A
 raw slice is no longer unit length, and a cosine index silently assumes it is:
 
 ```python
@@ -212,14 +213,14 @@ print(sorted(deduped.to_pydict()["id"]))
 
 Two of the four documents were going to cost a forward pass each for nothing. On a real
 crawl the near-duplicate rate is routinely 20% to 40%, and that is the same fraction off
-your GPU bill. See [preprocessors](preprocessors/index.md) for the MinHash and LSH tuning.
+your GPU bill. See {doc}`preprocessors <preprocessors/index>` for the MinHash and LSH tuning.
 
 ## Fuse dense and lexical rankings
 
 Dense embedding search and lexical (BM25) search miss different things: the embedding finds
 paraphrases, the keyword match finds exact terms and rare tokens. Hybrid retrieval runs both
 and fuses the rankings. `ds.ml.reciprocal_rank_fusion` does the fusing without asking you to
-put the two score scales into agreement — each list contributes `1 / (k + rank)` per key, and
+put the two score scales into agreement. Each list contributes `1 / (k + rank)` per key, and
 a document ranked highly by either retriever floats up.
 
 ```python
@@ -237,7 +238,7 @@ Pass more result sets as extra arguments to fuse three or more retrievers.
 
 Evaluating retrieval means running many queries against the corpus, not one.
 `ds.ml.batched_nearest_neighbors` scores a query set against this corpus and keeps each
-query's top `k` in one pass — an exact, index-free brute force that is right for an eval set
+query's top `k` in one pass. It is an exact, index-free brute force that is right for an eval set
 and honest about being `O(queries x corpus)`.
 
 ```python
@@ -250,7 +251,7 @@ print(sorted(zip(hits.to_pydict()["qid"], hits.to_pydict()["cid"])))
 # [(10, 1), (11, 2)]
 ```
 
-For a large corpus queried in production, build an ANN index instead — see below.
+For a large corpus queried in production, build an ANN index instead, as described below.
 
 Once you have the retrieved neighbors and a set of ground-truth relevant pairs,
 `ds.ml.recall_at_k` scores the retrieval: of the documents that should have come back for
@@ -295,13 +296,13 @@ print(chunks.to_pydict()["chunk"])
 `overlap` keeps a sentence cut across a boundary whole in one of the two chunks. Sizes
 are in characters, so pick one comfortably under the model's token limit. A rough rule is
 4 characters per token. Keep the document id on the row so you can attribute a retrieved
-chunk back to its source. [RAG](rag.md) walks the full ingest.
+chunk back to its source. {doc}`RAG <rag>` walks the full ingest.
 
 ## Storing vectors
 
 An embedding is a `List<Float64>` column. It is Arrow like any other column, so it writes
 to Parquet, joins, and filters without ceremony. Write to Lance instead when you intend
-to build an ANN index over it, which is what [vector search](vector-search.md) needs at
+to build an ANN index over it, which is what {doc}`vector search <vector-search>` needs at
 scale.
 
 ```python
@@ -313,7 +314,7 @@ unit.write.lance("s3://bucket/vectors.lance")
 A 1024-dimension float64 vector is 8 KB per row, so a million rows is 8 GB. Cast to
 `float32` before writing if the recall loss is acceptable, and keep the vector column out
 of any sort or join that does not need it. `offload_blobs` exists for exactly that. See
-[multimodal](multimodal.md).
+{doc}`multimodal <multimodal>`.
 :::
 
 ## Driving the pool yourself
@@ -338,7 +339,7 @@ def encoder_factory():
 batches = embed(chunks.iter_batches(), encoder_factory, text_column="chunk", num_workers=4)
 ```
 
-Same contract as the `WorkerFactory` in [inference](inference.md), which is why a local
+Same contract as the `WorkerFactory` in {doc}`inference <inference>`, which is why a local
 model, an ONNX runtime, and a hosted embedding API are interchangeable at this seam.
 
 ## Scoring embedding quality
@@ -366,14 +367,14 @@ print(vecs.agg(drift=bt.mean_cosine_distance("a", "b")).to_pydict())
 
 ## See also
 
-- [Vector search](vector-search.md): retrieving against the vectors you built.
-- [RAG](rag.md): the full chunk → embed → retrieve → generate pipeline.
-- [GPU scheduling](gpu.md): sizing the actor pool that runs the encoder.
-- [GPU execution](../deep-dives/gpu-execution.md): how a GPU stage is scheduled, and what
+- {doc}`Vector search <vector-search>`: retrieving against the vectors you built.
+- {doc}`RAG <rag>`: the full chunk → embed → retrieve → generate pipeline.
+- {doc}`GPU scheduling <gpu>`: sizing the actor pool that runs the encoder.
+- {doc}`GPU execution <../deep-dives/gpu-execution>`: how a GPU stage is scheduled, and what
   "once per worker" means underneath.
-- [Text embeddings recipe](../examples/ml/text-embeddings.md): the job, end to end, on a
+- {doc}`Text embeddings recipe <../examples/ml/text-embeddings>`: the job, end to end, on a
   real corpus.
-- [RAG index recipe](../examples/ml/rag-index.md): the same vectors, written and indexed.
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): what an embed job costs against
+- {doc}`RAG index recipe <../examples/ml/rag-index>`: the same vectors, written and indexed.
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: what an embed job costs against
   the alternatives.
-- [ML API](../api/ml.md): the `ml.embed` and `EncoderFactory` reference.
+- {doc}`ML API <../api/ml>`: the `ml.embed` and `EncoderFactory` reference.

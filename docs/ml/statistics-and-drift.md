@@ -22,7 +22,7 @@ The mean and the standard deviation are the wrong summary for most real columns,
 | `midhinge` | The midpoint of the middle half, ignoring the outer quartiles entirely. |
 | `trimean` | Tukey's robust location estimate, weighting the median twice. |
 | `quartile_dispersion` | Unitless spread in `[0, 1]`, comparable across columns. |
-| `robust_cv` | Interquartile range over the median — the outlier-proof coefficient of variation. |
+| `robust_cv` | Interquartile range over the median: the outlier-proof coefficient of variation. |
 | `interdecile_range` | The span containing the middle 80% of values. |
 | `decile_ratio` | P90 over P10, the classic inequality ratio. |
 
@@ -44,12 +44,12 @@ ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
 print(ds.agg(skew=bt.bowley_skew("x"), normality=bt.jarque_bera("x")).to_pydict())
 ```
 
-`bowley_skew` and `moors_kurtosis` are the quantile-based versions, which stay meaningful on a column whose fourth moment does not exist — which covers most real latency, revenue, and file-size columns. `jarque_bera` combines skew and kurtosis into the standard normality statistic, useful as a screen over hundreds of features.
+`bowley_skew` and `moors_kurtosis` are the quantile-based versions, which stay meaningful on a column whose fourth moment does not exist. That covers most real latency, revenue, and file-size columns. `jarque_bera` combines skew and kurtosis into the standard normality statistic, useful as a screen over hundreds of features.
 
 ### Weighted statistics
 
-When rows carry different weights — survey weights, recency decay, per-group sizes — the plain
-mean and variance are wrong. `bt.weighted_mean`, `bt.weighted_var`, `bt.weighted_std`,
+Survey weights, recency decay, and per-group sizes all give some rows more influence than others,
+and the plain mean and variance are wrong once they do. `bt.weighted_mean`, `bt.weighted_var`, `bt.weighted_std`,
 `bt.weighted_covariance`, and `bt.weighted_correlation` are the frequency-weighted forms, each
 a single aggregate matching `numpy.average`:
 
@@ -76,9 +76,9 @@ print(
 )
 ```
 
-`welch_t_statistic` is the unequal-variance test, which is the one to use by default. `cohens_d` and `hedges_g` give the effect *size*, which is what distinguishes a real effect from a merely detectable one — at a large row count every difference is "significant".
+`welch_t_statistic` is the unequal-variance test, which is the one to use by default. `cohens_d` and `hedges_g` give the effect *size*, which is what distinguishes a real effect from a merely detectable one. At a large enough row count every difference is "significant".
 
-`proportion_z_statistic` is the conversion-rate equivalent, and `mean_ci_half_width` / `proportion_ci_half_width` give the error bar. `group_mean` is the building block all of them share — the mean of a column over the rows a boolean expression selects — and it is worth reaching for directly whenever you want one arm's average without a second query.
+`proportion_z_statistic` is the conversion-rate equivalent, and `mean_ci_half_width` / `proportion_ci_half_width` give the error bar. `group_mean` is the building block all of them share: the mean of a column over the rows a boolean expression selects. Reach for it directly whenever you want one arm's average without running a second query.
 
 ### Screening features against a target
 
@@ -107,15 +107,15 @@ with_means = ds.with_columns(m=bt.mean(bt.col("spend")).over(partition_by=["plan
 print(round(with_means.agg(eta=bt.correlation_ratio("spend", "m")).to_pydict()["eta"][0], 4))
 ```
 
-`pearson_mode_skew` reads directly as "how many standard deviations the average sits above the most common value", which is the sentence a non-statistician understands — useful when the audience for a data-quality report is not the modelling team.
+`pearson_mode_skew` reads directly as "how many standard deviations the average sits above the most common value", which is the sentence a non-statistician understands. Reach for it when the audience for a data-quality report is not the modelling team.
 
 ```{note}
-These expressions return a statistic, not a p-value. To turn one into a decision, use the matching test in `batcher.ml.stats` (the hypothesis tests described later on this page), which pairs the statistic with a dependency-free p-value on the driver — arithmetic on the one aggregated number, not a pass over the data.
+These expressions return a statistic, not a p-value. To turn one into a decision, use the matching test in `batcher.ml.stats` (the hypothesis tests described later on this page), which pairs the statistic with a dependency-free p-value on the driver. That p-value is arithmetic on the one aggregated number, not a second pass over the data.
 ```
 
 ### Statistics that need a second pass
 
-A rank correlation needs an ordering and a trimmed mean needs the quantiles before it can filter on them, so these are functions over a `Dataset` rather than expressions. They are still entirely relational — a window, a `group_by`, or a second aggregate — so nothing materializes on the driver:
+A rank correlation needs an ordering and a trimmed mean needs the quantiles before it can filter on them, so these are functions over a `Dataset` rather than expressions. They are still entirely relational, built from a window, a `group_by`, or a second aggregate, so nothing materializes on the driver:
 
 ```python
 from batcher.ml.stats import cramers_v, entropy, mutual_information, spearman_corr
@@ -127,9 +127,9 @@ cats = bt.from_pydict({"a": ["x", "x", "y", "y"], "b": ["p", "p", "q", "q"]})
 print(entropy(cats, "a"), cramers_v(cats, "a", "b"), mutual_information(cats, "a", "b"))
 ```
 
-`spearman_corr` sees a monotone relationship a Pearson correlation underrates, and is immune to outliers because an extreme value contributes only its rank. `cramers_v` is the categorical counterpart of a correlation and, unlike `chi_square`, does not grow with the row count — so it ranks features consistently across datasets of different sizes.
+`spearman_corr` sees a monotone relationship a Pearson correlation underrates, and is immune to outliers because an extreme value contributes only its rank. `cramers_v` is the categorical counterpart of a correlation and, unlike `chi_square`, does not grow with the row count, so it ranks features consistently across datasets of different sizes.
 
-`correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset` — reading down a column shows what a feature moves with, which is what flags redundant features and multicollinearity. `partial_correlation` goes one step further and removes a confounder: two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on that multicollinearity per feature — how much the rest of the set inflates each column's variance — so a VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
+`correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset`. Reading down a column shows what a feature moves with, which is what flags redundant features and multicollinearity. `partial_correlation` goes one step further and removes a confounder: two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on that multicollinearity per feature, measuring how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
 
 Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fraction of one categorical column's uncertainty that knowing the other removes, so `theils_u(ds, "x", "y")` and `theils_u(ds, "y", "x")` differ and answer "does `x` predict `y`" rather than "are they related". For a numeric column against a grouping, `eta_squared` and its bias-corrected sibling `epsilon_squared` are the bounded effect sizes `anova_f` lacks: both read as "this grouping explains 30% of the variance" and stay comparable across sample sizes, which a raw F never is. `omega_squared` corrects the bias furthest for generalizing beyond the sample, and `cohens_f` is the effect-size scale a power analysis is specified on.
 
@@ -137,8 +137,8 @@ Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fracti
 
 ## Profiling features before modelling
 
-`Dataset.profile` answers the data-quality question — how much is present, how many distinct
-values. `feature_profile` answers the modelling one in the same single pass, and names the
+`Dataset.profile` answers the data-quality question of how much is present and how many distinct
+values there are. `feature_profile` answers the modelling one in the same single pass, and names the
 transform each column is asking for:
 
 ```python
@@ -155,7 +155,7 @@ The second uses a deterministic rule for which of a redundant pair to drop, beca
 that depends on iteration order gives a different feature set on every run.
 
 `feature_report` ranks every candidate against a binary target by information value,
-point-biserial correlation, class separation, and null rate — four numbers that catch
+point-biserial correlation, class separation, and null rate. Those four numbers catch
 different kinds of signal, so a feature strong on any of them survives.
 
 `batcher.ml.feature_scores` is the univariate filter that scikit-learn's `SelectKBest` runs, one score per feature against the target: `f_classif_scores` (ANOVA F for a categorical target), `f_regression_scores` (regression F for a continuous one), `chi2_scores` (categorical against categorical), and `mutual_info_scores` (bits shared, which catches a non-monotone link the F scores miss). `select_k_best` turns any of those score dicts into the columns to keep.
@@ -173,7 +173,7 @@ A univariate score sees a feature that only matters in combination with another 
 
 ## Explaining a model
 
-Once a model is trained, `batcher.ml.interpret` says *why* it predicts what it does — over
+Once a model is trained, `batcher.ml.interpret` says *why* it predicts what it does. It answers over
 the whole dataset, because it re-scores through the engine rather than on a driver sample.
 
 `permutation_importance` ranks features by how far the error rises when each is shuffled. It
@@ -189,7 +189,7 @@ importance = permutation_importance(test, predict, feature_names, y_true="label"
 ```
 
 `partial_dependence` traces what the model does as one feature varies, averaged over the
-real joint distribution of the others — the curve a stakeholder reads as "risk rises with
+real joint distribution of the others. That is the curve a stakeholder reads as "risk rises with
 balance, then plateaus".
 
 ## Outlier detection
@@ -211,7 +211,7 @@ flagged = flag_outliers(ds, "latency", method="iqr")   # a boolean flag column, 
 them, and `OutlierClipper` clamps them as a fitted preprocessor that applies the *training*
 bounds to serving data. `outlier_bounds` returns the raw cut points.
 
-Those rules are univariate — one column at a time. `mahalanobis_distance` is the multivariate score for a row that looks ordinary on every column but is an outlier in the *joint* distribution, measuring distance from the center in units that account for the columns' correlations. Its square is chi-squared with one degree of freedom per column, which is how you turn it into a threshold.
+Those rules are univariate, judging one column at a time. `mahalanobis_distance` is the multivariate score for a row that looks ordinary on every column but is an outlier in the *joint* distribution, measuring distance from the center in units that account for the columns' correlations. Its square is chi-squared with one degree of freedom per column, which is how you turn it into a threshold.
 
 ```python
 from batcher.ml.outliers import mahalanobis_distance
@@ -245,7 +245,7 @@ Read the numbers with the conventions the monitoring literature settled on:
 | `categorical_drift` | The share of mass that would have to move for the two to match. |
 | `information_value` | Below 0.02 useless; 0.02 to 0.1 weak; 0.1 to 0.3 medium; above 0.3 strong. |
 
-`drift_report` runs the whole check and returns a `Dataset` ordered by descending PSI, which is what makes it appendable to a monitoring table — a single PSI is far less informative than its history:
+`drift_report` runs the whole check and returns a `Dataset` ordered by descending PSI, which is what makes it appendable to a monitoring table. A single PSI is far less informative than its history:
 
 ```python
 report = drift_report(train, today, ["x"], buckets=5)
@@ -258,8 +258,8 @@ print(report.columns)
 
 A classifier trained on a 1%-positive dataset learns to predict "negative" and scores well on
 accuracy while being useless. `batcher.ml.sampling` reshapes the class balance as a relational
-operation — an exact content-hashed filter or concatenation, never a driver-side shuffle, so it
-runs over a dataset larger than memory.
+operation: an exact content-hashed filter or concatenation, never a driver-side shuffle. That is
+what lets it run over a dataset larger than memory.
 
 ```python
 import batcher as bt
@@ -273,10 +273,10 @@ print(class_counts(oversample(ds, "y"), "y"))     # exactly balanced by duplicat
 `undersample` discards majority rows; `oversample` duplicates minority rows deterministically;
 `balanced_sample` moves every class to the median count. When the model supports it, prefer
 `class_weights` (a `{class: weight}` dict for the model's ``class_weight``) or `sample_weights`
-(a per-row weight column) — they rebalance the *loss* without discarding or duplicating a
+(a per-row weight column). Both rebalance the *loss* without discarding or duplicating a
 single row. `class_counts` is the first thing to look at.
 
-`stratified_sample` is the different tool for a different job: it keeps the same fraction of *every* stratum rather than equalizing them, so it shrinks a dataset for a quick experiment while preserving its class balance — a proportional 10% sample, not 10% of the whole that would starve the rare classes.
+`stratified_sample` is the different tool for a different job: it keeps the same fraction of *every* stratum rather than equalizing them, so it shrinks a dataset for a quick experiment while preserving its class balance. You get a proportional 10% sample rather than 10% of the whole, which would starve the rare classes.
 
 ```python
 from batcher.ml.sampling import class_counts, stratified_sample
@@ -305,7 +305,7 @@ folds = ds.ml.kfold(5, key="x", stratify="y")
 print([v.filter(bt.col("y") == 1).count() for _, v in folds])
 ```
 
-`group=` keeps every row of a group in the same fold. Use it whenever rows repeat an entity — a user, a patient, a session, a document. Without it the model memorizes the entity rather than the pattern, cross-validation looks excellent, and production does not. This is the most common silent leak in applied ML.
+`group=` keeps every row of a group in the same fold. Use it whenever rows repeat an entity such as a user, a patient, a session, or a document. Without it the model memorizes the entity rather than the pattern, cross-validation looks excellent, and production does not. This is the most common silent leak in applied ML.
 
 For a time series, neither applies: a random fold puts next week's rows in the training set, so the model sees the future and the validation score is one no deployment will reproduce.
 
@@ -329,7 +329,7 @@ composes.
 
 A test statistic says how large an effect is; the p-value says how surprising it is under the null hypothesis, and the p-value is what you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a `TestResult` carrying the statistic, its degrees of freedom, and the p-value.
 
-Use `t_test_1samp` to check a column's mean against a target, `t_test_ind` for Welch's two-sample test of two groups, `anova_test` to extend that to several groups, `chi_square_test` for the independence of two categorical columns, and `normality_test` (Jarque-Bera) to screen a column before assuming it is Gaussian. `pearson_test` and `spearman_test` add a p-value to a linear or monotone correlation, `proportion_ztest` checks a success rate against a target (with `binomial_test` the exact small-sample version), and `mcnemar_test` compares two classifiers' error rates on the same rows — the paired test to reach for when deciding whether one model genuinely beats another.
+Use `t_test_1samp` to check a column's mean against a target, `t_test_ind` for Welch's two-sample test of two groups, `anova_test` to extend that to several groups, `chi_square_test` for the independence of two categorical columns, and `normality_test` (Jarque-Bera) to screen a column before assuming it is Gaussian. `pearson_test` and `spearman_test` add a p-value to a linear or monotone correlation, `proportion_ztest` checks a success rate against a target (with `binomial_test` the exact small-sample version), and `mcnemar_test` compares two classifiers' error rates on the same rows. `mcnemar_test` is the paired test to reach for when deciding whether one model genuinely beats another.
 
 ```python
 import batcher as bt
@@ -342,11 +342,17 @@ result = t_test_ind(ds, "x", "g")
 print(round(result.pvalue, 4), result.pvalue < 0.05)
 ```
 
-`bartlett_test` and `levene_test` check the equal-variance assumption a t-test and an ANOVA quietly rely on: Bartlett's is the powerful choice for normal groups, Levene's (median-centered) the robust default. When the data itself is too skewed or ordinal for a t-test, `mann_whitney_u` (two groups) and `kruskal_wallis` (several) are the rank-based, distribution-free alternatives, asking whether one group tends to larger ranks rather than a larger mean. For *paired* measurements — a before/after or matched-pair design — `wilcoxon_signed_rank` is the distribution-free replacement for the paired t-test. `friedman_test` extends that to several treatments measured on the same blocks — the non-parametric repeated-measures ANOVA. Report `cliffs_delta` or `common_language_effect_size` beside a Mann-Whitney result: the test says *whether* two groups differ, these say *how much* — the probability that a random member of one exceeds the other. The tail probabilities come from dependency-free implementations of the Student's t, F, and chi-squared survival functions, checked against SciPy. The whole reduction is a handful of aggregates, so a test scales the same way every other statistic here does.
+`bartlett_test` and `levene_test` check the equal-variance assumption a t-test and an ANOVA quietly rely on. Bartlett's is the powerful choice for normal groups, and Levene's (median-centered) is the robust default.
+
+When the data itself is too skewed or ordinal for a t-test, `mann_whitney_u` (two groups) and `kruskal_wallis` (several) are the rank-based, distribution-free alternatives, asking whether one group tends to larger ranks rather than a larger mean. For *paired* measurements such as a before/after or matched-pair design, `wilcoxon_signed_rank` is the distribution-free replacement for the paired t-test. `friedman_test` extends that to several treatments measured on the same blocks, giving you the non-parametric repeated-measures ANOVA.
+
+Report `cliffs_delta` or `common_language_effect_size` beside a Mann-Whitney result. The test says *whether* two groups differ; these say *how much*, as the probability that a random member of one exceeds a random member of the other.
+
+The tail probabilities come from dependency-free implementations of the Student's t, F, and chi-squared survival functions, checked against SciPy. The whole reduction is a handful of aggregates, so a test scales the same way every other statistic here does.
 
 ## Time-series diagnostics
 
-A time series carries its signal in how a column relates to its own past, which a Pearson correlation cannot see. `batcher.ml.timeseries` orders a column by a time key and measures that self-relationship. `autocorrelation` gives the lag-`k` value, `autocorrelations` the whole function up to a maximum lag, `ljung_box` pools the first several lags into one white-noise test, and `durbin_watson` is the regression diagnostic for autocorrelated residuals. `partial_autocorrelation` and `partial_autocorrelations` give the *partial* function, which strips out what the intervening lags already explain and so cuts off sharply at the order of an autoregressive process — the tool for choosing that order.
+A time series carries its signal in how a column relates to its own past, which a Pearson correlation cannot see. `batcher.ml.timeseries` orders a column by a time key and measures that self-relationship. `autocorrelation` gives the lag-`k` value, `autocorrelations` the whole function up to a maximum lag, `ljung_box` pools the first several lags into one white-noise test, and `durbin_watson` is the regression diagnostic for autocorrelated residuals. `partial_autocorrelation` and `partial_autocorrelations` give the *partial* function, which strips out what the intervening lags already explain and so cuts off sharply at the order of an autoregressive process. That sharp cutoff is what makes it the tool for choosing the order.
 
 ```python
 import batcher as bt
@@ -357,7 +363,7 @@ print({k: round(v, 3) for k, v in autocorrelations(ds, "sales", 4, order_by="t")
 print(ljung_box(ds, "sales", 4, order_by="t").pvalue < 0.05)
 ```
 
-For scoring a forecast, `mean_absolute_scaled_error` is the scale-free metric: the model's mean absolute error divided by the naive seasonal forecast's, so a value below 1 beats naive and the number is comparable across series on any scale. 
+For scoring a forecast, `mean_absolute_scaled_error` is the scale-free metric: the model's mean absolute error divided by the naive seasonal forecast's, so a value below 1 beats naive and the number is comparable across series on any scale.
 
 An autocorrelation needs the whole series in time order, so unlike the mergeable statistics above these run over a single ordered window rather than a partitionable aggregate. The formulas are the Box-Jenkins definitions, checked against independent numpy references.
 
@@ -371,6 +377,7 @@ Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed
 
 ## See also
 
-- {doc}`evaluation` — score a model once you have a trustworthy split.
-- {doc}`preprocessors/index` — the transforms these statistics tell you a column needs.
-- {doc}`../user-guide/data-quality` — assert contracts rather than measure them.
+- {doc}`evaluation`: score a model once you have a trustworthy split.
+- {doc}`preprocessors/index`: the transforms these statistics tell you a column needs.
+- {doc}`../user-guide/data-quality`: assert contracts rather than measure them.
+- {doc}`../cookbook/statistics/index`: short runnable recipes for the functions on this page.

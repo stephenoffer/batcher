@@ -14,6 +14,9 @@ directions.
 
 ## Scorecard
 
+Each row is one workload shape, with the engine that won it and by how much. The
+methodology above is what makes these numbers comparable, so read them together:
+
 | Shape | Winner |
 |---|---|
 | Global aggregate, filtered count | Batcher, by 5× |
@@ -24,6 +27,8 @@ directions.
 | Join → aggregate | DuckDB, 1.15× |
 | TPC-H overall (sf1), DuckDB on its native store | DuckDB, geomean ~1.40× |
 | TPC-H overall (sf1), DuckDB reading the same Arrow | Batcher, all 22 queries |
+| TPC-H overall (sf10), DuckDB on its native store | DuckDB, 2.08×; Batcher wins 4 of 22 |
+| TPC-H overall (sf10), DuckDB reading the same Arrow | Batcher, 1.89×; wins 21 of 22 |
 | Delta file skipping (`count(*)` with a predicate) | Batcher, 1.42× |
 
 ## Operators

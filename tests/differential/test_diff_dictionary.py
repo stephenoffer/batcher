@@ -95,3 +95,47 @@ def test_dictionary_with_null_value_equals_plain():
     enc = bt.from_arrow(t).select("k", "n").collect()
     dec = bt.from_arrow(plain).select("k", "n").collect()
     assert _norm(enc) == _norm(dec)
+
+
+def test_declared_schema_matches_what_collect_returns():
+    """`Dataset.schema` predicts the boundary's decode instead of reporting the raw type.
+
+    The scan arm of `_schema` handed back the source's own types while the other two arms
+    predicted normalization, so a dictionary column was advertised as
+    `dictionary<values=string, ...>` and delivered as plain `string`. A schema that
+    disagrees with the data is a contract bug on its own, and it is what made the join
+    below fail.
+    """
+    ds = bt.from_arrow(_dict_encoded())
+    declared, actual = ds.schema, ds.collect().schema
+    assert declared.names == actual.names
+    for field in declared:
+        assert field.type == actual.field(field.name).type, (
+            f"{field.name}: declared {field.type}, collect() returned "
+            f"{actual.field(field.name).type}"
+        )
+
+
+def test_a_dictionary_key_joins_against_a_plain_string_key():
+    """A categorical key joins a plain-string key — both reach the engine decoded.
+
+    This raised `PlanError: join key type mismatch: left 'k' is dictionary<...> but right
+    'k' is string` for a join the engine runs correctly, because the build-time check
+    compared the *declared* types and only one side had been normalized. Reading a
+    dimension table as plain strings and a fact table from Parquet (dictionary-encoded) is
+    the ordinary star-schema shape, so this rejected a common, valid query.
+    """
+    facts = bt.from_arrow(_dict_encoded())
+    dim = bt.from_arrow(pa.table({"k": ["a", "b", "c"], "label": ["A", "B", "C"]}))
+    got = facts.join(dim, on="k").collect()
+    # Same answer as joining the un-encoded facts.
+    want = bt.from_arrow(_plain()).join(dim, on="k").collect()
+    assert _norm(got) == _norm(want)
+    assert got.num_rows == 6
+
+
+def test_a_large_string_column_is_reported_as_string():
+    """`LargeUtf8` normalizes to `Utf8` at the boundary, so the schema must say so."""
+    ds = bt.from_arrow(pa.table({"s": pa.array(["x", "y"], type=pa.large_string())}))
+    assert ds.schema.field("s").type == pa.string()
+    assert ds.collect().schema.field("s").type == pa.string()

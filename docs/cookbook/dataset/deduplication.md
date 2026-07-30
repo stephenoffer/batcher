@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/deduplication.py
 ```
+
+## See also
+
+- {doc}`dq_contracts`: data-quality contracts: validate, fail, drop, or quarantine.
+- {doc}`grouping`: grouping: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

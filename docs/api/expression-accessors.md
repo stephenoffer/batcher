@@ -18,7 +18,7 @@ Each namespace and the methods it carries:
 | --- | --- |
 | `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0, boundary="char")` (RAG document splitter; `boundary` may be `"char"`/`"word"`/`"sentence"`/`"line"` so a chunk never ends mid-word), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, `zfill(width)` (zero-pad numeric strings), `contains_any([...])` (true if any literal substring is present), and more |
 | `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `epoch_ms()` / `epoch_us()` / `epoch_ns()` (integer epoch at ms/µs/ns resolution), `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), `to_string(fmt)` (ISO-8601 by default), `timestamp(unit)` (the Polars epoch reader), `is_business_day()` (the weekday test, Polars' spelling of `is_weekday`), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `l1_norm` (Manhattan magnitude), `max_abs` (MaxAbs-scaling divisor), `normalize`, `softmax` (per-row logits→probabilities), `arg_sort` (indices sorting ascending, so reverse for top-k), `cum_sum` (cumulative sum), `diff` (first difference with a leading null, for delta features), `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `concat(o)` (append, keeping duplicates — DuckDB `list_concat`, not a set op), `has_all(o)` / `has_any(o)` (containment tests, DuckDB `list_has_all`/`list_has_any`), `transform(element()-expr)`, `filter(element()-pred)`, `drop_nulls()` (the null-dropping filter, Polars `list.drop_nulls`), `join(sep)`, `add(o)` / `subtract(o)` / `multiply(o)` (element-wise vector arithmetic → List<Float64>); vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `l1_distance(o)` (Manhattan), `hamming_distance(o)` (differing positions, for binary or quantized embeddings), `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature, the blocking key for a vector similarity join) |
+| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `l1_norm` (Manhattan magnitude), `max_abs` (MaxAbs-scaling divisor), `normalize`, `softmax` (per-row logits→probabilities), `arg_sort` (indices sorting ascending, so reverse for top-k), `cum_sum` (cumulative sum), `diff` (first difference with a leading null, for delta features), `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `concat(o)` (append, keeping duplicates, as in DuckDB `list_concat` rather than a set op), `has_all(o)` / `has_any(o)` (containment tests, DuckDB `list_has_all`/`list_has_any`), `transform(element()-expr)`, `filter(element()-pred)`, `drop_nulls()` (the null-dropping filter, Polars `list.drop_nulls`), `join(sep)`, `add(o)` / `subtract(o)` / `multiply(o)` (element-wise vector arithmetic → List<Float64>); vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `l1_distance(o)` (Manhattan), `hamming_distance(o)` (differing positions, for binary or quantized embeddings), `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature, the blocking key for a vector similarity join) |
 | `.struct` | `field(name)`, `get(name)`, `keys()` |
 | `.json` | `extract_string(path)` |
 | `.map` | `get(key)`, `keys()`, `values()`, `len()` (entry count, DuckDB `cardinality`), `contains(key)` (DuckDB `map_contains`), which read a `Map`-typed column |
@@ -27,6 +27,9 @@ Each namespace and the methods it carries:
 | `.video` | `decode()` |
 
 ### More `.str` methods
+
+The table above lists the common string operations. These are the rest, covering padding,
+casing, encoding, and the similarity measures:
 
 | Method | Description |
 | --- | --- |
@@ -58,9 +61,9 @@ Each namespace and the methods it carries:
 | `.url_encode()` / `.url_decode()` | percent-encode a URL *component* and its inverse (DuckDB `url_encode`/`url_decode`) |
 | `.regexp_escape()` | escape the regex metacharacters, so a value can be embedded in a pattern as a literal (DuckDB `regexp_escape`) |
 | `.escape_regex()` | the Polars spelling of `regexp_escape` |
-| `.join(sep)` | concatenate every value of the group into one string — an aggregate (SQL `string_agg`, Polars `str.join`) |
+| `.join(sep)` | concatenate every value of the group into one string, as an aggregate (SQL `string_agg`, Polars `str.join`) |
 | `.parse_filename()` | the final component of a path (DuckDB `parse_filename`) |
-| `.parse_dirname()` | the *first* component of a path — `/` for an absolute one (DuckDB `parse_dirname`) |
+| `.parse_dirname()` | the *first* component of a path, which is `/` for an absolute one (DuckDB `parse_dirname`) |
 | `.parse_dirpath()` | everything before the last separator, i.e. the containing directory (DuckDB `parse_dirpath`) |
 | `.parse_path()` | the path's components as a `List<Utf8>`, keeping a leading `/` (DuckDB `parse_path`) |
 | `.to_binary()` / `.from_binary()` | the UTF-8 bytes as `0`/`1` text and back; undecodable input is null (DuckDB `to_binary`/`from_binary`) |
@@ -76,6 +79,9 @@ Each namespace and the methods it carries:
 of the month), and `.millennium()`. Each extracts the named field of a date/time column (→ Int64).
 
 ### More `.json` methods
+
+These extract a typed value at a JSON path, or describe the document's shape when you do
+not yet know it:
 
 | Method | Description |
 | --- | --- |

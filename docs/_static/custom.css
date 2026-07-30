@@ -396,3 +396,47 @@ article img[src*="_images/"]:not([src$=".svg"]) {
 .bt-matrix .p { color: var(--bt-amber); font-weight: 700; }
 .bt-matrix .n { color: var(--color-foreground-secondary); opacity: 0.45; }
 .bt-matrix-legend { font-size: 0.82rem; color: var(--color-foreground-secondary); margin: 0.3rem 0 0; }
+
+/* ---- Headline stat strip ----------------------------------------------- */
+/* Four measured numbers directly under the hero. Every tile carries its own
+   source line, because a number without provenance is marketing and the
+   documentation contract forbids publishing one. */
+
+.bt-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.9rem;
+  margin: 1.6rem 0 0.4rem;
+}
+.bt-stat {
+  padding: 1rem 1.05rem;
+  border: 1px solid var(--color-background-border);
+  border-radius: var(--bt-radius);
+  background: var(--color-background-secondary);
+  border-top: 3px solid var(--bt-blue);
+}
+.bt-stat-value {
+  display: block;
+  font-size: 1.5rem;
+  font-weight: 800;
+  line-height: 1.15;
+  color: var(--bt-blue);
+  letter-spacing: -0.02em;
+}
+.bt-stat-label {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--color-foreground-primary);
+}
+.bt-stat-src {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--color-foreground-secondary);
+}
+/* Two-up on tablets, stacked on phones: a four-across strip is unreadable in a
+   narrow column, and these tiles carry real text rather than just a figure. */
+@media (max-width: 900px) { .bt-stats { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .bt-stats { grid-template-columns: 1fr; } }

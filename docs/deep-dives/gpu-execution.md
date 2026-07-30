@@ -169,6 +169,9 @@ GPU tensors move between stages as Arrow through host memory. There's no device-
 
 ## Code map
 
+Each concern below maps to the file that owns it, so the device placement and batching
+rules on this page can be read directly:
+
 | Concern | File |
 |---|---|
 | Stage-overlapped streaming, chain detection | `python/batcher/core/udf/stream.py` |
@@ -186,14 +189,14 @@ GPU tensors move between stages as Arrow through host memory. There's no device-
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): why the GPU paths live in Python and not in the crates
-- [Execution engine](../internals/execution.md): the UDF stage this pipelines
+- {doc}`Architecture <../architecture/index>`: why the GPU paths live in Python and not in the crates
+- {doc}`Execution engine <../internals/execution>`: the UDF stage this pipelines
 - `docs/internals/rfc-gpu-transport.md` (an in-tree RFC, not a site page): the device-to-device transport this page does not have
-- [GPU guide](../ml/gpu.md): the knobs, from a user's side
-- [ML guide](../ml/index.md): how to write these pipelines
-- [Batch inference tutorial](../tutorials/batch-inference.md): the pipeline this page is underneath
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): the numbers on this page, in context
-- [Multimodal ingest benchmarks](../benchmarks/multimodal-ingest.md): the decode side of the same pipeline
-- [Tensor columns](tensor-columns.md): what crosses into the model
-- [Distributed scheduling](distributed-scheduling.md): how the actors get placed
+- {doc}`GPU guide <../ml/gpu>`: the knobs, from a user's side
+- {doc}`ML guide <../ml/index>`: how to write these pipelines
+- {doc}`Batch inference tutorial <../tutorials/batch-inference>`: the pipeline this page is underneath
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the numbers on this page, in context
+- {doc}`Multimodal ingest benchmarks <../benchmarks/multimodal-ingest>`: the decode side of the same pipeline
+- {doc}`Tensor columns <tensor-columns>`: what crosses into the model
+- {doc}`Distributed scheduling <distributed-scheduling>`: how the actors get placed
 :::

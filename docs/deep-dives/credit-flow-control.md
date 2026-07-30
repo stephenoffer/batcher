@@ -246,13 +246,13 @@ the buffer pool's job, and the two meet in the pressure signal that AIMD reads.
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): Carbonite as the authority over every backpressure knob
-- [Carbonite](../internals/carbonite.md): the flow-control knob reference
+- {doc}`Architecture <../architecture/index>`: Carbonite as the authority over every backpressure knob
+- {doc}`Carbonite <../internals/carbonite>`: the flow-control knob reference
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the stability argument for AIMD under a clamp
-- [Configuration options](../configuration/options.md): `flow_control.*` and `distributed.adaptive_credits`
-- [Streaming](../user-guide/streaming.md): the other place a fast producer meets a slow consumer
-- [Scaling benchmarks](../benchmarks/scaling.md): what the credited shuffle sustains as nodes are added
-- [The shuffle over Arrow Flight](shuffle-flight.md): what the credits are gating
-- [The buffer pool](buffer-pool.md): where `PressureLevel` comes from
-- [Distributed scheduling](distributed-scheduling.md): how many channels there are
+- {doc}`Configuration options <../configuration/options>`: `flow_control.*` and `distributed.adaptive_credits`
+- {doc}`Streaming <../user-guide/streaming>`: the other place a fast producer meets a slow consumer
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: what the credited shuffle sustains as nodes are added
+- {doc}`The shuffle over Arrow Flight <shuffle-flight>`: what the credits are gating
+- {doc}`The buffer pool <buffer-pool>`: where `PressureLevel` comes from
+- {doc}`Distributed scheduling <distributed-scheduling>`: how many channels there are
 :::

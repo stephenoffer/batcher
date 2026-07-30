@@ -10,8 +10,6 @@ decides *where* to run, never *what* the result is (single-node == distributed i
 
 from __future__ import annotations
 
-import functools
-import importlib.util
 import logging
 import sys
 
@@ -21,20 +19,24 @@ from batcher.plan.logical import LogicalPlan
 __all__ = ["resolve_distributed"]
 
 
-@functools.lru_cache(maxsize=1)
-def _ray_importable() -> bool:
-    """Whether `ray` can be imported at all — resolved once per process.
+def _ray_already_live() -> bool:
+    """Whether Ray could possibly be initialized in this process — a `sys.modules` lookup.
 
-    ``distributed="auto"`` runs on every terminal op, and its first act was ``import ray``.
-    Python caches a *successful* import in `sys.modules` but caches nothing about a failed
-    one, so on the (common) machine with no Ray installed that statement re-walked every
-    `sys.path` entry looking for a package that is not there, once per query. Asking
-    `find_spec` once and remembering the answer turns a per-query path scan into a single
-    dict lookup, and leaves the behavior identical: an installed-but-broken Ray still
-    reaches the ``import ray`` below and still degrades to single-node through the
-    existing handler.
+    ``distributed="auto"`` runs on every terminal op, and its first act was ``import ray``
+    so it could ask ``ray.is_initialized()``. Where Ray is *installed but not running* —
+    every single-node script on a Ray or Anyscale image, which is the environment this
+    engine ships into — that import cost **444 ms on the first `collect()` of the process**
+    to compute the answer "no". A 3-row local query paid the entire Ray runtime import to
+    be told to run locally.
+
+    Checking `sys.modules` is not an approximation of that question, it is the same
+    question: ``ray.is_initialized()`` can only return True if this process called
+    ``ray.init()`` (or is a Ray worker), and both require ``ray`` to have been imported
+    already. So an absent `sys.modules` entry proves the import would return False, and the
+    only thing skipping it loses is the cost. Ray installed but never imported, Ray not
+    installed, and Ray broken all reach the same single-node answer they did before.
     """
-    return "ray" in sys.modules or importlib.util.find_spec("ray") is not None
+    return "ray" in sys.modules
 
 
 def resolve_distributed(
@@ -53,8 +55,8 @@ def resolve_distributed(
     """
     if distributed != "auto":
         return bool(distributed)
-    if not _ray_importable():
-        return False  # no Ray, no cluster — the answer can only be single-node
+    if not _ray_already_live():
+        return False  # nothing imported Ray, so nothing initialized it — single-node
     try:
         import ray
 

@@ -242,6 +242,10 @@ Alongside it: `autoloader.py:93` does a full unpaginated LIST every pass and app
 not idempotent); `mark()` commits per file, so discovering 1M files means 1M fsyncs — that is
 why seeding this table for the measurement above had to bypass the public API.
 
+The `> max_seen` filter turned out to be worse than a missed pushdown: it is silent data loss
+whenever names are not monotonic, which is the normal case (`part-00000-<uuid>.parquet`). See
+"the autoloader's lexical filter" in section 7.
+
 ### Other hard walls
 
 | connector | defect | severity |
@@ -434,6 +438,18 @@ Not gaps closed but capability that did not exist, all in the multimodal/unstruc
   option compiled, ran, loaded no index, and left every page surviving. Correct results, a
   green suite, a no-op feature. `test_pruning_actually_engages` asserts the decoder returns
   fewer rows than the group holds, which is the only assertion that can tell the difference.
+- **The autoloader's lexical filter dropped files.** Discovery kept only the names sorting
+  after the greatest already-seen name. That is sound only when files arrive under
+  monotonically increasing names, and the writers that matter do not: `part-00000-<uuid>`
+  means that once one file is processed, roughly half of every later arrival sorts below the
+  maximum and is never offered to the seen-store at all. Silent, permanent, and invisible to
+  every existing test, all of which used zero-padded sequential names. Removed — the listing
+  is unchanged and `unseen` is already an index probe, so the filter was buying a fraction of
+  a millisecond and costing rows.
+- **Pulsar's drain was one client call per message.** `batch_receive()` — listed as "unused"
+  above — now takes the whole buffered batch in one call, under a `batch_receive_policy` sized
+  for a poll's budget with a 1 ms give-up, while the blocking wait for the first message stays
+  a plain `receive` so an idle topic parks rather than spins.
 - **Parquet bloom filters: now read.** Range pruning — footer stats and the page index — is
   only as good as the data's clustering. On a **high-cardinality unordered** column every
   page's `[min, max]` spans the domain, so an equality prunes nothing: measured on 2M random

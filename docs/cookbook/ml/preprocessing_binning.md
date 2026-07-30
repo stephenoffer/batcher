@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/ml/preprocessing_binning.py
 ```
+
+## See also
+
+- {doc}`outlier_detection`: finding outliers: per-column rules and a multivariate distance.
+- {doc}`preprocessing_chain`: chaining preprocessors into one fitted pipeline.
+- {doc}`../../ml/index`: the ML surface these recipes sit on.
+- {doc}`../../ml/preprocessors/index`: the fit and transform steps most pipelines start with.

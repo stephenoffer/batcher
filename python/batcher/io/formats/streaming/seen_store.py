@@ -152,16 +152,6 @@ class SeenStore:
             known.update(row[0] for row in cur)
         return [c for c in candidates if c not in known]
 
-    def max_seen(self) -> str | None:
-        """The lexicographically greatest seen path, or ``None`` if empty.
-
-        Enables the lexical fast-path in the file lister: candidates ordering
-        after this name cannot have been seen yet.
-        """
-        cur = self._conn.execute("SELECT MAX(path) FROM seen_files")
-        row = cur.fetchone()
-        return row[0] if row is not None else None
-
     def close(self) -> None:
         """Close the underlying database connection."""
         self._conn.close()

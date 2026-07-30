@@ -248,11 +248,11 @@ dimension.
 
 ## See also
 
-- [Quality gates](quality-gates.md): the same idea, applied to values instead of columns.
-- [Multi-source join](multi-source-join.md): where a type mismatch does its real damage.
-- [Incremental ingest](incremental-ingest.md): the loader dropping new files into the
+- {doc}`Quality gates <quality-gates>`: the same idea, applied to values instead of columns.
+- {doc}`Multi-source join <multi-source-join>`: where a type mismatch does its real damage.
+- {doc}`Incremental ingest <incremental-ingest>`: the loader dropping new files into the
   directory that drifted.
-- [Reading data](../../user-guide/reading-data.md): the reader options in full.
-- [Type system](../../user-guide/type-system.md): the promotion rules behind the lattice.
-- [Delta Lake](../../integrations/delta-lake.md): what a committed schema is.
-- [IO API reference](../../api/io.md): `schema_mode` and the rest of the reader arguments.
+- {doc}`Reading data <../../user-guide/reading-data>`: the reader options in full.
+- {doc}`Type system <../../user-guide/type-system>`: the promotion rules behind the lattice.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: what a committed schema is.
+- {doc}`IO API reference <../../api/io>`: `schema_mode` and the rest of the reader arguments.

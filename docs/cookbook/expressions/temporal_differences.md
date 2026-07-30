@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/temporal_differences.py
 ```
+
+## See also
+
+- {doc}`temporal_business_days`: weekend and business-day predicates, and formatting a timestamp for output.
+- {doc}`temporal_parts`: pulling calendar parts out of a timestamp column.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

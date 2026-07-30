@@ -341,6 +341,45 @@ impl AxisKeys {
             }
         }
     }
+
+    /// The flat order-preserving `u64` key per universe entry, when this axis has one.
+    ///
+    /// `None` for the encoded (row-format) axis, whose keys are variable-width bytes and
+    /// cannot be handed out as a slice. Callers that want the fast path must keep a generic
+    /// fallback for that case.
+    pub(super) fn fast(&self) -> Option<&[u64]> {
+        match self {
+            AxisKeys::Fast(keys) => Some(keys),
+            AxisKeys::Encoded { .. } => None,
+        }
+    }
+
+    /// The **left**-side universe entries in ascending key order.
+    ///
+    /// The mirror of [`Self::sorted_right`], and the band join's reason for existing: with
+    /// the left rows in key order their bounds into the sorted right side are monotone, so
+    /// one merge pass replaces a binary search per row. At five million rows a side those
+    /// searches were 11.5 s of a 11.8 s join — 23 random probes into a 40 MB array, five
+    /// million times over, which no amount of parallelism makes cache-friendly.
+    pub(super) fn sorted_left(&self, nl: usize, lmap: &[u32], rmap: &[u32]) -> Vec<u32> {
+        match self {
+            AxisKeys::Fast(keys) => {
+                let mut pairs: Vec<(u64, u32)> =
+                    (0..nl as u32).map(|e| (keys[e as usize], e)).collect();
+                if pairs.len() >= PARALLEL_SORT_MIN_ROWS {
+                    pairs.par_sort_unstable();
+                } else {
+                    pairs.sort_unstable();
+                }
+                pairs.into_iter().map(|(_, e)| e).collect()
+            }
+            AxisKeys::Encoded { left, right } => {
+                let mut idx: Vec<u32> = (0..nl as u32).collect();
+                sort_by_key(&mut idx, |e| key(e, nl, left, right, lmap, rmap));
+                idx
+            }
+        }
+    }
 }
 
 /// Dense ranks over a sorted order: equal keys share a rank, so comparing ranks is exactly

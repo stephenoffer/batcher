@@ -138,7 +138,7 @@ so the information survives whatever the next step does with them.
 `transform` is a lazy `Dataset`, so it composes with the rest of a pipeline and the
 result is computed by a terminal op such as `collect()` or `write.parquet(...)`, on one
 node or across a cluster. Use preprocessors before a training loop, covered in
-[PyTorch integration](../pytorch.md), or before batch [inference](../inference.md).
+{doc}`PyTorch integration <../pytorch>`, or before batch {doc}`inference <../inference>`.
 
 ## The rest of this section
 
@@ -176,12 +176,12 @@ Fuzzy dedup with MinHash, and `similarity_join` on embeddings.
 :::
 ::::
 
-## Next steps
+## See also
 
-- [Feature engineering tutorial](../../tutorials/feature-engineering.md): the full workflow
+- {doc}`Feature engineering tutorial <../../tutorials/feature-engineering>`: the full workflow
   from raw table to model-ready matrix, end to end, with `Chain`.
-- [PyTorch integration](../pytorch.md): hand the assembled features to a training loop.
-- [ML API reference](../../api/ml.md): the complete `Preprocessor` surface.
+- {doc}`PyTorch integration <../pytorch>`: hand the assembled features to a training loop.
+- {doc}`ML API reference <../../api/ml>`: the complete `Preprocessor` surface.
 
 ```{toctree}
 :hidden:

@@ -226,14 +226,14 @@ Pin a device model with `accelerator_type="NVIDIA_A100"` on a heterogeneous clus
 
 ## See also
 
-- [Image captioning](image-captioning.md): the same pipeline with a vision-language model.
-- [Audio transcription](audio-transcription.md): the same decode → model shape, for sound.
-- [GPU scheduling](../../ml/gpu.md): fractional packing and autoscaling pools in full.
-- [Inference](../../ml/inference.md) and [batch scoring](../../ml/batch-scoring.md): the
+- {doc}`Image captioning <image-captioning>`: the same pipeline with a vision-language model.
+- {doc}`Audio transcription <audio-transcription>`: the same decode → model shape, for sound.
+- {doc}`GPU scheduling <../../ml/gpu>`: fractional packing and autoscaling pools in full.
+- {doc}`Inference <../../ml/inference>` and {doc}`batch scoring <../../ml/batch-scoring>`: the
   `map_batches` / `ml.infer` surface these calls lower to.
-- [Multimodal](../../ml/multimodal.md): the `.image` decode expressions.
-- [ML API reference](../../api/ml.md): every argument of `ds.ml.infer` and `ds.ml.download`.
-- [AI and GPU benchmarks](../../benchmarks/ai-and-gpu.md): where the numbers above come from.
-- [GPU execution](../../deep-dives/gpu-execution.md): how the CPU and GPU stages overlap.
-- [PyTorch integration](../../integrations/pytorch.md): handing these tensors to a training
+- {doc}`Multimodal <../../ml/multimodal>`: the `.image` decode expressions.
+- {doc}`ML API reference <../../api/ml>`: every argument of `ds.ml.infer` and `ds.ml.download`.
+- {doc}`AI and GPU benchmarks <../../benchmarks/ai-and-gpu>`: where the numbers above come from.
+- {doc}`GPU execution <../../deep-dives/gpu-execution>`: how the CPU and GPU stages overlap.
+- {doc}`PyTorch integration <../../integrations/pytorch>`: handing these tensors to a training
   loop.

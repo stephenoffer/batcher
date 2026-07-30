@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/io/sources_and_sinks.py
 ```
+
+## See also
+
+- {doc}`save_modes`: save modes and write manifests: what happens when the target already exists.
+- {doc}`streaming_reads`: reading in bounded memory: iter_batches, limits, and lazy metadata.
+- {doc}`../../user-guide/reading-data`: every source format and how paths and schemas resolve.
+- {doc}`../../user-guide/writing-data`: sinks, save modes, and partitioned output.

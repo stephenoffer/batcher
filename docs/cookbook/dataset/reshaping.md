@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/dataset/reshaping.py
 ```
+
+## See also
+
+- {doc}`profiling`: profiling a table you have just been handed.
+- {doc}`sampling_and_splits`: sampling and splitting: reproducible subsets that do not leak.
+- {doc}`../../user-guide/transformations`: the full transformation surface these recipes draw on.
+- {doc}`../../api/dataset`: every `Dataset` method, in one reference table.

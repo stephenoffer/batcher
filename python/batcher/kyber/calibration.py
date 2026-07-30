@@ -32,6 +32,7 @@ import weakref
 from statistics import median
 
 from batcher._internal.logging import note_suppressed
+from batcher._internal.mathx import clamp_factor
 from batcher.config import Config, CostCoefficients, active_config
 from batcher.metadata import MetadataHub
 
@@ -231,7 +232,9 @@ def _calibrate(
         if not per_row:
             continue
         measured = median(per_row)
-        updates[coeff] = _clamp(_shrink(measured, c0, len(per_row), prior_strength), c0, clamp)
+        updates[coeff] = clamp_factor(
+            _shrink(measured, c0, len(per_row), prior_strength), c0, clamp
+        )
 
     speedup = _measured_jit_speedup(by_kind, defaults, cfg)
     if speedup is not None:
@@ -300,9 +303,9 @@ def _measured_jit_speedup(
     # *prior-relative* — the measurement is `prior x ratio`, so the prior is the anchor, and
     # each ratio is itself a median over `min_samples` rows. Shrinking would anchor it twice
     # and stop the loop learning a genuinely different engine, which is exactly the fixed-point
-    # failure `_shrink` was written to remove. `_clamp` still bounds how far it may travel.
+    # failure `_shrink` was written to remove. `clamp_factor` still bounds how far it may travel.
     measured = defaults.jit_speedup * median(ratios)
-    return _clamp(max(1.0, measured), defaults.jit_speedup, clamp)
+    return clamp_factor(max(1.0, measured), defaults.jit_speedup, clamp)
 
 
 def _shrink(measured: float, prior: float, n_samples: int, prior_strength: float) -> float:
@@ -326,7 +329,7 @@ def _shrink(measured: float, prior: float, n_samples: int, prior_strength: float
     must blend to the reciprocal (0.316x), which the arithmetic form puts at 0.55x. The
     asymmetry biases every coefficient upward whenever the measurements straddle the prior,
     and it is the same reason the q-error correction averages geometrically. It also matches
-    `_clamp`, which already bounds the result multiplicatively.
+    `clamp_factor`, which already bounds the result multiplicatively.
 
     Args:
         measured: The coefficient the samples imply.
@@ -345,9 +348,3 @@ def _shrink(measured: float, prior: float, n_samples: int, prior_strength: float
         # the arithmetic blend rather than dropping the measurement entirely.
         return weight * measured + (1.0 - weight) * prior
     return math.exp(weight * math.log(measured) + (1.0 - weight) * math.log(prior))
-
-
-def _clamp(value: float, default: float, factor: float) -> float:
-    """Bound `value` to within `factor`x of `default` (both directions)."""
-    lo, hi = default / factor, default * factor
-    return max(lo, min(hi, value))

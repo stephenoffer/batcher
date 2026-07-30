@@ -371,16 +371,29 @@ def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> b
 def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
     """The output Arrow schema without scanning rows.
 
-    A bare scan returns its source schema directly. Otherwise the plan's
-    type-carrying `available_schema()` analysis answers without touching the engine
-    when it can infer every output type; anything it leaves uncertain falls back to
-    a zero-row execution (`limit(0)`), which the engine answers without
-    materializing data.
+    A bare scan returns its source schema, normalized the way the FFI boundary will
+    normalize it. Otherwise the plan's type-carrying `available_schema()` analysis answers
+    without touching the engine when it can infer every output type; anything it leaves
+    uncertain falls back to a zero-row execution (`limit(0)`), which the engine answers
+    without materializing data.
+
+    The `widen` on the scan arm is what keeps all three arms agreeing. The other two
+    already predict the boundary's normalization — `available_schema()` through
+    `plan.types`, and the `limit(0)` fallback by actually executing — while this one
+    handed back the source's own types. A dictionary-encoded column (what Parquet emits
+    natively for a low-cardinality string) was therefore reported as
+    `dictionary<values=string, ...>` by `Dataset.schema` when `collect()` returns plain
+    `string`, so the cheapest arm was the only one that lied.
     """
     from batcher.plan.logical import Limit, Scan
+    from batcher.plan.types import widen
 
     if isinstance(plan, Scan) and len(sources) == 1:
-        return sources[0].schema()
+        source_schema = sources[0].schema()
+        return pa.schema(
+            [f.with_type(widen(f.type)) for f in source_schema],
+            metadata=source_schema.metadata,
+        )
     inferred = plan.available_schema()
     if inferred is not None:
         return inferred.arrow

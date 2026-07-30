@@ -81,3 +81,63 @@ def test_reopening_replaces_a_stale_schema():
     assert _MEMORY_SCHEMA["learned"].names == ["a"]
     MemoryStreamSink("learned", schema=pa.schema([("b", pa.string())])).open()
     assert _MEMORY_SCHEMA["learned"].names == ["b"]
+
+
+# --------------------------------------------------------------------------
+# The cap: a debugging sink must fail loudly, in both modes.
+# --------------------------------------------------------------------------
+def _tiny_budget():
+    import dataclasses
+
+    from batcher.config import Config, config_context
+
+    base = Config()
+    return config_context(
+        base.replace(memory=dataclasses.replace(base.memory, streaming_state_max_bytes=1))
+    )
+
+
+def test_a_complete_mode_sink_is_capped_too():
+    """Replacing the table each micro-batch bounds the sink by the *running result*, and a
+    running result is not small by construction: a `group_by` over a high-cardinality key
+    grows with the stream. So the one mode with no guard was the one the other mode's error
+    message recommends switching to."""
+    from batcher._internal.errors import ResourceError
+
+    sink = MemoryStreamSink("learned", output_mode="complete")
+    sink.open()
+    with _tiny_budget(), pytest.raises(ResourceError, match="in-memory streaming sink"):
+        sink.write_batch(0, pa.table({"g": list(range(1000))}))
+
+
+def test_the_complete_mode_error_does_not_recommend_complete_mode():
+    """The append-mode remedy is "switch to outputMode='complete'", which is no remedy at
+    all for a query already in it."""
+    from batcher._internal.errors import ResourceError
+
+    sink = MemoryStreamSink("learned", output_mode="complete")
+    sink.open()
+    with _tiny_budget(), pytest.raises(ResourceError) as excinfo:
+        sink.write_batch(0, pa.table({"g": list(range(1000))}))
+    assert "outputMode='complete'" not in str(excinfo.value)
+    assert "memory.streaming_state_max_bytes" in str(excinfo.value)
+
+
+def test_an_append_mode_sink_keeps_its_own_remedy():
+    from batcher._internal.errors import ResourceError
+
+    sink = MemoryStreamSink("unschooled")
+    sink.open()
+    with _tiny_budget(), pytest.raises(ResourceError) as excinfo:
+        sink.write_batch(0, pa.table({"g": list(range(1000))}))
+    assert "outputMode='complete'" in str(excinfo.value)
+
+
+def test_a_complete_mode_sink_does_not_accumulate_across_micro_batches():
+    """The replaced table is the whole accounting, so a long stream of small results must
+    never trip the cap — otherwise the new check would break the mode it is guarding."""
+    sink = MemoryStreamSink("learned", output_mode="complete")
+    sink.open()
+    for i in range(200):
+        sink.write_batch(i, pa.table({"g": [i], "n": [i]}))
+    assert sink._held == pa.table({"g": [199], "n": [199]}).nbytes

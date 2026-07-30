@@ -217,20 +217,20 @@ it's a floor, not a ledger.
 
 A reservation is also an *estimate* accepted in advance. The pool can't tell you that the
 hash table you reserved 100 MB for will actually take 400. What corrects that is the
-learned memory model described in [Learned metadata](learned-metadata.md), which fits a
+learned memory model described in {doc}`Learned metadata <learned-metadata>`, which fits a
 measured bytes-per-input-row figure per operator family from `m_peak_bytes` and blends the
 plan's estimate toward it.
 
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): Carbonite's lane, where it protects but never decides or executes
-- [Carbonite](../internals/carbonite.md): the resource manager that drives the pool
+- {doc}`Architecture <../architecture/index>`: Carbonite's lane, where it protects but never decides or executes
+- {doc}`Carbonite <../internals/carbonite>`: the resource manager that drives the pool
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the control theory behind the hysteresis
-- [Configuration options](../configuration/options.md): every `memory.*` knob named here
-- [Performance](../user-guide/performance.md): setting an envelope on purpose
-- [Scaling benchmarks](../benchmarks/scaling.md): what bounded memory buys under load
-- [Spilling](spilling.md): what happens when a reservation cannot be granted
-- [Credit-based flow control](credit-flow-control.md): the same envelope, applied to the network
-- [Arrow and memory](arrow-memory.md): what the bytes being counted actually are
+- {doc}`Configuration options <../configuration/options>`: every `memory.*` knob named here
+- {doc}`Performance <../user-guide/performance>`: setting an envelope on purpose
+- {doc}`Scaling benchmarks <../benchmarks/scaling>`: what bounded memory buys under load
+- {doc}`Spilling <spilling>`: what happens when a reservation cannot be granted
+- {doc}`Credit-based flow control <credit-flow-control>`: the same envelope, applied to the network
+- {doc}`Arrow and memory <arrow-memory>`: what the bytes being counted actually are
 :::

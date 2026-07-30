@@ -161,6 +161,83 @@ def test_psi_stall_shares_are_normalized_to_a_fraction(monkeypatch):
     assert "memory_stall" not in out
 
 
+def test_psi_is_sampled_not_re_read_on_every_call(monkeypatch):
+    # These files are read on every terminal op, and re-reading them per query cost about as
+    # much as executing a small query. PSI publishes a 10-second rolling average, so a
+    # quarter-second-old sample answers identically -- but only a call *count* can show the
+    # re-read is gone, since the value is the same either way.
+    import builtins
+
+    files = {
+        "/proc/self/cgroup": "0::/\n",
+        "/sys/fs/cgroup/cpu.pressure": "some avg10=12.50 avg60=1.00 avg300=0.00 total=1\n",
+        "/sys/fs/cgroup/memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        "/sys/fs/cgroup/io.pressure": "some avg10=100.00 avg60=1.00 avg300=0.00 total=1\n",
+    }
+    opened: list[str] = []
+    inner = _fake_open(files)
+
+    def counting_open(path, *a, **k):
+        opened.append(str(path))
+        return inner(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    first = cgroup.cgroup_pressure()
+    after_first = len(opened)
+    for _ in range(20):
+        assert cgroup.cgroup_pressure() == first
+    assert len(opened) == after_first, "a sampled reading must not re-open the PSI files"
+
+    # The sample is still invalidated by the one hook a test uses to fake `/sys`, so the
+    # isolation every other test in this file relies on is unaffected.
+    hardware.reset_hardware_probes()
+    assert cgroup.cgroup_pressure() == first
+    assert len(opened) > after_first
+
+
+def test_the_machine_fingerprint_is_hashed_once_per_process(monkeypatch):
+    # `fingerprint()` is the scoping key for every learned parameter, so the query path asks
+    # for it repeatedly -- 11 times on a warm `collect()`. It joins fourteen fields and
+    # SHA-256s them, for a profile that is assembled once and frozen, so every call after the
+    # first re-derives a value that cannot have changed.
+    calls: list[int] = []
+    real = profile.HardwareProfile.fingerprint
+
+    def counting(self):
+        calls.append(1)
+        return real(self)
+
+    monkeypatch.setattr(profile.HardwareProfile, "fingerprint", counting)
+    hardware.reset_hardware_probes()
+
+    first = profile.fingerprint()
+    for _ in range(20):
+        assert profile.fingerprint() == first
+    assert len(calls) == 1, f"digest recomputed {len(calls)} times for one machine"
+
+    # Still cleared by the one hook a test uses to fake the machine, so a profile faked after
+    # a reset is not shadowed by the previous machine's key.
+    hardware.reset_hardware_probes()
+    assert profile.fingerprint() == first
+    assert len(calls) == 2
+
+
+def test_a_sampled_pressure_dict_cannot_be_mutated_by_a_caller(monkeypatch):
+    # The memo holds one dict; handing it out directly would let any caller's edit become
+    # every later caller's reading.
+    import builtins
+
+    files = {
+        "/proc/self/cgroup": "0::/\n",
+        "/sys/fs/cgroup/cpu.pressure": "some avg10=12.50 avg60=1.00 avg300=0.00 total=1\n",
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    first = cgroup.cgroup_pressure()
+    first["cpu_stall"] = 999.0
+    assert cgroup.cgroup_pressure()["cpu_stall"] == pytest.approx(0.125)
+
+
 def test_cpu_oversubscription_folds_queueing_and_stalling_together(monkeypatch):
     # A box with twice the runnable work as cores, half of whose wall time is stalled, is
     # worse than either signal alone says. Fan-out gating needs the combined figure.

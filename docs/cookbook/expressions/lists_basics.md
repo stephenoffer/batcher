@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/lists_basics.py
 ```
+
+## See also
+
+- {doc}`lists_aggregate`: reducing a list column to one value per row.
+- {doc}`lists_set_operations`: treating two list columns as sets: union, intersection, difference, overlap.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.

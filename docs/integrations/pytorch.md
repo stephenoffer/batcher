@@ -143,7 +143,7 @@ split is exactly balanced, deterministic in `(seed, epoch)`, and resumable mid-e
 :::{important}
 `stream_loader` is the one shard authority, so **turn off any framework auto-sharding**
 (`DistributedSampler`, a DataLoader sampler) or your ranks will overlap.
-[Streaming for training](../ml/streaming.md) has the ordering contract.
+{doc}`Streaming for training <../ml/streaming>` has the ordering contract.
 :::
 
 ## Inference: load the model once
@@ -210,12 +210,12 @@ parallel, in Rust, before it becomes a tensor.
 
 ## See also
 
-- [PyTorch (ML guide)](../ml/pytorch.md): converters, DataLoader wrapping, the full loop.
-- [Streaming for training](../ml/streaming.md): the sample-order contract and resumption.
-- [Feature pipeline](../examples/ml/feature-pipeline.md): the engineering that happens before
+- {doc}`PyTorch (ML guide) <../ml/pytorch>`: converters, DataLoader wrapping, the full loop.
+- {doc}`Streaming for training <../ml/streaming>`: the sample-order contract and resumption.
+- {doc}`Feature pipeline <../examples/ml/feature-pipeline>`: the engineering that happens before
   a row becomes a tensor.
-- [Train/test split](../examples/ml/train-test-split.md): a deterministic split that survives
+- {doc}`Train/test split <../examples/ml/train-test-split>`: a deterministic split that survives
   a re-run.
-- [ML API](../api/ml.md): `iter_torch_batches`, `streaming_split`, `stream_loader`.
-- [Ray](ray.md): what a distributed run actually schedules.
-- [Hugging Face](huggingface.md): model ids, and the corpus that feeds this loop.
+- {doc}`ML API <../api/ml>`: `iter_torch_batches`, `streaming_split`, `stream_loader`.
+- {doc}`Ray <ray>`: what a distributed run actually schedules.
+- {doc}`Hugging Face <huggingface>`: model ids, and the corpus that feeds this loop.

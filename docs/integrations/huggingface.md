@@ -186,9 +186,9 @@ reload per batch. Pass a class, or a model id, which becomes one. Batcher warns;
 
 ## See also
 
-- [Inference](../ml/inference.md): the actor pool, batching, GPU placement.
-- [Reading data](../user-guide/reading-data.md): the readers and how they split.
-- [Text embeddings](../examples/ml/text-embeddings.md): `ds.ml.embed` over a real corpus.
-- [LLM batch scoring](../examples/ml/llm-batch-scoring.md): the same actor pool, a bigger model.
-- [ML API](../api/ml.md): `infer`, `embed`, `map_batches`, the preprocessors.
-- [PyTorch](pytorch.md): tensors, DDP ingest, model-once-per-worker.
+- {doc}`Inference <../ml/inference>`: the actor pool, batching, GPU placement.
+- {doc}`Reading data <../user-guide/reading-data>`: the readers and how they split.
+- {doc}`Text embeddings <../examples/ml/text-embeddings>`: `ds.ml.embed` over a real corpus.
+- {doc}`LLM batch scoring <../examples/ml/llm-batch-scoring>`: the same actor pool, a bigger model.
+- {doc}`ML API <../api/ml>`: `infer`, `embed`, `map_batches`, the preprocessors.
+- {doc}`PyTorch <pytorch>`: tensors, DDP ingest, model-once-per-worker.

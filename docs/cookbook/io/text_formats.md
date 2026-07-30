@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/io/text_formats.py
 ```
+
+## See also
+
+- {doc}`streaming_reads`: reading in bounded memory: iter_batches, limits, and lazy metadata.
+- {doc}`sources_and_sinks`: the source and sink registries: what formats exist, and the objects behind them.
+- {doc}`../../user-guide/reading-data`: every source format and how paths and schemas resolve.
+- {doc}`../../user-guide/writing-data`: sinks, save modes, and partitioned output.

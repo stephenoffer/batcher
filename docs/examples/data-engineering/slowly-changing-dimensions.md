@@ -179,7 +179,7 @@ One row per key, "before and after" available, and the row count never grows. It
 
 The incoming snapshot must have **one row per natural key**. Two rows for the same key is
 a cardinality violation and the merge will tell you so. Deduplicate first (see
-[deduplication](deduplication.md)).
+{doc}`deduplication <deduplication>`).
 
 :::{warning}
 `as_of` must move forward across loads. It is stored, compared, and written into the
@@ -202,10 +202,10 @@ set deliberately, because it is the one thing here you cannot fix retroactively.
 
 ## See also
 
-- [CDC pipeline](cdc-pipeline.md): when the source is a change feed, not a snapshot.
-- [Multi-source join](multi-source-join.md): joining facts to dimensions in general.
-- [Deduplication](deduplication.md): getting to one row per key before the load.
-- [Lakehouse tables](../../user-guide/lakehouse.md): the `ds.scd` reference.
-- [Joins](../../user-guide/joins.md): the equi-join plus range filter, and `join_asof`.
-- [Delta Lake](../../integrations/delta-lake.md): a real transaction around the commit.
-- [Dataset API](../../api/dataset.md): `type1`, `type2`, `type3`, `apply_changes`.
+- {doc}`CDC pipeline <cdc-pipeline>`: when the source is a change feed, not a snapshot.
+- {doc}`Multi-source join <multi-source-join>`: joining facts to dimensions in general.
+- {doc}`Deduplication <deduplication>`: getting to one row per key before the load.
+- {doc}`Lakehouse tables <../../user-guide/lakehouse>`: the `ds.scd` reference.
+- {doc}`Joins <../../user-guide/joins>`: the equi-join plus range filter, and `join_asof`.
+- {doc}`Delta Lake <../../integrations/delta-lake>`: a real transaction around the commit.
+- {doc}`Dataset API <../../api/dataset>`: `type1`, `type2`, `type3`, `apply_changes`.

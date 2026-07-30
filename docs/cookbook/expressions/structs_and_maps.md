@@ -14,3 +14,10 @@ Run it yourself:
 ```bash
 python examples/expressions/structs_and_maps.py
 ```
+
+## See also
+
+- {doc}`strings_slicing`: string slicing: taking a fixed piece of every value.
+- {doc}`temporal_business_days`: weekend and business-day predicates, and formatting a timestamp for output.
+- {doc}`../../user-guide/expressions`: how expressions are built, evaluated, and combined.
+- {doc}`../../api/expressions`: the complete `Expr` reference.
