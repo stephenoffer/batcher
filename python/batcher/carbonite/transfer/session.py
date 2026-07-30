@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher.carbonite.transfer.fabric_usage import fabric_baseline, fabric_usage
 from batcher.carbonite.transfer.lifecycle import host_of, process_client, register_session
 from batcher.carbonite.transfer.locality import (
     TransferMode,
@@ -94,6 +95,10 @@ class ShuffleSession:
             from batcher.carbonite.memory.pressure import PressureMonitor
 
             self._pressure = PressureMonitor()
+        # A baseline of the node's fabric counters, so `stats` can say what the wire actually
+        # carried while this session ran. Taken only where a fabric exists — a few small file
+        # reads on an RDMA node, nothing at all anywhere else.
+        self._fabric_baseline, self._fabric_started = fabric_baseline()
         register_session(self)
 
     def set_credits(self, credits: int | None) -> None:
@@ -407,6 +412,7 @@ class ShuffleSession:
             out.update({f"credit_{k}": v for k, v in self._flow_control.stats().items()})
         elif self._credits is not None:
             out["credit_window"] = self._credits
+        out.update(fabric_usage(self._fabric_baseline, self._fabric_started))
         return out
 
     def release(self, ticket: ShuffleTicket) -> None:

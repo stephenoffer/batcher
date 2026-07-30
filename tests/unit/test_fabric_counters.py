@@ -138,3 +138,50 @@ def test_a_dropped_link_puts_a_node_on_the_drain_list():
     clean = {"node_id": "a", "quarantined": [], "fabric_errors": {"symbol_errors": 40}}
     dropped = {"node_id": "b", "quarantined": [], "fabric_errors": {"link_downed": 1}}
     assert [r["node_id"] for r in hardware_probe.unhealthy_nodes((clean, dropped))] == ["b"]
+
+
+# --- What a shuffle reports about the wire it ran on ---------------------------------------
+
+
+def test_a_node_with_no_fabric_adds_nothing_to_the_shuffle_stats(monkeypatch, tmp_path):
+    # Most nodes. The measurement must cost nothing and say nothing there.
+    monkeypatch.setattr(rdma, "RDMA_SYSFS_ROOT", str(tmp_path / "absent"))
+    from batcher.carbonite.transfer import ShuffleSession
+
+    stats = ShuffleSession(4).stats()
+    assert not [k for k in stats if k.startswith("fabric_")]
+
+
+def test_a_shuffle_reports_what_the_fabric_carried(monkeypatch):
+    from batcher.carbonite.transfer import ShuffleSession
+
+    baseline = (counters.PortCounters("mlx5_0", 1, xmit_bytes=0, rcv_bytes=0),)
+    monkeypatch.setattr("batcher._internal.hardware.fabric.port_counters", lambda: baseline)
+    shuffle = ShuffleSession(4)
+    # A tenth of a 400 Gb/s fabric, which is the shape of "the shuffle never reached the
+    # fast wire" — the failure every other statistic in the session reads the same through.
+    monkeypatch.setattr("batcher._internal.hardware.fabric.fabric_bandwidth_gbps", lambda: 400.0)
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.throughput_delta",
+        lambda before, after, seconds: {"mlx5_0:1": 40.0},
+    )
+    stats = shuffle.stats()
+    assert stats["fabric_gbps_observed"] == pytest.approx(40.0)
+    assert stats["fabric_gbps_capable"] == pytest.approx(400.0)
+    assert stats["fabric_utilization"] == pytest.approx(0.1)
+
+
+def test_a_failing_probe_never_breaks_the_stats(monkeypatch):
+    from batcher.carbonite.transfer import ShuffleSession
+
+    baseline = (counters.PortCounters("mlx5_0", 1, xmit_bytes=0),)
+    monkeypatch.setattr("batcher._internal.hardware.fabric.port_counters", lambda: baseline)
+    shuffle = ShuffleSession(4)
+
+    def _boom():
+        raise RuntimeError("sysfs went away")
+
+    monkeypatch.setattr("batcher._internal.hardware.fabric.port_counters", _boom)
+    stats = shuffle.stats()
+    assert "fetches" in stats
+    assert "fabric_gbps_observed" not in stats
