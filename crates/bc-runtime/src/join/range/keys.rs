@@ -323,6 +323,65 @@ fn sort_u64_pairs(pairs: &mut [(u64, u32)]) {
     }
 }
 
+/// The universe entries `first..last` in ascending key order, ties broken by entry.
+///
+/// Entries in that half-open range index `keys` directly, so the keys involved are a contiguous
+/// subslice and the whole thing is one sort of one array.
+///
+/// Both one-sided orders — the band's sorted left and sorted right — used to build a
+/// `Vec<(u64, u32)>`, sort that, and map the entries back out. Three costs, all avoidable: the
+/// tuple pads to **16 bytes** where the information is 12 and fits in 8, and a sort is
+/// memory-bound; and the build and extract passes ran on one core. This packs key and entry into
+/// a single `u64` exactly as [`packed_keys`] does for the two-sided order, which was already
+/// doing it — the one-sided paths simply never got the same treatment.
+///
+/// The order is **identical**, not merely equivalent: with the key in the high bits and the
+/// entry in the low ones, ordering by the packed value orders by key and breaks ties by entry,
+/// which is what the pair sort did. Packing needs the key span to fit in 32 bits, and the pair
+/// sort remains for the spans that do not.
+fn sorted_entries(keys: &[u64], first: u32, last: u32) -> Vec<u32> {
+    let sub = &keys[first as usize..last as usize];
+    let n = sub.len();
+
+    // min/max is associative, so the fold order cannot change the span.
+    let (lo, hi) = if n >= PARALLEL_MAP_MIN {
+        sub.par_iter()
+            .fold(|| (u64::MAX, 0u64), |(l, h), &k| (l.min(k), h.max(k)))
+            .reduce(|| (u64::MAX, 0u64), |a, b| (a.0.min(b.0), a.1.max(b.1)))
+    } else {
+        sub.iter()
+            .fold((u64::MAX, 0u64), |(l, h), &k| (l.min(k), h.max(k)))
+    };
+
+    if n == 0 || n > u32::MAX as usize || hi.wrapping_sub(lo) >= 1u64 << 32 {
+        let mut pairs: Vec<(u64, u32)> = (first..last).map(|e| (keys[e as usize], e)).collect();
+        sort_u64_pairs(&mut pairs);
+        return pairs.into_iter().map(|(_, e)| e).collect();
+    }
+
+    let mut packed: Vec<u64> = if n >= PARALLEL_MAP_MIN {
+        sub.par_iter()
+            .enumerate()
+            .map(|(i, &k)| ((k - lo) << 32) | (first as u64 + i as u64))
+            .collect()
+    } else {
+        sub.iter()
+            .enumerate()
+            .map(|(i, &k)| ((k - lo) << 32) | (first as u64 + i as u64))
+            .collect()
+    };
+    if n >= PARALLEL_SORT_MIN_ROWS {
+        packed.par_sort_unstable();
+    } else {
+        packed.sort_unstable();
+    }
+    if n >= PARALLEL_MAP_MIN {
+        packed.par_iter().map(|&p| p as u32).collect()
+    } else {
+        packed.iter().map(|&p| p as u32).collect()
+    }
+}
+
 impl AxisKeys {
     /// Build the universe's keys for one condition, preferring the `u64` path.
     pub(super) fn build(
@@ -426,17 +485,7 @@ impl AxisKeys {
     /// The right-side universe entries in ascending key order.
     pub(super) fn sorted_right(&self, n: usize, nl: usize, lmap: &[u32], rmap: &[u32]) -> Vec<u32> {
         match self {
-            AxisKeys::Fast(keys) => {
-                let mut pairs: Vec<(u64, u32)> = ((nl as u32)..(n as u32))
-                    .map(|e| (keys[e as usize], e))
-                    .collect();
-                if pairs.len() >= PARALLEL_SORT_MIN_ROWS {
-                    pairs.par_sort_unstable();
-                } else {
-                    pairs.sort_unstable();
-                }
-                pairs.into_iter().map(|(_, e)| e).collect()
-            }
+            AxisKeys::Fast(keys) => sorted_entries(keys, nl as u32, n as u32),
             AxisKeys::Encoded { left, right } => {
                 let mut idx: Vec<u32> = ((nl as u32)..(n as u32)).collect();
                 sort_by_key(&mut idx, |e| key(e, nl, left, right, lmap, rmap));
@@ -466,16 +515,7 @@ impl AxisKeys {
     /// million times over, which no amount of parallelism makes cache-friendly.
     pub(super) fn sorted_left(&self, nl: usize, lmap: &[u32], rmap: &[u32]) -> Vec<u32> {
         match self {
-            AxisKeys::Fast(keys) => {
-                let mut pairs: Vec<(u64, u32)> =
-                    (0..nl as u32).map(|e| (keys[e as usize], e)).collect();
-                if pairs.len() >= PARALLEL_SORT_MIN_ROWS {
-                    pairs.par_sort_unstable();
-                } else {
-                    pairs.sort_unstable();
-                }
-                pairs.into_iter().map(|(_, e)| e).collect()
-            }
+            AxisKeys::Fast(keys) => sorted_entries(keys, 0, nl as u32),
             AxisKeys::Encoded { left, right } => {
                 let mut idx: Vec<u32> = (0..nl as u32).collect();
                 sort_by_key(&mut idx, |e| key(e, nl, left, right, lmap, rmap));
