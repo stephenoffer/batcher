@@ -535,6 +535,119 @@ fn a_range_join_over_a_dictionary_agrees_with_the_decoded_oracle() {
     );
 }
 
+/// A dictionary of **floats** must still obey the engine's one float-identity contract.
+///
+/// This is the combination `keys::contains_float` does not see. Its `_ => false` arm catches
+/// `Dictionary(_, Float64)`, justified by a comment saying dictionaries are decoded at the FFI
+/// boundary — true today, and exactly the assumption Proposal 3 removes. Without
+/// canonicalization `-0.0` and `0.0` are distinct keys, so a `GROUP BY` splits one group in two
+/// and a join drops matches: the silent wrong-answer `keys.rs` exists to prevent, and the one
+/// its module docs say has already happened here once.
+///
+/// Every NaN must likewise collapse to one group, and must not collapse with a number.
+///
+/// **What this does and does not currently prove.** It passes today, and the honest reason is
+/// that the group key is a bare `Col`, which `Expr::eval` decodes at the leaf
+/// (`eval::dispatch::decode_dict`) before any grouping happens — so `assign_groups`' dictionary
+/// fast path is not reached by this plan, and the values that arrive are already canonicalized
+/// as ordinary floats. That makes `assign_groups`' dictionary path *doubly* unreachable from a
+/// query: decoded once at the FFI boundary and again at the `Col` leaf.
+///
+/// It is kept as a **tripwire for the change that is coming**, not as evidence about a path it
+/// does not exercise. The moment a dictionary is preserved far enough to reach
+/// `keys::canonicalize_float_keys` as a key, `contains_float`'s `_ => false` arm returns false
+/// for it, no canonicalization happens, and this test goes red on the group count. Which is
+/// exactly when someone needs to know.
+#[test]
+fn a_float_dictionary_follows_the_engines_float_identity() {
+    // Two spellings of zero and two NaN bit patterns, plus ordinary values. The decoded
+    // oracle groups these into {0.0, 1.5, 2.5, NaN} = 4 groups; the dictionary must agree.
+    let raw: Vec<f64> = vec![
+        0.0,
+        -0.0,
+        1.5,
+        f64::NAN,
+        -f64::NAN,
+        2.5,
+        0.0,
+        -0.0,
+        1.5,
+        f64::NAN,
+    ];
+    let plain: ArrayRef = Arc::new(arrow::array::Float64Array::from(raw.clone()));
+    // Build the dictionary over the *distinct bit patterns*, which is the adversarial case:
+    // `-0.0` and `0.0` land on different codes, so grouping on codes alone splits them.
+    let mut distinct: Vec<f64> = Vec::new();
+    let keys: Vec<i32> = raw
+        .iter()
+        .map(|&v| {
+            let pos = distinct.iter().position(|d| d.to_bits() == v.to_bits());
+            match pos {
+                Some(p) => p as i32,
+                None => {
+                    distinct.push(v);
+                    (distinct.len() - 1) as i32
+                }
+            }
+        })
+        .collect();
+    let dict: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            arrow::array::Int32Array::from(keys),
+            Arc::new(arrow::array::Float64Array::from(distinct)),
+        )
+        .expect("float dictionary"),
+    );
+
+    let v: ArrayRef = Arc::new(Int64Array::from(
+        (0..raw.len()).map(|i| i as i64).collect::<Vec<_>>(),
+    ));
+    let dict_batch =
+        RecordBatch::try_from_iter_with_nullable(vec![("k", dict, true), ("v", v.clone(), false)])
+            .expect("dict");
+    let plain_batch =
+        RecordBatch::try_from_iter_with_nullable(vec![("k", plain, true), ("v", v, false)])
+            .expect("plain");
+
+    let plan = || RelOp::Aggregate {
+        input: Box::new(RelOp::Scan { source_id: 0 }),
+        group_keys: vec![item(col("k"), "k")],
+        aggregates: vec![AggregateItem {
+            func: AggFunc::CountStar,
+            input: None,
+            input2: None,
+            param: None,
+            alias: "n".into(),
+        }],
+    };
+
+    for ex in [
+        Executor::Sequential,
+        Executor::Streaming,
+        Executor::StreamingParallel,
+    ] {
+        let got_batches = ex.run(&plan(), &[vec![dict_batch.clone()]]);
+        let want_batches = ex.run(&plan(), &[vec![plain_batch.clone()]]);
+        let mut got = decoded(&got_batches);
+        let mut want = decoded(&want_batches);
+        got.sort();
+        want.sort();
+        assert_eq!(
+            want.len(),
+            4,
+            "the oracle itself must fold -0.0 into 0.0 and every NaN into one, else this \
+             test proves nothing"
+        );
+        assert_eq!(
+            got,
+            want,
+            "float dictionary on {}: grouping split a group that the decoded oracle keeps \
+             whole — `-0.0`/`0.0` or two NaN bit patterns were treated as distinct keys",
+            ex.name()
+        );
+    }
+}
+
 #[test]
 fn limit_over_a_dictionary_agrees_with_the_decoded_oracle() {
     assert_agrees(

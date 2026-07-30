@@ -57,6 +57,17 @@ pub(crate) const SHUFFLE_HASHER: bc_arrow::PortableBuildHasher =
 /// Whether a data type has a floating-point leaf that needs canonicalizing — a top-level
 /// float, or a float nested inside a list/struct key. Dictionary and top-level narrow
 /// floats are decoded/widened at the FFI boundary, so only these shapes reach the engine.
+///
+/// **That boundary decode is load-bearing here, and it is scheduled to be removed.** The
+/// `_ => false` arm below catches `Dictionary(_, Float64)`, so if a float dictionary ever
+/// reaches this as a key it is *not* canonicalized: `-0.0` and `0.0` keep distinct codes,
+/// one `GROUP BY` group splits in two, and a join drops matches — the silent wrong answer
+/// this module exists to prevent. `decode_dict_keys` covers the join paths by running first,
+/// but `agg::group::combine` calls `canonicalize_float_keys` directly. Anyone implementing
+/// `rfc-streaming-executor.md` Proposal 3 must either recurse this into `Dictionary` (and
+/// teach `canon_array` to rebuild one) or decode before canonicalizing.
+/// `a_float_dictionary_follows_the_engines_float_identity` in
+/// `bc-interp/tests/dictionary_operators.rs` is the tripwire.
 fn contains_float(dt: &DataType) -> bool {
     match dt {
         DataType::Float32 | DataType::Float64 => true,
