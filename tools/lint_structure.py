@@ -47,6 +47,13 @@ DIR_ALLOW: dict[str, str] = {
         "`evaluate`/`calibration`/`thresholds`/`tables` here and the plan-layer "
         "`plan/functions/metrics/model/`, so do not go looking for one"
     ),
+    "benchmarks/gpu_backend": (
+        "13 GPU benchmark scripts against a cap of 12. Each is a standalone `python "
+        "benchmarks/gpu_backend/<name>.py` entry point a reader runs by name, so grouping them "
+        "into subdirectories would change every invocation in the docs and the results file to "
+        "hide a count. Split by what is being measured (kernel / cluster / energy) if it grows "
+        "much past this"
+    ),
     "python/batcher/kyber/rules/extra": (
         "Kyber's extended rule families: one small module per family + a registry, the "
         "sanctioned pattern for the optimizer's large (hundreds-of-rules) rule set"
