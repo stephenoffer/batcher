@@ -33,29 +33,27 @@ __all__ = ["sharded_gpu_aggregate"]
 def sharded_gpu_aggregate(
     source: Source, ops: list[dict], *, gpu_count: int, sharded: bool
 ) -> pa.Table | None:
-    """Run `ops` — a translated chain whose last operator is an aggregate — across the GPUs.
+    """Run a translated chain across the GPUs, reducing per device and folding once.
 
     Args:
         source: The scan's source; must be splittable for the fan-out to be worth it.
-        ops: The bottom-up operator IR chain, ending in an `aggregate` node.
+        ops: The bottom-up operator IR chain. Its reducing prefix runs per device; anything
+            above the reducer runs once on the folded result.
         gpu_count: The cluster's live device count.
         sharded: Whether the working set exceeds one device, so the chain must fan out.
             `False` still runs on a worker (which reads the source itself) but as one shard.
 
     Returns:
-        The aggregate's result, or `None` when the fan-out does not apply — an unsplittable
-        source, a non-mergeable reduction, an unreadable cluster — so the caller can use the
-        single-device dispatch or the CPU engine instead.
+        The chain's result, or `None` when the fan-out does not apply — an unsplittable source,
+        no shardable reducer, an unreadable cluster — so the caller can use the single-device
+        dispatch or the CPU engine instead.
     """
-    if not ops or ops[-1].get("op") != "aggregate":
-        return None
-    from batcher.core.gpu_plan.mergeable import decompose
+    from batcher.core.gpu_plan.mergeable import shard_plan
 
-    parts = decompose(ops[-1])
-    if parts is None:
-        return None  # a reduction with no mergeable partial form stays on one device
-    partial_ir, combine_ir, finalize_ir = parts
-    shard_ops = [*ops[:-1], partial_ir]
+    split = shard_plan(ops)
+    if split is None:
+        return None
+    shard_ops, merge_ops, tail_ops = split
 
     descriptors = _shard_descriptors(source, gpu_count, sharded=sharded)
     if descriptors is None:
@@ -63,7 +61,7 @@ def sharded_gpu_aggregate(
     partials = _run_shards(descriptors, shard_ops)
     if not partials:
         return None
-    return _combine(partials, combine_ir, finalize_ir)
+    return _merge(partials, [*merge_ops, *tail_ops])
 
 
 def _shard_descriptors(source: Source, gpu_count: int, *, sharded: bool):
@@ -137,12 +135,13 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
     return [t for t in results if t is not None and t.num_rows]
 
 
-def _combine(partials: list, combine_ir: dict, finalize_ir: dict) -> pa.Table:
-    """Fold the shards' partials into the answer.
+def _merge(partials: list, ops: list[dict]) -> pa.Table:
+    """Fold the shards' results into the answer, then run whatever sat above the reducer.
 
-    Runs on the host through the translator's own kernels, on one row per group per shard —
-    small by construction, which is the point of a mergeable decomposition. Using the same
-    kernels as the device keeps the two halves of the algebra in one implementation.
+    Runs on the host through the translator's own kernels, over one row per group (or per
+    distinct row, or per top-N entry) per shard — small by construction, which is the whole
+    point of reducing before merging. Using the same kernels as the device keeps both halves
+    of the algebra in one implementation.
     """
     import pandas as pd
     import pyarrow as pa
@@ -151,4 +150,4 @@ def _combine(partials: list, combine_ir: dict, finalize_ir: dict) -> pa.Table:
     from batcher.core.gpu_plan.execute import run_chain
 
     be = DfBackend(pd)
-    return be.to_arrow(run_chain(pa.concat_tables(partials), [combine_ir, finalize_ir], be))
+    return be.to_arrow(run_chain(pa.concat_tables(partials), ops, be))

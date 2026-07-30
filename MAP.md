@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 976 Python modules across 151 packages and 179 Rust files across 13 crates.
+Covering 978 Python modules across 151 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -302,6 +302,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
+| `accelerators.py` | 135 | Accelerator reporting (`accelerators`, `show_accelerators`). |
 | `admin.py` | 223 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -1250,6 +1251,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 83 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
+| `energy.py` | 188 | Measuring what a stage drew — Core's half of the energy loop. |
 | `executor.py` | 245 | The Core local executor. |
 | `gpu_transform.py` | 201 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
@@ -1269,7 +1271,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 173 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 482 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
-| `mergeable.py` | 177 | Split a translated chain into a per-shard stage and a merge stage, in the plan IR. |
+| `mergeable.py` | 189 | Split a translated chain into a per-shard stage and a merge stage, in the plan IR. |
 | `ops.py` | 124 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `windows.py` | 310 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
@@ -1661,7 +1663,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 |---|---|---|
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
-| `energy.py` | 150 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
+| `energy.py` | 154 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `metrics.py` | 389 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 185 | The host and engine the queries are running on — the dashboard's hardware panel. |
@@ -1755,7 +1757,7 @@ Energy as a first-class plan quantity: power draw, grid conversion, and per-stag
 
 | module | lines | what it is |
 |---|---|---|
-| `accounting.py` | 198 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
+| `accounting.py` | 210 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
 | `carbon.py` | 153 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
 | `power.py` | 221 | Device power draw — the neutral model every power-aware decision reads. |
 

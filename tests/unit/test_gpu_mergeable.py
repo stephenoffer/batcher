@@ -174,3 +174,97 @@ def test_partial_stage_is_smaller_than_its_input():
     partial = be.to_arrow(run_chain(table, [partial_ir], be))
     assert partial.num_rows < table.num_rows
     assert partial.num_rows == len(set(table.column("k").to_pylist()))
+
+
+# --- the generalized split: which operators may run per shard -------------------------
+
+
+def _fold_split(table: pa.Table, ops: list[dict], shard_count: int, be) -> pa.Table:
+    """Run `shard_ops` per shard, then `merge_ops + tail_ops` once — the distributed shape."""
+    from batcher.core.gpu_plan.mergeable import shard_plan
+
+    split = shard_plan(ops)
+    assert split is not None, "this chain should be shardable"
+    shard_ops, merge_ops, tail_ops = split
+    pieces = [be.to_arrow(run_chain(s, shard_ops, be)) for s in _shards(table, shard_count)]
+    merged = pa.concat_tables([p for p in pieces if p.num_rows] or pieces[:1])
+    return be.to_arrow(run_chain(merged, [*merge_ops, *tail_ops], be))
+
+
+@pytest.mark.parametrize("shard_count", [1, 2, 3, 5])
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda ds: ds.select("k", "j").distinct(),
+        lambda ds: ds.filter(col("v") > 10.0).select("k").distinct(),
+        # operators ABOVE the reducer run once on the folded result; requiring the reducer to
+        # be the chain's last operator excluded this, the ordinary analytical shape
+        lambda ds: ds.group_by("k").agg(s=col("v").sum()).filter(col("s") > 100.0),
+        lambda ds: ds.group_by("k").agg(s=col("v").sum()).sort("s", descending=True).limit(3),
+    ],
+)
+def test_generalized_split_matches_the_single_node_answer(build, shard_count, be):
+    table = _table()
+    ds = build(bt.from_arrow(table))
+    spec = gpu_plan_ops(ds._plan)
+    assert spec is not None
+    got = _fold_split(table, spec[1], shard_count, be)
+    expected = ds.collect()
+    assert _rows(got.select(expected.column_names)) == _rows(expected)
+
+
+@pytest.mark.parametrize("shard_count", [1, 2, 3, 5])
+def test_sharded_top_n_keeps_the_single_node_order(shard_count, be):
+    """A top-N is compared row-for-row: its order is the whole point of the operator."""
+    table = _table()
+    ds = bt.from_arrow(table).sort("v", descending=True).limit(9)
+    spec = gpu_plan_ops(ds._plan)
+    got = _fold_split(table, spec[1], shard_count, be)
+    expected = ds.collect()
+
+    def in_order(t):
+        return [
+            tuple(float(f"{v:.12e}") if isinstance(v, float) else v for v in row)
+            for row in zip(*t.select(expected.column_names).to_pydict().values(), strict=True)
+        ]
+
+    assert in_order(got) == in_order(expected)
+
+
+def test_only_row_local_operators_run_below_the_cut():
+    """The split must cut at the FIRST non-row-local operator, not the last reducer.
+
+    `sort(...).limit(10)` under an aggregate is the trap: each shard would contribute its own
+    ten rows to a global ten that may all have come from one shard, and the aggregate over that
+    is a confidently wrong number. Cutting at the sort makes the aggregate part of the tail,
+    which runs once on the merged top-N.
+    """
+    from batcher.core.gpu_plan.mergeable import shard_plan
+
+    ds = (
+        bt.from_arrow(_table())
+        .filter(col("v") > 5.0)
+        .sort("v", descending=True)
+        .limit(10)
+        .group_by("k")
+        .agg(s=col("v").sum())
+    )
+    shard_ops, _merge, tail_ops = shard_plan(gpu_plan_ops(ds._plan)[1])
+    assert [op["op"] for op in shard_ops] == ["filter", "sort", "limit"]
+    assert [op["op"] for op in tail_ops] == ["aggregate"]
+
+
+def test_a_map_only_chain_has_nothing_to_fold():
+    """No reducer means no fan-out: the result is every input row, so folding buys nothing."""
+    from batcher.core.gpu_plan.mergeable import shard_plan
+
+    ds = bt.from_arrow(_table()).filter(col("v") > 5.0).with_columns(w=col("v") * 2.0)
+    assert shard_plan(gpu_plan_ops(ds._plan)[1]) is None
+
+
+def test_a_limit_with_an_offset_does_not_shard():
+    """A shard's rows 10..20 are not the global rows 10..20."""
+    from batcher.core.gpu_plan.mergeable import shard_plan
+
+    ds = bt.from_arrow(_table()).sort("v").limit(5, offset=10)
+    assert shard_plan(gpu_plan_ops(ds._plan)[1]) is None
