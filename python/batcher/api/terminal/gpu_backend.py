@@ -113,28 +113,28 @@ def try_gpu_collect(
             return None
         return _dispatch_cudf_plan(pa.Table.from_batches(batches), ops)
 
-    # A `[supported ops] over Join(scan, scan)` — an equi-join plus a chain — runs on one GPU.
+    # A `[ops] over Join(chain, chain)` — an equi/semi/anti join plus the chains pushed below
+    # it and above it — runs on one GPU.
     join_spec = gpu_join_spec(plan)
     if join_spec is not None:
-        lscan, rscan, join_ir, ops = join_spec
+        (lscan, lops), (rscan, rops), join_ir, ops = join_spec
         lb = list(sources[lscan.source_id].read())
         rb = list(sources[rscan.source_id].read())
         if not lb or not rb:
             return None
         return _dispatch_cudf_join(
-            pa.Table.from_batches(lb), pa.Table.from_batches(rb), join_ir, ops
+            pa.Table.from_batches(lb), pa.Table.from_batches(rb), lops, rops, join_ir, ops
         )
 
-    # A `[supported ops] over Union(scans)` — concat (+ optional dedup) + a chain — on one GPU.
+    # A `[ops] over Union(chains)` — concat (+ optional dedup) + a chain — on one GPU.
     union_spec = gpu_union_spec(plan)
     if union_spec is not None:
-        scans, distinct, ops = union_spec
-        tables = [
-            pa.Table.from_batches(b) for sc in scans if (b := list(sources[sc.source_id].read()))
-        ]
+        inputs, distinct, ops = union_spec
+        read = [(list(sources[sc.source_id].read()), iops) for sc, iops in inputs]
+        tables = [(pa.Table.from_batches(b), iops) for b, iops in read if b]
         if not tables:
             return None
-        return _dispatch_cudf_union(tables, distinct, ops)
+        return _dispatch_cudf_union([t for t, _ in tables], [o for _, o in tables], distinct, ops)
     return None
 
 
@@ -319,77 +319,60 @@ def _cudf_plan_worker(table, ops):
     return execute_cudf_plan(table, ops)
 
 
-def _cudf_join_worker(left_t, right_t, join_ir, ops):
+def _cudf_join_worker(left_t, right_t, left_ops, right_ops, join_ir, ops):
     from batcher.core.gpu_plan import execute_cudf_join
 
-    return execute_cudf_join(left_t, right_t, join_ir, ops)
+    return execute_cudf_join(left_t, right_t, left_ops, right_ops, join_ir, ops)
 
 
-def _cudf_union_worker(tables, distinct, ops):
+def _cudf_union_worker(tables, input_ops, distinct, ops):
     from batcher.core.gpu_plan import execute_cudf_union
 
-    return execute_cudf_union(tables, distinct, ops)
+    return execute_cudf_union(tables, input_ops, distinct, ops)
 
 
-def _dispatch_cudf_union(tables: list, distinct: bool, ops: list[dict]) -> pa.Table | None:
+def _dispatch_cudf_union(
+    tables: list, input_ops: list[list[dict]], distinct: bool, ops: list[dict]
+) -> pa.Table | None:
     """Run a union (+ op chain) on one GPU via cuDF; `None` on failure → CPU fallback."""
-    from batcher.core.gpu_transform import gpu_available
-
-    try:
-        if gpu_available():
-            with contextlib.suppress(Exception):
-                return _cudf_union_worker(tables, distinct, ops)
-        import ray
-
-        from batcher.dist.executors.ray_runtime import _ensure_ray
-
-        _ensure_ray(1)
-        opts = _gpu_task_opts()
-        return ray.get(ray.remote(**opts)(_cudf_union_worker).remote(tables, distinct, ops))
-    except Exception:
-        return None
+    return _dispatch_on_gpu(_cudf_union_worker, tables, input_ops, distinct, ops)
 
 
-def _dispatch_cudf_join(left_t, right_t, join_ir: dict, ops: list[dict]) -> pa.Table | None:
-    """Run an equi-join + op chain on one GPU via cuDF (in-process if this process owns a GPU
-    with cuDF, else a GPU worker). `None` on any failure → CPU fallback."""
-    from batcher.core.gpu_transform import gpu_available
-
-    try:
-        if gpu_available():
-            with contextlib.suppress(Exception):
-                return _cudf_join_worker(left_t, right_t, join_ir, ops)
-        import ray
-
-        from batcher.dist.executors.ray_runtime import _ensure_ray
-
-        _ensure_ray(1)
-        opts = _gpu_task_opts()
-        return ray.get(ray.remote(**opts)(_cudf_join_worker).remote(left_t, right_t, join_ir, ops))
-    except Exception:
-        return None
+def _dispatch_cudf_join(
+    left_t, right_t, left_ops: list[dict], right_ops: list[dict], join_ir: dict, ops: list[dict]
+) -> pa.Table | None:
+    """Run a join + op chain on one GPU via cuDF (in-process if this process owns a GPU with
+    cuDF, else a GPU worker). `None` on any failure → CPU fallback."""
+    return _dispatch_on_gpu(_cudf_join_worker, left_t, right_t, left_ops, right_ops, join_ir, ops)
 
 
 def _dispatch_cudf_plan(table: pa.Table, ops: list[dict]) -> pa.Table | None:
-    """Run a translated op chain on ONE GPU via cuDF — in-process if this process owns a GPU with
-    cuDF, else on a GPU worker (cuDF shipped in the runtime_env). Returns `None` on any failure —
-    an unsupported expression, a cuDF-less worker, or a GPU OOM — so the caller uses the CPU
-    engine. GPU is an accelerator, never a requirement."""
+    """Run a translated op chain on ONE GPU via cuDF; `None` on failure → CPU fallback."""
+    return _dispatch_on_gpu(_cudf_plan_worker, table, ops)
+
+
+def _dispatch_on_gpu(worker, *args) -> pa.Table | None:
+    """Run `worker(*args)` on a GPU — in-process when this process owns one with cuDF, else on
+    a GPU worker (cuDF shipped in the runtime_env).
+
+    Returns `None` on any failure — an untranslatable expression, a cuDF-less worker, or a GPU
+    OOM — so the caller uses the CPU engine. GPU is an accelerator, never a requirement, and
+    every dispatch shape (chain, join, union) needs exactly this behavior, so they share it
+    rather than restating it three times with three chances to drift."""
     from batcher.core.gpu_transform import gpu_available
 
     try:
         if gpu_available():
             with contextlib.suppress(Exception):
-                return _cudf_plan_worker(table, ops)  # GPU-equipped process with cuDF
+                return worker(*args)  # GPU-equipped process with cuDF
         import ray
 
         from batcher.dist.executors.ray_runtime import _ensure_ray
 
         _ensure_ray(1)
-        opts = _gpu_task_opts()
-        return ray.get(ray.remote(**opts)(_cudf_plan_worker).remote(table, ops))
+        return ray.get(ray.remote(**_gpu_task_opts())(worker).remote(*args))
     except Exception:
-        return None  # cuDF-less / OOM / unsupported expr -> CPU fallback
+        return None
 
 
 def _gpu_agg_spec(plan: LogicalPlan):
