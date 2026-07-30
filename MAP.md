@@ -164,7 +164,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 361 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 751 | Top-level expression constructors re-exported for the public API. |
+| `functions.py` | 763 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
@@ -722,7 +722,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 264 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
-| `scaling.py` | 464 | What the live cluster is, and what of it a query may use. |
+| `scaling.py` | 495 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 392 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 104 | Why this query got the fan-out it got. |
 
@@ -743,7 +743,7 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 | module | lines | what it is |
 |---|---|---|
 | `_barrier.py` | 254 | The map-stage barrier: gather partition results under worker-loss recovery. |
-| `_drain.py` | 77 | Which workers are on a node that is going away. |
+| `_drain.py` | 112 | Which workers are on a node that is going away. |
 | `_faults.py` | 227 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 
 ### `batcher/dist/fleet/` — 4 · backend
@@ -994,7 +994,7 @@ Extended Kyber rule families.
 | `metadata_adaptive.py` | 291 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 190 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
 | `nullability.py` | 364 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
-| `predicate_impossible.py` | 321 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
+| `predicate_impossible.py` | 341 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
 | `predicate_infer.py` | 490 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 350 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 458 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
@@ -1939,7 +1939,7 @@ Metrics that score generated or collected text, with no model in the loop.
 | `overlap.py` | 382 | Lexical-overlap metrics — scoring generated text against a reference, in one pass. |
 | `pii_safety.py` | 175 | PII and safety monitors — did the model leak contact details or emit a banned pattern. |
 | `quality.py` | 408 | Surface-quality metrics — the hygiene of raw text, before anyone judges its meaning. |
-| `retrieval.py` | 187 | Retrieval-grounding metrics — scoring a generated answer against its retrieved context. |
+| `retrieval.py` | 395 | Retrieval-grounding metrics — scoring a generated answer against its retrieved context. |
 | `script.py` | 164 | Script and character-set composition metrics — corpus-level detectors of language drift. |
 | `tone.py` | 191 | Tone and style metrics — how an LLM sounds, measured as corpus rates. |
 
@@ -2191,7 +2191,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 399 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 271 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 88 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather.rs` | 248 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
+| `gather.rs` | 253 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 137 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
