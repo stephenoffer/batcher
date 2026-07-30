@@ -258,6 +258,17 @@ pub(crate) fn hash_join_indices_impl(
     // same key identity as every other operator, which is the invariant `keys.rs` exists to
     // hold. A key set with no float column is returned unchanged (`None`), so the integer
     // fast paths below are untouched.
+    // Decode dictionary keys *before* the float fold, in the order the two demand: a dictionary
+    // of floats must be decoded before its floats can be canonicalized. The two sides of a join
+    // are reached by different operator chains, so one can carry a dictionary while the other
+    // carries decoded values, and `RowConverter` — built from one side's type and fed both —
+    // then rejects the join outright. Same "one canonical form" argument as the fold below; see
+    // `keys::decode_dict_keys`. `None` when no key is a dictionary, so nothing is allocated.
+    let l_dec = crate::keys::decode_dict_keys(left_keys);
+    let r_dec = crate::keys::decode_dict_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_dec.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_dec.as_deref().unwrap_or(right_keys);
+
     let l_canon = crate::keys::canonicalize_float_keys(left_keys);
     let r_canon = crate::keys::canonicalize_float_keys(right_keys);
     let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
@@ -1210,6 +1221,17 @@ pub fn broadcast_hash_join_indices(
     // same key identity as every other operator, which is the invariant `keys.rs` exists to
     // hold. A key set with no float column is returned unchanged (`None`), so the integer
     // fast paths below are untouched.
+    // Decode dictionary keys *before* the float fold, in the order the two demand: a dictionary
+    // of floats must be decoded before its floats can be canonicalized. The two sides of a join
+    // are reached by different operator chains, so one can carry a dictionary while the other
+    // carries decoded values, and `RowConverter` — built from one side's type and fed both —
+    // then rejects the join outright. Same "one canonical form" argument as the fold below; see
+    // `keys::decode_dict_keys`. `None` when no key is a dictionary, so nothing is allocated.
+    let l_dec = crate::keys::decode_dict_keys(left_keys);
+    let r_dec = crate::keys::decode_dict_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_dec.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_dec.as_deref().unwrap_or(right_keys);
+
     let l_canon = crate::keys::canonicalize_float_keys(left_keys);
     let r_canon = crate::keys::canonicalize_float_keys(right_keys);
     let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);

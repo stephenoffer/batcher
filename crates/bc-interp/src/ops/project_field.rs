@@ -24,11 +24,36 @@ use bc_ir::ProjectionItem;
 pub(super) fn output_field(item: &ProjectionItem, array: &ArrayRef, batch: &RecordBatch) -> Field {
     match &item.expr {
         bc_expr::Expr::Col { name } => match batch.schema().index_of(name) {
-            Ok(idx) => batch
-                .schema()
-                .field(idx)
-                .clone()
-                .with_name(item.alias.clone()),
+            Ok(idx) => {
+                let src = batch
+                    .schema()
+                    .field(idx)
+                    .clone()
+                    .with_name(item.alias.clone());
+                // The **evaluated array** is the authority on the physical type; the source
+                // field is the authority on everything else. A bare column is normally a
+                // zero-copy `Arc` clone of the source, so the two agree and this is the source
+                // field unchanged, which is what preserves the extension metadata above.
+                //
+                // They disagree exactly when `Expr::eval` changed the encoding, and today that
+                // means one thing: a `Dictionary` column is decoded at the `Col` leaf
+                // (`bc_expr::eval::dispatch::decode_dict`), so the field would claim
+                // `Dictionary(Int32, Utf8)` for a `Utf8` array and `RecordBatch::try_new`
+                // rejects the whole batch — "column types must match schema types". Taking the
+                // type from the array while keeping the name, nullability and metadata
+                // satisfies both concerns at once.
+                //
+                // This is the operator `bc_py::normalize.rs`'s NOTE predicts would break if the
+                // FFI boundary stopped decoding dictionaries, and it was the only one:
+                // `tests/dictionary_operators.rs` runs every operator over a dictionary against
+                // the decoded oracle, and Project was the single failure (Distinct and HashJoin
+                // failed only through the Project inside them).
+                if src.data_type() == array.data_type() {
+                    src
+                } else {
+                    src.with_data_type(array.data_type().clone())
+                }
+            }
             Err(_) => Field::new(&item.alias, array.data_type().clone(), true),
         },
         bc_expr::Expr::Image {

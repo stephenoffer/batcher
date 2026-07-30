@@ -292,6 +292,18 @@ pub fn range_join_indices(
             ),
         });
     }
+    // Decode dictionary keys *before* the type check below, not after it. The two sides of a
+    // join are reached by different operator chains, so one can arrive dictionary-encoded and
+    // the other decoded; comparing physical types then reads that as "key types differ" and
+    // declines a join it is perfectly able to run. Declining fails safe rather than wrong — the
+    // caller gets an error, not a bad answer — but it is still a query that stops working, so
+    // the encodings are reconciled first and the check then compares the types that matter.
+    // Same argument as `keys::decode_dict_keys`, which the hash join uses for the same reason.
+    let l_dec = crate::keys::decode_dict_keys(left_keys);
+    let r_dec = crate::keys::decode_dict_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_dec.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_dec.as_deref().unwrap_or(right_keys);
+
     for (l, r) in left_keys.iter().zip(right_keys) {
         if l.data_type() != r.data_type() {
             return Err(RuntimeError::UnsupportedRangeJoin {

@@ -185,6 +185,52 @@ pub(crate) fn canonicalize_float_keys(keys: &[ArrayRef]) -> Option<Vec<ArrayRef>
     )
 }
 
+/// Decode any dictionary-encoded key column to its value type, so two sides of a join agree
+/// on *encoding* and not merely on value.
+///
+/// This belongs beside [`canonicalize_float_keys`] because it is the same class of bug and the
+/// same argument: key identity has to be one thing, and an encoding difference is a way for two
+/// paths to disagree about it while both being individually correct. The float case is two
+/// spellings of one number; this is two spellings of one string.
+///
+/// It is load-bearing the moment a dictionary can reach an operator, which is what
+/// `rfc-streaming-executor.md` Proposal 3 would allow. The concrete failure is not a wrong
+/// answer but a hard error, because `arrow::row::RowConverter` is built from one side's type and
+/// fed both: "RowConverter column schema mismatch, expected Utf8 got Dictionary(Int32, Utf8)".
+/// That arises whenever the two sides are reached by different operator chains — a bare `Scan`
+/// on one side and anything that decodes on the other — which is the ordinary shape of a
+/// fact-to-dimension join, not a corner case.
+///
+/// Decoding rather than teaching the join to compare codes is deliberate here: two dictionaries
+/// built independently assign different codes to the same value, so codes are only comparable
+/// against a shared dictionary. A dictionary-native join key means unifying the dictionaries
+/// first, which is a performance project (`competitor_technique_review.md` item 6) rather than
+/// the correctness floor this provides.
+///
+/// Returns `None` when no key is dictionary-encoded — the common case and, until the boundary
+/// stops decoding, every case — so the caller allocates nothing.
+pub(crate) fn decode_dict_keys(keys: &[ArrayRef]) -> Option<Vec<ArrayRef>> {
+    if !keys
+        .iter()
+        .any(|k| matches!(k.data_type(), DataType::Dictionary(_, _)))
+    {
+        return None;
+    }
+    Some(
+        keys.iter()
+            .map(|k| match k.data_type() {
+                DataType::Dictionary(_, value) => {
+                    // A cast to the dictionary's own value type cannot fail on well-formed
+                    // input; keeping the original on an error leaves the caller exactly as
+                    // it was rather than turning a decode into a query failure.
+                    arrow::compute::cast(k, value).unwrap_or_else(|_| Arc::clone(k))
+                }
+                _ => Arc::clone(k),
+            })
+            .collect(),
+    )
+}
+
 /// Canonicalize the array component of each ORDER BY key `(array, options)`, folding
 /// `-0.0`/`0.0` and every NaN bit pattern exactly as [`canonicalize_float_keys`] does for
 /// grouping keys, while preserving each key's `SortOptions`. The order path ranks raw bits
