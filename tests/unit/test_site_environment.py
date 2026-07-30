@@ -451,3 +451,60 @@ def test_auto_and_its_resolved_path_are_one_cache(monkeypatch, tmp_path):
         second = _file_cache.get_file_cache()
     assert first is not None
     assert first is second
+
+
+def test_the_dashboard_snapshot_carries_the_site_where_there_is_one(monkeypatch):
+    # The facts that explain a *default* rather than measure a run: why the spill went where
+    # it did, why the shuffle was priced the way it was. Neither is visible anywhere else.
+    from batcher.observe.system import system_snapshot
+
+    monkeypatch.setenv("BATCHER_PROVIDER", "crusoe")
+    provider.reset_provider_probe()
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: "/ephemeral")
+    site = system_snapshot()["site"]
+    assert site["provider"] == "crusoe"
+    assert site["neocloud"] is True
+    assert site["scratch_dir"] == "/ephemeral"
+
+
+def test_a_machine_with_no_site_facts_gets_no_site_section(monkeypatch):
+    from batcher.observe.system import system_snapshot
+
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.rdma_summary",
+        lambda: {
+            "ports": 0,
+            "active_ports": 0,
+            "bandwidth_gbps": 0.0,
+            "link_layers": {},
+            "rdma_available": False,
+            "partition": "",
+            "devices": [],
+            "numa_nodes": [],
+        },
+    )
+    assert "site" not in system_snapshot()
+
+
+def test_a_fabric_alone_is_enough_to_report_a_site(monkeypatch):
+    from batcher.observe.system import system_snapshot
+
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.rdma_summary",
+        lambda: {
+            "ports": 8,
+            "active_ports": 6,
+            "bandwidth_gbps": 2400.0,
+            "link_layers": {"InfiniBand": 6},
+            "rdma_available": True,
+            "partition": "",
+            "devices": [],
+            "numa_nodes": [],
+        },
+    )
+    monkeypatch.setattr("batcher._internal.hardware.fabric.fabric_bandwidth_gbps", lambda: 2400.0)
+    site = system_snapshot()["site"]
+    assert site["fabric_ports"] == 6
+    assert site["fabric_gbps"] == 2400.0

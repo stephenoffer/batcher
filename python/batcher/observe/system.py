@@ -39,11 +39,17 @@ def system_snapshot() -> dict[str, Any]:
     "why did the optimizer start cold on this node?" (a different machine class) and to "will
     what this node learns help the next one?" (only if the fingerprints match).
 
+    On a GPU cloud there is a ``site`` section too: the provider, what scheduled the process,
+    the fabric it is on, and the local volume its spills will land on. Those are the facts that
+    explain a default rather than a reading — why a spill went where it did, why the optimizer
+    priced a shuffle the way it did — and they are omitted entirely on a machine that has none
+    of them, so a laptop's snapshot is the size it always was.
+
     Returns:
         A dict with ``host``, ``hardware``, ``runtime``, ``engine``, ``config``, and
-        ``cluster`` sections.
+        ``cluster`` sections, plus ``site`` on a machine that reports one.
     """
-    return {
+    snapshot = {
         "host": _host(),
         "hardware": hardware_profile().to_dict(),
         "runtime": _runtime(),
@@ -51,6 +57,10 @@ def system_snapshot() -> dict[str, Any]:
         "config": _config(),
         "cluster": _cluster(),
     }
+    site = _site()
+    if site:
+        snapshot["site"] = site
+    return snapshot
 
 
 def _host() -> dict[str, Any]:
@@ -183,3 +193,36 @@ def _cluster() -> dict[str, Any]:
         }
     except Exception:  # pragma: no cover - ray not installed or not initialized
         return {"attached": False}
+
+
+def _site() -> dict[str, Any]:
+    """Where this process is running, and on what wire — empty off a GPU cloud.
+
+    Deliberately the facts that *explain a default* rather than the ones that measure a run.
+    A reader looking at a slow query wants to know that the spill went to the container
+    overlay because no local volume was found, or that the shuffle was priced against a fabric
+    this container cannot see; neither is visible anywhere else in the snapshot.
+    """
+    from batcher._internal.hardware.fabric import fabric_bandwidth_gbps, rdma_summary
+    from batcher._internal.site import local_scratch_root, scheduler_kind, site_profile
+
+    profile = site_profile()
+    scheduler = scheduler_kind()
+    fabric = rdma_summary()
+    scratch = local_scratch_root()
+    if not (profile.known or scheduler != "none" or fabric["ports"] or scratch):
+        return {}
+    out: dict[str, Any] = {
+        "provider": profile.provider,
+        "neocloud": profile.neocloud,
+        "scheduler": scheduler,
+        "scratch_dir": scratch or "",
+    }
+    if profile.instance_type:
+        out["instance_type"] = profile.instance_type
+    if profile.region:
+        out["region"] = profile.region
+    if fabric["ports"]:
+        out["fabric_ports"] = fabric["active_ports"]
+        out["fabric_gbps"] = fabric_bandwidth_gbps()
+    return out
