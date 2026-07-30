@@ -1403,7 +1403,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 177 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 270 | Format auto-detection for the generic `read(path, format=None)` entry point. |
-| `filesystem.py` | 394 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
+| `filesystem.py` | 412 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 342 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `predicate.py` | 374 | Predicate translation for source-side pushdown. |
