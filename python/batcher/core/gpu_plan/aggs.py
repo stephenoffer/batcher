@@ -125,28 +125,7 @@ def _normalized_key(df, name: str, be: DfBackend, *, slot: int) -> str:
     return normalized
 
 
-def _input_column(df, spec: dict, be: DfBackend, slot: int) -> str:
-    """The column name a reduction consumes, materializing a computed input if needed.
-
-    Declines a `NaN`-bearing float input. The engine orders `NaN` above every number, so a
-    `NaN` in a group makes its `max`, `sum` and `mean` all `NaN`; both dataframe libraries
-    instead treat it as missing and reduce the remaining values, which returns a plausible
-    number where the engine returns `NaN`. Rather than reconcile that per reduction, the
-    stage falls back to the CPU engine — `NaN` in a measure column is rare, and a wrong
-    aggregate is not worth the coverage.
-    """
-    expr = spec["input"]
-    if expr.get("e") == "col":
-        name = expr["name"]
-    else:
-        name = f"__bt_ag{slot}"
-        df[name] = be.column(eval_expr(expr, df, be), df)
-    if be.has_nan(df[name]):
-        raise Unsupported(f"aggregate over NaN-bearing column {name!r}")
-    return name
-
-
-def _reduce(grouped, spec: dict, column: str):
+def _reduce(grouped, spec: dict, column: str | None):
     """One reduction over the shared `GroupBy`, as a Series indexed by the group key."""
     func = spec["func"]
     if func == "count_star":
@@ -165,6 +144,60 @@ def _reduce(grouped, spec: dict, column: str):
     if func == "quantile":
         return _call(series, "quantile", float(spec["param"]))
     raise Unsupported(f"aggregate {func}")
+
+
+#: Reductions whose answer over a `NaN`-bearing column already matches the engine, because both
+#: propagate the `NaN` through the arithmetic (or count it as the value it is). `min` and `max`
+#: are absent and are the reason this list exists: the engine orders `NaN` above every number,
+#: so it wins a maximum and loses a minimum, while both libraries treat it as missing for those
+#: two alone. `median` and `quantile` are absent for the same family of reason: over a group
+#: whose values are all `NaN` they report missing where the engine reports `NaN`. Every entry
+#: that is here was checked against the engine before being listed.
+_NAN_SAFE = frozenset(
+    {
+        "sum",
+        "mean",
+        "count",
+        "count_star",
+        "count_distinct",
+        "any_value",
+        "product",
+        "var",
+        "stddev",
+        "skewness",
+        "bool_and",
+        "bool_or",
+    }
+)
+
+
+def _materialize_inputs(df, ir: dict, be: DfBackend) -> list[str | None]:
+    """Each reduction's input column, added to `df` when it is computed rather than read.
+
+    Runs *before* the `GroupBy` is built, so every column a reduction reads is already in the
+    frame the grouping was taken over. `count_star` reads no column and gets `None`.
+
+    Declines the four order statistics — `min`, `max`, `median`, `quantile` — over a
+    `NaN`-bearing column, and only those. The whole aggregate used to fall back for *any*
+    reduction over such a column, so a division by zero somewhere upstream cost the entire query
+    its device even when every reduction in it handles `NaN` exactly as the engine does.
+    """
+    out: list[str | None] = []
+    for slot, spec in enumerate(ir["aggregates"]):
+        func = spec["func"]
+        if func == "count_star":
+            out.append(None)
+            continue
+        expr = spec["input"]
+        if expr.get("e") == "col":
+            name = expr["name"]
+        else:
+            name = f"__bt_ag{slot}"
+            df[name] = be.column(eval_expr(expr, df, be), df)
+        if func not in _NAN_SAFE and be.has_nan(df[name]):
+            raise Unsupported(f"{func} over the NaN-bearing column {name!r}")
+        out.append(name)
+    return out
 
 
 def _call(series, name: str, *args, **kwargs):
@@ -200,12 +233,12 @@ def aggregate(df, ir: dict, be: DfBackend):
     keys, aliases = _key_columns(df, ir, be)
     if not keys:
         return _global(df, ir, be)
+    inputs = _materialize_inputs(df, ir, be)
     # `dropna=False`: a null key is a group, exactly as it is in the engine and in SQL.
     # The libraries drop it by default, which silently deletes rows from the answer.
     grouped = df.groupby(keys, sort=False, dropna=False)
     columns = {}
-    for slot, spec in enumerate(ir["aggregates"]):
-        column = None if spec["func"] == "count_star" else _input_column(df, spec, be, slot)
+    for spec, column in zip(ir["aggregates"], inputs, strict=True):
         columns[spec["alias"]] = _reduce(grouped, spec, column)
     out = be.lib.DataFrame(columns) if columns else be.lib.DataFrame(index=grouped.size().index)
     out = out.reset_index()
@@ -231,10 +264,10 @@ def _global(df, ir: dict, be: DfBackend):
     key = "__bt_all"
     df = df.copy()
     df[key] = 0
+    inputs = _materialize_inputs(df, ir, be)
     grouped = df.groupby([key], sort=False, dropna=False)
     columns = {}
-    for slot, spec in enumerate(ir["aggregates"]):
-        column = None if spec["func"] == "count_star" else _input_column(df, spec, be, slot)
+    for spec, column in zip(ir["aggregates"], inputs, strict=True):
         columns[spec["alias"]] = _reduce(grouped, spec, column)
     out = be.lib.DataFrame(columns).reset_index(drop=True)
     if not len(df):

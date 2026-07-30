@@ -28,6 +28,8 @@ from batcher.core.gpu_plan.execute import run_chain
 
 pytestmark = pytest.mark.unit
 
+NAN = float("nan")
+
 
 @pytest.fixture
 def be():
@@ -587,3 +589,67 @@ def test_subtracting_two_timestamps_is_still_a_duration(be):
     got, expected = _run(lambda ds: ds.select(r=col("t") - col("u")), DATES, be)
     assert got.schema.field("r").type == expected.schema.field("r").type
     assert got.column("r").to_pylist() == expected.column("r").to_pylist()
+
+
+# --- a NaN no longer costs the whole plan its device -----------------------------------
+
+NANS = pa.table(
+    {
+        "g": ["mix", "mix", "mix", "allnan", "allnan", "clean", "clean", "withnull", "one"],
+        "v": [1.0, NAN, 3.0, NAN, NAN, 2.0, 4.0, None, 5.0],
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "reducer",
+    ["sum", "mean", "count", "std", "var", "product", "count_distinct", "any_value", "skew"],
+)
+def test_a_nan_bearing_column_still_reaches_the_device(be, reducer):
+    """The whole aggregate used to fall back for *any* reduction over a NaN-bearing column.
+
+    A division by zero somewhere upstream cost the entire query its device, even when every
+    reduction in it handles NaN exactly as the engine does — which nine of them do.
+    """
+    got, expected = _run(lambda ds: ds.group_by("g").agg(r=getattr(col("v"), reducer)()), NANS, be)
+    by_key = dict(zip(got.column("g").to_pylist(), got.column("r").to_pylist(), strict=True))
+    want = dict(
+        zip(expected.column("g").to_pylist(), expected.column("r").to_pylist(), strict=True)
+    )
+    assert by_key.keys() == want.keys()
+    for key, value in want.items():
+        actual = by_key[key]
+        if value is None or actual is None:
+            assert actual is value, key
+        elif value != value:  # NaN
+            assert actual != actual, key
+        else:
+            assert actual == pytest.approx(value), key
+
+
+@pytest.mark.parametrize("reducer", ["min", "max", "median"])
+def test_an_order_statistic_over_a_nan_still_declines(be, reducer):
+    """The engine orders NaN above every number, so it wins a maximum and loses a minimum.
+
+    Both libraries treat it as missing for those, and over a group of only NaNs they report
+    missing where the engine reports NaN. Declining is the honest answer; a plausible number
+    is not.
+    """
+    from batcher.core.gpu_plan import Unsupported
+    from batcher.core.gpu_plan.execute import run_chain
+
+    ds = bt.from_arrow(NANS).group_by("g").agg(r=getattr(col("v"), reducer)())
+    spec = gpu_plan_ops(ds._plan)
+    assert spec is not None, "the shape matches; the NaN is what declines"
+    with pytest.raises(Unsupported):
+        run_chain(NANS, spec[1], be)
+
+
+def test_an_order_statistic_without_a_nan_is_unaffected(be):
+    """The decline is on the data, not on the reduction — clean columns keep the device."""
+    clean = pa.table({"g": ["a", "a", "b"], "v": [1.0, 3.0, 2.0]})
+    for reducer in ("min", "max", "median"):
+        got, expected = _run(
+            lambda ds, r=reducer: ds.group_by("g").agg(x=getattr(col("v"), r)()), clean, be
+        )
+        assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
