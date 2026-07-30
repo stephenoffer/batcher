@@ -69,15 +69,53 @@ impl SpillCodec {
     /// ratio) and leaves everything else uncompressed — never a regression, a win
     /// exactly where the payload dwarfs the CPU.
     pub(super) fn classify(schema: &Schema) -> Self {
-        use arrow::datatypes::DataType::*;
-        let has_blob = schema
+        if schema
             .fields()
             .iter()
-            .any(|f| matches!(f.data_type(), LargeBinary | Binary | LargeUtf8));
-        if has_blob {
+            .any(|f| Self::carries_blobs(f.data_type()))
+        {
             Self::Zstd
         } else {
             Self::None
+        }
+    }
+
+    /// Whether `dt` carries blob-sized payloads, **including inside nesting**.
+    ///
+    /// The top-level check this replaces missed the case the spill path actually produces.
+    /// A media scan's payload is a flat `LargeBinary` column, which it caught — but
+    /// `array_agg` over that column collects each group's values into a `List`, so the
+    /// *spilled partial state* is `List<LargeBinary>`, and `array_agg`/`histogram` are
+    /// exactly the aggregates that force the grace path rather than a bounded one. A struct
+    /// column from a nested Parquet or JSON read is the same shape. Those spills are where
+    /// the payload most dwarfs the CPU, and they were the ones going out uncompressed.
+    ///
+    /// `Utf8` stays excluded, deliberately: the measurement behind this policy is that
+    /// compressing ordinary string state is a net *loss* on fast spill disk. `LargeUtf8` is
+    /// in because a 64-bit-offset string column exists to hold large text.
+    ///
+    /// `FixedSizeBinary` is in only past [`MIN_FIXED_SIZE_BLOB`]. The type covers both an
+    /// embedding or thumbnail (hundreds of bytes and up, compresses well) and a hash, UUID,
+    /// or IP address (4–32 bytes, does not) — and compressing a schema because it carries a
+    /// 16-byte UUID would break this policy's "never a regression" property.
+    fn carries_blobs(dt: &arrow::datatypes::DataType) -> bool {
+        use arrow::datatypes::DataType::*;
+        match dt {
+            LargeBinary | Binary | BinaryView | LargeUtf8 => true,
+            FixedSizeBinary(width) => *width >= MIN_FIXED_SIZE_BLOB,
+            List(f)
+            | LargeList(f)
+            | ListView(f)
+            | LargeListView(f)
+            | FixedSizeList(f, _)
+            | Map(f, _) => Self::carries_blobs(f.data_type()),
+            Struct(fields) => fields.iter().any(|f| Self::carries_blobs(f.data_type())),
+            Union(fields, _) => fields
+                .iter()
+                .any(|(_, f)| Self::carries_blobs(f.data_type())),
+            Dictionary(_, values) => Self::carries_blobs(values),
+            RunEndEncoded(_, f) => Self::carries_blobs(f.data_type()),
+            _ => false,
         }
     }
 
@@ -98,6 +136,15 @@ impl SpillCodec {
             .unwrap_or(base)
     }
 }
+
+/// Smallest `FixedSizeBinary` width treated as a blob by [`SpillCodec::classify`].
+///
+/// The type spans two unrelated uses: a payload (an embedding, a thumbnail, a hash digest of
+/// a document) which is hundreds of bytes or more and compresses well, and an identifier (a
+/// UUID at 16 bytes, an IPv4 at 4, a 32-byte hash) which does not. 64 bytes sits above every
+/// common identifier width and below every payload one, so the codec policy keeps its
+/// "never a regression" property.
+const MIN_FIXED_SIZE_BLOB: i32 = 64;
 
 /// Total write-buffer memory one spill store may hold across **all** its partitions.
 ///

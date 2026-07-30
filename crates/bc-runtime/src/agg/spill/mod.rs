@@ -973,6 +973,87 @@ mod tests {
         assert_eq!(SpillCodec::classify(&blobs), SpillCodec::Zstd);
     }
 
+    /// A blob **inside nesting** must be found, because that is the shape the spill path
+    /// actually produces.
+    ///
+    /// A media scan's payload is a flat `LargeBinary` column, which the top-level check
+    /// already caught. But `array_agg` over that column collects each group's values into a
+    /// `List`, so the spilled *partial state* is `List<LargeBinary>` — and `array_agg` and
+    /// `histogram` are precisely the aggregates that force the grace path rather than a
+    /// bounded one. A struct column from a nested Parquet or JSON read has the same shape.
+    /// Those are the spills where the payload most dwarfs the CPU, and they were going out
+    /// uncompressed.
+    #[test]
+    fn auto_codec_finds_a_blob_inside_nesting() {
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+
+        // `array_agg(blob)` state.
+        let list_of_blobs = Schema::new(vec![
+            Field::new("g0", DataType::Int64, true),
+            Field::new(
+                "s0_0",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
+                true,
+            ),
+        ]);
+        assert_eq!(SpillCodec::classify(&list_of_blobs), SpillCodec::Zstd);
+
+        // A nested read's struct column.
+        let struct_with_blob = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("bytes", DataType::LargeBinary, true),
+            ])),
+            true,
+        )]);
+        assert_eq!(SpillCodec::classify(&struct_with_blob), SpillCodec::Zstd);
+
+        // A list of plain numbers is not a blob — nesting alone must not trigger it, or the
+        // policy's "never a regression" property is gone.
+        let list_of_ints = Schema::new(vec![Field::new(
+            "s0_0",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )]);
+        assert_eq!(SpillCodec::classify(&list_of_ints), SpillCodec::None);
+    }
+
+    /// `FixedSizeBinary` spans a payload and an identifier, and only the payload should
+    /// pull in compression.
+    #[test]
+    fn auto_codec_treats_only_wide_fixed_size_binary_as_a_blob() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // A UUID (16) or a 32-byte digest is an identifier: compressing a schema because it
+        // carries one would be the regression this policy promises never to cause.
+        for width in [4, 16, 32] {
+            let ids = Schema::new(vec![Field::new(
+                "id",
+                DataType::FixedSizeBinary(width),
+                false,
+            )]);
+            assert_eq!(
+                SpillCodec::classify(&ids),
+                SpillCodec::None,
+                "a {width}-byte FixedSizeBinary is an identifier, not a payload"
+            );
+        }
+        // An embedding or thumbnail is a payload.
+        for width in [64, 512, 4096] {
+            let vecs = Schema::new(vec![Field::new(
+                "embedding",
+                DataType::FixedSizeBinary(width),
+                false,
+            )]);
+            assert_eq!(
+                SpillCodec::classify(&vecs),
+                SpillCodec::Zstd,
+                "a {width}-byte FixedSizeBinary is a payload"
+            );
+        }
+    }
+
     #[test]
     fn concurrent_disk_stores_under_one_root_are_isolated() {
         // Two stores sharing one spill root must not collide on `part-*.arrow`, and
