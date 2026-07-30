@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from batcher.core.energy import energy_scope, measure_stage
+from batcher.core.energy import energy_scope, measure_stage, reset_energy_sampling
 from batcher.kyber.gpu import (
     learned_work_per_joule,
     record_measured_efficiency,
@@ -21,6 +21,15 @@ from batcher.metadata import MetadataHub
 from batcher.metadata.backends import InProcessBackend
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sampling():
+    """The meter caches a device reading per sampling interval; a faked draw must not leak."""
+    reset_energy_sampling()
+    yield
+    reset_energy_sampling()
+
 
 _MIN_SAMPLES = 8
 
@@ -132,6 +141,7 @@ def test_the_conductor_folds_only_measured_stages(monkeypatch) -> None:
     assert learned_work_per_joule(hub, "NVIDIA_H100") is None
 
     monkeypatch.setattr(core_energy, "_draw", lambda: (700.0, 0.9, True))
+    reset_energy_sampling()
     for _ in range(_MIN_SAMPLES):
         with (
             bt.measure_energy(),
@@ -172,6 +182,7 @@ def test_the_loop_runs_end_to_end_from_a_measured_scope(monkeypatch) -> None:
     hub = _hub()
     monkeypatch.setattr("batcher.core.runtime.default_hub", lambda: hub)
     monkeypatch.setattr(core_energy, "_draw", lambda: (700.0, 0.95, True))
+    reset_energy_sampling()
     for _ in range(_MIN_SAMPLES):
         with (
             bt.measure_energy(),

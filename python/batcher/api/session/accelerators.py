@@ -95,6 +95,14 @@ def accelerators() -> dict:
         power["budget_watts"] = energy.power_budget_watts
     if nvml_available():
         power["draw_watts"] = round(total_power_watts(), 1)
+    if fleet.get("power_zones"):
+        # Per zone, because the breaker a rack trips is a zone's, not the fleet's: a hall
+        # inside its total budget can still have one busway over its own.
+        from batcher.dist.executors.ray_runtime.fabric import power_zone_load
+
+        zones = {z: round(w, 1) for z, w in power_zone_load().items() if z}
+        if zones:
+            power["by_zone_watts"] = zones
     report["power"] = power
     return report
 
@@ -139,8 +147,13 @@ def show_accelerators() -> None:
             print(f"       {fleet['racks']} rack(s), {fleet['power_zones']} power zone(s)")
     power = report["power"]
     if power:
-        parts = [f"{k.replace('_', ' ')} {v}" for k, v in sorted(power.items())]
-        print("power: " + ", ".join(parts))
+        parts = [
+            f"{k.replace('_', ' ')} {v}" for k, v in sorted(power.items()) if k != "by_zone_watts"
+        ]
+        if parts:
+            print("power: " + ", ".join(parts))
+        for zone, watts in sorted(power.get("by_zone_watts", {}).items()):
+            print(f"       zone {zone}: {watts} W at full load")
 
 
 @contextlib.contextmanager

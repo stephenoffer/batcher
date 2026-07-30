@@ -52,6 +52,35 @@ the driver has applied. A `fleet` key appears when Ray is up and the cluster has
 nodes, with the widest coherent NVLink domain and how many racks and power zones the fleet
 spans.
 
+## Whether a device is worth using at all
+
+The question most engines answer with a heuristic. Batcher answers it with a time model, and
+the term that decides it is the one a data engine is most tempted to leave out: every byte of a
+relational stage crosses the host link before a kernel sees it, and on PCIe that link is slower
+than a server's own memory.
+
+```python
+from batcher.kyber.gpu import device_energy_advice
+
+scan = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0)
+print(scan.transfer_share > 0.5)
+# True
+resident = device_energy_advice(
+    "NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0, resident=True
+)
+print(resident.speedup > scan.speedup)
+# True
+```
+
+The same scan is roughly 2x on an H100 and 0.5x on a T4 — slower than the CPU outright, because
+a PCIe 3.0 copy costs more than scanning the data. On a Grace-Blackwell package the coherent
+host link is an order of magnitude faster and the same stage is worth offloading. Batcher will
+not route a stage to a device the model says loses, and says so in the plan's reason.
+
+Two things change the answer, and both are worth reaching for before a faster device: keeping
+the data resident (a stage fed by another GPU stage pays no copy at all), and giving the stage
+more work per byte. A stage below its device's roofline ridge is a copy with a kernel attached.
+
 ## Budget the power a job may draw
 
 A rack is provisioned in watts before it is provisioned in slots. Sixteen 700 W devices need

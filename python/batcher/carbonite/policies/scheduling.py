@@ -44,6 +44,21 @@ __all__ = ["DefaultSchedulingPolicy"]
 _MAX_TASK_FANOUT = 100_000
 
 
+def _healthy_devices(gpu_count: int) -> int:
+    """Devices that passed the health verdicts, or `gpu_count` when health checking is off.
+
+    Absent telemetry reports `None` and is treated as "no opinion" rather than as an unhealthy
+    fleet: the alternative takes a cluster offline the day `pynvml` stops being installed.
+    """
+    from batcher.carbonite.accel.health import schedulable_device_count
+    from batcher.config import active_config
+
+    if not active_config().accelerator.health.enabled:
+        return gpu_count
+    healthy = schedulable_device_count()
+    return gpu_count if healthy is None else max(1, healthy)
+
+
 class DefaultSchedulingPolicy:
     """Derive a per-Ray-task `SchedulingEnvelope` from Kyber's per-operator bounds.
 
@@ -67,38 +82,43 @@ class DefaultSchedulingPolicy:
     ) -> SchedulingEnvelope:
         """Budget a GPU map/inference stage against the GPUs that actually exist.
 
-        The relational `envelope` below is the CPU shuffle grant and correctly requests no
-        GPU. This closes the gap that GPU demand previously reached Ray *only* as the raw
-        `map_batches(num_gpus=)` tag, so Carbonite — the layer that decides feasibility —
-        never saw it, and an infeasible request hung instead of erroring. The grant is
-        clamped to inventory: `gpu_count / num_gpus` tasks can hold a GPU at once, and a
-        cluster reporting no GPUs gets no GPU grant (the stage runs on CPU rather than
-        pending forever). Fractional `num_gpus` is preserved — packing four 0.25-GPU
-        actors onto one device is the point of a fractional request.
+               The relational `envelope` below is the CPU shuffle grant and correctly requests no
+               GPU. This closes the gap that GPU demand previously reached Ray *only* as the raw
+               `map_batches(num_gpus=)` tag, so Carbonite — the layer that decides feasibility —
+               never saw it, and an infeasible request hung instead of erroring. The grant is
+               clamped to inventory: `gpu_count / num_gpus` tasks can hold a GPU at once, and a
+               cluster reporting no GPUs gets no GPU grant (the stage runs on CPU rather than
+               pending forever). Fractional `num_gpus` is preserved — packing four 0.25-GPU
+               actors onto one device is the point of a fractional request.
 
-        Inventory is not the only ceiling. Where a power budget is configured
-        (`accelerator.energy.power_budget_watts`) it is frequently the tighter one: a rack of
-        sixteen 700 W devices needs more than eleven kilowatts of device power alone, more
-        than one rack circuit delivers, and exceeding it does not fail — the driver clamps
-        every device in the zone, which reads as the whole rack getting slower. Protecting
-        against that is exactly Carbonite's job, so the grant is clamped to the devices the
-        budget can power as well as to the ones that exist.
+               Inventory is not the only ceiling, and neither is the count of devices that exist.
+               With `accelerator.health` enabled the grant is also clamped to the devices that are
+               *schedulable*: one reporting uncorrectable ECC errors returns wrong tensors, and one
+               the driver has clamped contributes a fraction of a healthy device while drawing most
+               of its power. Granting against the raw count places work on both.
+        Where a power budget is configured
+               (`accelerator.energy.power_budget_watts`) it is frequently the tighter one: a rack of
+               sixteen 700 W devices needs more than eleven kilowatts of device power alone, more
+               than one rack circuit delivers, and exceeding it does not fail — the driver clamps
+               every device in the zone, which reads as the whole rack getting slower. Protecting
+               against that is exactly Carbonite's job, so the grant is clamped to the devices the
+               budget can power as well as to the ones that exist.
 
-        There is deliberately no VRAM envelope yet: the analogue of the RAM grant needs a
-        `gpu_memory_bytes` field on `SchedulingEnvelope` in the neutral `plan` layer, and
-        that contract change belongs in the same commit as its consumer.
+               There is deliberately no VRAM envelope yet: the analogue of the RAM grant needs a
+               `gpu_memory_bytes` field on `SchedulingEnvelope` in the neutral `plan` layer, and
+               that contract change belongs in the same commit as its consumer.
 
-        Args:
-            num_gpus: GPUs requested per task, fractional allowed.
-            n_tasks: The desired worker fan-out before GPU clamping.
-            gpu_count: GPU devices the cluster/host reports.
-            accelerator_type: The fleet's device model, used to price the power budget.
-                `None` or an unrecognized model skips the power clamp rather than guessing
-                a draw, so an unknown fleet is granted exactly what inventory allows.
+               Args:
+                   num_gpus: GPUs requested per task, fractional allowed.
+                   n_tasks: The desired worker fan-out before GPU clamping.
+                   gpu_count: GPU devices the cluster/host reports.
+                   accelerator_type: The fleet's device model, used to price the power budget.
+                       `None` or an unrecognized model skips the power clamp rather than guessing
+                       a draw, so an unknown fleet is granted exactly what inventory allows.
 
-        Returns:
-            A `SchedulingEnvelope` whose GPU grant is feasible against the inventory and,
-            where one is configured, against the power budget.
+               Returns:
+                   A `SchedulingEnvelope` whose GPU grant is feasible against the inventory and,
+                   where one is configured, against the power budget.
         """
         if num_gpus <= 0 or gpu_count <= 0:
             # No GPU visible (or none asked for): grant none. Asking for a GPU the
@@ -107,6 +127,7 @@ class DefaultSchedulingPolicy:
         from batcher.carbonite.accel.power import devices_within_budget
 
         devices = min(gpu_count, devices_within_budget(accelerator_type, gpu_count))
+        devices = min(devices, _healthy_devices(gpu_count))
         concurrent = max(1, int(devices / num_gpus))
         return SchedulingEnvelope(
             num_gpus=num_gpus,

@@ -12,9 +12,27 @@ import pytest
 
 from batcher.config import AcceleratorConfig, Config, EnergyConfig, config_context
 from batcher.core import energy as core_energy
-from batcher.core.energy import active_ledger, energy_scope, measure_stage
+from batcher.core.energy import (
+    active_ledger,
+    energy_scope,
+    measure_stage,
+    reset_energy_sampling,
+)
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sampling():
+    """Drop the cached device reading around every test.
+
+    The meter samples at most once per `telemetry_interval_s`, so without this a faked draw
+    in one test would be served to the next — a cache that makes tests pass by accident is
+    worse than no cache.
+    """
+    reset_energy_sampling()
+    yield
+    reset_energy_sampling()
 
 
 def test_outside_a_scope_the_meter_records_nothing() -> None:
@@ -72,6 +90,7 @@ def test_without_telemetry_the_figure_is_modelled_and_marked() -> None:
 
 def test_with_telemetry_the_figure_is_measured(monkeypatch) -> None:
     monkeypatch.setattr(core_energy, "_draw", lambda: (1400.0, 0.8, True))
+    reset_energy_sampling()
     with (
         energy_scope() as ledger,
         measure_stage("A#1", accelerator_type="NVIDIA_H100", device_count=2),
@@ -122,6 +141,7 @@ def test_the_summary_reports_how_much_was_measured(monkeypatch) -> None:
         with measure_stage("modelled#1", accelerator_type="NVIDIA_H100", device_count=1):
             pass
         monkeypatch.setattr(core_energy, "_draw", lambda: (700.0, 0.9, True))
+        reset_energy_sampling()
         with measure_stage("measured#2", accelerator_type="NVIDIA_H100", device_count=1):
             pass
     fraction = ledger.summary()["measured_fraction"]
@@ -181,3 +201,35 @@ def test_the_public_scope_is_the_same_ledger() -> None:
         meter.add_rows(7)
     assert ledger.total_rows == 7
     assert active_ledger() is None
+
+
+def test_a_reading_is_reused_within_the_sampling_interval(monkeypatch) -> None:
+    # A per-batch GPU kernel can run hundreds of times a second; an NVML round trip on each
+    # would cost more than the measurement is worth.
+    calls: list[int] = []
+
+    def _draw():
+        calls.append(1)
+        return (700.0, 0.9, True)
+
+    monkeypatch.setattr(core_energy, "_draw", _draw)
+    reset_energy_sampling()
+    with energy_scope():
+        for _ in range(20):
+            with measure_stage("A#1", accelerator_type="NVIDIA_H100", device_count=1):
+                pass
+    assert len(calls) == 1, "one reading served the whole interval"
+
+
+def test_a_nested_scope_folds_into_its_parent() -> None:
+    with energy_scope() as outer:
+        with measure_stage("outer#1", accelerator_type="NVIDIA_H100", device_count=1) as m:
+            m.add_rows(10)
+        with (
+            energy_scope() as inner,
+            measure_stage("inner#1", accelerator_type="NVIDIA_H100", device_count=1) as m,
+        ):
+            m.add_rows(5)
+        assert len(inner.stages) == 1
+    assert [s.stage for s in outer.stages] == ["outer#1", "inner#1"]
+    assert outer.total_rows == 15, "bracketing a sub-pipeline must not hide it from the total"

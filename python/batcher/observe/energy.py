@@ -48,13 +48,18 @@ def format_energy_report(ledger: EnergyLedger, grid: GridProfile | None = None) 
 
     Args:
         ledger: The run's energy ledger.
-        grid: The site's grid profile, for cost and carbon lines. Omitted lines rather than
-            zeroed ones when it is absent or unconfigured.
+        grid: The site's grid profile, for cost and carbon lines. `None` reads the configured
+            one, so a deployment that set its price and intensity gets those lines without
+            passing anything. Lines are omitted rather than zeroed when it is unconfigured.
 
     Returns:
         A plain-text block, or a single line saying nothing was recorded when the ledger is
         empty.
     """
+    if grid is None:
+        from batcher.plan.energy.carbon import configured_grid
+
+        grid = configured_grid()
     if not ledger.stages:
         return "energy: nothing recorded (no accelerator stage ran, or accounting is off)"
 
@@ -104,11 +109,16 @@ def energy_metrics(ledger: EnergyLedger, grid: GridProfile | None = None) -> dic
 
     Args:
         ledger: The run's energy ledger.
-        grid: The site's grid profile, for the cost and carbon rows.
+        grid: The site's grid profile, for the cost and carbon rows. `None` reads the
+            configured one.
 
     Returns:
         Metric name to value.
     """
+    if grid is None:
+        from batcher.plan.energy.carbon import configured_grid
+
+        grid = configured_grid()
     out = {f"energy.{k}": v for k, v in ledger.summary().items()}
     total = ledger.total_joules
     if grid is not None and grid.configured and total > 0:

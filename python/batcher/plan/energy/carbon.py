@@ -24,6 +24,7 @@ from dataclasses import dataclass
 __all__ = [
     "GridProfile",
     "carbon_grams",
+    "configured_grid",
     "energy_cost",
     "joules_to_kwh",
     "kwh_to_joules",
@@ -151,3 +152,24 @@ class GridProfile:
             Facility energy in joules.
         """
         return joules * max(1.0, self.pue) if joules > 0 else 0.0
+
+
+def configured_grid() -> GridProfile:
+    """The site's grid profile, read from the active configuration.
+
+    One accessor, so a cost figure and a carbon figure produced in different layers cannot
+    disagree about the price, the intensity, or the facility overhead they used.
+
+    Returns:
+        A `GridProfile`; unconfigured (and so reporting no cost and no emissions) by default.
+    """
+    from batcher.config import active_config
+
+    energy = active_config().accelerator.energy
+    return GridProfile(
+        region=energy.region,
+        gco2e_per_kwh=energy.carbon_intensity,
+        price_per_kwh=energy.price_per_kwh,
+        pue=energy.pue,
+        renewable_fraction=energy.renewable_fraction,
+    )

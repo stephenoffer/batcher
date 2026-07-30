@@ -167,6 +167,16 @@ def decide_gpu_backend(
             rows,
         )
 
+    # Size is necessary but not sufficient. A relational stage's bytes cross the host link
+    # before a kernel sees them, and on PCIe that link is slower than a server's own memory:
+    # a big enough scan can clear every threshold above and still finish sooner on the CPU.
+    # The verdict is only consulted when the device model is known and only ever *refuses* —
+    # a forced request is still honored, and an unrecognized device has no opinion.
+    if not force and accelerator_type and rows > 0 and ws_gb > 0:
+        veto = _transfer_veto(accelerator_type, ws_gb, rows)
+        if veto is not None:
+            return GpuDecision(False, False, veto, rows)
+
     one_gpu_gb = max(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
         1e-9,
@@ -247,6 +257,52 @@ class GpuMapParams:
     reason: str
 
 
+#: Floating-point work a relational row costs on average: a few comparisons and an
+#: accumulate. Relational operators are not compute-bound by any margin, which is the whole
+#: reason the host copy decides the verdict for them and not for inference.
+_RELATIONAL_FLOPS_PER_ROW = 4.0
+
+
+def _transfer_veto(accelerator_type: str, working_set_gb: float, rows: int) -> str | None:
+    """A reason to stay on the CPU when the host copy would cost more than the device saves.
+
+    `None` when the device is worth using, when its model is unrecognized, or when the
+    arithmetic cannot be formed — so this only ever removes a GPU choice that the transfer
+    model says loses, and never adds one.
+    """
+    from batcher.kyber.gpu.energy import device_energy_advice
+
+    bytes_per_row = working_set_gb * 1e9 / max(1, rows)
+    advice = device_energy_advice(
+        accelerator_type,
+        bytes_per_row=bytes_per_row,
+        flops_per_row=_RELATIONAL_FLOPS_PER_ROW,
+    )
+    if advice.speedup <= 0 or advice.speedup >= 1.0:
+        return None
+    return (
+        f"{accelerator_type} would run this at {advice.speedup:.2f}x the CPU once the host "
+        f"copy is charged ({advice.transfer_share:.0%} of device time is transfer): CPU wins"
+    )
+
+
+def _mig_fraction(model_memory_gb: float, accelerator_type: str) -> float | None:
+    """The device fraction a MIG instance would give this model, or `None` to use the quanta.
+
+    Preferred over the coarse packing quanta wherever it applies, because it is both finer (a
+    seventh of a device rather than a quarter) and stronger: a partition isolates memory and
+    faults, while a fractional request only shares a scheduler. `None` whenever partitioning
+    does not apply — no device model, the switch off, a device that cannot partition, or a
+    model that needs the whole device — and the caller then packs exactly as it did before.
+    """
+    if not accelerator_type or not active_config().accelerator.prefer_mig:
+        return None
+    from batcher._internal.hardware.mig import smallest_profile_for
+
+    profile = smallest_profile_for(model_memory_gb, accelerator_type)
+    return profile.gpu_fraction if profile is not None else None
+
+
 def decide_gpu_map_params(
     model_memory_gb: float,
     num_gpus: float,
@@ -255,6 +311,7 @@ def decide_gpu_map_params(
     *,
     assign_num_gpus: bool = True,
     input_row_bytes: float = 0.0,
+    accelerator_type: str = "",
 ) -> GpuMapParams:
     """Size a GPU inference stage from the model's memory footprint vs one GPU's memory.
 
@@ -284,7 +341,14 @@ def decide_gpu_map_params(
     `input_row_bytes` is the estimated Arrow width of one input row, which the batch seed
     charges alongside the activation prior because both are resident on the device at once.
     `0.0` — the default, and what a caller with no estimator passes — reproduces the previous
-    activation-only budget exactly."""
+    activation-only budget exactly.
+
+    `accelerator_type` is the binding device's model, when the topology could name it. Given
+    one, and with `accelerator.prefer_mig` on, the packing fraction comes from the device's
+    *own* MIG profiles instead of the coarse quanta: a model that fits a `1g` instance asks for
+    a seventh of an H100 rather than a quarter, and gets memory and fault isolation the
+    fractional request does not provide. `""` — an unlabelled or mixed fleet — keeps the
+    quanta, which is exactly the behavior before this."""
     dc = active_config().distributed
     gpu_gb = max(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
@@ -301,7 +365,9 @@ def decide_gpu_map_params(
         if frac <= 1.0:
             # No `next()` default: this branch is guarded by `frac <= 1.0` and `_PACK_QUANTA`
             # ends at 1.0, so a quantum always matches. A default here would disguise that.
-            out_gpus = next(q for q in _PACK_QUANTA if q >= frac)
+            out_gpus = _mig_fraction(model_memory_gb, accelerator_type) or next(
+                q for q in _PACK_QUANTA if q >= frac
+            )
         else:
             out_gpus = float(math.ceil(frac))
 

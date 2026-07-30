@@ -70,6 +70,10 @@ def size_gpu_map_batches(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPla
         gpu_memory_gb=device_gb,
         assign_num_gpus=not is_non_gpu_accel,
         input_row_bytes=input_row_bytes,
+        # The binding device's *model*, which the profile carries when the fleet is uniform.
+        # It is what lets the packing fraction come from the device's own MIG profiles rather
+        # than from a quantum that knows only a byte count; `""` keeps the previous behavior.
+        accelerator_type="" if is_non_gpu_accel else ctx.hardware.accelerator_type,
     )
     if params.num_gpus == node.num_gpus and params.batch_size == node.batch_size:
         return None

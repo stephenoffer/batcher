@@ -26,18 +26,22 @@ _USABLE_VRAM = 0.85
 
 
 def recommend_accelerator_type(model_memory_gb: float) -> str | None:
-    """The smallest GPU class in a mixed cluster whose VRAM fits `model_memory_gb`, else `None`.
+    """The GPU class in a mixed cluster a stage should be pinned to, or `None` to leave it free.
 
-    On a heterogeneous GPU cluster (a mix of, say, T4s and A100s) an inference stage that leaves
-    `accelerator_type` unset can be scheduled onto *any* GPU — including one too small to hold the
-    model, an OOM the moment it loads. Pinning the stage to the smallest device class that fits
-    prevents that while wasting the least VRAM. `None` means "don't pin", returned whenever pinning
-    would not help or could not be decided:
+    On a heterogeneous fleet a stage that leaves `accelerator_type` unset can be scheduled onto
+    *any* GPU, including one too small to hold the model — an OOM the moment it loads. Pinning
+    prevents that.
 
-    * a homogeneous cluster (one GPU class) — nothing to choose between;
-    * the smallest device already fits — every device is safe, so a pin only constrains placement;
-    * no device fits — pinning to nothing is not an option, and the sizing path shards instead;
-    * unreadable topology or unlabelled GPU nodes.
+    The *choice* is Kyber's (`select_device_class`), because "which device class" is an
+    optimization decision and it depends on policy this layer has no business knowing: the
+    smallest device that fits wastes the least VRAM, the most efficient one that fits wastes
+    the least power, and on a fleet with measured history the one that actually delivered most
+    per joule beats both. This function's job is the half Kyber cannot do — reading the live
+    topology to find out which classes exist.
+
+    `None` means "don't pin", returned whenever pinning would not help or could not be
+    decided: a homogeneous cluster, every device already fits, nothing fits (the sizing path
+    shards instead), or an unreadable topology.
 
     Args:
         model_memory_gb: The stage's declared model footprint; `<= 0` reports `None` (unknown).
@@ -52,27 +56,36 @@ def recommend_accelerator_type(model_memory_gb: float) -> str | None:
 
         if not ray.is_initialized():
             return None
-        from batcher._internal.accelerators import accelerator_memory_bytes
         from batcher.dist.executors.ray_runtime.scaling import node_classes
 
         classes = node_classes()
     except Exception:
         return None
-    # Distinct GPU classes with a known VRAM, as (usable_gb, name).
-    seen: dict[str, float] = {}
-    for c in classes:
-        name = c.get("accelerator_type")
-        if c["gpus"] > 0 and name:
-            seen[name] = accelerator_memory_bytes(name) / (1 << 30) * _USABLE_VRAM
-    usable = {n: gb for n, gb in seen.items() if gb > 0}
-    if len(usable) < 2:
-        return None  # homogeneous (or unknowable) → no class choice to make
-    if min(usable.values()) >= model_memory_gb:
-        return None  # every device already fits → a pin would only constrain placement
-    fitting = {n: gb for n, gb in usable.items() if gb >= model_memory_gb}
-    if not fitting:
-        return None  # nothing fits one device → let the sizing path shard instead
-    return min(fitting, key=lambda n: fitting[n])  # the smallest device that fits (least waste)
+    candidates = sorted({c.get("accelerator_type") or "" for c in classes if c["gpus"] > 0})
+    if not any(candidates):
+        return None
+    from batcher.kyber.gpu import select_device_class
+
+    return select_device_class(
+        [c for c in candidates if c],
+        model_memory_gb,
+        headroom=1.0 - _USABLE_VRAM,
+        hub=_learned_hub(),
+    )
+
+
+def _learned_hub():
+    """The metadata hub, so the choice can prefer what this fleet measured, or `None`.
+
+    Best-effort: a fleet with no learned history, or a metadata backend that cannot be opened,
+    simply falls back to the datasheet ordering.
+    """
+    try:
+        from batcher.core.runtime import default_hub
+
+        return default_hub()
+    except Exception:
+        return None
 
 
 def cluster_accelerator_type() -> str | None:

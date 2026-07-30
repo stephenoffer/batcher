@@ -30,6 +30,8 @@ from batcher.governance.residency import (
     DataResidency,
     ResidencyCatalog,
     ResidencyVerdict,
+    active_residency,
+    set_residency,
 )
 
 __all__ = [
@@ -51,6 +53,8 @@ __all__ = [
     "RowFilter",
     "SecurityCatalog",
     "TagMask",
+    "active_residency",
     "column_lineage",
     "enforce",
+    "set_residency",
 ]

@@ -23,6 +23,7 @@ from batcher.plan.energy.accounting import EnergyLedger, StageEnergy, merge_ledg
 from batcher.plan.energy.carbon import (
     GridProfile,
     carbon_grams,
+    configured_grid,
     energy_cost,
     joules_to_kwh,
     kwh_to_joules,
@@ -43,6 +44,7 @@ __all__ = [
     "PowerEnvelope",
     "StageEnergy",
     "carbon_grams",
+    "configured_grid",
     "configured_power_envelope",
     "device_power_watts",
     "energy_cost",

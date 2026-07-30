@@ -165,6 +165,10 @@ class EnergyAdvice:
         power_ratio: Device draw against the CPU path's draw, `0.0` when unknown.
         energy_ratio: Expected device energy against CPU energy for the same work; below
             `1.0` means the device is the cheaper machine to run.
+        transfer_share: Fraction of the device's time spent moving bytes across the host link
+            rather than computing. Above roughly a half the stage is a copy with a kernel
+            attached, and no faster device fixes it — the fix is to keep the data resident or
+            to leave the stage on the CPU.
         reason: One line for the decision log.
     """
 
@@ -172,19 +176,23 @@ class EnergyAdvice:
     speedup: float = 0.0
     power_ratio: float = 0.0
     energy_ratio: float = 0.0
+    transfer_share: float = 0.0
     reason: str = ""
 
 
 #: Draw of the CPU path a stage would otherwise run on, in watts: one server's worth of
 #: sockets and memory at load. A rough figure, and it only ever appears as a *ratio* against a
-#: device's draw, so the comparison is far less sensitive to it than an absolute joule count
-#: would be.
+#: device's draw, so the comparison is far less sensitive to it than an absolute joule count.
 _CPU_PATH_WATTS = 400.0
 
 #: Peak dense half-precision throughput of that same CPU path, in TFLOP/s — roughly what a
-#: two-socket server reaches with AVX-512. Used only as the denominator of a ratio, for the
-#: same reason.
+#: two-socket server reaches with AVX-512. Used only as the denominator of a ratio.
 _CPU_PATH_TFLOPS = 2.0
+
+#: Fraction of the input a relational stage typically returns, used to charge the result's trip
+#: back across the host link. Aggregates and filters return far less than they read, which is
+#: why charging a full round trip would over-penalize exactly the shapes a device is good at.
+_RESULT_FRACTION = 0.1
 
 
 def device_energy_advice(
@@ -194,35 +202,46 @@ def device_energy_advice(
     flops_per_row: float,
     cpu_gbps: float = 20.0,
     achieved_fraction: float = 1.0,
+    resident: bool = False,
 ) -> EnergyAdvice:
-    """Judge a stage's device move on energy rather than on time alone.
+    """Judge a stage's device move on time *and* energy, with the host copy charged for.
 
-    The roofline argument, made explicit. A stage with `flops_per_row / bytes_per_row` below a
-    device's ridge point is bandwidth-bound: its speedup is the memory-bandwidth ratio, not the
-    FLOPS ratio, and a device that draws five times the power for three times the bandwidth is
-    burning energy to finish sooner. Above the ridge the FLOPS ratio applies and the device
-    wins on both axes, which is why inference and decode belong on one and a projection does
-    not.
+    Three terms, per row, so the verdict is independent of how many rows there are:
+
+    * **the copy** — every byte crosses the host link before a kernel sees it, and on PCIe that
+      link is slower than a server's own memory bandwidth. This is the term a data engine
+      forgets and then cannot explain, and it is why a device wins on inference and loses on a
+      projection. A coherent CPU-GPU package (`nvlink-c2c`) moves it by an order of magnitude,
+      which changes the answer rather than shading it;
+    * **the kernel** — the roofline: bytes over device bandwidth against FLOPs over device
+      throughput, whichever binds;
+    * **the return** — the result's trip back, charged at a fraction of the input because the
+      relational shapes worth offloading reduce.
+
+    The CPU path is scored on the same roofline, against its own memory bandwidth and its own
+    vector throughput, and it pays no copy. Comparing those totals is what makes "a scan is not
+    worth a GPU" and "decode is" fall out of one calculation instead of two heuristics.
 
     Args:
         accelerator_type: The candidate device model.
         bytes_per_row: Bytes of input the stage reads per row.
         flops_per_row: Floating-point work the stage does per row.
         cpu_gbps: Effective memory bandwidth of the CPU path, in GB/s.
-        achieved_fraction: Fraction of the nameplate ratio a real kernel is expected to
-            reach, in (0, 1]. The ratios below are peak-against-peak and so are an upper
-            bound; a caller with a measured figure passes it and gets an honest verdict
-            instead of an optimistic one.
+        achieved_fraction: Fraction of nameplate a real kernel reaches, in (0, 1]. The device
+            figures are peak; a caller with a measured number passes it and gets an honest
+            verdict instead of an optimistic one.
+        resident: The data is already in device memory — a stage fed by another GPU stage, or
+            a model already loaded. Skips the copy, which is usually the whole argument.
 
     Returns:
         The advice. With an unrecognized device every ratio is `0.0` and `worth_it` is True,
         preserving whatever decision the caller would have made without an energy opinion.
     """
     from batcher._internal.device_specs import (
-        device_arithmetic_intensity,
         device_half_tflops,
         device_memory_bandwidth_gbps,
         device_tdp_watts,
+        host_transfer_seconds,
     )
 
     bandwidth = device_memory_bandwidth_gbps(accelerator_type)
@@ -230,30 +249,43 @@ def device_energy_advice(
     if bandwidth <= 0 or watts <= 0 or bytes_per_row <= 0:
         return EnergyAdvice(worth_it=True, reason="device unknown: no energy opinion")
 
-    ridge = device_arithmetic_intensity(accelerator_type)
-    intensity = flops_per_row / bytes_per_row
-    if intensity >= ridge > 0:
-        # Above the ridge the device is compute-bound, so its advantage is the FLOPS ratio.
-        speedup = max(1.0, device_half_tflops(accelerator_type) / _CPU_PATH_TFLOPS)
-        shape = "compute-bound"
-    else:
-        # Below it the tensor cores are idle waiting on HBM, and the only ratio that applies
-        # is memory bandwidth — which is why a scan gains far less from a device than its
-        # FLOPS figure suggests.
-        speedup = max(1.0, bandwidth / max(1.0, cpu_gbps))
-        shape = "bandwidth-bound"
+    reach = min(1.0, max(1e-3, achieved_fraction))
+    # The CPU path is a roofline too. Charging it only memory bandwidth made a
+    # compute-heavy row look free on the CPU and cost the device its whole advantage —
+    # the verdict said an inference stage was not worth a GPU, which is exactly backwards.
+    cpu_seconds = max(
+        bytes_per_row / (max(1.0, cpu_gbps) * 1e9),
+        flops_per_row / (_CPU_PATH_TFLOPS * 1e12),
+    )
 
-    speedup *= min(1.0, max(1e-3, achieved_fraction))
+    memory_seconds = bytes_per_row / (bandwidth * 1e9 * reach)
+    tflops = device_half_tflops(accelerator_type)
+    compute_seconds = flops_per_row / (tflops * 1e12 * reach) if tflops > 0 else 0.0
+    kernel_seconds = max(memory_seconds, compute_seconds)
+    shape = "compute-bound" if compute_seconds > memory_seconds else "bandwidth-bound"
+
+    transfer_seconds = 0.0
+    if not resident:
+        transfer_seconds = host_transfer_seconds(bytes_per_row, accelerator_type)
+        transfer_seconds += host_transfer_seconds(
+            bytes_per_row * _RESULT_FRACTION, accelerator_type
+        )
+    device_seconds = kernel_seconds + transfer_seconds
+
+    speedup = cpu_seconds / device_seconds if device_seconds > 0 else 0.0
     power_ratio = (watts + watts * 0.25) / _CPU_PATH_WATTS
-    energy_ratio = power_ratio / max(1e-9, speedup)
+    energy_ratio = power_ratio / speedup if speedup > 0 else 0.0
+    transfer_share = transfer_seconds / device_seconds if device_seconds > 0 else 0.0
+    dominated = " (host copy dominates)" if transfer_share > 0.5 else ""
     return EnergyAdvice(
-        worth_it=energy_ratio <= 1.0,
+        worth_it=energy_ratio <= 1.0 and speedup >= 1.0,
         speedup=speedup,
         power_ratio=power_ratio,
         energy_ratio=energy_ratio,
+        transfer_share=transfer_share,
         reason=(
-            f"{shape}: {speedup:.1f}x throughput for {power_ratio:.1f}x power "
-            f"({energy_ratio:.2f}x energy)"
+            f"{shape}: {speedup:.2f}x throughput for {power_ratio:.1f}x power "
+            f"({energy_ratio:.2f}x energy){dominated}"
         ),
     )
 

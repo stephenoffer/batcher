@@ -68,27 +68,49 @@ def plan_collective(
     nodes: tuple[GpuNodeTopology, ...] | None = None,
     *,
     cpus_per_device: float = 1.0,
+    datasets: list[str] | tuple[str, ...] = (),
+    zone_budget_watts: float = 0.0,
 ) -> CollectivePlacement:
     """Lay a collective of `world_size` devices out, staying inside one fabric where it fits.
+
+    Three constraints are applied before the fabric preference, because each of them can
+    remove a node that the fabric would otherwise have picked: a dataset's residency rules,
+    the power a zone can still supply, and — when `accelerator.efficiency_first_placement` is
+    on — the order that fills the most efficient hardware first.
 
     Args:
         world_size: Devices the collective needs.
         nodes: Topology records, or `None` to read them live.
         cpus_per_device: Host cores to co-schedule per device, for the feeding pipeline.
+        datasets: Dataset names or paths the stage reads. Given these, nodes whose region any
+            input forbids are removed before placement rather than after, which is the
+            difference between a compliance control and a compliance report.
+        zone_budget_watts: Watts one power zone may supply, `0.0` for unbudgeted. A zone that
+            cannot power more devices is skipped, because filling it clamps every device in it.
 
     Returns:
         The placement. With an unreadable topology the bundles are empty and the strategy is
         the existing `PACK` default, so the caller schedules exactly as it did before.
     """
     want = max(1, world_size)
-    records = gpu_node_topology() if nodes is None else nodes
+    fleet = gpu_node_topology() if nodes is None else nodes
+    records = _eligible(fleet, datasets, zone_budget_watts)
     if not records:
-        return CollectivePlacement(
-            world_size=want, reason="topology unreadable: scheduling without a placement hint"
+        # An empty fleet and a fleet filtered to nothing are different failures with different
+        # fixes, and reporting both as "unreadable" sends the reader looking for a label
+        # problem when the answer is a policy they wrote.
+        reason = (
+            "topology unreadable: scheduling without a placement hint"
+            if not fleet
+            else (
+                f"no eligible node of {len(fleet)}: residency or the power budget excluded "
+                "every one, so this stage cannot be placed as configured"
+            )
         )
+        return CollectivePlacement(world_size=want, reason=reason)
 
     # Prefer a single node whose coherent domain already holds the whole collective.
-    for node in sorted(records, key=lambda n: (-n.local_domain, n.node_id)):
+    for node in _preferred_order(records):
         if node.local_domain >= want:
             return CollectivePlacement(
                 world_size=want,
@@ -107,7 +129,7 @@ def plan_collective(
     ids: list[str] = []
     remaining = want
     for group in domain_groups(records).values():
-        for node in sorted(group, key=lambda n: (-n.gpus, n.node_id)):
+        for node in _preferred_order(group, by_capacity=True):
             if remaining <= 0:
                 break
             take = min(node.gpus, remaining)
@@ -140,6 +162,57 @@ def plan_collective(
             f"the collective spans {len(bundles)} nodes and its all-reduce leaves the fast path"
         ),
     )
+
+
+def _eligible(
+    records: tuple[GpuNodeTopology, ...],
+    datasets: list[str] | tuple[str, ...],
+    zone_budget_watts: float,
+) -> tuple[GpuNodeTopology, ...]:
+    """Nodes a collective may actually use: residency-permitted, and in a zone with power left.
+
+    Both filters are no-ops by default — no datasets named, no budget configured — so a caller
+    that passes neither gets exactly the fleet it passed in.
+    """
+    out = records
+    if datasets:
+        from batcher.dist.executors.ray_runtime.fabric.residency import permitted_nodes
+        from batcher.governance.residency import active_residency
+
+        out = permitted_nodes(active_residency(), datasets, out)
+    if zone_budget_watts > 0:
+        drawn = power_zone_load(out)
+        out = tuple(
+            n
+            for n in out
+            if devices_within_power_budget(
+                zone_budget_watts, n.accelerator_type, drawn.get(n.power_zone, 0.0)
+            )
+            != 0
+        )
+    return out
+
+
+def _preferred_order(
+    records: tuple[GpuNodeTopology, ...] | list[GpuNodeTopology],
+    *,
+    by_capacity: bool = False,
+) -> list[GpuNodeTopology]:
+    """Nodes in the order a collective should fill them.
+
+    Widest coherent domain first (or largest device count, when filling a group), because a
+    collective that fits one fabric is worth more than any other property. Under
+    `accelerator.efficiency_first_placement` the throughput-per-watt order breaks ties, which
+    is what fills the efficient hardware first on a fleet that is power-bound rather than
+    slot-bound.
+    """
+    from batcher.config import active_config
+
+    primary = (lambda n: -n.gpus) if by_capacity else (lambda n: -n.local_domain)
+    if active_config().accelerator.efficiency_first_placement:
+        ranked = {n.node_id: i for i, n in enumerate(rank_nodes_by_efficiency(tuple(records)))}
+        return sorted(records, key=lambda n: (primary(n), ranked.get(n.node_id, 0), n.node_id))
+    return sorted(records, key=lambda n: (primary(n), n.node_id))
 
 
 def power_zone_load(

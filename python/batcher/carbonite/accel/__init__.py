@@ -4,10 +4,13 @@ Carbonite protects a run from the resources it does not have. On a GPU fleet the
 those is device memory — 80 GiB with no swap behind it and a failure mode that kills a worker
 rather than degrading it — and the second scarcest is a healthy device.
 
-Four modules, one question each:
+Six modules, one question each:
 
 * `vram` — device memory as a pool: reserve, release, headroom, and what another tenant is
-  already holding.
+  already holding, which is the binding figure when sizing an inference stage on a shared
+  device.
+* `allocator` — how the allocations `vram` admitted are actually served: a suballocated pool
+  in front of the driver, host spilling, and the measured high-water mark.
 * `mig` — partitioning one device into isolated instances, so a small model stops holding a
   large device.
 * `kv_cache` — the LLM cache budget that actually sets an inference stage's concurrency.
@@ -21,6 +24,15 @@ decisions, and the framework doing the allocating carries them out.
 
 from __future__ import annotations
 
+from batcher.carbonite.accel.allocator import (
+    MIN_POOL_BYTES,
+    AllocatorPlan,
+    configure_device_memory,
+    device_allocator_state,
+    plan_allocator,
+    prepare_device_memory,
+    reset_device_allocator,
+)
 from batcher.carbonite.accel.health import (
     HealthThresholds,
     HealthVerdict,
@@ -48,17 +60,12 @@ from batcher.carbonite.accel.power import (
     devices_within_budget,
     validate_fleet_power,
 )
-from batcher.carbonite.accel.vram import (
-    DEFAULT_HEADROOM,
-    SPILL_TIERS,
-    VramPool,
-    VramReservation,
-    spill_tier,
-)
+from batcher.carbonite.accel.vram import DEFAULT_HEADROOM, VramPool, VramReservation
 
 __all__ = [
     "DEFAULT_HEADROOM",
-    "SPILL_TIERS",
+    "MIN_POOL_BYTES",
+    "AllocatorPlan",
     "HealthThresholds",
     "HealthVerdict",
     "KvCacheBudget",
@@ -68,7 +75,9 @@ __all__ = [
     "VramReservation",
     "assess_device",
     "assess_fleet",
+    "configure_device_memory",
     "configured_thresholds",
+    "device_allocator_state",
     "devices_within_budget",
     "kv_bytes_per_token",
     "kv_cache_bytes",
@@ -76,9 +85,11 @@ __all__ = [
     "mig_plan",
     "mig_profiles",
     "mig_supported",
+    "plan_allocator",
+    "prepare_device_memory",
+    "reset_device_allocator",
     "schedulable_device_count",
     "schedulable_devices",
     "smallest_profile_for",
-    "spill_tier",
     "validate_fleet_power",
 ]

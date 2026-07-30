@@ -137,9 +137,45 @@ def test_a_compute_bound_stage_is_worth_the_watts() -> None:
 
 
 def test_a_bandwidth_bound_stage_gains_bandwidth_not_flops() -> None:
-    advice = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0)
+    advice = device_energy_advice(
+        "NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0, resident=True
+    )
     assert "bandwidth-bound" in advice.reason
-    assert advice.speedup == pytest.approx(3350.0 / 20.0)
+    assert advice.speedup == pytest.approx(3350.0 / 20.0), "resident data pays no copy"
+    assert advice.transfer_share == 0.0
+
+
+def test_the_host_copy_is_charged_and_usually_dominates_a_scan() -> None:
+    # The term a data engine forgets and then cannot explain. A scan's bytes cross PCIe
+    # before a kernel sees them, and that copy is slower than the device's own memory by two
+    # orders of magnitude — so the 167x an on-device roofline promises collapses to ~2x.
+    advice = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0)
+    assert advice.transfer_share > 0.5
+    assert "host copy dominates" in advice.reason
+    assert advice.speedup < 5.0
+
+
+def test_a_coherent_package_changes_the_answer_rather_than_shading_it() -> None:
+    # An NVLink-C2C host link is an order of magnitude faster than PCIe, which is what makes
+    # scan-shaped work worth offloading on those parts and not on their PCIe siblings.
+    pcie = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0)
+    c2c = device_energy_advice("NVIDIA_GB200", bytes_per_row=64.0, flops_per_row=4.0)
+    assert c2c.speedup > 5 * pcie.speedup
+
+
+def test_a_slow_link_can_make_a_device_lose_outright() -> None:
+    advice = device_energy_advice("NVIDIA_TESLA_T4", bytes_per_row=64.0, flops_per_row=4.0)
+    assert advice.speedup < 1.0, "a PCIe 3.0 copy is slower than the CPU scanning the data"
+    assert not advice.worth_it
+
+
+def test_the_cpu_path_is_scored_on_the_same_roofline() -> None:
+    # Charging the CPU only its memory bandwidth made a compute-heavy row look free there and
+    # cost the device its entire advantage — the verdict said inference was not worth a GPU.
+    advice = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=2_000_000.0)
+    assert advice.worth_it
+    assert advice.speedup > 100
+    assert "compute-bound" in advice.reason
 
 
 def test_a_kernel_far_off_peak_stops_being_worth_the_watts() -> None:

@@ -40,13 +40,21 @@ def devices_within_budget(
         requested: Devices the caller wants.
         utilization: Utilization the devices are expected to run at.
 
+    Computed *through* `validate_fleet_power` rather than beside it, so the number a stage is
+    granted and the counter-offer a refusal reports are the same number by construction. Two
+    code paths to the same figure is how a plan comes to be refused for one fan-out and then
+    scheduled at another.
+
     Returns:
         The device count to use: `requested` unchanged when no budget is configured or the
         device model is unrecognized, and at least 1 otherwise — a budget too small for a
         single device is a misconfiguration to surface with a verdict, not a silent
         zero-device plan.
     """
-    return configured_power_envelope().clamp_devices(requested, accelerator_type, utilization)
+    verdict = validate_fleet_power(accelerator_type, requested, utilization=utilization)
+    if verdict.feasible or verdict.suggested_bounds is None:
+        return requested
+    return max(1, min(requested, verdict.suggested_bounds.n_max_parallelism))
 
 
 def validate_fleet_power(

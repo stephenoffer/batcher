@@ -35,6 +35,8 @@ __all__ = [
     "DataResidency",
     "ResidencyCatalog",
     "ResidencyVerdict",
+    "active_residency",
+    "set_residency",
 ]
 
 #: Enforcement modes, weakest first. `advisory` exists so a fleet can measure before it blocks.
@@ -324,3 +326,53 @@ class ResidencyCatalog:
         if permitted is None:
             return tuple(candidates)
         return tuple(c for c in candidates if c in permitted)
+
+
+#: The catalog the scheduler consults, in `off` mode until a deployment installs one. Process
+#: level rather than per-query: a residency obligation is a property of the deployment, and one
+#: that a caller could forget to pass would be enforced only on the paths that remembered.
+_ACTIVE = ResidencyCatalog()
+
+
+def active_residency() -> ResidencyCatalog:
+    """The residency catalog in force for this process.
+
+    Returns:
+        The installed catalog, or an empty one in `off` mode — which permits everything, so a
+        deployment that installs nothing is unaffected.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import active_residency
+            >>> active_residency().mode in ("off", "advisory", "strict")
+            True
+    """
+    return _ACTIVE
+
+
+def set_residency(catalog: ResidencyCatalog | None) -> ResidencyCatalog:
+    """Install the residency catalog the scheduler consults, returning the previous one.
+
+    Args:
+        catalog: The catalog to install, or `None` to clear back to an empty `off` catalog.
+
+    Returns:
+        The catalog that was previously installed, so a caller can restore it.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import DataResidency, ResidencyCatalog
+            >>> from batcher.governance import active_residency, set_residency
+            >>> catalog = ResidencyCatalog(mode="advisory")
+            >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
+            >>> previous = set_residency(catalog)
+            >>> active_residency().mode
+            'advisory'
+            >>> _ = set_residency(previous)
+    """
+    global _ACTIVE
+    previous = _ACTIVE
+    _ACTIVE = catalog if catalog is not None else ResidencyCatalog()
+    return previous

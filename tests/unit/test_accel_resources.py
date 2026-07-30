@@ -14,7 +14,6 @@ import pytest
 from batcher._internal.errors import ResourceError
 from batcher._internal.hardware.nvml import DeviceTelemetry
 from batcher.carbonite.accel import (
-    SPILL_TIERS,
     HealthThresholds,
     KvCacheBudget,
     VramPool,
@@ -27,7 +26,6 @@ from batcher.carbonite.accel import (
     mig_supported,
     schedulable_devices,
     smallest_profile_for,
-    spill_tier,
 )
 
 pytestmark = pytest.mark.unit
@@ -102,24 +100,6 @@ def test_pool_tracks_the_high_water_mark() -> None:
 def test_a_non_positive_reservation_is_rejected() -> None:
     with pytest.raises(ResourceError, match="must be positive"):
         VramPool(capacity_bytes=_GIB).reserve(0)
-
-
-def test_a_working_set_that_fits_stays_on_the_device() -> None:
-    pool = VramPool(capacity_bytes=80 * _GIB, headroom=0.0)
-    assert spill_tier(10 * _GIB, pool) == "device"
-    assert spill_tier(0, pool) == "device", "nothing to place is not a spill"
-
-
-def test_a_working_set_the_host_can_hold_goes_to_the_host_not_disk() -> None:
-    pool = VramPool(capacity_bytes=80 * _GIB, headroom=0.0)
-    assert spill_tier(200 * _GIB, pool, host_free_bytes=500 * _GIB) == "host"
-
-
-def test_unknown_host_memory_routes_to_disk_rather_than_assuming() -> None:
-    pool = VramPool(capacity_bytes=80 * _GIB, headroom=0.0)
-    assert spill_tier(200 * _GIB, pool) == "disk"
-    assert spill_tier(200 * _GIB, pool, host_free_bytes=8 * _GIB) == "disk"
-    assert set(SPILL_TIERS) == {"device", "host", "disk"}
 
 
 # --- MIG ------------------------------------------------------------------------------

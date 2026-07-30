@@ -205,6 +205,28 @@ def _truncate_to_window(prompts: list, tokenizer: object, max_tokens: int) -> li
     return out
 
 
+def _free_device_bytes() -> int:
+    """Device memory the smallest visible GPU actually has free, or `0` when none is visible.
+
+    Nominal capacity is the wrong number on a shared device: sizing a KV cache against total
+    VRAM when another process holds half of it is how a serving engine OOMs on its first full
+    batch. The pool takes the measured resident figure and reserves against the remainder.
+    """
+    from batcher._internal.hardware import device_telemetry, gpu_inventory
+    from batcher.carbonite.accel import VramPool
+
+    capacity = min((int(g.get("memory_bytes") or 0) for g in gpu_inventory()), default=0)
+    if capacity <= 0:
+        return 0
+    pool = VramPool(capacity_bytes=capacity, headroom=0.0)
+    for reading in device_telemetry():
+        pool.observe_external(reading.index, reading.memory_used_bytes)
+    return min(
+        (pool.available_bytes(r.index) for r in device_telemetry()),
+        default=pool.available_bytes(0),
+    )
+
+
 def kv_cache_concurrency(
     *,
     context_tokens: int,
@@ -236,7 +258,9 @@ def kv_cache_concurrency(
         head_dim: Dimension of one attention head.
         weight_bytes: Resident model weights after any quantization.
         device_bytes: Device memory available to the stage. `None` reads the smallest GPU
-            this process can see, and reports `0` when there is none.
+            this process can see *and subtracts what other processes already hold on it*,
+            because the memory a co-tenant is using is the binding constraint and is invisible
+            to a per-process allocator. Reports `0` when no device is visible.
         dtype: Cache element type. `None` reads `accelerator.kv_cache_dtype` from the active
             configuration, where FP8 halves the cache against FP16.
 
@@ -263,9 +287,7 @@ def kv_cache_concurrency(
 
     accel = active_config().accelerator
     if device_bytes is None:
-        from batcher._internal.hardware import gpu_inventory
-
-        device_bytes = min((int(g.get("memory_bytes") or 0) for g in gpu_inventory()), default=0)
+        device_bytes = _free_device_bytes()
     per_token = kv_bytes_per_token(layers, kv_heads, head_dim, dtype or accel.kv_cache_dtype)
     budget = KvCacheBudget(
         device_bytes=max(0, device_bytes),

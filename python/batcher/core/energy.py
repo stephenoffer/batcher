@@ -28,7 +28,13 @@ from dataclasses import dataclass, field
 
 from batcher.plan.energy import EnergyLedger, StageEnergy
 
-__all__ = ["StageMeter", "active_ledger", "energy_scope", "measure_stage"]
+__all__ = [
+    "StageMeter",
+    "active_ledger",
+    "energy_scope",
+    "measure_stage",
+    "reset_energy_sampling",
+]
 
 _LEDGER: contextvars.ContextVar[EnergyLedger | None] = contextvars.ContextVar(
     "batcher_energy_ledger", default=None
@@ -48,18 +54,27 @@ def active_ledger() -> EnergyLedger | None:
 def energy_scope(ledger: EnergyLedger | None = None) -> Iterator[EnergyLedger]:
     """Collect the energy of every stage inside the block into one ledger.
 
+    A scope opened inside another folds into it when it closes, so bracketing a sub-pipeline
+    does not hide its stages from the outer run's total.
+
     Args:
         ledger: An existing ledger to append to, or `None` for a fresh one.
 
     Yields:
         The ledger being filled, so the caller can report from it after the block.
     """
+    parent = _LEDGER.get()
     target = ledger if ledger is not None else EnergyLedger()
     token = _LEDGER.set(target)
     try:
         yield target
     finally:
         _LEDGER.reset(token)
+        # A scope opened inside another folds into it on the way out, so a caller that
+        # brackets a sub-pipeline still sees those stages in the outer run's total. The fold
+        # is the same mergeable operation a distributed run uses on its workers' ledgers.
+        if parent is not None and target is not parent and target.stages:
+            parent.merge(target)
 
 
 @dataclass
@@ -101,6 +116,40 @@ class StageMeter:
         """
         if count > 0:
             self.tokens += count
+
+
+#: The last telemetry reading and when it was taken, so a stage that runs many times a second
+#: does not hammer NVML. Two readings per stage is nothing for a stage that runs for seconds;
+#: it is the entire cost for one that runs for milliseconds, which the per-batch GPU kernels do.
+_LAST_DRAW: list[tuple[float, tuple[float, float, bool]]] = []
+
+
+def _sampled_draw() -> tuple[float, float, bool]:
+    """`_draw()`, at most once per `accelerator.energy.telemetry_interval_s`.
+
+    The cached reading is deliberately reused rather than re-read: within one interval a
+    device's draw is close to constant, and a per-invocation NVML round trip on a kernel that
+    runs in milliseconds costs more than the measurement is worth.
+    """
+    from batcher.config import active_config
+
+    interval = active_config().accelerator.energy.telemetry_interval_s
+    now = time.monotonic()
+    if _LAST_DRAW and now - _LAST_DRAW[0][0] < interval:
+        return _LAST_DRAW[0][1]
+    reading = _draw()
+    _LAST_DRAW[:] = [(now, reading)]
+    return reading
+
+
+def reset_energy_sampling() -> None:
+    """Forget the cached telemetry reading, so the next measurement re-reads the devices.
+
+    The counterpart of `carbonite.memory.probe.reset_memory_sampling`. Needed whenever the
+    sampling interval changes under a running process — a `config_context` that tightens it —
+    and by any test that fakes a device draw.
+    """
+    _LAST_DRAW.clear()
 
 
 def _draw() -> tuple[float, float, bool]:
@@ -155,13 +204,13 @@ def measure_stage(
         yield meter
         return
 
-    start_watts, start_util, start_ok = _draw()
+    start_watts, start_util, start_ok = _sampled_draw()
     started = time.perf_counter()
     try:
         yield meter
     finally:
         seconds = max(0.0, time.perf_counter() - started)
-        end_watts, end_util, end_ok = _draw()
+        end_watts, end_util, end_ok = _sampled_draw()
         measured = start_ok and end_ok
         if measured:
             watts = (start_watts + end_watts) / 2.0
