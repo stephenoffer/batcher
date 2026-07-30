@@ -2132,7 +2132,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `mig.py` | 158 | Multi-Instance GPU profiles — which partitionings a device model actually offers. |
 | `nvml.py` | 385 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
 | `probes.py` | 70 | The one hook that clears every memoized hardware reading. |
-| `profile.py` | 321 | The machine's identity — one record of what this hardware is, and a key that names it. |
+| `profile.py` | 375 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 155 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
