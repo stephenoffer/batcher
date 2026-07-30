@@ -294,6 +294,40 @@ identifier, or a blocklisted term.
    contains_any_rate
 ```
 
+The injection monitors score the text a model was *given* rather than the text it produced: an
+instruction hidden in a retrieved document, a jailbreak framing in a user message, characters
+that render as nothing. They are surface heuristics, not classifiers, so read them as a rate to
+watch rather than a count of successful attacks:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   instruction_override_rate
+   jailbreak_marker_rate
+   hidden_unicode_rate
+   system_prompt_echo_rate
+   code_execution_rate
+   sql_injection_rate
+   unsafe_html_rate
+```
+
+The leakage monitors score what left — a credential recited into an answer, a payload encoded
+past a reviewer, a link built to carry the conversation to someone else's host:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   credential_leak_rate
+   private_key_rate
+   encoded_payload_rate
+   data_uri_rate
+   url_exfiltration_rate
+```
+
 The formatting metrics check whether generated text used the Markdown elements a task asked for.
 
 ```{eval-rst}

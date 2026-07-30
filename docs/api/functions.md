@@ -84,7 +84,8 @@ malformed row degrades instead of raising.
 ## Prompt construction
 
 Assemble an LLM prompt from row columns in the data plane: interpolate columns into a template,
-wrap a field in tags, or trim a column to fit a context budget.
+wrap fields in tags, render a chat or instruction format, or fold a list of retrieved passages
+into one context block.
 
 ```{eval-rst}
 .. autosummary::
@@ -93,7 +94,25 @@ wrap a field in tags, or trim a column to fit a context budget.
 
    render_template
    wrap_tag
+   tagged_fields
+   chatml_prompt
+   instruction_prompt
+   join_context
+```
+
+Keeping the assembled prompt inside a model's context window is the other half. These estimate
+tokens from characters rather than running a tokenizer per row, which would be per-row Python on
+the hot path, so leave headroom rather than targeting the window exactly.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   prompt_token_estimate
+   fits_context
    truncate_to_token_budget
+   truncate_middle
 ```
 
 ## Horizontal functions
@@ -203,8 +222,7 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
 
 ## See also
 
-:::{seealso}
 - {doc}`expressions`: the `Expr` methods and accessor namespaces.
 - {doc}`metrics`: the scoring and statistical aggregates.
 - {doc}`../user-guide/expressions`: the same language taught rather than tabulated.
-:::
+- {doc}`../cookbook/expressions/index`: runnable recipes for these functions in context.
