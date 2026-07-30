@@ -85,7 +85,9 @@ def _is_fixed_count_sample(node: LogicalPlan) -> bool:
     return isinstance(node, Sample) and node.n is not None
 
 
-def _resident_bytes(node: LogicalPlan, rows: float, width: float, estimator) -> int:
+def _resident_bytes(
+    node: LogicalPlan, rows: float, width: float, estimator, morsel_rows: int = 0
+) -> int:
     """Bytes a materializing operator actually holds — which is not always its output.
 
     For most breakers the two coincide: an aggregate's state is its groups, a sort's is
@@ -111,18 +113,66 @@ def _resident_bytes(node: LogicalPlan, rows: float, width: float, estimator) -> 
         rows: Its estimated output rows.
         width: Its estimated output row width in bytes.
         estimator: The shared cardinality estimator, for sizing a join's build side.
+        morsel_rows: The configured morsel size, for sizing an aggregate's live partial
+            state (see `_aggregate_resident_bytes`). `0` skips that refinement.
 
     Returns:
         The operator's resident state in bytes.
     """
-    from batcher.plan.logical import Join, Sort
+    from batcher.plan.logical import Aggregate, Join, Sort
 
     if isinstance(node, Join):
         build = estimator.estimate(node.right).rows
         return int(max(0.0, build) * estimator.row_width(node.right, width))
     if isinstance(node, Sort) and node.limit:
         return int(min(float(node.limit), rows) * width)
+    if isinstance(node, Aggregate):
+        return _aggregate_resident_bytes(node, rows, width, estimator, morsel_rows)
     return int(rows * width)
+
+
+def _aggregate_resident_bytes(
+    node: LogicalPlan, rows: float, width: float, estimator, morsel_rows: int
+) -> int:
+    """An aggregate's resident state, which is **not** its groups when grouping is wide.
+
+    The parallel aggregate is `partial -> combine -> finalize`: every morsel builds its own
+    group table and all of them are live when `combine` merges them. So what it holds is the
+    sum of the per-morsel partials, and the reduction that decides how big those are is the
+    one *within a morsel* — not the global one.
+
+    That distinction is the whole defect. `GROUP BY k` over 24 M rows into 2 M groups reduces
+    12:1 globally, so budgeting the output gave 2 M x 16 B = **32 MB**. But a 16,384-row
+    morsel of a 2 M-group key space holds ~16,300 distinct keys, so it reduces by nothing:
+    every input row survives into a partial, and the live partial state is the size of the
+    input again. Measured peak for that query was ~2.4 GB against a 537 MB envelope, with the
+    query never routed out of core because the estimate said 32 MB.
+
+    `agg_par` states this exact asymmetry about *CPU* — "when grouping does not reduce, the
+    pre-aggregation is pure overhead" — and it was never applied to memory.
+
+    The per-morsel group count is `min(morsel_rows, ndv)`, so the partial state is
+    `input_rows x (that / morsel_rows) x width`. Both ends come out right: a wide key gives
+    the factor 1 and the full input, and `GROUP BY flag` over three groups gives
+    `3 / 16,384` — negligible, exactly as it should be, so a reducing group-by's envelope is
+    unchanged.
+
+    The larger of the two readings wins, because a wide aggregate holds its partials *and*
+    eventually its output, and the output dominates only when grouping reduces.
+    """
+    out_bytes = int(rows * width)
+    if morsel_rows <= 0 or rows <= 0:
+        return out_bytes
+    inputs = list(children(node))
+    if not inputs:
+        return out_bytes
+    in_rows = estimator.estimate(inputs[0]).rows
+    if in_rows <= 0:
+        return out_bytes
+    # Distinct keys a single morsel can hold: bounded by the morsel and by the key space.
+    per_morsel_groups = min(float(morsel_rows), rows)
+    partial_bytes = int(in_rows * (per_morsel_groups / morsel_rows) * width)
+    return max(out_bytes, partial_bytes)
 
 
 def _streaming_bytes(
@@ -333,7 +383,7 @@ def annotate_ops(
             if not known:
                 mem = 0  # unknown size — don't budget (never fail a real query on a guess)
             elif materializes:
-                mem = _resident_bytes(node, rows, width, estimator)
+                mem = _resident_bytes(node, rows, width, estimator, morsel_rows)
             else:
                 # streaming: ~one morsel in flight, byte-bounded.
                 mem = _streaming_bytes(node, width, morsel_rows, morsel_bytes, estimator)
