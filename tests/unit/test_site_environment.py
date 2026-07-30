@@ -346,3 +346,58 @@ def test_the_spill_cost_model_prices_the_disk_the_engine_will_actually_use(monke
     monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
     storage_cost.spill_device_factor()
     assert seen and seen[0] != "/ephemeral"
+
+
+def test_a_slurm_allocation_wider_than_ray_is_reported_once(monkeypatch, caplog):
+    # The silent failure: `srun -N 4 python job.py` runs on four nodes, a bare `ray.init()`
+    # starts a one-node Ray on whichever one the script landed on, and the job uses a quarter
+    # of the hardware it was billed for while returning the right answer.
+    import logging
+    import sys
+    import types
+
+    from batcher.dist.executors.ray_runtime import capacity as readiness
+
+    monkeypatch.setattr(readiness, "_ALLOCATION_WARNED", False)
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "gpu-[01-04]")
+    fake_ray = types.SimpleNamespace(is_initialized=lambda: True, nodes=lambda: [{"Alive": True}])
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    with caplog.at_level(logging.WARNING):
+        readiness.warn_once_if_allocation_is_wider_than_ray()
+    assert "holds 4 nodes but Ray sees 1" in caplog.text
+    # Once per process: repeating it per query trains the reader to skip it.
+    caplog.clear()
+    readiness.warn_once_if_allocation_is_wider_than_ray()
+    assert caplog.text == ""
+
+
+def test_a_ray_cluster_that_spans_the_allocation_says_nothing(monkeypatch, caplog):
+    import logging
+    import sys
+    import types
+
+    from batcher.dist.executors.ray_runtime import capacity as readiness
+
+    monkeypatch.setattr(readiness, "_ALLOCATION_WARNED", False)
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "gpu-[01-04]")
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        types.SimpleNamespace(is_initialized=lambda: True, nodes=lambda: [{"Alive": True}] * 4),
+    )
+    with caplog.at_level(logging.WARNING):
+        readiness.warn_once_if_allocation_is_wider_than_ray()
+    assert caplog.text == ""
+
+
+def test_an_unscheduled_process_says_nothing(monkeypatch, caplog):
+    import logging
+
+    from batcher.dist.executors.ray_runtime import capacity as readiness
+
+    monkeypatch.setattr(readiness, "_ALLOCATION_WARNED", False)
+    with caplog.at_level(logging.WARNING):
+        readiness.warn_once_if_allocation_is_wider_than_ray()
+    assert caplog.text == ""

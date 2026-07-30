@@ -335,11 +335,13 @@ def _ensure_ray_locked(ray, workers: int) -> None:
                     raise
                 ray.init(**_ray_init_kwargs(workers, force_attach=True))
             except ConnectionError:
-                # A managed-cluster signal routed us to `address="auto"` but no cluster is
-                # actually reachable (e.g. a local dev run inside a workspace whose cluster
-                # is down): start a local single-node Ray instead of failing the job.
+                # The cluster did not answer. That is usually "not yet" rather than "not
+                # there" — the head is still coming up — so retry before concluding
+                # anything, because both conclusions available here are expensive.
                 if not ray.is_initialized():
-                    ray.init(**_ray_init_kwargs(workers, force_local=True))
+                    from .readiness import _connect_or_fall_back
+
+                    _connect_or_fall_back(ray, workers)
         # Batcher initialized Ray: a local cluster shares the driver's modules and a
         # remote one carries the self-shipped runtime_env, so the job makes batcher
         # importable — no per-remote shipping needed.
@@ -351,6 +353,9 @@ def _ensure_ray_locked(ray, workers: int) -> None:
         # ship its package on each remote instead. A no-op when trust_cluster_image.
         set_job_ships_batcher(False)
         _ship_decided = True
+    from .capacity import warn_once_if_allocation_is_wider_than_ray
+
+    warn_once_if_allocation_is_wider_than_ray()
     _wrap_tasks(ray, task_options(current_envelope()))
 
 
