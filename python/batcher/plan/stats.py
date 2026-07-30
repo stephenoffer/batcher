@@ -31,9 +31,17 @@ import enum
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
-__all__ = ["ColumnStat", "Provenance", "RelStats", "ambiguous_float_bound", "weakest"]
+__all__ = [
+    "ColumnStat",
+    "Provenance",
+    "RelStats",
+    "ambiguous_float_bound",
+    "mismatched_exactness",
+    "weakest",
+]
 
 
 def ambiguous_float_bound(value: Any) -> bool:
@@ -67,6 +75,41 @@ def ambiguous_float_bound(value: Any) -> bool:
         ``True`` if the bound is a float NaN or a float zero, and so cannot be reasoned from.
     """
     return isinstance(value, float) and (math.isnan(value) or value == 0.0)
+
+
+def mismatched_exactness(bound: Any, literal: Any) -> bool:
+    """Whether comparing these two in Python is *more precise* than the engine's comparison.
+
+    A `Decimal` bound against a `float` literal is the case, and it is a silent wrong-answer
+    path rather than a missed optimization. Python compares the two exactly: it widens the
+    float to the rational it actually represents, so ``Decimal("999999999.990") ==
+    999999999.99`` is `False`, because the nearest double to 999999999.99 is
+    999999999.9900000095367431640625.
+
+    The engine does not. A decimal column compared against a float literal is promoted to
+    Float64 on both sides (`coerce_numeric`, matching DuckDB's DOUBLE-dominates-DECIMAL rule),
+    and there the two are the same double and compare equal.
+
+    So a rewrite that reasons about such a pair with Python's comparison proves things the
+    engine disagrees with. That is not hypothetical: it folded ``price = Decimal("999999999.99")``
+    over a `decimal(20,3)` column to an empty relation, and the query returned no rows while
+    executing the same filter returned one. Decimal literals reach the plan as floats (the IR
+    has no decimal literal), so every money predicate written the exact way is on this path.
+
+    Two bounds of the same kind are fine, and so is a decimal against an integer — the engine
+    widens the integer into the decimal exactly, which is what Python does too.
+
+    Args:
+        bound: A recorded `min` or `max` bound.
+        literal: The predicate's literal, to be compared against that bound.
+
+    Returns:
+        ``True`` if one side is a `Decimal` and the other a `float`, so a Python comparison
+        between them cannot be trusted to predict the engine.
+    """
+    kinds = (isinstance(bound, Decimal), isinstance(literal, Decimal))
+    floats = (isinstance(bound, float), isinstance(literal, float))
+    return (kinds[0] and floats[1]) or (kinds[1] and floats[0])
 
 
 class Provenance(enum.IntEnum):

@@ -27,7 +27,7 @@ from batcher.metadata.hub import MetadataHub
 from batcher.plan.bloom_index import BloomIndex
 from batcher.plan.expr_ir import Binary, Col, IsNotNull, IsNull, Lit, Not
 from batcher.plan.logical import Filter, LogicalPlan, Project, Scan
-from batcher.plan.stats import ColumnStat, Provenance, RelStats
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, mismatched_exactness
 
 __all__ = [
     "answer_filter_any",
@@ -284,6 +284,13 @@ def _comparison_empty(op: str, stat: ColumnStat | None, value) -> bool:
     # that `WHERE f < 0` keeps nothing — and executing it returns the `-0.0` row we proved
     # away. Refusing costs a scan; answering costs a wrong count.
     if _is_zero_float(lo) or _is_zero_float(hi):
+        return False
+    # A decimal bound against a float literal is the same class of disagreement, and the one
+    # that reaches every exact money predicate: the IR has no decimal literal, so
+    # `price = Decimal("999999999.99")` arrives here as a float, and Python compares it to the
+    # `Decimal` bound *exactly* while the engine promotes both to Float64 and finds them equal.
+    # It proved `count()` was 0 for a filter whose `collect()` returned the row.
+    if mismatched_exactness(lo, value) or mismatched_exactness(hi, value):
         return False
     try:
         if op == "lt":
