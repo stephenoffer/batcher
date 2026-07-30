@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import logging
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.plan.resource import SchedulingEnvelope
 
@@ -217,6 +219,45 @@ def _resolve_placement_strategy(env: SchedulingEnvelope | None) -> str:
     return "PACK" if nodes == 1 else pref
 
 
+def _report_collective_fabric(workers: int, env: SchedulingEnvelope | None) -> None:
+    """Log where a gang-scheduled collective sits relative to the fleet's fabric domains.
+
+    STRICT_PACK already puts a collective's actors on one node. What it cannot do is make a
+    node wide enough: a world size above the widest NVLink domain the fleet has runs its
+    all-reduce over PCIe or the network at a fraction of the fabric rate. That is invisible
+    from the job's own timings — the run is simply slower — so it is recorded here, where the
+    world size and the topology are both known, rather than left to be rediscovered.
+
+    Best-effort and never raises: this is an observation about a placement that has already
+    been decided, and a fleet whose topology cannot be read keeps the placement it had.
+    """
+    if env is None or not env.gpu_collective or workers <= 1:
+        return
+    if not active_config().accelerator.fabric_aware_placement:
+        return
+    try:
+        from batcher._internal.logging import get_logger, log_kv
+        from batcher.dist.executors.ray_runtime.fabric import largest_local_domain
+
+        widest = largest_local_domain()
+        if widest <= 0:
+            return  # unreadable or unlabelled topology: no observation to make
+        log = get_logger("dist")
+        if workers > widest:
+            log_kv(
+                log,
+                logging.WARNING,
+                "collective wider than the fleet's fabric domain",
+                world_size=workers,
+                widest_domain=widest,
+                effect="all-reduce leaves NVLink for the host bus or network",
+            )
+        else:
+            log_kv(log, logging.DEBUG, "collective fits one fabric domain", world_size=workers)
+    except Exception as exc:  # observation only: never fail a placement over it
+        note_suppressed("dist", "report collective fabric", exc)
+
+
 def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     """Gang-schedule a placement group of `workers` bundles across nodes.
 
@@ -239,6 +280,7 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     # building W bundles must not re-read the cluster W times (O(workers x nodes)).
     node_class = _fleet_node_class_resources(env)
     strategy = _resolve_placement_strategy(env)
+    _report_collective_fabric(workers, env)
     pg = placement_group([_bundle(env, node_class) for _ in range(workers)], strategy=strategy)
     ready, _ = ray.wait([pg.ready()], timeout=_placement_timeout_s())
     if not ready:

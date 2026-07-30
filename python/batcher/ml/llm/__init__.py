@@ -19,6 +19,7 @@ from batcher.ml.llm.engines import (
 )
 from batcher.ml.llm.generate import llm_generate, llm_udf
 from batcher.ml.llm.packing import pack_sequences
+from batcher.ml.llm.sizing import kv_cache_concurrency
 from batcher.ml.llm.structured import json_schema, llm_classify_udf, llm_extract_udf
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "anthropic_engine",
     "http_engine",
     "json_schema",
+    "kv_cache_concurrency",
     "llm_classify_udf",
     "llm_extract_udf",
     "llm_generate",

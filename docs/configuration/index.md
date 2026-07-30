@@ -2,7 +2,7 @@
 
 This page describes how to build a Batcher `Config`, make it active, and load one from the environment or a file.
 
-Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, and `observability`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
+Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, `observability`, and `accelerator`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
 
 ```python
 import batcher as bt
@@ -173,17 +173,16 @@ The environment and file layers are read once when `batcher` is imported.
 
 ## See also
 
-:::{seealso}
 - {doc}`../user-guide/performance`: which of these options matter when a query is slow.
 - {doc}`../user-guide/caching`: the result cache and the options that bound it.
 - {doc}`../deep-dives/buffer-pool`: what the memory options actually govern.
 - {doc}`../api/configuration`: the configuration objects as an API surface.
-:::
 
 ```{toctree}
 :maxdepth: 1
 
 options
+accelerator
 environment
 profiles
 ```

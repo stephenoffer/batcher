@@ -198,6 +198,12 @@ Run the pipeline and understand what it did: caching, plans, progress, and the f
 ::::{grid} 1 2 2 2
 :gutter: 3
 
+:::{grid-item-card} {octicon}`rocket;1.1em` Performance
+:link: performance
+:link-type: doc
+The levers that make a correct query fast.
+:::
+
 :::{grid-item-card} {octicon}`stack;1.1em` Caching
 :link: caching
 :link-type: doc
@@ -222,6 +228,12 @@ Progress, structured logs, and the web dashboard.
 Patterns for pipelines that stay fast.
 :::
 
+:::{grid-item-card} {octicon}`server;1.1em` GPU fleets
+:link: gpu-fleets
+:link-type: doc
+Power budgets, fabric-aware placement, device health, residency.
+:::
+
 :::{grid-item-card} {octicon}`bug;1.1em` Troubleshooting
 :link: troubleshooting
 :link-type: doc
@@ -231,14 +243,12 @@ Diagnose and fix common issues.
 
 ## See also
 
-:::{seealso}
 - {doc}`../api/index`: the reference behind every method these guides use.
 - {doc}`../examples/index`: the same operations assembled into complete pipelines.
 - {doc}`../ml/index`: the model half of the pipeline, once the relational half is in place.
 - {doc}`../configuration/index`: the tunables the performance and memory guides refer to.
 - {doc}`../deep-dives/index`: why an operator behaves the way these pages describe.
 - {doc}`../integrations/index`: connecting a specific source or sink.
-:::
 
 ```{toctree}
 :hidden:
@@ -298,6 +308,7 @@ performance
 caching
 explain-plans
 observability
+gpu-fleets
 best-practices
 troubleshooting
 ```

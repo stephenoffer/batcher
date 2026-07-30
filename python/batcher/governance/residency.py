@@ -45,6 +45,14 @@ RESIDENCY_MODES = ("off", "advisory", "strict")
 class DataResidency:
     """One dataset's permitted processing regions, and the obligation behind them.
 
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import DataResidency
+            >>> rule = DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR")
+            >>> sorted(rule.allowed_regions)
+            ['eu-north-1']
+
     Attributes:
         dataset: Dataset name or path prefix the rule governs. Prefix matching is longest-wins,
             so `"s3://eu-customer/"` can carry a default and `"s3://eu-customer/public/"` a
@@ -65,6 +73,13 @@ class DataResidency:
 class ResidencyVerdict:
     """Whether a placement is permitted, and why not when it is not.
 
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import ResidencyVerdict
+            >>> ResidencyVerdict(allowed=True).message()
+            ''
+
     Attributes:
         allowed: Whether the placement may proceed.
         dataset: The dataset checked.
@@ -84,6 +99,19 @@ class ResidencyVerdict:
     def message(self) -> str:
         """A one-line explanation suitable for a log line or an exception.
 
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import ResidencyVerdict
+                >>> verdict = ResidencyVerdict(
+                ...     allowed=False,
+                ...     dataset="s3://eu/orders",
+                ...     region="us-east-1",
+                ...     allowed_regions=frozenset({"eu-north-1"}),
+                ... )
+                >>> verdict.message().endswith("permitted in eu-north-1")
+                True
+
         Returns:
             An empty string when allowed, otherwise the dataset, the refused region, the
             permitted set, and the obligation that requires it.
@@ -102,6 +130,15 @@ class ResidencyVerdict:
 class ResidencyCatalog:
     """The registered residency rules, and the checks that resolve against them.
 
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import DataResidency, ResidencyCatalog
+            >>> catalog = ResidencyCatalog(mode="strict")
+            >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
+            >>> catalog.check("s3://eu/orders", "us-east-1").allowed
+            False
+
     Attributes:
         mode: One of `RESIDENCY_MODES`. `off` (the default) makes every check pass.
         rules: Registered rules, keyed by dataset name or path prefix.
@@ -112,6 +149,14 @@ class ResidencyCatalog:
 
     def register(self, rule: DataResidency) -> ResidencyCatalog:
         """Add or replace a rule, returning self so registrations chain.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import DataResidency, ResidencyCatalog
+                >>> catalog = ResidencyCatalog().register(DataResidency("s3://eu/"))
+                >>> len(catalog.rules)
+                1
 
         Args:
             rule: The rule to register; a second rule for the same key replaces the first.
@@ -124,6 +169,16 @@ class ResidencyCatalog:
 
     def rule_for(self, dataset: str) -> DataResidency | None:
         """The most specific registered rule governing a dataset, or `None`.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import DataResidency, ResidencyCatalog
+                >>> catalog = ResidencyCatalog().register(DataResidency("s3://eu/"))
+                >>> catalog.rule_for("s3://eu/orders").dataset
+                's3://eu/'
+                >>> catalog.rule_for("s3://other/orders") is None
+                True
 
         Longest-prefix wins, so a narrow exception under a broad default is expressible
         without ordering rules by hand.
@@ -143,6 +198,17 @@ class ResidencyCatalog:
 
     def check(self, dataset: str, region: str) -> ResidencyVerdict:
         """Whether a dataset may be processed in a region.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import DataResidency, ResidencyCatalog
+                >>> catalog = ResidencyCatalog(mode="advisory")
+                >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
+                >>> catalog.check("s3://eu/orders", "eu-north-1").allowed
+                True
+                >>> catalog.check("s3://eu/orders", "us-east-1").enforced
+                False
 
         Args:
             dataset: Dataset name or path.
@@ -171,6 +237,15 @@ class ResidencyCatalog:
     def enforce(self, dataset: str, region: str) -> ResidencyVerdict:
         """Check a placement and raise in `strict` mode when it is refused.
 
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import DataResidency, ResidencyCatalog
+                >>> catalog = ResidencyCatalog(mode="advisory")
+                >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
+                >>> catalog.enforce("s3://eu/orders", "us-east-1").allowed
+                False
+
         Args:
             dataset: Dataset name or path.
             region: The region work would run in.
@@ -189,6 +264,16 @@ class ResidencyCatalog:
 
     def permitted_regions(self, datasets: list[str] | tuple[str, ...]) -> frozenset[str] | None:
         """Regions where *every* named dataset may be processed.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import DataResidency, ResidencyCatalog
+                >>> catalog = ResidencyCatalog(mode="strict")
+                >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
+                >>> _ = catalog.register(DataResidency("s3://uk/", frozenset({"eu-west-2"})))
+                >>> sorted(catalog.permitted_regions(["s3://eu/a", "s3://uk/b"]))
+                []
 
         The figure a multi-input job needs: a join of an EU dataset and a UK dataset may run
         only where both are permitted, and that intersection is frequently empty — which is a
@@ -215,6 +300,15 @@ class ResidencyCatalog:
         datasets: list[str] | tuple[str, ...],
     ) -> tuple[str, ...]:
         """Candidate regions that every named dataset permits, in the given order.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.governance import DataResidency, ResidencyCatalog
+                >>> catalog = ResidencyCatalog(mode="strict")
+                >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
+                >>> catalog.filter_regions(["us-east-1", "eu-north-1"], ["s3://eu/orders"])
+                ('eu-north-1',)
 
         What a scheduler calls before choosing where to place a stage.
 

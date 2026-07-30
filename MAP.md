@@ -748,7 +748,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 154 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `aggregate.py` | 153 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `tasks.py` | 123 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
@@ -1269,7 +1269,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 173 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 482 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
-| `mergeable.py` | 118 | Decompose a group-by aggregate into `partial → combine → finalize`, in the plan IR. |
+| `mergeable.py` | 177 | Split a translated chain into a per-shard stage and a merge stage, in the plan IR. |
 | `ops.py` | 124 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `windows.py` | 310 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 

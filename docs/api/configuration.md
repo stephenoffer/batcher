@@ -29,6 +29,7 @@ Sections are themselves frozen dataclasses. Read fields directly, and derive new
 | `config.optimizer` | Kyber planning thresholds, cost model, cardinality |
 | `config.pid` | Adaptive batch-size controller gains |
 | `config.metadata` | Learned-stats backend and decay |
+| `config.accelerator` | GPU fleet placement, power envelope, and device health |
 
 ### Section classes
 
@@ -46,6 +47,9 @@ The section dataclasses are exported so you can construct one and slot it into
 | `MetadataConfig` | learned-stats backend, URI, and decay rate |
 | `GovernanceConfig` | whether row/column policy is advisory or mandatory |
 | `TenantConfig` | which tenant a scope's work belongs to, and its share |
+| `AcceleratorConfig` | GPU placement, VRAM headroom, MIG preference, and KV-cache sizing |
+| `EnergyConfig` | the site's power budget, energy price, grid carbon intensity, and PUE |
+| `DeviceHealthConfig` | when a device is derated or taken out of rotation |
 
 ### Config.replace
 
@@ -135,3 +139,4 @@ Highest first: `config_context` > `set_config` > `BATCHER_*` env vars > `BATCHER
 - {doc}`../configuration/environment`: the `BATCHER_*` spelling of the same settings.
 - {doc}`../configuration/profiles`: ready-made configurations for common machine shapes.
 - {doc}`../user-guide/performance`: which fields are worth changing for a slow query.
+- {doc}`../cookbook/operations/configuration`: options, scoped overrides, and profiles, as a runnable script.

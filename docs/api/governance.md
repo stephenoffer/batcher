@@ -184,15 +184,61 @@ value three transformations downstream, after it has been renamed and cast and a
 .. autodata:: Origin
 ```
 
+## Data residency
+
+A residency rule answers a different question from a grant: not who may read a dataset but
+*where it may be computed on*. That is the half of a sovereignty obligation a scheduler can
+break silently, by placing a stage in whichever region has spare accelerator capacity.
+
+{py:obj}`ResidencyCatalog <batcher.governance.ResidencyCatalog>` holds the rules and resolves
+a placement to a {py:obj}`ResidencyVerdict <batcher.governance.ResidencyVerdict>`. Its `mode`
+is one of `RESIDENCY_MODES`: `off` checks nothing, `advisory` reports a refusal a caller logs
+and proceeds past, and `strict` raises. An unregistered dataset is unrestricted, because
+residency is an obligation you state rather than one Batcher infers from a bucket name.
+
+```python
+from batcher.governance import DataResidency, ResidencyCatalog
+
+catalog = ResidencyCatalog(mode="strict")
+catalog.register(
+    DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR Art. 44")
+)
+
+verdict = catalog.check("s3://eu-customers/orders", "us-east-1")
+print(verdict.allowed)
+# False
+print(verdict.message())
+# dataset 's3://eu-customers/orders' may not be processed in region 'us-east-1': permitted in eu-north-1 (GDPR Art. 44)
+```
+
+A job reading several datasets may run only where all of them may, so
+`permitted_regions` returns the intersection and `filter_regions` narrows a scheduler's
+candidate list in preference order. An empty intersection is a real answer: the job has to be
+split, not placed.
+
+```{eval-rst}
+.. autoclass:: DataResidency
+   :members:
+
+.. autoclass:: ResidencyCatalog
+   :members:
+
+.. autoclass:: ResidencyVerdict
+   :members:
+
+.. autodata:: RESIDENCY_MODES
+```
+
 ## See also
 
-:::{seealso}
 - {doc}`Governance guide <../user-guide/governance>`: the worked introduction, with a runnable
   catalog, principal, and rewritten plan.
+- {doc}`GPU fleets <../user-guide/gpu-fleets>`: residency as a placement constraint, beside the
+  power and device-health controls a GPU datacenter runs on.
 - {doc}`Data quality <../user-guide/data-quality>`: validation, which composes with this.
 - {doc}`Explain plans <../user-guide/explain-plans>`: reading the rewrite `enforce` produced.
 - {doc}`Quality gates <../examples/data-engineering/quality-gates>`: failing the pipeline
   rather than the dashboard.
 - {doc}`The plan IR <../deep-dives/plan-ir>`: the tree governance rewrites.
 - {doc}`Dataset API <dataset>` and {doc}`expressions <expressions>`: what a mask lowers to.
-:::
+- {doc}`../cookbook/governance/index`: masking, PII transforms, and lineage as runnable scripts.

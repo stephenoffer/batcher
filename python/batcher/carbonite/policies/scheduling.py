@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.memory.estimator import learned_plan_peak
+from batcher.config import active_config
 from batcher.plan.resource import SchedulingEnvelope
 
 if TYPE_CHECKING:
@@ -44,6 +45,25 @@ __all__ = ["DefaultSchedulingPolicy"]
 _MAX_TASK_FANOUT = 100_000
 
 
+def _devices_within_power_budget(accelerator_type: str | None, gpu_count: int) -> int:
+    """Devices the configured power budget can run, or `gpu_count` when it has no opinion.
+
+    Returns the inventory figure unchanged in the two cases where a clamp would be an
+    invention: no budget configured (the default), and a device model whose draw this build
+    does not recognize.
+    """
+    from batcher.plan.energy.power import max_concurrent_devices
+
+    energy = active_config().accelerator.energy
+    if energy.power_budget_watts <= 0:
+        return gpu_count
+    usable = energy.power_budget_watts * (1.0 - min(0.9, max(0.0, energy.power_headroom)))
+    allowed = max_concurrent_devices(usable, accelerator_type)
+    if allowed < 0:
+        return gpu_count  # unknown device: no opinion
+    return max(1, allowed)
+
+
 class DefaultSchedulingPolicy:
     """Derive a per-Ray-task `SchedulingEnvelope` from Kyber's per-operator bounds.
 
@@ -58,7 +78,13 @@ class DefaultSchedulingPolicy:
     """
 
     @staticmethod
-    def gpu_envelope(*, num_gpus: float, n_tasks: int, gpu_count: int) -> SchedulingEnvelope:
+    def gpu_envelope(
+        *,
+        num_gpus: float,
+        n_tasks: int,
+        gpu_count: int,
+        accelerator_type: str | None = None,
+    ) -> SchedulingEnvelope:
         """Budget a GPU map/inference stage against the GPUs that actually exist.
 
         The relational `envelope` below is the CPU shuffle grant and correctly requests no
@@ -70,6 +96,14 @@ class DefaultSchedulingPolicy:
         pending forever). Fractional `num_gpus` is preserved — packing four 0.25-GPU
         actors onto one device is the point of a fractional request.
 
+        Inventory is not the only ceiling. Where a power budget is configured
+        (`accelerator.energy.power_budget_watts`) it is frequently the tighter one: a rack of
+        sixteen 700 W devices needs more than eleven kilowatts of device power alone, more
+        than one rack circuit delivers, and exceeding it does not fail — the driver clamps
+        every device in the zone, which reads as the whole rack getting slower. Protecting
+        against that is exactly Carbonite's job, so the grant is clamped to the devices the
+        budget can power as well as to the ones that exist.
+
         There is deliberately no VRAM envelope yet: the analogue of the RAM grant needs a
         `gpu_memory_bytes` field on `SchedulingEnvelope` in the neutral `plan` layer, and
         that contract change belongs in the same commit as its consumer.
@@ -78,18 +112,24 @@ class DefaultSchedulingPolicy:
             num_gpus: GPUs requested per task, fractional allowed.
             n_tasks: The desired worker fan-out before GPU clamping.
             gpu_count: GPU devices the cluster/host reports.
+            accelerator_type: The fleet's device model, used to price the power budget.
+                `None` or an unrecognized model skips the power clamp rather than guessing
+                a draw, so an unknown fleet is granted exactly what inventory allows.
 
         Returns:
-            A `SchedulingEnvelope` whose GPU grant is feasible against the inventory.
+            A `SchedulingEnvelope` whose GPU grant is feasible against the inventory and,
+            where one is configured, against the power budget.
         """
         if num_gpus <= 0 or gpu_count <= 0:
             # No GPU visible (or none asked for): grant none. Asking for a GPU the
             # cluster does not have makes the task permanently unschedulable.
             return SchedulingEnvelope(num_gpus=0.0, n_tasks=max(1, n_tasks))
-        concurrent = max(1, int(gpu_count / num_gpus))
+        devices = min(gpu_count, _devices_within_power_budget(accelerator_type, gpu_count))
+        concurrent = max(1, int(devices / num_gpus))
         return SchedulingEnvelope(
             num_gpus=num_gpus,
             n_tasks=max(1, min(n_tasks, concurrent)),
+            accelerator_type=accelerator_type,
         )
 
     def envelope(

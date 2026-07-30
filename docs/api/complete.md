@@ -419,6 +419,15 @@ for what each one does and when to change it.
 .. autoclass:: batcher.MetadataConfig
    :members:
 
+.. autoclass:: batcher.config.AcceleratorConfig
+   :members:
+
+.. autoclass:: batcher.config.EnergyConfig
+   :members:
+
+.. autoclass:: batcher.config.DeviceHealthConfig
+   :members:
+
 .. autoclass:: batcher.GovernanceConfig
    :members:
 
