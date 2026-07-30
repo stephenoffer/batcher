@@ -10,11 +10,14 @@ correct as it grows multiple execution tiers and scales from one core to a clust
                     ┌→ bc-ir → bc-runtime ┐
 bc-arrow → bc-expr →┤                     ├→ bc-interp → bc-py
                     └→ bc-codegen ────────┘
-leaves (no bc-* deps), pulled in where they are needed:
+near-leaves (nothing but `bc-arrow`, the DAG's root, below them), pulled in where needed:
   bc-sketches  → bc-runtime (agg/hll, agg/qsketch), bc-py
   bc-resource  → bc-interp, bc-py
   bc-transport → bc-py
-  bc-io        → bc-py
+  bc-io        → bc-py. Depends on `bc-arrow` for `usable_cores`: its Parquet-decode
+                  runtime must be sized by the cgroup CFS quota, not tokio's
+                  quota-blind `available_parallelism`, and the alternative was
+                  pasting the quota parse into a second crate.
   bc-secrets   → bc-expr (resolves `env:`/`file:`/`cmd:` secret references, with a
                   TTL cache). Deliberately dependency-free: it sits under bc-expr,
                   which everything links, so a cloud SDK here would put tokio + a TLS

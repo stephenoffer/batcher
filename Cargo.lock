@@ -575,6 +575,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-avro",
+ "bc-arrow",
  "bytes",
  "futures",
  "object_store",

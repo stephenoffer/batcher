@@ -93,10 +93,20 @@ pub enum IoError {
 /// parquet reader needs an executor; sharing one runtime lets concurrent split reads
 /// (one per worker thread) overlap their object-store I/O on a common thread pool
 /// instead of each spinning up its own.
+///
+/// Sized to [`bc_arrow::usable_cores`] rather than tokio's default. The default is
+/// `available_parallelism`, which honors the CPU *affinity mask* but not the cgroup CFS
+/// *bandwidth* quota — and Kubernetes' `cpu` limit is the latter. A pod limited to 15 cores
+/// on a 16-core node therefore got 16 decode workers, and exceeding the quota does not merely
+/// waste a thread: it gets the whole cgroup throttled for the rest of the CFS period, so the
+/// extra worker buys stalls for every other thread in the process. Parquet decode is
+/// CPU-bound, so this pool is exactly where that shows up.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(bc_arrow::usable_cores())
+            .thread_name("bc-io")
             .enable_all()
             .build()
             .expect("build tokio runtime")

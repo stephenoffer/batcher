@@ -42,8 +42,8 @@ MUSTs. A change that breaks one is wrong even if it compiles and your tests pass
    Arrow `RecordBatch`. Zero-copy across FFI. No bespoke row formats.
 4. **Only `bc-py` links PyO3.** Every other crate `cargo test`s without a Python interpreter.
 5. **The crate DAG points one way.** `bc-arrow → bc-expr → {bc-ir → bc-runtime, bc-codegen}
-   → bc-interp → bc-py`, with `bc-sketches`/`bc-resource`/`bc-transport`/`bc-io` as leaves
-   consumed higher up. Never an upward or sideways edge.
+   → bc-interp → bc-py`, with `bc-sketches`/`bc-resource`/`bc-transport`/`bc-io` hanging off
+   it and consumed higher up. Never an upward or sideways edge.
 6. **One `Expr`, one `RelOp`, across tiers.** The Tier-0 interpreter is the correctness
    oracle; the Cranelift JIT MUST be bit-for-bit identical on its supported subset and
    silently fall back otherwise — **never diverge**.

@@ -823,11 +823,6 @@ fn bucket_of_salted(hash: u64, num_partitions: usize, salt: u64) -> u32 {
     bucket_of(h, num_partitions)
 }
 
-/// Map a key hash to a bucket in `[0, num_partitions)` without a division: a bit
-/// mask when the count is a power of two, else Lemire's multiply-shift over the
-/// hash's high-entropy bits. Deterministic, so equal keys (and both join sides)
-/// always agree within a run.
-#[inline]
 /// Per-row bucket ids for an all-`Int64` key, hashing native values directly (no row encoding).
 /// `None` unless every key column is `Int64` (narrow ints are normalized to `Int64` upstream, so
 /// this covers the common single- and composite-integer shuffle shapes).
@@ -972,7 +967,18 @@ fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize, salt: u64) -> O
     })
 }
 
-fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
+/// Map a key hash to a bucket in `[0, num_partitions)` **without a division**: a bit mask when
+/// the count is a power of two, else Lemire's multiply-shift over the hash's high-entropy bits.
+/// Deterministic, so equal keys (and both join sides) always agree within a run.
+///
+/// The division this avoids is not a micro-optimization. A 64-bit `%` by a runtime value is a
+/// hardware divide — tens of cycles, poorly pipelined — and every caller runs it once per row,
+/// some of them twice (a histogram pass and then a scatter pass over the same rows).
+///
+/// This doc travelled with `#[inline]` above `partition_int_key` for a while, leaving that
+/// function with two stacked doc comments and this one with none; it is back where it belongs.
+#[inline]
+pub(crate) fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
     if num_partitions.is_power_of_two() {
         (hash & (num_partitions as u64 - 1)) as u32
     } else {

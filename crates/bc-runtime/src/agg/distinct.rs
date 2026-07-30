@@ -242,7 +242,14 @@ fn par_dedup_pairs(grp: &Int64Array, vals: &Int64Array, n: usize) -> (Vec<i64>, 
     // combine's radix bucketing). Cheap flat allocations, no per-(chunk,bucket) growing vectors.
     let nthreads = rayon::current_num_threads().max(1);
     let chunk = n.div_ceil(nthreads).max(1);
-    let bucket_of = |i: usize| (state.hash_one((g[i], v[i])) % parts as u64) as usize;
+    // `crate::shuffle::bucket_of`, not `% parts`: a 64-bit modulo by a runtime value is a
+    // hardware divide, and this closure runs twice per row — once to histogram, once to
+    // scatter. `parts` is the thread count, so it is a power of two only by luck. Which
+    // bucket a pair lands in is a purely internal choice (the dedup compares real keys
+    // inside each bucket), and the bucket count is already `current_num_threads()`, so
+    // nothing downstream could have depended on the old mapping either.
+    let bucket_of =
+        |i: usize| crate::shuffle::bucket_of(state.hash_one((g[i], v[i])), parts) as usize;
     let per_chunk: Vec<(Vec<u32>, Vec<u32>)> = (0..n)
         .into_par_iter()
         .step_by(chunk)

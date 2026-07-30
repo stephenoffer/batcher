@@ -120,11 +120,30 @@ pub(crate) fn eval_str(
             })?;
 
     let out: ArrayRef = match func {
-        StrFunc::Upper => Arc::new(map_str(s, |v| v.to_uppercase())),
-        StrFunc::Lower => Arc::new(map_str(s, |v| v.to_lowercase())),
+        // `to_ascii_uppercase` when the row is ASCII, which is the overwhelmingly common
+        // case and is byte-parallel; `to_uppercase` walks a Unicode case-mapping table per
+        // scalar value. The results are identical on ASCII input — no ASCII character has a
+        // non-ASCII or multi-character case mapping — so this is a pure short-circuit.
+        StrFunc::Upper => Arc::new(map_str(s, |v| {
+            if v.is_ascii() {
+                v.to_ascii_uppercase()
+            } else {
+                v.to_uppercase()
+            }
+        })),
+        StrFunc::Lower => Arc::new(map_str(s, |v| {
+            if v.is_ascii() {
+                v.to_ascii_lowercase()
+            } else {
+                v.to_lowercase()
+            }
+        })),
+        // `char_len` for the same reason: an ASCII row's character count is its byte length,
+        // and `is_ascii` reads the buffer a word at a time where `chars().count()` reads it a
+        // byte at a time looking for continuation bytes.
         StrFunc::Len => Arc::new(
             s.iter()
-                .map(|o| o.map(|v| v.chars().count() as i64))
+                .map(|o| o.map(|v| char_len(v) as i64))
                 .collect::<Int64Array>(),
         ),
         StrFunc::Contains => {
@@ -158,7 +177,12 @@ pub(crate) fn eval_str(
             if pat.is_empty() {
                 Arc::new(map_str_borrow(s, |v| v))
             } else {
-                Arc::new(map_str(s, |v| v.replace(pat, rep)))
+                // One `memmem::Finder` for the whole column. `str::replace` builds a Two-Way
+                // searcher per call, so a column-constant needle was being re-analyzed once
+                // per row — the same cost `like.rs` removed for `LIKE`, in a function that
+                // has to scan every row anyway.
+                let finder = memchr::memmem::Finder::new(pat);
+                Arc::new(map_str(s, |v| replace_all(&finder, v, pat.len(), rep)))
             }
         }
         // With a `pattern`, trim that set of characters (DuckDB `trim(s, chars)` /
@@ -224,9 +248,12 @@ pub(crate) fn eval_str(
         }
         StrFunc::Position => {
             let pat = require_pattern(pattern, func)?;
+            // As with `Replace`: the needle is constant for the column, so the searcher is
+            // built once rather than once per row inside `str::find`.
+            let finder = memchr::memmem::Finder::new(pat);
             Arc::new(
                 s.iter()
-                    .map(|o| o.map(|v| char_position(v, pat)))
+                    .map(|o| o.map(|v| char_position(&finder, v)))
                     .collect::<Int64Array>(),
             )
         }
@@ -611,7 +638,9 @@ pub(crate) fn eval_str(
         StrFunc::SubstringIndex => {
             let delim = require_pattern(pattern, func)?;
             let count = start.unwrap_or(0);
-            Arc::new(map_str(s, |v| substring_index(v, delim, count)))
+            // `map_str_borrow`, not `map_str`: the result is a slice of the input, so the
+            // builder copies the bytes once instead of into a per-row `String` first.
+            Arc::new(map_str_borrow(s, |v| substring_index(v, delim, count)))
         }
         StrFunc::Overlay => {
             let rep = replacement.ok_or_else(|| ExprError::MissingArgument {
@@ -881,20 +910,37 @@ fn is_space_separator(c: char) -> bool {
 /// `substring_index(s, delim, count)` — the part of `s` before the `count`-th
 /// occurrence of `delim`. Positive `count` counts delimiters from the left,
 /// negative from the right; `0` yields the empty string (Spark semantics).
-fn substring_index(s: &str, delim: &str, count: i64) -> String {
+/// Returns a borrowed slice of `s`, not a fresh `String`: the answer is always a prefix or a
+/// suffix of the input, so the old `split().collect::<Vec<_>>()` plus `join` paid a vector
+/// allocation *and* a string allocation per row to rebuild bytes it already had.
+fn substring_index<'a>(s: &'a str, delim: &str, count: i64) -> &'a str {
     if count == 0 || delim.is_empty() {
-        return String::new();
+        return "";
     }
-    let parts: Vec<&str> = s.split(delim).collect();
-    let n = parts.len();
     if count > 0 {
-        // `count as usize` is safe (count > 0); clamp to the number of parts. The old
-        // `-count` overflowed for `count == i64::MIN`, panicking on the slice index.
-        let take = (count as usize).min(n);
-        parts[..take].join(delim)
+        // The prefix before the `count`-th delimiter. Fewer than `count` delimiters means
+        // every part is taken, which is the whole string — the same clamp the `Vec` form did.
+        // `count as usize` is safe (count > 0); the old `-count` overflowed at `i64::MIN`.
+        match s.match_indices(delim).nth(count as usize - 1) {
+            Some((pos, _)) => &s[..pos],
+            None => s,
+        }
     } else {
-        let take = (count.unsigned_abs() as usize).min(n);
-        parts[n - take..].join(delim)
+        // Counting from the right must still use the *left-to-right* match set. `rmatch_indices`
+        // is not its mirror image when the delimiter can overlap itself: `"---"` matches `"--"`
+        // at index 0 going forwards and at index 1 going backwards, so a right-to-left walk
+        // would split this string at a position `split` never chooses, and the result would
+        // disagree with the `Vec` form on exactly the inputs nobody tests. Two forward passes,
+        // still no allocation.
+        let parts = s.match_indices(delim).count() + 1;
+        let skip = parts.saturating_sub(count.unsigned_abs() as usize);
+        if skip == 0 {
+            return s;
+        }
+        match s.match_indices(delim).nth(skip - 1) {
+            Some((pos, _)) => &s[pos + delim.len()..],
+            None => s,
+        }
     }
 }
 
@@ -916,14 +962,25 @@ fn split_part<'a>(s: &'a str, delim: &str, n: i64) -> &'a str {
         let hi = s.char_indices().nth(idx + 1).map_or(s.len(), |(b, _)| b);
         return &s[lo..hi];
     }
-    let parts: Vec<&str> = s.split(delim).collect();
-    let len = parts.len() as i64;
-    let idx = if n < 0 { len + n } else { n - 1 };
-    if idx < 0 || idx >= len {
-        ""
+    // `nth` walks to the field wanted and stops, where the old form collected every field
+    // into a `Vec` first — an allocation and a full scan to return one borrowed slice.
+    //
+    // A negative `n` counts fields but still splits left to right, and is deliberately *not*
+    // `rsplit`: the two disagree whenever the delimiter can overlap itself. `"---"` split on
+    // `"--"` matches at index 0 going forwards and index 1 going backwards, so `rsplit` reports
+    // a different last field than `split` does, and `split_part("---", "--", -1)` would answer
+    // `""` where the relation says `"-"`.
+    let idx = if n < 0 {
+        let fields = s.split(delim).count() as i64;
+        let i = fields + n;
+        if i < 0 {
+            return "";
+        }
+        i as usize
     } else {
-        parts[idx as usize]
-    }
+        n as usize - 1
+    };
+    s.split(delim).nth(idx).unwrap_or("")
 }
 
 /// SQL `OVERLAY` — replace `length` chars of `s` starting at 1-based `pos` with
@@ -1249,13 +1306,49 @@ fn hex_decode(v: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 1-based character position of the first occurrence of `pat` in `v`, or 0 if it
-/// does not occur (SQL `POSITION` / DuckDB `strpos`).
-fn char_position(v: &str, pat: &str) -> i64 {
-    match v.find(pat) {
-        Some(byte_idx) => v[..byte_idx].chars().count() as i64 + 1,
+/// Characters in `v` — its byte length when it is ASCII, its scalar-value count otherwise.
+///
+/// `is_ascii` compares a machine word at a time; `chars().count()` walks byte by byte looking
+/// for continuation bytes. Since an ASCII string has exactly one byte per character, the two
+/// agree on every input this short-circuits, so the fast path is a pure optimization.
+fn char_len(v: &str) -> usize {
+    if v.is_ascii() {
+        v.len()
+    } else {
+        v.chars().count()
+    }
+}
+
+/// 1-based character position of the first occurrence of `finder`'s needle in `v`, or 0 if
+/// it does not occur (SQL `POSITION` / DuckDB `strpos`).
+///
+/// The finder is passed in rather than built here because the needle is constant for a whole
+/// column: `str::find` would construct a Two-Way searcher on every row.
+fn char_position(finder: &memchr::memmem::Finder<'_>, v: &str) -> i64 {
+    match finder.find(v.as_bytes()) {
+        // A UTF-8 needle can only match at a character boundary, so the prefix is a valid
+        // `str` and its character count is the answer.
+        Some(byte_idx) => char_len(&v[..byte_idx]) as i64 + 1,
         None => 0,
     }
+}
+
+/// Replace every non-overlapping occurrence of `finder`'s needle in `v` with `rep`.
+///
+/// Equivalent to `v.replace(needle, rep)` for a non-empty needle, but reuses one prebuilt
+/// searcher across the column instead of constructing one per row. `find_iter` yields
+/// non-overlapping matches left to right, which is exactly `str::replace`'s rule, and every
+/// match index is a character boundary because both haystack and needle are valid UTF-8.
+fn replace_all(finder: &memchr::memmem::Finder<'_>, v: &str, pat_len: usize, rep: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut last = 0usize;
+    for pos in finder.find_iter(v.as_bytes()) {
+        out.push_str(&v[last..pos]);
+        out.push_str(rep);
+        last = pos + pat_len;
+    }
+    out.push_str(&v[last..]);
+    out
 }
 
 /// The largest byte length a single Arrow `Utf8` value can hold: its offsets are
@@ -2160,7 +2253,7 @@ mod tests {
         assert_eq!(val(StrFunc::RTrim, 2), "\tx\t");
     }
 
-    use super::{overlay, split_part, substring_index};
+    use super::{char_len, char_position, overlay, replace_all, split_part, substring_index};
 
     /// `right(s, n)` with a negative `n` drops the first `|n|` characters (DuckDB),
     /// where the old `.max(0)` collapsed it to the empty string.
@@ -2269,6 +2362,172 @@ mod tests {
         assert_eq!(substring_index("a-b-c", "-", -2), "b-c");
         assert_eq!(substring_index("a-b-c", "-", i64::MIN), "a-b-c");
         assert_eq!(substring_index("a-b-c", "-", i64::MAX), "a-b-c");
+    }
+
+    /// The slice-returning `substring_index` must equal the `split`/`join` form it replaced.
+    ///
+    /// Written as a differential against a literal transcription of the old body rather than
+    /// as hand-written expectations: the rewrite exists to avoid two allocations per row, and
+    /// the only thing worth asserting is that it changed nothing else.
+    #[test]
+    fn substring_index_matches_the_split_and_join_reference() {
+        fn reference(s: &str, delim: &str, count: i64) -> String {
+            if count == 0 || delim.is_empty() {
+                return String::new();
+            }
+            let parts: Vec<&str> = s.split(delim).collect();
+            let n = parts.len();
+            if count > 0 {
+                parts[..(count as usize).min(n)].join(delim)
+            } else {
+                let take = (count.unsigned_abs() as usize).min(n);
+                parts[n - take..].join(delim)
+            }
+        }
+        // `---`/`aaa`/`aaaa` are the cases that matter: a delimiter that can overlap itself
+        // matches at different indices scanning forwards and backwards, so a right-to-left
+        // implementation of the negative-count branch diverges here and nowhere else.
+        let cases = [
+            "a-b-c",
+            "",
+            "-",
+            "--",
+            "---",
+            "----",
+            "a",
+            "-a-",
+            "a--b",
+            "aaa",
+            "aaaa",
+            "中-文-x",
+            "aXXbXXc",
+            "no-delimiter-here",
+        ];
+        for s in cases {
+            for delim in ["-", "--", "aa", "XX", "", "z"] {
+                for count in [-4i64, -3, -2, -1, 0, 1, 2, 3, 9] {
+                    assert_eq!(
+                        substring_index(s, delim, count),
+                        reference(s, delim, count),
+                        "substring_index({s:?}, {delim:?}, {count})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `nth`-based `split_part` must equal the `collect`-into-`Vec` form it replaced.
+    #[test]
+    fn split_part_matches_the_collect_reference() {
+        fn reference<'a>(s: &'a str, delim: &str, n: i64) -> &'a str {
+            if n == 0 || delim.is_empty() {
+                return "";
+            }
+            let parts: Vec<&str> = s.split(delim).collect();
+            let len = parts.len() as i64;
+            let idx = if n < 0 { len + n } else { n - 1 };
+            if idx < 0 || idx >= len {
+                ""
+            } else {
+                parts[idx as usize]
+            }
+        }
+        // Same self-overlapping cases as `substring_index`, for the same reason: `rsplit`
+        // disagrees with `split` about the last field of `"---"` split on `"--"`.
+        for s in [
+            "a-b-c",
+            "",
+            "-",
+            "--",
+            "---",
+            "----",
+            "a",
+            "-a-",
+            "a--b",
+            "aaa",
+            "aaaa",
+            "中-文-x",
+            "aXXb",
+        ] {
+            for delim in ["-", "--", "aa", "XX", "z"] {
+                for n in [-5i64, -4, -3, -2, -1, 1, 2, 3, 4, 9] {
+                    assert_eq!(
+                        split_part(s, delim, n),
+                        reference(s, delim, n),
+                        "split_part({s:?}, {delim:?}, {n})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The prebuilt-finder `replace_all` must equal `str::replace` exactly, including the
+    /// cases where a naive scan diverges: an overlapping needle (`aa` in `aaaa` replaces
+    /// twice, not three times), an empty replacement, and a multi-byte needle.
+    #[test]
+    fn replace_all_matches_str_replace() {
+        let cases = [
+            ("aaaa", "aa", "b"),
+            ("aaa", "aa", "b"),
+            ("banana", "ana", "X"),
+            ("hello", "l", ""),
+            ("hello", "hello", "hi"),
+            ("", "x", "y"),
+            ("no match", "zzz", "q"),
+            ("中文中文", "中", "*"),
+            ("中文中文", "文中", "-"),
+            ("abc", "c", "cc"),
+        ];
+        for (hay, needle, rep) in cases {
+            let finder = memchr::memmem::Finder::new(needle);
+            assert_eq!(
+                replace_all(&finder, hay, needle.len(), rep),
+                hay.replace(needle, rep),
+                "replace_all({hay:?}, {needle:?}, {rep:?})"
+            );
+        }
+    }
+
+    /// The ASCII short-circuits must agree with the Unicode paths they skip.
+    #[test]
+    fn ascii_fast_paths_agree_with_the_unicode_ones() {
+        for v in [
+            "",
+            "hello",
+            "HELLO",
+            "MiXeD 123!",
+            "中文",
+            "straße",
+            "ÅNGSTRÖM",
+            "a中B",
+        ] {
+            assert_eq!(char_len(v), v.chars().count(), "char_len({v:?})");
+            // The dispatch in `eval_str` short-circuits only on ASCII, so that is the only
+            // input where the two must agree — but they must agree exactly there.
+            if v.is_ascii() {
+                assert_eq!(v.to_ascii_uppercase(), v.to_uppercase());
+                assert_eq!(v.to_ascii_lowercase(), v.to_lowercase());
+            }
+        }
+    }
+
+    /// `char_position` counts characters, not bytes, past a multi-byte prefix.
+    #[test]
+    fn char_position_counts_characters_past_a_multibyte_prefix() {
+        let cases = [
+            ("中文abc", "abc", 3),
+            ("abc", "a", 1),
+            ("abc", "z", 0),
+            ("中", "中", 1),
+        ];
+        for (hay, needle, want) in cases {
+            let finder = memchr::memmem::Finder::new(needle);
+            assert_eq!(
+                char_position(&finder, hay),
+                want,
+                "position({hay:?}, {needle:?})"
+            );
+        }
     }
 
     /// `overlay` at the i64 extremes clamps instead of overflowing (`pos - 1` and

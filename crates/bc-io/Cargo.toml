@@ -7,6 +7,12 @@ license.workspace = true
 
 [dependencies]
 arrow.workspace = true
+# The base of the crate DAG, for `usable_cores` — the one place that reads the cgroup CFS
+# quota as well as the affinity mask. Sizing this crate's decode runtime from tokio's default
+# (`available_parallelism`, quota-blind) oversubscribes a CPU-limited pod and gets the whole
+# cgroup throttled. A downward edge onto the DAG's root, and the alternative would be pasting
+# the quota parse into a second crate.
+bc-arrow.workspace = true
 # Native Parquet decode. `async` + `object_store` give the streaming reader that
 # fetches column chunks concurrently straight from object storage (the throughput
 # win over a per-chunk pyarrow read). Pinned to 56 to match arrow 56 so the
