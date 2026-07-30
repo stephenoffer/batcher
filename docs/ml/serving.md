@@ -125,6 +125,41 @@ scored = scored.with_columns(
 )
 ```
 
+`arg_sort` gives you positions, and `.list.gather(...)` is what spends them. Together they
+turn a score vector and a candidate list into a ranked selection without a per-row loop, which
+is the shape of a reranking stage:
+
+```python
+import batcher as bt
+
+candidates = bt.from_pydict(
+    {"docs": [["low", "high", "mid"]], "scores": [[0.1, 0.9, 0.5]]}
+)
+best_first = bt.col("scores").list.arg_sort().list.reverse()
+print(candidates.select(top2=bt.col("docs").list.gather(best_first.list.head(2))).to_pydict())
+# {'top2': [['high', 'mid']]}
+```
+
+A cutoff wider than the candidate list is fine — the extra positions come back as nulls rather
+than an error, because a fixed `k` against a short candidate set is ordinary.
+
+Two more read the scores rather than reorder them. `.list.log_softmax()` is the log-domain
+distribution, and it is not the same as taking the log of `softmax`: a probability small enough
+to underflow to zero there becomes `-inf`, while the log form stays finite. That is the whole
+reason a scoring pipeline carries log-probabilities.
+
+`.list.entropy()` reduces a row to its uncertainty in nats — zero when the model put all its
+mass on one class, `ln n` when it spread evenly over `n`. It is the routing signal for a
+cascade: answer the confident rows from the small model and send the rest somewhere more
+expensive.
+
+```python
+preds = bt.from_pydict({"id": [1, 2], "prob": [[0.99, 0.01], [0.5, 0.5]]})
+unsure = preds.filter(bt.col("prob").list.entropy() > bt.lit(0.5))
+print(unsure.select("id").to_pydict())
+# {'id': [2]}
+```
+
 ## Batching
 
 The batch the server sees is the morsel the pipeline hands the UDF. Set `batch_size`

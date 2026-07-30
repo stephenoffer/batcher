@@ -34,6 +34,11 @@ pub(crate) fn eval_list_set(
     if matches!(op, ListSetOp::Concat) {
         return eval_list_concat(l, r);
     }
+    // Not a set operation either: `gather` reads the right list as positions into the left,
+    // so it never reaches the element-identity machinery below.
+    if matches!(op, ListSetOp::Gather) {
+        return crate::eval::list_ops::eval_list_gather(l, r);
+    }
     // Promote both children to a common numeric type when they differ (e.g.
     // `List<Int64>` ∩ `List<Float64>`) so `concat` and the comparison see one type.
     // Without this, mismatched-width numeric lists errored in `concat` where DuckDB
@@ -86,6 +91,7 @@ pub(crate) fn eval_list_set(
                 // Handled by `eval_list_concat` above; this arm is unreachable and is
                 // spelled out rather than wildcarded so a new op cannot slip through.
                 ListSetOp::Concat => unreachable!("concat takes its own path"),
+                ListSetOp::Gather => unreachable!("gather takes its own path"),
             };
             if keep_it && seen.insert(owned) {
                 keep.push(k as u32);

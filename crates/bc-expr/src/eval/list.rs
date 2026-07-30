@@ -567,6 +567,8 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     match func {
         ListFunc::Normalize => return crate::eval::list_ops::list_reduce::normalize(list),
         ListFunc::Softmax => return crate::eval::list_ops::list_reduce::softmax(list),
+        ListFunc::LogSoftmax => return crate::eval::list_ops::list_reduce::log_softmax(list),
+        ListFunc::Entropy => return crate::eval::list_ops::list_reduce::entropy(list),
         ListFunc::ArgSort => return crate::eval::list_ops::list_reduce::arg_sort(list),
         ListFunc::CumSum => return crate::eval::list_ops::list_reduce::cum_sum(list),
         ListFunc::Diff => return crate::eval::list_ops::list_reduce::diff(list),

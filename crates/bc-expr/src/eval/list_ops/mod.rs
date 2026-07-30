@@ -6,6 +6,7 @@
 //! keep `eval/` within its file-count limit.
 
 pub(crate) mod coerce;
+pub(crate) mod gather;
 pub(crate) mod jaccard_str;
 pub(crate) mod list_hof;
 pub(crate) mod list_reduce;
@@ -16,6 +17,7 @@ pub(crate) mod multiset;
 pub(crate) mod simhash;
 
 pub(crate) use coerce::{accumulate_pair, as_var_list};
+pub(crate) use gather::eval_list_gather;
 pub(crate) use list_hof::{eval_list_filter, eval_list_transform};
 pub(crate) use list_reshape::eval_flatten;
 pub(crate) use list_set::eval_list_set;

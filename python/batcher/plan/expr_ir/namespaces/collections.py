@@ -752,6 +752,38 @@ class _ListNamespace:
         """
         return ListSet("array_concat", self._e, _wrap(other))
 
+    def gather(self, indices: Any) -> ListSet:
+        """Take each row's elements at the positions `indices` names (→ list).
+
+        The operation that makes :meth:`arg_sort` usable. `arg_sort` hands back the positions
+        that put a row's scores in order; without a way to spend them the reranking has to
+        leave the engine and happen a row at a time in Python. Together they are a rerank in
+        two expressions: sort the scores, reverse for descending, `head(k)` for the cutoff,
+        then gather the candidates with the result.
+
+        A negative index counts from the end, as :meth:`get` does. An index outside the row
+        yields a null element rather than an error, because a `head(k)` wider than the row is
+        an ordinary thing to write. A null row on either side gives a null row.
+
+        Args:
+            indices: A list-of-integer column giving the positions to take, per row.
+
+        Returns:
+            A new list expression holding the gathered elements, in the order given.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"docs": [["low", "high", "mid"]], "scores": [[0.1, 0.9, 0.5]]}
+                ... )
+                >>> ranked = bt.col("scores").list.arg_sort().list.reverse()
+                >>> ds.select(top2=bt.col("docs").list.gather(ranked.list.head(2))).to_pydict()
+                {'top2': [['high', 'mid']]}
+        """
+        return ListSet("array_gather", self._e, _wrap(indices))
+
     def has_all(self, other: Any) -> Expr:
         """Whether every element of ``other`` is present in this list (→ Boolean).
 
@@ -1580,6 +1612,8 @@ _LIST_FUNCS = {
     "max_abs": "max_abs",  # max absolute value = the MaxAbs-scaling divisor (-> Float64)
     "normalize": "normalize",  # L2-normalize to unit length (→ list); embedding prep
     "softmax": "softmax",  # logits → probability distribution per row (→ list)
+    "log_softmax": "log_softmax",  # logits → log-domain distribution (→ list); no underflow
+    "entropy": "entropy",  # per-row Shannon entropy in nats (→ Float64); uncertainty
     "cum_sum": "cum_sum",  # cumulative sum per row (→ list)
     "diff": "diff",  # first difference xᵢ−xᵢ₋₁ per row, leading null (→ list)
 }

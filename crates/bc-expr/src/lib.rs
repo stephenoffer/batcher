@@ -553,6 +553,15 @@ pub enum ListSetOp {
     /// NULL).
     #[serde(rename = "array_concat")]
     Concat,
+    /// `array_gather(values, indices)` — each row's elements at the positions its `indices`
+    /// row names. Like `Concat` it rides this family for its shape (two lists in, one list
+    /// out) rather than because it is a set operation. It is what makes `arg_sort` usable:
+    /// the indices that rank a score vector are spent by gathering the candidates with them,
+    /// so a rerank stays in the engine. A negative index counts from the end (as `list.get`
+    /// does) and an out-of-range one yields a null element rather than an error, because a
+    /// `head(k)` wider than the row is ordinary. A null row on either side → null row.
+    #[serde(rename = "array_gather")]
+    Gather,
 }
 
 /// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
@@ -674,6 +683,20 @@ pub enum ListFunc {
     /// `flatten`; Polars `list.explode`-free flatten). Null inner lists are skipped;
     /// a null outer row stays null. Element type `T` is preserved.
     Flatten,
+    /// `log_softmax(x)` — `xᵢ − max − ln Σ exp(xⱼ − max)` → `List<Float64>`. The log-domain
+    /// sibling of `Softmax`, and not the same as taking its log: a probability that underflows
+    /// to 0 in the linear form becomes `-inf` there, while here it stays a large negative
+    /// finite number. That is the reason scoring and training pipelines carry
+    /// log-probabilities, so the conversion has to happen in the log domain to be worth
+    /// anything. Per-element nulls are preserved; a null/empty row stays null/empty.
+    LogSoftmax,
+    /// Shannon entropy of each row read as a distribution, in **nats**: `−Σ pᵢ ln pᵢ` after
+    /// normalizing the row by its own sum → Float64. Works on a probability vector, a count
+    /// vector, or unnormalized weights alike. 0 when all the mass is on one outcome, `ln n`
+    /// when spread evenly over `n` — the per-row uncertainty of a classifier's output, a
+    /// retrieval score distribution, or an attention row. A non-positive element is skipped
+    /// (`p ln p` is undefined there); a row totalling zero has no distribution and yields null.
+    Entropy,
     /// First difference over each row's list → `List<Float64>` of the **same length**:
     /// element `i` is `xᵢ − xᵢ₋₁`, with element 0 null (no predecessor). If either
     /// neighbor is null the difference is null (Polars `list.diff`). The delta-feature

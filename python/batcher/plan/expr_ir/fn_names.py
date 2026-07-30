@@ -81,6 +81,9 @@ class ListSetFn(StrEnum):
     # `array_concat` rides this family because its shape is the same (two lists in, one
     # list out), but it is not a set operation: it appends without deduplicating.
     ARRAY_CONCAT = "array_concat"
+    # `array_gather` rides this family for the same reason: two lists in, one list out. It
+    # reads the right list as *positions* into the left, which is what makes `arg_sort` usable.
+    ARRAY_GATHER = "array_gather"
 
 
 class ListZipFn(StrEnum):
@@ -162,7 +165,8 @@ of whether it counts seconds or nanoseconds, so the plan has to say."""
 
 LIST_FNS: Final[frozenset[str]] = frozenset(
     {
-        "arg_max", "arg_min", "arg_sort", "cum_sum", "diff", "flatten", "l1_norm", "l2_norm", "len",
+        "arg_max", "arg_min", "arg_sort", "cum_sum", "diff", "entropy", "flatten", "l1_norm",
+        "l2_norm", "len", "log_softmax",
         "max", "max_abs", "mean", "median", "min", "n_unique", "normalize", "product",
         "reverse", "softmax", "sort", "std", "sum", "unique", "var",
     }
