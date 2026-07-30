@@ -169,7 +169,7 @@ def test_the_gpu_kernel_is_bracketed_so_a_stage_is_actually_recorded(monkeypatch
     assert out is result
     assert len(ledger.stages) == 1
     record = ledger.stages[0]
-    assert record.stage.startswith("GpuGroupBy#")
+    assert record.stage == "GpuGroupBy", "a stable label: the kernel runs once per morsel"
     assert record.accelerator_type == "NVIDIA_H100"
     assert record.rows == 2
     assert record.joules > 0

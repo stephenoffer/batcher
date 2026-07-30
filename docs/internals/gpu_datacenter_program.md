@@ -135,6 +135,34 @@ they are held to instead is documented, rendered by Sphinx, and taught with an e
 example. `plan_collective`, `residency_report`, and `merge_ledgers` meet that bar too, but
 their *scheduler-side* call sites are not wired — see the register below.
 
+## A second audit, and the two defects it found
+
+Asking "does this actually execute?" rather than "does it pass?" found two more, both worse
+than anything the gates catch.
+
+**The clamps were on dead code.** `DefaultSchedulingPolicy.gpu_envelope` carried the
+inventory, power, and health ceilings for several commits and had *no production caller* —
+tests only. The live path, `api.executors._map_scheduling_envelope`, sized a GPU stage's
+fan-out from the **CPU** count and consulted none of them. So a stage on a four-GPU cluster
+asked for one actor per core, and the surplus sat pending on a GPU request the cluster could
+not satisfy, which is the shape that looks like a hang. The conductor now derives `n_tasks`
+through `gpu_envelope`, and `tests/unit/test_gpu_envelope_wiring.py` drives the *conductor's*
+function rather than the policy directly — the only way that class of defect is visible.
+
+**And a regression this work introduced.** Folding the device count and the binding VRAM into
+one topology read looked like an obvious saving. It routed around `cluster_gpu_memory_gb`,
+whose entire job is to report the *smallest* device in the fleet, so the packing fraction came
+from the driver's device instead — packing four actors onto a 16 GB worker sized against an
+80 GB one. An existing test caught it. The saving was not even real: topology reads inside a
+scheduling phase are already served from a snapshot. Both reads are back, with a comment
+saying why they must stay separate.
+
+Two smaller corrections from the same pass. The MIG packing fraction now refuses a device
+*label* that disagrees with the memory the fleet reports, because a seventh of an H100 handed
+to a device that is not one under-allocates silently. And the transfer veto steps aside once a
+fleet has measured its own GPU/CPU crossover: a veto is a *removal*, so a model carrying a
+CPU-bandwidth constant must not disable a path that this hardware had been winning with.
+
 ## What this program did **not** do
 
 Named explicitly, because the absence of each is a real limit and not an oversight:

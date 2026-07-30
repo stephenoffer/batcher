@@ -170,13 +170,65 @@ class EnergyLedger:
             out[s.accelerator_type] = out.get(s.accelerator_type, 0.0) + s.joules
         return out
 
+    def by_stage(self) -> list[StageEnergy]:
+        """One record per stage name, with repeats rolled up, in first-seen order.
+
+        A kernel that runs once per morsel appends a record per call, which is right for
+        accounting and useless for reading: the report wants the stage, not its invocations.
+        Durations and energy sum; utilization is averaged *weighted by duration*, because a
+        plain mean would let a thousand idle microseconds outvote a second of real work.
+        """
+        order: list[str] = []
+        acc: dict[str, dict] = {}
+        for s in self.stages:
+            if s.stage not in acc:
+                order.append(s.stage)
+                acc[s.stage] = {
+                    "device": s.accelerator_type,
+                    "devices": s.device_count,
+                    "seconds": 0.0,
+                    "util_seconds": 0.0,
+                    "joules": 0.0,
+                    "rows": 0,
+                    "tokens": 0,
+                    "measured": True,
+                }
+            entry = acc[s.stage]
+            entry["seconds"] += s.seconds
+            entry["util_seconds"] += s.utilization * s.seconds
+            entry["joules"] += s.joules
+            entry["rows"] += s.rows
+            entry["tokens"] += s.tokens
+            entry["devices"] = max(entry["devices"], s.device_count)
+            entry["measured"] = entry["measured"] and s.measured
+        out: list[StageEnergy] = []
+        for name in order:
+            e = acc[name]
+            seconds = e["seconds"]
+            out.append(
+                StageEnergy(
+                    stage=name,
+                    accelerator_type=e["device"],
+                    device_count=e["devices"],
+                    seconds=seconds,
+                    utilization=(e["util_seconds"] / seconds) if seconds > 0 else 0.0,
+                    joules=e["joules"],
+                    rows=e["rows"],
+                    tokens=e["tokens"],
+                    measured=e["measured"],
+                )
+            )
+        return out
+
     def hottest_stage(self) -> StageEnergy | None:
         """The single stage that drew the most energy, or `None` for an empty ledger.
 
         Where to look first: energy in a pipeline is almost always concentrated, so the
-        largest consumer is nearly always the only one worth optimizing.
+        largest consumer is nearly always the only one worth optimizing. Rolled up by stage,
+        so a kernel that runs a thousand times is compared as one stage rather than as a
+        thousand small ones that each lose to a single large stage.
         """
-        return max(self.stages, key=lambda s: s.joules, default=None)
+        return max(self.by_stage(), key=lambda s: s.joules, default=None)
 
     def tokens_per_joule(self) -> float | None:
         """Whole-run generative efficiency, or `None` when no tokens or no energy were recorded."""

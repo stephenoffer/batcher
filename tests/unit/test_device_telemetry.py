@@ -62,6 +62,18 @@ def _fake_pynvml(*, devices: int = 2, refuse: frozenset[str] = frozenset()) -> t
     return mod
 
 
+def _modern_pynvml() -> types.ModuleType:
+    """A `pynvml` from the 12.x line, where the throttle API is spelled `...EventReasons`."""
+    mod = _fake_pynvml()
+    del mod.nvmlDeviceGetCurrentClocksThrottleReasons
+    del mod.nvmlClocksThrottleReasonSwPowerCap
+    del mod.nvmlClocksThrottleReasonHwThermalSlowdown
+    mod.nvmlClocksEventReasonSwPowerCap = 0x4
+    mod.nvmlClocksEventReasonHwThermalSlowdown = 0x40
+    mod.nvmlDeviceGetCurrentClocksEventReasons = lambda h: 0x4 if h == 0 else 0
+    return mod
+
+
 @pytest.fixture
 def driver(monkeypatch):
     """Install a fake driver and clear the memoized handshake around the test."""
@@ -148,3 +160,69 @@ def test_handshake_is_memoized_but_readings_are_not(driver) -> None:
     nvml.device_telemetry()
     nvml.device_telemetry()
     assert len(calls) == 4, "a cached utilization reading would be worse than none"
+
+
+def test_the_renamed_throttle_api_is_still_read(monkeypatch) -> None:
+    # NVML renamed this call in the 12.x line. A build carrying only the new name would
+    # otherwise report a permanently unthrottled fleet — a silent loss of the one signal that
+    # explains a device running at a third of its rate.
+    monkeypatch.setitem(sys.modules, "pynvml", _modern_pynvml())
+    nvml.reset_nvml_probe()
+    try:
+        throttled = nvml.throttled_devices()
+        assert [d.index for d in throttled] == [0]
+        assert throttled[0].throttle_reasons == ("power",)
+    finally:
+        nvml.reset_nvml_probe()
+
+
+def test_a_driver_with_neither_spelling_reports_no_clamp(monkeypatch) -> None:
+    mod = _fake_pynvml()
+    del mod.nvmlDeviceGetCurrentClocksThrottleReasons
+    monkeypatch.setitem(sys.modules, "pynvml", mod)
+    nvml.reset_nvml_probe()
+    try:
+        assert nvml.throttled_devices() == (), "unknown API, no clamp claimed"
+        assert len(nvml.device_telemetry()) == 2, "and the rest of the record still answers"
+    finally:
+        nvml.reset_nvml_probe()
+
+
+def test_a_torn_down_library_is_re_initialized_rather_than_lost(monkeypatch) -> None:
+    # `accelerators.gpu_inventory` is a second NVML user in this process, and it calls
+    # `nvmlShutdown` in a finally. Any ordering that drops the reference count to zero would
+    # otherwise leave this module reporting "no telemetry" silently and permanently.
+    mod = _fake_pynvml()
+    state = {"up": False, "inits": 0}
+
+    def init():
+        state["up"] = True
+        state["inits"] += 1
+
+    def count():
+        if not state["up"]:
+            raise RuntimeError("NVML_ERROR_UNINITIALIZED")
+        return 2
+
+    mod.nvmlInit = init
+    mod.nvmlDeviceGetCount = count
+    monkeypatch.setitem(sys.modules, "pynvml", mod)
+    nvml.reset_nvml_probe()
+    try:
+        assert len(nvml.device_telemetry()) == 2
+        state["up"] = False  # another user shut the library down
+        assert len(nvml.device_telemetry()) == 2, "recovered by re-initializing once"
+        assert state["inits"] == 2
+    finally:
+        nvml.reset_nvml_probe()
+
+
+def test_a_genuinely_absent_library_still_reads_as_no_devices(monkeypatch) -> None:
+    mod = _fake_pynvml()
+    mod.nvmlDeviceGetCount = lambda: (_ for _ in ()).throw(RuntimeError("gone"))
+    monkeypatch.setitem(sys.modules, "pynvml", mod)
+    nvml.reset_nvml_probe()
+    try:
+        assert nvml.device_telemetry() == ()
+    finally:
+        nvml.reset_nvml_probe()

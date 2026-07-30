@@ -233,6 +233,33 @@ def _cache_scope() -> str:
     return f"t={tenant_id}|v={viewer}"
 
 
+def _gpu_device_count() -> int:
+    """Devices the cluster reports, or this host's when there is no cluster.
+
+    Deliberately *not* fused with the VRAM read below into one topology call. That fusion was
+    tried and was wrong twice over: the binding-VRAM figure has its own accessor
+    (`cluster_gpu_memory_gb`) whose semantics are "the smallest device in the fleet", and
+    routing around it packed a fraction derived from the driver's device onto a smaller
+    worker — the exact OOM that accessor exists to prevent. The cost the fusion was chasing is
+    not there either: topology reads inside a scheduling phase are served from a snapshot.
+
+    `0` means "no GPU visible", which makes the fan-out clamp a no-op rather than a refusal: a
+    stage that declared `num_gpus` on a fleet whose inventory cannot be read keeps what it
+    asked for.
+    """
+    from batcher._internal.hardware import gpu_inventory
+
+    try:
+        from batcher.dist.executors.ray_runtime.scaling import cluster_hardware_profile
+
+        profile = cluster_hardware_profile()
+        if profile is not None and profile.gpu_count > 0:
+            return profile.gpu_count
+    except Exception:  # pragma: no cover - an unreadable cluster falls back to this host
+        pass
+    return len(gpu_inventory())
+
+
 def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     """Build a GPU- and memory-aware `SchedulingEnvelope` for a `map_batches` pipeline.
 
@@ -324,6 +351,22 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     )
 
     n_tasks = num_workers or (cfg.execution.parallelism or available_cpu_count())
+    # A GPU stage's fan-out is bounded by devices, not by cores. Asking for one actor per CPU
+    # on an eight-GPU cluster leaves most of them holding a GPU request the cluster cannot
+    # satisfy — pending, not failing, which is the shape that looks like a hang. Carbonite
+    # owns that clamp (it protects), and applies three ceilings at once: the devices that
+    # exist, the devices the power budget can run, and the devices that are healthy enough to
+    # schedule on. Only the first is on by default, so an unbudgeted fleet with health checking
+    # off gets exactly the inventory clamp and nothing else.
+    if num_gpus > 0:
+        from batcher.carbonite.policies.scheduling import DefaultSchedulingPolicy
+
+        n_tasks = DefaultSchedulingPolicy.gpu_envelope(
+            num_gpus=num_gpus,
+            n_tasks=n_tasks,
+            gpu_count=_gpu_device_count(),
+            accelerator_type=accelerator_type,
+        ).n_tasks
     # A CPU-only map stage (no GPU) is usually IO/decode-bound preprocessing — request
     # a fractional CPU so more actors pack per node, mirroring the GPU-fraction packing
     # above. A GPU stage keeps a full CPU (the GPU is the binding resource there).

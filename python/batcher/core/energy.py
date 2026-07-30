@@ -24,7 +24,7 @@ import contextlib
 import contextvars
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from batcher.plan.energy import EnergyLedger, StageEnergy
 
@@ -56,6 +56,11 @@ def energy_scope(ledger: EnergyLedger | None = None) -> Iterator[EnergyLedger]:
 
     A scope opened inside another folds into it when it closes, so bracketing a sub-pipeline
     does not hide its stages from the outer run's total.
+
+    The scope is a `ContextVar`, which bounds what it can see: a stage running in a thread the
+    block did not start, or in a Ray worker, has its own (empty) context and records nothing
+    here. That is why a distributed run's energy has to be folded from the workers' own
+    ledgers rather than collected by the driver holding a scope open.
 
     Args:
         ledger: An existing ledger to append to, or `None` for a fresh one.
@@ -97,7 +102,6 @@ class StageMeter:
     device_count: int = 0
     rows: int = 0
     tokens: int = 0
-    _started: float = field(default_factory=time.perf_counter, repr=False)
 
     def add_rows(self, count: int) -> None:
         """Add to the rows this stage has emitted.

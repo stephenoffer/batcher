@@ -63,8 +63,9 @@ def format_energy_report(ledger: EnergyLedger, grid: GridProfile | None = None) 
     if not ledger.stages:
         return "energy: nothing recorded (no accelerator stage ran, or accounting is off)"
 
+    stages = ledger.by_stage()
     rows = ["stage                     device            energy    util   idle    work/J"]
-    for stage in ledger.stages:
+    for stage in stages:
         per_joule = stage.tokens_per_joule or stage.rows_per_joule
         work = f"{per_joule:,.1f}" if per_joule is not None else "-"
         idle = stage.idle_joules / stage.joules if stage.joules > 0 else 0.0
@@ -77,7 +78,7 @@ def format_energy_report(ledger: EnergyLedger, grid: GridProfile | None = None) 
     rows.append("")
     measured = ledger.measured_joules / total if total > 0 else 0.0
     basis = "measured" if measured >= 0.999 else f"{measured:.0%} measured, rest modelled"
-    rows.append(f"total {_si(total)} across {len(ledger.stages)} stage(s) ({basis})")
+    rows.append(f"total {_si(total)} across {len(stages)} stage(s) ({basis})")
     if total > 0:
         idle_share = f"{ledger.idle_fraction():.0%}"
         rows.append(f"idle  {_si(ledger.total_idle_joules)} ({idle_share} of total)")
@@ -94,8 +95,8 @@ def format_energy_report(ledger: EnergyLedger, grid: GridProfile | None = None) 
                 f"carbon {grid.carbon_grams(total):,.1f} g CO2e "
                 f"at {grid.gco2e_per_kwh:g} g/kWh, PUE {grid.pue:g}"
             )
-    hottest = ledger.hottest_stage()
-    if hottest is not None and len(ledger.stages) > 1:
+    hottest = max(stages, key=lambda s: s.joules, default=None)
+    if hottest is not None and len(stages) > 1:
         share = hottest.joules / total if total > 0 else 0.0
         rows.append(f"hottest {hottest.stage} at {share:.0%} of the run's energy")
     return "\n".join(rows)
@@ -152,6 +153,7 @@ def format_device_table(readings: Sequence[DeviceTelemetry] | None = None) -> st
         readings = device_telemetry()
     if not readings:
         return "devices: no telemetry (NVML unavailable on this host)"
+    faults, links = _device_conditions()
     rows = ["gpu  name                        power      sm    memory        temp  state"]
     for d in readings:
         power = f"{d.power_watts:.0f}/{d.power_limit_watts:.0f} W" if d.power_watts else "-"
@@ -159,14 +161,52 @@ def format_device_table(readings: Sequence[DeviceTelemetry] | None = None) -> st
             memory = f"{d.memory_used_bytes >> 30}/{d.memory_total_bytes >> 30} GiB"
         else:
             memory = "-"
-        state = ",".join(d.throttle_reasons) if d.throttled else "ok"
-        if d.ecc_uncorrected:
-            state = f"ecc:{d.ecc_uncorrected}"
         rows.append(
             f"{d.index:<3}  {d.name[:26]:<26}  {power:>10}  {d.sm_utilization:>4.0%}  "
-            f"{memory:>12}  {d.temperature_c:>4.0f}C  {state}"
+            f"{memory:>12}  {d.temperature_c:>4.0f}C  {_device_state(d, faults, links)}"
         )
     return "\n".join(rows)
+
+
+def _device_conditions():
+    """`(faults_by_index, links_by_index)`, both empty where nothing could be read.
+
+    Read once per table rather than per row, and never allowed to fail: this is a status
+    display, and a display that raises is worse than one missing a column.
+    """
+    try:
+        from batcher._internal.hardware.fabric import device_pcie_links
+        from batcher._internal.hardware.faults import device_faults
+
+        return (
+            {f.index: f for f in device_faults() if f.readable},
+            dict(enumerate(device_pcie_links())),
+        )
+    except Exception:  # pragma: no cover - a status table must never fail a run
+        return ({}, {})
+
+
+def _device_state(reading, faults: dict, links: dict) -> str:
+    """The `state` cell for one device: the worst condition it is in, most serious first.
+
+    Ordered by what an operator should do about it, not by severity of the underlying fault.
+    A device needing replacement outranks one returning wrong data, which outranks one merely
+    running slow — and a degraded *link* comes last precisely because it is the one that never
+    announces itself: it belongs in the table, below anything more urgent.
+    """
+    fault = faults.get(reading.index)
+    if fault is not None and fault.remap_failure:
+        return "rma:row-remap-failed"
+    if reading.ecc_uncorrected:
+        return f"ecc:{reading.ecc_uncorrected}"
+    if fault is not None and fault.needs_reset:
+        return "reset-pending"
+    if reading.throttled:
+        return ",".join(reading.throttle_reasons)
+    link = links.get(reading.index)
+    if link is not None and link.degraded:
+        return f"link:{link.degradation_ratio:.0%}"
+    return "ok"
 
 
 def format_fleet_efficiency(ledger: EnergyLedger) -> str:

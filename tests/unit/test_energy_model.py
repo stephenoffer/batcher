@@ -208,3 +208,35 @@ def test_summary_is_json_safe() -> None:
     ledger = EnergyLedger()
     ledger.record(StageEnergy("A#1", "NVIDIA_H100", 1, 1.0, 1.0, joules=700.0, rows=10, tokens=5))
     assert all(isinstance(v, float) for v in ledger.summary().values())
+
+
+def test_repeated_invocations_roll_up_into_one_stage() -> None:
+    # A GPU kernel runs once per morsel. A report with one row per call is unreadable on
+    # exactly the workload it exists for, and every one of those rows loses the "hottest
+    # stage" comparison to a single large stage that is doing less work in total.
+    ledger = EnergyLedger()
+    for _ in range(500):
+        ledger.record(StageEnergy("GpuGroupBy", "NVIDIA_H100", 1, 0.01, 0.9, joules=7.0, rows=16))
+    ledger.record(StageEnergy("Decode#1", "NVIDIA_H100", 8, 5.0, 0.4, joules=100.0, rows=10))
+    rolled = ledger.by_stage()
+    assert [s.stage for s in rolled] == ["GpuGroupBy", "Decode#1"], "first-seen order"
+    assert rolled[0].joules == pytest.approx(3500.0)
+    assert rolled[0].rows == 8000
+    assert rolled[0].seconds == pytest.approx(5.0)
+    assert ledger.hottest_stage().stage == "GpuGroupBy", "500 small calls outweigh one big one"
+    assert len(ledger.stages) == 501, "the records themselves are untouched"
+
+
+def test_rolled_up_utilization_is_weighted_by_duration() -> None:
+    # A plain mean would let a thousand idle microseconds outvote a second of real work.
+    ledger = EnergyLedger()
+    ledger.record(StageEnergy("A", "NVIDIA_H100", 1, 100.0, 1.0, joules=1.0))
+    ledger.record(StageEnergy("A", "NVIDIA_H100", 1, 0.001, 0.0, joules=1.0))
+    assert ledger.by_stage()[0].utilization == pytest.approx(1.0, abs=1e-4)
+
+
+def test_a_stage_is_modelled_if_any_of_its_calls_was() -> None:
+    ledger = EnergyLedger()
+    ledger.record(StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=True))
+    ledger.record(StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=False))
+    assert not ledger.by_stage()[0].measured, "a roll-up is only as measured as its weakest call"

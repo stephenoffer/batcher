@@ -127,3 +127,50 @@ def test_an_unrecognized_part_resolves_to_unknown_not_a_neighbour() -> None:
     assert resolve_device_name("NVIDIA") is None, "a vendor alone identifies no part"
     assert resolve_device_name("") is None
     assert resolve_device_name(None) is None
+
+
+def test_every_key_resolves_to_itself() -> None:
+    # The round trip the resolver's precomputed token table must preserve. A key that no
+    # longer resolves to itself means the precomputation and the table have drifted, and the
+    # symptom downstream is a device silently reading as unknown.
+    for name in known_device_names():
+        assert resolve_device_name(name) == name, name
+
+
+def test_every_key_resolves_from_a_driver_style_spelling() -> None:
+    # Drivers report names with spaces and hyphens where the table uses underscores.
+    for name in known_device_names():
+        spelled = name.replace("_", " ").title()
+        assert resolve_device_name(spelled) is not None, spelled
+
+
+def test_every_row_is_physically_plausible() -> None:
+    # The table is hand-entered from datasheets and nothing downstream can second-guess a
+    # figure, so these are the bounds a transposed or fat-fingered column would violate.
+    # Deliberately wide: they catch a typo, not a device that is merely unusual.
+    for name in known_device_names():
+        spec = device_spec(name)
+        assert 100 <= spec.memory_bandwidth_gbps <= 10_000, f"{name}: HBM/GDDR rate"
+        assert 4 <= spec.memory_gib <= 1024, f"{name}: device memory"
+        assert spec.tdp_watts == 0 or 50 <= spec.tdp_watts <= 1500, f"{name}: board power"
+        assert 0 <= spec.half_tflops <= 5000, f"{name}: dense half rate"
+        assert 0 <= spec.nvlink_gbps <= 5000, f"{name}: fabric bandwidth"
+
+
+def test_the_host_link_is_always_slower_than_device_memory() -> None:
+    # Physically true of every accelerator ever shipped, and the one invariant that catches a
+    # host-link figure entered in the wrong column: if a device could reach host memory as
+    # fast as its own, it would not have its own.
+    for name in known_device_names():
+        spec = device_spec(name)
+        if spec.host_link_gbps:
+            assert spec.host_link_gbps < spec.memory_bandwidth_gbps, name
+
+
+def test_the_fabric_is_always_faster_than_the_host_link() -> None:
+    # The reason a collective is worth keeping inside an NVLink domain at all. A part where
+    # this did not hold would make every placement decision in this package pointless.
+    for name in known_device_names():
+        spec = device_spec(name)
+        if spec.nvlink_gbps and spec.host_link_gbps:
+            assert spec.nvlink_gbps > spec.host_link_gbps, name

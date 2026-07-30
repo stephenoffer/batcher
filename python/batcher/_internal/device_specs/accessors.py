@@ -7,6 +7,8 @@ whatever default it already had rather than acting on a fabricated figure.
 
 from __future__ import annotations
 
+import functools
+
 from batcher._internal.device_specs.table import SPECS, DeviceSpec
 
 __all__ = [
@@ -242,6 +244,16 @@ def _model_token(key: str) -> str:
     return ""
 
 
+#: Each table key pre-split into its tokens and its part token, computed once at import. The
+#: table is constant, so recomputing this per lookup was pure waste — and it was not cheap:
+#: character-by-character splitting of 31 keys ran to ~130 us a call, on a path that runs once
+#: per device per query. This is the same table, arranged for the question it is asked.
+_KEY_TOKENS: tuple[tuple[str, tuple[str, ...], str], ...] = tuple(
+    (key, tuple(_tokens(key)), _model_token(key)) for key in SPECS
+)
+
+
+@functools.lru_cache(maxsize=256)
 def resolve_device_name(reported: str | None) -> str | None:
     """Map a driver-reported device name onto a table key, or `None` when nothing matches.
 
@@ -260,6 +272,9 @@ def resolve_device_name(reported: str | None) -> str | None:
     Args:
         reported: A device name as a driver, framework, or node label reports it.
 
+    Memoized: a device name is asked about once per device per query, and the answer cannot
+    change for a given string.
+
     Returns:
         The canonical table key, or `None` when nothing matches. `None` means unknown, and
         every accessor then reports unknown rather than a nearest guess.
@@ -273,11 +288,9 @@ def resolve_device_name(reported: str | None) -> str | None:
     if not name_tokens:
         return None
     best: tuple[int, int, str] | None = None
-    for key in SPECS:
-        part = _model_token(key)
+    for key, key_tokens, part in _KEY_TOKENS:
         if not part or not any(t.startswith(part) or part.startswith(t) for t in name_tokens):
             continue
-        key_tokens = _tokens(key)
         score = sum(1 for kt in key_tokens if any(nt.startswith(kt) for nt in name_tokens))
         if score < 2:
             continue

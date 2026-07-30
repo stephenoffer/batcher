@@ -186,3 +186,42 @@ def test_the_planned_and_recorded_energy_agree_in_magnitude() -> None:
     record = ledger.stages[0]
     planned = stage_joules(record.seconds, "NVIDIA_H100", 4, 1.0)
     assert record.joules == pytest.approx(planned)
+
+
+def test_the_device_a_stage_is_sized_for_is_the_one_it_is_pinned_to() -> None:
+    """The pin wins over the fleet's binding model, because it is the stronger statement.
+
+    A stage pinned to an L40S on a fleet whose binding model is an H100 must be packed for an
+    L40S. Sizing a fraction for a partitionable 80 GB part and running it on a 48 GB part that
+    cannot partition at all is an over-subscription nothing between the two layers would catch.
+    """
+    import batcher as bt
+    from batcher.config import active_config
+    from batcher.kyber.cardinality import StatsEstimator
+    from batcher.kyber.gpu.sizing import size_gpu_map_batches
+    from batcher.kyber.pass_base import OptimizerContext
+    from batcher.plan.resource import HardwareProfile
+
+    fleet = HardwareProfile.for_cluster(
+        cpu_cores=32,
+        memory_bytes=1 << 40,
+        worker_count=2,
+        gpu_count=8,
+        gpu_memory_bytes=48 * _GIB,
+        accelerator_type="NVIDIA_H100",
+    )
+    ds = bt.from_pydict({"x": [1, 2, 3]})
+    node = ds.ml.map_batches(lambda b: b, model_memory_gb=6.0, accelerator_type="NVIDIA_L40S")._plan
+    ctx = OptimizerContext(
+        config=active_config(),
+        sources=ds._sources,
+        hub=None,
+        estimator=StatsEstimator(ds._sources),
+        hardware=fleet,
+    )
+    sized = size_gpu_map_batches(node, ctx)
+    assert sized is not None
+    # An L40S cannot be partitioned, so the pinned stage takes the coarse quantum. Sizing
+    # against the fleet's H100 instead would have produced a seventh of a device.
+    assert sized.num_gpus != pytest.approx(1 / 7)
+    assert sized.num_gpus in (0.25, 0.5, 1.0)

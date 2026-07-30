@@ -20,6 +20,14 @@ Four things this feeds, none of which can be answered without it:
   to a CUDA allocator's own accounting, and it is the difference between a model that loads and
   one that OOMs on a shared device.
 
+**Four private helpers here are shared, not local.** `hardware/fabric/{nvlink,pcie,rdma}`
+import `_nvml`, `_read`, `_decode`, and `_device_count` from this module rather than opening
+their own NVML handle — one handshake per process, one failure policy, and one place that
+recovers from the library being torn down underneath us. They are underscore-prefixed because
+they are private to `_internal`, not because they have a single caller: renaming or narrowing
+one silently breaks the fabric probes, which fail by reporting an unlinked fleet rather than
+by raising.
+
 **Every entry point degrades to empty rather than raising.** NVML is absent on a CPU-only node,
 absent inside a container that did not mount the driver, and present-but-refusing for some
 queries on consumer parts and inside MIG instances. A telemetry source that can fail a query is
@@ -60,8 +68,11 @@ class DeviceTelemetry:
         memory_utilization: Fraction of the sample period memory was being read or written.
         memory_used_bytes: Device memory resident across every process on the device.
         memory_total_bytes: Total device memory.
-        ecc_uncorrected: Lifetime uncorrectable ECC error count; anything above zero means the
-            device has already corrupted data.
+        ecc_uncorrected: Uncorrectable ECC errors since the driver last loaded — NVML's
+            *volatile* counter, not its aggregate lifetime one. Volatile is the right signal
+            for scheduling: it clears when a device is reset or replaced, so a repaired device
+            returns to service instead of being quarantined by its own history. Anything above
+            zero means data has already been read back wrong.
         throttle_reasons: Active clock-clamping reasons (`"thermal"`, `"power"`, `"hw_slowdown"`,
             `"sw_thermal"`, `"sync_boost"`), empty when the device is running unclamped.
         graphics_clock_mhz: Current graphics clock.
@@ -103,16 +114,17 @@ class DeviceTelemetry:
         return bool(self.throttle_reasons)
 
 
-#: NVML throttle-reason bits, as `(attribute name on pynvml, reported label)`. Read by name
-#: rather than by literal value so a pynvml release that renumbers them cannot silently
-#: mislabel a reason, and an unknown name is skipped instead of raising.
+#: NVML throttle-reason bits, as `(suffix of the pynvml constant, reported label)`. Read by
+#: name rather than by literal value so a release that renumbers them cannot silently mislabel
+#: a reason, and an unknown name is skipped instead of raising. The prefix varies by release,
+#: which is why only the suffix is written here.
 _THROTTLE_BITS = (
-    ("nvmlClocksThrottleReasonSwPowerCap", "power"),
-    ("nvmlClocksThrottleReasonHwPowerBrakeSlowdown", "power"),
-    ("nvmlClocksThrottleReasonSwThermalSlowdown", "sw_thermal"),
-    ("nvmlClocksThrottleReasonHwThermalSlowdown", "thermal"),
-    ("nvmlClocksThrottleReasonHwSlowdown", "hw_slowdown"),
-    ("nvmlClocksThrottleReasonSyncBoost", "sync_boost"),
+    ("SwPowerCap", "power"),
+    ("HwPowerBrakeSlowdown", "power"),
+    ("SwThermalSlowdown", "sw_thermal"),
+    ("HwThermalSlowdown", "thermal"),
+    ("HwSlowdown", "hw_slowdown"),
+    ("SyncBoost", "sync_boost"),
 )
 
 
@@ -166,14 +178,35 @@ def _read(fn, default):
         return default
 
 
+#: The throttle-reason getter, under both names it has had. NVML renamed it to
+#: `...ClocksEventReasons` in the 12.x line, and a build carrying only the new name would
+#: otherwise report a permanently unthrottled fleet — a silent loss of the one signal that
+#: explains a device running at a third of its rate.
+_THROTTLE_GETTERS = (
+    "nvmlDeviceGetCurrentClocksEventReasons",
+    "nvmlDeviceGetCurrentClocksThrottleReasons",
+)
+
+#: Same story for the reason *bits*: `nvmlClocksThrottleReason*` became `nvmlClocksEventReason*`.
+_THROTTLE_PREFIXES = ("nvmlClocksEventReason", "nvmlClocksThrottleReason")
+
+
 def _throttle_reasons(nv, handle) -> tuple[str, ...]:
     """Active clock-clamping reasons for one device, deduplicated and ordered stably."""
-    bits = _read(lambda: nv.nvmlDeviceGetCurrentClocksThrottleReasons(handle), 0)
+    bits = 0
+    for getter in _THROTTLE_GETTERS:
+        fn = getattr(nv, getter, None)
+        if fn is not None:
+            bits = _read(lambda f=fn: f(handle), 0)
+            break
     if not bits:
         return ()
     out: list[str] = []
     for attr, label in _THROTTLE_BITS:
-        mask = getattr(nv, attr, None)
+        mask = next(
+            (m for m in (getattr(nv, p + attr, None) for p in _THROTTLE_PREFIXES) if m is not None),
+            None,
+        )
         if mask is not None and bits & mask and label not in out:
             out.append(label)
     return tuple(out)
@@ -197,7 +230,7 @@ def device_telemetry() -> tuple[DeviceTelemetry, ...]:
     nv = _nvml()
     if nv is None:
         return ()
-    count = _read(nv.nvmlDeviceGetCount, 0)
+    count = _device_count(nv)
     out: list[DeviceTelemetry] = []
     for index in range(count):
         handle = _read(lambda i=index: nv.nvmlDeviceGetHandleByIndex(i), None)
@@ -227,6 +260,26 @@ def device_telemetry() -> tuple[DeviceTelemetry, ...]:
             )
         )
     return tuple(out)
+
+
+def _device_count(nv) -> int:
+    """Device count, re-initializing NVML once if the library has been torn down under us.
+
+    This process has a second NVML user: `accelerators.gpu_inventory` initializes the library,
+    reads the device list, and calls `nvmlShutdown` in a `finally`. NVML reference-counts
+    init/shutdown, so that is normally harmless — but any ordering that drops the count to zero
+    leaves this module holding a memoized handle to a torn-down library, and every subsequent
+    reading would degrade to "not reported" *silently and permanently*. One re-init recovers
+    it; a second failure is a genuine absence and reads as zero devices.
+    """
+    try:
+        return int(nv.nvmlDeviceGetCount())
+    except Exception:
+        try:
+            nv.nvmlInit()
+            return int(nv.nvmlDeviceGetCount())
+        except Exception:
+            return 0
 
 
 def total_power_watts() -> float:

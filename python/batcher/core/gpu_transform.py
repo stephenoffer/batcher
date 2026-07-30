@@ -135,10 +135,11 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
     # alike, and it is the only point that knows both the device and the rows it produced.
     # Outside an `energy_scope` the meter returns immediately, so the untraced path is
     # unchanged.
+    # A stable label, not a per-invocation one: this kernel runs once per morsel on a large
+    # input, and a report with one row per call is unreadable on exactly the workload it is
+    # for. The ledger rolls repeats up by name.
     with measure_stage(
-        f"GpuGroupBy#{id(table) & 0xFFFF}",
-        accelerator_type=_local_device_model(),
-        device_count=1,
+        "GpuGroupBy", accelerator_type=_local_device_model(), device_count=1
     ) as meter:
         out = _dispatch_groupby(table, key, aggs, backend=backend, device=device)
         meter.add_rows(out.num_rows)

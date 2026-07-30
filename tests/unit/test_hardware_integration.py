@@ -68,18 +68,27 @@ def test_an_unknown_link_models_no_transfer_rather_than_a_penalty() -> None:
 
 
 def test_a_partitionable_device_packs_on_its_instance_boundary() -> None:
-    assert _mig_fraction(6.0, "NVIDIA_H100") == pytest.approx(1 / 7)
+    assert _mig_fraction(6.0, "NVIDIA_H100", 80.0) == pytest.approx(1 / 7)
 
 
 def test_an_unlabelled_or_unpartitionable_device_keeps_the_quanta() -> None:
-    assert _mig_fraction(6.0, "") is None, "an unlabelled fleet packs exactly as before"
-    assert _mig_fraction(6.0, "NVIDIA_L40S") is None, "no MIG on this part"
-    assert _mig_fraction(70.0, "NVIDIA_H100") is None, "needs the whole device"
+    assert _mig_fraction(6.0, "", 80.0) is None, "an unlabelled fleet packs exactly as before"
+    assert _mig_fraction(6.0, "NVIDIA_L40S", 48.0) is None, "no MIG on this part"
+    assert _mig_fraction(70.0, "NVIDIA_H100", 80.0) is None, "needs the whole device"
+
+
+def test_a_label_that_disagrees_with_the_memory_is_not_trusted() -> None:
+    # A stage pinned to a class the fleet does not have, or a memory figure that is the
+    # config's fallback constant rather than a probe. A seventh of an H100 handed to a device
+    # that is not one is an under-allocation nothing downstream would catch.
+    assert _mig_fraction(6.0, "NVIDIA_H100", 12.0) is None
+    assert _mig_fraction(6.0, "NVIDIA_H100", 0.0) is None
+    assert _mig_fraction(6.0, "NVIDIA_H100", 76.0) == pytest.approx(1 / 7), "within tolerance"
 
 
 def test_the_switch_turns_partition_packing_off() -> None:
     with config_context(Config().replace(accelerator=AcceleratorConfig(prefer_mig=False))):
-        assert _mig_fraction(6.0, "NVIDIA_H100") is None
+        assert _mig_fraction(6.0, "NVIDIA_H100", 80.0) is None
 
 
 # --- the grant is clamped by health as well as by inventory ------------------------------
