@@ -11,7 +11,9 @@ disagreement there is a wrong answer rather than a slow one.
 from __future__ import annotations
 
 from batcher.plan.distribution.mergeable import (
+    BROADCAST_SAFE_JOINS,
     ROW_LOCAL_OPS,
+    ShardSplit,
     decompose,
     flatten_ops,
     nest_ops,
@@ -19,7 +21,9 @@ from batcher.plan.distribution.mergeable import (
 )
 
 __all__ = [
+    "BROADCAST_SAFE_JOINS",
     "ROW_LOCAL_OPS",
+    "ShardSplit",
     "decompose",
     "flatten_ops",
     "nest_ops",

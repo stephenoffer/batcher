@@ -48,11 +48,20 @@ def _read(descriptor: dict):
 
 
 def _device() -> DfBackend:
-    """The cuDF backend, imported here so a driver with no RAPIDS can still import this module."""
+    """The cuDF backend, imported here so a driver with no RAPIDS can still import this module.
+
+    Configures the worker's device allocator on the way past. It happens here rather than at
+    task submission because the allocator is a property of the *process* that will compute,
+    and only the worker knows which device it was given and what is already resident on it.
+    The call is idempotent, so the second task this worker runs pays nothing and keeps the
+    pool the first one built.
+    """
     import cudf
 
+    from batcher.carbonite.accel import prepare_device_memory
     from batcher.core.gpu_plan import DfBackend
 
+    prepare_device_memory()
     return DfBackend(cudf)
 
 

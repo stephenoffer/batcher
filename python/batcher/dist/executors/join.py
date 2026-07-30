@@ -30,16 +30,17 @@ from batcher.dist.executors.ray_runtime import (
     record_worker_metrics,
 )
 from batcher.io.source import Source
+from batcher.plan.distribution import BROADCAST_SAFE_JOINS
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 from batcher.plan.types import retained_bytes, total_retained_bytes
 
 # Join types for which broadcasting the right (build) side and range-splitting the
-# left (probe) side is correct. The output is driven by left rows, so emitting per
-# left-chunk and unioning never duplicates a right row. RIGHT/FULL must emit
-# unmatched *right* rows exactly once — a per-chunk broadcast (every chunk sees the
-# full right side) would duplicate them — so they keep the co-partition shuffle even
-# when the planner marked them broadcast (every strategy yields the same relation).
-_BROADCAST_SAFE = frozenset({"inner", "left", "semi", "anti"})
+# left (probe) side is correct. Read from `plan.distribution` rather than restated,
+# because the GPU fan-out asks the same question and the two must not drift: a join
+# type that is broadcast-safe on one backend and not the other is a duplicated row.
+# RIGHT/FULL keep the co-partition shuffle even when the planner marked them
+# broadcast (every strategy yields the same relation).
+_BROADCAST_SAFE = BROADCAST_SAFE_JOINS
 
 # Join types where the probe (left) side may be pruned by a bloom over the build
 # (right) side's keys: a probe row with no matching build key contributes nothing

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
     from batcher.io.source import Source
 
-__all__ = ["sharded_gpu_aggregate"]
+__all__ = ["merge_shards", "shard_descriptors", "sharded_gpu_aggregate"]
 
 
 def sharded_gpu_aggregate(
@@ -54,7 +54,7 @@ def sharded_gpu_aggregate(
     if split is None:
         return None
 
-    descriptors = _shard_descriptors(
+    descriptors = shard_descriptors(
         source, gpu_count, sharded=sharded, preserve_order=split.ordered
     )
     if descriptors is None:
@@ -62,10 +62,10 @@ def sharded_gpu_aggregate(
     partials = _run_shards(descriptors, split.shard_ops)
     if not partials:
         return None
-    return _merge(partials, [*split.merge_ops, *split.tail_ops])
+    return merge_shards(partials, [*split.merge_ops, *split.tail_ops])
 
 
-def _shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve_order: bool):
+def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve_order: bool):
     """One partition descriptor per shard, or `None` when the source cannot be fanned out.
 
     A shard reads itself from storage, so the driver never materializes the source to hand it
@@ -160,7 +160,7 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
     return [t for t in results if t is not None and t.num_rows]
 
 
-def _merge(partials: list, ops: list[dict]) -> pa.Table:
+def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
     """Combine the shards' results, then run whatever sat above the reducer.
 
     For a folded chain this runs on one row per group (or per distinct row, or per top-N entry)

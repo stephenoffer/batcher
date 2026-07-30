@@ -39,6 +39,7 @@ from typing import Any
 from batcher.plan.ir_tags import Op
 
 __all__ = [
+    "BROADCAST_SAFE_JOINS",
     "ROW_LOCAL_OPS",
     "ShardSplit",
     "decompose",
@@ -72,6 +73,13 @@ class ShardSplit:
 #: Operators whose output for a row depends only on that row, so a shard can run them over the
 #: rows it holds and get the same answer it would have as part of the whole.
 ROW_LOCAL_OPS = frozenset({Op.FILTER, Op.PROJECT})
+
+#: Join types whose output is driven by LEFT rows, so broadcasting the right (build) side to
+#: every worker and splitting the left (probe) side is correct: unioning the per-shard outputs
+#: never duplicates a right row. `right` and `full` must emit an unmatched *right* row exactly
+#: once, and every shard sees the whole right side, so each would emit it — those need a
+#: co-partitioning exchange instead.
+BROADCAST_SAFE_JOINS = frozenset({"inner", "left", "semi", "anti"})
 
 # Reductions that combine with *themselves*: applying them to the partials gives the answer.
 _SELF_COMBINING = {"min": "min", "max": "max", "product": "product",

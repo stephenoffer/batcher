@@ -133,10 +133,24 @@ def try_gpu_collect(
         return _dispatch_cudf_plan(pa.Table.from_batches(batches), ops)
 
     # A `[ops] over Join(chain, chain)` — an equi/semi/anti join plus the chains pushed below
-    # it and above it — runs on one GPU, which reads BOTH sides itself.
+    # it and above it. A join the planner marked `broadcast` splits its probe side across every
+    # device, each reading the whole build side itself; anything else runs on one GPU, which
+    # reads both sides itself.
     join_spec = gpu_join_spec(plan)
     if join_spec is not None:
         (lscan, lops), (rscan, rops), join_ir, ops = join_spec
+        fanned = _try_sharded_join(
+            sources[lscan.source_id],
+            sources[rscan.source_id],
+            lops,
+            rops,
+            join_ir,
+            ops,
+            gpu_count,
+            decision,
+        )
+        if fanned is not None:
+            return fanned
         on_worker = gpu_join_on_worker(
             sources[lscan.source_id], sources[rscan.source_id], lops, rops, join_ir, ops
         )
@@ -208,6 +222,40 @@ def _try_sharded_aggregate(source: Source, ops: list[dict], gpu_count: int, deci
         release_autoscale()
 
 
+def _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count: int, decision):
+    """Fan a broadcast-safe join out across the cluster's GPUs, or `None`.
+
+    Same shape as the chain fan-out: ask the autoscaler for the devices the plan wants, wait
+    for them, and size against what arrived. `None` means the fan-out does not apply and the
+    caller uses the single-device dispatch."""
+    from batcher.dist.executors.ray_runtime.scaling import (
+        await_autoscale,
+        release_autoscale,
+        request_autoscale,
+    )
+    from batcher.dist.gpu import sharded_gpu_join
+
+    wanted = max(gpu_count, int(decision.desired_gpus))
+    request_autoscale(gpu_count, target_gpus=float(wanted))
+    try:
+        await_autoscale(wanted, target_gpus=float(wanted))
+        return sharded_gpu_join(
+            left,
+            right,
+            lops,
+            rops,
+            join_ir,
+            ops,
+            gpu_count=_cluster_gpu_count(),
+            sharded=decision.distributed,
+        )
+    except Exception as exc:
+        note_suppressed("api", "fan the GPU join out across devices", exc)
+        return None
+    finally:
+        release_autoscale()
+
+
 def _agg_input_rows(plan, sources, fallback: int = 0) -> int:
     """The ACTUAL input row count for an aggregate-over-scan (the scan source's footer count) —
     the exact x-coordinate for the crossover learner, identical for the same source across GPU
@@ -258,21 +306,36 @@ def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
         return
 
 
+def _on_device():
+    """Configure this worker's device allocator before it computes.
+
+    Runs inside the task body rather than at submission: only the process that was handed a
+    device knows how much of it is free, and the pool it builds has to live in that process.
+    Idempotent, so a worker reused across tasks keeps the pool the first one paid for.
+    """
+    from batcher.carbonite.accel import prepare_device_memory
+
+    prepare_device_memory()
+
+
 def _cudf_plan_worker(table, ops):
     from batcher.core.gpu_plan import execute_cudf_plan
 
+    _on_device()
     return execute_cudf_plan(table, ops)
 
 
 def _cudf_join_worker(left_t, right_t, left_ops, right_ops, join_ir, ops):
     from batcher.core.gpu_plan import execute_cudf_join
 
+    _on_device()
     return execute_cudf_join(left_t, right_t, left_ops, right_ops, join_ir, ops)
 
 
 def _cudf_union_worker(tables, input_ops, distinct, ops):
     from batcher.core.gpu_plan import execute_cudf_union
 
+    _on_device()
     return execute_cudf_union(tables, input_ops, distinct, ops)
 
 

@@ -22,7 +22,12 @@ from __future__ import annotations
 
 from batcher._internal.logging import note_suppressed
 
-__all__ = ["is_memory_failure", "split_descriptor"]
+__all__ = ["is_memory_failure", "measured_parts", "split_descriptor"]
+
+#: Most pieces one round may divide a shard into. A shard that appears to want more than this
+#: is one whose measurement is not to be trusted (a runaway cross product, a corrupt footer),
+#: and dividing by a thousand would cost a thousand reads to discover that.
+MAX_MEASURED_PARTS = 16
 
 #: Substrings that identify an allocation failure across the layers a GPU task crosses — RMM
 #: and the CUDA driver underneath cuDF, the C++ allocator, and Python's own `MemoryError`.
@@ -60,6 +65,39 @@ def is_memory_failure(exc: BaseException) -> bool:
     if cause is not None:
         text += f" {type(cause).__name__} {cause}".lower()
     return any(marker in text for marker in _MEMORY_MARKERS)
+
+
+def measured_parts(default: int = 2) -> int:
+    """How many pieces a shard that just overflowed should be divided into, from what it drew.
+
+    Halving is the right *blind* answer, but it is only ever right by accident: a shard that
+    peaked at eight times the pool takes three failed rounds to reach a size that fits, and
+    each of those rounds re-reads the whole shard from storage. When the allocator was asked
+    to keep statistics, the high-water mark says how far over the shard actually went, and the
+    factor that clears it in one round is arithmetic rather than a search.
+
+    Args:
+        default: The factor to use when nothing was measured — the blind halving.
+
+    Returns:
+        The number of pieces to divide into, `default` whenever the device did not report a
+        peak or a ceiling to compare it against. An unmeasured device keeps the old behavior
+        rather than being divided against a fabricated figure.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.dist.gpu import measured_parts
+            >>> measured_parts()  # nothing measured on a host with no device
+            2
+    """
+    from batcher.carbonite.accel import device_allocator_state
+
+    state = device_allocator_state()
+    peak, ceiling = int(state.get("peak_bytes", 0)), int(state.get("pool_bytes", 0))
+    if peak <= 0 or ceiling <= 0 or peak <= ceiling:
+        return default
+    return max(default, min(MAX_MEASURED_PARTS, -(-peak // ceiling)))
 
 
 def split_descriptor(descriptor: dict, parts: int = 2) -> list[dict]:
@@ -117,6 +155,7 @@ def run_subdivided(descriptor: dict, run, *, parts: int, rounds: int):
     """
     import pyarrow as pa
 
+    parts = measured_parts(parts)
     pending = [((i,), d) for i, d in enumerate(split_descriptor(descriptor, parts))]
     if len(pending) == 1:
         raise MemoryError("a shard of one split cannot be divided further")

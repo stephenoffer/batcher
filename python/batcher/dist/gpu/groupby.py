@@ -17,13 +17,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.dist.gpu.tasks import gpu_task_options
+from batcher.plan.ir_tags import Op
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from batcher.io.source import Source
 
-__all__ = ["dispatch_gpu_aggregate", "distributed_gpu_aggregate", "partial_aggs"]
+__all__ = ["combine_ops", "dispatch_gpu_aggregate", "distributed_gpu_aggregate", "partial_aggs"]
 
 
 def partial_aggs(aggs: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
@@ -39,37 +40,100 @@ def partial_aggs(aggs: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]
     return partial
 
 
+def _col(name: str) -> dict:
+    """A column reference in expression IR."""
+    return {"e": "col", "name": name}
+
+
+def combine_ops(key: str, aggs: dict[str, tuple[str, str]]) -> list[dict]:
+    """The operator chain that folds per-shard GPU partials into the final aggregate.
+
+    The mergeable `combine` step, written as IR rather than as a `Dataset`. It is the same
+    algebra either way, but the IR form is what keeps this module inside its layer: `dist`
+    schedules the operators the conductor hands it and must not reach back up through the
+    public API to do so.
+
+    A `sum` of sums is a sum and a `count` of counts is *also* a sum — counting the partials
+    again would return the number of shards. A `mean` arrives as separate sum and count
+    partials and is divided after both have been folded, because the mean of shard means is
+    not the mean unless every shard held the same number of rows.
+
+    Args:
+        key: The group-by key column.
+        aggs: The user's aggregates as `{alias: (column, func)}`.
+
+    Returns:
+        A bottom-up operator IR chain, ready for `nest_ops`.
+    """
+    reductions: list[dict] = []
+    means: dict[str, tuple[str, str]] = {}
+    for alias, (_col_name, func) in aggs.items():
+        if func == "mean":
+            total, count = f"{alias}__st", f"{alias}__nt"
+            reductions.append({"func": "sum", "alias": total, "input": _col(f"{alias}__s")})
+            reductions.append({"func": "sum", "alias": count, "input": _col(f"{alias}__n")})
+            means[alias] = (total, count)
+        else:
+            fold = "sum" if func == "count" else func
+            reductions.append({"func": fold, "alias": alias, "input": _col(f"{alias}__{func}")})
+    ops: list[dict] = [
+        {
+            "op": Op.AGGREGATE,
+            "group_keys": [{"expr": _col(key), "alias": key}],
+            "aggregates": reductions,
+        }
+    ]
+    if means:
+        ops.append({"op": Op.PROJECT, "exprs": _mean_projection(key, aggs, means)})
+    return ops
+
+
+def _mean_projection(key: str, aggs: dict, means: dict[str, tuple[str, str]]) -> list[dict]:
+    """Divide each folded sum by its folded count, and present the user's own column order."""
+    exprs = [{"expr": _col(key), "alias": key}]
+    for alias in aggs:
+        if alias not in means:
+            exprs.append({"expr": _col(alias), "alias": alias})
+            continue
+        total, count = means[alias]
+        # The numerator is cast so an integer column's mean is a mean and not a floor
+        # division, matching what `col(a) / col(b)` lowers to on the public API.
+        exprs.append(
+            {
+                "expr": {
+                    "e": "binary",
+                    "op": "div",
+                    "left": {
+                        "e": "cast",
+                        "input": _col(total),
+                        "dtype": "float64",
+                        "try_cast": False,
+                    },
+                    "right": _col(count),
+                },
+                "alias": alias,
+            }
+        )
+    return exprs
+
+
 def _combine_partials(
     partials: list[pa.Table], key: str, aggs: dict[str, tuple[str, str]]
 ) -> pa.Table:
     """Combine per-shard GPU partials into the final aggregate (the mergeable `combine` step),
-    reusing Batcher's own engine so the fold is native and tested."""
+    running the fold on Batcher's own engine so it is native and tested."""
+    import json
+
     import pyarrow as pa
 
-    import batcher as bt
-    from batcher import col
+    from batcher._internal.native import engine
+    from batcher.dist.executors.ray_runtime import engine_config_json
+    from batcher.plan.distribution import nest_ops
 
     combined = pa.concat_tables(partials)
-    final: dict = {}
-    means: dict[str, tuple[str, str]] = {}
-    for alias, (_col, func) in aggs.items():
-        if func == "sum":
-            final[alias] = col(f"{alias}__sum").sum()
-        elif func == "count":
-            final[alias] = col(f"{alias}__count").sum()
-        elif func == "min":
-            final[alias] = col(f"{alias}__min").min()
-        elif func == "max":
-            final[alias] = col(f"{alias}__max").max()
-        elif func == "mean":
-            final[f"{alias}__st"] = col(f"{alias}__s").sum()
-            final[f"{alias}__nt"] = col(f"{alias}__n").sum()
-            means[alias] = (f"{alias}__st", f"{alias}__nt")
-    ds = bt.from_arrow(combined).group_by(key).agg(**final)
-    if means:
-        ds = ds.with_columns(**{a: col(s) / col(n) for a, (s, n) in means.items()})
-        ds = ds.select(key, *aggs.keys())
-    return ds.collect()
+    plan = json.dumps(nest_ops(combine_ops(key, aggs)))
+    out = engine().execute_plan(plan, [combined.to_batches()], engine_config_json())
+    return pa.Table.from_batches(out, schema=out[0].schema) if out else combined
 
 
 def _gpu_partial_task(desc: dict, key: str, reductions: dict):
