@@ -143,7 +143,11 @@ def apply_ufunc(name: str, x, be):
     try:
         if be.is_gpu:
             return fn(x)
-        raw = fn(x.to_numpy(dtype="float64", na_value=np.nan))
+        # `errstate`: `sqrt(-1)` and `log(0)` are NaN and -inf here, which is what the engine
+        # returns, so NumPy's warning about them is noise from a correct result. Left alone it
+        # escapes from a translation into whatever the caller's warning filter does with it.
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            raw = fn(x.to_numpy(dtype="float64", na_value=np.nan))
     except (TypeError, AttributeError, NotImplementedError, ValueError) as exc:
         raise Unsupported(f"math fn {name}: {exc}") from exc
     out = be.float_series(raw)

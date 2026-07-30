@@ -110,11 +110,13 @@ def _run_join_shards(
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime import speculation_policy
-    from batcher.dist.gpu.shards import is_memory_failure, run_subdivided
+    from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import gpu_join_task, gpu_task_options
 
     dc = active_config().distributed
     task = ray.remote(**gpu_task_options())(gpu_join_task)
+
+    report = ShardReport("gpu-join", len(probes))
 
     def _launch(i: int):
         return task.remote(probes[i], build, left_ops, right_ops, join_ir, above_ops)
@@ -123,6 +125,7 @@ def _run_join_shards(
         if not is_memory_failure(exc) or dc.gpu_shard_subdivide <= 1:
             raise exc
         note_suppressed("dist", f"gpu join shard {i} did not fit; subdividing", exc)
+        report.note_subdivided()
         return run_subdivided(
             probes[i],
             lambda d: ray.get(task.remote(d, build, left_ops, right_ops, join_ir, above_ops)),
@@ -132,4 +135,5 @@ def _run_join_shards(
 
     refs = [_launch(i) for i in range(len(probes))]
     results = gather_with_backups(refs, _launch, speculation_policy(), on_failure=_on_failure)
+    report.publish()
     return [t for t in results if t is not None and t.num_rows]

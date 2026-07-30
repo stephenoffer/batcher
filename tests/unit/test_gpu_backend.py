@@ -107,3 +107,37 @@ def test_oversubscribed_shards_combine_to_the_same_aggregate():
         assert got["c"].tolist() == exp["c"].tolist()
         assert got["m"].tolist() == exp["m"].round(6).tolist()
         assert got["mx"].tolist() == exp["mx"].round(6).tolist()
+
+
+def test_the_translated_path_is_tried_before_the_legacy_group_by(monkeypatch):
+    """The legacy kernel used to shadow the translator on the commonest GPU shape.
+
+    A one-key group-by over a scan matches both, and the legacy path ran first — so every query
+    of that shape missed the translator's wider reductions, its chains above and below the
+    reducer, its per-shard recovery, and its device sizing. Nothing else pins the order, because
+    both paths return the right answer; only one of them returns it at scale.
+    """
+    import batcher as bt
+    from batcher.api.terminal import gpu_backend
+    from batcher.kyber.gpu.policy import GpuDecision
+
+    called: list[str] = []
+
+    def _note(name):
+        def _fn(*_args, **_kwargs):
+            called.append(name)
+            return None
+
+        return _fn
+
+    monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 1)
+    monkeypatch.setattr(gpu_backend, "_translated", _note("translated"))
+    monkeypatch.setattr(gpu_backend, "_legacy_groupby", _note("legacy"))
+    monkeypatch.setattr(
+        "batcher.kyber.gpu.policy.decide_gpu_backend",
+        lambda *a, **k: GpuDecision(True, False, "test", 100, 1),
+    )
+
+    q = bt.from_pydict({"k": [1, 2], "v": [1.0, 2.0]}).group_by("k").agg(s=bt.col("v").sum())
+    assert gpu_backend.try_gpu_collect(q._plan, q._sources) is None
+    assert called == ["translated", "legacy"]

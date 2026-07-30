@@ -131,6 +131,11 @@ RECOVERY = "recovery"
 #:   have happened.
 #: - ``preempt_migrate``: a draining (spot-preempted) worker's work moved before it died.
 #: - ``give_up``: the recovery budget was exhausted and the query is failing.
+#: - ``shard_degraded``: a GPU fan-out finished, but not every shard ran the way it was meant
+#:   to — some were subdivided to fit a device, or recomputed on the CPU engine because their
+#:   device was lost. The answer is the same either way, which is exactly why it needs an
+#:   event: a run where a third of the shards fell back to the host is a very different run
+#:   from one where none did, and the two are otherwise indistinguishable from the result.
 RECOVERY_EVENTS = (
     "worker_lost",
     "recompute",
@@ -139,6 +144,7 @@ RECOVERY_EVENTS = (
     "replica_retired",
     "preempt_migrate",
     "give_up",
+    "shard_degraded",
 )
 
 

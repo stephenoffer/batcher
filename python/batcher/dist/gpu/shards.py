@@ -189,3 +189,48 @@ def run_subdivided(descriptor: dict, run, *, parts: int, rounds: int):
             return pa.concat_tables(ordered) if ordered else None
         pending = failed
     raise last or MemoryError("gpu shard did not fit after subdividing")
+
+
+class ShardReport:
+    """Counts how a fan-out's shards actually ran, and says so when it was not the plain way.
+
+    A fan-out that recovers is doing its job, and a fan-out that recovers *constantly* is a
+    cluster telling you something — devices too small for the shard size, or a spot pool being
+    reclaimed faster than the work finishes. Both produce the same answer as a clean run, so
+    without an event the difference is invisible: the query is simply slower, for no reason the
+    operator can see.
+
+    Silent when nothing degraded, so the ordinary case adds no noise.
+    """
+
+    __slots__ = ("recovered", "shards", "stage", "subdivided")
+
+    def __init__(self, stage: str, shards: int) -> None:
+        """Start a report for `stage` over `shards` shards."""
+        self.stage = stage
+        self.shards = shards
+        self.subdivided = 0
+        self.recovered = 0
+
+    def note_subdivided(self) -> None:
+        """One shard did not fit its device and was run in pieces."""
+        self.subdivided += 1
+
+    def note_recovered(self) -> None:
+        """One shard's device was lost and the CPU engine produced its partial instead."""
+        self.recovered += 1
+
+    def publish(self) -> None:
+        """Emit the summary if anything degraded; do nothing if the run was clean."""
+        if not (self.subdivided or self.recovered):
+            return
+        from batcher._internal import events
+
+        events.publish(
+            events.RECOVERY,
+            name=self.stage,
+            event="shard_degraded",
+            shards=self.shards,
+            subdivided=self.subdivided,
+            recovered_on_cpu=self.recovered,
+        )

@@ -72,50 +72,40 @@ def try_gpu_collect(
     )
     if not decision.use_gpu:
         return None
+
+    import time
+
+    # The TRANSLATED path is tried first, because it is a strict superset of what the legacy
+    # group-by kernel below covers: more reductions, chains above and below the reducer,
+    # per-shard recovery, and shard sizing from what the plan wants. Trying the legacy path
+    # first, as this used to, meant the single most common GPU shape — a one-key group-by over
+    # a scan — never reached any of it.
+    t0 = time.perf_counter()
+    result = _translated(plan, sources, gpu_count, decision)
+    if result is None:
+        result = _legacy_groupby(plan, sources, decision)
+    if result is None:
+        return None
+    # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
+    # consumes). Keyed on the source's ACTUAL input rows — the same exact x the CPU side records
+    # against — so the two fitted lines are directly comparable.
+    _record_gpu_timing(hub, plan, sources, decision.est_rows, (time.perf_counter() - t0) * 1000.0)
+    return result
+
+
+def _translated(plan: LogicalPlan, sources: list[Source], gpu_count: int, decision):
+    """Run `plan` through the plan translator, or `None` when it does not apply.
+
+    A chain with a mergeable reducer fans out across every GPU — each device reduces the shard
+    it read itself and the small results are folded once — so the query is bounded by the shard
+    count rather than by one device's memory. Anything else runs as a single dispatch, on a
+    worker that still reads the source itself: staging a large relation on the driver to send it
+    to a GPU is the wrong end of the machine, and the driver is routinely the smallest node.
+    """
     import pyarrow as pa
 
-    # Fast path: a pure single-key group-by aggregate over a scan runs DISTRIBUTED (each GPU
-    # worker partial-aggregates its own shard, mergeable combine) — scales past one GPU's memory.
-    spec = _gpu_agg_spec(plan)
-    if spec is not None:
-        import time
-
-        key_out, key_src, aggs, scan = spec
-        # Kyber routes by working-set size: shard across GPUs when it exceeds one GPU, else one
-        # GPU. Either way the WORKER reads its shard from storage (no driver materialization); the
-        # helper returns None only for a non-splittable in-memory source, which we then ship whole.
-        t0 = time.perf_counter()
-        result = distributed_gpu_aggregate(
-            sources[scan.source_id], key_src, aggs, sharded=decision.distributed
-        )
-        if result is None:
-            batches = list(sources[scan.source_id].read())
-            if not batches:
-                return None
-            result = dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
-        # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
-        # consumes). Keyed on the source's ACTUAL input rows — the same exact x the CPU side
-        # records against — so the two fitted lines are directly comparable.
-        gpu_ms = (time.perf_counter() - t0) * 1000.0
-        _record_gpu_timing(hub, plan, sources, decision.est_rows, gpu_ms)
-        if key_out != key_src and key_src in result.column_names:
-            result = result.rename_columns(
-                [key_out if n == key_src else n for n in result.column_names]
-            )
-        return result
-
-    # General path: a linear chain of translatable operators. A chain with a mergeable REDUCER
-    # fans out across every GPU first — each device reduces the shard it read itself and the
-    # small results are folded once — so the query is bounded by the shard count rather than by
-    # one device's memory. Anything else runs as a single dispatch, on a worker that still reads
-    # the source itself: staging a large relation on the driver to send it to a GPU is the wrong
-    # end of the machine, and the driver is routinely the smallest node in the cluster.
     from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops, gpu_union_spec
-    from batcher.dist.gpu import (
-        gpu_chain_on_worker,
-        gpu_join_on_worker,
-        gpu_union_on_worker,
-    )
+    from batcher.dist.gpu import gpu_chain_on_worker, gpu_join_on_worker, gpu_union_on_worker
 
     plan_spec = gpu_plan_ops(plan)
     if plan_spec is not None:
@@ -132,32 +122,20 @@ def try_gpu_collect(
             return None
         return _dispatch_cudf_plan(pa.Table.from_batches(batches), ops)
 
-    # A `[ops] over Join(chain, chain)` — an equi/semi/anti join plus the chains pushed below
-    # it and above it. A join the planner marked `broadcast` splits its probe side across every
-    # device, each reading the whole build side itself; anything else runs on one GPU, which
-    # reads both sides itself.
+    # A `[ops] over Join(chain, chain)`. A join the planner marked `broadcast` splits its probe
+    # side across every device, each reading the whole build side itself; anything else runs on
+    # one GPU, which reads both sides itself.
     join_spec = gpu_join_spec(plan)
     if join_spec is not None:
         (lscan, lops), (rscan, rops), join_ir, ops = join_spec
-        fanned = _try_sharded_join(
-            sources[lscan.source_id],
-            sources[rscan.source_id],
-            lops,
-            rops,
-            join_ir,
-            ops,
-            gpu_count,
-            decision,
-        )
+        left, right = sources[lscan.source_id], sources[rscan.source_id]
+        fanned = _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count, decision)
         if fanned is not None:
             return fanned
-        on_worker = gpu_join_on_worker(
-            sources[lscan.source_id], sources[rscan.source_id], lops, rops, join_ir, ops
-        )
+        on_worker = gpu_join_on_worker(left, right, lops, rops, join_ir, ops)
         if on_worker is not None:
             return on_worker
-        lb = list(sources[lscan.source_id].read())
-        rb = list(sources[rscan.source_id].read())
+        lb, rb = list(left.read()), list(right.read())
         if not lb or not rb:
             return None
         return _dispatch_cudf_join(
@@ -182,78 +160,103 @@ def try_gpu_collect(
     return None
 
 
-def _try_sharded_aggregate(source: Source, ops: list[dict], gpu_count: int, decision):
-    """Fan a chain with a mergeable reducer out across the cluster's GPUs, or `None`.
+def _legacy_groupby(plan: LogicalPlan, sources: list[Source], decision):
+    """The single-key group-by fan-out, for a fleet whose workers have torch but not cuDF.
 
-    `None` means the fan-out does not apply — the chain has no mergeable reducer, the source is
-    not splittable, or the cluster is unreadable — and the caller then uses the single-device
-    dispatch. Every failure mode is a slower path, never a different answer: the fan-out is the
-    mergeable decomposition of the same chain.
+    Reached only when the translator declined or could not run — which on a normal cluster is
+    never, since cuDF ships with the task's runtime_env. Its kernel falls back to a torch
+    scatter-reduce, so it is the difference between an accelerated group-by and none at all on
+    a RAPIDS-less fleet.
+    """
+    import pyarrow as pa
 
-    It asks the autoscaler for the devices Kyber says the plan *wants* — enough to hold the
-    working set in one wave — rather than for the devices the cluster already has. Asking for
-    what is already there pins the floor against reclamation and can never grow the cluster, so
-    a query that could use thirty-two devices ran on the four it happened to find. It then waits
-    (bounded, and a no-op on a fixed cluster) for them to arrive before shards are sized, since
-    sizing against the pre-scale topology is how a query asks for capacity and then declines to
-    use it. The floor is released in `finally` so the autoscaler can reclaim the nodes after."""
+    spec = _gpu_agg_spec(plan)
+    if spec is None:
+        return None
+    key_out, key_src, aggs, scan = spec
+    result = distributed_gpu_aggregate(
+        sources[scan.source_id], key_src, aggs, sharded=decision.distributed
+    )
+    if result is None:
+        batches = list(sources[scan.source_id].read())
+        if not batches:
+            return None
+        result = dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
+    if key_out != key_src and key_src in result.column_names:
+        return result.rename_columns([key_out if n == key_src else n for n in result.column_names])
+    return result
+
+
+def _with_gpu_capacity(gpu_count: int, decision, run):
+    """Run a fan-out with the cluster grown to the devices the plan wants, then released.
+
+    Asks the autoscaler for `decision.desired_gpus` — enough to hold the working set in one
+    wave — rather than for the devices the cluster already has. Asking for what is already
+    there pins the floor against reclamation and can never grow the cluster, so a query that
+    could use thirty-two devices ran on the four it happened to find. It then waits (bounded,
+    and a no-op on a fixed cluster) before `run` sizes its shards, since sizing against the
+    pre-scale topology is how a query asks for capacity and then declines to use it.
+
+    `run` receives the device count the wait actually produced. Any failure inside is a
+    `None` — every fan-out has a slower path behind it, and none of them change the answer.
+    """
     from batcher.dist.executors.ray_runtime.scaling import (
         await_autoscale,
         release_autoscale,
         request_autoscale,
     )
-    from batcher.dist.gpu import sharded_gpu_aggregate
 
     wanted = max(gpu_count, int(decision.desired_gpus))
     request_autoscale(gpu_count, target_gpus=float(wanted))
     try:
         # One core per device task is the floor a GPU stage needs; the GPU target is the
-        # binding one. A zero CPU target would make the wait a no-op, since it reads as "this
-        # query wants nothing".
+        # binding one. A zero CPU target would make the wait a no-op, since it reads as
+        # "this query wants nothing".
         await_autoscale(wanted, target_gpus=float(wanted))
-        # Re-read the topology: the fan-out must be sized against the cluster the wait produced.
-        return sharded_gpu_aggregate(
-            source, ops, gpu_count=_cluster_gpu_count(), sharded=decision.distributed
-        )
+        return run(_cluster_gpu_count())
     except Exception as exc:
-        note_suppressed("api", "fan the GPU aggregate out across devices", exc)
+        note_suppressed("api", "fan a GPU stage out across devices", exc)
         return None
     finally:
         release_autoscale()
 
 
-def _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count: int, decision):
-    """Fan a broadcast-safe join out across the cluster's GPUs, or `None`.
+def _try_sharded_aggregate(source: Source, ops: list[dict], gpu_count: int, decision):
+    """Fan a chain with a mergeable reducer out across the cluster's GPUs, or `None`.
 
-    Same shape as the chain fan-out: ask the autoscaler for the devices the plan wants, wait
-    for them, and size against what arrived. `None` means the fan-out does not apply and the
-    caller uses the single-device dispatch."""
-    from batcher.dist.executors.ray_runtime.scaling import (
-        await_autoscale,
-        release_autoscale,
-        request_autoscale,
+    `None` means the fan-out does not apply — the chain has no shardable split, the source is
+    not splittable, or the cluster is unreadable — and the caller then uses the single-device
+    dispatch. Every failure mode is a slower path, never a different answer: the fan-out is the
+    mergeable decomposition of the same chain."""
+    from batcher.dist.gpu import sharded_gpu_aggregate
+
+    return _with_gpu_capacity(
+        gpu_count,
+        decision,
+        lambda live: sharded_gpu_aggregate(
+            source, ops, gpu_count=live, sharded=decision.distributed
+        ),
     )
+
+
+def _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count: int, decision):
+    """Fan a broadcast-safe join out across the cluster's GPUs, or `None`."""
     from batcher.dist.gpu import sharded_gpu_join
 
-    wanted = max(gpu_count, int(decision.desired_gpus))
-    request_autoscale(gpu_count, target_gpus=float(wanted))
-    try:
-        await_autoscale(wanted, target_gpus=float(wanted))
-        return sharded_gpu_join(
+    return _with_gpu_capacity(
+        gpu_count,
+        decision,
+        lambda live: sharded_gpu_join(
             left,
             right,
             lops,
             rops,
             join_ir,
             ops,
-            gpu_count=_cluster_gpu_count(),
+            gpu_count=live,
             sharded=decision.distributed,
-        )
-    except Exception as exc:
-        note_suppressed("api", "fan the GPU join out across devices", exc)
-        return None
-    finally:
-        release_autoscale()
+        ),
+    )
 
 
 def _agg_input_rows(plan, sources, fallback: int = 0) -> int:

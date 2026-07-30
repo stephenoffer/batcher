@@ -135,13 +135,15 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
 
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.dist.executors.ray_runtime import engine_config_json, speculation_policy
-    from batcher.dist.gpu.shards import is_memory_failure, run_subdivided
+    from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import cpu_shard_partial, gpu_shard_partial, gpu_task_options
 
     dc = active_config().distributed
     cfg_json = engine_config_json()
     gpu_task = ray.remote(**gpu_task_options())(gpu_shard_partial)
     cpu_task = ray.remote(max_retries=int(dc.task_max_retries))(cpu_shard_partial)
+
+    report = ShardReport("gpu-chain", len(descriptors))
 
     def _launch(i: int):
         return gpu_task.remote(descriptors[i], shard_ops)
@@ -150,6 +152,7 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
         if is_memory_failure(exc) and dc.gpu_shard_subdivide > 1:
             try:
                 note_suppressed("dist", f"gpu shard {i} did not fit; subdividing", exc)
+                report.note_subdivided()
                 return run_subdivided(
                     descriptors[i],
                     lambda d: ray.get(gpu_task.remote(d, shard_ops)),
@@ -161,11 +164,13 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
         if not dc.gpu_shard_cpu_fallback:
             raise exc
         note_suppressed("dist", f"gpu shard {i}; recomputing on the CPU engine", exc)
+        report.note_recovered()
         return _Recovering(cpu_task.remote(descriptors[i], shard_ops, cfg_json))
 
     refs = [_launch(i) for i in range(len(descriptors))]
     results = gather_with_backups(refs, _launch, speculation_policy(), on_failure=_on_failure)
     results = _await_recoveries(results)
+    report.publish()
     return [t for t in results if t is not None and t.num_rows]
 
 

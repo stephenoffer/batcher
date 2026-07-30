@@ -245,3 +245,57 @@ def test_a_run_with_no_recoveries_is_untouched():
 
     results = ["a", "b", None, "c"]
     assert _await_recoveries(results) is results
+
+
+# --- saying so when a run degraded ----------------------------------------------------
+
+
+def _captured_events():
+    """Collect published events for the duration of a `with` block."""
+    import contextlib
+
+    from batcher._internal import events
+
+    @contextlib.contextmanager
+    def _capture():
+        seen: list = []
+        unsubscribe = events.subscribe(seen.append)
+        try:
+            yield seen
+        finally:
+            if callable(unsubscribe):
+                unsubscribe()
+
+    return _capture
+
+
+def test_a_clean_fan_out_says_nothing():
+    """The ordinary case must add no noise, or the signal is worthless."""
+    from batcher.dist.gpu.shards import ShardReport
+
+    with _captured_events()() as seen:
+        ShardReport("gpu-chain", 8).publish()
+    assert [e for e in seen if e.fields.get("event") == "shard_degraded"] == []
+
+
+def test_a_degraded_fan_out_reports_what_happened():
+    """A run where a third of the shards fell back is a different run, and looks identical.
+
+    Same rows, same schema, just slower — so without this event an operator has no way to tell
+    a healthy cluster from one whose devices are too small for the shard size, or whose spot
+    pool is being reclaimed faster than the work finishes.
+    """
+    from batcher.dist.gpu.shards import ShardReport
+
+    report = ShardReport("gpu-chain", 9)
+    report.note_subdivided()
+    report.note_recovered()
+    report.note_recovered()
+    with _captured_events()() as seen:
+        report.publish()
+    degraded = [e for e in seen if e.fields.get("event") == "shard_degraded"]
+    assert len(degraded) == 1
+    assert degraded[0].fields["shards"] == 9
+    assert degraded[0].fields["subdivided"] == 1
+    assert degraded[0].fields["recovered_on_cpu"] == 2
+    assert degraded[0].name == "gpu-chain"
