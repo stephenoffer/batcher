@@ -43,6 +43,12 @@ use crate::error::RuntimeError;
 /// Left rows per worker below which splitting the searches is not worth the fan-out.
 const PARALLEL_MIN_PER_WORKER: usize = 4_096;
 
+/// Element floor above which the sorted-right gather is worth handing to rayon.
+///
+/// Matches `keys::PARALLEL_MAP_MIN`: the same trade, guarding a linear pass over an array the
+/// size of the right side, and it must not fire on the small joins this operator also serves.
+const PARALLEL_GATHER_MIN: usize = 32_768;
+
 /// The condition indices bounding the shared right key from below and from above, or `None`
 /// when this pair of conditions is not a band.
 ///
@@ -175,9 +181,16 @@ pub(super) fn run(
     // universes encode the *same* right column with the same sense, so their right halves
     // are identical `u64`s. `None` on the encoded (variable-width) axis, where the generic
     // comparison path runs instead.
-    let right_sorted: Option<Vec<u64>> = k_lo
-        .fast()
-        .map(|all| order.iter().map(|&r| all[r as usize]).collect());
+    let right_sorted: Option<Vec<u64>> = k_lo.fast().map(|all| {
+        // One gather over the sorted right side, so it fans out the way the merges below do.
+        // rayon's indexed `collect` writes each element at the index it was read from, so this
+        // is the sequential gather's output element for element.
+        if order.len() >= PARALLEL_GATHER_MIN {
+            order.par_iter().map(|&r| all[r as usize]).collect()
+        } else {
+            order.iter().map(|&r| all[r as usize]).collect()
+        }
+    });
     let right = Right {
         order: &order,
         sorted: right_sorted.as_deref(),
