@@ -41,16 +41,16 @@ def whole_source_descriptor(source: Source) -> dict | None:
     `None` means the source is in-memory (its rows are already on the driver, so there is
     nothing to save) or the cluster is unreadable.
     """
+    # Only Ray is optional; the batcher imports stay outside the `try` so a refactor that moves
+    # one fails loudly instead of reading as "this source cannot be described to a worker".
+    from batcher.dist.executors.partition_io import partition_descriptors
+    from batcher.dist.executors.partition_io._sources import _scan_splits
+    from batcher.io.splits import WholeSourceSplit
+
     try:
         import ray
-
-        from batcher.dist.executors.partition_io import (
-            WholeSourceSplit,
-            _scan_splits,
-            partition_descriptors,
-        )
-    except Exception as exc:
-        note_suppressed("dist", "import the GPU dispatch dependencies", exc)
+    except ImportError as exc:  # the `[ray]` extra is not installed
+        note_suppressed("dist", "import ray for the GPU dispatch", exc)
         return None
     if not ray.is_initialized():
         return None
@@ -143,13 +143,19 @@ def _remote(task, *args) -> pa.Table | None:
     Every failure here — no GPU node, a worker without cuDF, a device OOM, an untranslatable
     expression — has the same correct answer: use the CPU engine. Distinguishing them would
     only let a caller act on a distinction that does not change what it should do.
+
+    The imports stay OUTSIDE that judgement. A moved symbol is not a dispatch failure, and
+    letting it read as one is how a whole accelerated path disables itself in silence.
     """
+    from batcher.dist.executors.ray_runtime import _ensure_ray
+    from batcher.dist.gpu.tasks import gpu_task_options
+
     try:
         import ray
-
-        from batcher.dist.executors.ray_runtime import _ensure_ray
-        from batcher.dist.gpu.tasks import gpu_task_options
-
+    except ImportError as exc:  # the `[ray]` extra is not installed
+        note_suppressed("dist", "import ray for the GPU dispatch", exc)
+        return None
+    try:
         _ensure_ray(1)
         return ray.get(ray.remote(**gpu_task_options())(task).remote(*args))
     except Exception as exc:

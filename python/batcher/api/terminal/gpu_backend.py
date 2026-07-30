@@ -96,11 +96,17 @@ def try_gpu_collect(
 def _translated(plan: LogicalPlan, sources: list[Source], gpu_count: int, decision):
     """Run `plan` through the plan translator, or `None` when it does not apply.
 
-    A chain with a mergeable reducer fans out across every GPU — each device reduces the shard
-    it read itself and the small results are folded once — so the query is bounded by the shard
-    count rather than by one device's memory. Anything else runs as a single dispatch, on a
-    worker that still reads the source itself: staging a large relation on the driver to send it
-    to a GPU is the wrong end of the machine, and the driver is routinely the smallest node.
+    Three attempts in descending order of ambition, each a fallback for the one before:
+
+    1. **Fan out.** Every chain whose shape divides — a mergeable reducer to fold, or a
+       row-local chain to reassemble — runs a shard per device, each device reading its own
+       shard from storage.
+    2. **One worker, reading for itself.** Reached when the fan-out declined or failed, so this
+       is a retry as a single shard rather than the usual path. It still keeps the source off
+       the driver, which is the point: staging a large relation on the driver to send it to a
+       GPU is the wrong end of the machine, and the driver is routinely the smallest node.
+    3. **Ship the table.** Only for an in-memory source, whose rows are on the driver by
+       construction, or a process that owns a device but has no Ray to schedule with.
     """
     import pyarrow as pa
 

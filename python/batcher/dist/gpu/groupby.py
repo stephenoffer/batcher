@@ -162,16 +162,20 @@ def distributed_gpu_aggregate(
     avoids materializing the source on the driver and shipping it. Returns `None` when the source
     isn't splittable (an in-memory handle) or the cluster has no GPUs → the caller ships the
     in-memory table directly."""
+    # Only Ray is optional, so only Ray's import is tolerated. These were all inside one
+    # `except Exception: return None`, and when `_scan_splits` stopped being re-exported from
+    # `partition_io` that turned a broken import into "this source cannot be fanned out" —
+    # disabling the whole fan-out, correctly and silently, with not even a debug note.
+    #
+    # `_scan_splits` is reached through `_sources` rather than the package, because the package
+    # no longer re-exports it and its `__init__` is not this module's to edit.
+    from batcher.dist.executors.partition_io._sources import _scan_splits
+    from batcher.dist.executors.ray_runtime import _ensure_ray, cluster_topology
+    from batcher.dist.executors.ray_runtime.scaling import release_autoscale, request_autoscale
+
     try:
         import ray
-
-        from batcher.dist.executors.partition_io import _scan_splits
-        from batcher.dist.executors.ray_runtime import _ensure_ray, cluster_topology
-        from batcher.dist.executors.ray_runtime.scaling import (
-            release_autoscale,
-            request_autoscale,
-        )
-    except Exception:
+    except ImportError:  # the `[ray]` extra is not installed
         return None
 
     if not ray.is_initialized():
@@ -182,7 +186,8 @@ def distributed_gpu_aggregate(
     # Only worth it for a genuinely splittable source (shared-nothing shard reads). An
     # in-memory source has no splits → let the driver-ships-table path handle it.
     from batcher.config import active_config
-    from batcher.dist.executors.partition_io import WholeSourceSplit, partition_descriptors
+    from batcher.dist.executors.partition_io import partition_descriptors
+    from batcher.io.splits import WholeSourceSplit
 
     splits = _scan_splits(source, n_gpus)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):

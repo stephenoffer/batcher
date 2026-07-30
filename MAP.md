@@ -1232,7 +1232,7 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 102 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
 | `power.py` | 101 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
-| `vram.py` | 216 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
+| `vram.py` | 233 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 

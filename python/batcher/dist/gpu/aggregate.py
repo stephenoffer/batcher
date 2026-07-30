@@ -77,17 +77,19 @@ def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve
     to reproduce the single-node result. A fold does not care, and asking for ordering it does
     not need would only constrain how the source may be divided.
     """
+    # Only Ray is optional here, so only Ray's import is tolerated. The batcher imports are
+    # deliberately NOT in the `try`: they were, and when `_scan_splits` stopped being re-exported
+    # the `except Exception` turned a broken import into "this source cannot be fanned out". The
+    # whole multi-device path disabled itself, correctly and silently, behind a debug note.
+    from batcher.dist.executors.partition_io import partition_descriptors
+    from batcher.dist.executors.partition_io._sources import _scan_splits
+    from batcher.dist.executors.ray_runtime import _ensure_ray
+    from batcher.io.splits import WholeSourceSplit
+
     try:
         import ray
-
-        from batcher.dist.executors.partition_io import (
-            WholeSourceSplit,
-            _scan_splits,
-            partition_descriptors,
-        )
-        from batcher.dist.executors.ray_runtime import _ensure_ray
-    except Exception as exc:
-        note_suppressed("dist", "import the GPU fan-out dependencies", exc)
+    except ImportError as exc:  # the `[ray]` extra is not installed
+        note_suppressed("dist", "import ray for the GPU fan-out", exc)
         return None
     if not ray.is_initialized() or gpu_count < 1:
         return None

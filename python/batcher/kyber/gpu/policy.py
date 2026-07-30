@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from batcher.config import active_config
+from batcher.kyber.gpu.shape import broadcast_join, is_shardable
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
@@ -173,7 +174,10 @@ def decide_gpu_backend(
     # a big enough scan can clear every threshold above and still finish sooner on the CPU.
     # The verdict is only consulted when the device model is known and only ever *refuses* —
     # a forced request is still honored, and an unrecognized device has no opinion.
-    if not force and accelerator_type and rows > 0 and ws_gb > 0:
+    # ...and only while this fleet has measured nothing. A learned crossover means the GPU
+    # path actually ran here and was timed against the CPU on this hardware, which outranks a
+    # model whose CPU-bandwidth constant may not describe this machine. Measurement wins.
+    if not force and accelerator_type and rows > 0 and ws_gb > 0 and learned_min is None:
         veto = _transfer_veto(accelerator_type, ws_gb, rows)
         if veto is not None:
             return GpuDecision(False, False, veto, rows)
@@ -189,10 +193,10 @@ def decide_gpu_backend(
             f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)",
             rows,
             1,
-            _broadcast_join(plan, sources),
+            broadcast_join(plan, sources),
         )
-    shardable = _is_shardable(plan)
-    broadcast = _broadcast_join(plan, sources)
+    shardable = is_shardable(plan)
+    broadcast = broadcast_join(plan, sources)
     # How many devices would hold the working set in one wave, which is what the autoscaler is
     # asked for. Capped so a badly-estimated query cannot ask a cluster to grow without bound.
     wanted = min(math.ceil(ws_gb / one_gpu_gb), max(1, int(dc.gpu_max_autoscale_devices)))
@@ -234,77 +238,6 @@ def decide_gpu_backend(
     return GpuDecision(False, False, f"~{ws_gb:.1f}GB {scope}: {why}", rows)
 
 
-def _broadcast_join(plan: LogicalPlan, sources: list[Source]) -> bool:
-    """Whether Kyber would run this plan's join by replicating its build side.
-
-    The GPU backend splits a join's probe side across devices and gives every device the whole
-    build side, which is only worth doing — and only fits — when the build side is small. That
-    is a cost decision Kyber already makes, through the same `adaptive_build_side` the CPU join
-    path uses; asking it here means the two backends cannot disagree about which joins are
-    broadcast, and a disagreement is an out-of-memory on every device at once.
-
-    It has to be *asked* rather than read off the plan, because the GPU backend is offered the
-    plan before the optimizer runs, so the join's `strategy` is still whatever the plan builder
-    put there. Reading it found `hash` on every join and the fan-out never ran.
-
-    A decision that also **swaps** the join's sides reports False. The swap is correct and the
-    fan-out could honor it, but the probe side would then be the plan's right input, and a
-    fan-out that split the wrong side would be wrong rather than slow.
-
-    Never raises: an unanswerable question is answered "no", and the join runs on one device.
-    """
-    from batcher._internal.logging import note_suppressed
-    from batcher.plan.logical import Join
-
-    try:
-        joins = [n for n in _walk(plan) if isinstance(n, Join)]
-        if len(joins) != 1:
-            return False
-        from batcher.kyber import load_learned_stats
-        from batcher.kyber.cardinality import CardinalityEstimator
-        from batcher.kyber.rules.selection import adaptive_build_side
-
-        est = CardinalityEstimator(sources=sources, learned=load_learned_stats(None))
-        _rewritten, decisions = adaptive_build_side(joins[0], est)
-        return len(decisions) == 1 and decisions[0].broadcast and not decisions[0].swapped
-    except Exception as exc:  # pragma: no cover - routing must never break a plan
-        note_suppressed("kyber", "ask whether the join broadcasts", exc)
-        return False
-
-
-def _walk(node):
-    """Every node of a plan, parents before children."""
-    yield node
-    for attr in ("input", "left", "right"):
-        child = getattr(node, attr, None)
-        if child is not None:
-            yield from _walk(child)
-    for child in getattr(node, "inputs", ()) or ():
-        yield from _walk(child)
-
-
-def _is_shardable(plan: LogicalPlan) -> bool:
-    """Whether `plan` divides across devices, so its per-device memory is one shard's.
-
-    Two shapes do: one with a mergeable reducer, whose shards fold, and a row-local one, whose
-    shards concatenate. Answered from the plan's own IR through the shared algebra in
-    `plan.distribution` rather than re-derived here — the optimizer routing a plan to the
-    fan-out and the backend building it must agree about which plans divide, and two statements
-    of that rule are the one way they could ever disagree.
-
-    Never raises: a plan that cannot be lowered (a `map_batches` UDF) simply is not shardable.
-    """
-    from batcher._internal.logging import note_suppressed
-    from batcher.plan.distribution import flatten_ops, shard_plan
-
-    try:
-        ops = flatten_ops(plan.to_ir())
-        return ops is not None and shard_plan(ops) is not None
-    except Exception as exc:  # pragma: no cover - routing must never break a plan
-        note_suppressed("kyber", "test the plan for a mergeable reducer", exc)
-        return False
-
-
 @dataclass(frozen=True, slots=True)
 class GpuMapParams:
     """Kyber's resource sizing for one GPU `map_batches` (inference) stage: how much of a GPU to
@@ -327,7 +260,13 @@ def _transfer_veto(accelerator_type: str, working_set_gb: float, rows: int) -> s
     `None` when the device is worth using, when its model is unrecognized, or when the
     arithmetic cannot be formed — so this only ever removes a GPU choice that the transfer
     model says loses, and never adds one.
+
+    The caller applies it only where nothing has been measured. The model's CPU-bandwidth
+    figure is a constant, and a constant that is wrong for one machine would otherwise
+    disable a path that machine had been winning with — so a fleet with a learned crossover
+    keeps deciding on its own timings.
     """
+    from batcher._internal.hardware.fabric.device_links import device_link_efficiency
     from batcher.kyber.gpu.energy import device_energy_advice
 
     bytes_per_row = working_set_gb * 1e9 / max(1, rows)
@@ -335,6 +274,11 @@ def _transfer_veto(accelerator_type: str, working_set_gb: float, rows: int) -> s
         accelerator_type,
         bytes_per_row=bytes_per_row,
         flops_per_row=_RELATIONAL_FLOPS_PER_ROW,
+        # The copy is charged at the link the device *has*, not the one its datasheet lists.
+        # A board that renegotiated to half width is the case this veto exists for and the one
+        # a nameplate figure is blindest to: it passes every health check and feeds at half
+        # rate. Unreadable links report 1.0, which is the assumption made here before.
+        link_efficiency=device_link_efficiency(),
     )
     if advice.speedup <= 0 or advice.speedup >= 1.0:
         return None
@@ -344,7 +288,7 @@ def _transfer_veto(accelerator_type: str, working_set_gb: float, rows: int) -> s
     )
 
 
-def _mig_fraction(model_memory_gb: float, accelerator_type: str) -> float | None:
+def _mig_fraction(model_memory_gb: float, accelerator_type: str, gpu_gb: float) -> float | None:
     """The device fraction a MIG instance would give this model, or `None` to use the quanta.
 
     Preferred over the coarse packing quanta wherever it applies, because it is both finer (a
@@ -352,11 +296,22 @@ def _mig_fraction(model_memory_gb: float, accelerator_type: str) -> float | None
     faults, while a fractional request only shares a scheduler. `None` whenever partitioning
     does not apply — no device model, the switch off, a device that cannot partition, or a
     model that needs the whole device — and the caller then packs exactly as it did before.
+
+    `gpu_gb` is the memory the *binding device* actually reports, and the label is only
+    trusted when the two agree. They can disagree: a stage may be pinned to a device class the
+    fleet does not currently have, or the memory figure may be the config's fallback constant
+    rather than a probe. A seventh of an H100 handed to a device that is not one is an
+    under-allocation nothing downstream would catch, so a mismatch falls back to the quanta,
+    which size against the memory figure directly.
     """
     if not accelerator_type or not active_config().accelerator.prefer_mig:
         return None
+    from batcher._internal.device_specs import device_spec
     from batcher._internal.hardware.mig import smallest_profile_for
 
+    spec = device_spec(accelerator_type)
+    if spec is None or gpu_gb <= 0 or abs(spec.memory_gib - gpu_gb) > 0.1 * spec.memory_gib:
+        return None
     profile = smallest_profile_for(model_memory_gb, accelerator_type)
     return profile.gpu_fraction if profile is not None else None
 
@@ -423,7 +378,7 @@ def decide_gpu_map_params(
         if frac <= 1.0:
             # No `next()` default: this branch is guarded by `frac <= 1.0` and `_PACK_QUANTA`
             # ends at 1.0, so a quantum always matches. A default here would disguise that.
-            out_gpus = _mig_fraction(model_memory_gb, accelerator_type) or next(
+            out_gpus = _mig_fraction(model_memory_gb, accelerator_type, gpu_gb) or next(
                 q for q in _PACK_QUANTA if q >= frac
             )
         else:
