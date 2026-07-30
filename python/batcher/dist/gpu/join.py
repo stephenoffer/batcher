@@ -43,6 +43,7 @@ def sharded_gpu_join(
     *,
     gpu_count: int,
     sharded: bool,
+    broadcast: bool,
 ) -> pa.Table | None:
     """Run a translated join across the cluster's GPUs, or `None` when it does not apply.
 
@@ -55,19 +56,20 @@ def sharded_gpu_join(
         ops: The operator chain above the join.
         gpu_count: The cluster's live device count.
         sharded: Whether the working set exceeds one device.
+        broadcast: Kyber's verdict that this join's build side is small enough to replicate.
 
     Returns:
         The join's result, or `None` when the fan-out does not apply — a join type that is not
-        broadcast-safe, a join the planner did not mark `broadcast`, a chain above the join with
-        no shardable split, an unsplittable probe side, or an unreadable cluster.
+        broadcast-safe, a build side Kyber will not replicate, a chain above the join with no
+        shardable split, an unsplittable probe side, or an unreadable cluster.
     """
     from batcher.plan.distribution import BROADCAST_SAFE_JOINS, ShardSplit, shard_plan
 
     if join_ir.get("join_type") not in BROADCAST_SAFE_JOINS:
         return None
-    if join_ir.get("strategy") != "broadcast":
-        # Kyber owns the "is the build side small enough" decision, and it has already been
-        # made. Re-deriving it here would give the two backends two different answers to one
+    if not broadcast:
+        # "Is the build side small enough" is Kyber's decision and it has already been made.
+        # Re-deriving it here would give the two backends two different answers to one
         # question, and the wrong one is an out-of-memory on every device at once.
         return None
     # The chain ABOVE the join divides the same way any chain does; an empty one merges by

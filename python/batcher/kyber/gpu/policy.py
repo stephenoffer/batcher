@@ -57,6 +57,7 @@ class GpuDecision:
     reason: str
     est_rows: int = -1
     desired_gpus: int = 0
+    broadcast_join: bool = False
 
 
 def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None):
@@ -183,9 +184,15 @@ def decide_gpu_backend(
     )
     if ws_gb <= one_gpu_gb:
         return GpuDecision(
-            True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows, 1
+            True,
+            False,
+            f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)",
+            rows,
+            1,
+            _broadcast_join(plan, sources),
         )
     shardable = _is_shardable(plan)
+    broadcast = _broadcast_join(plan, sources)
     # How many devices would hold the working set in one wave, which is what the autoscaler is
     # asked for. Capped so a badly-estimated query cannot ask a cluster to grow without bound.
     wanted = min(math.ceil(ws_gb / one_gpu_gb), max(1, int(dc.gpu_max_autoscale_devices)))
@@ -196,6 +203,7 @@ def decide_gpu_backend(
             f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs",
             rows,
             wanted,
+            broadcast,
         )
     # Beyond the cluster's *aggregate* VRAM the question is no longer how much memory the
     # cluster has at once, but how small a shard can be made. A plan with a mergeable reducer
@@ -216,6 +224,7 @@ def decide_gpu_backend(
             f"~{ws_gb / shards:.2f}GB across {shards}",
             rows,
             wanted,
+            broadcast,
         )
     # Not shardable, and larger than one device. A single dispatch is the only accelerated form
     # available and it does not fit, so it would OOM and fall back anyway; the CPU engine spills
@@ -223,6 +232,55 @@ def decide_gpu_backend(
     scope = f"exceeds all {gpu_count} GPUs" if ws_gb > one_gpu_gb * gpu_count else "exceeds one GPU"
     why = "nothing to shard on" if not shardable else "CPU engine (spillable)"
     return GpuDecision(False, False, f"~{ws_gb:.1f}GB {scope}: {why}", rows)
+
+
+def _broadcast_join(plan: LogicalPlan, sources: list[Source]) -> bool:
+    """Whether Kyber would run this plan's join by replicating its build side.
+
+    The GPU backend splits a join's probe side across devices and gives every device the whole
+    build side, which is only worth doing — and only fits — when the build side is small. That
+    is a cost decision Kyber already makes, through the same `adaptive_build_side` the CPU join
+    path uses; asking it here means the two backends cannot disagree about which joins are
+    broadcast, and a disagreement is an out-of-memory on every device at once.
+
+    It has to be *asked* rather than read off the plan, because the GPU backend is offered the
+    plan before the optimizer runs, so the join's `strategy` is still whatever the plan builder
+    put there. Reading it found `hash` on every join and the fan-out never ran.
+
+    A decision that also **swaps** the join's sides reports False. The swap is correct and the
+    fan-out could honor it, but the probe side would then be the plan's right input, and a
+    fan-out that split the wrong side would be wrong rather than slow.
+
+    Never raises: an unanswerable question is answered "no", and the join runs on one device.
+    """
+    from batcher._internal.logging import note_suppressed
+    from batcher.plan.logical import Join
+
+    try:
+        joins = [n for n in _walk(plan) if isinstance(n, Join)]
+        if len(joins) != 1:
+            return False
+        from batcher.kyber import load_learned_stats
+        from batcher.kyber.cardinality import CardinalityEstimator
+        from batcher.kyber.rules.selection import adaptive_build_side
+
+        est = CardinalityEstimator(sources=sources, learned=load_learned_stats(None))
+        _rewritten, decisions = adaptive_build_side(joins[0], est)
+        return len(decisions) == 1 and decisions[0].broadcast and not decisions[0].swapped
+    except Exception as exc:  # pragma: no cover - routing must never break a plan
+        note_suppressed("kyber", "ask whether the join broadcasts", exc)
+        return False
+
+
+def _walk(node):
+    """Every node of a plan, parents before children."""
+    yield node
+    for attr in ("input", "left", "right"):
+        child = getattr(node, attr, None)
+        if child is not None:
+            yield from _walk(child)
+    for child in getattr(node, "inputs", ()) or ():
+        yield from _walk(child)
 
 
 def _is_shardable(plan: LogicalPlan) -> bool:

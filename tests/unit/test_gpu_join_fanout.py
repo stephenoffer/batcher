@@ -162,3 +162,39 @@ def test_broadcasting_an_outer_join_would_duplicate_unmatched_build_rows(be):
         for shard in _shards(probe, 2)
     )
     assert split > single, "the whole point of the exclusion"
+
+
+# --- and the fan-out has to be reachable at all ---------------------------------------
+
+
+def test_the_broadcast_verdict_comes_from_kyber_not_from_the_plan():
+    """The GPU backend is offered the plan BEFORE the optimizer runs.
+
+    So the join's `strategy` is still whatever the plan builder put there — `hash` on every
+    join, including the ones Kyber would broadcast. Gating the fan-out on that string made it
+    unreachable: correct, tested, and never executed. The verdict is asked of Kyber instead,
+    through the same build-side decision the CPU join path uses, so the two backends cannot
+    disagree about which joins broadcast.
+    """
+    from batcher.kyber.gpu.policy import decide_gpu_backend
+
+    fact, dim = _tables()
+    ds = bt.from_arrow(fact).join(bt.from_arrow(dim), on="id")
+    # The plan the backend is handed says `hash`...
+    assert ds._plan.to_ir()["strategy"] == "hash"
+    # ...and Kyber says this build side is small enough to replicate.
+    decision = decide_gpu_backend(
+        ds._plan, ds._sources, gpu_count=4, force=True, gpu_memory_gb=80.0
+    )
+    assert decision.use_gpu and decision.broadcast_join
+
+
+def test_a_plan_with_no_join_reports_no_broadcast():
+    from batcher.kyber.gpu.policy import decide_gpu_backend
+
+    fact, _dim = _tables()
+    ds = bt.from_arrow(fact).group_by("id").agg(s=col("v").sum())
+    decision = decide_gpu_backend(
+        ds._plan, ds._sources, gpu_count=4, force=True, gpu_memory_gb=80.0
+    )
+    assert not decision.broadcast_join
