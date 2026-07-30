@@ -124,6 +124,13 @@ print("hottest Generate#2" in format_energy_report(ledger))
 # True
 ```
 
+Every stage measured from a real device reading is also folded into Batcher's learned
+statistics on the way out of the block. The next run's device choice is then made against what
+this fleet delivers rather than against a datasheet ratio, which matters because a datasheet
+compares peak to peak and a real stage rarely is: a starved H100 can do less work per joule
+than a fed A100, and no specification says so. Modelled figures are deliberately not learned
+from, since folding them would teach the optimizer its own assumptions back.
+
 The idle share is the number to act on. Above roughly a third, the pipeline is starving its
 devices, and the fix is upstream: more prefetch, larger batches, or fewer devices. A faster
 kernel changes nothing.

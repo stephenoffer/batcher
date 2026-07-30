@@ -25,16 +25,30 @@ so an unrecognized device or an unconfigured envelope leaves the existing decisi
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.metadata.hardware_scope import scoped
+
+if TYPE_CHECKING:
+    from batcher.metadata import MetadataHub
 
 __all__ = [
     "EnergyAdvice",
     "device_energy_advice",
+    "learned_work_per_joule",
     "power_bounded_devices",
+    "record_measured_efficiency",
     "select_device_class",
     "stage_joules",
 ]
+
+#: Hub namespace for measured device efficiency, and the sample floor below which a bucket is
+#: not trusted. Efficiency swings with the *workload* as much as the device — a starved stage
+#: measures badly on the fastest part — so a handful of runs is not evidence about the hardware.
+_EFFICIENCY_NS = "gpu_work_per_joule"
+_MIN_SAMPLES = 8
 
 
 def select_device_class(
@@ -43,6 +57,7 @@ def select_device_class(
     *,
     prefer_efficiency: bool | None = None,
     headroom: float = 0.15,
+    hub: MetadataHub | None = None,
 ) -> str | None:
     """Choose the device class a stage should be pinned to, or `None` to leave it unpinned.
 
@@ -57,6 +72,11 @@ def select_device_class(
         prefer_efficiency: Order by throughput per watt rather than by size. `None` reads
             `accelerator.efficiency_first_placement` from the active config.
         headroom: Fraction of a device's memory left free when deciding what fits.
+        hub: The metadata hub, consulted for *measured* efficiency when ordering by it. A
+            device this fleet has actually run beats one the datasheet merely rates highly,
+            because the datasheet ratio is peak-against-peak and a real stage rarely is. Only
+            used when every fitting candidate has been measured — a partial ordering would
+            rank the measured against the unmeasured, which compares two different things.
 
     Returns:
         A device model name to pin to, or `None` when nothing fits, nothing is known, or every
@@ -77,6 +97,9 @@ def select_device_class(
     if prefer_efficiency is None:
         prefer_efficiency = active_config().accelerator.efficiency_first_placement
     if prefer_efficiency:
+        measured = {n: learned_work_per_joule(hub, n) for n in fitting}
+        if all(v is not None for v in measured.values()) and measured:
+            return max(measured, key=lambda n: (measured[n], n))
         ranked = sorted(fitting, key=lambda n: (-device_tflops_per_watt(n), n))
         return ranked[0]
     return min(fitting, key=lambda n: (fitting[n], n))
@@ -233,3 +256,84 @@ def device_energy_advice(
             f"({energy_ratio:.2f}x energy)"
         ),
     )
+
+
+def record_measured_efficiency(
+    hub: MetadataHub | None,
+    accelerator_type: str | None,
+    joules: float,
+    work: int,
+    *,
+    kind: str = "rows",
+) -> None:
+    """Fold one stage's measured work-per-joule into what this fleet has learned.
+
+    **Core measures, Kyber consumes.** The datasheet says an H100 does 3.2x an A100's dense
+    FLOPS; it does not say what *this* workload gets on either, and for a bandwidth-bound
+    stage the answer is nowhere near the FLOPS ratio. A fleet that runs the same shape daily
+    can measure the difference, and that measurement is worth more than any ratio derived from
+    a specification.
+
+    Stored as running sums per device model, so folding is O(1) and order-independent — the
+    same mergeable shape everything else here uses.
+
+    Args:
+        hub: The metadata hub, or `None` to skip recording.
+        accelerator_type: Device model the stage ran on; an unresolvable name is skipped
+            rather than pooled, because pooling unlike devices converges on an average right
+            for neither.
+        joules: Energy the stage drew.
+        work: Rows emitted or tokens generated.
+        kind: `"rows"` or `"tokens"`; the two are not comparable and never share a bucket.
+    """
+    if hub is None or not accelerator_type or joules <= 0 or work <= 0:
+        return
+    try:
+        key = f"{accelerator_type}:{kind}"
+        bucket = hub.get_keyed_param(scoped(_EFFICIENCY_NS), key) or {}
+        hub.put_keyed_param(
+            scoped(_EFFICIENCY_NS),
+            key,
+            {
+                "joules": float(bucket.get("joules", 0.0)) + float(joules),
+                "work": float(bucket.get("work", 0.0)) + float(work),
+                "n": int(bucket.get("n", 0)) + 1,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("kyber", "record measured efficiency", exc)
+
+
+def learned_work_per_joule(
+    hub: MetadataHub | None,
+    accelerator_type: str | None,
+    *,
+    kind: str = "rows",
+) -> float | None:
+    """What this fleet has measured a device to deliver per joule, or `None` when it hasn't.
+
+    `None` until the bucket holds enough samples, and `None` for a device nothing has run on.
+    A caller must fall back to the datasheet ratio rather than treating an absent measurement
+    as a bad one — that is the difference between "we have not measured this device" and
+    "this device is slow".
+
+    Args:
+        hub: The metadata hub, or `None`.
+        accelerator_type: Device model to look up.
+        kind: `"rows"` or `"tokens"`, matching what was recorded.
+
+    Returns:
+        Measured work per joule, or `None` when unknown or under-sampled.
+    """
+    if hub is None or not accelerator_type:
+        return None
+    try:
+        bucket = hub.get_keyed_param(scoped(_EFFICIENCY_NS), f"{accelerator_type}:{kind}") or {}
+    except Exception as exc:  # pragma: no cover
+        note_suppressed("kyber", "read measured efficiency", exc)
+        return None
+    joules = float(bucket.get("joules", 0.0))
+    work = float(bucket.get("work", 0.0))
+    if int(bucket.get("n", 0)) < _MIN_SAMPLES or joules <= 0 or work <= 0:
+        return None
+    return work / joules
