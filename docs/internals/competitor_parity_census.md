@@ -927,6 +927,17 @@ worth remembering the next time a reference engine will not run.
 Ordered by measured value, from the same censuses and a capability probe of the DataFrame
 surface.
 
+**Re-check this list against the code before working from it.** On 2026-07-30 two of its six
+entries were already closed — entry 5's `ds.rollup`/`cube`/`grouping_sets` had shipped in
+`api/multi_group.py`, and entry 1 was closed the same day — and the same pass found three of
+the six items in `competitor_technique_review.md`'s backlog already built
+(`ConjunctOrder`, `TopNBound`, the range join). That is not carelessness in the ledgers; it
+is what happens when implementation runs ahead of the documents that direct it. The cost is
+real either way: an agent working from a stale open list re-derives what exists, and a stale
+*closed* claim defends a number the live path never produces (see the dictionary entry in
+`competitor_technique_review.md` item 6). Each entry below names the symbol to grep for, so
+the check is one command rather than a reading.
+
 1. ~~**`.dt.date()` returns a midnight `TIMESTAMP`, not a `DATE`.**~~ **Closed.** It was an
    alias for `truncate('day')`; it is now `cast('date')`, so it returns `date32` and matches
    both Polars' `dt.date` and DuckDB's `CAST(ts AS DATE)` / `date(ts)`. Pinned by
@@ -955,8 +966,15 @@ surface.
    DuckDB's eleven after entries 177-178; the six that remain (`map_entries`,
    `map_from_entries`, `map_concat`, `map_extract`, `element_at` on a map) each need a
    kernel, since none is recoverable from the key list the way `len` and `contains` were.
-5. **`ROLLUP`/`CUBE`/`GROUPING SETS` on the DataFrame API.** The SQL front-end has them
-   (`_sql/parser/grouping_sets.py`); `ds.rollup(...)` does not exist.
+5. ~~**`ROLLUP`/`CUBE`/`GROUPING SETS` on the DataFrame API.**~~ **Closed.**
+   `api/multi_group.py` (`MultiLevelGroupBy`, `rollup_levels`, `cube_levels`) provides
+   `ds.rollup(...)`, `ds.cube(...)` and `ds.grouping_sets(...)`, wired from
+   `api/dataset/frame.py`. It takes the same approach the SQL translator does, for the same
+   reason: each level is an ordinary `group_by` over its active keys with the inactive ones
+   grouped by a typed null (`nullif(col, col)`), stacked with `union(distinct=False)`, so
+   every level is a plan the optimizer, the spill path and the distributed executor already
+   understand. Verified against DuckDB on the same input — `ROLLUP(r,c)` 6 rows,
+   `CUBE(r,c)` 8, `GROUPING SETS((r),(c),())` 5, all exact matches.
 6. **Scalar gaps with no engine implementation.** The ones entries 109-125 did not take,
    and why: `chr`, `bin`, `to_base`, `format_bytes` and `bar` all map **Int → Utf8**, and
    `StrFunc` requires a Utf8 input — the caller downcasts to `StringArray` before the
