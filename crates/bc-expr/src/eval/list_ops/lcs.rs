@@ -32,7 +32,9 @@ use crate::ExprError;
 pub(crate) fn eval_lcs_length(la: &ListArray, ra: &ListArray) -> Result<ArrayRef, ExprError> {
     // One converter over both children, so an element from either side encodes to the same
     // bytes — the same element-identity `list_set` and `multiset_overlap` use.
-    let (lv, rv) = (la.values(), ra.values());
+    // `List<Null>` — what an all-empty list column infers to — cannot be concatenated with a
+    // `List<Utf8>` child, so align the element types before encoding them together.
+    let (lv, rv) = super::align_children(la.values(), ra.values())?;
     let combined = concat(&[lv.as_ref(), rv.as_ref()])?;
     let roffset = lv.len();
     let key = crate::eval::list::float_canonical_key(&combined)?;

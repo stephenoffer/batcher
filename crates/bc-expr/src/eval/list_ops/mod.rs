@@ -17,7 +17,7 @@ pub(crate) mod list_zip;
 pub(crate) mod multiset;
 pub(crate) mod simhash;
 
-pub(crate) use coerce::{accumulate_pair, as_var_list};
+pub(crate) use coerce::{accumulate_pair, align_children, as_var_list};
 pub(crate) use gather::eval_list_gather;
 pub(crate) use lcs::eval_lcs_length;
 pub(crate) use list_hof::{eval_list_filter, eval_list_transform};

@@ -34,7 +34,9 @@ pub(crate) fn eval_multiset_overlap(la: &ListArray, ra: &ListArray) -> Result<Ar
     // One converter over both children so an element from either side encodes to the same
     // bytes; the children are concatenated (left keeps its index, right `k` maps to
     // `left.len() + k`) exactly as `list_set` does.
-    let (lv, rv) = (la.values(), ra.values());
+    // `List<Null>` — what an all-empty list column infers to — cannot be concatenated with a
+    // `List<Utf8>` child, so align the element types before encoding them together.
+    let (lv, rv) = super::align_children(la.values(), ra.values())?;
     let combined = concat(&[lv.as_ref(), rv.as_ref()])?;
     let roffset = lv.len();
     // Compare through the float-canonical key so `-0.0`/`0.0` and every NaN collapse the

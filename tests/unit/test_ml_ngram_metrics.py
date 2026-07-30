@@ -298,3 +298,18 @@ def test_rouge_l_never_exceeds_rouge_n_recall_on_the_same_text():
     assert _score(bt.rouge_l_recall("p", "r"), **columns) <= _score(
         bt.ngram_recall("p", "r"), **columns
     )
+
+
+def test_a_list_column_that_is_always_empty_still_compares():
+    """An all-empty column infers to `list<null>`, whose child cannot concatenate with a
+    string child. Both equality kernels align the element types first, so an empty retrieval
+    against a populated one scores zero rather than raising."""
+    ds = bt.from_pydict({"empty": [[], []], "full": [["a", "b"], ["c"]]})
+    got = ds.select(
+        bag=bt.col("empty").list.multiset_overlap(bt.col("full")),
+        ordered=bt.col("empty").list.lcs_length(bt.col("full")),
+        reversed_bag=bt.col("full").list.multiset_overlap(bt.col("empty")),
+    ).to_pydict()
+    assert got["bag"] == [0.0, 0.0]
+    assert got["ordered"] == [0.0, 0.0]
+    assert got["reversed_bag"] == [0.0, 0.0]
