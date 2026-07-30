@@ -16,6 +16,8 @@ cannot see an ordering bug, which is the whole risk in the sort changes below.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pyarrow as pa
 import pytest
 
@@ -512,3 +514,76 @@ def test_the_other_unary_functions_still_widen(be, fn):
     table = pa.table({"i": pa.array([1, -2, 4, None], type=pa.int64())})
     got, expected = _run(lambda ds, f=fn: ds.select(r=getattr(col("i"), f)()), table, be)
     assert got.schema.field("r").type == expected.schema.field("r").type
+
+
+# --- a pattern that is a pattern, and one that is not ----------------------------------
+
+PATTERNS = pa.table({"s": ["123abc", "axb", "a.b", "a+b", "AAA", "a|b", None]})
+
+
+@pytest.mark.parametrize(
+    "pattern", [r"\d", "a.b", "a+b", "a|b", "A{2}", "[ab]", "^a", "b$", "(a)", "a*"]
+)
+def test_contains_matches_a_literal_not_a_regular_expression(be, pattern):
+    """The engine matches a literal substring; both libraries default to a regex.
+
+    Every one of these patterns matched rows the engine does not, and the metacharacter that
+    makes it bite is `.` — which is in every path, hostname, version string and email domain
+    anyone filters on. `contains("a.b")` was matching "axb".
+    """
+    got, expected = _run(lambda ds: ds.select(r=col("s").str.contains(pattern)), PATTERNS, be)
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist()
+
+
+def test_contains_still_finds_a_plain_substring(be):
+    got, expected = _run(lambda ds: ds.select(r=col("s").str.contains("ab")), PATTERNS, be)
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist()
+    assert got.column("r").to_pylist()[:2] == [True, False]
+
+
+@pytest.mark.parametrize("fn", ["starts_with", "ends_with"])
+def test_the_other_pattern_functions_were_already_literal(be, fn):
+    got, expected = _run(
+        lambda ds, f=fn: ds.select(r=getattr(col("s").str, f)("a.b")), PATTERNS, be
+    )
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist()
+
+
+# --- the one arithmetic where the two disagree about the unit --------------------------
+
+DATES = pa.table(
+    {
+        "a": [dt.date(2024, 3, 1), dt.date(2024, 1, 1), None, dt.date(2024, 2, 29)],
+        "b": [dt.date(2024, 1, 1), dt.date(2024, 3, 1), dt.date(2024, 1, 1), dt.date(2024, 3, 1)],
+        "t": [
+            dt.datetime(2024, 3, 1, 12),
+            dt.datetime(2024, 1, 1),
+            None,
+            dt.datetime(2024, 2, 29, 6),
+        ],
+        "u": [
+            dt.datetime(2024, 1, 1),
+            dt.datetime(2024, 3, 1, 6),
+            dt.datetime(2024, 1, 1),
+            dt.datetime(2024, 3, 1),
+        ],
+    }
+)
+
+
+def test_subtracting_two_dates_gives_a_count_of_days(be):
+    """The libraries return a duration; the engine returns an integer number of days.
+
+    The values agree and the column does not, which is the worse half: a shard contributing
+    `duration[s]` beside a CPU-fallback shard's `int64` cannot be concatenated at all.
+    """
+    got, expected = _run(lambda ds: ds.select(r=col("a") - col("b")), DATES, be)
+    assert got.schema.field("r").type == expected.schema.field("r").type == pa.int64()
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist()
+
+
+def test_subtracting_two_timestamps_is_still_a_duration(be):
+    """The counter-case: both sides call this a duration, so it must be left alone."""
+    got, expected = _run(lambda ds: ds.select(r=col("t") - col("u")), DATES, be)
+    assert got.schema.field("r").type == expected.schema.field("r").type
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist()

@@ -180,6 +180,23 @@ class DfBackend:
             return pa.types.is_floating(arrow)
         return getattr(dtype, "kind", "") == "f"
 
+    def is_date(self, value: Any) -> bool:
+        """Whether `value` is a DATE column — a calendar day with no time of day.
+
+        Asked because subtracting two of them is the one arithmetic the engine answers in a
+        different *unit* from the libraries: it returns a count of days, they return a duration.
+        A timestamp difference is a duration on both, so only DATE needs the distinction.
+        """
+        if not self.is_series(value):
+            return False
+        dtype = getattr(value, "dtype", None)
+        arrow = getattr(dtype, "pyarrow_dtype", None)
+        if arrow is None:
+            return False
+        import pyarrow as pa
+
+        return pa.types.is_date(arrow)
+
     def is_integer(self, value: Any) -> bool:
         """Whether `value` is an integer column.
 

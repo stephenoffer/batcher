@@ -100,9 +100,10 @@ _DATE_ATTRS = frozenset({"day", "day_of_year", "days_in_month", "hour", "is_leap
 # name that exists on cuDF but not pandas is a path nothing verifies.
 _STR_METHODS = {"lower": "lower", "upper": "upper", "initcap": "title"}
 
-# String functions taking a single `pattern` argument, mapped to their `.str` method.
+# String functions taking a single `pattern` argument, mapped to their `.str` method. Both of
+# these match literally on both libraries, which is what the engine does. `contains` is NOT here
+# because it does not: it defaults to a regular expression and is handled explicitly.
 _STR_PATTERN_METHODS = {
-    "contains": "contains",
     "starts_with": "startswith",
     "ends_with": "endswith",
 }
@@ -217,6 +218,13 @@ def eval_str(ir, df, be, eval_expr):
         return (x.str.find(ir["pattern"]) + 1).astype(be.dtype(_int64()))
     if fn == "len":
         return x.str.len().astype(be.dtype(_int64()))
+    if fn == "contains":
+        # The engine matches a **literal** substring, exactly as `replace` does. Both
+        # libraries' `contains` defaults to a regular expression instead, so any pattern
+        # carrying a metacharacter matches rows the engine does not — and `.` is in every path,
+        # hostname, version string and email domain anyone filters on. `contains("a.b")` was
+        # matching "axb"; `contains("a|b")` was matching everything.
+        return x.str.contains(ir["pattern"], regex=False)
     if fn in _STR_PATTERN_METHODS:
         return getattr(x.str, _STR_PATTERN_METHODS[fn])(ir["pattern"])
     if fn == "replace":

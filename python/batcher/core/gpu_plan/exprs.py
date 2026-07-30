@@ -146,6 +146,8 @@ def _binary(ir, df, be):
         raise Unsupported("add_months")  # calendar arithmetic differs across the backends
     if not be.is_series(left) and not be.is_series(right):
         raise Unsupported("constant-folded binary")  # nothing to align against
+    if op == "sub" and be.is_date(left) and be.is_date(right):
+        return _date_difference(left, right, be)
     if op == "mod":
         return _truncated_mod(be.column(left, df), right, df, be)
     if op in _COMPARISONS and (be.is_float(left) or be.is_float(right)):
@@ -154,6 +156,24 @@ def _binary(ir, df, be):
     if fn is None:
         raise Unsupported(f"binary op {op}")
     return fn(left, right)
+
+
+def _date_difference(left, right, be):
+    """`DATE - DATE` as a count of days, which is the engine's answer and not the libraries'.
+
+    Subtracting two dates gives a *duration* on both backends and an integer number of days in
+    the engine. The values agree; the column does not, and a shard contributing `duration[s]`
+    beside a CPU-fallback shard's `int64` is a concatenation nobody can complete.
+
+    A timestamp difference is a duration on both sides and is left alone — this is the only
+    arithmetic where the two disagree about the unit rather than the number.
+    """
+    import pyarrow as pa
+
+    days = getattr((left - right).dt, "days", None)
+    if days is None:
+        raise Unsupported("date difference")
+    return days.astype(be.dtype(pa.int64()))
 
 
 _COMPARISONS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
