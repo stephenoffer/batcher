@@ -1,0 +1,150 @@
+"""Reporting what a run cost in watts — the terminal view and the metrics rows.
+
+A GPU-hour is what a datacenter bills; joules are what it buys; and the gap between the two is
+where every efficiency conversation happens. `plan.energy` produces the numbers, and this
+renders them: a compact per-stage table for a human at a terminal, and a flat row set for a
+metrics sink.
+
+Two reporting rules the rest of `observe` also follows, restated because they matter more here
+than elsewhere. **An unknown figure is omitted, never zero** — a run whose device model this
+build does not recognize should report no energy rather than 0 J, because a zero in a cost
+report is a claim and an omission is not. And **efficiency is work per joule**, so a stage that
+emitted nothing has no efficiency figure rather than an infinite one.
+
+Neutral, like the rest of `observe`: it reads the ledger and the device telemetry, and imports
+no subsystem.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from batcher._internal.hardware.nvml import DeviceTelemetry
+    from batcher.plan.energy import EnergyLedger, GridProfile
+
+__all__ = ["energy_metrics", "format_device_table", "format_energy_report"]
+
+
+def _si(joules: float) -> str:
+    """Joules at a human scale: J, kJ, MJ, or GJ, three significant figures."""
+    for unit, scale in (("GJ", 1e9), ("MJ", 1e6), ("kJ", 1e3)):
+        if joules >= scale:
+            return f"{joules / scale:.3g} {unit}"
+    return f"{joules:.3g} J"
+
+
+def format_energy_report(ledger: EnergyLedger, grid: GridProfile | None = None) -> str:
+    """A per-stage energy table with the run's roll-up beneath it.
+
+    Args:
+        ledger: The run's energy ledger.
+        grid: The site's grid profile, for cost and carbon lines. Omitted lines rather than
+            zeroed ones when it is absent or unconfigured.
+
+    Returns:
+        A plain-text block, or a single line saying nothing was recorded when the ledger is
+        empty.
+    """
+    if not ledger.stages:
+        return "energy: nothing recorded (no accelerator stage ran, or accounting is off)"
+
+    rows = ["stage                     device            energy    util   idle    work/J"]
+    for stage in ledger.stages:
+        per_joule = stage.tokens_per_joule or stage.rows_per_joule
+        work = f"{per_joule:,.1f}" if per_joule is not None else "-"
+        idle = stage.idle_joules / stage.joules if stage.joules > 0 else 0.0
+        rows.append(
+            f"{stage.stage[:24]:<24}  {(stage.accelerator_type or 'cpu')[:16]:<16}  "
+            f"{_si(stage.joules):>8}  {stage.utilization:>5.0%}  {idle:>4.0%}  {work:>8}"
+        )
+
+    total = ledger.total_joules
+    rows.append("")
+    rows.append(f"total {_si(total)} across {len(ledger.stages)} stage(s)")
+    if total > 0:
+        idle_share = f"{ledger.idle_fraction():.0%}"
+        rows.append(f"idle  {_si(ledger.total_idle_joules)} ({idle_share} of total)")
+    tpj, rpj = ledger.tokens_per_joule(), ledger.rows_per_joule()
+    if tpj is not None:
+        rows.append(f"efficiency {tpj:,.1f} tokens/J")
+    if rpj is not None:
+        rows.append(f"efficiency {rpj:,.1f} rows/J")
+    if grid is not None and grid.configured and total > 0:
+        if grid.price_per_kwh > 0:
+            rows.append(f"cost   {grid.cost(total):,.4f} per run at {grid.price_per_kwh}/kWh")
+        if grid.gco2e_per_kwh > 0:
+            rows.append(
+                f"carbon {grid.carbon_grams(total):,.1f} g CO2e "
+                f"at {grid.gco2e_per_kwh:g} g/kWh, PUE {grid.pue:g}"
+            )
+    hottest = ledger.hottest_stage()
+    if hottest is not None and len(ledger.stages) > 1:
+        share = hottest.joules / total if total > 0 else 0.0
+        rows.append(f"hottest {hottest.stage} at {share:.0%} of the run's energy")
+    return "\n".join(rows)
+
+
+def energy_metrics(ledger: EnergyLedger, grid: GridProfile | None = None) -> dict[str, float]:
+    """The run's energy figures as flat metric rows.
+
+    Keys are prefixed `energy.` so they group in a sink alongside the existing `query.` and
+    `shuffle.` families. Undefined figures are absent rather than zero.
+
+    Args:
+        ledger: The run's energy ledger.
+        grid: The site's grid profile, for the cost and carbon rows.
+
+    Returns:
+        Metric name to value.
+    """
+    out = {f"energy.{k}": v for k, v in ledger.summary().items()}
+    total = ledger.total_joules
+    if grid is not None and grid.configured and total > 0:
+        if grid.price_per_kwh > 0:
+            out["energy.cost"] = grid.cost(total)
+        if grid.gco2e_per_kwh > 0:
+            out["energy.carbon_grams"] = grid.carbon_grams(total)
+        out["energy.facility_joules"] = grid.facility_joules(total)
+    for device, joules in ledger.by_device().items():
+        if device:
+            out[f"energy.device.{device}"] = joules
+    return out
+
+
+def format_device_table(readings: Sequence[DeviceTelemetry] | None = None) -> str:
+    """A live per-device view: draw, utilization, memory, temperature, and any clamp.
+
+    This is the table that answers "why is this run slow" when the answer is not in the plan:
+    a device pinned at its power limit, one clamped thermally, or one whose memory another
+    tenant has filled.
+
+    Args:
+        readings: Telemetry records, or `None` to read them live.
+
+    Returns:
+        A plain-text table, or one line saying telemetry is unavailable.
+    """
+    if readings is None:
+        from batcher._internal.hardware.nvml import device_telemetry
+
+        readings = device_telemetry()
+    if not readings:
+        return "devices: no telemetry (NVML unavailable on this host)"
+    rows = ["gpu  name                        power      sm    memory        temp  state"]
+    for d in readings:
+        power = f"{d.power_watts:.0f}/{d.power_limit_watts:.0f} W" if d.power_watts else "-"
+        if d.memory_total_bytes:
+            memory = f"{d.memory_used_bytes >> 30}/{d.memory_total_bytes >> 30} GiB"
+        else:
+            memory = "-"
+        state = ",".join(d.throttle_reasons) if d.throttled else "ok"
+        if d.ecc_uncorrected:
+            state = f"ecc:{d.ecc_uncorrected}"
+        rows.append(
+            f"{d.index:<3}  {d.name[:26]:<26}  {power:>10}  {d.sm_utilization:>4.0%}  "
+            f"{memory:>12}  {d.temperature_c:>4.0f}C  {state}"
+        )
+    return "\n".join(rows)

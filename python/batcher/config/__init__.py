@@ -7,6 +7,11 @@ immutable `Config` composed of typed sections. Nothing mutates in place;
 
 from __future__ import annotations
 
+from batcher.config.accelerator import (
+    AcceleratorConfig,
+    DeviceHealthConfig,
+    EnergyConfig,
+)
 from batcher.config.config import (
     CardinalityConfig,
     Config,
@@ -47,11 +52,14 @@ from batcher.config.options import (
 from batcher.config.serde import config_to_dict, env_var_names
 
 __all__ = [
+    "AcceleratorConfig",
     "CardinalityConfig",
     "Config",
     "CostCoefficients",
     "CostWeights",
+    "DeviceHealthConfig",
     "DistributedConfig",
+    "EnergyConfig",
     "ExecutionConfig",
     "FlowControlConfig",
     "GovernanceConfig",

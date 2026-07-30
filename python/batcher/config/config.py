@@ -24,6 +24,8 @@ import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from batcher.config.accelerator import AcceleratorConfig
+
 __all__ = [
     "CardinalityConfig",
     "Config",
@@ -1194,10 +1196,16 @@ class DistributedConfig:
     # on one node is hosted on an actor on that node, so the bulk of its fetches become
     # same-node (shared-memory/direct) hits instead of network transfers. Result-
     # preserving (placement never changes the output, only where bytes travel), so it is
-    # safe; off by default keeps the plain round-robin placement. Pays off on a
-    # multi-node cluster with a skewed/co-partitioned shuffle; a no-op for an evenly
-    # spread bucket (no node dominates) and on a single node (everything is same-node).
-    locality_aware_scheduling: bool = False
+    # safe. Pays off on a multi-node cluster with a skewed/co-partitioned shuffle; a
+    # no-op for an evenly spread bucket (no node dominates).
+    #
+    # On by default. It was off because deciding placement meant a `node_id` round-trip
+    # per worker, charged to every shuffle — including the single-node case, where the
+    # answer is always "nothing to place". Node identity now comes from the workers'
+    # advertised shuffle addresses, which the driver already holds, so a single-node
+    # fleet resolves to "no placement" with no remote call at all and a multi-node one
+    # pays a single fan-out for the per-mapper byte sizes.
+    locality_aware_scheduling: bool = True
     # Persistent shuffle-actor fleet for the adaptive Flight path. When on, an adaptive
     # multi-stage query reserves ONE placement group + worker fleet for the whole query
     # and reuses it across breaker stages: a stage's intermediate stays partitioned on
@@ -1406,6 +1414,18 @@ class DistributedConfig:
     # override just that one while keeping the rest of the profile. Resolved once at
     # every config entry point (see `batcher.config.profiles`).
     resilience: str = "default"
+    # How long before a known termination deadline a worker starts draining — enough time
+    # to migrate its published shuffle output to a survivor before the kill lands. Only
+    # consulted when a deadline is discoverable (`SLURM_JOB_END_TIME`, or an explicit
+    # `BATCHER_DEADLINE_EPOCH_S` from any launcher that knows when its lease expires); a
+    # cluster with no lease never reaches this. The default matches both AWS's ~2 minute
+    # spot notice and the `--signal=B:USR1@120` an HPC job is conventionally submitted
+    # with, so the deadline path and the signal path drain on the same budget. Too short
+    # and the kill lands mid-migration, which costs the same recompute as not draining;
+    # too long and the fleet stops taking work while it still had useful time. Draining
+    # only moves *where* a partial lives, never what it holds, so this never changes a
+    # result. See `carbonite/resilience/deadline.py`.
+    drain_lead_s: float = 120.0
 
     def resolved_gpu_memory_gb(self) -> float:
         """The usable memory budget of one GPU, detected when `gpu_memory_gb` is `0.0`.
@@ -1655,7 +1675,8 @@ class Config:
     envelope and spill tiers), `flow_control` (credit-based shuffle backpressure),
     `optimizer` (Kyber join planning, cost, and cardinality), `pid` (the adaptive
     batch-size controller gains), `metadata` (where learned statistics live and how
-    fast they age), and `distributed` (Ray attachment and shuffle transport).
+    fast they age), `distributed` (Ray attachment and shuffle transport), and
+    `accelerator` (a GPU fleet's power envelope, health thresholds, and placement).
 
     Immutable: derive a variant with `replace` (whole-section swap) rather than
     mutating, and read the one in effect via `active_config`. The Rust-relevant
@@ -1684,6 +1705,10 @@ class Config:
     observability: ObservabilityConfig = ObservabilityConfig()
     governance: GovernanceConfig = GovernanceConfig()
     tenant: TenantConfig = TenantConfig()
+    # `default_factory`, unlike the sections above it: those are defined in this module, so
+    # ruff can prove they are frozen and allows the call; `AcceleratorConfig` is imported, so
+    # it cannot, and RUF009 fires. The value is identical either way.
+    accelerator: AcceleratorConfig = dataclasses.field(default_factory=AcceleratorConfig)
 
     def replace(self, **section_overrides: object) -> Config:
         """Return a new Config with whole sections replaced.

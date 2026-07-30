@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import ConfigError
+from batcher.config.accelerator import validate_accelerator
 from batcher.config.config import VERBOSITY_LEVELS
 from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, RESILIENCE_PROFILES
 
@@ -48,6 +49,7 @@ def run_checks(cfg: Config) -> None:
     _check_distributed(cfg.distributed)
     _check_flow_control(cfg.flow_control)
     _check_optimizer(cfg.optimizer)
+    validate_accelerator(cfg.accelerator)
     _check_pid(cfg.pid)
     _check_metadata(cfg.metadata)
     _check_observability(cfg.observability)
@@ -164,6 +166,10 @@ def _check_distributed_faults(d: DistributedConfig) -> None:
     _check(
         d.recovery_backoff_base_s >= 0,
         f"distributed.recovery_backoff_base_s must be >= 0, got {d.recovery_backoff_base_s}",
+    )
+    _check(
+        d.drain_lead_s >= 0,
+        f"distributed.drain_lead_s must be >= 0, got {d.drain_lead_s}",
     )
     _check(
         d.flight_idle_timeout_s > 0,
