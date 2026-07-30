@@ -689,7 +689,7 @@ Per-operator distributed executor implementations.
 | `aggregate.py` | 245 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 48 | Distributed DISTINCT — deduplicate across workers via the aggregate shuffle. |
 | `join.py` | 866 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
-| `map.py` | 1470 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 1478 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 522 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 216 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -742,8 +742,8 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 254 | The map-stage barrier: gather partition results under worker-loss recovery. |
-| `_drain.py` | 112 | Which workers are on a node that is going away. |
+| `_barrier.py` | 252 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_drain.py` | 135 | Which workers are on a node that is going away. |
 | `_faults.py` | 227 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 
 ### `batcher/dist/fleet/` — 4 · backend
@@ -763,8 +763,8 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 223 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `device_read.py` | 127 | Read a shard onto the device, instead of onto the host and then across the bus. |
+| `aggregate.py` | 225 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `device_read.py` | 126 | Read a shard onto the device, instead of onto the host and then across the bus. |
 | `dispatch.py` | 157 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 237 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 141 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
