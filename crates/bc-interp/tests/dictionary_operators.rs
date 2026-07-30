@@ -49,33 +49,93 @@ const ROWS: usize = 300;
 /// is what makes the dictionary path worth taking in the first place.
 const CARDINALITY: usize = 7;
 
-fn label(i: usize) -> String {
-    format!("cat-{:02}", i % CARDINALITY)
+/// Every seventh row is NULL.
+///
+/// A dictionary has **two** places a null can live — a null *key* (this row has no value) and a
+/// null entry in the *values* array (this row points at a null) — and they are different
+/// physical encodings of the same logical row. Both are built below, because a key path that
+/// reads one and not the other is wrong in a way no non-null test can see, and because
+/// `null_mask`, `NULL_HASH` and the join's null exclusion all read nullness off the key column
+/// whose encoding just changed.
+fn label(i: usize) -> Option<String> {
+    if i % 7 == 3 {
+        None
+    } else {
+        Some(format!("cat-{:02}", i % CARDINALITY))
+    }
 }
 
 /// One batch with a dictionary-encoded `k` and a plain `v`, and the same batch with `k`
 /// decoded. Identical values, so the two plans below differ *only* in the encoding.
-fn pair(offset: usize, rows: usize) -> (RecordBatch, RecordBatch) {
-    let labels: Vec<String> = (offset..offset + rows).map(label).collect();
-    let strs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    let values: ArrayRef = Arc::new(StringArray::from(strs.clone()));
-    let dict: ArrayRef = Arc::new(strs.iter().copied().collect::<DictionaryArray<Int32Type>>());
+///
+/// `null_in_values` selects which of the two null encodings the dictionary uses: a null key
+/// pointing at nothing, or a valid key pointing at a null dictionary entry. The decoded oracle
+/// is the same array either way, which is exactly the point.
+fn pair(offset: usize, rows: usize, null_in_values: bool) -> (RecordBatch, RecordBatch) {
+    let labels: Vec<Option<String>> = (offset..offset + rows).map(label).collect();
+    let opt: Vec<Option<&str>> = labels.iter().map(|s| s.as_deref()).collect();
+    let values: ArrayRef = Arc::new(StringArray::from(opt.clone()));
+
+    let dict: ArrayRef = if null_in_values {
+        // Every row has a valid key; the *dictionary* carries the null. Built by hand because
+        // the `collect` below folds nulls into null keys instead.
+        let mut distinct: Vec<Option<&str>> = vec![None];
+        for v in opt.iter().flatten() {
+            if !distinct.contains(&Some(*v)) {
+                distinct.push(Some(*v));
+            }
+        }
+        let keys: Vec<i32> = opt
+            .iter()
+            .map(|v| distinct.iter().position(|d| d == v).unwrap() as i32)
+            .collect();
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                arrow::array::Int32Array::from(keys),
+                Arc::new(StringArray::from(distinct)),
+            )
+            .expect("dict with a null value"),
+        )
+    } else {
+        Arc::new(opt.iter().copied().collect::<DictionaryArray<Int32Type>>())
+    };
+
     let v: ArrayRef = Arc::new(Int64Array::from(
         (offset..offset + rows)
             .map(|i| i as i64)
             .collect::<Vec<_>>(),
     ));
 
-    let dict_batch = RecordBatch::try_from_iter(vec![("k", dict), ("v", v.clone())]).expect("dict");
-    let plain_batch = RecordBatch::try_from_iter(vec![("k", values), ("v", v)]).expect("plain");
+    // Nullability is stated rather than inferred. `try_from_iter` derives it from
+    // `null_count() > 0`, which makes the *empty* batch below declare `k` non-nullable while
+    // its siblings declare it nullable — four sources with three schemas, which the engine
+    // rightly rejects. That is a property of this harness, not of the engine, and pinning it
+    // here is what keeps a real disagreement from hiding behind a schema error.
+    let dict_batch =
+        RecordBatch::try_from_iter_with_nullable(vec![("k", dict, true), ("v", v.clone(), false)])
+            .expect("dict");
+    let plain_batch =
+        RecordBatch::try_from_iter_with_nullable(vec![("k", values, true), ("v", v, false)])
+            .expect("plain");
     (dict_batch, plain_batch)
 }
 
-/// Two morsels each way.
-fn sources() -> (Vec<RecordBatch>, Vec<RecordBatch>) {
-    let (d0, p0) = pair(0, ROWS);
-    let (d1, p1) = pair(ROWS, ROWS);
-    (vec![d0, d1], vec![p0, p1])
+/// The input shapes every operator is checked over.
+///
+/// More than one morsel, so an operator that mishandles a dictionary only on a later batch is
+/// caught; an **empty** morsel, because a zero-row batch is where a schema is carried without
+/// any values to infer it from; and both null encodings.
+fn shapes() -> Vec<(&'static str, Vec<RecordBatch>, Vec<RecordBatch>)> {
+    let mut out = Vec::new();
+    for (tag, null_in_values) in [("null keys", false), ("null dictionary values", true)] {
+        let (d0, p0) = pair(0, ROWS, null_in_values);
+        let (d1, p1) = pair(ROWS, ROWS, null_in_values);
+        // A single row exercises the paths that special-case "fewer than a morsel".
+        let (d2, p2) = pair(2 * ROWS, 1, null_in_values);
+        let (de, pe) = pair(0, 0, null_in_values);
+        out.push((tag, vec![d0, de.clone(), d1, d2], vec![p0, pe, p1, p2]));
+    }
+    out
 }
 
 fn col(name: &str) -> Expr {
@@ -163,30 +223,29 @@ fn assert_agrees(what: &str, plan_for: impl Fn() -> RelOp, ordered: bool) {
         Executor::Streaming,
         Executor::StreamingParallel,
     ] {
-        let (dict_src, plain_src) = sources();
-        let dict_out = ex.run(&plan_for(), &[dict_src.clone(), dict_src]);
-        let plain_out = ex.run(&plan_for(), &[plain_src.clone(), plain_src]);
+        for (shape, dict_src, plain_src) in shapes() {
+            let case = format!("{what} on {} [{shape}]", ex.name());
+            let dict_out = ex.run(&plan_for(), &[dict_src.clone(), dict_src]);
+            let plain_out = ex.run(&plan_for(), &[plain_src.clone(), plain_src]);
 
-        let mut got = decoded(&dict_out);
-        let mut want = decoded(&plain_out);
-        assert_eq!(
-            got.len(),
-            want.len(),
-            "{what} on {}: row count differs — dictionary {} vs decoded {}",
-            ex.name(),
-            got.len(),
-            want.len()
-        );
-        if !ordered {
-            got.sort();
-            want.sort();
+            let mut got = decoded(&dict_out);
+            let mut want = decoded(&plain_out);
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{case}: row count differs — dictionary {} vs decoded {}",
+                got.len(),
+                want.len()
+            );
+            if !ordered {
+                got.sort();
+                want.sort();
+            }
+            assert_eq!(
+                got, want,
+                "{case}: the dictionary-encoded run disagrees with the decoded oracle"
+            );
         }
-        assert_eq!(
-            got,
-            want,
-            "{what} on {}: the dictionary-encoded run disagrees with the decoded oracle",
-            ex.name()
-        );
     }
 }
 
