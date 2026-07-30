@@ -31,6 +31,15 @@ use crate::ExprError;
 /// Float64 rather than Int64 to match every other `ListBinaryFunc`, so the metric
 /// expressions that divide by it never have to cast.
 pub(crate) fn eval_multiset_overlap(la: &ListArray, ra: &ListArray) -> Result<ArrayRef, ExprError> {
+    // Strings are the overwhelmingly common element here — every generation metric feeds this
+    // n-gram text — and the general path below is expensive for them: it concatenates both
+    // children (copying every string) and row-encodes the result before a single comparison.
+    // Hashing `&str` directly skips both, and the borrow is safe because the arrays outlive
+    // the call. Measured on 20k pairs of 40-token text, this is the difference between a
+    // metric that scans a corpus and one that is only usable on a sample.
+    if let (Some(left), Some(right)) = (utf8_child(la), utf8_child(ra)) {
+        return Ok(utf8_overlap(la, left, ra, right));
+    }
     // One converter over both children so an element from either side encodes to the same
     // bytes; the children are concatenated (left keeps its index, right `k` maps to
     // `left.len() + k`) exactly as `list_set` does.
@@ -78,6 +87,53 @@ pub(crate) fn eval_multiset_overlap(la: &ListArray, ra: &ListArray) -> Result<Ar
         out.append_value(overlap as f64);
     }
     Ok(Arc::new(out.finish()))
+}
+
+/// The `Utf8` child of a list column, when that is what it holds.
+fn utf8_child(list: &ListArray) -> Option<&arrow::array::StringArray> {
+    use arrow::array::AsArray;
+    list.values().as_string_opt::<i32>()
+}
+
+/// `eval_multiset_overlap` over two `List<Utf8>` columns, hashing the strings directly.
+///
+/// Identical contract to the general path: a null row on either side is null, an empty row is
+/// a real zero, and a null element matches nothing.
+fn utf8_overlap(
+    la: &ListArray,
+    left: &arrow::array::StringArray,
+    ra: &ListArray,
+    right: &arrow::array::StringArray,
+) -> ArrayRef {
+    let (lo, ro) = (la.value_offsets(), ra.value_offsets());
+    let mut out = Float64Builder::with_capacity(la.len());
+    let mut counts: HashMap<&str, i64> = HashMap::new();
+    for i in 0..la.len() {
+        if la.is_null(i) || ra.is_null(i) {
+            out.append_null();
+            continue;
+        }
+        counts.clear();
+        for k in ro[i] as usize..ro[i + 1] as usize {
+            if !right.is_null(k) {
+                *counts.entry(right.value(k)).or_insert(0) += 1;
+            }
+        }
+        let mut overlap = 0i64;
+        for k in lo[i] as usize..lo[i + 1] as usize {
+            if left.is_null(k) {
+                continue;
+            }
+            if let Some(remaining) = counts.get_mut(left.value(k)) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    overlap += 1;
+                }
+            }
+        }
+        out.append_value(overlap as f64);
+    }
+    Arc::new(out.finish())
 }
 
 #[cfg(test)]

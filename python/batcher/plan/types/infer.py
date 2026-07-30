@@ -87,6 +87,7 @@ _LIST_ELEMENT_REDUCE = frozenset({"sum", "min", "max"})
 
 _STR_STR = frozenset(
     {
+        "squad_normalize",
         "strip_html",
         "upper",
         "lower",

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1042 Python modules across 164 packages and 189 Rust files across 13 crates.
+Covering 1044 Python modules across 164 packages and 189 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -302,7 +302,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
-| `accelerators.py` | 421 | Accelerator reporting (`accelerators`, `show_accelerators`). |
+| `accelerators.py` | 462 | Accelerator reporting (`accelerators`, `show_accelerators`). |
 | `admin.py` | 223 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -457,7 +457,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 | `judge.py` | 368 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 183 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
 | `requests.py` | 290 | Turning a `RecordBatch` into the per-row requests an engine receives. |
-| `sizing.py` | 299 | Sizing an LLM engine from the workload instead of from the model's maximum. |
+| `sizing.py` | 304 | Sizing an LLM engine from the workload instead of from the model's maximum. |
 | `structured.py` | 426 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
 
 ### `batcher/ml/llm/engines/` — 6 · front-end
@@ -561,7 +561,7 @@ Reranking a retrieved candidate set before it reaches a model.
 
 | module | lines | what it is |
 |---|---|---|
-| `mmr.py` | 221 | Maximal marginal relevance — reranking a candidate set for diversity, not just relevance. |
+| `mmr.py` | 226 | Maximal marginal relevance — reranking a candidate set for diversity, not just relevance. |
 
 ### `batcher/ml/serving/` — 6 · front-end
 
@@ -735,9 +735,9 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 |---|---|---|
 | `accelerators.py` | 146 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
-| `capacity.py` | 91 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 320 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
-| `lifecycle.py` | 468 | Ray lifecycle + single-node fallback for the distributed executor. |
+| `capacity.py` | 144 | How many workers a cluster can actually *place*, as opposed to afford. |
+| `hardware_probe.py` | 373 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `lifecycle.py` | 471 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 264 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
@@ -1229,12 +1229,12 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | module | lines | what it is |
 |---|---|---|
 | `affinity.py` | 189 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
-| `allocator.py` | 335 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
-| `health.py` | 432 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
+| `allocator.py` | 342 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
+| `health.py` | 448 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 102 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
 | `power.py` | 101 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
-| `vram.py` | 233 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
+| `vram.py` | 241 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1865,7 +1865,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | `_bind.py` | 82 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 470 | The curated per-accessor docstrings, keyed by accessor name. |
 | `collections.py` | 1682 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `strings.py` | 4030 | The `.str` accessor namespace. |
+| `strings.py` | 4062 | The `.str` accessor namespace. |
 | `temporal.py` | 1084 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -1954,7 +1954,7 @@ Metrics that score generated or collected text, with no model in the loop.
 
 | module | lines | what it is |
 |---|---|---|
-| `_text.py` | 79 | The tokenization and ratio-shape helpers every text metric in this package builds on. |
+| `_text.py` | 84 | The tokenization and ratio-shape helpers every text metric in this package builds on. |
 | `diversity.py` | 276 | Degeneration and diversity metrics — catching a model that has started repeating itself. |
 | `formatting.py` | 337 | Output-shape metrics — did the generation take the form it was asked to take. |
 | `length.py` | 430 | Length, size, and reading-level metrics — how much text there is and how hard it is. |
@@ -2025,7 +2025,7 @@ The neutral type vocabulary and inference for the plan layer.
 | module | lines | what it is |
 |---|---|---|
 | `footprint.py` | 86 | How much memory live Arrow data actually keeps resident. |
-| `infer.py` | 491 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
+| `infer.py` | 492 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 103 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `media.py` | 83 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
@@ -2129,7 +2129,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `isa.py` | 137 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 67 | The memory ceiling and page geometry this process runs under. |
 | `mig.py` | 158 | Multi-Instance GPU profiles — which partitionings a device model actually offers. |
-| `nvml.py` | 307 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
+| `nvml.py` | 385 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
 | `probes.py` | 70 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 321 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 107 | The block device behind a directory — what spilling to it will actually cost. |
@@ -2150,6 +2150,7 @@ The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 
 | module | lines | what it is |
 |---|---|---|
+| `counters.py` | 228 | What an RDMA port has actually carried, and what it got wrong doing it. |
 | `device_links.py` | 216 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
 | `nvlink.py` | 259 | NVLink, per link and per device — whether the fast path between devices is actually up. |
 | `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |
@@ -2162,6 +2163,7 @@ How a GPU is failing, as distinct from how busy it is.
 | module | lines | what it is |
 |---|---|---|
 | `counters.py` | 213 | The per-device fault counters NVML publishes — memory rows, retired pages, PCIe replays. |
+| `modes.py` | 203 | Device settings that cost throughput or correctness without ever raising anything. |
 | `xid.py` | 253 | Xid errors — the driver's own account of what went wrong with a device. |
 
 ### `batcher/_internal/site/` — 0 · utility
@@ -2343,7 +2345,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/list_set.rs` | 188 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 28 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
-| `eval/list_ops/multiset.rs` | 82 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
+| `eval/list_ops/multiset.rs` | 138 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 194 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 475 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
@@ -2360,7 +2362,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
 | `eval/security/mask.rs` | 35 | Character masking — the redaction primitive behind partial-disclosure policies ("show only the last four digits"). |
 | `eval/security/mod.rs` | 115 | Data-protection string functions: `hmac_sha256`, `aes_encrypt`, `aes_decrypt`, `mask`. |
-| `eval/str/case.rs` | 134 | Identifier case conversion for `StrFunc::ToCase` — one word splitter, ten styles. |
+| `eval/str/case.rs` | 272 | Case conversion for `StrFunc::ToCase`, and the SQuAD normalization every text metric runs first. |
 | `eval/str/chunk.rs` | 182 | `StrFunc::Chunk` — overlapping text windows (the RAG document splitter). |
 | `eval/str/compress.rs` | 144 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
 | `eval/str/html.rs` | 172 | `strip_html`: recover the readable text of an HTML document. |
@@ -2368,7 +2370,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 655 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1696 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1697 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 136 | String functions whose input is a **number**, not a string. |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
@@ -2376,7 +2378,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1296 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1305 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 412 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
@@ -2390,12 +2392,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `float_ident.rs` | 154 | The engine's one definition of **float identity**. |
 | `hardware.rs` | 190 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
-| `isa.rs` | 240 | The host's instruction-set capabilities, in full. |
-| `lib.rs` | 234 | `bc-arrow` — Arrow building blocks shared across the engine. |
-| `page_cache.rs` | 126 | Telling the kernel how a spill file is about to be used. |
-| `placement.rs` | 152 | Which CPU a worker thread should run on. |
+| `isa.rs` | 226 | The host's instruction-set capabilities, in full. |
+| `lib.rs` | 231 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `page_cache.rs` | 69 | Telling the kernel how a spill file is about to be used. |
+| `placement.rs` | 143 | Which CPU a worker thread should run on. |
 | `row_sort.rs` | 201 | A stable multi-column sort permutation over the Arrow row format. |
-| `topology.rs` | 589 | The machine's memory and core topology, as the data plane needs to see it. |
+| `topology.rs` | 468 | The machine's memory and core topology, as the data plane needs to see it. |
 
 ### `bc-sketches`
 

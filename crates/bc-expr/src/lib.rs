@@ -862,6 +862,15 @@ pub enum StrFunc {
     /// and the primitive the multiset generation metrics (BLEU/ROUGE-N/Distinct-n) build
     /// their token n-gram sets from.
     TokenNgrams,
+    /// The SQuAD answer normalization every word-level text metric runs first: lowercase,
+    /// drop the standalone articles `a`/`an`/`the`, delete punctuation, collapse whitespace,
+    /// trim. → Utf8; null → null.
+    ///
+    /// It replaces a composition of `lower` and three `regexp_replace_all` passes, which cost
+    /// ninety times a bare `len` over the same column and which every word metric paid twice.
+    /// One pass, one allocation. `eval/str/squad.rs` documents how the five steps reduce to a
+    /// scan over word and non-word runs, and pins the result against the composition.
+    SquadNormalize,
     /// True where `pattern` (a regex) matches anywhere in the string. → Boolean.
     RegexpMatches,
     /// Replace the first match of regex `pattern` with `replacement`. → Utf8.

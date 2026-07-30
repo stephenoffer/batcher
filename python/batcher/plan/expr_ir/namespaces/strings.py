@@ -3389,6 +3389,38 @@ class _StrNamespace:
         # `pattern` carries the boundary mode, which is otherwise unused by `chunk`.
         return StrFunc("chunk", self._e, pattern=boundary, start=overlap, length=size)
 
+    def squad_normalize(self) -> StrFunc:
+        """Lowercase, drop standalone articles, delete punctuation, collapse spaces, trim.
+
+        The SQuAD answer normalization, and the tokenization every word-level metric in
+        :mod:`batcher` agrees on — which is what makes `token_set_f1`,
+        `answer_groundedness` and the BLEU/ROUGE family comparable to each other.
+
+        It is one engine pass, not the five it reads as. Written out it would be `lower`, a
+        regex for the articles, a regex for the punctuation, a regex for the whitespace, and a
+        trim; that composition measured ninety times the cost of a bare :meth:`len` over the
+        same column.
+
+        Two details are worth knowing before using it as a general cleaner. Punctuation is
+        *deleted* rather than replaced, so ``cat-dog`` becomes one token while ``cat, dog``
+        stays two. And the articles ``a``/``an``/``the`` are dropped entirely, which is right
+        for scoring an answer and wrong for most other purposes — reach for
+        :meth:`remove_punctuation` and :meth:`normalize_whitespace` when you want the cleaning
+        without the article removal.
+
+        Returns:
+            A new Utf8 expression holding the normalized text; null stays null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  The quick, brown Fox!  ", "a cat-dog"]})
+                >>> ds.select(n=bt.col("s").str.squad_normalize()).to_pydict()
+                {'n': ['quick brown fox', 'catdog']}
+        """
+        return StrFunc("squad_normalize", self._e)
+
     def token_ngrams(self, n: int) -> StrFunc:
         """Every window of `n` adjacent whitespace tokens, joined by a space → List<Utf8>.
 

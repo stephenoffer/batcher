@@ -139,7 +139,11 @@ metric here is linear. On sentences that is nothing; on thousand-token documents
 cell updates per row. Truncate, or score per sentence.
 
 All of these tokenize with the same SQuAD normalization the token-set metrics use, so the
-numbers are comparable across this page. That is not what a reference BLEU implementation
+numbers are comparable across this page. That normalization is `str.squad_normalize` — lowercase,
+drop the standalone articles, delete punctuation, collapse whitespace, trim — and it is worth
+knowing two of its rules before reading a score. Punctuation is *deleted* rather than replaced,
+so `cat-dog` is one token while `cat, dog` is two; and the articles are dropped entirely, which
+is right for scoring an answer and wrong for most other cleaning. That is not what a reference BLEU implementation
 does, so use them to rank runs against each other rather than to publish against a paper.
 
 The two primitives underneath are on the expression accessors, for a score this page does not

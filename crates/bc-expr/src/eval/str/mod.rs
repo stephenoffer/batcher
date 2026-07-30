@@ -600,6 +600,7 @@ pub(crate) fn eval_str(
             Arc::new(builder.finish())
         }
         StrFunc::Chunk => chunk::eval_chunk(s, start, length, pattern)?,
+        StrFunc::SquadNormalize => case::eval_squad_normalize(s),
         StrFunc::TokenNgrams => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
             // `length` carries `n`; clamp to at least 1 so a bad plan never panics.

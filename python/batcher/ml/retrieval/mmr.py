@@ -14,10 +14,15 @@ so a candidate that duplicates something already selected is penalized however r
 `lambda_mult` is the dial: 1.0 is pure relevance (the ranking you already had), 0.0 is pure
 diversity, and the useful range is 0.5 to 0.8.
 
-The selection is greedy and sequential per query, which cannot be an `Expr`. It is a batch UDF
-instead, vectorized with NumPy over the whole batch's flattened embedding buffer: the similarity
-matrix for one query's candidates is one matrix multiply, and the greedy loop runs over `k`
-selections, not over rows of data.
+The selection is greedy and sequential per query, so it cannot be an `Expr`. It is a batch UDF
+instead, and the work inside one query is NumPy: the candidates' pairwise similarity is a single
+matrix multiply, and the running redundancy is updated per selection rather than recomputed,
+which is the difference between `O(k*n)` and `O(k^2*n)` on a wide candidate set.
+
+The loop over *rows* is still Python, one iteration per query. That is honest rather than ideal
+— a rerank is `k` candidates per query, not a column of tokens, so the per-row overhead is small
+against the matrix multiply it wraps; but on a batch of a million queries it is a million Python
+iterations, and if that ever dominates, the fix is a kernel rather than a faster loop.
 """
 
 from __future__ import annotations

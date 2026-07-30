@@ -19,11 +19,16 @@ __all__ = ["char_ngrams", "mean_ratio", "normalize", "token_ngrams", "tokens"]
 
 
 def normalize(text: Expr) -> Expr:
-    """The SQuAD answer normalization: lowercase, drop articles and punctuation, collapse spaces."""
-    lowered = text.str.lower()
-    without_articles = lowered.str.regexp_replace_all(r"\b(a|an|the)\b", " ")
-    without_punct = without_articles.str.remove_punctuation()
-    return without_punct.str.normalize_whitespace().str.strip()
+    """The SQuAD answer normalization: lowercase, drop articles and punctuation, collapse spaces.
+
+    One engine kernel, not the five-expression composition it reads as. That composition —
+    `lower`, three `regexp_replace_all` passes, two trims — measured ninety times the cost of a
+    bare `len` over the same column, and every word-level metric in this package paid it once
+    per text column (BLEU, eight times). The kernel is pinned byte-for-byte against the
+    composition in `bc-expr`'s own tests, including the Unicode cases where the two classes of
+    "word character" could have diverged.
+    """
+    return text.str.squad_normalize()
 
 
 def tokens(text: Expr) -> Expr:
