@@ -2354,7 +2354,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/compress.rs` | 144 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
 | `eval/str/html.rs` | 172 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 80 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
-| `eval/str/json.rs` | 653 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
+| `eval/str/json.rs` | 655 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
 | `eval/str/mod.rs` | 1696 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
