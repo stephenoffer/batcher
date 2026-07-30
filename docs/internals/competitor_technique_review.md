@@ -321,8 +321,48 @@ egress, not on ingress.** `normalize_to` keeps the `Dictionary` and normalizes o
 type; a new egress pass decodes `Dictionary` to its value type on the batches handed back to
 Python; and `plan/types/lattice.py::widen` then needs **no change at all**, because it already
 reports the value type — which is precisely what keeps `Dataset.schema` truthful and keeps a
-dictionary column joinable against a plain string one. The audit that remains is every operator
-that builds an output batch from its input's schema.
+dictionary column joinable against a plain string one.
+
+### Built, measured end to end, and reverted — with the numbers
+
+**The operator half is done and committed.** `bc-interp/tests/dictionary_operators.rs` runs
+twelve operators over a dictionary against the decoded oracle on all three executors, both null
+encodings, and empty/single-row batches. Nine were already correct; three were fixed
+(`project_field::output_field` took its type from the input schema instead of the evaluated
+array; `keys::decode_dict_keys` now reconciles the two sides of a hash join and a range join).
+So a future attempt starts from an engine that handles dictionaries correctly.
+
+**The boundary half was then built and benchmarked, and the result retires the headline claim.**
+Preserving a canonical `Dictionary(Int32, Utf8)` on ingress and decoding on egress works exactly
+as designed — `Dataset.schema` still reports `string`, `collect()` still returns `string`, and
+results are correct. Measured at six million rows, best of five, against the same data
+pre-decoded (which is what the old boundary produced):
+
+| query shape | dictionary | plain string | |
+|---|---|---|---|
+| filter + `sum`, 25 x 63-char values | 3.4 ms | 9.6 ms | **2.80x** |
+| filter + `sum`, 1000 x 72-char values | 3.3 ms | 9.1 ms | **2.75x** |
+| filter + `sum`, 25 x 7-char values | 3.2 ms | 3.8 ms | **1.20x** |
+| filter 1/25, return the column | 5.8 ms | 6.3 ms | 1.08x |
+| filter 24/25, return the column | 7.5 ms | 7.0 ms | **0.93x** |
+| `SELECT <string col>`, no filter | 7.4 ms | 4.6 ms | **0.63x** |
+
+So the win is real but it is **1.2x to 2.8x and scales with string length**, not 19.6x — and it
+is a **regression on any query that returns the column rather than consuming it**, because the
+decode moves from the input to the (equally large) output while the engine carries the encoding
+in between. `SELECT a_string_column FROM t` is not a corner case, and a regression there is a
+blocking failure, so the change was reverted rather than shipped.
+
+**What that changes about this item.** It is no longer "flip one decode and collect 19.6x". It
+is a **planner** decision — preserve the encoding only when the plan *consumes* the column
+(filter, group-by, join key) and decode at the leaf when it *projects* it — which is a cost
+model, not a boundary edit. Valued honestly it is worth ~1.2x on TPC-H-shaped short codes and
+~2.8x on long low-cardinality strings, on consuming shapes only. Anything sequenced behind it
+(notably `StringView`, item 2) should be re-argued against those numbers rather than the
+retired one.
+
+The 19.6x itself is not reproducible end to end and should stop being quoted: measured here, a
+plain-string filter over 6M rows costs 3.8 ms, not the 144.9 ms that figure divides into.
 
 ## 7. Adaptive morsel sizing
 

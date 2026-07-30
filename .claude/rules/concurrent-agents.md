@@ -68,6 +68,31 @@ What to do about it:
 - **Re-run before reporting.** A crashed run has no result, not a bad one.
 - If you must run the whole suite, do it right after your own build, and expect to repeat.
 
+### You do not have to wait: build into a sandbox instead
+
+`just build` is what clobbers the shared `.so`. Building the crate does not. So an FFI or
+Rust-side change can be tested end to end, with the real Python suite, while another session
+is mid-run — which otherwise blocks the whole `bc-py` surface for as long as they are active:
+
+```
+cargo build --release -p bc-py --features pyo3/extension-module   # -> target/release/lib_native.so
+SB=<scratchpad>/sandbox && rm -rf $SB && mkdir -p $SB
+git archive HEAD python tests | tar -x -C $SB                     # committed state, not their WIP
+cp target/release/lib_native.so $SB/python/batcher/_native.abi3.so
+PYTHONPATH=$SB/python python -m pytest $SB/tests/differential -q
+```
+
+Three things make this work and are worth keeping: `bc-py`'s `[lib] name = "_native"` is a
+plain `cdylib`, so the file cargo produces *is* the extension module under a different name;
+`git archive HEAD` gives you the committed tree rather than the other session's half-finished
+edits, so their broken imports do not become your test failures; and `PYTHONPATH` wins over the
+installed package, so nothing outside the scratchpad is touched. Confirm you are in the sandbox
+with `bt.versions()["engine_profile"]` and `bt._native.__file__`.
+
+This was used to build, benchmark and then **reject** the dictionary-preserving boundary change
+(`competitor_technique_review.md` item 6) during a session where another agent held 20-27
+pytest processes against the installed `.so` for its entire duration.
+
 The same swap is why a benchmark can silently measure the *other* agent's build: check
 `bt.versions()["engine_profile"]`, which the suite now does for you.
 
