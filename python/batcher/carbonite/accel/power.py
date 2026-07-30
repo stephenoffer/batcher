@@ -12,36 +12,19 @@ and a counter-offer rather than a refusal. The counter-offer is a device count, 
 `ResourceBounds.n_max_parallelism` because that is exactly what it bounds — how many workers
 may hold a device at once.
 
-This module is the one place the envelope is read, so the scheduling grant and the verdict
-cannot disagree about what the budget allows. Two rules keep it safe to leave enabled:
+The envelope itself is read in the neutral layer (`plan.energy.configured_power_envelope`), so
+the scheduling grant Kyber sizes against and the verdict Carbonite returns cannot disagree
+about what the budget allows. Two rules keep this safe to leave enabled:
 an unconfigured budget admits everything, and an unrecognized device model admits everything,
 because clamping a fleet against fabricated watts is worse than not clamping it at all.
 """
 
 from __future__ import annotations
 
-from batcher.config import active_config
-from batcher.plan.energy.power import PowerEnvelope, device_power_watts, max_concurrent_devices
+from batcher.plan.energy.power import configured_power_envelope, device_power_watts
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds
 
-__all__ = ["configured_envelope", "devices_within_budget", "validate_fleet_power"]
-
-
-def configured_envelope(expected_watts: float = 0.0) -> PowerEnvelope:
-    """The deployment's power envelope, with an optional expected draw filled in.
-
-    Args:
-        expected_watts: The draw a caller has estimated for its work, `0.0` when unknown.
-
-    Returns:
-        A `PowerEnvelope`; `unbounded` when no budget is configured, which is the default.
-    """
-    energy = active_config().accelerator.energy
-    return PowerEnvelope(
-        budget_watts=max(0.0, energy.power_budget_watts),
-        expected_watts=max(0.0, expected_watts),
-        headroom_fraction=energy.power_headroom,
-    )
+__all__ = ["devices_within_budget", "validate_fleet_power"]
 
 
 def devices_within_budget(
@@ -63,13 +46,7 @@ def devices_within_budget(
         single device is a misconfiguration to surface with a verdict, not a silent
         zero-device plan.
     """
-    envelope = configured_envelope()
-    if envelope.unbounded or requested <= 0:
-        return requested
-    allowed = max_concurrent_devices(envelope.usable_watts, accelerator_type, utilization)
-    if allowed < 0:
-        return requested  # unknown device: no opinion
-    return max(1, min(requested, allowed))
+    return configured_power_envelope().clamp_devices(requested, accelerator_type, utilization)
 
 
 def validate_fleet_power(
@@ -93,7 +70,7 @@ def validate_fleet_power(
         was modelled from a datasheet rather than measured, which it always is at planning
         time — power admission should steer a plan, never fail a query.
     """
-    envelope = configured_envelope()
+    envelope = configured_power_envelope()
     if envelope.unbounded or devices <= 0:
         return FeasibilityVerdict(feasible=True)
     per_device = device_power_watts(accelerator_type, utilization, include_host=True)

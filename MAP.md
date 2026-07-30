@@ -344,7 +344,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 356 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 366 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -752,10 +752,10 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 172 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `dispatch.py` | 129 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `dispatch.py` | 157 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 173 | The single-key group-by fan-out that predates the plan translator. |
 | `shards.py` | 145 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 162 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 190 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
 

@@ -16,7 +16,12 @@ import pytest
 from batcher._internal.errors import AccessDeniedError
 from batcher._internal.hardware.nvml import DeviceTelemetry
 from batcher.governance import DataResidency, ResidencyCatalog
-from batcher.observe import energy_metrics, format_device_table, format_energy_report
+from batcher.observe import (
+    energy_metrics,
+    format_device_table,
+    format_energy_report,
+    format_fleet_efficiency,
+)
 from batcher.plan.energy import EnergyLedger, GridProfile, StageEnergy
 
 pytestmark = pytest.mark.unit
@@ -165,3 +170,19 @@ def test_device_table_surfaces_a_clamp_and_an_ecc_error() -> None:
     assert "power" in table
     assert "ecc:3" in table
     assert "60/80 GiB" in table
+
+
+def test_fleet_efficiency_needs_two_device_models_to_compare() -> None:
+    assert "nothing to compare" in format_fleet_efficiency(_ledger())
+
+
+def test_fleet_efficiency_ranks_the_cheaper_machine_first() -> None:
+    ledger = EnergyLedger()
+    ledger.record(StageEnergy("A#1", "NVIDIA_H100", 8, 10.0, 0.9, joules=1000.0, tokens=90_000))
+    ledger.record(
+        StageEnergy("A#2", "NVIDIA_TESLA_V100", 8, 10.0, 0.9, joules=1000.0, tokens=20_000)
+    )
+    lines = format_fleet_efficiency(ledger).splitlines()
+    assert lines[0].startswith("NVIDIA_H100")
+    assert "tokens/J" in lines[0]
+    assert lines[1].startswith("NVIDIA_TESLA_V100")

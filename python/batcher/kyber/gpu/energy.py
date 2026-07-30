@@ -101,16 +101,12 @@ def power_bounded_devices(
         single device is a misconfiguration to surface at admission, not a silent zero-device
         plan here.
     """
-    from batcher.plan.energy.power import max_concurrent_devices
+    from batcher.plan.energy.power import configured_power_envelope
 
-    energy = active_config().accelerator.energy
-    if energy.power_budget_watts <= 0 or requested <= 0:
-        return requested
-    usable = energy.power_budget_watts * (1.0 - min(0.9, max(0.0, energy.power_headroom)))
-    allowed = max_concurrent_devices(usable, accelerator_type, utilization)
-    if allowed < 0:
-        return requested  # unknown device: no opinion
-    return max(1, min(requested, allowed))
+    # The same clamp Carbonite admits against, computed once in the neutral layer: the two
+    # subsystems cannot import each other, and a second copy of this arithmetic is how a plan
+    # comes to be sized for one fan-out and granted another.
+    return configured_power_envelope().clamp_devices(requested, accelerator_type, utilization)
 
 
 def stage_joules(

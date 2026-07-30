@@ -29,6 +29,7 @@ from batcher.plan.energy.carbon import (
 )
 from batcher.plan.energy.power import (
     PowerEnvelope,
+    configured_power_envelope,
     device_power_watts,
     energy_joules,
     fleet_power_watts,
@@ -42,6 +43,7 @@ __all__ = [
     "PowerEnvelope",
     "StageEnergy",
     "carbon_grams",
+    "configured_power_envelope",
     "device_power_watts",
     "energy_cost",
     "energy_joules",

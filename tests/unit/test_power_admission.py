@@ -17,13 +17,14 @@ from batcher._internal.device_specs import (
     device_vendor,
     devices_by_generation,
 )
-from batcher.carbonite.accel import (
-    configured_envelope,
-    devices_within_budget,
-    validate_fleet_power,
-)
+from batcher.carbonite.accel import devices_within_budget, validate_fleet_power
 from batcher.config import AcceleratorConfig, Config, EnergyConfig, config_context
-from batcher.plan.energy import EnergyLedger, StageEnergy, merge_ledgers
+from batcher.plan.energy import (
+    EnergyLedger,
+    StageEnergy,
+    configured_power_envelope,
+    merge_ledgers,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -38,7 +39,7 @@ def _budget(watts: float) -> Config:
 
 
 def test_no_budget_admits_everything() -> None:
-    assert configured_envelope().unbounded
+    assert configured_power_envelope().unbounded
     assert validate_fleet_power("NVIDIA_H100", 1024).feasible
     assert devices_within_budget("NVIDIA_H100", 1024) == 1024
 
@@ -71,7 +72,7 @@ def test_headroom_is_charged_against_the_budget() -> None:
         )
     )
     with config_context(tight):
-        assert configured_envelope().usable_watts == pytest.approx(4_500.0)
+        assert configured_power_envelope().usable_watts == pytest.approx(4_500.0)
         assert not validate_fleet_power("NVIDIA_H100", 8).feasible
 
 
@@ -91,8 +92,8 @@ def test_lower_utilization_admits_more_devices() -> None:
 
 def test_the_expected_draw_can_be_carried_on_the_envelope() -> None:
     with config_context(_budget(10_000.0)):
-        assert not configured_envelope(expected_watts=9_999.0).fits()
-        assert configured_envelope(expected_watts=1_000.0).fits()
+        assert not configured_power_envelope(expected_watts=9_999.0).fits()
+        assert configured_power_envelope(expected_watts=1_000.0).fits()
 
 
 # --- mergeable energy ----------------------------------------------------------------------

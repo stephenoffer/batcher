@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import pytest
 
+from batcher.config import AcceleratorConfig, Config, config_context
 from batcher.plan.energy import (
     EnergyLedger,
     GridProfile,
     PowerEnvelope,
     StageEnergy,
     carbon_grams,
+    configured_power_envelope,
     device_power_watts,
     energy_cost,
     energy_joules,
@@ -100,6 +102,46 @@ def test_envelope_passes_an_unknown_expected_draw() -> None:
     # An unsizable plan must not be refused on power grounds — that would fail queries whose
     # hardware this build simply does not recognize.
     assert PowerEnvelope(budget_watts=10.0, expected_watts=0.0).fits()
+
+
+def test_one_clamp_serves_both_subsystems() -> None:
+    # Kyber sizes against this and Carbonite admits against it. A second copy of the
+    # arithmetic is how a plan gets sized for one fan-out and granted another.
+    envelope = PowerEnvelope(budget_watts=10_000.0, headroom_fraction=0.1)
+    assert envelope.devices_that_fit("NVIDIA_H100") == 10
+    assert envelope.clamp_devices(64, "NVIDIA_H100") == 10
+    assert envelope.clamp_devices(4, "NVIDIA_H100") == 4, "a smaller request is left alone"
+
+
+def test_an_unbounded_envelope_has_no_opinion_on_device_count() -> None:
+    assert PowerEnvelope().devices_that_fit("NVIDIA_H100") == -1
+    assert PowerEnvelope().clamp_devices(64, "NVIDIA_H100") == 64
+
+
+def test_an_unknown_device_is_never_clamped() -> None:
+    envelope = PowerEnvelope(budget_watts=100.0)
+    assert envelope.devices_that_fit("MADE_UP") == -1
+    assert envelope.clamp_devices(64, "MADE_UP") == 64
+
+
+def test_a_budget_too_small_for_one_device_still_plans_one() -> None:
+    assert PowerEnvelope(budget_watts=50.0).clamp_devices(8, "NVIDIA_H100") == 1
+
+
+def test_the_configured_envelope_reads_the_active_config() -> None:
+    from batcher.config import EnergyConfig
+
+    assert configured_power_envelope().unbounded
+    cfg = Config().replace(
+        accelerator=AcceleratorConfig(
+            energy=EnergyConfig(power_budget_watts=10_000.0, power_headroom=0.2)
+        )
+    )
+    with config_context(cfg):
+        envelope = configured_power_envelope(expected_watts=500.0)
+    assert envelope.budget_watts == 10_000.0
+    assert envelope.usable_watts == pytest.approx(8_000.0)
+    assert envelope.expected_watts == 500.0
 
 
 def test_kwh_round_trips() -> None:
