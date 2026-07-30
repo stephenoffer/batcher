@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.carbonite.policies.spill_shape import (
     SPILL_BYTES_PER_PARTITION,
@@ -231,13 +232,39 @@ class SpillAdvisor:
         `SPILL_COMPRESS_ABOVE` of measured peak, trading CPU for fewer bytes pays; below it
         the CPU is not worth it. Compression is lossless, so this is a pure throughput lever.
 
+        The size rule is only half of it: whether the trade pays is also a question about the
+        *device*. On local flash the codec is the bottleneck; on a network volume at a tenth
+        of that bandwidth every byte not written is time not spent, and a state well under the
+        size threshold is still worth compressing. The device's measured class supplies that
+        half.
+
         Args:
             plan: The physical plan about to be spilled.
 
         Returns:
             The decision, or `None` for an un-sized plan (keep the configured default).
         """
-        return should_compress(self.peak_bytes(plan))
+        return should_compress(self.peak_bytes(plan), self._spill_device_factor())
+
+    def _spill_device_factor(self) -> float:
+        """What a byte costs on the device this query will spill to, against local flash.
+
+        Resolved the same three ways the spill paths resolve their directory — configured
+        root, measured local scratch, system tempdir — so the policy and the write agree about
+        which disk is being reasoned about. `1.0` on anything unidentified, which is the
+        size-only behaviour this had before.
+        """
+        import tempfile
+
+        from batcher._internal.hardware.storage import device_cost_factor
+        from batcher._internal.site import local_scratch_root
+
+        try:
+            target = self._config.memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
+            return device_cost_factor(target)
+        except Exception as exc:  # pragma: no cover - a probe must never break spilling
+            note_suppressed("carbonite", "read the spill device class", exc)
+            return 1.0
 
     def soft_budget(self) -> int:
         """Bytes a query aims to stay under (the admission/throttle threshold)."""

@@ -20,40 +20,20 @@ from __future__ import annotations
 
 import tempfile
 
-from batcher._internal.hardware import device_class
+from batcher._internal.hardware.storage import (
+    SPILL_DEVICE_FACTOR,
+    SPILL_DEVICE_FACTOR_DEFAULT,
+    device_cost_factor,
+)
 from batcher.config import active_config
 
 __all__ = ["SPILL_DEVICE_FACTOR", "SPILL_DEVICE_FACTOR_DEFAULT", "spill_device_factor"]
 
-# What a spilled byte costs relative to one on local flash, by the class of device it lands on.
-#
-# **Local flash is the omitted baseline, because that is where the spill cost term was
-# calibrated.** This table only ever charges *more*, and only where a device was positively
-# identified as slower than that baseline. A class nobody could read keeps the factor the model
-# has always used, so an unreadable `/sys` re-ranks no plan: a measurement moves a decision
-# here, never the absence of one.
-#
-# The multipliers are conservative ratios of sustained sequential throughput.
-SPILL_DEVICE_FACTOR = {
-    # Roughly a tenth of local flash's bandwidth, with request latency on top.
-    "network": 10.0,
-    # An order of magnitude worse again once access stops being purely sequential, which an
-    # external merge's concurrent run reads guarantee.
-    "rotational": 30.0,
-    # A file-backed device: the host filesystem's own cost plus a layer of indirection.
-    "loopback": 2.0,
-}
-
-# Every other class — `nvme`, `ssd`, `raid`, `mapped`, `memory`, and `unknown`. Local flash is
-# the calibration point, and an unidentified device is left at it rather than guessed at, so
-# this model is a strict refinement of the constant it replaces rather than a re-tuning of it.
-#
-# `memory` (a tmpfs spill target) belongs here too, and deliberately: it is genuinely fast, so
-# costing it as slow would be a lie. It is also a trap — spilling to RAM relieves no memory
-# pressure at all — but that is a *feasibility* question for Carbonite, not a ranking question
-# for the cost model, and encoding the warning as a fake throughput number would bury it in the
-# one place nobody reads.
-SPILL_DEVICE_FACTOR_DEFAULT = 1.0
+# The device-class cost table lives at layer 0 (`_internal.hardware.storage`), not here.
+# Carbonite needs the same figures to decide whether compressing a spilled byte pays, and the
+# two subsystems are forbidden to import each other — so the fact sits below both rather than
+# being pasted into each. Re-exported under the names this module has always published, so a
+# caller and the surface diff see no change.
 
 
 def spill_device_factor() -> float:
@@ -66,8 +46,9 @@ def spill_device_factor() -> float:
     it lands on the node's NVMe — a factor of ten in the wrong direction on exactly the
     machines where an out-of-core plan is worth ranking carefully.
 
-    Cheap enough for the planning path: `device_class` memoizes per resolved directory, so this
-    costs one `stat` the first time a process plans a spilling query and a dict lookup after.
+    Cheap enough for the planning path: the device probe behind it memoizes per resolved
+    directory, so this costs one `stat` the first time a process plans a spilling query and a
+    dict lookup after.
 
     Examples:
         .. doctest::
@@ -82,4 +63,4 @@ def spill_device_factor() -> float:
     from batcher._internal.site import local_scratch_root
 
     spill_dir = active_config().memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
-    return SPILL_DEVICE_FACTOR.get(device_class(spill_dir), SPILL_DEVICE_FACTOR_DEFAULT)
+    return device_cost_factor(spill_dir)

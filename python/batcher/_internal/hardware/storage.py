@@ -21,7 +21,10 @@ import functools
 import os
 
 __all__ = [
+    "SPILL_DEVICE_FACTOR",
+    "SPILL_DEVICE_FACTOR_DEFAULT",
     "device_class",
+    "device_cost_factor",
 ]
 
 # Device-name prefixes that identify a class without any /sys lookup. Ordered longest-first so
@@ -105,3 +108,48 @@ def device_class(path: str) -> str:
     if rotational is None:
         return "unknown"
     return "rotational" if rotational else "ssd"
+
+
+# What a byte written to a device class costs relative to one on local flash.
+#
+# **Local flash is the omitted baseline**, because that is where every spill constant in this
+# engine was calibrated. This table only ever charges *more*, and only where a device was
+# positively identified as slower than that baseline: a class nobody could read keeps the
+# factor the callers have always used, so an unreadable `/sys` re-ranks no plan and re-tunes
+# no policy. The multipliers are conservative ratios of sustained sequential throughput.
+#
+# It lives here, at layer 0 beside `device_class`, because *two* subsystems need it and they
+# are forbidden to import each other: Kyber prices a spilled byte with it, and Carbonite
+# decides whether compressing that byte pays. Copy-paste is the only wrong way to share
+# between them, so the fact and its scale sit below both.
+SPILL_DEVICE_FACTOR: dict[str, float] = {
+    # Roughly a tenth of local flash's bandwidth, with request latency on top.
+    "network": 10.0,
+    # An order of magnitude worse again once access stops being purely sequential, which an
+    # external merge's concurrent run reads guarantee.
+    "rotational": 30.0,
+    # A file-backed device: the host filesystem's own cost plus a layer of indirection.
+    "loopback": 2.0,
+}
+
+# Every other class — `nvme`, `ssd`, `raid`, `mapped`, `memory`, and `unknown`. An
+# unidentified device is left at the calibration point rather than guessed at.
+#
+# `memory` (a tmpfs target) belongs here too, and deliberately: it is genuinely fast, so
+# costing it as slow would be a lie. That it relieves no memory pressure at all is a
+# *feasibility* question for whoever chose the directory, not a throughput one, and encoding
+# the warning as a fake bandwidth number would bury it where nobody reads.
+SPILL_DEVICE_FACTOR_DEFAULT = 1.0
+
+
+def device_cost_factor(path: str) -> float:
+    """How much a byte written under `path` costs relative to one on local flash.
+
+    Args:
+        path: Any path on the filesystem in question; it need not exist.
+
+    Returns:
+        The multiplier, at least 1.0. `1.0` for local flash, for an unidentified device, and
+        off Linux — a measurement moves a decision here, never the absence of one.
+    """
+    return SPILL_DEVICE_FACTOR.get(device_class(path), SPILL_DEVICE_FACTOR_DEFAULT)

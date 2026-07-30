@@ -337,7 +337,12 @@ def test_the_spill_cost_model_prices_the_disk_the_engine_will_actually_use(monke
     from batcher.kyber import storage_cost
 
     seen: list[str] = []
-    monkeypatch.setattr(storage_cost, "device_class", lambda path: seen.append(path) or "network")
+    # Pinned where the probe lives: the class table moved to layer 0 so Carbonite could read
+    # the same figures without importing Kyber.
+    monkeypatch.setattr(
+        "batcher._internal.hardware.storage.device_class",
+        lambda path: seen.append(path) or "network",
+    )
     monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: "/ephemeral")
     assert storage_cost.spill_device_factor() == storage_cost.SPILL_DEVICE_FACTOR["network"]
     assert seen == ["/ephemeral"]

@@ -136,11 +136,32 @@ def envelope_shortfall(basis: int, envelope_bytes: int) -> int:
     return max(0, per_bucket - envelope_bytes)
 
 
-def should_compress(peak: int) -> bool | None:
-    """Whether a spilled state of `peak` bytes is large enough to pay for compression.
+#: Device cost factor at or above which the disk, not the CPU, is the binding constraint.
+#:
+#: Compression trades CPU for bytes, so whether it pays is a question about the *device*, not
+#: only about the size of the state. On local flash at several gigabytes a second the codec is
+#: the bottleneck and a small state should go straight down. On a network volume at a tenth of
+#: that — the class this factor names — every byte not written is time not spent, and the
+#: trade pays at any size worth spilling. Two is the smallest factor that is unambiguously not
+#: local flash (`loopback`), which keeps this from firing on a device merely measured
+#: imprecisely.
+_COMPRESS_DEVICE_FACTOR = 2.0
+
+#: Below this a state is too small for the device argument to matter either: the whole spill
+#: is a handful of buffers and the codec's own setup dominates. Deliberately far under
+#: `SPILL_COMPRESS_ABOVE`, since the point of the device term is to compress states that rule
+#: would have written raw.
+_COMPRESS_DEVICE_FLOOR = 64 << 20
+
+
+def should_compress(peak: int, device_factor: float = 1.0) -> bool | None:
+    """Whether a spilled state of `peak` bytes is worth compressing on this device.
 
     Args:
         peak: The learned-blended peak working-set bytes for the plan.
+        device_factor: What a byte costs on the spill device relative to local flash, from
+            `hardware.storage.device_cost_factor`. `1.0` — local flash, and every device that
+            could not be identified — keeps the size-only rule this had before.
 
     Returns:
         The decision, or `None` for an un-sized plan so the caller keeps the configured
@@ -148,4 +169,8 @@ def should_compress(peak: int) -> bool | None:
     """
     if peak <= 0:
         return None
+    if device_factor >= _COMPRESS_DEVICE_FACTOR and peak >= _COMPRESS_DEVICE_FLOOR:
+        # The disk is the bottleneck, so the CPU the codec costs is CPU that would otherwise
+        # be waiting on it.
+        return True
     return peak >= SPILL_COMPRESS_ABOVE
