@@ -59,7 +59,9 @@ class HealthThresholds:
 
     Attributes:
         max_temperature_c: Above this the device is degraded even without a driver clamp,
-            because it is about to be clamped.
+            because it is about to be clamped. A *ceiling*: where the driver publishes the
+            part's own slowdown point, the lower of the two applies, so a part that clamps at
+            83 is not judged against a fleet-wide 87 it never reaches.
         quarantine_below_derate: Derate at or below which a degraded device stops being
             scheduled at all. A device contributing a quarter of a healthy one while drawing
             most of its power is worth taking out; one contributing half is not.
@@ -110,6 +112,11 @@ class HealthVerdict:
         return self.state != "quarantine"
 
 
+#: How far below a device's own slowdown point it is called hot. Five degrees is roughly a
+#: minute of headroom on a device under load, which is the difference between a scheduler
+#: that can shed work before the clamp and one that learns about it afterwards.
+_THERMAL_MARGIN_C = 5.0
+
 #: Throttle reasons that indicate a *hardware* problem rather than a policy cap. A power cap is
 #: the datacenter's own limit doing exactly what it was set to do; a hardware thermal slowdown
 #: is the device protecting itself, which means cooling has already failed.
@@ -151,7 +158,16 @@ def assess_device(
     if "power" in clamps or "sw_thermal" in clamps:
         reasons.append("power_clamp")
         derate = min(derate, 0.75)
-    if telemetry.temperature_c > th.max_temperature_c:
+    # The device's own slowdown point where it published one, and the configured ceiling
+    # otherwise. A constant cannot serve a mixed fleet: the threshold differs by tens of
+    # degrees across parts, so one figure is too strict on some and too lax on others — and
+    # "too lax" means the warning arrives after the clamp it existed to precede. A margin
+    # below the slowdown point is what makes this a warning rather than a restatement of
+    # `thermal_throttle`, which already fires once the clamp is on.
+    hot_at = th.max_temperature_c
+    if telemetry.slowdown_temperature_c > 0.0:
+        hot_at = min(hot_at, telemetry.slowdown_temperature_c - _THERMAL_MARGIN_C)
+    if telemetry.temperature_c > hot_at:
         reasons.append("hot")
         derate = min(derate, 0.75)
     if telemetry.memory_total_bytes > 0:

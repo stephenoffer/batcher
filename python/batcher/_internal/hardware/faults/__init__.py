@@ -6,7 +6,7 @@ has fallen off the bus, double-bit-faulted its memory, or exhausted its spare me
 still enumerated, still reports a temperature, and still accepts work. It is the single most
 expensive thing a scheduler can keep feeding.
 
-Two sources, because no one source has it all:
+Three sources, because no one source has it all:
 
 * `xid` — the driver's own error events, scraped from the kernel log. Xid is the only place a
   double-bit ECC fault, a fallen-off-the-bus device, or a GPU that stopped responding is
@@ -14,6 +14,10 @@ Two sources, because no one source has it all:
 * `counters` — NVML's remapped-row and retired-page accounting, plus the PCIe replay counter.
   These are the *predictive* signals: a device with pending row remaps needs a reset, and one
   with a remap failure has run out of spares and needs replacing.
+* `modes` — the settings a device arrived configured with. ECC off, persistence off, an
+  exclusive compute mode, or a power limit at the part's floor each cost throughput or
+  correctness without raising anything, and on a rented node they are whatever the last
+  tenant left behind.
 
 Both degrade to "nothing reported" without the driver, without permission to read the kernel
 log, and off Linux. A caller cannot distinguish "healthy" from "unreadable" by the values
@@ -30,6 +34,11 @@ from batcher._internal.hardware.faults.counters import (
     device_faults,
     faulted_devices,
 )
+from batcher._internal.hardware.faults.modes import (
+    DeviceModes,
+    device_modes,
+    misconfigured_devices,
+)
 from batcher._internal.hardware.faults.xid import (
     XID_DESCRIPTIONS,
     XID_FATAL,
@@ -44,10 +53,13 @@ __all__ = [
     "XID_DESCRIPTIONS",
     "XID_FATAL",
     "DeviceFaults",
+    "DeviceModes",
     "XidEvent",
     "describe_xid",
     "device_faults",
+    "device_modes",
     "faulted_devices",
+    "misconfigured_devices",
     "recent_xid_events",
     "xid_fatal",
     "xid_readable",

@@ -28,10 +28,11 @@ def _device_rows() -> list[dict]:
     """Per-device rows: nameplate figures for what is attached, live readings where available."""
     from batcher._internal.device_specs import device_spec, resolve_device_name
     from batcher._internal.hardware import device_telemetry, gpu_inventory
-    from batcher._internal.hardware.faults import device_faults
+    from batcher._internal.hardware.faults import device_faults, device_modes
 
     live = {d.index: d for d in device_telemetry()}
     faults = {f.index: f for f in device_faults()}
+    modes = {m.index: m for m in device_modes()}
     rows: list[dict] = []
     for index, device in enumerate(gpu_inventory()):
         name = str(device.get("name") or "")
@@ -62,6 +63,7 @@ def _device_rows() -> list[dict]:
                 row["ecc_uncorrected"] = reading.ecc_uncorrected
         _add_measured_link(row, index)
         _add_faults(row, faults.get(index))
+        _add_modes(row, modes.get(index))
         rows.append(row)
     return rows
 
@@ -100,6 +102,17 @@ def _add_faults(row: dict, faults) -> None:
         row["remapped_uncorrectable"] = faults.remapped_uncorrectable
     if faults.pcie_replay:
         row["pcie_replay"] = faults.pcie_replay
+
+
+def _add_modes(row: dict, modes) -> None:
+    """Add the device's configuration, where it is costing something.
+
+    Only the findings. A well-configured device contributes nothing here, which is what keeps
+    the row readable and makes the day it says `ecc_disabled` worth noticing.
+    """
+    if modes is None or not modes.findings:
+        return
+    row["config"] = list(modes.findings)
 
 
 def accelerators() -> dict:
@@ -203,6 +216,25 @@ def _add_fleet_health(fleet: dict) -> None:
     }
 
 
+#: What each configuration finding means and what to do about it. Spelled out rather than
+#: printed as a reason code, because the reader of this report is an operator deciding whether
+#: to reconfigure a node, and `ecc_disabled` on its own does not say why that matters.
+_CONFIG_ADVICE = {
+    "ecc_disabled": "ECC is OFF: an uncorrectable memory error will not be reported at all",
+    "compute_mode_exclusive_process": (
+        "compute mode is exclusive: a second worker cannot open this device"
+    ),
+    "compute_mode_exclusive_thread": (
+        "compute mode is exclusive: a second worker cannot open this device"
+    ),
+    "compute_mode_prohibited": "compute mode is prohibited: no process can use this device",
+    "power_at_floor": "power limit is at the part's floor: the device is permanently clamped",
+    "persistence_off": (
+        "persistence mode is off: every task pays the driver's device initialization again"
+    ),
+}
+
+
 def _show_silent_faults(devices: list[dict]) -> None:
     """Call out, by device, the conditions that cost throughput without costing correctness.
 
@@ -221,6 +253,8 @@ def _show_silent_faults(devices: list[dict]) -> None:
             print(f"gpu {row['index']}  memory row remapping has FAILED: device needs replacing")
         elif row.get("reset_pending"):
             print(f"gpu {row['index']}  memory repair pending: schedule a device reset")
+        for finding in row.get("config", ()):
+            print(f"gpu {row['index']}  {_CONFIG_ADVICE.get(finding, finding)}")
 
 
 def _add_site(report: dict) -> None:
@@ -256,6 +290,13 @@ def _add_fabric(report: dict) -> None:
     fabric: dict = {}
     rdma = rdma_summary()
     if rdma["ports"]:
+        from batcher._internal.hardware.fabric import fabric_error_total
+
+        errors = fabric_error_total()
+        # Only when non-zero. A clean fabric's counters are a row of zeros, and printing them
+        # trains a reader to skip the section that matters on the day they are not zero.
+        if any(errors.values()):
+            rdma["errors"] = {k: v for k, v in errors.items() if v}
         fabric["rdma"] = rdma
     nvlink = nvlink_summary()
     if nvlink["links"]:

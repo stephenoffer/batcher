@@ -78,6 +78,11 @@ class DeviceTelemetry:
         throttle_reasons: Active clock-clamping reasons (`"thermal"`, `"power"`, `"hw_slowdown"`,
             `"sw_thermal"`, `"sync_boost"`), empty when the device is running unclamped.
         graphics_clock_mhz: Current graphics clock.
+        slowdown_temperature_c: The temperature at which *this part* starts clamping itself,
+            as the driver reports it, `0.0` when unreported. A constant cannot stand in for
+            it: the threshold differs by tens of degrees across the parts one fleet runs, so
+            a fixed figure is simultaneously too strict on one and too lax on another — and
+            "too lax" means the warning arrives after the clamp it was supposed to precede.
     """
 
     index: int
@@ -93,6 +98,7 @@ class DeviceTelemetry:
     ecc_uncorrected: int = 0
     throttle_reasons: tuple[str, ...] = ()
     graphics_clock_mhz: int = 0
+    slowdown_temperature_c: float = 0.0
 
     @property
     def memory_free_bytes(self) -> int:
@@ -259,6 +265,12 @@ def device_telemetry() -> tuple[DeviceTelemetry, ...]:
                 ),
                 throttle_reasons=_throttle_reasons(nv, handle),
                 graphics_clock_mhz=int(_read(lambda h=handle: nv.nvmlDeviceGetClockInfo(h, 0), 0)),
+                # `NVML_TEMPERATURE_THRESHOLD_SLOWDOWN` (1): the point the driver itself starts
+                # clamping at, which is the only threshold that means the same thing on every
+                # part in a mixed fleet.
+                slowdown_temperature_c=float(
+                    _read(lambda h=handle: nv.nvmlDeviceGetTemperatureThreshold(h, 1), 0) or 0
+                ),
             )
         )
     return tuple(out)
