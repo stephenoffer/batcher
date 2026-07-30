@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 944 Python modules across 146 packages and 180 Rust files across 13 crates.
+Covering 945 Python modules across 146 packages and 180 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -163,7 +163,7 @@ The public, fluent, lazy, expression-first API surface.
 | module | lines | what it is |
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
-| `executors.py` | 317 | Execution strategies and their registry (the conductor's wiring). |
+| `executors.py` | 361 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 697 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
@@ -659,10 +659,10 @@ Subquery handling and decorrelation for the SQL translator.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 1337 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 625 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_join.py` | 372 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
-| `flight_sort.py` | 359 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
-| `flight_window.py` | 175 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 629 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
+| `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
+| `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1132 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 187 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
@@ -700,7 +700,8 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 
 | module | lines | what it is |
 |---|---|---|
-| `_sources.py` | 498 | Shared partitioning + post-breaker helpers for the distributed operators. |
+| `_sources.py` | 468 | Shared partitioning + post-breaker helpers for the distributed operators. |
+| `assignment.py` | 188 | How a source's splits are divided among the workers — the three assignment strategies. |
 | `folds.py` | 89 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 80 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
@@ -730,7 +731,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 | `_fleet.py` | 476 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
 | `plan_id.py` | 155 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
-| `source.py` | 170 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
+| `source.py` | 193 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -1204,7 +1205,7 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 
 | module | lines | what it is |
 |---|---|---|
-| `lifecycle.py` | 93 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
+| `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
 | `locality.py` | 117 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `placement.py` | 106 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 448 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
