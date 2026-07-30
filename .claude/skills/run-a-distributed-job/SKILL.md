@@ -163,6 +163,37 @@ when attaching). Per-worker memory is not a knob: it derives from the *worker no
 worker. Flight has **no port setting** — the shuffle server binds an ephemeral port and
 advertises the Ray node IP, so open the node-to-node range rather than hunting a `flight_port`.
 
+## On a GPU fleet
+
+Four controls exist for a cluster whose scarce resource is accelerators rather than cores, all
+of them off or unbounded by default so a fleet that configures nothing behaves as before.
+`config.accelerator` is where they live (`docs/configuration/accelerator.md`), and
+`docs/user-guide/gpu-fleets.md` is the walkthrough.
+
+- **Power binds before slots.** `accelerator.energy.power_budget_watts` clamps GPU fan-out to
+  what a rack can actually power — ten 700 W devices on a 10 kW circuit, not the sixteen its
+  slots hold. Exceeding a real budget does not fail; the driver clamps every device in the
+  zone, which reads as the whole rack getting slower for no visible reason.
+- **A collective must not span a fabric.** Placement is already STRICT_PACK for a
+  `gpu_collective` stage, but STRICT_PACK cannot make a node wider than its NVLink domain. A
+  world size above the widest domain is logged with both numbers. Label nodes with
+  `batcher.io/rack`, `batcher.io/fabric`, and `batcher.io/power-zone` so the topology is
+  readable; unlabelled, every topology decision degrades to the node-level one it made before.
+- **Residency constrains placement, not just storage.** `governance.ResidencyCatalog` states
+  which regions a dataset may be *computed* in, and `dist...fabric.permitted_nodes` filters the
+  fleet to the nodes every input permits. Start in `advisory` mode: `strict` refuses, and the
+  first strict run of a large pipeline fails somewhere nobody predicted.
+- **Energy is measured and mergeable.** `core.energy.measure_stage` records what a stage drew,
+  marking whether the figure came from a device reading or a datasheet, and `merge_ledgers`
+  folds per-worker ledgers into one figure equal to the single-node one. Report it with
+  `observe.format_energy_report`; the idle share is the number to act on.
+
+Two failure modes worth naming, because neither surfaces as an error: a device the driver has
+clamped runs at a fraction of its rate with the job's own timings as the only symptom
+(`ml.devices.device_feed_advice` separates that from a starved pipeline), and a device
+reporting uncorrectable ECC errors returns wrong tensors (health checking quarantines it, but
+it is opt-in because it needs `pynvml` on every worker).
+
 ## Failures and retries
 
 - **A preempted worker recomputes its partition** from its durable input. That makes
@@ -221,6 +252,8 @@ distributed one.
 - `docs/integrations/ray.md`; `docs/architecture/{execution,fault-tolerance}.md`;
   `docs/configuration/options.md` (every knob named above).
 - `docs/deep-dives/{shuffle-flight,distributed-scheduling,credit-flow-control,spilling,mergeable-algebra}.md`.
+- `docs/user-guide/gpu-fleets.md` and `docs/configuration/accelerator.md` for a GPU fleet's
+  power budget, fabric-aware placement, device health, and data residency.
 - `docs/benchmarks/{scaling,vs-spark}.md` — the Spark page is an architectural argument and
   publishes **no** head-to-head timings; do not quote it as a measurement.
 - Skills: `write-a-batcher-pipeline`, `optimize-a-slow-query`, `debug-a-batcher-query`,

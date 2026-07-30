@@ -45,14 +45,20 @@ from batcher.carbonite.accel.mig import (
     smallest_profile_for,
 )
 from batcher.carbonite.accel.power import (
-    configured_envelope,
     devices_within_budget,
     validate_fleet_power,
 )
-from batcher.carbonite.accel.vram import DEFAULT_HEADROOM, VramPool, VramReservation
+from batcher.carbonite.accel.vram import (
+    DEFAULT_HEADROOM,
+    SPILL_TIERS,
+    VramPool,
+    VramReservation,
+    spill_tier,
+)
 
 __all__ = [
     "DEFAULT_HEADROOM",
+    "SPILL_TIERS",
     "HealthThresholds",
     "HealthVerdict",
     "KvCacheBudget",
@@ -62,7 +68,6 @@ __all__ = [
     "VramReservation",
     "assess_device",
     "assess_fleet",
-    "configured_envelope",
     "configured_thresholds",
     "devices_within_budget",
     "kv_bytes_per_token",
@@ -74,5 +79,6 @@ __all__ = [
     "schedulable_device_count",
     "schedulable_devices",
     "smallest_profile_for",
+    "spill_tier",
     "validate_fleet_power",
 ]

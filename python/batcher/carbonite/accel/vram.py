@@ -31,7 +31,12 @@ from dataclasses import dataclass, field
 
 from batcher._internal.errors import ResourceError
 
-__all__ = ["VramPool", "VramReservation"]
+__all__ = ["SPILL_TIERS", "VramPool", "VramReservation", "spill_tier"]
+
+#: Where a working set that will not fit device memory should go, in order of cost. Device
+#: memory is roughly an order of magnitude faster than the host bus and two more than disk, so
+#: the tiers are not interchangeable and the choice is worth making deliberately.
+SPILL_TIERS = ("device", "host", "disk")
 
 #: Fraction of a device held back from reservation by default: CUDA context (~0.5-1 GiB),
 #: allocator fragmentation, and activation peaks a declared model footprint never includes.
@@ -206,3 +211,27 @@ class VramPool:
             "peak_bytes": float(sum(self.peak_bytes(d) for d in devices)),
             "max_pressure": max((self.pressure(d) for d in devices), default=0.0),
         }
+
+
+def spill_tier(nbytes: int, pool: VramPool, *, device: int = 0, host_free_bytes: int = 0) -> str:
+    """Where a working set of `nbytes` should live, given what the device has left.
+
+    The device-memory analogue of the host spill decision, and it matters more here because
+    the tiers are further apart: device memory is roughly an order of magnitude faster than the
+    host bus, and the host bus two more than disk. A KV cache or an embedding table that will
+    not fit a device is not automatically a disk problem — pinned host memory is often the
+    right tier, and it is the one a bare "does it fit VRAM" check never considers.
+
+    Args:
+        nbytes: Bytes the working set needs.
+        pool: The pool governing the device.
+        device: Device index.
+        host_free_bytes: Host memory available to hold the spill; `0` means unknown, which
+            routes to disk rather than assuming the host can absorb it.
+
+    Returns:
+        One of `SPILL_TIERS`.
+    """
+    if nbytes <= 0 or pool.fits(nbytes, device):
+        return "device"
+    return "host" if 0 < nbytes <= host_free_bytes else "disk"

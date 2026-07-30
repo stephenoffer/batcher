@@ -146,6 +146,11 @@ exclude_patterns = [
     "internals/snowflake_parity.md",
     "internals/anyscale_parity.md",
     "internals/orchestration_parity.md",
+    # The record of the GPU-datacenter alignment program: what landed, the rules it followed,
+    # and an explicit register of what it did not do (no Rust data-plane work, no measurement
+    # on real GPU hardware). A working document for contributors, and the "what we did not do"
+    # register is exactly what a published page must not carry.
+    "internals/gpu_datacenter_program.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",

@@ -27,7 +27,12 @@ if TYPE_CHECKING:
     from batcher._internal.hardware.nvml import DeviceTelemetry
     from batcher.plan.energy import EnergyLedger, GridProfile
 
-__all__ = ["energy_metrics", "format_device_table", "format_energy_report"]
+__all__ = [
+    "energy_metrics",
+    "format_device_table",
+    "format_energy_report",
+    "format_fleet_efficiency",
+]
 
 
 def _si(joules: float) -> str:
@@ -152,3 +157,45 @@ def format_device_table(readings: Sequence[DeviceTelemetry] | None = None) -> st
             f"{memory:>12}  {d.temperature_c:>4.0f}C  {state}"
         )
     return "\n".join(rows)
+
+
+def format_fleet_efficiency(ledger: EnergyLedger) -> str:
+    """Work per joule by device model, so a mixed fleet can be compared against itself.
+
+    The question a heterogeneous fleet asks and a total cannot answer: which of these devices
+    is actually the cheaper machine to run for this workload. A newer part drawing 40% more
+    power while doing 2.5x the work wins, and only a per-device ratio says so.
+
+    Args:
+        ledger: The run's energy ledger.
+
+    Returns:
+        One line per device model, ordered most efficient first, or a note when the ledger
+        holds a single device model (nothing to compare) or none at all.
+    """
+    rows: dict[str, tuple[float, int, int]] = {}
+    for stage in ledger.stages:
+        if not stage.accelerator_type:
+            continue
+        joules, rows_, tokens = rows.get(stage.accelerator_type, (0.0, 0, 0))
+        rows[stage.accelerator_type] = (
+            joules + stage.joules,
+            rows_ + stage.rows,
+            tokens + stage.tokens,
+        )
+    if len(rows) < 2:
+        return "fleet efficiency: one device model (nothing to compare)"
+
+    def rate(entry: tuple[float, int, int]) -> float:
+        joules, rows_, tokens = entry
+        work = tokens or rows_
+        return work / joules if joules > 0 and work > 0 else 0.0
+
+    lines = []
+    for device, entry in sorted(rows.items(), key=lambda kv: (-rate(kv[1]), kv[0])):
+        joules, rows_, tokens = entry
+        unit = "tokens" if tokens else "rows"
+        value = rate(entry)
+        measure = f"{value:,.1f} {unit}/J" if value > 0 else "no work recorded"
+        lines.append(f"{device:<24}  {_si(joules):>10}  {measure}")
+    return "\n".join(lines)
