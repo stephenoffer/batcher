@@ -176,8 +176,20 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
     // reader falls back to PyArrow, the symptom is a scan that is quietly slower rather than
     // one that fails. Credentials (`access_key`), addressing style
     // (`force_virtual_addressing`) and the timeouts were all being dropped that way.
+    // Only an S3-family URL gets the `aws_*` translations. The env reader above is already
+    // per-scheme and its test says why: an `aws_*` key on a GCS store is not merely useless,
+    // it makes the cache key differ for no reason, so two identical stores are built and
+    // credential resolution runs twice. The query path had been translating regardless.
+    let s3_family = matches!(scheme, "s3" | "s3a");
     for (k, v) in url.query_pairs() {
         let (k, v) = (k.to_string(), v.to_string());
+        if !s3_family {
+            // A non-S3 scheme keeps whatever the caller wrote; `object_store` ignores a key
+            // it does not know, which is the same outcome as translating it wrongly minus the
+            // spurious cache entry.
+            opts.push((k, v));
+            continue;
+        }
         match k.as_str() {
             "region" => opts.push(("aws_region".into(), v)),
             "endpoint" | "endpoint_override" => {
@@ -333,6 +345,21 @@ mod tests {
         // number would be rejected and the option lost.
         assert_eq!(opts.get("connect_timeout").map(String::as_str), Some("5s"));
         assert_eq!(opts.get("timeout").map(String::as_str), Some("90s"));
+    }
+
+    /// An `aws_*` key on a GCS or Azure store is not merely useless: it changes the cache key,
+    /// so two identical stores are built and the credential chain resolves twice. The
+    /// environment reader was already per-scheme; the query-string path was not.
+    #[test]
+    fn the_aws_translations_do_not_leak_onto_other_schemes() {
+        let gs = opts_for("gs://bucket/key.parquet?region=eu-west-1&access_key=AK");
+        assert!(!gs.contains_key("aws_region"));
+        assert!(!gs.contains_key("aws_access_key_id"));
+        // The caller's own spelling survives, and object_store ignores what it does not know.
+        assert_eq!(gs.get("region").map(String::as_str), Some("eu-west-1"));
+
+        let s3 = opts_for("s3://bucket/key.parquet?region=eu-west-1");
+        assert_eq!(s3.get("aws_region").map(String::as_str), Some("eu-west-1"));
     }
 
     /// A duration that already carries a unit is passed through rather than re-suffixed.
