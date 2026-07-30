@@ -148,14 +148,18 @@ def _translated(plan: LogicalPlan, sources: list[Source], gpu_count: int, decisi
             pa.Table.from_batches(lb), pa.Table.from_batches(rb), lops, rops, join_ir, ops
         )
 
-    # A `[ops] over Union(chains)` — concat (+ optional dedup) + a chain — on one GPU, which
-    # reads every input itself.
+    # A `[ops] over Union(chains)` — concat (+ optional dedup) + a chain. A `UNION ALL` shards
+    # each of its inputs across every device; anything else runs on one GPU, which reads every
+    # input itself.
     union_spec = gpu_union_spec(plan)
     if union_spec is not None:
         inputs, distinct, ops = union_spec
-        on_worker = gpu_union_on_worker(
-            [sources[sc.source_id] for sc, _ in inputs], [o for _, o in inputs], distinct, ops
-        )
+        usources = [sources[sc.source_id] for sc, _ in inputs]
+        input_ops = [o for _, o in inputs]
+        fanned = _try_sharded_union(usources, input_ops, distinct, ops, gpu_count, decision)
+        if fanned is not None:
+            return fanned
+        on_worker = gpu_union_on_worker(usources, input_ops, distinct, ops)
         if on_worker is not None:
             return on_worker
         read = [(list(sources[sc.source_id].read()), iops) for sc, iops in inputs]
@@ -258,6 +262,27 @@ def _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count: int, dec
             lops,
             rops,
             join_ir,
+            ops,
+            gpu_count=live,
+            sharded=decision.distributed,
+        ),
+    )
+
+
+def _try_sharded_union(usources, input_ops, distinct, ops, gpu_count: int, decision):
+    """Fan a `UNION ALL` out across the cluster's GPUs, or `None`.
+
+    A deduplicating union declines inside the fan-out rather than here, so the rule about why
+    lives beside the algebra that cannot honour it."""
+    from batcher.dist.gpu import sharded_gpu_union
+
+    return _with_gpu_capacity(
+        gpu_count,
+        decision,
+        lambda live: sharded_gpu_union(
+            usources,
+            input_ops,
+            distinct,
             ops,
             gpu_count=live,
             sharded=decision.distributed,

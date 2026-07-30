@@ -18,6 +18,7 @@ from batcher.dist.gpu.groupby import dispatch_gpu_aggregate, distributed_gpu_agg
 from batcher.dist.gpu.join import sharded_gpu_join
 from batcher.dist.gpu.shards import measured_parts
 from batcher.dist.gpu.tasks import gpu_task_options, gpu_task_runtime_env
+from batcher.dist.gpu.union import sharded_gpu_union
 
 __all__ = [
     "dispatch_gpu_aggregate",
@@ -30,4 +31,5 @@ __all__ = [
     "measured_parts",
     "sharded_gpu_aggregate",
     "sharded_gpu_join",
+    "sharded_gpu_union",
 ]
