@@ -344,7 +344,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 463 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 472 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 446 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -685,7 +685,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1168 | The shared Arrow Flight shuffle worker actor. |
-| `shuffle_io.py` | 196 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
+| `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
 | `window_stream.py` | 243 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window. |
@@ -1307,7 +1307,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `base.py` | 83 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 241 | Measuring what a stage drew — Core's half of the energy loop. |
 | `executor.py` | 245 | The Core local executor. |
-| `gpu_transform.py` | 244 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
+| `gpu_transform.py` | 306 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
@@ -2454,10 +2454,10 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 561 | Aggregate Parquet footer statistics across many files, natively. |
-| `lib.rs` | 575 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 578 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
-| `predicate.rs` | 281 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
-| `row_filter.rs` | 345 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
+| `row_filter.rs` | 349 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `store.rs` | 170 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`

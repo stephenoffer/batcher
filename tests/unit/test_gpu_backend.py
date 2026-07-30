@@ -141,3 +141,24 @@ def test_the_translated_path_is_tried_before_the_legacy_group_by(monkeypatch):
     q = bt.from_pydict({"k": [1, 2], "v": [1.0, 2.0]}).group_by("k").agg(s=bt.col("v").sum())
     assert gpu_backend.try_gpu_collect(q._plan, q._sources) is None
     assert called == ["translated", "legacy"]
+
+
+def test_a_gpu_kernel_that_raises_falls_back_instead_of_failing_the_query(monkeypatch):
+    """`backend="gpu"` is documented as always safe, and nothing enforced it.
+
+    The caller in `api/terminal/core.py` has no handler, so a raise from the GPU path reached
+    the user: the legacy torch kernel raised a bare `TypeError` on a string group key, which is
+    an ordinary column, and the query failed rather than running on the CPU engine.
+    """
+    from batcher.api.terminal import gpu_backend
+
+    monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 2)
+
+    def _boom(*_args, **_kwargs):
+        raise TypeError("can't convert np.ndarray of type numpy.object_")
+
+    monkeypatch.setattr(gpu_backend, "_translated", _boom)
+    monkeypatch.setattr(gpu_backend, "_legacy_groupby", _boom)
+
+    ds = bt.from_pydict({"k": ["a", "b"], "v": [1.0, 2.0]}).group_by("k").agg(s=col("v").sum())
+    assert gpu_backend.try_gpu_collect(_plan(ds), ds._sources, None, force=True) is None

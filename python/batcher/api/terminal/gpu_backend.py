@@ -81,9 +81,18 @@ def try_gpu_collect(
     # first, as this used to, meant the single most common GPU shape — a one-key group-by over
     # a scan — never reached any of it.
     t0 = time.perf_counter()
-    result = _translated(plan, sources, gpu_count, decision)
-    if result is None:
-        result = _legacy_groupby(plan, sources, decision)
+    try:
+        result = _translated(plan, sources, gpu_count, decision)
+        if result is None:
+            result = _legacy_groupby(plan, sources, decision)
+    except Exception as exc:
+        # `backend="gpu"` is documented as always safe: an unsupported shape, a lost device or
+        # a kernel that cannot handle this data uses the CPU engine and returns the same rows.
+        # Nothing enforced that. A raise from here reached the caller, which has no handler,
+        # so a query the GPU could not run *failed* instead of running — the legacy kernel
+        # raised a bare `TypeError` on a string group key, which is an ordinary column.
+        note_suppressed("api", "run this plan on the GPU; using the CPU engine", exc)
+        return None
     if result is None:
         return None
     # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
