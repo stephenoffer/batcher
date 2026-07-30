@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from batcher.core.gpu_plan.backend import DfBackend, Unsupported
 from batcher.core.gpu_plan.eligibility import JOIN_HOW
-from batcher.core.gpu_plan.ops import apply_op
+from batcher.core.gpu_plan.ops import apply_op, distinct_rows, fold_zero
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -23,11 +23,14 @@ __all__ = [
     "execute_cudf_union",
     "run_chain",
     "run_join",
+    "run_ops",
     "run_union",
 ]
 
 _LEFT = "L__"
 _RIGHT = "R__"
+#: Suffix of the synthetic key component that keeps a null key from matching (`_null_key_marker`).
+_NULL_KEY = "__bt_nullkey"
 
 
 def _cudf() -> DfBackend:
@@ -38,7 +41,24 @@ def _cudf() -> DfBackend:
 
 def run_chain(table: pa.Table, ops: list[dict], be: DfBackend):
     """Replay an operator chain on a dataframe built from `table`."""
-    df = be.from_arrow(table)
+    return run_ops(be.from_arrow(table), ops, be)
+
+
+def run_ops(df, ops: list[dict], be: DfBackend):
+    """Replay an operator chain on a dataframe that is already on the backend.
+
+    The entry point for a frame the caller obtained without going through Arrow — a shard the
+    device read for itself. Kept as one loop shared with `run_chain` so the two ways of
+    getting a frame cannot drift into two ways of executing one.
+
+    Args:
+        df: The frame to transform.
+        ops: The bottom-up operator IR chain.
+        be: The dataframe backend to compute on.
+
+    Returns:
+        The chain's result, as a frame on `be`.
+    """
     for op in ops:
         df = apply_op(df, op, be)
     return df
@@ -73,7 +93,7 @@ def run_join(left_t, right_t, left_ops, right_ops, join_ir: dict, ops: list[dict
     right = run_chain(right_t, right_ops, be)
     how = JOIN_HOW[join_ir["join_type"]]
     if how in ("semi", "anti"):
-        out = _semi_join(left, right, join_ir, keep=how == "semi")
+        out = _semi_join(left, right, join_ir, be, keep=how == "semi")
     else:
         out = _equi_join(left, right, join_ir, how, be)
     for op in ops:
@@ -84,10 +104,19 @@ def run_join(left_t, right_t, left_ops, right_ops, join_ir: dict, ops: list[dict
 def _equi_join(left, right, join_ir: dict, how: str, be: DfBackend):
     lg = left.add_prefix(_LEFT)
     rg = right.add_prefix(_RIGHT)
+    lkeys = [_LEFT + k for k in join_ir["left_keys"]]
+    rkeys = [_RIGHT + k for k in join_ir["right_keys"]]
+    # A null key matches nothing, not even another null. Both dataframe libraries' `merge`
+    # matches it to itself, which invents rows an inner join must not produce and, worse,
+    # pairs up two rows an outer join was supposed to report as unmatched. Adding one
+    # synthetic key component fixes every join type at once, because the merge then does the
+    # rest of the work itself: an inner join drops the rows, an outer keeps them unmatched.
+    lg[_LEFT + _NULL_KEY] = _null_key_marker(lg, lkeys, side=0)
+    rg[_RIGHT + _NULL_KEY] = _null_key_marker(rg, rkeys, side=1)
     merged = lg.merge(
         rg,
-        left_on=[_LEFT + k for k in join_ir["left_keys"]],
-        right_on=[_RIGHT + k for k in join_ir["right_keys"]],
+        left_on=[*lkeys, _LEFT + _NULL_KEY],
+        right_on=[*rkeys, _RIGHT + _NULL_KEY],
         how=how,
     )
     cols = {}
@@ -97,13 +126,35 @@ def _equi_join(left, right, join_ir: dict, how: str, be: DfBackend):
     return be.lib.DataFrame(cols)
 
 
-def _semi_join(left, right, join_ir: dict, *, keep: bool):
+def _null_key_marker(frame, keys: list[str], *, side: int):
+    """A synthetic key component under which a null key matches nothing.
+
+    `-1` wherever the row's key is complete, so the two sides agree there and the real keys
+    decide the match. A side-specific `0` or `1` wherever any key component is null — a value
+    the other side never carries on any row, so such a row cannot match a complete key, and two
+    null keys cannot match each other either.
+
+    Any component being null makes the whole key null, which is SQL's rule: a comparison with
+    an unknown is unknown, and one unknown column is enough to make the row's key unknown.
+    """
+    missing = frame[keys[0]].isna()
+    for key in keys[1:]:
+        missing = missing | frame[key].isna()
+    return missing.astype("int8") * (side + 1) - 1
+
+
+def _semi_join(left, right, join_ir: dict, be: DfBackend, *, keep: bool):
     """A semi/anti join as a key-membership filter over the left side.
 
     A `merge` cannot express either one: it would duplicate a left row per matching right row
-    (semi keeps one) and has no mode that keeps the non-matching rows alone (anti). Membership
-    also gets the null key right for free, since null is not a member of anything — which is
-    the answer both semi and anti want.
+    (semi keeps one) and has no mode that keeps the non-matching rows alone (anti).
+
+    A null left key is *not* a member, however many nulls the right side holds, because null
+    equals nothing including itself. `isin` disagrees — it treats a null as an ordinary value
+    and finds it — so nullness is subtracted from the membership rather than relied upon. The
+    consequence of getting this wrong runs in opposite directions for the two joins, which is
+    why it is worth stating: a semi join gains rows it should have dropped, and an anti join
+    drops the rows that are most often the point of running one.
     """
     lkeys = join_ir["left_keys"]
     rkeys = join_ir["right_keys"]
@@ -111,8 +162,12 @@ def _semi_join(left, right, join_ir: dict, *, keep: bool):
         # A composite key needs a tuple-valued membership test, which neither backend offers
         # without materializing a joint key column of an inferred type.
         raise Unsupported("semi/anti join on a composite key")
-    member = left[lkeys[0]].isin(right[rkeys[0]])
-    mask = member.fillna(False)
+    # Folded on both sides: `isin` compares by hash, so a left `0.0` would not find a right
+    # `-0.0` — the same two-zeros split the group key and DISTINCT have, arriving through a
+    # third door.
+    probe = fold_zero(left[lkeys[0]], be)
+    member = probe.isin(fold_zero(right[rkeys[0]], be))
+    mask = member.fillna(False) & ~probe.isna()
     out = left[mask if keep else ~mask].reset_index(drop=True)
     return out.rename(columns={o["name"]: o["alias"] for o in join_ir["output"]})[
         [o["alias"] for o in join_ir["output"]]
@@ -149,7 +204,8 @@ def run_union(tables: list, input_ops: list[list[dict]], distinct: bool, ops, be
     frames = [run_chain(t, o, be) for t, o in zip(tables, input_ops, strict=True)]
     out = be.concat(frames)
     if distinct:
-        out = out.drop_duplicates().reset_index(drop=True)
+        # The same fold DISTINCT needs: a UNION deduplicates rows, so it decides identity.
+        out = distinct_rows(out, be)
     for op in ops:
         out = apply_op(out, op, be)
     return out

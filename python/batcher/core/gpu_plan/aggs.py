@@ -8,6 +8,9 @@ a smoke test and each produce a *wrong answer* rather than an error:
   had nulls silently lost rows from its result;
 * the **sum of an all-null group is null**, not `0.0`. `groupby.sum()` returns `0.0`, which
   reads as a real measurement;
+* **`all` and `any` over an all-null group are null**, not `True` and `False`. The libraries
+  skip the nulls and return the fold's identity, so a `.all()` over a group whose values were
+  every one of them null reads as "every one of them was true";
 * **variance and standard deviation are the sample** forms (`ddof=1`), which is the libraries'
   default but not the one a "population" reading would pick.
 
@@ -37,21 +40,29 @@ _PLAIN = {
     "mean": "mean",
     "median": "median",
     "count_distinct": "nunique",
-    "bool_and": "all",
-    "bool_or": "any",
+    # `any_value` is "the first non-null value", which is what both libraries' `first` returns.
+    "any_value": "first",
 }
 
 # Reductions needing `min_count=1` so an all-null (or empty) group yields null rather than
 # the operator's identity element — `sum` of nothing is not `0`, and `product` is not `1`.
 _MIN_COUNT = {"sum": "sum", "product": "prod"}
 
+# Boolean folds with the same problem `_MIN_COUNT` solves, but no `min_count` to solve it
+# with. `all` and `any` skip nulls and then return their identity — `True` and `False` — for a
+# group that had nothing to fold, where the engine (and SQL) return null. Left alone, a
+# `.all()` over a group whose values were all null reads as "every one of them was true".
+_BOOL_FOLD = {"bool_and": "all", "bool_or": "any"}
+
 # Sample-moment reductions (`ddof=1`): a one-row group has no sample variance, so both the
-# engine and the libraries return null for it.
-_SAMPLE_MOMENT = {"var": "var", "stddev": "std"}
+# engine and the libraries return null for it. `skew` is the same family — the adjusted
+# Fisher-Pearson form both the engine and the libraries compute.
+_SAMPLE_MOMENT = {"var": "var", "stddev": "std", "skewness": "skew"}
 
 _SUPPORTED = (
     frozenset(_PLAIN)
     | frozenset(_MIN_COUNT)
+    | frozenset(_BOOL_FOLD)
     | frozenset(_SAMPLE_MOMENT)
     | {
         "count_star",
@@ -85,13 +96,33 @@ def _key_columns(df, ir: dict, be: DfBackend) -> tuple[list[str], list[str]]:
     for i, gk in enumerate(ir["group_keys"]):
         expr = gk["expr"]
         if expr.get("e") == "col":
-            names.append(expr["name"])
+            name = expr["name"]
         else:
-            tmp = f"__bt_gk{i}"
-            df[tmp] = be.column(eval_expr(expr, df, be), df)
-            names.append(tmp)
+            name = f"__bt_gk{i}"
+            df[name] = be.column(eval_expr(expr, df, be), df)
+        names.append(_normalized_key(df, name, be, slot=i))
         aliases.append(gk["alias"])
     return names, aliases
+
+
+def _normalized_key(df, name: str, be: DfBackend, *, slot: int) -> str:
+    """`name`, or a private copy of it with negative zero folded onto zero.
+
+    IEEE says `-0.0 == 0.0`, and so do the engine and SQL, so the two belong in one group.
+    Both dataframe libraries group by a *hash* of the value instead, and the two zeros have
+    different bit patterns — so a float key carrying both silently returned two groups where
+    the engine returns one, splitting a sum between them. This is the failure a distributed
+    aggregate is most exposed to, since a shard that happened to see only one of the two
+    zeros produces a partial nothing later folds together.
+
+    Adding zero is the fold: `-0.0 + 0.0` is `+0.0`, and `x + 0.0` is `x` for every other
+    value, including the infinities and `NaN`. Only float keys pay for it.
+    """
+    if not be.is_float(df[name]):
+        return name
+    normalized = f"__bt_gz{slot}"
+    df[normalized] = df[name] + 0.0
+    return normalized
 
 
 def _input_column(df, spec: dict, be: DfBackend, slot: int) -> str:
@@ -125,6 +156,10 @@ def _reduce(grouped, spec: dict, column: str):
         return _call(series, _PLAIN[func])
     if func in _MIN_COUNT:
         return _call(series, _MIN_COUNT[func], min_count=1)
+    if func in _BOOL_FOLD:
+        # `.where(cond)` nulls the entries where `cond` is false, which is the `min_count=1`
+        # the boolean folds do not offer: a group that folded nothing folded to null.
+        return _call(series, _BOOL_FOLD[func]).where(_call(series, "count") > 0)
     if func in _SAMPLE_MOMENT:
         return _call(series, _SAMPLE_MOMENT[func])
     if func == "quantile":
@@ -188,6 +223,10 @@ def _global(df, ir: dict, be: DfBackend):
     Reached by `agg()` with no `group_by`, and by every distributed *combine* step, so it
     cannot be left to the CPU engine without giving up the whole multi-GPU reduce path.
     Modeled as a single constant group so one code path serves both.
+
+    A keyless aggregate always returns **one** row, including over no rows at all — that is
+    what distinguishes it from a grouped one, which returns a row per group and so returns
+    none. Grouping an empty frame produces no groups, so the empty case is finished by hand.
     """
     key = "__bt_all"
     df = df.copy()
@@ -198,4 +237,25 @@ def _global(df, ir: dict, be: DfBackend):
         column = None if spec["func"] == "count_star" else _input_column(df, spec, be, slot)
         columns[spec["alias"]] = _reduce(grouped, spec, column)
     out = be.lib.DataFrame(columns).reset_index(drop=True)
+    if not len(df):
+        out = _empty_global_row(out, ir)
     return out[[a["alias"] for a in ir["aggregates"]]]
+
+
+#: Reductions that count rather than measure, so their answer over no rows is `0` and not null.
+_COUNTING = frozenset({"count", "count_star", "count_distinct"})
+
+
+def _empty_global_row(out, ir: dict):
+    """The one row a keyless aggregate over an empty frame returns.
+
+    Built by reindexing the empty result rather than by constructing a row from scratch, which
+    is what keeps each column's dtype: a `sum` over an empty float column must come back as a
+    null *float*, not as a null of no type, or the shard contributes a column its neighbours
+    cannot be concatenated with.
+    """
+    row = out.reindex(range(1))
+    for spec in ir["aggregates"]:
+        if spec["func"] in _COUNTING:
+            row[spec["alias"]] = 0
+    return row.reset_index(drop=True)

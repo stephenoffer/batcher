@@ -1,0 +1,305 @@
+"""Shapes the GPU translator used to decline or get wrong, checked against the CPU engine.
+
+Same contract and same oracle as `test_gpu_plan.py` — the translator replayed on pandas must
+equal Batcher's own engine, which is itself checked against DuckDB. This module covers the
+cases that motivated widening it:
+
+* the boolean folds over an **all-null group**, where the libraries return the fold's identity
+  and the engine returns null. That one was not a missing feature but a *wrong answer* on a
+  path already advertised as supported;
+* a **sort on a computed key** and a sort whose keys **disagree about null placement**, both
+  of which sent the entire plan to the CPU engine rather than the one operator.
+
+Every ordering case is compared row-for-row. An order-independent comparison is exactly what
+cannot see an ordering bug, which is the whole risk in the sort changes below.
+"""
+
+from __future__ import annotations
+
+import pyarrow as pa
+import pytest
+
+import batcher as bt
+from batcher import col
+from batcher.core.gpu_plan import DfBackend, gpu_plan_ops
+from batcher.core.gpu_plan.execute import run_chain
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def be():
+    import pandas as pd
+
+    return DfBackend(pd)
+
+
+def _rows(table: pa.Table) -> list[tuple]:
+    cols = table.to_pydict()
+    return [tuple(row) for row in zip(*cols.values(), strict=True)]
+
+
+def _by_key(table: pa.Table) -> dict:
+    """A one-reducer grouped result as `{key: value}`, so groups compare regardless of order."""
+    return dict(zip(table.column("k").to_pylist(), table.column("r").to_pylist(), strict=True))
+
+
+def _run(build, table, be):
+    """Translate and replay `build`, alongside what the CPU engine computes for it."""
+    ds = build(bt.from_arrow(table))
+    spec = gpu_plan_ops(ds._plan)
+    assert spec is not None, "shape should be GPU-translatable"
+    got = be.to_arrow(run_chain(table, spec[1], be))
+    expected = ds.collect()
+    return got.select(expected.column_names), expected
+
+
+# --- the boolean folds over a group with nothing to fold ------------------------------
+
+BOOLS = pa.table(
+    {
+        # `mixed` has both, `all_true` only true, `all_false` only false, and `empty` is
+        # the group that matters: every value null, so there is nothing to fold.
+        "k": ["mixed", "mixed", "all_true", "all_true", "all_false", "empty", "empty"],
+        "b": [True, False, True, True, False, None, None],
+    }
+)
+
+
+@pytest.mark.parametrize("reducer", ["all", "any"])
+def test_a_boolean_fold_over_an_all_null_group_is_null(be, reducer):
+    """The libraries skip the nulls and return the fold's identity; the engine returns null.
+
+    Left alone, `.all()` over a group whose values were every one of them null reads as
+    "every one of them was true" — a wrong answer, not a missing feature.
+    """
+    got, expected = _run(lambda ds: ds.group_by("k").agg(r=getattr(col("b"), reducer)()), BOOLS, be)
+    assert _by_key(got) == _by_key(expected)
+    # And specifically: the empty group is null, not the identity element.
+    assert _by_key(got)["empty"] is None
+
+
+def test_a_boolean_fold_still_folds_the_groups_that_have_values(be):
+    got, _ = _run(lambda ds: ds.group_by("k").agg(r=col("b").all()), BOOLS, be)
+    by_key = _by_key(got)
+    assert by_key["all_true"] is True
+    assert by_key["mixed"] is False
+
+
+@pytest.mark.parametrize("reducer", ["all", "any"])
+def test_a_keyless_boolean_fold_over_all_nulls_is_null(be, reducer):
+    """The keyless form is the distributed *combine* step, so it cannot be left wrong."""
+    table = pa.table({"b": [None, None]}, schema=pa.schema([pa.field("b", pa.bool_())]))
+    got, expected = _run(lambda ds: ds.agg(r=getattr(col("b"), reducer)()), table, be)
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist() == [None]
+
+
+# --- aggregates that used to drop the whole plan --------------------------------------
+
+STATS = pa.table(
+    {
+        "k": ["a", "a", "a", "a", "b", "b", "c"],
+        "v": [1.0, 2.0, 4.0, 8.0, 3.0, 5.0, 7.0],
+        "n": [1, 2, 4, 8, 3, 5, None],
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda ds: ds.group_by("k").agg(s=col("v").skew()),
+        lambda ds: ds.group_by("k").agg(a=col("n").any_value()),
+        lambda ds: ds.group_by("k").agg(s=col("v").skew(), m=col("v").mean()),
+        lambda ds: ds.agg(s=col("v").skew()),
+    ],
+)
+def test_widened_aggregates_match_the_engine(be, build):
+    got, expected = _run(build, STATS, be)
+    for name in expected.column_names:
+        pairs = zip(got.column(name).to_pylist(), expected.column(name).to_pylist(), strict=True)
+        for g, e in pairs:
+            assert (g is None and e is None) or g == pytest.approx(e), name
+
+
+# --- sorts that used to fall back -----------------------------------------------------
+
+SORTABLE = pa.table(
+    {
+        "a": [3, 1, None, 2, None, 1],
+        "b": ["x", "Y", "z", None, "w", "A"],
+        "c": [1.5, -2.0, 0.0, 9.0, 4.0, -1.0],
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        # A computed key: previously "sort on a computed key" -> the whole plan to the CPU.
+        lambda ds: ds.sort(col("a") * 2),
+        lambda ds: ds.sort(col("b").str.lower()),
+        lambda ds: ds.sort(col("c").abs(), descending=True),
+        lambda ds: ds.sort("a", col("c") + col("a")),
+    ],
+)
+def test_a_sort_on_a_computed_key_matches_the_engine_row_for_row(be, build):
+    got, expected = _run(build, SORTABLE, be)
+    assert _rows(got) == _rows(expected)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        # Keys disagreeing about null placement: previously unexpressible, so a fallback.
+        lambda ds: ds.sort("a", "b", nulls_first=[True, False]),
+        lambda ds: ds.sort("a", "b", nulls_first=[False, True]),
+        lambda ds: ds.sort("a", "b", descending=[True, False], nulls_first=[True, False]),
+        # ...and the agreeing cases must not have regressed.
+        lambda ds: ds.sort("a", "b", nulls_first=[True, True]),
+        lambda ds: ds.sort("a", "b", nulls_first=[False, False]),
+        lambda ds: ds.sort("a", descending=True),
+    ],
+)
+def test_per_key_null_placement_matches_the_engine_row_for_row(be, build):
+    got, expected = _run(build, SORTABLE, be)
+    assert _rows(got) == _rows(expected)
+
+
+def test_a_sort_does_not_leak_its_private_columns(be):
+    """The indicator and computed-key columns are scaffolding, not output."""
+    got, expected = _run(lambda ds: ds.sort(col("a") * 2), SORTABLE, be)
+    assert got.column_names == expected.column_names
+    assert not any(name.startswith("__bt_") for name in got.column_names)
+
+
+def test_a_limited_sort_still_takes_the_top_rows(be):
+    got, expected = _run(lambda ds: ds.sort("a").limit(3), SORTABLE, be)
+    assert _rows(got) == _rows(expected)
+
+
+# --- keys that two implementations disagree about ------------------------------------
+
+NULL_LEFT = pa.table({"k": [1, None, 2, None], "l": [1, 2, 3, 4]})
+NULL_RIGHT = pa.table({"k": [1, None, 5], "r": [10, 20, 50]})
+
+
+def _run_join(how, left, right, be):
+    """Translate and replay a join, alongside what the CPU engine computes for it."""
+    from batcher.core.gpu_plan import gpu_join_spec
+    from batcher.core.gpu_plan.execute import run_join
+
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how=how)
+    spec = gpu_join_spec(ds._plan)
+    assert spec is not None, "join should be GPU-translatable"
+    (_ls, lops), (_rs, rops), join_ir, ops = spec
+    got = be.to_arrow(run_join(left, right, lops, rops, join_ir, ops, be))
+    expected = ds.collect()
+    return got.select(expected.column_names), expected
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer", "semi", "anti"])
+def test_a_null_join_key_matches_nothing(be, how):
+    """Null equals nothing, including itself — and `merge`/`isin` both disagree.
+
+    Every join type was wrong here, in both directions: an inner join invented a row, an
+    outer join paired up two rows it was supposed to report as unmatched, a semi join gained
+    a row it should have dropped, and an anti join dropped the rows that are usually the
+    reason for running one.
+    """
+    got, expected = _run_join(how, NULL_LEFT, NULL_RIGHT, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+def test_a_complete_key_still_joins(be):
+    """The null handling must not cost the matches that were already right."""
+    left = pa.table({"k": [1, 2, 3], "l": [1, 2, 3]})
+    right = pa.table({"k": [2, 3, 4], "r": [20, 30, 40]})
+    got, expected = _run_join("inner", left, right, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+    assert got.num_rows == 2
+
+
+ZEROS = pa.table(
+    {
+        # Both zeros, which IEEE, SQL and the engine all call one value.
+        "k": [0.0, -0.0, 1.0, float("inf"), -0.0, 2.0],
+        "v": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+    }
+)
+
+
+def test_negative_zero_groups_with_zero(be):
+    """The libraries group by a hash, and the two zeros hash apart — so one group became two.
+
+    A distributed aggregate is where this bites hardest: a shard that saw only one of the two
+    zeros produces a partial that nothing later folds together.
+    """
+    got, expected = _run(lambda ds: ds.group_by("k").agg(s=col("v").sum()), ZEROS, be)
+    assert got.num_rows == expected.num_rows
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+def test_negative_zero_folds_in_a_computed_key(be):
+    got, expected = _run(lambda ds: ds.group_by(z=col("k") * 0.0).agg(s=col("v").sum()), ZEROS, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+def test_an_integer_key_is_not_paid_for(be):
+    """Only float keys need the fold, so an integer group-by must be untouched by it."""
+    table = pa.table({"k": [1, 1, 2, None], "v": [1.0, 2.0, 4.0, 8.0]})
+    got, expected = _run(lambda ds: ds.group_by("k").agg(s=col("v").sum()), table, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+# --- a keyless aggregate over nothing --------------------------------------------------
+
+EMPTY = pa.table({"x": pa.array([], type=pa.int64()), "y": pa.array([], type=pa.float64())})
+
+
+@pytest.mark.parametrize(
+    "reducer", ["sum", "mean", "min", "max", "median", "std", "var", "product"]
+)
+def test_a_measuring_aggregate_over_no_rows_is_one_null_row(be, reducer):
+    """One row is what makes a keyless aggregate keyless — a grouped one returns none.
+
+    Grouping an empty frame produces no groups, so the translator returned nothing at all
+    where SQL and the engine return a single row of nulls.
+    """
+    got, expected = _run(lambda ds: ds.agg(r=getattr(col("y"), reducer)()), EMPTY, be)
+    assert got.num_rows == expected.num_rows == 1
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist() == [None]
+
+
+@pytest.mark.parametrize("reducer", ["count", "count_distinct"])
+def test_a_counting_aggregate_over_no_rows_is_zero(be, reducer):
+    """Counting nothing is zero, not null — the one place the empty row is not null."""
+    got, expected = _run(lambda ds: ds.agg(r=getattr(col("y"), reducer)()), EMPTY, be)
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist() == [0]
+
+
+def test_the_empty_row_keeps_each_columns_type(be):
+    """A null `sum` must be a null *float*, or the shard cannot concatenate with its peers."""
+    got, expected = _run(lambda ds: ds.agg(s=col("y").sum(), n=col("x").count()), EMPTY, be)
+    assert got.schema.field("s").type == expected.schema.field("s").type
+    assert got.num_rows == 1
+
+
+def test_a_grouped_aggregate_over_no_rows_still_returns_no_rows(be):
+    """The counter-case: no groups means no rows, and the empty-row rule must not reach it."""
+    got, expected = _run(lambda ds: ds.group_by("x").agg(s=col("y").sum()), EMPTY, be)
+    assert got.num_rows == expected.num_rows == 0
+
+
+def test_distinct_folds_negative_zero_but_keeps_the_row_it_saw_first(be):
+    """DISTINCT is a group-by over every column, so it inherits the two-zeros problem."""
+    table = pa.table({"f": [-0.0, 0.0, 1.0, 0.0], "g": ["b", "b", "a", "b"]})
+    got, expected = _run(lambda ds: ds.distinct(), table, be)
+    assert got.num_rows == expected.num_rows == 2
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+def test_distinct_over_columns_with_no_floats_is_unchanged(be):
+    table = pa.table({"a": [1, 1, 2, None, None], "b": ["x", "x", "y", None, None]})
+    got, expected = _run(lambda ds: ds.distinct(), table, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
