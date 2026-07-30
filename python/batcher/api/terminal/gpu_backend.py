@@ -103,28 +103,40 @@ def try_gpu_collect(
             )
         return result
 
-    # General path: a linear chain of translatable operators. A chain ENDING IN AN AGGREGATE
-    # fans out across every GPU first — each device reduces its own shard and the small partials
-    # are folded once — so the query is bounded by the shard count rather than by one device's
-    # memory. Anything else runs as a single dispatch on one GPU.
+    # General path: a linear chain of translatable operators. A chain with a mergeable REDUCER
+    # fans out across every GPU first — each device reduces the shard it read itself and the
+    # small results are folded once — so the query is bounded by the shard count rather than by
+    # one device's memory. Anything else runs as a single dispatch, on a worker that still reads
+    # the source itself: staging a large relation on the driver to send it to a GPU is the wrong
+    # end of the machine, and the driver is routinely the smallest node in the cluster.
     from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops, gpu_union_spec
+    from batcher.dist.gpu import gpu_chain_on_worker, gpu_join_on_worker
 
     plan_spec = gpu_plan_ops(plan)
     if plan_spec is not None:
         scan, ops = plan_spec
-        fanned = _try_sharded_aggregate(sources[scan.source_id], ops, gpu_count, decision)
+        source = sources[scan.source_id]
+        fanned = _try_sharded_aggregate(source, ops, gpu_count, decision)
         if fanned is not None:
             return fanned
-        batches = list(sources[scan.source_id].read())
+        on_worker = gpu_chain_on_worker(source, ops)
+        if on_worker is not None:
+            return on_worker
+        batches = list(source.read())  # in-memory source: the rows are on the driver already
         if not batches:
             return None
         return _dispatch_cudf_plan(pa.Table.from_batches(batches), ops)
 
     # A `[ops] over Join(chain, chain)` — an equi/semi/anti join plus the chains pushed below
-    # it and above it — runs on one GPU.
+    # it and above it — runs on one GPU, which reads BOTH sides itself.
     join_spec = gpu_join_spec(plan)
     if join_spec is not None:
         (lscan, lops), (rscan, rops), join_ir, ops = join_spec
+        on_worker = gpu_join_on_worker(
+            sources[lscan.source_id], sources[rscan.source_id], lops, rops, join_ir, ops
+        )
+        if on_worker is not None:
+            return on_worker
         lb = list(sources[lscan.source_id].read())
         rb = list(sources[rscan.source_id].read())
         if not lb or not rb:

@@ -17,14 +17,20 @@ hand it out, so a fan-out over a hundred shards moves no bulk data through the o
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from batcher.core.gpu_plan import DfBackend
 
 __all__ = [
     "cpu_shard_partial",
+    "gpu_join_task",
     "gpu_shard_partial",
     "gpu_task_options",
     "gpu_task_runtime_env",
     "nest_ops",
+    "run_shard_chain",
+    "run_shard_join",
 ]
 
 
@@ -49,25 +55,78 @@ def nest_ops(ops: list[dict], source_id: int = 0) -> dict:
     return node
 
 
-def gpu_shard_partial(descriptor: dict, ops: list[dict]):
-    """On a GPU worker: read this shard from storage and replay `ops` on the device.
+def _read(descriptor: dict):
+    """The shard's rows as one Arrow table, or `None` when the shard is empty."""
+    import pyarrow as pa
+
+    from batcher.dist.executors.partition_io import read_partition_descriptor
+
+    batches = read_partition_descriptor(descriptor)
+    return pa.Table.from_batches(batches) if batches else None
+
+
+def _device() -> DfBackend:
+    """The cuDF backend, imported here so a driver with no RAPIDS can still import this module."""
+    import cudf
+
+    from batcher.core.gpu_plan import DfBackend
+
+    return DfBackend(cudf)
+
+
+def run_shard_chain(descriptor: dict, ops: list[dict], be: DfBackend):
+    """Read a shard and replay `ops` on `be`, returning Arrow — the body of the GPU task.
+
+    Parameterized by backend so the *task body* is testable on the host against the CPU engine,
+    exactly as the translator it calls is. A task that can only be exercised on a GPU is a task
+    nothing checks.
 
     Returns `None` for an empty shard, which the driver drops rather than concatenating an
     empty table of possibly-different schema into the partials.
     """
-    import pyarrow as pa
-
-    from batcher.core.gpu_plan import DfBackend
     from batcher.core.gpu_plan.execute import run_chain
-    from batcher.dist.executors.partition_io import read_partition_descriptor
 
-    batches = read_partition_descriptor(descriptor)
-    if not batches:
+    table = _read(descriptor)
+    return None if table is None else be.to_arrow(run_chain(table, ops, be))
+
+
+def gpu_shard_partial(descriptor: dict, ops: list[dict]):
+    """On a GPU worker: read this shard from storage and replay `ops` on the device."""
+    return run_shard_chain(descriptor, ops, _device())
+
+
+def run_shard_join(
+    left_desc: dict,
+    right_desc: dict,
+    left_ops: list[dict],
+    right_ops: list[dict],
+    join_ir: dict,
+    ops: list[dict],
+    be: DfBackend,
+):
+    """Read both join inputs and run the join on `be` — the body of the GPU join task.
+
+    Returns `None` when either side is empty, which the caller reads as "nothing to join" and
+    handles rather than concatenating an empty table of unknown schema.
+    """
+    from batcher.core.gpu_plan.execute import run_join
+
+    left, right = _read(left_desc), _read(right_desc)
+    if left is None or right is None:
         return None
-    import cudf
+    return be.to_arrow(run_join(left, right, left_ops, right_ops, join_ir, ops, be))
 
-    be = DfBackend(cudf)
-    return be.to_arrow(run_chain(pa.Table.from_batches(batches), ops, be))
+
+def gpu_join_task(
+    left_desc: dict,
+    right_desc: dict,
+    left_ops: list[dict],
+    right_ops: list[dict],
+    join_ir: dict,
+    ops: list[dict],
+):
+    """On a GPU worker: read both join inputs from storage and run the join on the device."""
+    return run_shard_join(left_desc, right_desc, left_ops, right_ops, join_ir, ops, _device())
 
 
 def cpu_shard_partial(descriptor: dict, ops: list[dict], engine_config: str):

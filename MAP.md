@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 979 Python modules across 151 packages and 179 Rust files across 13 crates.
+Covering 980 Python modules across 151 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -344,7 +344,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 472 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 484 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -391,7 +391,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `batch_format.py` | 181 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 | `cluster.py` | 346 | Unsupervised clustering — grouping rows by similarity, with no labels. |
 | `converters.py` | 399 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
-| `devices.py` | 359 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
+| `devices.py` | 406 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
 | `discriminant.py` | 324 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 500 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
@@ -730,6 +730,7 @@ Fabric-aware placement: what the accelerator fleet looks like, and where work sh
 | module | lines | what it is |
 |---|---|---|
 | `placement.py` | 224 | Placing accelerator work on the fleet: gang bundles, power zones, and efficiency order. |
+| `residency.py` | 97 | Residency as a placement filter — the point where a sovereignty rule reaches the scheduler. |
 | `topology.py` | 279 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
 
 ### `batcher/dist/fleet/` — 4 · backend
@@ -751,7 +752,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 |---|---|---|
 | `aggregate.py` | 153 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `dispatch.py` | 129 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
-| `tasks.py` | 161 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 182 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -1177,7 +1178,7 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 
 | module | lines | what it is |
 |---|---|---|
-| `health.py` | 195 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
+| `health.py` | 241 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 213 | Multi-Instance GPU: cutting one device into several, so a small model stops holding a big one. |
 | `vram.py` | 208 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
