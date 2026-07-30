@@ -57,12 +57,6 @@ def _float64():
     return pa.float64()
 
 
-def _float64():
-    import pyarrow as pa
-
-    return pa.float64()
-
-
 # Unary math functions, as `(device method, NumPy ufunc)`. Both names are spelled out rather
 # than derived from the engine's name, because guessing either is a silent-wrong-answer bug:
 # `trunc` was resolved by name to pandas' `Series.truncate`, which slices *rows by index* and
@@ -126,6 +120,11 @@ def eval_math(ir, df, be, eval_expr):
         return (pos - neg).astype(be.dtype(_float64())).where(x.notna(), None)
     if fn == "round":
         return round_half_away(x, 0, be)
+    if fn == "abs" and be.is_integer(x):
+        # The one unary function whose result keeps an integer input's type. Both libraries'
+        # own `.abs()` preserves it; the ufunc path below would widen it to double, which is
+        # the right number in the wrong column.
+        return x.abs()
     names = _MATH_FNS.get(fn)
     if names is None:
         raise Unsupported(f"math fn {fn}")

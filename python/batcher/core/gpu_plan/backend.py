@@ -20,7 +20,60 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import pyarrow as pa
 
-__all__ = ["DfBackend", "Unsupported"]
+__all__ = ["DfBackend", "Unsupported", "widen_narrow", "widened_type"]
+
+
+def widened_type(dtype: pa.DataType):
+    """The type the engine would present `dtype` as, or `None` when it presents it unchanged.
+
+    The FFI boundary normalizes every integer width — signed and unsigned, `uint64` included —
+    to `int64`, and every narrow float to `double`. A query over an `int32` column therefore
+    returns `int64` from the engine, and every test and every downstream consumer is written
+    against that.
+
+    The translator reads Arrow *without* crossing that boundary, so left alone it hands back
+    the source's own width. That is not a wrong number, but it is a wrong column, and it is
+    worst exactly where this backend is used: a sharded fan-out concatenates its shards'
+    partials, and a shard that fell back to the CPU engine contributes `int64` beside a device
+    shard's `int32`.
+
+    Args:
+        dtype: The source column's Arrow type.
+
+    Returns:
+        The widened Arrow type, or `None` when `dtype` already is what the engine would show.
+    """
+    import pyarrow as pa
+
+    if pa.types.is_integer(dtype) and dtype != pa.int64():
+        return pa.int64()
+    if pa.types.is_floating(dtype) and dtype != pa.float64():
+        return pa.float64()
+    return None
+
+
+def widen_narrow(table: pa.Table) -> pa.Table:
+    """`table` with its narrow numeric columns widened the way the engine's boundary would.
+
+    A no-op — and not even a schema rebuild — for a table that is already wide, which is the
+    common case, so the check costs one pass over the field list rather than over the data.
+
+    Args:
+        table: The table as read from storage.
+
+    Returns:
+        The table, cast where a column's width would otherwise disagree with the engine.
+    """
+    import pyarrow as pa
+
+    targets = [widened_type(field.type) for field in table.schema]
+    if not any(targets):
+        return table
+    fields = [
+        field if target is None else pa.field(field.name, target, field.nullable)
+        for field, target in zip(table.schema, targets, strict=True)
+    ]
+    return table.cast(pa.schema(fields))
 
 
 class Unsupported(Exception):
@@ -54,6 +107,7 @@ class DfBackend:
 
     def from_arrow(self, table: pa.Table):
         """An Arrow table as a dataframe, preserving Arrow's null mask on both libraries."""
+        table = widen_narrow(table)
         if self._arrow_native:
             return self.lib.DataFrame.from_arrow(table)
         return table.to_pandas(types_mapper=self.lib.ArrowDtype)
@@ -125,6 +179,25 @@ class DfBackend:
 
             return pa.types.is_floating(arrow)
         return getattr(dtype, "kind", "") == "f"
+
+    def is_integer(self, value: Any) -> bool:
+        """Whether `value` is an integer column.
+
+        Asked by exactly one caller, and for a narrow reason: `abs` is the only unary math
+        function whose result keeps its input's integer type — every other one widens to
+        double on both the engine and here. Routing an integer `abs` through the float ufunc
+        path returns `1.0` where the engine returns `1`, which is not a wrong number but is a
+        wrong *column*, and a shard that contributes one cannot be concatenated with its peers.
+        """
+        if not self.is_series(value):
+            return isinstance(value, int) and not isinstance(value, bool)
+        dtype = getattr(value, "dtype", None)
+        arrow = getattr(dtype, "pyarrow_dtype", None)
+        if arrow is not None:
+            import pyarrow as pa
+
+            return pa.types.is_integer(arrow)
+        return getattr(dtype, "kind", "") in ("i", "u")
 
     def has_nan(self, value: Any) -> bool:
         """Whether a float column actually carries a `NaN` (as opposed to a null).

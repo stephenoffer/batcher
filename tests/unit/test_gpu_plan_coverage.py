@@ -429,3 +429,86 @@ def test_a_composite_key_does_not_fan_out_on_a_duplicated_right_side(be, how):
     """`(1, "a")` appears twice on the right; a semi join must still emit one left row."""
     got, _ = _run_join_on(how, ["d", "s"], STAR_FACT, STAR_DIM, be)
     assert got.num_rows <= STAR_FACT.num_rows
+
+
+# --- the widths the engine presents, from a reader that never crossed its boundary -----
+
+NARROW = pa.table(
+    {
+        "i": pa.array([1, 2, None], type=pa.int32()),
+        "s": pa.array([1, 2, 3], type=pa.int16()),
+        "t": pa.array([1, 2, 3], type=pa.int8()),
+        "u": pa.array([1, 2, 3], type=pa.uint8()),
+        "b": pa.array([9, 9, 9], type=pa.uint64()),
+        "f": pa.array([1.5, 2.5, 3.5], type=pa.float32()),
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda ds: ds.select("i", "s", "t", "u", "b", "f"),
+        lambda ds: ds.select(r=col("i") + 1),
+        lambda ds: ds.select(r=col("i").abs()),
+        lambda ds: ds.agg(r=col("i").sum()),
+        lambda ds: ds.agg(r=col("f").mean()),
+        lambda ds: ds.group_by("i").agg(n=col("s").count()),
+        lambda ds: ds.filter(col("s") > 1).select("s", "f"),
+        lambda ds: ds.sort("f").select("f"),
+    ],
+)
+def test_a_narrow_column_comes_back_at_the_width_the_engine_presents(be, build):
+    """The FFI boundary widens every integer to `int64` and every float to `double`.
+
+    The translator reads Arrow without crossing that boundary, so left alone it hands back the
+    source's own width. Not a wrong number — a wrong *column*, and worst exactly where this
+    backend is used: a fan-out concatenates its shards, and a shard that fell back to the CPU
+    engine contributes `int64` beside a device shard's `int32`.
+    """
+    got, expected = _run(build, NARROW, be)
+    assert [f.type for f in got.schema] == [f.type for f in expected.schema]
+    assert got.to_pylist() == expected.to_pylist()
+
+
+def test_a_table_that_is_already_wide_is_not_rebuilt(be):
+    """The check is over the field list, not the data, so the common case costs nothing."""
+    from batcher.core.gpu_plan.backend import widen_narrow
+
+    wide = pa.table({"a": pa.array([1], type=pa.int64()), "b": pa.array([1.0])})
+    assert widen_narrow(wide) is wide
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (pa.int8(), pa.int64()),
+        (pa.int32(), pa.int64()),
+        (pa.uint64(), pa.int64()),
+        (pa.float32(), pa.float64()),
+        (pa.int64(), None),
+        (pa.float64(), None),
+        (pa.string(), None),
+        (pa.bool_(), None),
+        (pa.date32(), None),
+    ],
+)
+def test_the_widening_rule_matches_the_boundary(source, expected):
+    from batcher.core.gpu_plan.backend import widened_type
+
+    assert widened_type(source) == expected
+
+
+def test_abs_is_the_one_function_that_keeps_an_integer_integer(be):
+    """Every other unary math function widens to double on both sides; `abs` does not."""
+    table = pa.table({"i": pa.array([1, -2, 0, None], type=pa.int64())})
+    got, expected = _run(lambda ds: ds.select(r=col("i").abs()), table, be)
+    assert got.schema.field("r").type == expected.schema.field("r").type == pa.int64()
+    assert got.column("r").to_pylist() == expected.column("r").to_pylist()
+
+
+@pytest.mark.parametrize("fn", ["ceil", "floor", "sqrt", "exp", "sign"])
+def test_the_other_unary_functions_still_widen(be, fn):
+    table = pa.table({"i": pa.array([1, -2, 4, None], type=pa.int64())})
+    got, expected = _run(lambda ds, f=fn: ds.select(r=getattr(col("i"), f)()), table, be)
+    assert got.schema.field("r").type == expected.schema.field("r").type
