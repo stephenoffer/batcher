@@ -354,6 +354,12 @@ def test_string_operations_match_cpu_engine(build, be):
         lambda: col("s").str.position("o"),
         lambda: col("s").str.right(2),
         lambda: col("s").str.initcap(),
+        # the fixed-duration truncations, which are a floor
+        lambda: col("t").dt.truncate("day"),
+        lambda: col("t").dt.truncate("hour"),
+        lambda: col("t").dt.truncate("minute"),
+        lambda: col("t").dt.truncate("second"),
+        lambda: col("t").dt.strftime("%Y-%m"),
     ],
 )
 def test_temporal_and_string_functions_match_cpu_engine(expr, be):

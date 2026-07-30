@@ -195,3 +195,53 @@ def test_a_single_device_plan_asks_for_one():
     decision = decide_gpu_backend(q._plan, q._sources, gpu_count=8, force=True, gpu_memory_gb=80.0)
     assert decision.use_gpu and not decision.distributed
     assert decision.desired_gpus == 1
+
+
+# --- recovering several shards at once ------------------------------------------------
+
+
+def test_recoveries_are_submitted_before_any_is_awaited():
+    """A spot reclamation takes several nodes at once, which is the case that matters.
+
+    Awaiting each recovery where its failure was noticed would run them one after another,
+    turning the one event a fan-out most needs to absorb into the slowest possible response.
+    The barrier's failure hook returns a handle instead, so every recovery is already in flight
+    by the time the first is awaited.
+    """
+    from batcher.dist.gpu.aggregate import _await_recoveries, _Recovering
+
+    class _Ref:
+        def __init__(self, value):
+            self.value = value
+
+    awaited: list = []
+
+    class _FakeRay:
+        @staticmethod
+        def get(refs):
+            awaited.append(list(refs))
+            return [r.value for r in refs]
+
+    import sys
+
+    saved = sys.modules.get("ray")
+    sys.modules["ray"] = _FakeRay
+    try:
+        results = ["a", _Recovering(_Ref("b")), "c", _Recovering(_Ref("d"))]
+        assert _await_recoveries(results) == ["a", "b", "c", "d"]
+    finally:
+        if saved is None:
+            del sys.modules["ray"]
+        else:
+            sys.modules["ray"] = saved
+    # one wait covering both, not one wait each
+    assert len(awaited) == 1
+    assert len(awaited[0]) == 2
+
+
+def test_a_run_with_no_recoveries_is_untouched():
+    """The common case must not pay for the recovery machinery, or reorder anything."""
+    from batcher.dist.gpu.aggregate import _await_recoveries
+
+    results = ["a", "b", None, "c"]
+    assert _await_recoveries(results) is results

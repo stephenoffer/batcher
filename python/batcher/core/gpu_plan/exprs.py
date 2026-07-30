@@ -23,9 +23,11 @@ from batcher.core.gpu_plan.backend import Unsupported
 from batcher.core.gpu_plan.scalar_fns import (
     apply_ufunc,
     eval_date,
+    eval_date_trunc,
     eval_math,
     eval_math2,
     eval_str,
+    eval_strftime,
 )
 
 if TYPE_CHECKING:
@@ -331,4 +333,6 @@ _HANDLERS = {
     "in_list": _in_list,
     "str": _named(eval_str),
     "date": _named(eval_date),
+    "date_trunc": _named(eval_date_trunc),
+    "strftime": _named(eval_strftime),
 }

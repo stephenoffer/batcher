@@ -24,9 +24,11 @@ if TYPE_CHECKING:
 __all__ = [
     "apply_ufunc",
     "eval_date",
+    "eval_date_trunc",
     "eval_math",
     "eval_math2",
     "eval_str",
+    "eval_strftime",
     "round_half_away",
 ]
 
@@ -249,6 +251,42 @@ def eval_date(ir, df, be, eval_expr):
 
         return (x.astype(be.dtype(pa.int64())) // 1_000_000).astype(be.dtype(_int64()))
     raise Unsupported(f"date fn {fn}")
+
+
+#: `date_trunc` units that are a fixed duration, so truncating is flooring to a multiple of it.
+#: The calendar units — week, month, quarter, year — are deliberately absent: their length
+#: varies, so they are calendar arithmetic rather than a floor, and the two backends do not
+#: offer the same construction for it. A `GROUP BY date_trunc('month', ...)` therefore still
+#: runs on the CPU engine, which is a coverage gap and not a wrong answer.
+_TRUNC_FREQ = {"second": "s", "minute": "min", "hour": "h", "day": "D"}
+
+
+def eval_date_trunc(ir, df, be, eval_expr):
+    """`date_trunc(unit, ts)` for the fixed-duration units, by flooring."""
+    unit = ir.get("unit")
+    freq = _TRUNC_FREQ.get(unit)
+    if freq is None:
+        raise Unsupported(f"date_trunc to a calendar unit ({unit})")
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    floor = getattr(x.dt, "floor", None)
+    if floor is None:
+        raise Unsupported("date_trunc")
+    try:
+        return floor(freq)
+    except (TypeError, ValueError, NotImplementedError) as exc:
+        raise Unsupported(f"date_trunc {unit}: {exc}") from exc
+
+
+def eval_strftime(ir, df, be, eval_expr):
+    """`strftime(ts, format)` — the format is a constant in every plan the engine builds."""
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    fmt = getattr(x.dt, "strftime", None)
+    if fmt is None:
+        raise Unsupported("strftime")
+    try:
+        return fmt(ir["format"])
+    except (TypeError, ValueError, NotImplementedError) as exc:
+        raise Unsupported(f"strftime: {exc}") from exc
 
 
 def _iso_week(x, be):

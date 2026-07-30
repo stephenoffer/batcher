@@ -122,6 +122,14 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
     * anything else — a lost worker, an untranslatable expression — is recomputed by the native
       **CPU engine**, which produces the identical partial. A deterministic error fails the same
       way on a smaller shard, so it does not take the first rung.
+
+    Those recomputations are *submitted* from the barrier and awaited after it, not awaited
+    inside it. The case that matters is a spot reclamation taking several nodes at once, where
+    resolving each recovery where it was noticed would run them one after another — turning the
+    one event a fan-out most needs to absorb into the slowest possible response to it.
+
+    A subdivision, by contrast, runs its pieces one at a time on purpose. The shard did not fit;
+    running its pieces concurrently on the same device is how it would not fit again.
     """
     import ray
 
@@ -153,11 +161,38 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
         if not dc.gpu_shard_cpu_fallback:
             raise exc
         note_suppressed("dist", f"gpu shard {i}; recomputing on the CPU engine", exc)
-        return ray.get(cpu_task.remote(descriptors[i], shard_ops, cfg_json))
+        return _Recovering(cpu_task.remote(descriptors[i], shard_ops, cfg_json))
 
     refs = [_launch(i) for i in range(len(descriptors))]
     results = gather_with_backups(refs, _launch, speculation_policy(), on_failure=_on_failure)
+    results = _await_recoveries(results)
     return [t for t in results if t is not None and t.num_rows]
+
+
+class _Recovering:
+    """A shard whose CPU recomputation is in flight, standing in for its eventual result.
+
+    Returned from the barrier's failure hook so the barrier does not block on it. Every
+    recovery is therefore already running by the time the last one is awaited.
+    """
+
+    __slots__ = ("ref",)
+
+    def __init__(self, ref) -> None:
+        self.ref = ref
+
+
+def _await_recoveries(results: list) -> list:
+    """Resolve the in-flight recomputations, in one wait rather than one wait each."""
+    pending = [i for i, r in enumerate(results) if isinstance(r, _Recovering)]
+    if not pending:
+        return results
+    import ray
+
+    out = list(results)
+    for i, value in zip(pending, ray.get([results[i].ref for i in pending]), strict=True):
+        out[i] = value
+    return out
 
 
 def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
