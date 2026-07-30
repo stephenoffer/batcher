@@ -32,21 +32,21 @@ The translator is parameterized by dataframe library. It runs on cuDF on a GPU w
 
 A single device's memory is the wrong ceiling for the queries a GPU is worth using for. A chain with a **mergeable reducer** is split instead: each device reads its own shard straight from storage and reduces it, and the small per-group results are folded once.
 
-Three reducers have a mergeable form. An `aggregate`, for the reductions whose partials fold — a mean is not itself mergeable, but the sum and count it is a ratio of are. A `distinct`, because deduplicating twice is deduplicating once. And a sort carrying a limit, because a global top-N is the top-N of the shards' top-Ns. Only the row-local operators — filter and project — may run *below* the reducer; everything else reads rows its shard does not have. Anything *above* it runs once on the folded result, which is what lets the ordinary analytical shape (group by, then sort, then limit) fan out at all.
+Three reducers have a mergeable form. An `aggregate`, for the reductions whose partials fold: a mean is not itself mergeable, but the sum and count it is a ratio of are. A `distinct`, because deduplicating twice is deduplicating once. And a sort carrying a limit, because a global top-N is the top-N of the shards' top-Ns. Only the row-local operators (filter and project) may run *below* the reducer; everything else reads rows its shard does not have. Anything *above* it runs once on the folded result, which is what lets the ordinary analytical shape (group by, then sort, then limit) fan out at all.
 
 `median`, `quantile`, `var`, `stddev` and `count-distinct` each need a group's whole value set, so a chain reducing with one of those stays on a single device. An aggregate that cannot shard is a scale ceiling; one that shards wrongly is a wrong number.
 
-The decomposition is expressed as more plan IR (`plan/distribution/`) rather than as a second set of kernels, so partial and combine run through the same translator every other operator does, and the multi-device answer equals the single-device one by construction. The same module answers the optimizer's question — a plan that shards is bounded by its shard size rather than by one device's memory, which changes where Kyber routes it.
+The decomposition is expressed as more plan IR (`plan/distribution/`) rather than as a second set of kernels, so partial and combine run through the same translator every other operator does, and the multi-device answer equals the single-device one by construction. The same module answers the optimizer's question. A plan that shards is bounded by its shard size rather than by one device's memory, which changes where Kyber routes it.
 
 ### When a device is lost, or too small
 
 A fan-out that abandons the accelerated path because one shard failed is not much of a fan-out. Failures are handled where they happen:
 
-- a shard that **did not fit** is subdivided and rerun on the device, halving further while it still does not fit. The shard count is fixed before the query runs, from an estimate, and estimates are wrong exactly where it matters — a skewed key, a wider row than the footer promised, a neighbouring tenant on the device. Subdividing is exact because the stage is mergeable;
-- a shard that failed for **any other reason** — a reclaimed spot node, a device that fell off the bus — is recomputed by the native CPU engine, which produces the identical mergeable partial. One dead device costs that shard's time rather than the query;
+- a shard that **did not fit** is subdivided and rerun on the device, halving further while it still does not fit. The shard count is fixed before the query runs, from an estimate, and estimates are wrong exactly where it matters: a skewed key, a wider row than the footer promised, a neighboring tenant on the device. Subdividing is exact because the stage is mergeable;
+- a shard that failed for **any other reason** (a reclaimed spot node, a device that fell off the bus) is recomputed by the native CPU engine, which produces the identical mergeable partial. One dead device costs that shard's time rather than the query;
 - a **straggler** gets a duplicate through the same backup barrier the CPU shuffle uses, and whichever copy lands first is kept.
 
-No worker's input passes through the driver. Each task receives a partition descriptor — a manifest of splits with the projection and predicate already pushed into it — and reads from storage itself. The second path is the entire ML batch-inference workload.
+No worker's input passes through the driver. Each task receives a partition descriptor (a manifest of splits with the projection and predicate already pushed into it) and reads from storage itself. The second path is the entire ML batch-inference workload.
 
 ## Keeping the device fed
 
@@ -200,7 +200,7 @@ A GPU `fn` never runs in a process pool, because it has to keep a single process
 
 Multi-GPU collective placement doesn't work. `SchedulingEnvelope.gpu_collective` and `placement_strategy` exist in `plan/resource.py` and are read by `dist/executors/ray_runtime/scheduling.py`, but the actor pool sets only `num_gpus` and `accelerator_type` and there's no placement group behind them. This is about *inference* stages. The relational fan-out described above uses many devices, but as independent single-device tasks that share nothing, which is a weaker requirement than a collective.
 
-The relational backend has no device-to-device shuffle, so it distributes only what the mergeable algebra covers. A chain that reduces with `median`, `quantile`, `var`, `stddev` or `count-distinct` runs on one device; a chain with no reducer at all produces every input row and is left to the spillable CPU engine when it exceeds one device. Both are scale ceilings rather than wrong answers, and both would lift with a key-partitioning exchange between devices.
+The relational backend has no device-to-device shuffle, so it distributes only what the algebra above covers. A chain that reduces with `median`, `quantile`, `var`, `stddev` or `count-distinct` runs on one device, because each needs a group's whole value set. A `right` or `full` join runs on one device, because broadcasting the build side would duplicate its unmatched rows, and a join the planner did not mark `broadcast` runs on one device because its build side does not fit. All are scale ceilings rather than wrong answers, and all would lift with a key-partitioning exchange between devices.
 
 GPU tensors move between stages as Arrow through host memory. There's no device-to-device transport. That's a deliberate consequence of the Arrow-only invariant, and `docs/internals/rfc-gpu-transport.md` proposes changing it. That document is an in-tree proposal, not a description of shipped behavior.
 

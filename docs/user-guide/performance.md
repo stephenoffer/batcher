@@ -257,11 +257,12 @@ the CPU engine, and anything unsupported or a GPU-less cluster falls back
 transparently.
 
 Above it, how far the query scales depends on the plan rather than on the cluster. A
-chain that reduces — a group-by aggregate, a distinct, or a sort with a limit — splits
+chain that reduces (a group-by aggregate, a distinct, or a sort with a limit) splits
 across every device, each reading its own shard from storage and reducing it, so the
 memory that has to fit a device is one shard's rather than the whole working set's. A
-chain with nothing to reduce produces every input row, cannot be split that way, and
-runs on the spillable CPU engine once it exceeds one device.
+chain with nothing to reduce splits too, with each shard's rows reassembled in order.
+A join splits its large side and gives every device the small one, when the planner
+sized the small side to fit.
 
 That is why the shape of the query, not just its size, decides whether the GPU helps:
 
@@ -274,8 +275,12 @@ ds.group_by("country").agg(revenue=bt.col("amount").sum()).collect(backend="auto
 (ds.group_by("country").agg(r=bt.col("amount").sum())
    .sort("r", descending=True).limit(10).collect(backend="auto"))
 
-# does not reduce: one device, or the CPU engine if it does not fit one
+# does not reduce: still splits, and the shards' rows reassemble in order
 ds.filter(bt.col("amount") > 100).collect(backend="auto")
+
+# a star schema: the fact side splits, every device reads the dimension itself
+(facts.join(dims, on="sku").group_by("category").agg(r=bt.col("amount").sum())
+      .collect(backend="auto"))
 ```
 
 A shard that a device cannot hold is subdivided and rerun on the device rather than
