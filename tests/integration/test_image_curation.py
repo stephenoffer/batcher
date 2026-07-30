@@ -142,3 +142,24 @@ def test_null_and_undecodable_input_yields_null_rather_than_failing_the_batch(bu
     assert got[0] is not None
     assert got[1] is None
     assert got[2] is None
+
+
+def test_a_tiny_image_is_not_enlarged_to_invent_an_interior():
+    """`resize` fits within the box in both directions, so it would upscale a thumbnail —
+    reporting a sharpness of 0 for an image with no interior pixel to measure. Only
+    downscaling keeps the documented contract honest."""
+    one_pixel = _png(np.full((1, 1), 200, dtype="uint8"))
+    got = _measure(
+        [one_pixel],
+        s=bt.col("img").image.sharpness(),
+        b=bt.col("img").image.brightness(),
+    )
+    assert got["s"] == [None]
+    assert got["b"][0] == pytest.approx(200 / 255, abs=0.01)
+
+
+def test_an_image_smaller_than_the_measure_box_still_scores():
+    """Below the box but above the 3x3 floor: measured as-is, not resampled."""
+    small = _checker(size=16)
+    got = _measure([small], s=bt.col("img").image.sharpness())
+    assert got["s"][0] > 0.0

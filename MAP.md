@@ -1320,7 +1320,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 
 | module | lines | what it is |
 |---|---|---|
-| `aggs.py` | 261 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
+| `aggs.py` | 296 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
 | `backend.py` | 251 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 312 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
@@ -2348,7 +2348,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/math.rs` | 475 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 400 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/mod.rs` | 621 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
-| `eval/media/image/quality.rs` | 121 | Image-curation measures: how bright an image is, and how sharp. |
+| `eval/media/image/quality.rs` | 130 | Image-curation measures: how bright an image is, and how sharp. |
 | `eval/media/image/reencode.rs` | 250 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 42 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |

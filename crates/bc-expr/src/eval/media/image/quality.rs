@@ -22,18 +22,27 @@ use crate::ExprError;
 
 /// The edge the two measures share: decode, downsample, and flatten to luma.
 ///
-/// 128 on the long side keeps enough structure to tell focus from blur while making the cost
-/// per image independent of its resolution — a corpus mixing thumbnails and 50-megapixel scans
-/// otherwise spends all its time on the scans.
+/// 128 on the long side keeps enough structure to tell focus from blur while bounding the cost
+/// per image — a corpus mixing thumbnails and 50-megapixel scans otherwise spends all its time
+/// on the scans. An image already smaller than this is left alone: enlarging it would invent no
+/// detail and would give a one-pixel image an interior it does not have.
 const MEASURE_SIDE: u32 = 128;
 
 fn luma_plane(data: &[u8]) -> Option<(Vec<f64>, usize, usize)> {
     let img = image::load_from_memory(data).ok()?;
-    let small = img.resize(
-        MEASURE_SIDE,
-        MEASURE_SIDE,
-        image::imageops::FilterType::Triangle,
-    );
+    // Only ever *down*scale. `resize` fits within the box in both directions, so it happily
+    // enlarges a thumbnail to 128 on a side — which invents no detail, costs work, and turned
+    // a 1x1 image into a 128x128 uniform field that reported a sharpness of 0 where it has no
+    // interior pixel to measure at all.
+    let small = if img.width() > MEASURE_SIDE || img.height() > MEASURE_SIDE {
+        img.resize(
+            MEASURE_SIDE,
+            MEASURE_SIDE,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
     let grey = small.into_luma8();
     let (w, h) = (grey.width() as usize, grey.height() as usize);
     if w == 0 || h == 0 {
