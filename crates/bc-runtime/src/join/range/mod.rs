@@ -19,11 +19,31 @@
 //! the passes were 781 ms against a single-threaded sweep of 638 ms — while the sweep already
 //! fanned out to rayon and the passes did not. They are pure gathers and scatters over the
 //! universe, so they parallelize completely; three of them re-read `order2` to produce three
-//! arrays indexed identically, so they also fuse. Doing both took the whole operator, on the
-//! shape `report_range_join_phases` measures, from **107 ms to 91 ms at 500,000 rows a side,
-//! 558 ms to 386 ms at 2,000,000, and 1.9 s to 1.3 s at 5,000,000** (best of three each way,
-//! same box, load average ~13). Block-pair pruning would not have moved any of it: the
-//! suffix walk it removes was already the smaller half.
+//! arrays indexed identically, so they also fuse.
+//!
+//! Applying that same reading one layer down kept finding the same thing: **every phase of this
+//! operator except the sorts themselves was running on one core.** The `u64` key maps and the
+//! universe gathers in [`keys`]; the dense-rank pass, which looks serial but is a prefix sum in
+//! disguise (count the key changes per chunk, scan those counts, then let each chunk walk its own
+//! range); the one-sided key sorts, which also paid a padded 16-byte `(u64, u32)` where the
+//! packed `u64` [`keys::packed_keys`] already used for the two-sided order fits; and the band's
+//! monotone cursor walk, where each chunk seeks its own start with one binary search — exact,
+//! because the walk is monotone over a sorted array.
+//!
+//! Cumulative effect on the two shapes the phase reports measure, best of three each way at
+//! comparable load:
+//!
+//! | shape | n per side | before | after |
+//! |---|---|---|---|
+//! | general IEJoin | 500,000 | 107 ms | **78 ms** |
+//! | general IEJoin | 2,000,000 | 558 ms | **237 ms** |
+//! | general IEJoin | 5,000,000 | 1.9 s | **522 ms** |
+//! | band | 2,000,000 | 259 ms | **128 ms** |
+//! | band | 5,000,000 | 913 ms | **313 ms** |
+//!
+//! Every one of those is a reindexing or a re-association of the same values, so the arrays each
+//! phase hands the next are byte-for-byte what the sequential code produced. Block-pair pruning
+//! would not have moved any of it: the suffix walk it removes was already the smaller half.
 //!
 //! Three algorithms, picked by the *shape* of the condition rather than only its arity:
 //!
