@@ -85,6 +85,24 @@ def _signed():
     )
 
 
+def _temporal():
+    """A timestamp column with a null, a leap day, and a year boundary."""
+    return pa.table(
+        {
+            "t": pa.array(
+                [
+                    dt.datetime(2021, 3, 14, 15, 9, 26),
+                    dt.datetime(2020, 2, 29),
+                    None,
+                    dt.datetime(1999, 12, 31, 23, 59, 59),
+                ],
+                type=pa.timestamp("us"),
+            ),
+            "s": pa.array(["hello world", "ab", None, ""], type=pa.string()),
+        }
+    )
+
+
 def _texts():
     return pa.table(
         {
@@ -311,6 +329,45 @@ def test_string_operations_match_cpu_engine(build, be):
     _assert_matches(got, exp, be)
 
 
+@pytest.mark.parametrize(
+    "expr",
+    [
+        lambda: col("t").dt.year(),
+        lambda: col("t").dt.month(),
+        lambda: col("t").dt.day(),
+        lambda: col("t").dt.hour(),
+        lambda: col("t").dt.quarter(),
+        # the engine numbers the week from Sunday; both backends number it from Monday
+        lambda: col("t").dt.dayofweek(),
+        lambda: col("t").dt.dayofyear(),
+        # ...and `week` is the ISO week, which is a calculation rather than an attribute, and
+        # which fills a null timestamp with zero instead of propagating it
+        lambda: col("t").dt.week(),
+        lambda: col("t").dt.is_leap_year(),
+        lambda: col("t").dt.days_in_month(),
+        lambda: col("t").dt.epoch(),
+        # `lpad`/`rpad` TRUNCATE as well as pad; `rjust`/`ljust` only ever pad
+        lambda: col("s").str.lpad(6, "0"),
+        lambda: col("s").str.rpad(6, "0"),
+        lambda: col("s").str.repeat(2),
+        # SQL `position` is 1-based and reports 0 for "not found"; `find` is 0-based and -1
+        lambda: col("s").str.position("o"),
+        lambda: col("s").str.right(2),
+        lambda: col("s").str.initcap(),
+    ],
+)
+def test_temporal_and_string_functions_match_cpu_engine(expr, be):
+    got, exp = _run(lambda ds: ds.select(r=expr()), _temporal(), be)
+    _assert_same_order(got, exp, be)
+
+
+def test_a_date_function_can_drive_a_filter_and_a_group_key(be):
+    got, exp = _run(lambda ds: ds.filter(col("t").dt.year() > 2000), _temporal(), be)
+    _assert_matches(got, exp, be)
+    got, exp = _run(lambda ds: ds.group_by(y=col("t").dt.year()).agg(n=bt.count()), _temporal(), be)
+    _assert_matches(got, exp, be)
+
+
 def test_typed_literal_survives_the_wire_form(be):
     """A date literal rides the IR as days-since-epoch; comparing the raw integer is wrong."""
     table = pa.table({"d": pa.array([dt.date(2020, 1, 1), dt.date(2021, 6, 1)], type=pa.date32())})
@@ -410,6 +467,25 @@ def test_window_variants_match_cpu_engine(build, be):
     ],
 )
 def test_value_and_aggregate_windows_match_cpu_engine(build, be):
+    got, exp = _run(build, _nulls(), be)
+    _assert_same_order(got, exp, be)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        # a moving window — most of what a time series is ever asked for, and a shape the
+        # translator used to decline outright
+        lambda ds: ds.select(r=col("v").rolling_sum(2, partition_by=["g"], order_by=["v"])),
+        lambda ds: ds.select(r=col("v").rolling_mean(2, partition_by=["g"], order_by=["v"])),
+        lambda ds: ds.select(r=col("v").rolling_max(3, partition_by=["g"], order_by=["v"])),
+        lambda ds: ds.select(r=col("v").rolling_min(3, partition_by=["g"], order_by=["v"])),
+        lambda ds: ds.select(r=col("v").rolling_count(2, partition_by=["g"], order_by=["v"])),
+        # a one-row window lowers as CURRENT ROW -> CURRENT ROW, not as 0 PRECEDING
+        lambda ds: ds.select(r=col("v").rolling_sum(1, partition_by=["g"], order_by=["v"])),
+    ],
+)
+def test_rolling_frames_match_cpu_engine(build, be):
     got, exp = _run(build, _nulls(), be)
     _assert_same_order(got, exp, be)
 

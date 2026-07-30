@@ -45,6 +45,10 @@ _PARTITION_AGG = {
 # Reductions with an O(1)-per-row running form (used when an ORDER BY makes the frame
 # running). `avg` is derived from the running sum and count rather than listed here.
 _RUNNING = frozenset({"sum", "min", "max", "count", "avg"})
+# Reductions over a fixed-width moving window. `sum`/`count`/`avg` are computed as a difference
+# of running totals, which uses only operations both backends have and needs no windowing
+# primitive; `min`/`max` have no such closed form and go through the backend's own `rolling`.
+_ROLLING = frozenset({"sum", "min", "max", "count", "avg"})
 
 _POS = "__bt_wpos"
 _PID = "__bt_wpid"
@@ -86,7 +90,9 @@ def _supported_function(f: dict, *, ordered: bool) -> bool:
     if frame is None:
         # Unframed: whole partition when unordered, running when ordered.
         return not ordered or func in _RUNNING
-    return _is_running_frame(frame) and func in _RUNNING
+    if _is_running_frame(frame):
+        return func in _RUNNING
+    return _rolling_width(frame) is not None and func in _ROLLING
 
 
 def _is_running_frame(frame: dict) -> bool:
@@ -96,6 +102,30 @@ def _is_running_frame(frame: dict) -> bool:
         and frame.get("start", {}).get("kind") == "unbounded_preceding"
         and frame.get("end", {}).get("kind") == "current_row"
     )
+
+
+def _rolling_width(frame: dict) -> int | None:
+    """The row count of a `ROWS n PRECEDING → CURRENT ROW` frame, else `None`.
+
+    This is the moving-window shape — a rolling sum, a moving average — which is most of what
+    a time series is ever asked for, and which the translator used to decline outright. Frames
+    that look *forward* (`FOLLOWING`) are not covered: they are the same idea reflected, but
+    each needs its own verification against the engine and an unverified window function is a
+    wrong number rather than a slow one.
+    """
+    if frame.get("units") != "rows":
+        return None
+    start, end = frame.get("start", {}), frame.get("end", {})
+    if end.get("kind") != "current_row":
+        return None
+    # A one-row window lowers as `CURRENT ROW -> CURRENT ROW` rather than as `0 PRECEDING`,
+    # so matching only the `preceding` spelling declined the narrowest window there is.
+    if start.get("kind") == "current_row":
+        return 1
+    if start.get("kind") != "preceding":
+        return None
+    n = start.get("n")
+    return int(n) + 1 if isinstance(n, int) and n >= 0 else None
 
 
 def window(df, ir: dict, be: DfBackend):
@@ -204,7 +234,12 @@ def _evaluate(out, f: dict, be: DfBackend, *, order, size):
     if func in _VALUE:
         return _value(out, f, size=size)
     frame = f.get("frame")
-    running = bool(order) if frame is None else _is_running_frame(frame)
+    if frame is not None and not _is_running_frame(frame):
+        width = _rolling_width(frame)
+        if width is None:
+            raise Unsupported(f"window frame {frame}")
+        return _rolling(out, f, be, width)
+    running = bool(order) if frame is None else True
     return _running(out, f, be) if running else _partition_agg(out, f, be)
 
 
@@ -308,3 +343,43 @@ def _running(out, f: dict, be: DfBackend):
     if func == "avg":
         return total / seen
     raise Unsupported(f"running {func}")
+
+
+def _rolling(out, f: dict, be: DfBackend, width: int):
+    """A reduction over the `width` rows ending at the current one.
+
+    `sum`, `count` and `avg` are differences of running totals: the total through this row minus
+    the total through the row that has just left the window. That is exact, uses only operations
+    both backends have, and keeps the null handling identical to the running case — a window
+    with no non-null value yields null rather than the operator's identity.
+
+    `min` and `max` have no such closed form (a value leaving the window can be the one that was
+    the extreme), so they go through the backend's own `rolling`, and decline if it is absent.
+    """
+    name = _agg_input(out, f, be)
+    func = f["func"]
+    values = out[name]
+    pid = out[_PID]
+    total = values.fillna(0).groupby(pid, sort=False).cumsum()
+    seen = values.notna().astype("int64").groupby(pid, sort=False).cumsum()
+    # What the window has already passed: zero at a partition's start, where the shift is null.
+    gone_total = total.groupby(pid, sort=False).shift(width).fillna(0)
+    gone_seen = seen.groupby(pid, sort=False).shift(width).fillna(0)
+    count = seen - gone_seen
+    if func == "count":
+        return count
+    if func in ("sum", "avg"):
+        window_sum = total - gone_total
+        return (window_sum if func == "sum" else window_sum / count).where(count > 0, None)
+    grouped = values.groupby(pid, sort=False)
+    roller = getattr(grouped, "rolling", None)
+    if roller is None:
+        raise Unsupported(f"rolling {func}")
+    try:
+        rolled = getattr(roller(width, min_periods=1), "min" if func == "min" else "max")()
+    except (TypeError, NotImplementedError, AttributeError) as exc:
+        raise Unsupported(f"rolling {func}: {exc}") from exc
+    # `groupby(...).rolling(...)` prefixes the group key onto the index; drop it and realign.
+    if getattr(rolled.index, "nlevels", 1) > 1:
+        rolled = rolled.reset_index(level=0, drop=True)
+    return rolled.sort_index()

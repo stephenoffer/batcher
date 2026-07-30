@@ -20,6 +20,13 @@ import operator
 from typing import TYPE_CHECKING, Any
 
 from batcher.core.gpu_plan.backend import Unsupported
+from batcher.core.gpu_plan.scalar_fns import (
+    apply_ufunc,
+    eval_date,
+    eval_math,
+    eval_math2,
+    eval_str,
+)
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
@@ -49,49 +56,6 @@ _BINOPS = {
     "bit_xor": operator.xor,
     "shift_left": operator.lshift,
     "shift_right": operator.rshift,
-}
-
-# Unary math functions, as `(device method, NumPy ufunc)`. Both names are spelled out rather
-# than derived from the engine's name, because guessing either is a silent-wrong-answer bug:
-# `trunc` was resolved by name to pandas' `Series.truncate`, which slices *rows by index* and
-# has nothing to do with truncating a value — it returned a different table without raising.
-# A `None` device method means the ufunc is used on both backends.
-_MATH_FNS = {
-    "abs": ("abs", "absolute"),
-    "acos": ("acos", "arccos"),
-    "asin": ("asin", "arcsin"),
-    "atan": ("atan", "arctan"),
-    "cbrt": (None, "cbrt"),
-    "ceil": ("ceil", "ceil"),
-    "cos": ("cos", "cos"),
-    "cosh": (None, "cosh"),
-    "degrees": (None, "degrees"),
-    "exp": ("exp", "exp"),
-    "floor": ("floor", "floor"),
-    "ln": ("log", "log"),
-    "log10": (None, "log10"),
-    "log2": (None, "log2"),
-    "radians": (None, "radians"),
-    "sin": ("sin", "sin"),
-    "sinh": (None, "sinh"),
-    "sqrt": ("sqrt", "sqrt"),
-    "tan": ("tan", "tan"),
-    "tanh": (None, "tanh"),
-    "trunc": (None, "trunc"),
-}
-
-# `.dt` attributes that carry the same name as the engine's date function.
-_DATE_ATTRS = frozenset({"day", "hour", "microsecond", "minute", "month", "quarter", "second",
-                         "year"})  # fmt: skip
-
-# String functions that are a no-argument `.str` method of the same name on both backends.
-_STR_METHODS = frozenset({"lower", "upper", "title", "reverse"})
-
-# String functions taking a single `pattern` argument, mapped to their `.str` method.
-_STR_PATTERN_METHODS = {
-    "contains": "contains",
-    "starts_with": "startswith",
-    "ends_with": "endswith",
 }
 
 
@@ -276,7 +240,7 @@ def _cast(ir, df, be):
         # any value with a fractional part. That is not a cast this path can decline: it is
         # the ordinary spelling of bucketing a measure, so refusing it would send every such
         # query to the host.
-        x = _ufunc("rint", x, be)
+        x = apply_ufunc("rint", x, be)
     return x.astype(be.dtype(target))
 
 
@@ -333,130 +297,18 @@ def _extreme(ir, df, be, *, want_max: bool):
     return out
 
 
-def _math(ir, df, be):
-    x = be.column(eval_expr(ir["input"], df, be), df)
-    fn = ir["fn"]
-    if fn == "sign":
-        # Neither Series type has `.sign()`. The arithmetic form has to restore the null
-        # itself: a comparison against a null yields null, and casting that to an integer
-        # raises rather than propagating.
-        pos = (x > 0).fillna(False).astype("int64")
-        neg = (x < 0).fillna(False).astype("int64")
-        return (pos - neg).astype(be.dtype(_float64())).where(x.notna(), None)
-    if fn == "round":
-        return _round(x, 0, be)
-    names = _MATH_FNS.get(fn)
-    if names is None:
-        raise Unsupported(f"math fn {fn}")
-    device_method, ufunc = names
-    if be.is_gpu and device_method is not None:
-        return getattr(x, device_method)()
-    return _ufunc(ufunc, x, be)
-
-
-def _ufunc(name: str, x, be):
-    """Apply NumPy's `name` element-wise, keeping the null mask the ufunc would destroy.
-
-    On the device the column is handed to the ufunc directly, which cuDF dispatches on the
-    GPU — materializing it as a host array first would move the whole column off the device
-    to compute something it can do in place.
-
-    On the host backend the ufunc drops the Arrow extension type to a plain float array, in
-    which a null becomes `NaN`; after that null and `NaN` are the same value and every one of
-    them converts back to null. That turns `sqrt(NaN)` into null, which is not what the engine
-    returns, so the input's own mask is re-applied to restore the distinction.
-    """
-    import numpy as np
-
-    fn = getattr(np, name, None)
-    if fn is None:
-        raise Unsupported(f"math fn {name}")
-    try:
-        if be.is_gpu:
-            return fn(x)
-        raw = fn(x.to_numpy(dtype="float64", na_value=np.nan))
-    except (TypeError, AttributeError, NotImplementedError, ValueError) as exc:
-        raise Unsupported(f"math fn {name}: {exc}") from exc
-    out = be.float_series(raw)
-    out.index = x.index
-    return out.where(x.notna(), None)
-
-
-def _round(x, digits: int, be):
-    """`round(x, digits)` rounding halves **away from zero**, as the engine does.
-
-    Both backends round halves to *even* (NumPy's rule), so `round(-2.5)` is `-2.0` there and
-    `-3.0` in the engine. The difference is invisible on most data and systematic on money,
-    which is exactly the data most likely to be rounded.
-    """
-    scale = 10.0**digits
-    scaled = x * scale if digits else x
-    shifted = _ufunc("floor", _ufunc("absolute", scaled, be) + 0.5, be)
-    signed = shifted.where((scaled >= 0).fillna(True), -shifted)
-    return signed / scale if digits else signed
-
-
-def _float64():
-    import pyarrow as pa
-
-    return pa.float64()
-
-
-def _math2(ir, df, be):
-    fn = ir["fn"]
-    left = eval_expr(ir["left"], df, be)
-    right = eval_expr(ir["right"], df, be)
-    if fn == "pow":
-        return be.column(left, df) ** right
-    if fn == "round":
-        # `round(x, digits)` — the digit count is a constant in every plan the engine builds,
-        # and a per-row digit count has no Series form on either backend.
-        if be.is_series(right):
-            raise Unsupported("round with a non-constant digit count")
-        return _round(be.column(left, df), int(right), be)
-    raise Unsupported(f"math2 fn {fn}")
-
-
 def _in_list(ir, df, be):
     values = [literal_value(v) for v in ir["set"]]
     return be.column(eval_expr(ir["input"], df, be), df).isin(values)
 
 
-def _str(ir, df, be):
-    x = be.column(eval_expr(ir["input"], df, be), df)
-    fn = ir["fn"]
-    if fn in _STR_METHODS:
-        return getattr(x.str, fn)()
-    if fn == "len":
-        return x.str.len().astype(be.dtype(_int64()))
-    if fn in _STR_PATTERN_METHODS:
-        return getattr(x.str, _STR_PATTERN_METHODS[fn])(ir["pattern"])
-    if fn == "replace":
-        # The engine replaces every occurrence and treats the pattern as a literal.
-        return x.str.replace(ir["pattern"], ir["replacement"], regex=False)
-    if fn == "substr":
-        # SQL's 1-based, inclusive `substring(s, start, length)`: a `start` below 1 spends
-        # part of the length before the string begins, so `substr(s, 0, 1)` is the empty
-        # string. Slicing from a 0-based `start` instead silently returns a shifted window.
-        start, length = int(ir["start"]), int(ir["length"])
-        return x.str.slice(max(start - 1, 0), max(start + length - 1, 0))
-    if fn in ("trim", "l_trim", "r_trim"):
-        return {"trim": x.str.strip, "l_trim": x.str.lstrip, "r_trim": x.str.rstrip}[fn]()
-    raise Unsupported(f"str fn {fn}")
+def _named(handler):
+    """Adapt a function-family evaluator to the handler signature.
 
-
-def _date(ir, df, be):
-    fn = ir["fn"]
-    if fn not in _DATE_ATTRS:
-        raise Unsupported(f"date fn {fn}")
-    x = be.column(eval_expr(ir["input"], df, be), df)
-    return getattr(x.dt, fn).astype(be.dtype(_int64()))
-
-
-def _int64():
-    import pyarrow as pa
-
-    return pa.int64()
+    The families take `eval_expr` as an argument rather than importing it, so the vocabulary
+    module does not import back into the dispatcher that dispatches to it.
+    """
+    return lambda ir, df, be: handler(ir, df, be, eval_expr)
 
 
 _HANDLERS = {
@@ -474,9 +326,9 @@ _HANDLERS = {
     "nullif": _nullif,
     "greatest": lambda ir, df, be: _extreme(ir, df, be, want_max=True),
     "least": lambda ir, df, be: _extreme(ir, df, be, want_max=False),
-    "math": _math,
-    "math2": _math2,
+    "math": _named(eval_math),
+    "math2": _named(eval_math2),
     "in_list": _in_list,
-    "str": _str,
-    "date": _date,
+    "str": _named(eval_str),
+    "date": _named(eval_date),
 }
