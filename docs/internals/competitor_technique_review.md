@@ -1,7 +1,9 @@
 # Competitor technique review: what to take from DuckDB, Polars, DataFusion, Spark, Daft and Ray Data
 
-**Status:** review, 2026-07-24. Every competitor claim below cites a file that was read in
-this pass. Every claim about Batcher was checked against Batcher's code, not its docs.
+**Status:** review, 2026-07-24; **status of every Batcher-side claim re-checked against the code
+2026-07-29**, which moved three items to landed and one from "partly closed" to "unreachable on
+the live path". Every competitor claim below cites a file that was read in the original pass.
+Every claim about Batcher was checked against Batcher's code, not its docs.
 
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
 This document is the *parts list* behind it. It answers a narrower question: given the
@@ -33,14 +35,21 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 
 | # | Technique | Best source | Batcher today | Value |
 |---|---|---|---|---|
-| 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed this pass** | 1.3x to 5.7x on multi-predicate filters |
+| 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed** | 1.3x to 5.7x on multi-predicate filters |
 | 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | The other half of the single-node gap |
-| 3 | Online adaptive reordering of filter conjuncts | DuckDB | Absent | Fixes the case a static cost model gets wrong |
-| 4 | Top-K heap threshold pushed down as a filter | DataFusion | Absent (heap itself is good) | Large on `ORDER BY ... LIMIT k` over big inputs |
+| 3 | Online adaptive reordering of filter conjuncts | DuckDB | **Landed** (`ConjunctOrder`) | Fixes the case a static cost model gets wrong |
+| 4 | Top-K heap threshold pushed down as a filter | DataFusion | **Half landed** (`TopNBound` skips morsels; nothing reaches the scan) | Large on `ORDER BY ... LIMIT k` over big inputs |
 | 5 | Skew detected from measured partition sizes, split automatically | Spark AQE | Machinery exists, off by default | Removes a config the user cannot be expected to set |
-| 6 | Dictionary encoding surviving past the leaf | DuckDB, Arrow | Comparisons only | Compounds with 2 |
+| 6 | Dictionary encoding surviving past the leaf | DuckDB, Arrow | **Unreachable** — decoded at the FFI boundary, so the dict-native kernels never see a dictionary from Python | Compounds with 2 |
 | 7 | Adaptive morsel sizing as a pluggable strategy | Daft | Fixed 16,384 rows | Small, and mostly a latency story |
-| 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | Cartesian product + filter | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
+| 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
+
+**Status correction, 2026-07-29.** Items 3, 4 and 8 were recorded as absent or open and are
+landed; item 6 was recorded as partially closed and is in fact *inert on the live path*. Three
+of the six open items in the backlog at the bottom of this document therefore described work
+that already existed, which is a real cost: an agent working from this list re-implements what
+is there, or "fixes" what is not broken. Each row above now names the type that implements it
+so the claim can be checked in one grep. The per-item sections carry the evidence.
 
 Items 1 and 3 are two halves of the same DuckDB mechanism. Item 1 is the part that is
 provably safe without cross-morsel state, which is why it went first.
@@ -192,8 +201,25 @@ called per morsel from five sites (`crates/bc-interp/src/lib.rs:135`,
 `crates/bc-interp/src/par.rs:532` and `:1934`, `crates/bc-interp/src/stream/mod.rs:285`,
 `crates/bc-interp/src/stream/parallel.rs:501`) with no per-operator slot to hang a
 permutation on. The `Jit` value threaded through `par.rs` is the natural place to put one,
-since it is already compiled once per operator and shared across rayon workers. That is the
-next increment.
+since it is already compiled once per operator and shared across rayon workers.
+
+**Landed as `bc_expr::ConjunctOrder`** (`crates/bc-expr/src/select.rs`), and it took a
+stronger form than the mechanism it was modelled on. DuckDB hill-climbs on an *aggregate*
+signal — swap an adjacent pair, keep the swap if total runtime improved over the next ten
+batches — which needs tens of batches to walk a permutation. Because
+`short_circuit_filter_mask_with` already evaluates the conjuncts one at a time, Batcher can
+attribute rows and time to each conjunct *individually* and jump to the implied order after a
+single morsel. The rank is time-per-row divided by rows-removed-per-row, which is the quantity
+that actually matters and which cost alone cannot express. It needs no lock: every counter is a
+`Relaxed` atomic and each morsel derives its own permutation, because the conjuncts of an `AND`
+commute so every order yields the identical mask.
+
+It is wired at four sites, each building the state **once per operator** and capturing it in
+the per-morsel closure — the distinction that decides whether this works at all, since a
+per-morsel `ConjunctOrder` would measure and then discard: `stream/mod.rs:289`,
+`par.rs:567`, `par.rs:2094`, `stream/parallel.rs:619`. The default (streaming) executor never
+carries a JIT on this path, so it takes the measured order unconditionally.
+`a_measured_order_beats_the_static_one_and_agrees_with_the_oracle` pins both halves.
 
 Note that DuckDB's `CanThrow()` guard and Batcher's `is_infallible_predicate` are the same
 idea, arrived at for the same reason. Batcher's is stricter, because Batcher reorders and
@@ -222,6 +248,22 @@ top-K threshold is the same shape of object travelling the same path. The correc
 is in ties and nulls, and DataFusion's `build_filter_expression` is the reference for
 getting the `nulls_first` and equal-value cases right.
 
+**Half of this is landed, and the half matters.** `bc_runtime::topn::TopNBound` is wired into
+`ops::parallel_top_n` (`crates/bc-interp/src/ops/mod.rs:768`): once any morsel has produced a
+full set of `k` candidates it publishes its cut-off, and a later morsel whose entire first-key
+range is strictly worse than that is dropped for the price of one min/max pass over the key
+column. The bound only ever tightens, so a stale read costs a missed skip and never a wrong
+answer, and an `is_off()` gauge retires a bound that is not earning its cost. The key
+expressions are evaluated once per morsel and reused for the selection, the bound check and the
+candidate gather. `report_the_top_n_skip_saving` measures the trade it makes.
+
+What is **not** there is the edge to the scan. The bound skips morsels the engine has already
+read; nothing derived from it reaches a Parquet reader, so no row group is pruned and no I/O is
+avoided. That is the expensive half for `ORDER BY x LIMIT k` over a large file on disk, and it
+is what item 4 should now be read as meaning. It needs the predicate republished through the
+`runtime_filter.rs` transport and then through `io/predicate.py`'s pushdown, which is a
+boundary-crossing change rather than a data-plane one.
+
 ## 5. Skew detected from measured sizes
 
 Spark's `OptimizeSkewedJoin` calls a shuffle partition skewed when its size exceeds both
@@ -249,8 +291,38 @@ this pass adds is Spark's actual formula.
 `decode_dict` (`crates/bc-expr/src/eval/dispatch.rs:44`) casts a `Dictionary` column to its
 value type at the `Col` leaf, so no downstream kernel sees a dictionary. Two exceptions
 exist and both are recent wins: `InList` and `try_dict_compare` compare the distinct values
-and gather through the keys. Filters and group-by are dictionary-native; project, join keys
-and sort are not. This compounds with item 2 rather than competing with it.
+and gather through the keys. This compounds with item 2 rather than competing with it.
+
+**Correction, 2026-07-29: "filters and group-by are dictionary-native" is true of the kernels
+and false of the engine.** A `Dictionary` column is decoded **at the FFI boundary**, one level
+above every one of those fast paths: `bc_py::normalize_to`
+(`crates/bc-py/src/normalize.rs:84`) rewrites `Dictionary(_, value)` to `value` for every input
+column, alongside the narrow-numeric widening, so **no dictionary ever reaches the engine from
+Python**. `try_dict_compare`, the `InList` dictionary path and `assign_groups`' dictionary
+grouping are all reachable only from Rust callers that construct a dictionary directly — which
+is what their unit tests do, and which no query does.
+
+So the headline number attached to this axis in `competitive_architecture.md` ceiling 2 — a
+low-cardinality string filter going 144.9 ms to 7.4 ms, 19.6x — is a real measurement of a
+kernel that a user cannot reach, and the same applies to the ~7x quoted for grouping on codes.
+It is not a wrong measurement; it is a measurement of the wrong scope, and it should not be
+quoted as an engine result until the boundary preserves the encoding. `normalize.rs` is honest
+about this in its own `NOTE`; the scorecard is not.
+
+The blocker `normalize.rs` records is real and is not the kernels. The plan's schema treats a
+column by its Arrow type, so a preserved `Dictionary` propagates into intermediate schemas, and
+an operator that decodes one while reusing its input's schema then fails Arrow's own
+`RecordBatch::try_new` validation on the type mismatch. That is RFC
+`rfc-streaming-executor.md` Proposal 3: separate the plan's *logical* type (the value type)
+from the morsel's *physical* encoding (the dictionary).
+
+The shape of the fix worth recording, because it is smaller than the RFC implies: **decode on
+egress, not on ingress.** `normalize_to` keeps the `Dictionary` and normalizes only its value
+type; a new egress pass decodes `Dictionary` to its value type on the batches handed back to
+Python; and `plan/types/lattice.py::widen` then needs **no change at all**, because it already
+reports the value type — which is precisely what keeps `Dataset.schema` truthful and keeps a
+dictionary column joinable against a plain string one. The audit that remains is every operator
+that builds an output batch from its input's schema.
 
 ## 7. Adaptive morsel sizing
 
@@ -296,6 +368,26 @@ draft of this note claimed 15-643x in Batcher's favour; that was measured agains
 `NESTED_LOOP_JOIN` fallback over an Arrow scan and is retracted. The rest of this item is kept
 as the record of what was considered.
 
+**The block-decomposition diagnosis was measured and does not hold, 2026-07-29.** A phase study
+split the operator's non-sort time into the sweep and the seven passes that build the sweep's
+inputs. At five million rows a side the *passes* cost 781 ms against a single-threaded sweep of
+638 ms — and the sweep already fanned out to rayon while the passes ran on one core of 96. The
+suffix walk that block-pair pruning removes was already the smaller half, because `MarkSet`
+derives its level count from the universe size and each level multiplies the span one word read
+dismisses by 64, so an empty suffix costs one read per level (four at ten million entries)
+rather than one per word.
+
+Fixing what was actually there — fusing the three passes that re-read `order2` into one rayon
+pass, and parallelizing the `pos1` inverse permutation (disjoint by construction, so the slot
+type carries the disjointness as an atomic), `sorted_drank1` and `left_at` — took the whole
+operator from **107 ms to 91 ms at 500,000 rows a side, 558 ms to 386 ms at 2,000,000, and 1.9 s
+to 1.3 s at 5,000,000** (controlled A/B against `HEAD`, best of three each way, same box). Every
+change is a reindexing of the same values, so the arrays handed to the sweep are byte-for-byte
+what the sequential passes produced.
+
+Block decomposition remains the route to making the operator **distributable**, since that needs
+the same "which block pairs can intersect" pruning. It is no longer a single-node speed argument.
+
 **The cheaper option that was not taken, and why it looked like it suited Batcher.** A *binned* range join is a plan
 rewrite over operators that already exist. Bucket each point by `floor(x / W)`; expand each
 interval across the buckets it spans with `sequence` plus `Unnest`; equi-join on the bucket;
@@ -338,12 +430,30 @@ mistake for a gap:
 
 ## Backlog, in dependency order
 
-0. ~~A range-join algorithm (item 8).~~ **Landed** — the largest gap the review turned up, and
-   the one it recorded rather than half-built.
-1. Online adaptive conjunct reordering (item 3). Smallest remaining win, and it completes
-   the mechanism item 1 started.
-2. `StringView` adoption (item 2), with dictionary survival (item 6) alongside it, since
-   both are about not destroying a compact string representation at the leaf.
-3. Top-K threshold as a dynamic filter (item 4), reusing the runtime-filter transport.
-4. Skew salt derived from measured partition sizes (item 5).
-5. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
+Re-ordered 2026-07-29, after three items turned out to be already built. What is struck through
+is done; what remains is ordered by value against the mandate.
+
+0. ~~A range-join algorithm (item 8).~~ **Landed**, and its follow-up re-tuned — see item 8 for
+   why the block-decomposition step it named is a *distribution* prerequisite and not a
+   single-node speed fix.
+1. ~~Online adaptive conjunct reordering (item 3).~~ **Landed** as `ConjunctOrder`, in a
+   stronger form than DuckDB's (per-conjunct attribution rather than an aggregate hill-climb).
+2. **Preserve the dictionary across the FFI boundary (item 6).** Promoted to the top of the
+   remaining work, because it is not an optimization to build — the kernels exist and are
+   tested. It is one decode, in `normalize_to`, standing between them and every real query.
+   Decode on egress instead of ingress; `plan/types/lattice.py::widen` needs no change. The
+   audit is every operator that builds an output batch from its input's schema.
+3. `StringView` adoption (item 2), alongside 2, since both are about not destroying a compact
+   string representation. Still the largest and most invasive single-node item.
+4. **The scan half of the top-K dynamic filter (item 4).** The morsel-skip half is landed; what
+   is missing is republishing the bound so a Parquet reader can prune row groups, which is where
+   the I/O saving is.
+5. Skew salt derived from measured partition sizes (item 5).
+6. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
+
+**A process note, since this document exists to direct work.** Three of the six items in the
+previous version of this list described work that already existed, and one described a win the
+engine cannot reach. Every row of the shortlist now names the type that implements it, so the
+next reader can check the claim with one grep rather than trusting the prose. A parts list that
+has drifted is worse than no parts list: it spends effort re-deriving what is there and defends
+numbers the live path never produces.
