@@ -280,25 +280,29 @@ fn lit_f64(lit: &Lit) -> Option<f64> {
 /// wrong on skewed or correlated data — which is why the caller only ever uses this estimate
 /// to **decline** the filter, never to install it. Declining wrongly costs a speed-up;
 /// installing wrongly costs a slowdown, and only the measured probe is trusted for that.
-pub(crate) fn estimate(pred: &Pred, rg: &RowGroupMetaData) -> Option<f64> {
+pub(crate) fn estimate(
+    pred: &Pred,
+    rg: &RowGroupMetaData,
+    index: &crate::predicate::ColumnIndex,
+) -> Option<f64> {
     match pred {
         Pred::IsNull { col, negated } => {
             let rows = rg.num_rows();
             if rows <= 0 {
                 return None;
             }
-            let (stats, _) = crate::predicate::col_stats(rg, col)?;
+            let (stats, _) = index.stats(rg, col)?;
             // Exact, not interpolated: the null count is recorded, not inferred.
             let f = stats.null_count_opt()? as f64 / rows as f64;
             Some(if *negated { 1.0 - f } else { f })
         }
-        Pred::And { left, right } => Some(estimate(left, rg)? * estimate(right, rg)?),
+        Pred::And { left, right } => Some(estimate(left, rg, index)? * estimate(right, rg, index)?),
         Pred::Or { left, right } => {
-            let (a, b) = (estimate(left, rg)?, estimate(right, rg)?);
+            let (a, b) = (estimate(left, rg, index)?, estimate(right, rg, index)?);
             Some(a + b - a * b)
         }
         Pred::Cmp { col, op, lit } => {
-            let (stats, unsigned) = crate::predicate::col_stats(rg, col)?;
+            let (stats, unsigned) = index.stats(rg, col)?;
             let (lo, hi) = bounds_f64(stats, unsigned)?;
             let v = lit_f64(lit)?;
             let span = hi - lo;
