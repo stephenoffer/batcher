@@ -30,6 +30,7 @@ __all__ = [
     "cluster_hardware_profiles",
     "cluster_is_heterogeneous",
     "cluster_l3_cache_bytes",
+    "reset_fleet_health",
     "unhealthy_nodes",
     "warn_once_if_fleet_is_mixed",
 ]
@@ -245,8 +246,33 @@ def _device_health_on_this_worker() -> dict:
     }
 
 
+#: How long a fleet-health sample is reused before every accelerator node is asked again.
+#:
+#: The probe is a task per GPU node, and its callers are not all reports: the collective
+#: placement filter runs per placement decision, so an unsampled probe would put a fleet-wide
+#: round trip on a scheduling path — the exact cost the representative-sampling in
+#: `cluster_hardware_profiles` above exists to avoid.
+#:
+#: Thirty seconds is chosen against what is being measured, not against the callers. A
+#: quarantined device stays quarantined until an operator resets or replaces it, which is
+#: minutes at best; a device that faults *during* the window is caught on the next sample and
+#: costs one stage's placement, against a probe on every placement forever.
+_HEALTH_TTL_S = 30.0
+
+_HEALTH_SAMPLE: dict[str, object] = {"expires": 0.0, "value": ()}
+
+
+def reset_fleet_health() -> None:
+    """Drop the fleet-health sample, so the next call re-probes every node.
+
+    For a test, and for an operator who has just reset a device and wants the next report to
+    say so rather than repeating a thirty-second-old verdict.
+    """
+    _HEALTH_SAMPLE.update(expires=0.0, value=())
+
+
 def cluster_device_health() -> tuple[dict, ...]:
-    """One device-health record per accelerator node, read live.
+    """One device-health record per accelerator node, sampled.
 
     The fleet-wide view of the faults that do not fail a job. A node whose NVLink is down, whose
     host link renegotiated, or which holds a device the driver has condemned keeps accepting
@@ -260,6 +286,22 @@ def cluster_device_health() -> tuple[dict, ...]:
         a slow node must not stall the caller, and an unanswered probe is reported as absence
         rather than as health.
     """
+    import time
+
+    now = time.monotonic()
+    if now < float(_HEALTH_SAMPLE["expires"]):  # type: ignore[arg-type]
+        return _HEALTH_SAMPLE["value"]  # type: ignore[return-value]
+    probed = _probe_fleet_health()
+    # Only a successful probe is cached. An unreadable fleet is not a fact worth holding for
+    # thirty seconds — the cluster may be seconds from coming up — and caching it would make
+    # a transient failure decide the next half-minute of placements.
+    if probed:
+        _HEALTH_SAMPLE.update(expires=now + _HEALTH_TTL_S, value=probed)
+    return probed
+
+
+def _probe_fleet_health() -> tuple[dict, ...]:
+    """The unsampled fan-out behind `cluster_device_health`."""
     try:
         import ray
 

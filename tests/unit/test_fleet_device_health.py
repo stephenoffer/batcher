@@ -192,3 +192,33 @@ def test_the_probe_is_not_run_when_health_checking_is_off(monkeypatch):
     )
     with _health_enabled(enabled=False):
         assert len(placement._without_unhealthy(_topology("a"))) == 1
+
+
+# --- Sampling, so a scheduling path does not pay a fleet round trip ------------------------
+
+
+def test_the_probe_is_sampled_rather_than_run_per_caller(monkeypatch):
+    # The placement filter asks per placement decision. Unsampled, that puts a task-per-node
+    # round trip on a scheduling path.
+    calls = []
+    monkeypatch.setattr(
+        hardware_probe, "_probe_fleet_health", lambda: calls.append(1) or (_record("a"),)
+    )
+    hardware_probe.reset_fleet_health()
+    for _ in range(10):
+        assert hardware_probe.cluster_device_health() == (_record("a"),)
+    assert len(calls) == 1
+    hardware_probe.reset_fleet_health()
+    hardware_probe.cluster_device_health()
+    assert len(calls) == 2
+
+
+def test_an_unreadable_fleet_is_not_cached(monkeypatch):
+    # A cluster seconds from coming up must not have its unavailability held for half a
+    # minute of placement decisions.
+    calls = []
+    monkeypatch.setattr(hardware_probe, "_probe_fleet_health", lambda: calls.append(1) or ())
+    hardware_probe.reset_fleet_health()
+    for _ in range(3):
+        assert hardware_probe.cluster_device_health() == ()
+    assert len(calls) == 3
