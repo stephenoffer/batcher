@@ -237,6 +237,14 @@ def _cast(ir, df, be):
     x = be.column(eval_expr(ir["input"], df, be), df)
     import pyarrow as pa
 
+    if pa.types.is_string(target) and be.is_float(x):
+        # Float → string is a *formatting* decision, and the two implementations make three
+        # different ones: whether an integral value keeps its `.0` (`"4"` against `"4.0"`),
+        # what the sign of zero prints as, and whether `NaN` becomes the string `"nan"` or a
+        # null. None of those is more correct than the others, which is exactly why this
+        # cannot be reconciled — it has to be declined, or a column of numbers becomes a
+        # column of subtly different text.
+        raise Unsupported("cast float to string")
     if pa.types.is_integer(target) and be.is_float(x):
         # Float → integer **rounds**, half to even, where a direct `astype` instead raises on
         # any value with a fractional part. That is not a cast this path can decline: it is

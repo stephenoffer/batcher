@@ -10,6 +10,18 @@ plausible number rather than an error. `substr` is 1-based, `lpad` truncates as 
 `day_of_week` counts from a different day, `round` breaks halves away from zero rather than to
 even, and `position` reports 0 rather than -1 for "not found". Each is spelled out and pinned
 by a case comparing it against the engine.
+
+Two differences are known and deliberately left, because neither is a claim this vocabulary
+can make and neither changes a value:
+
+* the **transcendentals** (`sinh`, `tanh`, `acos` and their neighbours) can land one unit in
+  the last place away from the engine's, because they are a different `libm`. On a real device
+  they will differ again, and by more — a GPU's transcendental unit is its own implementation.
+  IEEE does not require these to be correctly rounded, so agreeing to the last bit is not
+  something any two implementations promise each other.
+* `round` returns `+0.0` where the engine returns `-0.0`. The two compare equal, and every
+  place in this package where the sign of zero could change an *answer* — a group key, a
+  distinct row, a join key — folds them together on purpose (`ops.fold_zero`).
 """
 
 from __future__ import annotations
