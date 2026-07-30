@@ -22,6 +22,15 @@ bc-resource.workspace = true
 arrow.workspace = true
 arrow-pyarrow.workspace = true
 mimalloc.workspace = true
+# The allocator's own accounting and its release valve, which the `mimalloc` wrapper does
+# not re-export. `mi_process_info` is what lets a memory envelope be computed from the
+# *engine's* footprint rather than from process RSS (which counts freed-but-retained pages),
+# and `mi_collect` is what makes that difference actionable: hand the retained arena back
+# before spilling a hash table to disk. `default-features = false` keeps the `local_dynamic_tls`
+# model the workspace pins — see the `mimalloc` note in the root manifest for why a dlopen'd
+# cdylib must not use `initial-exec` TLS. Same version the wrapper already links, so this adds
+# no code to the build, only a header surface.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 pyo3.workspace = true
 rayon.workspace = true
 serde_json.workspace = true

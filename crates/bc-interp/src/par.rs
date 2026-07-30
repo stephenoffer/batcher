@@ -477,22 +477,41 @@ fn pin_threads_enabled() -> bool {
     })
 }
 
-/// Pin the calling rayon worker (logical index `idx`) to a CPU core, round-robin over
-/// the available cores. Linux-only — hard affinity via `sched_setaffinity`; a no-op on
-/// other platforms (macOS exposes only advisory affinity hints), so pinning is
+/// Pin the calling rayon worker (logical index `idx`) to a CPU, following the topology
+/// order from `bc_arrow::placement`. Linux-only — hard affinity via `sched_setaffinity`;
+/// a no-op on other platforms (macOS exposes only advisory affinity hints), so pinning is
 /// best-effort and never errors out of execution.
+///
+/// The CPU id comes from [`bc_arrow::pinning_order`] rather than `idx % usable_cores()`,
+/// which was wrong in two ways that both showed up as "pinning enabled, nothing happened".
+/// It named ids `0..n` even when a cgroup or `taskset` had narrowed the process to, say,
+/// `48-95` — `sched_setaffinity` then refused every call and the error was (correctly)
+/// ignored, so every worker stayed unpinned. And where it did land, adjacent indices fell on
+/// SMT siblings of one core on the parts that enumerate siblings adjacently, running the pool
+/// at half throughput on half the machine. The order fixes both: it only names CPUs in the
+/// mask, fills distinct physical cores before any sibling, and strides across NUMA nodes.
 #[cfg(target_os = "linux")]
 fn pin_current_thread(idx: usize) {
-    let n = bc_arrow::usable_cores();
-    let core = idx % n;
-    // SAFETY: a zeroed `cpu_set_t` is a valid empty set; `CPU_SET` sets one valid
-    // core index (`< n`), and `sched_setaffinity(0, ...)` targets the current thread
-    // with a correctly-sized set. A failure (e.g. restricted cgroup) is ignored —
-    // pinning is best-effort and never affects correctness.
+    // Computed once for the process, not per worker: the order is a directory walk over
+    // /sys, and a 96-CPU host would otherwise repeat it for every pool thread started.
+    static ORDER: OnceLock<Vec<usize>> = OnceLock::new();
+    let order = ORDER.get_or_init(bc_arrow::pinning_order);
+    // An unreadable topology means "do not pin". Falling back to a modulo over the core
+    // count is what produced the silent no-op above; an unpinned thread is strictly better
+    // than one pinned by guesswork.
+    if order.is_empty() {
+        return;
+    }
+    let cpu = order[idx % order.len()];
+    // SAFETY: a zeroed `cpu_set_t` is a valid empty set; `CPU_SET` sets one CPU id taken
+    // from this process's own affinity mask, and `sched_setaffinity(0, ...)` targets the
+    // current thread with a correctly-sized set. A failure (e.g. the mask narrowed between
+    // detection and this call) is ignored — pinning is best-effort and never affects
+    // correctness.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(core, &mut set);
+        libc::CPU_SET(cpu, &mut set);
         let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
 }

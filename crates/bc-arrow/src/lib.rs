@@ -25,6 +25,20 @@ pub use arrow::error::ArrowError;
 mod hardware;
 pub use hardware::{usable_cores, HardwareProfile, SimdOverride};
 
+pub mod isa;
+pub use isa::IsaFeatures;
+
+pub mod page_cache;
+
+pub mod placement;
+pub use placement::{cpu_for_worker, pinning_order};
+
+pub mod topology;
+pub use topology::{
+    affinity_cpus, numa_node_cpus, prefetch_read, prefetch_read_l2, prefetch_slice_ahead,
+    CachePadded, CpuTopology, DEFAULT_CACHE_LINE, MAX_RADIX_BITS, MIN_RADIX_BITS,
+};
+
 pub mod hash;
 pub use hash::{mix64, xxhash64, PortableBuildHasher, PortableHasher};
 
