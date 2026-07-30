@@ -67,9 +67,15 @@ def _encode(stats: SourceStatistics) -> dict[str, Any]:
         "content_byte_size": stats.content_byte_size,
         "bounds_include_nan": stats.bounds_include_nan,
         "row_group_count": stats.row_group_count,
-        # Physical properties drive redundant-sort removal and partition pruning; without
-        # them a Batcher-written footerless source (CSV/JSON) loses its ordering on reload.
+        # `sorted_by` drives redundant-sort removal: it reaches `RelStats.sorted_by` through
+        # `to_relstats`, and without it a Batcher-written footerless source (CSV/JSON) loses
+        # its ordering on reload and re-sorts data that is already sorted.
         "sorted_by": list(stats.sorted_by),
+        # `partition_keys` is round-tripped for `ds.meta.storage`, and **not** for pruning —
+        # a claim this comment used to make. Hive partition pruning happens in the reader:
+        # the pushed predicate goes to `pyarrow.dataset`, which skips fragments by partition
+        # value before Kyber sees a row. No optimizer rule reads this field, so if one is
+        # ever written, that is the moment to check whether the reader already did the job.
         "partition_keys": list(stats.partition_keys),
         "columns": columns,
     }

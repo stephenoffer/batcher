@@ -51,7 +51,19 @@ class SourceFormat(Protocol):
         ...
 
     def row_count(self) -> int | None:
-        """The number of rows, if known cheaply without reading data (else None)."""
+        """The **exact** number of rows, if known cheaply without reading data (else None).
+
+        Exact is a requirement, not a hope. When the conductor has collected no
+        `SourceStatistics` for a source, the estimator falls back to this and tags the
+        result `Provenance.EXACT` — which is the provenance that lets a terminal be answered
+        from metadata *without executing*. A source that returns an estimate here makes
+        `count()` return a number the data does not support, silently.
+
+        An estimate belongs in `SourceStatistics(row_count=..., exact_rows=False)`, which
+        exists for exactly this distinction: it informs cost and cardinality and can never
+        answer a terminal. A catalog figure such as Postgres `reltuples` or Mongo
+        `estimatedDocumentCount` goes there. Return `None` here instead.
+        """
         ...
 
     def identity(self) -> str:

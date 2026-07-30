@@ -64,6 +64,15 @@ deliberately declined, each for a reason worth keeping:
   unmetered, and the plan-level learned state (`record_execution`, `learn_column_stats`,
   `record_selectivity`, `record_run_feedback`) is single-node only. "Single-node ==
   distributed" holds for *results*, not yet for all learned state.
+- **Spill throughput is a table, not a measurement.** `kyber.storage_cost.spill_device_factor`
+  prices a spilled byte from a static device-class table read out of `/sys` (10x network, 30x
+  rotational, local flash the omitted baseline), while Core records `spill_bytes`,
+  `io_write_bytes` and `t_op_ms` per operator — enough to measure the real sustained rate of
+  the configured spill directory. Declined because that table is *calibrated against* the cost
+  term it multiplies, so replacing it re-tunes two coupled numbers rather than sharpening one
+  — the same trap `SourceStatistics.content_byte_size` records, where a more accurate width
+  produced worse plans. Needs `bench-ops` and `test_spilling.py` under real memory pressure,
+  re-tuning both together.
 - **The general two-inequality join still runs IEJoin** and loses above roughly 1M rows. Band
   detection closed the single-key case; block pruning is the fix for the general shape.
 - **Token n-gram metrics need a Rust primitive.** BLEU, ROUGE-N, METEOR and Distinct-2/3 need

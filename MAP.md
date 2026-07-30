@@ -659,7 +659,7 @@ Subquery handling and decorrelation for the SQL translator.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 1337 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 629 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 642 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
@@ -767,7 +767,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 402 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 452 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 350 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 175 | The learned per-column statistics tables — their schema, their keys, and their bound. |
@@ -1327,7 +1327,7 @@ Template-Method base classes for file-backed sources and sinks.
 
 | module | lines | what it is |
 |---|---|---|
-| `base.py` | 106 | Format contracts and registries — the seam new IO formats plug into. |
+| `base.py` | 118 | Format contracts and registries — the seam new IO formats plug into. |
 
 ### `batcher/io/formats/lakehouse/` — 2 · neutral IO
 
@@ -1889,7 +1889,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `io_stats.py` | 242 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 320 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
 | `smoothed.py` | 153 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
-| `source_stats_store.py` | 145 | Persisted source statistics — remember what Batcher wrote, for the next read. |
+| `source_stats_store.py` | 151 | Persisted source statistics — remember what Batcher wrote, for the next read. |
 | `store.py` | 122 | The pluggable persistence abstraction behind the MetadataHub. |
 | `views.py` | 148 | The bounded derived views over the feedback history. |
 
@@ -1911,7 +1911,7 @@ Configuration: one frozen, typed `Config` object.
 
 | module | lines | what it is |
 |---|---|---|
-| `config.py` | 2338 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2344 | The single frozen `Config` and its typed sections. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 271 | Named fault-tolerance profiles for the distributed engine. |
