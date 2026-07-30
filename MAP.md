@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1041 Python modules across 164 packages and 189 Rust files across 13 crates.
+Covering 1042 Python modules across 164 packages and 189 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -343,7 +343,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
-| `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `event_log.py` | 412 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `gpu_backend.py` | 472 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
@@ -423,6 +423,7 @@ Preparing a training corpus: mixing sources, filtering junk, removing eval leaka
 | `decontamination.py` | 180 | Removing evaluation data from a training corpus. |
 | `filtering.py` | 242 | Heuristic quality filtering for a web-scale text corpus. |
 | `mixing.py` | 238 | Sampling several corpora into one training mixture, at declared weights. |
+| `ordering.py` | 196 | Ordering a corpus so a training batch is not mostly padding. |
 
 ### `batcher/ml/decode/` — 6 · front-end
 
@@ -1320,7 +1321,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 
 | module | lines | what it is |
 |---|---|---|
-| `aggs.py` | 296 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
+| `aggs.py` | 301 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
 | `backend.py` | 251 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 312 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
