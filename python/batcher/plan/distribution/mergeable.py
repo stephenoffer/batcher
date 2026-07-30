@@ -33,11 +33,41 @@ gets a plausible wrong answer:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from batcher.plan.ir_tags import Op
 
-__all__ = ["ROW_LOCAL_OPS", "decompose", "flatten_ops", "nest_ops", "shard_plan"]
+__all__ = [
+    "ROW_LOCAL_OPS",
+    "ShardSplit",
+    "decompose",
+    "flatten_ops",
+    "nest_ops",
+    "shard_plan",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ShardSplit:
+    """How one chain divides across workers.
+
+    `shard_ops` runs on every worker over its own shard, `merge_ops` folds the shards' results,
+    and `tail_ops` runs once on that folded result. `ordered` says the merge is a plain
+    concatenation **in shard order** rather than a fold — true exactly when the chain is
+    row-local, where each shard's output is its slice of the answer and the slices reassemble.
+
+    `ordered` has to be carried rather than inferred from an empty `merge_ops`, because the two
+    mean different things to the executor: a fold may collect its shards in any order, and a
+    concatenation may not. Reading one as the other reorders the result of every filter that
+    ever fans out.
+    """
+
+    shard_ops: list[dict]
+    merge_ops: list[dict]
+    tail_ops: list[dict]
+    ordered: bool = False
+
 
 #: Operators whose output for a row depends only on that row, so a shard can run them over the
 #: rows it holds and get the same answer it would have as part of the whole.
@@ -57,30 +87,42 @@ def _col(name: str) -> dict:
     return {"e": "col", "name": name}
 
 
-def shard_plan(ops: list[dict]) -> tuple[list[dict], list[dict], list[dict]] | None:
-    """Split a translated chain into `(shard_ops, merge_ops, tail_ops)`.
+def shard_plan(ops: list[dict]) -> ShardSplit | None:
+    """Split a chain of operators into a per-shard stage and a merge stage.
 
-    `shard_ops` runs on every device over its own shard; `merge_ops` folds the shards' results
-    into the answer; `tail_ops` runs once on that answer, which is small by construction
-    because a reducer produced it. Splitting out a tail is what lets the *ordinary* analytical
-    shape — group by, then sort, then limit — fan out at all: requiring the reducer to be the
-    chain's last operator excluded almost every real query.
+    Two chains divide, for different reasons.
+
+    A chain with a **mergeable reducer** folds: each shard reduces what it holds and the small
+    results combine. Anything above the reducer becomes a tail that runs once on the folded
+    result, which is what lets the ordinary analytical shape — group by, then sort, then limit
+    — fan out at all; requiring the reducer to be the chain's last operator excluded almost
+    every real query.
+
+    A **row-local** chain (filter and project only) concatenates: every shard's output is
+    already its slice of the answer, in order, so reassembling them in shard order is the
+    answer. That is the most trivially divisible shape there is, and excluding it because it
+    had "nothing to fold" left the largest scans — the ones a filter is written for — bounded
+    by a single worker's memory.
 
     Args:
         ops: The bottom-up operator IR chain.
 
     Returns:
-        The three stages, or `None` when the chain has no shardable reducer — a map-only chain
-        (nothing to fold), or one whose first non-row-local operator has no mergeable form.
+        The split, or `None` for an empty chain or one whose first non-row-local operator has
+        no mergeable form.
     """
+    if not ops:
+        return None
     cut = next((i for i, op in enumerate(ops) if op.get("op") not in ROW_LOCAL_OPS), None)
     if cut is None:
-        return None  # map-only: there is no reduction to distribute
+        return ShardSplit(list(ops), [], [], ordered=True)
     split = _split_reducer(ops[cut], ops[cut + 1 :])
     if split is None:
         return None
     shard_stage, merge_stage, consumed = split
-    return [*ops[:cut], *shard_stage], merge_stage, ops[cut + 1 + consumed :]
+    return ShardSplit(
+        [*ops[:cut], *shard_stage], merge_stage, ops[cut + 1 + consumed :], ordered=False
+    )
 
 
 def _split_reducer(op: dict, rest: list[dict]) -> tuple[list[dict], list[dict], int] | None:

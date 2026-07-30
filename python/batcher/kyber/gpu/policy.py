@@ -211,17 +211,18 @@ def decide_gpu_backend(
     # available and it does not fit, so it would OOM and fall back anyway; the CPU engine spills
     # and is the honest destination. Reported as such rather than attempted and abandoned.
     scope = f"exceeds all {gpu_count} GPUs" if ws_gb > one_gpu_gb * gpu_count else "exceeds one GPU"
-    why = "no mergeable reducer to shard on" if not shardable else "CPU engine (spillable)"
+    why = "nothing to shard on" if not shardable else "CPU engine (spillable)"
     return GpuDecision(False, False, f"~{ws_gb:.1f}GB {scope}: {why}", rows)
 
 
 def _is_shardable(plan: LogicalPlan) -> bool:
-    """Whether `plan` has a mergeable reducer, so its per-device memory is the shard's.
+    """Whether `plan` divides across devices, so its per-device memory is one shard's.
 
-    Answered from the plan's own IR through the shared algebra in `plan.mergeable`, rather
-    than re-derived here: the optimizer routing a plan to the fan-out and the backend building
-    the fan-out must agree about which plans have one, and two statements of that rule are the
-    one way they could ever disagree.
+    Two shapes do: one with a mergeable reducer, whose shards fold, and a row-local one, whose
+    shards concatenate. Answered from the plan's own IR through the shared algebra in
+    `plan.distribution` rather than re-derived here — the optimizer routing a plan to the
+    fan-out and the backend building it must agree about which plans divide, and two statements
+    of that rule are the one way they could ever disagree.
 
     Never raises: a plan that cannot be lowered (a `map_batches` UDF) simply is not shardable.
     """

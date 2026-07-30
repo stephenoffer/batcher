@@ -659,7 +659,7 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1340 | The distributed executor — the dispatcher. |
+| `executor.py` | 1362 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 642 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -714,14 +714,14 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 |---|---|---|
 | `accelerators.py` | 133 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 163 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
-| `capacity.py` | 55 | How many workers a cluster can actually *place*, as opposed to afford. |
+| `capacity.py` | 91 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `hardware_probe.py` | 209 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 468 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 241 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
-| `scaling.py` | 446 | What the live cluster is, and what of it a query may use. |
+| `scaling.py` | 466 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 343 | The metadata-driven scheduling envelope and placement-group machinery. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
@@ -751,10 +751,10 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 172 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `aggregate.py` | 183 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `dispatch.py` | 157 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 173 | The single-key group-by fan-out that predates the plan translator. |
-| `shards.py` | 145 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
+| `shards.py` | 152 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
 | `tasks.py` | 190 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
@@ -839,7 +839,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
 | `energy.py` | 235 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
-| `policy.py` | 350 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `policy.py` | 351 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `sizing.py` | 104 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem
@@ -1763,7 +1763,7 @@ How a plan splits across workers — the neutral algebra both the optimizer and 
 
 | module | lines | what it is |
 |---|---|---|
-| `mergeable.py` | 242 | Split a chain of operators into a per-shard stage and a merge stage, in the plan IR. |
+| `mergeable.py` | 284 | Split a chain of operators into a per-shard stage and a merge stage, in the plan IR. |
 
 ### `batcher/plan/energy/` — 1 · contract
 

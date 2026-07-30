@@ -185,10 +185,10 @@ def _fold_split(table: pa.Table, ops: list[dict], shard_count: int, be) -> pa.Ta
 
     split = shard_plan(ops)
     assert split is not None, "this chain should be shardable"
-    shard_ops, merge_ops, tail_ops = split
-    pieces = [be.to_arrow(run_chain(s, shard_ops, be)) for s in _shards(table, shard_count)]
+    pieces = [be.to_arrow(run_chain(s, split.shard_ops, be)) for s in _shards(table, shard_count)]
     merged = pa.concat_tables([p for p in pieces if p.num_rows] or pieces[:1])
-    return be.to_arrow(run_chain(merged, [*merge_ops, *tail_ops], be))
+    ops_above = [*split.merge_ops, *split.tail_ops]
+    return be.to_arrow(run_chain(merged, ops_above, be)) if ops_above else merged
 
 
 @pytest.mark.parametrize("shard_count", [1, 2, 3, 5])
@@ -249,17 +249,34 @@ def test_only_row_local_operators_run_below_the_cut():
         .group_by("k")
         .agg(s=col("v").sum())
     )
-    shard_ops, _merge, tail_ops = shard_plan(gpu_plan_ops(ds._plan)[1])
-    assert [op["op"] for op in shard_ops] == ["filter", "sort", "limit"]
-    assert [op["op"] for op in tail_ops] == ["aggregate"]
+    split = shard_plan(gpu_plan_ops(ds._plan)[1])
+    assert [op["op"] for op in split.shard_ops] == ["filter", "sort", "limit"]
+    assert [op["op"] for op in split.tail_ops] == ["aggregate"]
+    assert not split.ordered  # a fold, so shard order is not part of the answer
 
 
-def test_a_map_only_chain_has_nothing_to_fold():
-    """No reducer means no fan-out: the result is every input row, so folding buys nothing."""
+def test_a_row_local_chain_splits_as_an_ordered_concatenation():
+    """No reducer does not mean no fan-out.
+
+    Every shard's output is its slice of the answer, already in order, so the merge is a
+    concatenation rather than a fold. `ordered` has to say so: a fold may collect its shards in
+    any order and a concatenation may not, and reading one as the other reorders the result of
+    every filter that ever fans out.
+    """
     from batcher.plan.distribution import shard_plan
 
     ds = bt.from_arrow(_table()).filter(col("v") > 5.0).with_columns(w=col("v") * 2.0)
-    assert shard_plan(gpu_plan_ops(ds._plan)[1]) is None
+    split = shard_plan(gpu_plan_ops(ds._plan)[1])
+    assert split is not None
+    assert split.ordered
+    assert [op["op"] for op in split.shard_ops] == ["filter", "project"]
+    assert split.merge_ops == [] and split.tail_ops == []
+
+
+def test_an_empty_chain_does_not_split():
+    from batcher.plan.distribution import shard_plan
+
+    assert shard_plan([]) is None
 
 
 def test_a_limit_with_an_offset_does_not_shard():
@@ -268,3 +285,41 @@ def test_a_limit_with_an_offset_does_not_shard():
 
     ds = bt.from_arrow(_table()).sort("v").limit(5, offset=10)
     assert shard_plan(gpu_plan_ops(ds._plan)[1]) is None
+
+
+@pytest.mark.parametrize("shard_count", [1, 2, 3, 5, 400])
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda ds: ds.filter(col("v") > 20.0),
+        lambda ds: ds.with_columns(w=col("v") * 2.0),
+        lambda ds: ds.filter(col("v") > 20.0).with_columns(w=col("v") - col("k")),
+        lambda ds: ds.select("k", "v"),
+    ],
+)
+def test_a_row_local_chain_reassembles_in_shard_order(build, shard_count, be):
+    """Compared row-for-row, because the order is the whole reason the concatenation works.
+
+    A shard is a contiguous slice of the source and a filter preserves order, so the shards'
+    outputs are contiguous slices of the answer. Concatenating them in shard order reproduces
+    the single-node result exactly — and comparing this order-independently would not notice
+    if it did not.
+    """
+    from batcher.plan.distribution import shard_plan
+
+    table = _table()
+    ds = build(bt.from_arrow(table))
+    split = shard_plan(gpu_plan_ops(ds._plan)[1])
+    assert split is not None and split.ordered
+    pieces = [be.to_arrow(run_chain(s, split.shard_ops, be)) for s in _shards(table, shard_count)]
+    got = pa.concat_tables([p for p in pieces if p.num_rows] or pieces[:1])
+    expected = ds.collect()
+
+    def in_order(t):
+        cols = t.select(expected.column_names).to_pydict()
+        return [
+            tuple(float(f"{v:.12e}") if isinstance(v, float) else v for v in row)
+            for row in zip(*cols.values(), strict=True)
+        ]
+
+    assert in_order(got) == in_order(expected)

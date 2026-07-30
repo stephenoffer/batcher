@@ -45,7 +45,7 @@ def sharded_gpu_aggregate(
 
     Returns:
         The chain's result, or `None` when the fan-out does not apply — an unsplittable source,
-        no shardable reducer, an unreadable cluster — so the caller can use the single-device
+        no shardable split, an unreadable cluster — so the caller can use the single-device
         dispatch or the CPU engine instead.
     """
     from batcher.plan.distribution import shard_plan
@@ -53,23 +53,29 @@ def sharded_gpu_aggregate(
     split = shard_plan(ops)
     if split is None:
         return None
-    shard_ops, merge_ops, tail_ops = split
 
-    descriptors = _shard_descriptors(source, gpu_count, sharded=sharded)
+    descriptors = _shard_descriptors(
+        source, gpu_count, sharded=sharded, preserve_order=split.ordered
+    )
     if descriptors is None:
         return None
-    partials = _run_shards(descriptors, shard_ops)
+    partials = _run_shards(descriptors, split.shard_ops)
     if not partials:
         return None
-    return _merge(partials, [*merge_ops, *tail_ops])
+    return _merge(partials, [*split.merge_ops, *split.tail_ops])
 
 
-def _shard_descriptors(source: Source, gpu_count: int, *, sharded: bool):
+def _shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve_order: bool):
     """One partition descriptor per shard, or `None` when the source cannot be fanned out.
 
     A shard reads itself from storage, so the driver never materializes the source to hand it
     out. An in-memory source has no splits to describe, and is left to the caller's
     ship-the-table path.
+
+    `preserve_order` is passed through for a row-local chain, whose merge is a concatenation in
+    shard order: the shards have to *be* contiguous slices of the source for reassembling them
+    to reproduce the single-node result. A fold does not care, and asking for ordering it does
+    not need would only constrain how the source may be divided.
     """
     try:
         import ray
@@ -98,7 +104,7 @@ def _shard_descriptors(source: Source, gpu_count: int, *, sharded: bool):
     else:
         n_shards = 1
     _ensure_ray(gpu_count)
-    return partition_descriptors(source, n_shards)
+    return partition_descriptors(source, n_shards, preserve_order=preserve_order)
 
 
 def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
@@ -155,18 +161,23 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
 
 
 def _merge(partials: list, ops: list[dict]) -> pa.Table:
-    """Fold the shards' results into the answer, then run whatever sat above the reducer.
+    """Combine the shards' results, then run whatever sat above the reducer.
 
-    Runs on the host through the translator's own kernels, over one row per group (or per
-    distinct row, or per top-N entry) per shard — small by construction, which is the whole
-    point of reducing before merging. Using the same kernels as the device keeps both halves
-    of the algebra in one implementation.
+    For a folded chain this runs on one row per group (or per distinct row, or per top-N entry)
+    per shard — small by construction, which is the whole point of reducing before merging. For
+    a row-local chain `ops` is empty and this is the concatenation itself, in shard order.
+
+    Using the translator's own kernels keeps both halves of the algebra in one implementation.
     """
-    import pandas as pd
     import pyarrow as pa
+
+    combined = pa.concat_tables(partials)
+    if not ops:
+        return combined
+    import pandas as pd
 
     from batcher.core.gpu_plan import DfBackend
     from batcher.core.gpu_plan.execute import run_chain
 
     be = DfBackend(pd)
-    return be.to_arrow(run_chain(pa.concat_tables(partials), ops, be))
+    return be.to_arrow(run_chain(combined, ops, be))

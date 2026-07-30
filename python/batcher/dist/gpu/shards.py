@@ -117,14 +117,18 @@ def run_subdivided(descriptor: dict, run, *, parts: int, rounds: int):
     """
     import pyarrow as pa
 
-    pending = split_descriptor(descriptor, parts)
+    pending = [((i,), d) for i, d in enumerate(split_descriptor(descriptor, parts))]
     if len(pending) == 1:
         raise MemoryError("a shard of one split cannot be divided further")
-    done: list = []
+    # Keyed by position, and sorted before concatenating. A row-local chain's shard is a
+    # contiguous slice of the source and its pieces are contiguous slices of that, so their
+    # order IS part of the answer; appending them as they happen to finish would reorder the
+    # result of every filter that ever met a device too small for it.
+    done: dict[tuple, object] = {}
     for _ in range(max(1, rounds)):
-        failed: list[dict] = []
+        failed: list[tuple] = []
         last: BaseException | None = None
-        for piece in pending:
+        for key, piece in pending:
             try:
                 out = run(piece)
             except Exception as exc:
@@ -135,11 +139,14 @@ def run_subdivided(descriptor: dict, run, *, parts: int, rounds: int):
                 if len(smaller) == 1:
                     raise
                 note_suppressed("dist", "gpu shard piece; subdividing further", exc)
-                failed.extend(smaller)
+                failed.extend(((*key, j), d) for j, d in enumerate(smaller))
                 continue
             if out is not None and out.num_rows:
-                done.append(out)
+                done[key] = out
         if not failed:
-            return pa.concat_tables(done) if done else None
+            # Lexicographic on the position path, so a piece that was subdivided again sorts
+            # inside the piece it came from: (1,) < (1, 0) < (1, 1) < (2,).
+            ordered = [done[k] for k in sorted(done)]
+            return pa.concat_tables(ordered) if ordered else None
         pending = failed
     raise last or MemoryError("gpu shard did not fit after subdividing")

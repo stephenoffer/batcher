@@ -200,26 +200,43 @@ def test_routing_fits_on_one_real_gpu_where_the_t4_fallback_would_shard():
     assert small.distributed  # the same data must shard against a tiny device
 
 
-def test_a_plan_with_nothing_to_fold_is_not_sharded_across_devices():
-    """Sharding needs a mergeable reducer, not just data too big for one device.
+def test_a_plan_with_nothing_to_divide_is_not_sharded_across_devices():
+    """Sharding needs a plan that divides, not just data too big for one device.
 
-    A plan with no reducer produces every input row, so splitting it across devices computes
-    the same rows in more places and still cannot fit one device to return them. Routing it to
-    a fan-out promised a scale-out that does not exist, and the single dispatch underneath it
-    would OOM and fall back anyway; the spillable CPU engine is the honest destination, and the
-    reason says so.
+    A chain reducing with `median` needs a group's whole value set, so no shard can produce a
+    partial anyone can fold. Routing it to a fan-out would promise a scale-out that does not
+    exist, and the single dispatch underneath would OOM and fall back anyway; the spillable CPU
+    engine is the honest destination, and the reason says so.
     """
     import batcher as bt
     from batcher.kyber.gpu.policy import decide_gpu_backend
 
     rows = 200_000
     q = bt.from_pydict({"k": list(range(rows)), "v": list(range(rows))})
+    q = q.group_by("k").agg(m=bt.col("v").median())
     tiny = decide_gpu_backend(q._plan, q._sources, gpu_count=8, force=True, gpu_memory_gb=0.001)
     assert not tiny.use_gpu and not tiny.distributed
-    assert "no mergeable reducer" in tiny.reason
+    assert "nothing to shard on" in tiny.reason
     # ...and with room on one device it is a perfectly ordinary single dispatch.
     roomy = decide_gpu_backend(q._plan, q._sources, gpu_count=8, force=True, gpu_memory_gb=80.0)
     assert roomy.use_gpu and not roomy.distributed
+
+
+def test_a_row_local_chain_shards_because_its_slices_reassemble():
+    """A filter is the most divisible shape there is, and used to be refused the fan-out.
+
+    Each shard's output is its slice of the answer, in order, so concatenating the slices is
+    the answer. Excluding it for having "nothing to fold" left the largest scans — the ones a
+    filter is written for — bounded by one device's memory.
+    """
+    import batcher as bt
+    from batcher.kyber.gpu.policy import decide_gpu_backend
+
+    rows = 200_000
+    q = bt.from_pydict({"k": list(range(rows)), "v": list(range(rows))})
+    q = q.filter(bt.col("v") > 10)
+    tiny = decide_gpu_backend(q._plan, q._sources, gpu_count=8, force=True, gpu_memory_gb=0.001)
+    assert tiny.use_gpu and tiny.distributed
 
 
 def test_a_reducing_chain_is_sized_by_what_it_processes_not_what_it_returns():
