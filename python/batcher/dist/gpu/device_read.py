@@ -68,13 +68,33 @@ def read_descriptor_on_device(descriptor: dict, be: DfBackend):
     projection = descriptor.get("projection")
     _publish_transfer_path(specs)
     try:
-        frame = _read_parquet(specs, projection)
+        frame = _widen(_read_parquet(specs, projection), descriptor, projection, be)
     except Exception as exc:
         # A device read that fails is a slow shard, never a failed query: the host reader is
         # still there and still correct.
         note_suppressed("dist", "read a gpu shard on the device", exc)
         return None
     return frame if _schema_agrees(frame, descriptor, projection) else None
+
+
+def _widen(frame, descriptor: dict, projection: list[str] | None, be: DfBackend):
+    """Widen the frame's narrow numeric columns, as the host path's `from_arrow` would.
+
+    This reader never goes through `from_arrow`, so it does not get that widening for free —
+    and without it a device-read shard contributes an `int32` column beside a host-read one's
+    `int64`, which is exactly the concatenation a fan-out then has to make sense of. The source
+    schema decides rather than the frame's own dtypes, so both readers reach the same answer
+    from the same fact.
+    """
+    from batcher.core.gpu_plan.backend import widened_type
+
+    schema = descriptor["splits"][0].schema()
+    names = list(projection) if projection is not None else list(frame.columns)
+    for name in names:
+        target = widened_type(schema.field(name).type)
+        if target is not None:
+            frame[name] = frame[name].astype(be.dtype(target))
+    return frame
 
 
 def _specs(descriptor: dict):
