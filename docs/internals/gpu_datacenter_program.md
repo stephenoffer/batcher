@@ -208,13 +208,62 @@ rather than fixed: the two implementations disagree about whether an integral va
 `.0`, what the sign of zero prints as, and whether `NaN` becomes the string `"nan"` or a null,
 and none of those is the more correct answer.
 
+## The wires, the faults, and the site: what a later pass added
+
+The program above made the *fleet* legible. What stayed invisible was everything between the
+devices, everything that had already gone wrong with one, and everything about the rented
+machine the process woke up on. Each of those fails the same way: the job stays correct, runs
+at a fraction of its rate, and says nothing.
+
+| Question | Before | Now |
+|---|---|---|
+| What NIC does a cross-node shuffle run on? | unavailable | `hardware.fabric.rdma` |
+| Is the host link the one the datasheet promises? | assumed yes | `hardware.fabric.pcie`, `device_links` |
+| Is NVLink actually up on this board? | assumed yes | `hardware.fabric.nvlink` |
+| Has the fabric been dropping packets? | unavailable | `hardware.fabric.counters` |
+| Did this device fault an hour ago? | unavailable | `hardware.faults.xid` |
+| Has its memory run out of spare rows? | unavailable | `hardware.faults.counters` |
+| Is ECC even on? | assumed yes | `hardware.faults.modes` |
+| Which GPU cloud is this, and what scheduled it? | unavailable | `_internal.site` |
+| Where is the node's real scratch disk? | assumed `/tmp` | `_internal.site.scratch` |
+| Which node in the fleet is sick? | unavailable | `hardware_probe.cluster_device_health` |
+
+The decisions those facts changed, rather than merely informed:
+
+- Kyber prices a shuffled byte against the *measured* fabric instead of the constant 2.0 —
+  about 1.0 on a 400 Gb/s InfiniBand node, 16.0 on a 10 Gb/s VM — and charges a device
+  stage's host copy at the link the board negotiated rather than the one its model ships with.
+- Carbonite quarantines a device whose row remapping has failed (nothing repairs it), drains
+  one holding a pending repair, judges heat against the part's own slowdown point rather than
+  a fleet-wide constant, binds a GPU worker's host half to the cores next to its device, and
+  sizes a shared device by its measured tenancy rather than by the pool's own accounting.
+- Spilling finds the node's measured NVMe rather than the container's overlay, never a tmpfs
+  (where "spilling" relieves nothing), and compresses against the disk it is writing to.
+- A gang-scheduled collective is kept off a node with a condemned device.
+- The object-store read fan-out scales with the machine and carries a retry budget sized for
+  it, because a store's answer to 256 concurrent GETs is `503 SlowDown`.
+
+Five defects came out of the same pass, three of them in this session's own additions: a
+module-level `import ray` that pulled Ray into every purely local query; a device list that
+compacted around an unreadable entry and so attributed one board's NUMA node, link, and
+degradation ratio to another; a cost model still pricing the tempdir after the spill paths
+moved to measured scratch; a `chmod` that tightened the node's *shared* scratch mount rather
+than Batcher's own subdirectory of it; and the device-class cost table pasted into a second
+subsystem, which the layer rules forbid — it now sits at layer 0 where Kyber and Carbonite
+both read the one object.
+
 ## What this program did **not** do
 
 Named explicitly, because the absence of each is a real limit and not an oversight:
 
 - **No Rust data-plane work.** Nothing in `crates/` changed. GPUDirect/RDMA transport for the
   Flight shuffle, device-buffer zero-copy, and NCCL integration remain unaddressed; they are
-  data-plane changes and belong with a measurement on real hardware.
+  data-plane changes and belong with a measurement on real hardware. The control plane now
+  *reports* the gap rather than closing it: `ShuffleSession.stats` carries what the node's
+  fabric actually carried against what it is capable of, which is how a shuffle that never
+  reached the fast wire becomes visible. GPUDirect Storage is the same shape — `io.splits.gds`
+  answers whether a path could be served by the DMA path and why not, and nothing yet uses
+  cuFile to serve it.
 - **No measurement on a GPU.** This work was written and tested on a CPU-only host, so every
   energy figure the tests exercise is modelled rather than measured, and no throughput,
   tokens-per-joule, or power claim appears anywhere in the tree. The benchmark script

@@ -16,6 +16,8 @@ reference.
 |-------|---------|---------|
 | `vram_headroom` | `0.15` | Fraction of each device held back for the CUDA context, fragmentation, and activation peaks. |
 | `fabric_aware_placement` | `True` | Report when a gang-scheduled collective is wider than any NVLink domain the fleet has. |
+| `fabric_gbps` | `0.0` | The node's aggregate RDMA rate, for a container that cannot see `/sys/class/infiniband`. 0 measures it. |
+| `bind_host_to_device_numa` | `True` | Pin a GPU worker's host-side threads to the CPUs on its device's NUMA node. |
 | `prefer_mig` | `True` | Prefer a hardware partition over a whole device when a model fits one. |
 | `efficiency_first_placement` | `False` | On a mixed fleet, prefer the most throughput-per-watt device that fits rather than the smallest. |
 | `kv_cache_dtype` | `"fp16"` | KV-cache element type used to size inference concurrency. `"fp8"` halves the cache. |
@@ -52,36 +54,6 @@ energy = EnergyConfig(power_budget_watts=10_000.0, pue=1.15)
 cfg = Config().replace(accelerator=AcceleratorConfig(energy=energy))
 print(cfg.accelerator.energy.power_budget_watts)
 # 10000.0
-```
-
-## Device memory
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `allocator` | `"default"` | Allocator strategy: `default`, `pool`, `async`, or `managed`. |
-| `pool_initial_fraction` | `0.5` | Fraction of reservable device memory the pool takes at startup. |
-| `pool_max_fraction` | `1.0` | Fraction of reservable device memory the pool may grow to. |
-| `spill_to_host` | `False` | Move columns to host memory instead of failing when the device fills. |
-| `statistics` | `False` | Track allocation counts and the device high-water mark. |
-
-These fields are the {py:class}`DeviceMemoryConfig <batcher.config.DeviceMemoryConfig>`
-dataclass. The default allocator pays a synchronizing device allocation for every intermediate
-column, so a chain of many small operators spends most of its time in the driver. A pool pays
-that cost once and suballocates, which is the largest constant-factor lever on this page.
-Reserving more up front trades a longer first allocation for no growth pauses later.
-
-`spill_to_host` turns a class of hard out-of-memory failure into a slowdown, which is what
-makes a shard that misjudged its size survivable. It is off by default so an over-large query
-is loud rather than quietly slow.
-
-```python
-from batcher import Config
-from batcher.config import AcceleratorConfig, DeviceMemoryConfig
-
-memory = DeviceMemoryConfig(allocator="pool", pool_initial_fraction=0.7, spill_to_host=True)
-cfg = Config().replace(accelerator=AcceleratorConfig(memory=memory))
-print(cfg.accelerator.memory.allocator)
-# pool
 ```
 
 ## Device memory
@@ -139,10 +111,45 @@ print(cfg.accelerator.memory.allocator)
 | `max_temperature_c` | `87.0` | Temperature above which a device is treated as degraded. |
 | `quarantine_below_derate` | `0.3` | Derate at or below which a degraded device stops being scheduled. |
 | `max_memory_fraction` | `0.95` | Resident memory fraction above which a device is treated as full. |
+| `quarantine_on_remap_failure` | `True` | Take a device out of rotation when its memory row remapping has failed. |
+| `drain_on_reset_pending` | `False` | Stop scheduling onto a device holding a repair that only its next reset applies. |
 
 These fields are the {py:class}`DeviceHealthConfig <batcher.config.DeviceHealthConfig>`
 dataclass. A clamped device is derated rather than removed; one reporting uncorrectable ECC
 errors is quarantined outright. Absent telemetry never quarantines anything.
+
+`max_temperature_c` is a ceiling rather than the whole rule. Where the driver publishes the
+part's own slowdown point, the lower of the two applies, because parts clamp themselves tens
+of degrees apart and one fleet-wide figure is simultaneously too strict on some and too lax on
+others.
+
+The two remapping fields cover a failure mode ECC does not. HBM repairs itself by retiring a
+faulty row from a fixed pool of spares, so a device reports a *pending* repair (it applies at
+the next reset, and until then the faulty row is still mapped in) or a *failed* one (the
+spares are gone). A remap failure is quarantined by default because, unlike every other
+condition here, it does not recover: no reset repairs it. A pending repair only degrades,
+since the device is still returning correct results; turn on `drain_on_reset_pending` where a
+run is long enough that "the next boundary" is hours away.
+
+## What the fleet reports about itself
+
+None of the settings above helps unless the conditions they describe are visible.
+{py:func}`bt.accelerators() <batcher.accelerators>` reports them, and
+{py:func}`bt.show_accelerators() <batcher.show_accelerators>` prints the same thing with the
+silent conditions called out by device:
+
+- a host link that renegotiated below what the slot and the card both support, with the
+  fraction of nameplate bandwidth it is left with;
+- memory that has repaired itself as far as it can, or is holding a repair for the next reset;
+- ECC disabled, an exclusive compute mode, a power limit at the part's floor, or persistence
+  mode off, each of which costs throughput or correctness without raising anything;
+- how many MIG instances the device is partitioned into, which changes what every other
+  figure on the row is about;
+- the RDMA ports that are up, what they have carried, and what they got wrong carrying it.
+
+On a Ray cluster the report also probes every accelerator node, because NVML answers only
+about the host it runs on: `fleet.health` carries the nodes with a device that should not be
+scheduled on.
 
 ## See also
 
